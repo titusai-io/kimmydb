@@ -31,7 +31,7 @@ pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
 };
-pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome};
+pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{DurabilityClass, Engine, blocking};
 pub use error::{Result, StorageError};

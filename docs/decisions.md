@@ -11174,3 +11174,129 @@ this ADR adds a second way to reach it, since a stopped batch plans a
 snapshot. Fixing it belongs with the drop rules (ADR-034, ADR-123), not
 with the coverage rules, and wants its own record. And `exhausted` remains a claim a receiver
 cannot check, as ADR-127 left it.
+
+---
+
+## ADR-149 — A loop of writes is one commit: a scoped write for callers outside storage
+
+**Decision.** `Engine::write_batch` is the crate-public way to compose
+several document writes into one commit. It takes the writer once through
+`Engine::begin_write`, hands the closure a `WriteScope` — a type only this
+crate can construct, which owns the transaction and offers `replace` and
+`delete` — runs the closure, and then does one of three things. On `Ok`
+with at least one entry written, it commits once through `WriteTxn::commit`,
+so the commit is counted and the durability class is honoured as every
+commit is (ADR-088), and publishes every entry the scope collected after
+that commit, in the order written. On `Err` it aborts and publishes nothing,
+returning the closure's error. On `Ok` with nothing written — every replace
+unmatched, every delete of a document that was not there — it aborts rather
+than commits: no fsync, no count, and nothing to publish. `insert_many`
+reaches the same end for an empty batch by opening no transaction at all;
+a scope cannot know it is empty until the closure has run, so it opens one
+and aborts it, to the same effect. And a write that fails inside the scope
+poisons it. The in-transaction forms write the document before its index
+entries and its oplog entry, so a failure part way leaves the transaction
+holding a document nothing indexes and nothing logs; every caller inside
+this crate aborts on that, but the closure is outside the crate and may
+swallow the error. So `WriteScope` remembers the first failure, refuses
+every later `replace` and `delete` without writing, and `write_batch`
+aborts a poisoned scope and answers with a `Transaction` error naming that
+first failure whatever the closure returned. A caller cannot commit a torn
+write by ignoring an error. `replace_in_txn` and
+`delete_in_txn` are the bodies of `replace_if` and `delete_where` with the
+transaction's lifecycle taken out, in the shape of `insert_in_txn`: each
+mints its stamp with `next_stamp()` inside, under the writer its caller
+holds, writes the document, its index entries and its oplog entry into the
+caller's transaction, and answers with the entry to publish. The single-call
+forms are now `begin_write`, the in-transaction call, abort or commit, and
+publish, and keep their behaviour and their return values exactly: an
+unmatched replace without `upsert` and a delete the guard declines write
+nothing, commit nothing and yield no entry; a `Stale` condition is the
+error it was. `begin_write` and `WriteTxn` stay `pub(crate)`.
+
+**Why.** A loop that wraps a public one-commit-per-call method is a shape
+this engine has now met five times. The writer's own bulk path was the
+first: `insert_many` was one commit per document until `insert_in_txn` was
+factored out of `insert` so the batch could commit once. The replica's apply
+was the second (ADR-119): `apply_batch` called `apply_remote` per entry, each
+opening and committing its own transaction, and a 1,024-entry batch cost
+about 1,026 commits and as many fsyncs. The embedding worker's position was
+the third (ADR-125): a checkpoint per entry, each a commit of its own, until
+the position was written by deadline. The vector write is the fourth, and
+the worker's store the fifth, and they are the ones this record is for:
+`put_vectors` calls `replace` once per chunk and `delete` once per stale
+tail chunk, so a document of N chunks is N commits and, under `durable`, N
+fsyncs, measured at about 4.6 ms a chunk; and the worker stores about 32
+documents per provider batch that way, then commits once more for its
+position, 33 commits where one would do. A failure in the middle of either
+loop leaves a document with some chunks at the new stamp and some at the
+old, which nothing documents and which the vector guide describes as if it
+could not happen.
+
+Each of the earlier three was fixed in place, and each fix was right for its
+place, but the pattern is the point: the shape recurs because `begin_write`
+is `pub(crate)`, so a caller outside this crate has no way to hold the
+writer across two calls and can do no better than call public methods in a
+loop. Opening `begin_write` up would be the wrong answer. A transaction that
+leaves the crate can be committed without being counted, held across an
+`await`, published before it is durable, or minted into before the writer
+is taken — every one of which is a rule this crate keeps inside its own
+source, and checks there (`commits_are_counted_at_one_chokepoint`,
+`no_write_path_mints_a_stamp_before_it_takes_the_writer`). So the general
+form is a scope, not a transaction: the caller composes writes, the engine
+keeps the writer. The one rule a scope cannot keep by construction is the
+one the closure's answer decides — whether a failed write is committed
+around — and that is why the scope is poisoned by a failure rather than
+trusting the closure to abort: the review of this record reproduced a
+unique violation swallowed inside a scope leaving two live documents under
+one unique key, the second unindexed, unlogged and so never replicated.
+The closure also holds redb's one writer for as long as it runs, so it
+must not call any other write on the engine — the call would wait for the
+writer it holds — and nothing slow or network-bound belongs inside it;
+`write_batch`'s comment says both. What the scope promises is exactly what a bulk insert
+promises. One commit for the scope, counted once and durable the way the
+engine's class says. Entries published after the commit, in the order
+written, so a change stream never sees a change that then rolled back and
+sees a document's chunks in the order they were written. All-or-nothing on
+error: the closure's `Err` aborts everything the scope wrote, so a failure
+mid-loop leaves the previous state whole rather than a torn one. Nothing at
+all for a scope that wrote nothing. And every stamp minted under the writer
+— the in-transaction forms mint inside, after the caller took the writer, as
+`insert_in_txn` does — so a scope's stamps are contiguous in commit order
+and ADR-148's invariant holds for a scope exactly as it does for a batch.
+The source guard sees the in-transaction forms as it sees `insert_in_txn`:
+exempt by signature, because a function handed a `WriteTxn` is one whose
+caller is already holding the writer.
+
+What this does not change. Replication already applies a run as one commit
+(ADR-119), so a replica's side of a scoped write is unchanged: it was
+already one commit for N chunks while the writer paid N, and the scope
+brings the writer's side into line with it. The single-call forms keep their
+behaviour — `replace`, `replace_if`, `delete`, `delete_if` and
+`delete_guarded` are each still one commit, or none when nothing matched —
+and their existing tests are the proof. The durability classes, the
+coalescing barrier, and `WriteTxn::commit` are untouched; a scope commits
+through the same chokepoint as everything else. The scope holds the writer
+for the length of the closure, which is the trade ADR-119 accepted for a
+run: milliseconds of CPU for a document's chunks, where before the writer
+was released and retaken between each, at an fsync a time. This record adds
+the mechanism only; composing `put_vectors`, `delete_vectors` and the
+worker's store over it are their own changes, each with its own
+commit-count test.
+
+The defence is the ADR-119 test rule, applied wherever a loop wraps a write:
+a commit-count test per loop, in the style of
+`a_batch_is_one_commit_however_many_documents_it_holds`. For the mechanism
+itself, `a_scoped_write_is_one_commit_however_many_writes_it_holds` (seven
+writes, one commit, one fsync, seven entries published after it in order),
+`a_scoped_write_that_fails_leaves_nothing_behind`,
+`an_empty_scope_does_not_commit`,
+`a_swallowed_error_inside_a_scope_commits_nothing` (a unique violation
+ignored by the closure, which then reports success; the scope must still
+abort), and
+`a_stamp_inside_a_scope_is_minted_under_the_writer` (one thread holding the
+writer and inserting under it while another opens a scope; the scope's
+entries must sort above those inserts). Each was checked to fail with its
+mechanism removed: a scope committing per write, committing on error,
+committing an empty scope, forgetting a failed write, and minting a stamp
+before the writer.

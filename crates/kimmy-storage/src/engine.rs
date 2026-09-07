@@ -1998,6 +1998,97 @@ mod tests {
         assert_eq!(arrived, sorted, "an entry arrived below one already committed");
     }
 
+    /// ADR-148 inside a scope, in the shape of
+    /// `a_stamp_is_minted_only_under_the_writer`: every stamp a scope mints
+    /// is minted after the writer is taken, so an entry committed while a
+    /// scope waited for the writer sorts below everything the scope writes.
+    /// Here one thread holds the writer and appends inserts under it while
+    /// another opens a scope; the scope's entries must commit after those
+    /// inserts and sort after them too.
+    #[test]
+    fn a_stamp_inside_a_scope_is_minted_under_the_writer() {
+        use std::sync::mpsc::channel;
+
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let coll = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": "kept", "v": "before" }).unwrap();
+
+        let (held_tx, held_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        let holder = {
+            let engine = Arc::clone(&engine);
+            let coll = coll.clone();
+            std::thread::spawn(move || {
+                let txn = engine.begin_write().unwrap();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                let mut last = Hlc::ZERO;
+                for n in 0..3 {
+                    let (_, entry) =
+                        engine.insert_in_txn(&txn, &coll, bson::doc! { "_id": n }).unwrap();
+                    last = entry.stamp.hlc;
+                }
+                txn.commit().unwrap();
+                last
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // Asked for while the writer is held: the scope blocks until the
+        // inserts commit, and must mint nothing until then.
+        let scoped = {
+            let engine = Arc::clone(&engine);
+            let coll = coll.clone();
+            std::thread::spawn(move || {
+                let mut rx = engine.subscribe();
+                engine
+                    .write_batch(|scope| {
+                        scope.replace(
+                            &coll,
+                            &kimmy_core::DocId::String("kept".into()),
+                            bson::doc! { "v": "after" },
+                            false,
+                        )?;
+                        scope.replace(
+                            &coll,
+                            &kimmy_core::DocId::String("new".into()),
+                            bson::doc! { "v": "after" },
+                            true,
+                        )?;
+                        scope.delete(&coll, &kimmy_core::DocId::String("kept".into()))?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut stamps = Vec::new();
+                while let Ok(entry) = rx.try_recv() {
+                    stamps.push(entry.stamp.hlc);
+                }
+                stamps
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        go_tx.send(()).unwrap();
+        let last_insert = holder.join().unwrap();
+        let stamps = scoped.join().unwrap();
+
+        assert_eq!(stamps.len(), 3, "the scope published its three entries");
+        for stamp in &stamps {
+            assert!(
+                *stamp > last_insert,
+                "the scope committed after the inserts and must sort after them; {stamp:?} is \
+                 below {last_insert:?}, a stamp minted before the writer was held"
+            );
+        }
+        // The same fact as the oplog states it: arrival order is stamp
+        // order for this node's own entries.
+        let arrived: Vec<_> =
+            engine.read_arrival_from(0, 100).unwrap().iter().map(|e| e.stamp).collect();
+        let mut sorted = arrived.clone();
+        sorted.sort();
+        assert_eq!(arrived, sorted, "an entry arrived below one already committed");
+    }
+
     #[test]
     fn stamps_are_strictly_increasing() {
         let (engine, _dir) = engine();
