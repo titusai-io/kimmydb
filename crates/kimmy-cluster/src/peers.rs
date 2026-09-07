@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
-use crate::transport::{DivergenceProbe, PeerStalls, sync_once_with};
+use crate::transport::{DivergenceProbe, PeerStalls, Repair, sync_once_with};
 
 /// How often to run a round against every known peer.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -124,6 +124,25 @@ pub struct RoundReport {
     /// stop, `divergent_collections` holds its last value, and this says
     /// how old that value is.
     pub divergence_check_age_secs: Option<u64>,
+    /// Batches the rounds in this tick stopped short at an entry for a
+    /// collection this node does not hold — `SyncOutcome::unknown_collection`,
+    /// summed over the peers reached (ADR-148). A counter. Each one is a
+    /// window this node re-serves from the same place next round until the
+    /// collection is here; the round plans a snapshot from the peer to
+    /// bring it, and `repair_rounds` counts that happening.
+    pub entries_skipped_unknown_collection: usize,
+    /// Entries the rounds in this tick left for a later window because
+    /// they sat above the vector the peer had advertised for their origin
+    /// — `SyncOutcome::deferred`, summed (ADR-148). A counter. Ordinary and
+    /// rare on a busy cluster: the peer appended them between advertising
+    /// and serving, and the next round takes them from the right position.
+    pub entries_skipped_beyond_advertised: usize,
+    /// Rounds in this tick spent repairing against a peer (ADR-148):
+    /// re-serving its oplog from below this node's position, or pulling its
+    /// snapshot, because the check confirmed a divergence against it or a
+    /// batch stopped at a collection this node lacks. A counter. Rising is
+    /// a repair under way; it stops when the repair is done.
+    pub repair_rounds: usize,
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -343,6 +362,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
                             report.ddl_declined += outcome.ddl_declined;
+                            report.entries_skipped_unknown_collection += outcome.unknown_collection;
+                            report.entries_skipped_beyond_advertised += outcome.deferred;
+                            report.repair_rounds += usize::from(outcome.repairing);
                             if let Some(node) = outcome.peer {
                                 // Folded in only when the check actually ran
                                 // against this peer this contact
@@ -390,6 +412,32 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     let findings =
                                         kimmy_storage::DivergenceFindings { existence, count };
                                     divergence.observe(node, findings);
+                                    // Detection to repair (ADR-148): what
+                                    // the check has confirmed against this
+                                    // peer is asked for on the next round
+                                    // with it, from below this node's
+                                    // position — the collection's whole
+                                    // history from its creation, or the
+                                    // peer's snapshot for a collection this
+                                    // node does not hold at all.
+                                    let confirmed = divergence.confirmed_against(node);
+                                    for collection in &confirmed {
+                                        let repair = match engine.collection_by_id(*collection) {
+                                            Ok(Some(meta)) => Repair::Replay { from: meta.created },
+                                            _ => Repair::Snapshot,
+                                        };
+                                        if stalls.plan_repair(node, *collection, repair) {
+                                            warn!(
+                                                %peer,
+                                                node = %node,
+                                                collection = %collection,
+                                                ?repair,
+                                                "divergence confirmed; planned a repair from \
+                                                 this peer on the next round with it"
+                                            );
+                                        }
+                                    }
+                                    stalls.retain_repaired(node, &confirmed);
                                 } else {
                                     report.divergence_skips += 1;
                                 }

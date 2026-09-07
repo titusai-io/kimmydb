@@ -67,6 +67,20 @@ impl Hlc {
             None => Self { wall_ms: self.wall_ms.saturating_add(1), counter: 0 },
         }
     }
+
+    /// The previous representable timestamp; [`Hlc::ZERO`] stays where it
+    /// is. The inverse of [`Hlc::successor`], used to name "everything
+    /// strictly before this stamp" as an inclusive position: a sync window
+    /// that ends *before* an entry it did not carry is witnessed to here,
+    /// so the next request, which is inclusive at the position it names,
+    /// re-serves that entry rather than skipping it.
+    pub fn predecessor(self) -> Self {
+        match self.counter.checked_sub(1) {
+            Some(counter) => Self { wall_ms: self.wall_ms, counter },
+            None if self.wall_ms == 0 => Self::ZERO,
+            None => Self { wall_ms: self.wall_ms - 1, counter: u16::MAX },
+        }
+    }
 }
 
 impl fmt::Debug for Hlc {
@@ -211,6 +225,16 @@ mod tests {
 
     fn node(n: u8) -> NodeId {
         NodeId::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn predecessor_inverts_successor_and_stops_at_zero() {
+        let mid = Hlc::new(1_000, 5);
+        assert_eq!(mid.successor().predecessor(), mid);
+        assert_eq!(Hlc::new(1_000, 0).predecessor(), Hlc::new(999, u16::MAX));
+        assert_eq!(Hlc::new(999, u16::MAX).successor(), Hlc::new(1_000, 0));
+        assert_eq!(Hlc::ZERO.predecessor(), Hlc::ZERO, "nothing sorts before zero");
+        assert!(mid.predecessor() < mid);
     }
 
     #[test]

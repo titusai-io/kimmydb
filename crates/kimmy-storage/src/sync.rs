@@ -40,13 +40,31 @@ pub struct SyncOutcome {
     pub superseded: usize,
     /// Schema changes applied: collections, indexes, vector configuration.
     pub ddl: usize,
-    /// Entries for a collection this node does not have.
+    /// Batches this round stopped short at an entry for a collection this
+    /// node does not hold and has no tombstone for (ADR-148). At most one
+    /// per batch: the entry and everything after it are left for the next
+    /// window, and nothing past it is witnessed, so the position stays
+    /// below the entry rather than claiming it. Which collection it was is
+    /// in [`Self::unknown`].
     ///
-    /// Should be zero in a healthy cluster now that collection creation
-    /// replicates. It stays non-zero when the `CreateCollection` entry has aged
-    /// out of the peer's oplog — counted rather than silently dropped, because
-    /// that case is a gap in coverage rather than convergence.
+    /// Counted per **batch**, not per entry: a stopped batch stops once,
+    /// at one entry, and the warning names that entry and its collection.
+    ///
+    /// Zero in a healthy cluster, because collection creation replicates
+    /// and sorts before the documents written into it, and because a
+    /// collection dropped here leaves a tombstone that makes those
+    /// documents history rather than a stop. Non-zero is a hole: the
+    /// creation was witnessed here without being applied, or has aged out
+    /// of the peer's oplog. Either way the collection has to arrive by
+    /// another route — the loop asks the peer for a snapshot — and until it
+    /// does the same window is re-served and stops at the same entry, which
+    /// keeps the lag gauge honest about it.
     pub unknown_collection: usize,
+    /// The collection a stopped batch stopped at, when
+    /// [`Self::unknown_collection`] is non-zero: its id, and its name if the
+    /// entry carried one (a schema change does; a document names only the
+    /// id, which is all a node without the collection can know).
+    pub unknown: Option<UnknownCollection>,
     /// Replicated schema changes this node could not apply to its current
     /// state and skipped: a definition this build cannot apply, or a name
     /// already taken by a different definition it cannot arbitrate
@@ -66,6 +84,14 @@ pub struct SyncOutcome {
     /// The witnessed vector keeps the first rare, so a count that keeps
     /// rising is the second (ADR-141).
     pub ddl_declined: usize,
+    /// Entries this round left for a later window rather than witnessing
+    /// (ADR-148): above the vector the peer introduced the window with, so
+    /// nothing says the entries between this node's position and them were
+    /// carried too; or for a collection this node does not hold and has no
+    /// tombstone for, which may still arrive. Neither is a fact about the
+    /// data, so neither moves the witnessed vector, and the window is
+    /// re-served from where it stopped.
+    pub deferred: usize,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds of history —
@@ -146,6 +172,12 @@ pub struct SyncOutcome {
     /// from one that runs and agrees. Set only by `kimmy-cluster`'s
     /// `sync_once`, like the two fields above.
     pub count_probe_deferred: bool,
+    /// Whether this round was spent repairing (ADR-148): re-serving the
+    /// peer's oplog from below this node's position, or pulling its
+    /// snapshot, because a divergence had been confirmed against it or a
+    /// batch had stopped at a collection this node lacks. Set only by
+    /// `kimmy-cluster`'s `sync_once`, like `exhausted`.
+    pub repairing: bool,
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of
@@ -254,7 +286,43 @@ impl SyncOutcome {
             + self.unknown_collection
             + self.ddl_refused
             + self.ddl_declined
+            + self.deferred
     }
+}
+
+/// The collection a batch stopped at because this node does not hold it
+/// (ADR-148): see [`SyncOutcome::unknown_collection`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownCollection {
+    pub id: CollectionId,
+    /// `db.name`, when the entry that stopped the batch was a schema change
+    /// and so carried it.
+    pub name: Option<String>,
+    /// The entry the batch stopped at.
+    pub stamp: Stamp,
+}
+
+/// What a peer said when it introduced a window: the vector it advertised
+/// before serving it, and where the window ended (ADR-127). The receiver's
+/// witnessed vector is raised by what this proves and by nothing else.
+#[derive(Clone, Copy, Debug)]
+struct Introduced<'a> {
+    theirs: &'a VersionVector,
+    scanned_to: Hlc,
+    exhausted: bool,
+}
+
+/// Where a served window ends, for [`coverage_up_to`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowEnd {
+    /// The peer's whole tail: everything it advertised.
+    Exhausted,
+    /// Every entry up to and including this one was delivered or withheld
+    /// by design; nothing after it was examined.
+    Through(Stamp),
+    /// Every entry before this one was delivered or withheld by design;
+    /// this one and everything after it were not taken.
+    Before(Stamp),
 }
 
 /// What a batch from a peer proved this node has seen, beyond the entries
@@ -270,14 +338,13 @@ impl SyncOutcome {
 /// `scanned_to` is the last stamp the peer's scan examined, and `exhausted`
 /// says whether it stopped there because the oplog ended (ADR-127).
 ///
-/// - An **exhausted** window is the peer's whole tail, so it runs to the end of
-///   everything the peer advertised: the answer is `theirs` itself.
-/// - A window that stopped at the batch limit ends at `scanned_to`. Each
-///   advertised origin is raised to the *lower* of that stamp and the peer's
-///   own coverage of it: never past what the peer holds, and never past what it
-///   read. Ties at that stamp from origins with a higher node id sort after it
-///   and were not served — they are re-served next round, because the range
-///   read is inclusive at the stamp asked for.
+/// - An [`WindowEnd::Exhausted`] window is the peer's whole tail, so it runs
+///   to the end of everything the peer advertised: the answer is `theirs`
+///   itself.
+/// - A window that stopped at the batch limit ends at the stamp it reached.
+///   Each advertised origin is raised to the *lower* of that stamp and the
+///   peer's own coverage of it: never past what the peer holds, and never
+///   past what it read.
 ///
 /// Why the second case exists at all: an advertised stamp this node can
 /// never receive — a violation, a stamp whose entry sits behind the window —
@@ -296,19 +363,38 @@ impl SyncOutcome {
 /// silent, permanent divergence with every health signal green. ADR-126 takes
 /// the cap after the filter so the count is honest again; this rule no longer
 /// depends on the count at all, so the next filter cannot reopen the hole.
-pub fn coverage_after_batch(
-    theirs: &VersionVector,
-    scanned_to: Hlc,
-    exhausted: bool,
-) -> VersionVector {
-    if exhausted {
-        return theirs.clone();
+///
+/// **The end is a full [`Stamp`], not a bare [`Hlc`]** (ADR-148). A bare
+/// stamp cannot tell an entry *at* the window's end belonging to another
+/// origin apart from one just past it: the oplog sorts by `(hlc, node)`, so
+/// an entry of origin `o` at exactly the last examined stamp was examined
+/// only if `o` sorts at or before the node that stamp belongs to. Two members
+/// writing in the same millisecond share stamps routinely — a bulk load mints
+/// counters from zero on every member — and each such tie at a window's end
+/// was one entry claimed and never served, self-healing only while that
+/// origin kept writing. With the full stamp the bound is exact: an origin
+/// that sorts after it is raised to the stamp's predecessor, which the next
+/// request, inclusive at the position it names, re-serves from.
+pub fn coverage_up_to(theirs: &VersionVector, end: WindowEnd) -> VersionVector {
+    match end {
+        WindowEnd::Exhausted => theirs.clone(),
+        WindowEnd::Through(last) => {
+            let mut covered = VersionVector::new();
+            for (node, their_max) in theirs.iter() {
+                let reached = if node <= last.node { last.hlc } else { last.hlc.predecessor() };
+                covered.insert(node, their_max.min(reached));
+            }
+            covered
+        }
+        WindowEnd::Before(stop) => {
+            let mut covered = VersionVector::new();
+            for (node, their_max) in theirs.iter() {
+                let reached = if node < stop.node { stop.hlc } else { stop.hlc.predecessor() };
+                covered.insert(node, their_max.min(reached));
+            }
+            covered
+        }
     }
-    let mut covered = VersionVector::new();
-    for (node, their_max) in theirs.iter() {
-        covered.insert(node, their_max.min(scanned_to));
-    }
-    covered
 }
 
 impl Engine {
@@ -317,7 +403,7 @@ impl Engine {
     ///
     /// The single path the replication transport uses for a served batch:
     /// [`Self::apply_batch`] for the entries, with the witnessed vector raised
-    /// by [`coverage_after_batch`] in the same transaction as the batch's last
+    /// by [`coverage_up_to`] in the same transaction as the batch's last
     /// run of documents — so a round with no schema changes in it is one
     /// commit and one fsync, not one per entry plus two (ADR-119).
     /// `scanned_to` and `exhausted` are the peer's report of where its window
@@ -346,6 +432,21 @@ impl Engine {
     /// peer's advertised vector on exhaustion is ADR-082 itself, and this node
     /// holds nothing to test the claim against. A peer that reports
     /// `exhausted` falsely is trusted, necessarily.
+    ///
+    /// **A window is trusted only up to the vector that introduced it**
+    /// (ADR-148). The peer reads its vector, then its window, and keeps
+    /// replicating in between; an entry in the window above what the peer
+    /// advertised for its origin was appended after the vector was read,
+    /// and the window — which starts at this node's position on whichever
+    /// origin it trails *most*, one threshold for every origin — need not
+    /// begin where this node's history of *that* origin ends. Observing it
+    /// would raise the witnessed vector over whatever of that origin lies
+    /// between this node's position and the threshold, which the window
+    /// never carried: a contiguous run of one origin's stamps, lost with
+    /// every signal green. Such entries are left for the next window, which
+    /// the peer will advertise and this node will ask from its own position
+    /// for. See [`Self::apply_batch_absorbing`] for the second thing a
+    /// batch may leave: an entry for a collection this node does not hold.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
@@ -353,15 +454,7 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
-        let scanned_to = if exhausted {
-            scanned_to
-        } else {
-            entries.last().map_or(Hlc::ZERO, |last| scanned_to.min(last.stamp.hlc))
-        };
-        self.apply_batch_absorbing(
-            entries,
-            Some(&coverage_after_batch(theirs, scanned_to, exhausted)),
-        )
+        self.apply_batch_absorbing(entries, Some(Introduced { theirs, scanned_to, exhausted }))
     }
 
     /// The window at or after `from` a peer that asked to catch up may be
@@ -447,17 +540,49 @@ impl Engine {
     /// answers that cannot change until the next schema change. The memo is
     /// cleared at every DDL entry, which is the only thing in a batch that can
     /// change them.
+    ///
+    /// **What a batch leaves rather than takes (ADR-148).** Two kinds of
+    /// entry are not processed and not witnessed, so the position stays
+    /// below them and the next window re-serves them. An entry above the
+    /// vector the peer introduced the window with is left where it is and
+    /// the batch goes on: see [`Self::apply_peer_batch`]. An entry for a
+    /// collection this node has **no record of at all** — not here, and no
+    /// tombstone for it either — **stops the batch**: it and everything
+    /// after it are left, and the witnessed vector is raised only to just
+    /// before it. A tombstone, whichever way its stamp falls against the
+    /// entry, makes the entry history instead: it is superseded, witnessed
+    /// and carried past, because a collection this node destroyed is not
+    /// one that may still arrive (ADR-123).
+    /// The old rule counted such an entry and moved on, which witnessed it
+    /// away for good; but a collection this node lacks is not a fact about
+    /// the data the way a lost concurrent write or a refused definition is
+    /// (ADR-123). Its creation sorts before every document written into it,
+    /// so a document arriving without it is a creation this node witnessed
+    /// without applying — a hole — and the document can succeed once the
+    /// collection is here. Stopping keeps the oplog this node serves onward
+    /// contiguous per origin, which is what lets a peer trust an exhausted
+    /// window's vector at all; witnessing past the stop would hand every
+    /// peer the same hole. What brings the collection is the loop's
+    /// business: the outcome names it, and the loop asks the peer for a
+    /// snapshot.
     fn apply_batch_absorbing(
         &self,
         entries: &[OplogEntry],
-        extra: Option<&VersionVector>,
+        introduced: Option<Introduced<'_>>,
     ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
-        let mut witnessed = extra.cloned().unwrap_or_default();
+        let mut witnessed = VersionVector::new();
         let mut run = Run::default();
         let mut memo = Memo::default();
+        let mut stopped_at: Option<Stamp> = None;
 
         for entry in entries {
+            if let Some(introduced) = introduced
+                && entry.stamp.hlc > introduced.theirs.get(entry.stamp.node)
+            {
+                outcome.deferred += 1;
+                continue;
+            }
             // **Every** entry the batch takes, on every path — applied,
             // superseded, DDL, or skipped by design — is observed here, once,
             // before `apply_one` branches on it. Doing this per branch is
@@ -466,9 +591,34 @@ impl Engine {
             // Observing before applying is safe: an error from `apply_one`
             // fails the whole batch, and the vector is dropped with it, so no
             // stamp is recorded for an entry that was not applied. See
-            // ADR-054.
-            witnessed.observe(entry.stamp);
-            self.apply_one(entry, &mut run, &mut memo, &mut outcome)?;
+            // ADR-054. The one entry not taken — a collection this node
+            // lacks — is not observed, and the batch ends at it.
+            match self.apply_one(entry, &mut run, &mut memo, &mut outcome)? {
+                Step::Taken => witnessed.observe(entry.stamp),
+                Step::Unknown(name) => {
+                    outcome.unknown_collection += 1;
+                    outcome.unknown =
+                        Some(UnknownCollection { id: entry.collection, name, stamp: entry.stamp });
+                    stopped_at = Some(entry.stamp);
+                    break;
+                }
+            }
+        }
+
+        // What the window proved beyond the entries themselves: to its end
+        // as the peer reported it, clamped to what it actually carried, or
+        // to just before the entry the batch stopped at.
+        if let Some(Introduced { theirs, scanned_to, exhausted }) = introduced {
+            let end = match (stopped_at, exhausted) {
+                (Some(stop), _) => WindowEnd::Before(stop),
+                (None, true) => WindowEnd::Exhausted,
+                (None, false) => match entries.last() {
+                    Some(last) if last.stamp.hlc <= scanned_to => WindowEnd::Through(last.stamp),
+                    Some(last) => WindowEnd::Through(Stamp::new(scanned_to, last.stamp.node)),
+                    None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+                },
+            };
+            witnessed.merge(&coverage_up_to(theirs, end));
         }
 
         // The witnessed vector rides in the last run's transaction. A batch
@@ -481,12 +631,23 @@ impl Engine {
         }
         self.commit_run(&mut run)?;
 
-        if outcome.unknown_collection > 0 {
+        if let Some(unknown) = &outcome.unknown {
             warn!(
-                entries = outcome.unknown_collection,
-                "skipped replicated entries for collections this node does not have; \
-                 either the collection was dropped here, or its creation has aged out \
-                 of the peer's oplog"
+                collection = %unknown.id,
+                name = unknown.name.as_deref().unwrap_or("unknown"),
+                stamp = ?unknown.stamp,
+                left = entries.len() - entries.iter().position(|e| e.stamp == unknown.stamp).unwrap_or(entries.len()),
+                "stopped a replicated batch at an entry for a collection this node does not \
+                 have and has no tombstone for; its creation was witnessed here without \
+                 being applied, or has aged out of the peer's oplog. Nothing past it was \
+                 witnessed, the window is re-served from here, and the loop asks the peer \
+                 for a snapshot; counted in kimmy_sync_entries_skipped_total"
+            );
+        }
+        if outcome.deferred > 0 {
+            debug!(
+                entries = outcome.deferred,
+                "left entries above the vector the peer advertised for the next window"
             );
         }
         debug!(
@@ -494,6 +655,7 @@ impl Engine {
             superseded = outcome.superseded,
             ddl = outcome.ddl,
             unknown_collection = outcome.unknown_collection,
+            deferred = outcome.deferred,
             ddl_refused = outcome.ddl_refused,
             ddl_declined = outcome.ddl_declined,
             "merged a batch from a peer"
@@ -638,7 +800,9 @@ impl<T> Ddl<T> {
 /// dealt with it.
 enum DdlOutcome {
     Applied,
-    UnknownCollection,
+    /// It named a collection this node does not hold; `db.name` as the
+    /// entry carried it, for the log line and the outcome.
+    UnknownCollection(String),
     Refused,
     /// A drop older than the index standing under its name: recorded as a
     /// tombstone and not applied (ADR-132), counted so a member whose peers
@@ -712,6 +876,15 @@ pub(crate) fn settle<T>(result: Result<T>) -> Result<Ddl<T>> {
     }
 }
 
+/// What became of one entry in a batch: taken — applied, superseded, or
+/// skipped for a reason that is a fact about this node's data — or left,
+/// because it names a collection this node does not hold (ADR-148).
+enum Step {
+    Taken,
+    /// Left, with the collection's `db.name` if the entry carried one.
+    Unknown(Option<String>),
+}
+
 impl Engine {
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
@@ -725,11 +898,11 @@ impl Engine {
         run: &mut Run<'e>,
         memo: &mut Memo,
         outcome: &mut SyncOutcome,
-    ) -> Result<()> {
+    ) -> Result<Step> {
         // A node's own observation of a broken constraint is not a fact
         // about the data; refuse it even if a peer sends one.
         if entry.kind == OpKind::UniqueViolation {
-            return Ok(());
+            return Ok(Step::Taken);
         }
 
         // Schema changes come first in stamp order, so a collection exists
@@ -743,16 +916,29 @@ impl Engine {
             *memo = Memo::default();
             match self.apply_ddl(entry)? {
                 DdlOutcome::Applied => outcome.ddl += 1,
-                DdlOutcome::UnknownCollection => outcome.unknown_collection += 1,
+                DdlOutcome::UnknownCollection(name) => {
+                    // A tombstone **at all** makes this history, whichever
+                    // way the stamps fall (ADR-148). The collection was
+                    // destroyed here; a change addressed to the incarnation
+                    // that is gone cannot be applied by waiting, so it is
+                    // ADR-123's case exactly — witnessed, counted, and not
+                    // re-served. Only a collection this node has *no*
+                    // record of is one that may still arrive.
+                    if self.collection_dropped_at(entry.collection)?.is_some() {
+                        outcome.superseded += 1;
+                    } else {
+                        return Ok(Step::Unknown(Some(name)));
+                    }
+                }
                 DdlOutcome::Refused => outcome.ddl_refused += 1,
                 DdlOutcome::Declined => outcome.ddl_declined += 1,
             }
-            return Ok(());
+            return Ok(Step::Taken);
         }
 
         // A legacy `Collection` entry names nothing and cannot be acted on.
         if !entry.kind.is_document() {
-            return Ok(());
+            return Ok(Step::Taken);
         }
 
         // A drop the sender has not heard about yet must not be undone by
@@ -763,12 +949,23 @@ impl Engine {
             && entry.stamp < dropped_at
         {
             outcome.superseded += 1;
-            return Ok(());
+            return Ok(Step::Taken);
         }
 
         let Some(collection) = self.memo_collection(memo, entry.collection)? else {
-            outcome.unknown_collection += 1;
-            return Ok(());
+            // Gone here, and a tombstone says so: history, whichever way the
+            // stamps fall (ADR-148). The check above turns away a write from
+            // *before* a drop even when the collection was recreated; this
+            // one covers the collection that is simply not here, including
+            // the ordinary race in which a peer wrote into it before hearing
+            // the drop. Waiting for that collection would be waiting for
+            // something that is never coming, which is ADR-123's case and
+            // must not stop the batch.
+            if self.memo_dropped_at(memo, entry.collection)?.is_some() {
+                outcome.superseded += 1;
+                return Ok(Step::Taken);
+            }
+            return Ok(Step::Unknown(None));
         };
 
         // A recreated collection derives the *same* id as its predecessor
@@ -785,7 +982,7 @@ impl Engine {
             && entry.stamp.hlc <= floor
         {
             outcome.superseded += 1;
-            return Ok(());
+            return Ok(Step::Taken);
         }
 
         let txn = self.run_txn(run)?;
@@ -798,7 +995,7 @@ impl Engine {
             // was; the next entry carries on in it.
             RemoteApplied::Superseded => outcome.superseded += 1,
         }
-        Ok(())
+        Ok(Step::Taken)
     }
 
     /// Apply a replicated schema change.
@@ -922,7 +1119,12 @@ impl Engine {
                     // when applied, is what carries the ordering to a third
                     // member; nothing is lost by withholding the create.
                     Ddl::Applied(false) => return Ok(DdlOutcome::Applied),
-                    Ddl::Gone => return Ok(DdlOutcome::UnknownCollection),
+                    Ddl::Gone => {
+                        return Ok(DdlOutcome::UnknownCollection(format!(
+                            "{}.{}",
+                            target.db, target.collection
+                        )));
+                    }
                     Ddl::Refused(reason) => {
                         // The operator's signal: this node now lacks an index
                         // its peers hold, and nothing will retry it. Once per
@@ -1021,7 +1223,10 @@ impl Engine {
                             kimmy_core::IndexMeta::derive_id(&target.index),
                             entry.stamp,
                         )?;
-                        return Ok(DdlOutcome::UnknownCollection);
+                        return Ok(DdlOutcome::UnknownCollection(format!(
+                            "{}.{}",
+                            target.db, target.collection
+                        )));
                     }
                     Ddl::Refused(reason) => {
                         warn!(
@@ -1058,7 +1263,12 @@ impl Engine {
                 };
                 match applied {
                     Ddl::Applied(()) => {}
-                    Ddl::Gone => return Ok(DdlOutcome::UnknownCollection),
+                    Ddl::Gone => {
+                        return Ok(DdlOutcome::UnknownCollection(format!(
+                            "{}.{}",
+                            target.db, target.collection
+                        )));
+                    }
                     Ddl::Refused(reason) => {
                         warn!(
                             db = %target.db,
@@ -1231,6 +1441,32 @@ mod tests {
         }
     }
 
+    /// [`round_window`] with something happening on the peer *between* the
+    /// two reads a transport round makes of it: the vector it advertises,
+    /// then the window it serves. On the wire those are two frames, and the
+    /// peer keeps applying batches of its own in between — under load, for
+    /// seconds. `gap` is what the peer does in that interval.
+    fn round_with_gap(
+        into: &Engine,
+        from: &Engine,
+        limit: usize,
+        gap: impl FnOnce(),
+    ) -> (SyncOutcome, OplogWindow) {
+        let mine = into.witnessed_vector().unwrap();
+        let theirs = from.version_vector().unwrap();
+        gap();
+        match mine.behind(&theirs) {
+            Some(start) => {
+                let window = from.entries_for_peer(start, limit).unwrap();
+                let outcome = into
+                    .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+                    .unwrap();
+                (outcome, window)
+            }
+            None => (SyncOutcome::default(), OplogWindow { exhausted: true, ..Default::default() }),
+        }
+    }
+
     /// The highest stamp `into` has witnessed at any origin the peer
     /// advertised — what "the witness has not advanced past the window" is
     /// asserted against.
@@ -1256,22 +1492,30 @@ mod tests {
         Hlc::new(head.wall_ms + 1, 0)
     }
 
+    /// A window ending at `wall`, from a node that sorts at or after every
+    /// origin these tests advertise — so they pin the rule itself, and not
+    /// the tie-break at the window's end, which
+    /// `coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node`
+    /// pins on its own.
+    fn window_end(wall: u64) -> Stamp {
+        Stamp::new(Hlc::new(wall, 0), kimmy_core::NodeId::from_bytes([0xff; 16]))
+    }
+
     #[test]
     fn an_exhausted_window_proves_the_whole_advertised_vector() {
         let mut theirs = VersionVector::new();
         let origin = kimmy_core::NodeId::generate();
         theirs.insert(origin, Hlc::new(5_000, 0));
-        assert_eq!(coverage_after_batch(&theirs, Hlc::new(1_000, 0), true), theirs);
-        assert_eq!(coverage_after_batch(&theirs, Hlc::ZERO, true), theirs, "an empty tail too");
+        assert_eq!(coverage_up_to(&theirs, WindowEnd::Exhausted), theirs);
     }
 
     #[test]
     fn a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached() {
         // Three advertised origins: one whose coverage ends before the window
         // does, one inside it, one beyond. Only the last is clipped.
-        let early = kimmy_core::NodeId::generate();
-        let inside = kimmy_core::NodeId::generate();
-        let beyond = kimmy_core::NodeId::generate();
+        let early = kimmy_core::NodeId::from_bytes([1; 16]);
+        let inside = kimmy_core::NodeId::from_bytes([2; 16]);
+        let beyond = kimmy_core::NodeId::from_bytes([3; 16]);
         let mut theirs = VersionVector::new();
         theirs.insert(early, Hlc::new(1_000, 0));
         theirs.insert(inside, Hlc::new(2_500, 0));
@@ -1279,7 +1523,7 @@ mod tests {
         let stranger = kimmy_core::NodeId::generate();
 
         // A window the peer stopped scanning at 3_000 because its batch filled.
-        let covered = coverage_after_batch(&theirs, Hlc::new(3_000, 0), false);
+        let covered = coverage_up_to(&theirs, WindowEnd::Through(window_end(3_000)));
         assert_eq!(covered.get(early), Hlc::new(1_000, 0), "never past what the peer holds");
         assert_eq!(covered.get(inside), Hlc::new(2_500, 0));
         assert_eq!(covered.get(beyond), Hlc::new(3_000, 0), "clipped to the window end");
@@ -1298,11 +1542,11 @@ mod tests {
         // `apply_peer_batch` and pinned by
         // `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
         // `a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
-        let origin = kimmy_core::NodeId::generate();
+        let origin = kimmy_core::NodeId::from_bytes([1; 16]);
         let mut theirs = VersionVector::new();
         theirs.insert(origin, Hlc::new(9_000, 0));
 
-        let covered = coverage_after_batch(&theirs, Hlc::new(2_000, 0), false);
+        let covered = coverage_up_to(&theirs, WindowEnd::Through(window_end(2_000)));
         assert_eq!(covered.get(origin), Hlc::new(2_000, 0));
         assert_ne!(covered, theirs, "an empty batch must not absorb the peer's vector");
     }
@@ -1641,7 +1885,7 @@ mod tests {
         advertised.insert(granted, beyond);
         assert!(beyond > last.scanned_to, "only above the window's end do the two rules differ");
 
-        let covered = coverage_after_batch(&advertised, last.scanned_to, last.exhausted);
+        let covered = coverage_up_to(&advertised, WindowEnd::Exhausted);
         assert_eq!(
             covered.get(granted),
             beyond,
@@ -2807,7 +3051,11 @@ mod tests {
         b.drop_collection("shop", "orders").unwrap();
 
         let outcome = pull(&b, &a);
-        assert!(outcome.unknown_collection > 0, "{outcome:?}");
+        // History, not a hole: B's own drop is newer than every index entry
+        // A serves, so they are superseded and witnessed rather than left
+        // for a collection that may still arrive (ADR-148).
+        assert!(outcome.superseded > 0, "{outcome:?}");
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
         let id = kimmy_core::CollectionId::derive("shop", "orders");
         let index_id = kimmy_core::IndexMeta::derive_id("tags_1_cats_1");
         assert!(b.index_dropped_at(id, index_id).unwrap().is_some());
@@ -4151,5 +4399,528 @@ mod tests {
         // before. Against one that has not: served, as before.
         assert!(!a.can_serve_peer_holding(&VersionVector::default()).unwrap());
         assert!(b.can_serve_peer_holding(&VersionVector::default()).unwrap());
+    }
+    /// Every `_id` a collection holds on `engine`, as strings, so two members
+    /// can be compared document by document rather than by count.
+    fn ids_on(engine: &Engine, db: &str, name: &str) -> std::collections::BTreeSet<String> {
+        let Ok(coll) = engine.get_collection(db, name) else {
+            return Default::default();
+        };
+        engine
+            .snapshot_page(None)
+            .unwrap()
+            .documents
+            .iter()
+            .filter(|d| d.collection == coll.id)
+            .map(|d| d.id.to_string())
+            .collect()
+    }
+
+    /// The hole a three-member cluster lost three runs of one origin's
+    /// documents into, network-free.
+    ///
+    /// `from` is one threshold: this node's position on whichever advertised
+    /// origin it trails most. When the peer advertises nothing new of a
+    /// third origin, that origin does not set the threshold, and the window
+    /// starts wherever this node stands on the *peer's* origin — which can
+    /// be above its position on the third one. The peer keeps replicating
+    /// between advertising its vector and serving the window, and under
+    /// load that interval is seconds; if it appends the third origin's
+    /// entries in it, the window carries the ones above the threshold and
+    /// not the ones below. Observing the ones it carried raised this node's
+    /// witnessed position over the ones it did not, and nothing ever asked
+    /// for them again: a contiguous run of one origin's stamps, gone, with
+    /// lag 0 and every round reporting success.
+    ///
+    /// The rule that closes it: a window is trusted only up to the vector
+    /// that introduced it. An entry above what the peer advertised for its
+    /// origin is left for the next window, which the peer will advertise
+    /// and this node will ask from its own position for.
+    #[test]
+    fn entries_above_the_advertised_vector_are_left_for_the_next_window() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let on_a = a.create_collection("app", "docs").unwrap();
+        round(&b, &a, BATCH);
+        round(&c, &a, BATCH);
+        let on_b = b.get_collection("app", "docs").unwrap();
+        let on_c = c.get_collection("app", "docs").unwrap();
+
+        // A's first run, which C never pulls directly before the race.
+        a.insert_many(&on_a, (0..100).map(|i| doc! { "_id": i }).collect()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // B writes after it, so C's position on B sorts above A's run.
+        b.insert(&on_b, doc! { "_id": "b1" }).unwrap();
+        round(&c, &b, BATCH);
+        assert_eq!(c.count(&on_c).unwrap(), 1, "C has B's write and none of A's yet");
+
+        // A's second run, above C's position on B; then B writes again so C
+        // has something to pull from B.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.insert_many(&on_a, (100..200).map(|i| doc! { "_id": i }).collect()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        b.insert(&on_b, doc! { "_id": "b2" }).unwrap();
+
+        // The race: C asks B for its vector — B advertises nothing of A's
+        // that C lacks — and B pulls both of A's runs before serving C the
+        // window. The window starts at C's position on B, so it carries A's
+        // second run and not the first.
+        let (outcome, window) = round_with_gap(&c, &b, BATCH, || {
+            round(&b, &a, BATCH);
+        });
+        assert!(window.exhausted, "the shape needs a window the peer calls its whole tail");
+        assert!(
+            window.entries.iter().any(|e| e.stamp.node == a.node_id()),
+            "and the window did carry entries of A's that B advertised none of"
+        );
+        assert!(
+            outcome.deferred > 0,
+            "entries above what B advertised for A are left for the next window: {outcome:?}"
+        );
+        let a_on_c = c.witnessed_vector().unwrap().get(a.node_id());
+        let a_advertised = window.entries.iter().find(|e| e.stamp.node == b.node_id());
+        assert!(a_advertised.is_some());
+        assert!(
+            a_on_c < a.version_vector().unwrap().get(a.node_id()),
+            "C's witnessed position on A must not have jumped over the run it was not sent"
+        );
+
+        // From here every round succeeds, every window is exhausted, and the
+        // lag gauge reads 0: whatever C still lacks has to arrive anyway.
+        for _ in 0..4 {
+            round(&c, &a, BATCH);
+            round(&c, &b, BATCH);
+        }
+        let (on_a, on_c) = (ids_on(&a, "app", "docs"), ids_on(&c, "app", "docs"));
+        assert!(
+            on_a.is_subset(&on_c),
+            "C must hold every document A holds; missing {:?}",
+            on_a.difference(&on_c).collect::<Vec<_>>()
+        );
+        assert_eq!(on_c.len(), 202, "A's two runs and B's two writes");
+        assert!(c.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+    /// The window end named exactly (ADR-148): with the full stamp of the
+    /// last entry examined, an origin that sorts after that stamp's node is
+    /// raised only to the stamp's predecessor, because its entry at that
+    /// very stamp — routine under a bulk load, where every member mints
+    /// counters from zero in the same millisecond — was not examined.
+    #[test]
+    fn coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node() {
+        let early = kimmy_core::NodeId::from_bytes([1; 16]);
+        let last = kimmy_core::NodeId::from_bytes([5; 16]);
+        let later = kimmy_core::NodeId::from_bytes([9; 16]);
+        let at = Hlc::new(1_000, 3);
+        let mut theirs = VersionVector::new();
+        theirs.insert(early, Hlc::new(5_000, 0));
+        theirs.insert(last, Hlc::new(5_000, 0));
+        theirs.insert(later, Hlc::new(5_000, 0));
+
+        let through = coverage_up_to(&theirs, WindowEnd::Through(Stamp::new(at, last)));
+        assert_eq!(through.get(early), at, "an earlier node's entry at the stamp was examined");
+        assert_eq!(through.get(last), at, "the entry itself was delivered");
+        assert_eq!(through.get(later), at.predecessor(), "a later node's tie was not examined");
+
+        let before = coverage_up_to(&theirs, WindowEnd::Before(Stamp::new(at, last)));
+        assert_eq!(before.get(early), at);
+        assert_eq!(before.get(last), at.predecessor(), "the entry itself was not taken");
+        assert_eq!(before.get(later), at.predecessor());
+
+        assert_eq!(coverage_up_to(&theirs, WindowEnd::Exhausted), theirs);
+    }
+
+    /// The same tie through a batch: a window truncated at an entry of one
+    /// origin, with another origin's entry at exactly the same stamp behind
+    /// it. That entry has to be re-served next round, which it is only if
+    /// the position stays below it.
+    #[test]
+    fn an_entry_tied_at_a_truncated_windows_end_from_a_later_node_is_served_next_round() {
+        let (b, _db) = engine();
+        b.create_collection("db", "c").unwrap();
+        let first = kimmy_core::NodeId::from_bytes([1; 16]);
+        let second = kimmy_core::NodeId::from_bytes([2; 16]);
+        let at = Hlc::new(1_000, 0);
+        let mut theirs = VersionVector::new();
+        theirs.insert(first, at);
+        theirs.insert(second, at);
+
+        // The peer's window of one: `(at, first)` delivered, `(at, second)`
+        // behind it, unexamined.
+        let outcome = b.apply_peer_batch(&theirs, &[entry_from(first, at)], at, false).unwrap();
+        assert_eq!(outcome.applied, 1);
+        let mine = b.witnessed_vector().unwrap();
+        assert_eq!(mine.get(first), at);
+        assert!(mine.get(second) < at, "the tied entry was never served: {mine:?}");
+        assert_eq!(mine.behind(&theirs), Some(at.predecessor()), "and is asked for next round");
+    }
+
+    /// A document for a collection this node does not hold stops the batch
+    /// (ADR-148): nothing past it is witnessed, the same window comes round
+    /// again and stops at the same entry, and once the collection is here
+    /// everything behind it lands. The old rule counted the entry and
+    /// witnessed it away, and the document was gone for good.
+    #[test]
+    fn a_document_for_a_collection_this_node_lacks_stops_the_batch_until_the_collection_arrives() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let docs = a.create_collection("app", "docs").unwrap();
+        for i in 0..3 {
+            a.insert(&docs, doc! { "_id": i }).unwrap();
+        }
+        let later = a.create_collection("app", "later").unwrap();
+        for i in 0..2 {
+            a.insert(&later, doc! { "_id": i }).unwrap();
+        }
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let first_doc = history.iter().find(|e| e.kind == OpKind::Insert).unwrap().stamp;
+        let later_create = history
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection && e.collection == later.id)
+            .unwrap()
+            .stamp;
+
+        // A hole, as an upgrade finds one: B's position on A already sits
+        // above the creation of `docs` without B having applied it.
+        let mut hole = VersionVector::new();
+        hole.insert(a.node_id(), first_doc.hlc);
+        b.absorb_witnessed(&hole).unwrap();
+
+        for round_no in 0..3 {
+            let outcome = round(&b, &a, BATCH);
+            assert_eq!(outcome.unknown_collection, 1, "round {round_no}: {outcome:?}");
+            let unknown = outcome.unknown.as_ref().expect("names the collection");
+            assert_eq!(unknown.id, docs.id);
+            assert_eq!(unknown.name, None, "a document names only the id");
+            assert_eq!(unknown.stamp, first_doc);
+            assert_eq!(outcome.applied + outcome.ddl, 0, "nothing past the stop was taken");
+            assert!(
+                b.get_collection("app", "later").is_err(),
+                "the later creation was not reached"
+            );
+            let position = b.witnessed_vector().unwrap().get(a.node_id());
+            assert!(position < later_create.hlc, "and not witnessed either: {position:?}");
+        }
+
+        // The collection arrives — here by the operator recreating it, in
+        // the loop by a snapshot the stop asks the peer for.
+        b.create_collection("app", "docs").unwrap();
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        assert_eq!(outcome.applied, 5, "every document behind the stop: {outcome:?}");
+        assert!(b.get_collection("app", "later").is_ok());
+        assert_eq!(ids_on(&b, "app", "docs"), ids_on(&a, "app", "docs"));
+        assert_eq!(ids_on(&b, "app", "later"), ids_on(&a, "app", "later"));
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// The same stop for a schema change, which carries the collection's
+    /// name, and the case that is *not* a stop: a change for a collection
+    /// this node dropped, which is history and witnessed as such.
+    #[test]
+    fn a_schema_change_for_a_collection_this_node_lacks_stops_the_batch_unless_it_is_dropped_here()
+    {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let index = history.iter().find(|e| e.kind == OpKind::CreateIndex).unwrap().clone();
+
+        let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
+        assert_eq!(outcome.unknown_collection, 1, "{outcome:?}");
+        let unknown = outcome.unknown.expect("names the collection");
+        assert_eq!(unknown.id, orders.id);
+        assert_eq!(unknown.name.as_deref(), Some("shop.orders"));
+        assert_eq!(b.witnessed_vector().unwrap().get(a.node_id()), Hlc::ZERO, "not witnessed");
+
+        // Dropped here, newer than the change: history.
+        b.create_collection("shop", "orders").unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+        let outcome = b.apply_batch(&[index]).unwrap();
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        assert_eq!(outcome.superseded, 1, "{outcome:?}");
+        assert!(b.witnessed_vector().unwrap().get(a.node_id()) > Hlc::ZERO, "and witnessed");
+    }
+
+    /// A small deterministic pseudo-random source, so the load below is the
+    /// same on every run and a failure names a seed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Every stamp `engine` holds in its oplog.
+    fn stamps_held(engine: &Engine) -> std::collections::BTreeSet<Stamp> {
+        engine
+            .read_oplog_from(Hlc::ZERO, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.stamp)
+            .collect()
+    }
+
+    /// ADR-148's invariant, checked against the members' actual state: for
+    /// every member and every origin, no stamp of that origin at or below
+    /// the member's *witnessed* position is missing from the member's
+    /// oplog, and none at or below its *servable* position is either. Under
+    /// this load nothing is ever deliberately superseded — inserts of
+    /// distinct ids, creations, index creations — so "missing" is a hole.
+    fn assert_no_holes(members: &[&Engine]) {
+        for member in members {
+            let held = stamps_held(member);
+            let witnessed = member.witnessed_vector().unwrap();
+            let servable = member.version_vector().unwrap();
+            for origin in members {
+                let own: Vec<Stamp> = stamps_held(origin)
+                    .into_iter()
+                    .filter(|s| s.node == origin.node_id())
+                    .collect();
+                for stamp in own {
+                    if stamp.hlc <= servable.get(origin.node_id()) {
+                        assert!(
+                            held.contains(&stamp),
+                            "member {} advertises origin {} up to {:?} but lacks {:?}",
+                            member.node_id(),
+                            origin.node_id(),
+                            servable.get(origin.node_id()),
+                            stamp
+                        );
+                    }
+                    if stamp.hlc <= witnessed.get(origin.node_id()) {
+                        assert!(
+                            held.contains(&stamp),
+                            "member {} has witnessed origin {} up to {:?} but never applied {:?}",
+                            member.node_id(),
+                            origin.node_id(),
+                            witnessed.get(origin.node_id()),
+                            stamp
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bulk load that lost three runs of documents on one member, as
+    /// three engines in one process: one member originates a fast stream so
+    /// its peers' windows from it are always truncated at the cap, the
+    /// other two originate slower ones, schema changes land in between,
+    /// every member contacts its peers in an order that rotates each tick
+    /// (as `PeerHealth::select` rotates it), writes keep landing on every
+    /// member between one contact and the next, and on every contact the
+    /// peer may replicate from the third member between advertising its
+    /// vector and serving the window. The real threshold derivation, the
+    /// real coverage rule. After the load, ADR-148's invariant must hold on
+    /// every member — no position above a stamp the member does not hold —
+    /// and after rounds with nothing in the way every member must hold
+    /// every document.
+    ///
+    /// Each step sleeps a millisecond so stamps sort the way events
+    /// happened: three engines in one process would otherwise mint in the
+    /// same millisecond and the tie-break by counter would hide the very
+    /// ordering the hole depends on.
+    #[test]
+    fn a_bulk_load_with_rotating_contacts_and_relays_leaves_no_member_a_hole() {
+        const LIMIT: usize = 24;
+        const TICKS: usize = 24;
+        let mut rng = Lcg(0x5eed_c0ff_ee00_1234);
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let members = [&a, &b, &c];
+        let mut names = vec!["c0".to_string()];
+        a.create_collection("app", "c0").unwrap();
+        for m in &members[1..] {
+            round(m, &a, BATCH);
+        }
+        let mut next_id = 0u64;
+
+        // Every member writes a little; C writes about three times as much,
+        // so every window from C overflows the cap while windows from A and
+        // B are exhausted, the shape of the field cluster.
+        let mut write_burst = |rng: &mut Lcg, names: &mut Vec<String>| {
+            for (i, m) in members.iter().enumerate() {
+                let burst = if i == 2 { 4 + rng.below(4) } else { 1 + rng.below(2) };
+                for _ in 0..burst {
+                    let name = &names[rng.below(names.len() as u64) as usize];
+                    if let Ok(coll) = m.get_collection("app", name) {
+                        m.insert(&coll, doc! { "_id": next_id as i64 }).unwrap();
+                        next_id += 1;
+                    }
+                }
+                if rng.below(12) == 0 {
+                    let name = format!("c{}", names.len());
+                    m.create_collection("app", &name).unwrap();
+                    names.push(name);
+                }
+                if rng.below(15) == 0 {
+                    let name = &names[rng.below(names.len() as u64) as usize];
+                    if m.get_collection("app", name).is_ok() {
+                        let field = format!("f{}", rng.below(3));
+                        let fields =
+                            vec![crate::meta::IndexField { path: field, descending: false }];
+                        let _ = m.create_index("app", name, fields, false, None);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+
+        for tick in 0..TICKS {
+            // Contacts, one member after another, its two peers in an order
+            // that rotates with the tick; writes land on every member before
+            // each contact. On each contact, with some probability, the peer
+            // pulls from the third member in the gap.
+            for (i, m) in members.iter().enumerate() {
+                let others = [(i + 1) % 3, (i + 2) % 3];
+                let order = if tick % 2 == 0 { others } else { [others[1], others[0]] };
+                for j in order {
+                    write_burst(&mut rng, &mut names);
+                    let peer = members[j];
+                    let third = members[3 - i - j];
+                    let relay = rng.below(2) == 0;
+                    round_with_gap(m, peer, LIMIT, || {
+                        if relay {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            round(peer, third, LIMIT);
+                        }
+                    });
+                }
+            }
+        }
+
+        assert_no_holes(&members);
+
+        // Nothing in the way any more: rounds until every member covers
+        // every other, bounded so a wedge fails rather than hangs.
+        for _ in 0..200 {
+            let mut moved = false;
+            for m in &members {
+                for peer in &members {
+                    if m.node_id() != peer.node_id() {
+                        let outcome = round(m, peer, BATCH);
+                        moved |= outcome.applied + outcome.ddl + outcome.unknown_collection > 0;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        for name in &names {
+            let ids: Vec<_> = members.iter().map(|m| ids_on(m, "app", name)).collect();
+            assert_eq!(ids[0], ids[1], "collection {name}: a and b disagree");
+            assert_eq!(ids[0], ids[2], "collection {name}: a and c disagree");
+        }
+        assert_no_holes(&members);
+        for m in &members {
+            for peer in &members {
+                assert!(m.witnessed_vector().unwrap().covers(&peer.version_vector().unwrap()));
+            }
+        }
+    }
+    /// The ordinary concurrent drop-and-write, which must **not** stop a
+    /// batch (ADR-148). B drops a collection; A, which has not heard the
+    /// drop yet, writes into it, so the write is stamped *after* the drop.
+    /// A tombstone at all makes that write history here — the collection is
+    /// never coming back on its own — so it is superseded, witnessed, and
+    /// everything behind it in the window lands.
+    ///
+    /// Stopping instead is ADR-123's wedge wearing this ADR's clothes: the
+    /// entry can never succeed, the window is re-served for ever, and the
+    /// only way past it is a full-database snapshot whose completion
+    /// witnesses the entry anyway.
+    #[test]
+    fn a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let doomed = a.create_collection("app", "doomed").unwrap();
+        let other = a.create_collection("app", "other").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("app", "doomed").unwrap();
+
+        // A writes into the collection after B dropped it, and into another
+        // collection after that: the second write is what a stop would
+        // strand.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.insert(&doomed, doc! { "_id": "written-after-the-drop" }).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "a drop is history, not a stop: {outcome:?}");
+        assert!(outcome.superseded >= 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "and the entry behind it landed: {outcome:?}");
+        let other_on_b = b.get_collection("app", "other").unwrap();
+        assert_eq!(
+            ids_on(&b, "app", "other"),
+            ids_on(&a, "app", "other"),
+            "nothing behind the dropped collection's write was stranded"
+        );
+        assert_eq!(b.count(&other_on_b).unwrap(), 1);
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "and the round converged rather than re-serving the same window for ever"
+        );
+        assert!(b.get_collection("app", "doomed").is_err(), "the drop stands");
+
+        // And it stays converged: a further round moves nothing.
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default());
+    }
+    /// The DDL twin of
+    /// `a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall`,
+    /// and the case the stamp comparison strands: a schema change stamped
+    /// **after** a local drop. A creates an index on a collection B has
+    /// just dropped, so the `CreateIndex` is newer than B's tombstone. The
+    /// collection is gone here and is not coming back on its own, so the
+    /// change is history — superseded, witnessed, carried past — and what
+    /// follows it in the window lands.
+    ///
+    /// Under the comparison this replaced, the entry was neither older than
+    /// the drop nor placeable, so it stopped the batch on every round for
+    /// ever: ADR-123's wedge, reached through the rule written to avoid it.
+    #[test]
+    fn a_schema_change_stamped_after_a_local_drop_is_history_and_does_not_stop_the_batch() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+
+        // A has not heard the drop, so its index creation is stamped after
+        // B's tombstone; the write behind it is what a stop would strand.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(
+            outcome.unknown_collection, 0,
+            "a tombstone makes the change history, whichever way the stamps fall: {outcome:?}"
+        );
+        assert_eq!(outcome.superseded, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "and the entry behind it landed: {outcome:?}");
+        assert_eq!(
+            ids_on(&b, "shop", "other"),
+            ids_on(&a, "shop", "other"),
+            "nothing behind the dropped collection's schema change was stranded"
+        );
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "and the round converged rather than re-serving the same window for ever"
+        );
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and stays converged");
     }
 }

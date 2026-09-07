@@ -395,6 +395,18 @@ impl DivergenceTracker {
         }
     }
 
+    /// Collections confirmed divergent against `peer` by either half of
+    /// the check, as of its last folded-in contact — what a repair against
+    /// that peer is planned from (ADR-148). Empty for a peer with nothing
+    /// confirmed, or never checked.
+    pub fn confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        let mut out = self.confirmed.get(&peer).cloned().unwrap_or_default();
+        if let Some(by_count) = self.count_confirmed.get(&peer) {
+            out.extend(by_count.iter().copied());
+        }
+        out
+    }
+
     /// Distinct collections confirmed divergent against at least one peer,
     /// by either half of the check — what the gauge reports. The same
     /// collection confirmed against two peers, or by both existence and

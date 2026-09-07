@@ -144,7 +144,7 @@ mod tests {
         // vector's *own* position at whichever trailing origin it holds least
         // of — even when it is far ahead everywhere else. Coverage that never
         // moves for one origin therefore never moves the threshold at all,
-        // which is what `coverage_after_batch` in storage exists to prevent
+        // which is what `coverage_up_to` in storage exists to prevent
         // (ADR-082). This test pins the semantics that fix compensates for.
         let stuck = node();
         let busy = node();

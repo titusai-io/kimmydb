@@ -561,6 +561,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_divergence_checks_total{outcome}` | Contacts with a peer in which the check above **`ran`**, and rounds that did not run it (**`skipped`**): the round completed but the pull was truncated by the batch cap and could not be trusted, or the round failed. This is what tells a quiet cluster from a blind one. **Alert on `ran` not increasing** while `kimmy_cluster_members` is above 0 — the gauge above is then holding a value nothing has re-examined — and treat any sustained `skipped` rate as the gauge being *unknown* rather than clean, **including while `ran` is also rising**, which is the partly-blind case the alert cannot catch because neither series is labelled by peer. A round that failed is in `kimmy_sync_failures_total` *and* in `skipped` ([ADR-145](decisions.md)), so `ran` + `skipped` is every round the node attempted. See [below](#the-divergence-check) for the four readings ([ADR-135](decisions.md)) |
 | `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because the peer is behind this node — has not *processed* everything this node has ([ADR-146](decisions.md)) — and still catching up. `deferred` rising on a busy cluster is ordinary, and on a converged idle cluster it should not rise at all; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
 | `kimmy_sync_divergence_check_age_seconds` | Seconds since the last contact, with any peer, in which the check ran, as of the last sync tick; 0 before the first, when `ran` is also 0. **Alert on this above *k* × `cluster.sync_interval_secs`** (three is a reasonable *k*): the gauge above is then holding a value nothing has re-examined, whatever it reads — look at `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`. The one divergence series that keeps moving on a member whose every round fails, which leaves `ran` flat and the gauge serving its last value: measured on a three-member cluster, one member's gauge read 0 for half an hour after its last completed round ([ADR-145](decisions.md)) |
+| `kimmy_sync_entries_skipped_total{reason}` | Replicated entries a sync round left rather than took ([ADR-148](decisions.md)). **`unknown_collection`**: batches stopped at an entry for a collection this member has *no record of* — it neither holds the collection nor a tombstone for it — because the creation was witnessed here without being applied, or has aged out of the peer's oplog. One per stopped batch, at the entry the warning names. Nothing past the stop is witnessed, the same window is re-served every round, and the round plans a snapshot from that peer to bring the collection. A collection this member *dropped* is history and stops nothing, so an ordinary concurrent drop-and-write does not move this. **Alert on this sustained**: one or two while a creation propagates is ordinary, a rate that does not stop is a member that cannot place what its peers keep sending it, and `kimmy_sync_repair_rounds_total` is what says the snapshot is being pulled. **`beyond_advertised`**: entries above the vector the peer advertised before serving the window — it appended them in between — left for the next round, which asks for them from the right position. Ordinary and rare on a busy cluster; it is the counter for a race, not a fault |
+| `kimmy_sync_repair_rounds_total` | Sync rounds spent repairing against a peer ([ADR-148](decisions.md)): re-serving its oplog from a divergent collection's creation, window by window until one reaches the peer's tail, or pulling its snapshot. Rises after `kimmy_sync_divergent_collections` goes above 0, or after a batch stops at a collection this member lacks, and stops when the repair is done — so a burst here followed by the gauge returning to 0 is the repair working. Rising steadily while the gauge stays above 0 is a divergence the repair cannot close: the same collection is repaired again at most once every five minutes of rounds, and the warning at the time names it and the peer |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 | `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
@@ -583,6 +585,36 @@ run of documents, that peer has is simply missing here, with
 unmoved, because nothing about it fails a round ([ADR-133](decisions.md)).
 `kimmy_sync_divergent_collections` exists because that state is otherwise
 invisible.
+
+**The signature, stated once.** A hole in a member's *position* — it believes
+it has processed entries it was never served — reads `0` on
+`kimmy_replication_lag_seconds` by construction: the gauge measures how far
+behind the member's position says it is, and the position is exactly what is
+wrong. No round fails, so `kimmy_sync_failures_total` is flat and nothing is
+backed off; nothing is refused or declined. The three series that move for it
+are `kimmy_sync_divergent_collections`, which confirms the collection,
+`kimmy_sync_entries_skipped_total`, whose `unknown_collection` label rises
+when a member cannot place what it is being sent, and
+`kimmy_sync_repair_rounds_total`, which rises while the repair runs and stops
+when it is done ([ADR-148](decisions.md)). Since ADR-148 a confirmed
+divergence is repaired rather than only reported — the collection is re-served
+from its creation, or pulled as a snapshot — so the shape to expect is the
+gauge going above 0, repair rounds rising, and the gauge returning to 0. A
+gauge that stays above 0 while repair rounds keep rising is a divergence the
+repair cannot close, and the warning at the time names the collection and the
+peer.
+
+**The reading to be careful of is no reading at all.** The check compares this
+member against a *peer*, so a hole no peer disagrees about is invisible to it:
+if the same run of documents is missing on two of three members, all three
+counts agree, the gauge stays at 0, no repair is planned, and no counter here
+moves — which looks exactly like a converged cluster. Neither the gauge nor
+the repair is a proof of convergence across the cluster; they are a proof
+about pairs. When you have independent reason to suspect a loss — a client's
+own count, a bulk load whose totals do not match what it wrote — compare the
+members' document counts directly rather than reading this page, and repair
+with a restore or by removing and re-seeding the odd member out
+([ADR-148](decisions.md)).
 
 **What runs, and when.** Every anti-entropy round whose pull reaches the
 peer's true tail also asks that peer what it holds, on the same connection —
@@ -650,7 +682,9 @@ The four readings:
   is `kimmy_sync_divergence_count_probes_total`'s question, below.
 - **`ran` flat, `skipped` rising.** A node blinded by its own backlog, or a
   node whose rounds are failing — since [ADR-145](decisions.md) a failed
-  round is a skip too. `kimmy_sync_failures_total` tells them apart: rising
+  round is a skip too, and since [ADR-148](decisions.md) so is a round that
+  left entries for the next window, which by definition did not reach the
+  peer's tail. `kimmy_sync_failures_total` tells them apart: rising
   there is the wedge, flat there is the backlog. For the backlog, pair it
   with `kimmy_replication_lag_seconds` to see how deep, and expect both to
   resolve together as it drains. For the wedge, `sync round failed` names

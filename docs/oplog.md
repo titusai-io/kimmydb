@@ -363,8 +363,9 @@ read, so a window truncated at the limit really does carry `limit` entries
 the last stamp its scan examined, an entry it withheld included — and
 `exhausted`, whether it stopped there because the oplog ran out. The receiver
 raises its witnessed vector to the peer's whole advertised vector when the
-window was exhausted, and otherwise to `min(their_max, scanned_to)` per origin:
-never past what the peer holds, and never past what it read. It does **not**
+window was exhausted, and otherwise to the lower of the peer's own coverage and
+the stamp the window reached, per origin: never past what the peer holds, and
+never past what it read. It does **not**
 work this out from how many entries arrived. That inference was true only while
 nothing could shorten a batch for another reason, and when it stopped being
 true the receiver witnessed every entry behind a truncated window without ever
@@ -380,6 +381,45 @@ cannot witness away what it dropped, which is why `BatchTooLarge` is a retry
 rather than a short answer. The clamp is arithmetic that changes nothing for a
 correct sender. `exhausted` itself is not checkable — a node cannot know how
 much oplog its peer has — and is taken on trust.
+
+**A window is trusted only up to the vector that introduced it.** The threshold
+is one stamp, so a window need not begin where the receiver's history of any
+*particular* origin ends — and the sender answers `AskVersions` and
+`AskEntries` in two read transactions, replicating between them. An entry the
+sender appended in that gap sits in the window above what it advertised for
+that entry's origin; observing it would raise the receiver's position for that
+origin over everything of it the window never carried. Such an entry is left
+where it is: not applied, not witnessed, taken by the next window, and counted
+on `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`. The window's
+end is a full `Stamp` for the same reason — the oplog sorts by `(hlc, node)`,
+so an origin sorting after the end's node is raised only to the end's
+predecessor, its entry at that same `Hlc` never having been examined
+([ADR-148](decisions.md)).
+
+**A collection the receiver has no record of stops the batch.** A replicated
+entry naming a collection this node neither holds nor has a tombstone for is
+not skipped: nothing after it is applied, nothing past it is witnessed, and the
+same window is re-served every round while the node pulls a snapshot from the
+peer to bring the collection. ADR-123 skips a schema change this node can never
+apply; this one succeeds the moment the collection arrives, and witnessing it
+away is the same hole in a different dress.
+
+**A tombstone makes the same entry history, whichever way the stamps fall.** A
+collection dropped here is not one that may still arrive, so an entry addressed
+to it — including a peer's ordinary write made before it heard the drop — is
+superseded, witnessed and carried past rather than stopping anything. That is
+ADR-123's case: re-delivering it unchanged can never succeed
+([ADR-148](decisions.md)).
+
+**A stamp is minted only under the writer, so `oplog_versions` never names a
+stamp the committed oplog does not hold for the local origin.** Every local
+write takes redb's single writer first and mints second. A stamp minted before
+that wait sorts below every entry that commits while the wait lasts, and under
+a long writer queue a member's own oplog then goes non-monotonic in commit
+order against stamp order: the vector already names the stamp, the entry is not
+there to serve, and a peer that reads the vector and the window in that
+interval is served neither the entry nor a reason to come back for it
+([ADR-148](decisions.md)).
 
 ### Past the horizon
 

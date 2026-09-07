@@ -377,9 +377,13 @@ impl Engine {
 
         let key = doc_key(id)?;
         let body = bson::serialize_to_vec(&doc)?;
-        let stamp = self.next_stamp();
 
         let txn = self.begin_write()?;
+        // Under the writer, as an insert's is (ADR-148): a stamp minted
+        // while another transaction holds the writer sorts below what that
+        // transaction commits first, and a peer reading this node in that
+        // interval witnesses past it unserved.
+        let stamp = self.next_stamp();
         let (existed, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The previous image is needed to remove the index entries it
@@ -524,9 +528,10 @@ impl Engine {
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<Stamp>> {
         let key = doc_key(id)?;
-        let stamp = self.next_stamp();
 
         let txn = self.begin_write()?;
+        // Under the writer, as an insert's is (ADR-148).
+        let stamp = self.next_stamp();
         let previous = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
@@ -997,15 +1002,15 @@ impl Engine {
         let detail =
             kimmy_core::UniqueViolationDetail::new(violation.index.clone(), merged.clone(), ids);
 
+        let txn = self.begin_write()?;
         let entry = OplogEntry {
+            // Under the writer, as every stamp is (ADR-148).
             stamp: self.next_stamp(),
             kind: OpKind::UniqueViolation,
             collection: coll.id,
             doc_id: None,
             body: Some(bson::serialize_to_vec(&detail)?),
         };
-
-        let txn = self.begin_write()?;
         append_oplog(&txn, &entry)?;
         txn.commit()?;
         Ok(entry)

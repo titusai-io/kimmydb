@@ -2560,3 +2560,156 @@ async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
     assert_eq!(pushed.outcome.ddl_declined, 1, "declined and reported: {pushed:?}");
     assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some());
 }
+
+/// Detection to repair (ADR-148), through the real loop. B's witnessed
+/// position on A already sits above twenty documents it never applied —
+/// the state an upgrade finds a member in after a hole of the kind this
+/// ADR closes, and the state `apply_peer_batch` on an exhausted empty
+/// window puts it in here. Anti-entropy alone never asks for them again:
+/// the position says B has them, and the lag gauge reads 0. The count half
+/// of the divergence check confirms the collection against A, the loop
+/// plans a replay from the collection's creation on the next round with A,
+/// the replay re-serves A's oplog from there, the documents land, and the
+/// gauge returns to 0 on the probe after that.
+#[tokio::test]
+async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let mut collections = Vec::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let c = a.engine.create_collection("shop", name).unwrap();
+        a.engine.insert(&c, doc! { "_id": "0" }).unwrap();
+        collections.push(c);
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    let gamma = &collections[2];
+    for i in 1..=20 {
+        a.engine.insert(gamma, doc! { "_id": i.to_string() }).unwrap();
+    }
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    let gamma_on_b = b.engine.get_collection("shop", "gamma").unwrap();
+    assert_eq!(b.engine.count(&gamma_on_b).unwrap(), 1, "the hole: witnessed, never applied");
+    assert!(
+        b.engine.witnessed_vector().unwrap().covers(&theirs),
+        "and nothing about the position says so"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut confirmed_once = false;
+    let mut repair_rounds = 0usize;
+    let mut cleared = false;
+    while !cleared {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the divergence was not confirmed and repaired in time: confirmed={confirmed_once} \
+                     repair_rounds={repair_rounds} gamma on b={}",
+                    b.engine.count(&gamma_on_b).unwrap()
+                )
+            })
+            .expect("the loop must keep reporting");
+        confirmed_once |= report.divergent_collections > 0;
+        repair_rounds += report.repair_rounds;
+        cleared = confirmed_once && repair_rounds > 0 && report.divergent_collections == 0;
+    }
+    looping.abort();
+
+    assert_eq!(
+        b.engine.count(&gamma_on_b).unwrap(),
+        21,
+        "the replay re-served the documents the position had claimed"
+    );
+    assert!(repair_rounds >= 1, "at least one round was spent repairing: {repair_rounds}");
+}
+
+/// A member missing a collection its peer holds — the creation witnessed
+/// away, the documents for it arriving every round — stops its batches at
+/// the first such document, plans a snapshot from that peer, and holds the
+/// collection with every document after the next round (ADR-148). Nothing
+/// fails, and nothing past the stop is witnessed until then.
+#[tokio::test]
+async fn a_member_lacking_a_collection_stops_plans_a_snapshot_and_catches_up() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let base = a.engine.create_collection("shop", "base").unwrap();
+    a.engine.insert(&base, doc! { "_id": "0" }).unwrap();
+    sync(&a, &b).await;
+
+    // Created on A, and B's position on A moved *past* the creation without
+    // it: the shape a lost creation leaves behind. Past, not at — a window
+    // is inclusive at the stamp it is asked from, so a position level with
+    // the creation would simply be served it again.
+    let late = a.engine.create_collection("shop", "late").unwrap();
+    a.engine.insert(&base, doc! { "_id": "past-the-create" }).unwrap();
+    let past = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&past, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "late").is_err(), "B never applied the creation");
+
+    // The documents written into it afterwards are what every window from
+    // A now carries, and B cannot place any of them.
+    for i in 0..5 {
+        a.engine.insert(&late, doc! { "_id": i }).unwrap();
+    }
+    a.engine.insert(&base, doc! { "_id": "after" }).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut stopped = 0usize;
+    let mut repair_rounds = 0usize;
+    let mut failed = 0usize;
+    loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("never caught up: stopped={stopped} repair_rounds={repair_rounds}")
+            })
+            .expect("the loop must keep reporting");
+        stopped += report.entries_skipped_unknown_collection;
+        repair_rounds += report.repair_rounds;
+        failed += report.failed;
+        if let Ok(on_b) = b.engine.get_collection("shop", "late")
+            && b.engine.count(&on_b).unwrap() == 5
+            && b.engine.witnessed_vector().unwrap().covers(&a.engine.version_vector().unwrap())
+        {
+            break;
+        }
+    }
+    looping.abort();
+
+    assert!(stopped >= 1, "the batch stopped at the collection B lacks: {stopped}");
+    assert!(repair_rounds >= 1, "and a snapshot was pulled for it: {repair_rounds}");
+    assert_eq!(failed, 0, "without a round failing");
+    let base_on_b = b.engine.get_collection("shop", "base").unwrap();
+    assert!(
+        b.engine.get(&base_on_b, &DocId::String("after".into())).unwrap().is_some(),
+        "the document behind the stop landed too"
+    );
+}

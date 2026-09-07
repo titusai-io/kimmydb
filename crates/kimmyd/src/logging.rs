@@ -462,6 +462,30 @@ impl TelemetryGuard {
             "Seconds since the last peer contact in which the cross-member divergence check ran, as of the last sync tick; 0 before the first.",
             sync_divergence_check_age_secs
         );
+        // What a batch left rather than took, and the repairs that follow
+        // (ADR-148): the series that move for a hole the lag gauge reads 0
+        // through.
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entries_skipped.unknown_collection",
+            "{batch}",
+            "Sync batches stopped at an entry for a collection this node does not hold; re-served every round until a snapshot brings the collection.",
+            sync_entries_skipped_unknown_collection
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entries_skipped.beyond_advertised",
+            "{entry}",
+            "Replicated entries left for a later window because they sat above the vector the peer advertised before serving it.",
+            sync_entries_skipped_beyond_advertised
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.repair_rounds",
+            "{round}",
+            "Sync rounds spent repairing against a peer: re-serving its oplog from below this node's position, or pulling its snapshot.",
+            sync_repair_rounds
+        );
 
         // The embedding worker. Every one of these reads 0 on a node where the
         // worker is disabled, which is the distinction an operator is looking

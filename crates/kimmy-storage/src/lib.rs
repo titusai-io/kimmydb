@@ -43,7 +43,10 @@ pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, M
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
 };
-pub use sync::{SyncOutcome, lacks_collected, lag_behind_ms, lag_beyond_horizon_ms};
+pub use sync::{
+    SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to, lacks_collected, lag_behind_ms,
+    lag_beyond_horizon_ms,
+};
 pub use watch::{
     ChangeEvent, ChangeStream, InvalidateReason, OplogWindow, WatchOptions, WatchScope,
 };

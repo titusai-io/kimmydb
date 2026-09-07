@@ -200,6 +200,17 @@ pub struct MetricsSnapshot {
     /// last sync tick; 0 before the first (ADR-145). How old the gauge's
     /// reading is, on a member whose rounds have stopped completing.
     pub sync_divergence_check_age_secs: u64,
+    /// Batches a sync round stopped at an entry for a collection this node
+    /// does not hold, and entries a round left for a later window because
+    /// they sat above the vector the peer had advertised (ADR-148). Two
+    /// reasons on one series: the first is a hole being held open until a
+    /// snapshot closes it, the second ordinary and rare.
+    pub sync_entries_skipped_unknown_collection: u64,
+    pub sync_entries_skipped_beyond_advertised: u64,
+    /// Rounds spent repairing against a peer (ADR-148): re-serving its
+    /// oplog from below this node's position or pulling its snapshot, on
+    /// the strength of a confirmed divergence or a stopped batch.
+    pub sync_repair_rounds: u64,
     /// Worst runtime scheduling delay since the last scrape, microseconds.
     pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
@@ -259,6 +270,9 @@ pub struct Metrics {
     /// member whose rounds all fail, where the two counters above stop and
     /// the gauge holds its last value.
     sync_divergence_check_age_secs: AtomicU64,
+    sync_entries_skipped_unknown_collection: AtomicU64,
+    sync_entries_skipped_beyond_advertised: AtomicU64,
+    sync_repair_rounds: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
@@ -325,6 +339,9 @@ impl Default for Metrics {
             sync_divergence_count_compared: AtomicU64::new(0),
             sync_divergence_count_deferred: AtomicU64::new(0),
             sync_divergence_check_age_secs: AtomicU64::new(0),
+            sync_entries_skipped_unknown_collection: AtomicU64::new(0),
+            sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
+            sync_repair_rounds: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             runtime_stall_otlp_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
@@ -524,6 +541,22 @@ impl Metrics {
             .fetch_add(round.divergence_count_deferred as u64, Ordering::Relaxed);
         self.sync_divergence_check_age_secs
             .store(round.divergence_check_age_secs.unwrap_or(0), Ordering::Relaxed);
+        self.record_entries_skipped(
+            round.entries_skipped_unknown_collection as u64,
+            round.entries_skipped_beyond_advertised as u64,
+        );
+        self.sync_repair_rounds.fetch_add(round.repair_rounds as u64, Ordering::Relaxed);
+    }
+
+    /// Count what a batch left rather than took (ADR-148), on the series a
+    /// pulled and a pushed batch share, for the reason
+    /// [`Self::record_ddl_refused`] gives: `unknown_collection` batches
+    /// stopped at a collection this node lacks, `beyond_advertised` entries
+    /// left for a later window.
+    pub fn record_entries_skipped(&self, unknown_collection: u64, beyond_advertised: u64) {
+        self.sync_entries_skipped_unknown_collection
+            .fetch_add(unknown_collection, Ordering::Relaxed);
+        self.sync_entries_skipped_beyond_advertised.fetch_add(beyond_advertised, Ordering::Relaxed);
     }
 
     /// Count schema changes a peer pushed to this node that it could not
@@ -696,6 +729,11 @@ impl Metrics {
             sync_divergence_count_compared: self.get(&self.sync_divergence_count_compared),
             sync_divergence_count_deferred: self.get(&self.sync_divergence_count_deferred),
             sync_divergence_check_age_secs: self.get(&self.sync_divergence_check_age_secs),
+            sync_entries_skipped_unknown_collection: self
+                .get(&self.sync_entries_skipped_unknown_collection),
+            sync_entries_skipped_beyond_advertised: self
+                .get(&self.sync_entries_skipped_beyond_advertised),
+            sync_repair_rounds: self.get(&self.sync_repair_rounds),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -882,6 +920,13 @@ impl Metrics {
              # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, as of the last sync tick. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined - look at kimmy_sync_failures_total and kimmy_sync_peers_backing_off.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
+             # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.\n\
+             # TYPE kimmy_sync_entries_skipped_total counter\n\
+             kimmy_sync_entries_skipped_total{{reason=\"unknown_collection\"}} {sync_skipped_unknown}\n\
+             kimmy_sync_entries_skipped_total{{reason=\"beyond_advertised\"}} {sync_skipped_beyond}\n\
+             # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.\n\
+             # TYPE kimmy_sync_repair_rounds_total counter\n\
+             kimmy_sync_repair_rounds_total {sync_repair_rounds}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
@@ -961,6 +1006,9 @@ impl Metrics {
             sync_div_compared = self.get(&self.sync_divergence_count_compared),
             sync_div_deferred = self.get(&self.sync_divergence_count_deferred),
             sync_div_age = self.get(&self.sync_divergence_check_age_secs),
+            sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
+            sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
+            sync_repair_rounds = self.get(&self.sync_repair_rounds),
             frozen = kimmy_cluster::FROZEN_CONTACTS,
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
@@ -1063,6 +1111,9 @@ mod tests {
             divergence_count_compared: 61,
             divergence_count_deferred: 64,
             divergence_check_age_secs: Some(70),
+            entries_skipped_unknown_collection: 72,
+            entries_skipped_beyond_advertised: 74,
+            repair_rounds: 76,
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 3,
@@ -1075,6 +1126,9 @@ mod tests {
             divergence_count_compared: 2,
             divergence_count_deferred: 3,
             divergence_check_age_secs: Some(71),
+            entries_skipped_unknown_collection: 1,
+            entries_skipped_beyond_advertised: 1,
+            repair_rounds: 1,
         });
         for _ in 0..20 {
             m.record_tls_reload(true);
@@ -1246,6 +1300,13 @@ kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, as of the last sync tick. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined - look at kimmy_sync_failures_total and kimmy_sync_peers_backing_off.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
+# HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.
+# TYPE kimmy_sync_entries_skipped_total counter
+kimmy_sync_entries_skipped_total{reason=\"unknown_collection\"} 73
+kimmy_sync_entries_skipped_total{reason=\"beyond_advertised\"} 75
+# HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.
+# TYPE kimmy_sync_repair_rounds_total counter
+kimmy_sync_repair_rounds_total 77
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
 # TYPE kimmy_tls_reloads_total counter
 kimmy_tls_reloads_total{outcome=\"ok\"} 20
@@ -1382,6 +1443,15 @@ kimmy_request_duration_seconds_count 3
             "kimmy_sync_divergence_check_age_seconds {}\n",
             s.sync_divergence_check_age_secs
         ));
+        expect(&format!(
+            "kimmy_sync_entries_skipped_total{{reason=\"unknown_collection\"}} {}\n",
+            s.sync_entries_skipped_unknown_collection
+        ));
+        expect(&format!(
+            "kimmy_sync_entries_skipped_total{{reason=\"beyond_advertised\"}} {}\n",
+            s.sync_entries_skipped_beyond_advertised
+        ));
+        expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
             "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
@@ -1454,7 +1524,7 @@ kimmy_request_duration_seconds_count 3
         }
         // 53 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 73, "expected one sample per series: {out}");
+        assert_eq!(samples, 76, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -1593,6 +1663,9 @@ kimmy_request_duration_seconds_count 3
             divergence_count_compared: 2,
             divergence_count_deferred: 1,
             divergence_check_age_secs: Some(30),
+            entries_skipped_unknown_collection: 0,
+            entries_skipped_beyond_advertised: 0,
+            repair_rounds: 0,
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 2,
@@ -1605,6 +1678,9 @@ kimmy_request_duration_seconds_count 3
             divergence_count_compared: 0,
             divergence_count_deferred: 4,
             divergence_check_age_secs: Some(8),
+            entries_skipped_unknown_collection: 0,
+            entries_skipped_beyond_advertised: 0,
+            repair_rounds: 0,
         });
         m.record_tls_reload(true);
         m.record_tls_reload(false);
@@ -1678,6 +1754,9 @@ kimmy_request_duration_seconds_count 3
             divergence_count_compared: 0,
             divergence_count_deferred: 0,
             divergence_check_age_secs: None,
+            entries_skipped_unknown_collection: 0,
+            entries_skipped_beyond_advertised: 0,
+            repair_rounds: 0,
         });
         let out = m.render();
         assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
