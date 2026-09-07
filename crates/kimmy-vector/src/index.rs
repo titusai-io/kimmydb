@@ -140,6 +140,11 @@ struct SnapshotMeta {
     /// `created` rather than `incarnation_floor`, which is `None` on a first
     /// creation and so cannot tell two incarnations apart when it matters
     /// most.
+    ///
+    /// Defaulted on read so that a format-1 file, which has no such field,
+    /// parses far enough for the format check below to name what is wrong,
+    /// rather than failing on a missing field first. Either way it is refused.
+    #[serde(default)]
     created: Hlc,
     keys: Vec<String>,
 }

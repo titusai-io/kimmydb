@@ -493,11 +493,11 @@ pub async fn put_document_vectors(
     // No cache invalidation: `put_vectors` bumps the collection's vector
     // generation, which is what the search path reads to notice a write, and
     // it is all the embedding worker does for the identical write. Forgetting
-    // the entry outright would also delete the snapshot on every stored
-    // document — and, worse, a re-embed that replaces a document's chunks with
-    // the same number of chunks would then load that snapshot back as *fresh*
-    // at the current generation, defeating the staleness window for exactly
-    // the write that just happened.
+    // the entry outright also deleted the snapshot on every stored document,
+    // which cost a full rebuild on the next search rather than the bounded
+    // staleness the index is designed around. The snapshot that stays behind
+    // is not trusted past this write: the cache remembers the generation it
+    // wrote it at and will not call it fresh again (`IndexCache::try_snapshot`).
     state.engine.put_vectors(&shadow, &doc_id, &records)?;
 
     Ok(Json(json!({ "stored": stored, "_id": id })))
@@ -536,8 +536,8 @@ pub async fn delete_document_vectors(
         return Err(ApiError::not_found("vector collection is missing"));
     };
     // No cache invalidation, for the reason `put_document_vectors` gives:
-    // `delete_vectors` bumps the generation, and that is the whole of what a
-    // write owes the index.
+    // `delete_vectors` bumps the generation when it removed anything, and the
+    // snapshot left behind is not trusted past that.
     let removed = state.engine.delete_vectors(&shadow, &doc_id)?;
     Ok(Json(json!({ "deleted": removed })))
 }

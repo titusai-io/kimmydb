@@ -10007,15 +10007,19 @@ async fn dropping_a_database_forgets_every_vector_index_in_it() {
 
 /// Give a background consumer up to three seconds to reach some state.
 ///
-/// Returns either way; the assertion after it is what fails. A consumer is a
-/// task, so what it has done is only ever observable a poll later.
-async fn wait_until(mut reached: impl FnMut() -> bool) {
+/// Returns whether it did. A consumer is a task, so what it has done is only
+/// ever observable a poll later — and a caller using this as a *fence* (proof
+/// that the consumer has passed some entry) must assert the result, or a
+/// consumer that never got there passes the fence silently.
+#[must_use]
+async fn wait_until(mut reached: impl FnMut() -> bool) -> bool {
     for _ in 0..300 {
         if reached() {
-            return;
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    false
 }
 
 /// One direction of an anti-entropy round, as two members would run it.
@@ -10055,87 +10059,85 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
     // The consumer is a task, so the drop takes effect a poll later rather
     // than within the apply — which is the whole point of it not being in the
     // apply.
-    wait_until(|| applier.state.vectors.is_empty()).await;
     assert!(
-        applier.state.vectors.is_empty(),
+        wait_until(|| applier.state.vectors.is_empty()).await,
         "the applying member kept a graph for a collection it no longer holds"
     );
     assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
     consumer.abort();
 }
 
-/// The `DropCollection` entry a member minted for `db.coll`, lifted from its
-/// oplog so a test can deliver it a second time.
-///
-/// That is not a contrivance: overlapping windows are re-served as a matter of
-/// course, so a drop arriving again after the collection has been recreated is
-/// ordinary traffic.
-fn drop_entry_for(server: &Server, db: &str, coll: &str) -> kimmy_core::OplogEntry {
-    let id = kimmy_core::CollectionId::derive(db, coll);
-    let window = server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 4096).unwrap();
-    window
-        .entries
-        .into_iter()
-        .find(|e| e.kind == kimmy_core::OpKind::DropCollection && e.collection == id)
-        .expect("the drop this test just issued")
-}
-
 #[tokio::test]
-async fn a_stale_drop_re_delivered_after_a_recreation_leaves_the_live_index_alone() {
+async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alone() {
     // A collection recreated under the same name derives the same id, so it
     // reuses the same cache key and the same snapshot path. A drop from the
     // previous life therefore names, as far as an id goes, the collection
-    // standing here now — and overlapping windows re-serve such a drop as a
-    // matter of course.
+    // standing here now.
     //
     // Writing this test is what found the hazard: the consumer originally
     // acted on the entry, and a drop can reach it long after the fact, because
     // the feed is a bounded ring and five hundred chunks of one document is
-    // five hundred entries through it. It deleted a live collection's graph
-    // and snapshot. The consumer now checks whether the collection is actually
-    // gone before forgetting anything, which is what this pins — and it holds
-    // whether the stale drop is announced or not, so nothing here depends on
-    // how the sync path chooses to treat one.
+    // five hundred entries through it. By the time it read the drop the name
+    // had been created again and its graph rebuilt, and it deleted that live
+    // graph and snapshot. The consumer now checks whether the collection is
+    // actually gone before forgetting anything, which is what this pins.
+    //
+    // The lateness is arranged rather than raced: the consumer's receiver is
+    // opened before the drop — so the drop is queued for it, exactly as it
+    // would be behind a burst — but the consumer is not run until after the
+    // recreation and the rebuild. A consumer that trusted the entry would
+    // remove the live graph the moment it started; the guard collection's
+    // drop, published after, is the fence that proves it got that far.
     let issuer = Server::start().await;
     let applier = Server::start().await;
     let token = issuer.root().await;
-    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
 
     // Incarnation one, replicated, with its graph built on the applier.
     configure_vectors(&issuer, &token, "shop", "docs").await;
     replicate(&issuer, &applier);
-    build_graph(&applier, "shop", "docs");
+    let first = build_graph(&applier, "shop", "docs");
 
-    // Dropped, and the entry kept. Waiting for the applier to forget is also
-    // the fence that puts this drop behind us, so the graph rebuilt below
-    // cannot be the one it removed.
+    // Subscribed now, run later: `invalidator` subscribes when it is called,
+    // not when it is first polled, so everything published from here on
+    // queues for it.
+    let late_consumer = kimmy_api::vectors::invalidator(&applier.state);
+
+    // Dropped on the issuer and applied on the applier, which publishes the
+    // drop into the parked receiver. Nothing is running to act on it, so the
+    // applier still holds incarnation one's graph — the state a lagging
+    // member is in.
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
-    let stale = drop_entry_for(&issuer, "shop", "docs");
     replicate(&issuer, &applier);
-    wait_until(|| applier.state.vectors.is_empty()).await;
+    assert_eq!(applier.state.vectors.len(), 1, "nothing has consumed the drop yet");
 
-    // Incarnation two, under the same name — same derived id, same snapshot
-    // path — beside a second collection whose own drop is the fence at the end.
+    // Incarnation two under the same name — same derived id, same snapshot
+    // path — with its graph rebuilt on the applier, plus a guard collection
+    // whose own drop is the fence at the end.
     configure_vectors(&issuer, &token, "shop", "docs").await;
     configure_vectors(&issuer, &token, "shop", "guard").await;
     replicate(&issuer, &applier);
     let live = build_graph(&applier, "shop", "docs");
+    assert_eq!(live, first, "the recreated name must derive the same id for this to test anything");
     let guard = build_graph(&applier, "shop", "guard");
     assert_eq!(applier.state.vectors.len(), 2);
+    assert!(snapshot_of(&applier, live).is_dir());
 
-    // The hazard: the old incarnation's drop, arriving again at a member that
-    // now holds the new one.
-    applier.state.engine.apply_batch(&[stale]).unwrap();
+    // Now the consumer runs, and the first thing it reads is a drop for the
+    // id that the live collection holds.
+    let consumer = tokio::spawn(late_consumer);
 
-    // The guard's drop is published after anything that apply could have
-    // published, and the feed is ordered, so the guard's snapshot going means
-    // the consumer has passed the stale drop. That is what makes the
-    // assertion below a statement rather than a sleep.
+    // The guard's drop is published after the stale one, and the feed is
+    // ordered, so the guard's snapshot going means the consumer has read and
+    // passed the stale drop. Asserted, so a consumer that never got there
+    // cannot pass the fence silently.
     let res = issuer.delete("/v1/db/shop/coll/guard", Some(&token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
     replicate(&issuer, &applier);
-    wait_until(|| !snapshot_of(&applier, guard).exists()).await;
+    assert!(
+        wait_until(|| !snapshot_of(&applier, guard).exists()).await,
+        "the consumer never reached the guard's drop, so nothing below is evidence"
+    );
 
     assert!(
         snapshot_of(&applier, live).is_dir(),
@@ -10155,10 +10157,11 @@ async fn storing_vectors_for_a_document_leaves_the_collection_s_snapshot_alone()
     // vector generation, which is the whole of what the search path needs to
     // notice it, and is exactly what the embedding worker does for the same
     // write. Discarding the cached graph on top of that also deleted the
-    // snapshot — once per stored document — and, worse, a re-embed that
-    // replaced a document's chunks with the same number of chunks would then
-    // load that snapshot back as *fresh* at the current generation, defeating
-    // the staleness window for the write that had just happened.
+    // snapshot — once per stored document — so the next search paid a full
+    // rebuild instead of the bounded staleness the index is designed around.
+    // What keeps the surviving snapshot honest past this write is the cache
+    // itself (`a_snapshot_this_process_wrote_is_not_fresh_past_a_later_write`
+    // in kimmy-vector), not the route.
     let server = Server::start().await;
     let token = server.root().await;
     configure_vectors(&server, &token, "shop", "docs").await;

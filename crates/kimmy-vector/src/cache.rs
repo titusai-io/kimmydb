@@ -203,6 +203,20 @@ pub struct IndexCache {
     /// server can set it after the state that owns this cache is built,
     /// without a lock on the read side of every search.
     max_bytes: AtomicU64,
+    /// The generation each collection's snapshot was written at, for the
+    /// snapshots **this process** wrote.
+    ///
+    /// A snapshot is written by a build and read back by a later miss, and
+    /// between the two the collection can be written to. The generation
+    /// counter is in-memory, so it cannot vouch for a snapshot a *previous*
+    /// process left — that case keeps the count check in
+    /// [`Self::try_snapshot`] — but within one process it can, and it is the
+    /// only thing that can: an eviction under the budget keeps the snapshot,
+    /// a vector write that replaces a document's chunks with the same number
+    /// of chunks leaves the count equal, and the count check would then
+    /// adopt a graph from before that write as fresh at the generation after
+    /// it. Removed with the snapshot in [`Self::invalidate`].
+    saved_at: Mutex<HashMap<CollectionId, u64>>,
     /// Called with the collection about to be built, before the build. Lets
     /// a test hold a build open to observe what happens around it.
     #[cfg(test)]
@@ -220,6 +234,7 @@ impl Default for IndexCache {
             min_vectors: MIN_VECTORS_FOR_INDEX,
             snapshot_dir: None,
             max_bytes: AtomicU64::new(DEFAULT_MAX_BYTES),
+            saved_at: Mutex::new(HashMap::new()),
             #[cfg(test)]
             build_hook: Mutex::new(None),
         }
@@ -373,7 +388,7 @@ impl IndexCache {
 
         // Falling back on error keeps the query correct; the alternative is
         // failing a search because an optimisation could not be built.
-        match self.decide(engine, shadow, metric, dim) {
+        match self.decide(engine, shadow, metric, dim, generation) {
             Ok(decision) => self
                 .install(shadow, Entry::new(decision, generation, shadow.created, Instant::now())),
             Err(e) => {
@@ -477,16 +492,27 @@ impl IndexCache {
 
     /// Adopt a persisted graph, deciding how much to trust it.
     ///
-    /// The generation counter cannot vouch for a snapshot — it is in-memory
-    /// and resets with the process — so the check is the vector *count* the
-    /// snapshot covered against the count stored now. Equal counts adopt the
-    /// snapshot as fresh. Unequal counts still adopt it — serving a stale
-    /// graph is bounded recall loss, never wrong data, and it answers this
-    /// query instantly — but marked already-stale, so the very next access
-    /// rebuilds. The corner this accepts, on purpose: a delete-and-add while
-    /// the node was down leaves the count equal, and that snapshot serves as
-    /// fresh until the next vector write bumps the generation. Same class of
-    /// bound as the 30-second staleness window, with a longer clock.
+    /// A snapshot this process wrote is vouched for by the generation it was
+    /// written at (`saved_at`): equal to the generation now, nothing has been
+    /// written since and the graph is fresh; otherwise it is behind, however
+    /// the count compares. This is the case an eviction under the budget
+    /// produces — the entry goes, the snapshot stays, a document's chunks are
+    /// replaced with the same number of chunks, and the next miss reloads the
+    /// snapshot — and a count check alone would adopt that graph as fresh at
+    /// the generation *after* the write it predates.
+    ///
+    /// A snapshot a previous process wrote has no generation to compare — the
+    /// counter is in-memory and resets with the process — so for that one the
+    /// check is the vector *count* the snapshot covered against the count
+    /// stored now. Equal counts adopt the snapshot as fresh. The corner this
+    /// accepts, on purpose: a delete-and-add while the node was down leaves
+    /// the count equal, and that snapshot serves as fresh until the next
+    /// vector write bumps the generation. Same class of bound as the
+    /// 30-second staleness window, with a longer clock.
+    ///
+    /// A snapshot judged behind is still adopted — serving a stale graph is
+    /// bounded recall loss, never wrong data, and it answers this query
+    /// instantly — but marked already-stale, so the very next access rebuilds.
     ///
     /// Anything unreadable is deleted and `None` returned: a corrupt snapshot
     /// is discarded, not trusted, and the ordinary build path takes over. That
@@ -516,14 +542,34 @@ impl IndexCache {
             }
         };
 
-        let current = count_vectors(engine, shadow).ok()?;
-        let (generation, decided) = if current == index.len() {
+        let fresh = match self.saved_at.lock().get(&shadow.id).copied() {
+            Some(saved_at) => {
+                let fresh = saved_at == generation;
+                if !fresh {
+                    debug!(
+                        saved_at,
+                        generation,
+                        "snapshot predates a write this process made; serving it once and \
+                         rebuilding"
+                    );
+                }
+                fresh
+            }
+            None => {
+                let current = count_vectors(engine, shadow).ok()?;
+                let fresh = current == index.len();
+                if !fresh {
+                    debug!(
+                        snapshot = index.len(),
+                        current, "snapshot is behind the store; serving it once and rebuilding"
+                    );
+                }
+                fresh
+            }
+        };
+        let (generation, decided) = if fresh {
             (generation, Instant::now())
         } else {
-            debug!(
-                snapshot = index.len(),
-                current, "snapshot is behind the store; serving it once and rebuilding"
-            );
             // A generation no live counter returns, plus an already-expired
             // clock: the next access falls through to a rebuild.
             (u64::MAX, Instant::now() - MAX_STALENESS)
@@ -531,12 +577,16 @@ impl IndexCache {
         Some(Entry::new(Decision::Index(Arc::new(index)), generation, shadow.created, decided))
     }
 
+    /// Build the graph or the "too small" verdict, persisting a graph and
+    /// remembering `generation` — the generation the build was decided at —
+    /// as the one its snapshot is good for.
     fn decide(
         &self,
         engine: &Engine,
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
+        generation: u64,
     ) -> Result<Decision> {
         if count_vectors(engine, shadow)? < self.min_vectors {
             return Ok(Decision::TooSmall);
@@ -552,10 +602,19 @@ impl IndexCache {
         // Every successful build is persisted, so whatever graph a restart
         // finds is the newest one that existed. Failure to save costs the
         // next process a rebuild, not this query an answer.
-        if let Some(path) = self.snapshot_path(shadow.id)
-            && let Err(e) = index.save(&path)
-        {
-            tracing::warn!(error = %e, ?path, "could not save the HNSW snapshot");
+        if let Some(path) = self.snapshot_path(shadow.id) {
+            match index.save(&path) {
+                // `generation` was read before the build, so a write that
+                // landed during it makes this snapshot look behind — the
+                // conservative side, and the same one the entry itself is on.
+                Ok(()) => {
+                    self.saved_at.lock().insert(shadow.id, generation);
+                }
+                Err(e) => {
+                    self.saved_at.lock().remove(&shadow.id);
+                    tracing::warn!(error = %e, ?path, "could not save the HNSW snapshot");
+                }
+            }
         }
         Ok(Decision::Index(Arc::new(index)))
     }
@@ -574,6 +633,7 @@ impl IndexCache {
             entries.warned.remove(&collection);
         }
         self.builds.lock().remove(&collection);
+        self.saved_at.lock().remove(&collection);
         if let Some(path) = self.snapshot_path(collection) {
             // Removing a directory is filesystem work, and this is reached from
             // a request handler and from a change consumer, both on runtime
@@ -1059,6 +1119,74 @@ mod tests {
             cache.access(&engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
+    }
+
+    #[test]
+    fn a_snapshot_this_process_wrote_is_not_fresh_past_a_later_write() {
+        // An eviction under the budget removes the entry and keeps the
+        // snapshot. If the collection is then written to in a way that leaves
+        // its vector count unchanged — one document's chunks replaced by the
+        // same number of chunks, which is what every re-embed does — the next
+        // miss reloads that snapshot, and a count check alone would install a
+        // graph from before the write as fresh at the generation after it.
+        let (engine, docs, dir) = setup(60);
+        let other = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &docs, Metric::Cosine, 4);
+        let snapshot = cache.snapshot_path(docs.id).unwrap();
+        assert!(snapshot.is_dir(), "the build should have been persisted");
+
+        // A budget too small for two graphs: installing the other evicts docs.
+        cache.set_max_bytes(1);
+        cache.access(&engine, &other, Metric::Cosine, 4);
+        assert!(!cache.contains(docs.id), "docs should have been evicted for other");
+        assert!(snapshot.is_dir(), "eviction keeps the snapshot");
+
+        // Control: nothing written since the snapshot, so reloading it is
+        // adopting it as fresh — and that install evicts `other` in turn.
+        cache.access(&engine, &docs, Metric::Cosine, 4);
+        let generation = engine.vector_generation(docs.id);
+        assert_eq!(
+            cache.entries.lock().map[&docs.id].generation,
+            generation,
+            "with no write since it was saved, the snapshot is fresh"
+        );
+        assert!(!cache.contains(other.id));
+
+        // The write: document 0's one chunk replaced by one chunk. The count
+        // is unchanged; the generation is not.
+        let source = DocId::Int64(0);
+        engine
+            .put_vectors(
+                &docs,
+                &source,
+                &[VectorRecord {
+                    source: source.clone(),
+                    chunk: 0,
+                    source_hlc: Hlc::new(2, 0),
+                    vector: vec![0.0, 0.0, 0.0, 1.0],
+                    text: "moved".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(count_vectors(&engine, &docs).unwrap(), 60, "the count must not give it away");
+        let written = engine.vector_generation(docs.id);
+        assert!(written > generation);
+
+        // Evicted again, then reloaded: the snapshot predates the write and
+        // must come back already stale, whatever its count says.
+        cache.access(&engine, &other, Metric::Cosine, 4);
+        assert!(!cache.contains(docs.id));
+        assert!(snapshot.is_dir());
+        cache.access(&engine, &docs, Metric::Cosine, 4);
+        assert_eq!(
+            cache.entries.lock().map[&docs.id].generation,
+            u64::MAX,
+            "a snapshot written before a later write was adopted as fresh"
+        );
+        // And the access after it rebuilds, landing at the live generation.
+        cache.access(&engine, &docs, Metric::Cosine, 4);
+        assert_eq!(cache.entries.lock().map[&docs.id].generation, written);
     }
 
     #[test]

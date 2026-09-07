@@ -79,10 +79,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   collection's vector generation, which is what the search path reads to notice
   it and is all the embedding worker does for the identical write, so the BYO
   path now behaves as the worker path and as [Vectors](docs/vectors.md)
-  describes. It also removes a sharper edge: re-embedding one document usually
-  replaces its chunks with the same number of chunks, and the discarded
-  snapshot would then be loaded back as fresh at the current generation,
-  defeating the staleness window for the very write that had just happened.
+  describes. Keeping the snapshot exposed an edge the worker path had always
+  had: a graph evicted under `vector.index_cache.max_bytes` leaves its snapshot
+  behind, re-embedding one document usually replaces its chunks with the same
+  number of chunks, and the next search would reload that snapshot and, seeing
+  the vector count unchanged, adopt a graph from *before* the write as fresh at
+  the generation *after* it. The cache now remembers the generation it wrote
+  each snapshot at and refuses to call one fresh once the collection has been
+  written to since, whichever path wrote it; a snapshot from a previous process
+  keeps the count check, as before.
 
   What an operator should expect: `kimmy_vector_index_cache_bytes` falls to the
   graphs of collections that still exist, within a replication round on every
