@@ -1,6 +1,6 @@
 //! Vector configuration and search routes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -296,20 +296,26 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                     // a whole collection went. A parent's drop takes its shadow
                     // in the same transaction and mints no entry for it — but
                     // ids are derived from names, so the shadow's is computable
-                    // from the name this entry does carry. Checking an id that
-                    // never held a graph costs a metadata read, so both go.
-                    forget_unless_live(&state, entry.collection);
-                    if let Some(body) = &entry.body
-                        && let Ok(target) =
-                            bson::deserialize_from_slice::<kimmy_core::CollectionRef>(body)
-                    {
-                        forget_unless_live(
+                    // from the name this entry does carry, and the shadow is
+                    // the only one of the two that can hold a graph. So one
+                    // id is reconciled, by one point read of the shadow's
+                    // name; the parent is never looked up. The fallback, for a
+                    // body this node cannot read, is the whole-catalogue walk
+                    // by the entry's own id — which then names the parent, and
+                    // forgets nothing, on a parent's drop; that is the case
+                    // `Lagged` below and the startup sweep still cover.
+                    match entry.body.as_deref().and_then(|b| {
+                        bson::deserialize_from_slice::<kimmy_core::CollectionRef>(b).ok()
+                    }) {
+                        Some(target) => forget_dropped(&state, &target.db, &target.name),
+                        None => forget_unless_live(
                             &state,
-                            CollectionId::derive(
-                                &target.db,
-                                &vector_meta::shadow_name(&target.name),
-                            ),
-                        );
+                            entry.collection,
+                            kimmy_storage::blocking(|| {
+                                state.engine.collection_by_id(entry.collection)
+                            })
+                            .map(|live| live.map(|meta| meta.created)),
+                        ),
                     }
                 }
                 Ok(entry) if entry.kind == OpKind::ConfigureVectors => {
@@ -352,10 +358,12 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                 // every snapshot on the node and charge a rebuild for
                 // collections that are perfectly alive.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    // A read transaction per database, on a task that is
-                    // otherwise only ever waiting: off the worker, like every
-                    // other storage step.
-                    match kimmy_storage::blocking(|| live_collections(&state.engine)) {
+                    // One read transaction over the catalogue, on a task that
+                    // is otherwise only ever waiting: off the worker, like
+                    // every other storage step. `live_collections`, not
+                    // `all_collection_ids`: the latter hides every paired
+                    // shadow (ADR-138), which is every id a graph is keyed by.
+                    match kimmy_storage::blocking(|| state.engine.live_collections()) {
                         Ok(live) => {
                             // Resident entries first, then the disk. A snapshot
                             // whose entry was evicted under the budget, or that
@@ -392,6 +400,33 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
     }
 }
 
+/// Forget the graph a drop of `db.name` strands, by one point read.
+///
+/// The graph is keyed by the **shadow**, so that is the only id worth
+/// reconciling: `name` when it is a shadow already (the vectors were
+/// discarded on their own), else `shadow_name(name)` (the whole collection
+/// went, shadow with it). Its id is derived from that name (ADR-031), and
+/// `get_collection` is a keyed read of the one row, so the common path costs
+/// one row rather than the two catalogue walks it used to — which matters on
+/// this task in particular, since its lateness is what trips `Lagged` on the
+/// 1,024-entry ring.
+///
+/// What the read finds is handed to [`forget_unless_live`], which says why a
+/// read of live state, and not the entry, is what decides.
+fn forget_dropped(state: &SharedState, db: &str, name: &str) {
+    let shadow =
+        if vector_meta::is_shadow(name) { name.to_owned() } else { vector_meta::shadow_name(name) };
+    let id = CollectionId::derive(db, &shadow);
+    let live = kimmy_storage::blocking(|| match state.engine.get_collection(db, &shadow) {
+        Ok(meta) => Ok(Some(meta.created)),
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) => Ok(None),
+        Err(e) => Err(e),
+    });
+    forget_unless_live(state, id, live);
+}
+
 /// Forget a collection's graph, but **only what the live collection under the
 /// id does not account for**.
 ///
@@ -404,10 +439,11 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
 /// would then delete a live index that nobody dropped.
 ///
 /// So the entry only says which id to *look at*; what decides is what this
-/// node holds under it now. That is a read of state the drop has already
-/// committed, and it makes this task's correctness independent of how far
-/// behind it is — and of whether any particular drop is announced at all,
-/// which is not this crate's decision to depend on.
+/// node holds under it now — `live`, the `created` stamp of the collection
+/// the caller found there, or `None` for none. That is a read of state the
+/// drop has already committed, and it makes this task's correctness
+/// independent of how far behind it is — and of whether any particular drop
+/// is announced at all, which is not this crate's decision to depend on.
 ///
 /// Finding a collection under the id is not the end of it, though. One
 /// anti-entropy round can deliver the drop and the recreate together, all
@@ -415,10 +451,24 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
 /// held by a collection the graph was never built for. The cache compares
 /// the incarnation, entry and snapshot each on its own stamp, and forgets
 /// what belongs to the previous one.
-fn forget_unless_live(state: &SharedState, id: CollectionId) {
-    match kimmy_storage::blocking(|| state.engine.collection_by_id(id)) {
+///
+/// Check-then-act, and known to be: the caller read `created` from the store,
+/// and a drop and a recreate landing between that read and the reconcile
+/// would have the cache compare against a stamp that is already history.
+/// That is the class `IndexCache::forget_absent`'s doc names and accepts, and
+/// it costs a rebuild, never a wrong answer — `serve`, `HnswIndex::load` and
+/// the `created` checks in `forget_unless_created` all refuse the other
+/// incarnation regardless, and the next drop entry, or `Lagged`, reconciles
+/// again. A read that failed outright is logged and the graph left in place,
+/// on the same trade.
+fn forget_unless_live(
+    state: &SharedState,
+    id: CollectionId,
+    live: Result<Option<kimmy_core::Hlc>, kimmy_storage::StorageError>,
+) {
+    match live {
         Ok(live) => {
-            state.vectors.forget_unless_created(id, live.map(|meta| meta.created));
+            state.vectors.forget_unless_created(id, live);
         }
         Err(e) => warn!(
             error = %e,
@@ -427,30 +477,6 @@ fn forget_unless_live(state: &SharedState, id: CollectionId) {
              in place, which costs memory rather than answers"
         ),
     }
-}
-
-/// Every collection this node holds, shadow collections included, as its id
-/// and the `created` stamp of the incarnation standing under it.
-///
-/// Deliberately not `Engine::all_collection_ids`, which hides a shadow whose
-/// parent is present (ADR-138). The ids it hides are exactly the ones a vector
-/// index is keyed by, so reconciling against it would forget every live graph
-/// on the node.
-///
-/// The stamp rides along because the id alone cannot vouch for a graph or a
-/// snapshot: ids are derived from names, so a name dropped and created again
-/// is live at the same id, and whatever was built for its predecessor is
-/// keyed and stored under it too.
-pub fn live_collections(
-    engine: &kimmy_storage::Engine,
-) -> Result<HashMap<CollectionId, kimmy_core::Hlc>, kimmy_storage::StorageError> {
-    let mut live = HashMap::new();
-    for db in engine.list_databases()? {
-        for coll in engine.list_collections(&db.name)? {
-            live.insert(coll.id, coll.created);
-        }
-    }
-    Ok(live)
 }
 
 // ---------------------------------------------------------------------------

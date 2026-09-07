@@ -1861,13 +1861,7 @@ mod tests {
     /// What the daemon hands the sweep: every collection this engine holds,
     /// shadows included, by id and incarnation.
     fn live_collections(engine: &Engine) -> HashMap<CollectionId, Hlc> {
-        let mut live = HashMap::new();
-        for db in engine.list_databases().unwrap() {
-            for coll in engine.list_collections(&db.name).unwrap() {
-                live.insert(coll.id, coll.created);
-            }
-        }
-        live
+        engine.live_collections().unwrap()
     }
 
     #[test]

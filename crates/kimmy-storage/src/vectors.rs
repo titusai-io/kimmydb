@@ -8,13 +8,15 @@
 //! The `__` segment prefix is reserved for system objects, so a user cannot
 //! create a collection that shadows one.
 
+use std::collections::HashMap;
+
 use kimmy_core::{
     CollectionId, DocId, Error as CoreError, Hlc, ResumeToken, VectorConfig, VectorRecord,
     vector_meta,
 };
 use tracing::info;
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
@@ -188,14 +190,44 @@ impl crate::Engine {
     /// Find a collection by its internal id.
     ///
     /// Oplog entries carry the id, not the name, so any consumer of the log
-    /// needs this to decide whether an entry is interesting.
+    /// needs this to decide whether an entry is interesting. A catalogue walk
+    /// in one read transaction, stopping at the first match: a caller that
+    /// knows the name should use [`Self::get_collection`], which is a point
+    /// read.
     pub fn collection_by_id(&self, id: kimmy_core::CollectionId) -> Result<Option<CollectionMeta>> {
-        for db in self.list_databases()? {
-            if let Some(found) = self.list_collections(&db.name)?.into_iter().find(|c| c.id == id) {
-                return Ok(Some(found));
+        let txn = self.db().begin_read()?;
+        let collections = txn.open_table(crate::tables::COLLECTIONS)?;
+        for entry in collections.iter()? {
+            let (_, value) = entry?;
+            let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+            if meta.id == id {
+                return Ok(Some(meta));
             }
         }
         Ok(None)
+    }
+
+    /// Every collection this node holds, **shadow collections included**, as
+    /// its id and the `created` stamp of the incarnation standing under it.
+    ///
+    /// Deliberately not [`Self::all_collection_ids`], which hides a shadow
+    /// whose parent is present (ADR-138) because the cross-member existence
+    /// check must not read the owning member's lifecycle lag as divergence.
+    /// The ids it hides are exactly the ones a vector index is keyed by, so
+    /// reconciling the index cache against it would forget every live graph
+    /// on the node. The two are one walk (`Engine::collections`) one argument
+    /// apart: `PairedShadows::Included` here, `Hidden` there.
+    ///
+    /// The stamp rides along because the id alone cannot vouch for a graph or
+    /// a snapshot: ids are derived from names, so a name dropped and created
+    /// again is live at the same id, and whatever was built for its
+    /// predecessor is keyed and stored under it too.
+    pub fn live_collections(&self) -> Result<HashMap<CollectionId, Hlc>> {
+        Ok(self
+            .collections(crate::engine::PairedShadows::Included)?
+            .into_iter()
+            .map(|c| (c.id, c.created))
+            .collect())
     }
 
     /// Persist a background consumer's position in the oplog.

@@ -178,28 +178,23 @@ pub fn create_collection(
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 
-/// The shadow collections a drop of `db.coll` will take with it.
+/// The id a drop of `db.coll` strands a vector index under.
 ///
-/// Resolved *before* the drop, for the reason `vectors::disable_vectors`
-/// resolves its own there: the vector index is keyed by the **shadow**
-/// collection's id, the shadow is removed in the same transaction as its
-/// parent, and once that has happened there is no id left to forget the graph
-/// under. Looked up by name rather than through `vector_collection`, which
-/// answers `None` for a collection whose configuration was removed without its
-/// vectors — the drop still takes that shadow, so it still strands a graph.
-/// A shadow named directly is its own answer.
-fn shadows_of(state: &SharedState, db: &str, coll: &str) -> Vec<kimmy_core::CollectionId> {
-    let mut ids = Vec::new();
+/// The index is keyed by the **shadow** collection's id, and the shadow is
+/// removed in the same transaction as its parent, so the id has to be in hand
+/// before the drop — the reason `vectors::disable_vectors` resolves its own
+/// first. It is not looked up, though: a collection id is derived from its
+/// name (ADR-031), so the shadow's is `derive(db, shadow_name(coll))`, or
+/// `derive(db, coll)` for a shadow named directly, with no read at all. That
+/// is also why there is no `Option`: a collection that never had vectors, or
+/// had its configuration removed without them, derives an id all the same,
+/// and `IndexCache::invalidate` on an id that never held a graph is a no-op.
+fn shadow_of(db: &str, coll: &str) -> kimmy_core::CollectionId {
     if kimmy_core::vector_meta::is_shadow(coll) {
-        if let Ok(meta) = state.engine.get_collection(db, coll) {
-            ids.push(meta.id);
-        }
-    } else if let Ok(shadow) =
-        state.engine.get_collection(db, &kimmy_core::vector_meta::shadow_name(coll))
-    {
-        ids.push(shadow.id);
+        kimmy_core::CollectionId::derive(db, coll)
+    } else {
+        kimmy_core::CollectionId::derive(db, &kimmy_core::vector_meta::shadow_name(coll))
     }
-    ids
 }
 
 /// Drop every collection in a database. Each drop is a replicated entry and
@@ -217,9 +212,20 @@ pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value
     // Every vector-enabled collection in the database, not one: this drops
     // them all, and a graph left behind for any of them is resident memory
     // and disk for data that no longer exists. Listed before the drop for the
-    // reason `shadows_of` gives, and every shadow in the database is listed
+    // reason `shadow_of` gives, and every shadow in the database is listed
     // here by name — beside its parent or, for an orphan (ADR-138), without
     // one — so this is the whole set the drop takes.
+    //
+    // Check-then-act, and known to be: listed, then dropped, then forgotten,
+    // with nothing holding the catalogue still in between. A shadow created
+    // after the listing is dropped by `drop_database` and not forgotten here;
+    // a name recreated after the drop and before the invalidate loses the
+    // graph its first search built. Both are the class
+    // `IndexCache::forget_absent`'s doc names and accepts, and cost a rebuild,
+    // never a wrong answer: `serve`, `HnswIndex::load` and the `created`
+    // checks refuse a graph of the other incarnation, and the change-feed
+    // consumer (`vectors::invalidator`) reconciles the dropped one again from
+    // the entry the drop mints.
     let shadows: Vec<kimmy_core::CollectionId> = state
         .engine
         .list_collections(db)?
@@ -242,11 +248,14 @@ pub fn drop_collection(
 ) -> Result<Value, ApiError> {
     let _span = op_span("drop_collection", db, Some(coll)).entered();
     auth.require(Action::Ddl, db, Some(coll))?;
-    let shadows = shadows_of(state, db, coll);
+    // Derived, then dropped, then forgotten: the same check-then-act window
+    // `drop_database` documents, one collection wide. A recreate of the name
+    // landing between the drop and the invalidate has the graph its first
+    // search built forgotten with its predecessor's — a rebuild, never a wrong
+    // answer, for the reasons given there.
+    let shadow = shadow_of(db, coll);
     let dropped = state.engine.drop_collection(db, coll)?;
-    for shadow in shadows {
-        state.vectors.invalidate(shadow);
-    }
+    state.vectors.invalidate(shadow);
     Ok(json!({ "dropped": dropped }))
 }
 
@@ -1986,6 +1995,25 @@ mod tests {
     #[test]
     fn an_absent_filter_matches_everything() {
         assert_eq!(parse_filter(None).unwrap(), filter::Filter::AlwaysTrue);
+    }
+
+    #[test]
+    fn the_shadow_a_drop_strands_is_derived_to_the_id_the_catalogue_holds() {
+        // `shadow_of` reads nothing, so the only thing that can make it wrong
+        // is deriving from the wrong name: the parent's, or a shadow's name
+        // suffixed a second time. Pinned against the id the engine actually
+        // filed the shadow under, for a configured collection and for the
+        // shadow named directly.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("docs");
+        let docs = engine.create_collection("app", "docs").unwrap();
+        let shadow = engine.create_system_collection("app", &shadow_name).unwrap();
+        assert_eq!(engine.get_collection("app", &shadow_name).unwrap().id, shadow.id);
+
+        assert_eq!(shadow_of("app", "docs"), shadow.id, "a parent's drop strands its shadow");
+        assert_eq!(shadow_of("app", &shadow_name), shadow.id, "a shadow named directly is itself");
+        assert_ne!(shadow_of("app", "docs"), docs.id, "never the parent: it holds no graph");
     }
 
     // -----------------------------------------------------------------------
