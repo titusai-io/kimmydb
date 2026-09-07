@@ -601,7 +601,7 @@ rather than materialising everything to refuse it.
 ```json
 { "error": "bad_request",
   "message": "$group produced 148230 documents, over the pipeline limit of 100000.
-              Narrow the pipeline with an earlier $match, …" }
+              Narrow the pipeline with an earlier $match" }
 ```
 
 **It refuses rather than truncating.** A `$group` over 90% of the input looks
