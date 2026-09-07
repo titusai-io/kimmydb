@@ -383,7 +383,7 @@ impl Engine {
 ///
 /// The last two are facts the *reading* side knows exactly and the receiving
 /// side used to guess at from the number of entries that arrived. See
-/// [`crate::sync::coverage_after_batch`].
+/// [`crate::sync::coverage_up_to`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OplogWindow {
     /// The entries the predicate retained, in stamp order.

@@ -1106,6 +1106,9 @@ async fn spawn_cluster(
         move |outcome: &kimmy_storage::SyncOutcome| {
             state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
             state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
+            state
+                .metrics
+                .record_entries_skipped(outcome.unknown_collection as u64, outcome.deferred as u64);
         }
     });
     let serving = tokio::spawn(kimmy_cluster::serve_with(

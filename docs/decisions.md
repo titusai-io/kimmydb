@@ -10893,3 +10893,263 @@ series; by `kimmyd`'s `lifecycle` unit tests; and by
 — `SIGTERM`, which logs both lines and leaves a marker the next start reads;
 `SIGKILL`, after which the next start warns under its banner; and a bind that
 fails, which logs its exit and is read as clean by the start after it.
+
+## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
+
+**Decision.** Three rules, one invariant.
+
+*A stamp is minted inside the write transaction that will carry its
+entry.* Every local write path now takes redb's writer first and mints
+second: `create_database`, `create_collection_inner`,
+`drop_collection_inner`, `replace`, `delete_where`, the `UniqueViolation`
+entry, `create_index_inner` and `drop_index_inner`. The paths that mint
+into a transaction the caller already holds — an insert, a bulk insert, a
+modify — were already right and are unchanged. A source guard,
+`no_write_path_mints_a_stamp_before_it_takes_the_writer`, fails on a new
+path that mints and then waits.
+
+*A served window is trusted only up to the vector the peer introduced it
+with.* `apply_peer_batch` leaves any entry whose stamp is above what the
+peer advertised for that entry's origin: not applied, not witnessed,
+counted as `deferred`, and taken by the next window, which the peer will
+advertise and this node will ask for from its own position. The window's
+end is also named by a full `Stamp` rather than a bare `Hlc`
+(`coverage_up_to`, `WindowEnd`), so an origin that sorts after the node
+the end belongs to is raised only to that stamp's predecessor: its entry
+at the same `Hlc` was never examined.
+
+*An entry for a collection this node has no record of stops the batch.*
+No record means both halves: the collection is not here, **and** there is
+no tombstone for it. Then nothing after the entry is applied and nothing
+past it is witnessed; the witnessed vector is raised only to just before
+it, the same window is re-served every round, and the round plans a
+snapshot from that peer to bring the collection. **A tombstone, whichever
+way its stamp falls against the entry, makes the entry history instead**
+— superseded, witnessed, carried past. That includes the entry stamped
+*after* the drop, which is the ordinary concurrent drop-and-write: a peer
+writes into a collection before it hears the drop. Presence of the
+tombstone is the test, not the comparison, because the question the stop
+asks is "may this collection still arrive", and a tombstone with no
+collection beside it means the answer is no *for the incarnation this
+entry belongs to*.
+
+That is worth stating exactly, because a collection can of course come
+back: a `CreateCollection` re-creating it under the same name. What makes
+the rule safe is contiguity per origin, not any claim about clocks. A
+re-creation is appended at its own origin like any other entry, so it
+sits in that origin's stream in stamp order, and every entry of the new
+incarnation is stamped after it. A peer serves contiguously in stamp
+order from the point asked for, and after this ADR a receiver's position
+for an origin never runs ahead of what it applied — so the re-creation is
+always delivered *before* anything of the incarnation it opens. An entry
+that arrives to find no collection and a tombstone therefore cannot
+belong to an incarnation still to come: the create that would have
+brought it would have arrived first. It belongs to the incarnation the
+tombstone closed, and is history. Were that contiguity ever broken — a
+position advanced past an entry never applied, which is the whole subject
+of this record — the stop would not save this case either, and the
+witnessed entry would be the least of it. The stop is
+counted on a new series, `kimmy_sync_entries_skipped_total{reason}`,
+whose `unknown_collection` label is this case — one per stopped batch,
+at the entry the warning names — and whose `beyond_advertised` label is
+the deferral above; the warning names the collection, which it did not.
+
+*Detection becomes repair.* A collection the cross-member divergence
+check confirms against a peer (ADR-145's tracker, read through
+`DivergenceTracker::confirmed_against`) is repaired on the next round
+with that peer: the round asks from the collection's creation stamp
+rather than from this node's position — window by window until one
+reaches the peer's tail — or pulls the peer's snapshot when this node
+does not hold the collection at all. A stopped batch plans a snapshot on
+its own, without waiting for the check, because a round that stops can
+never reach the tail and the check never runs on it. Rounds spent
+repairing are counted (`kimmy_sync_repair_rounds_total`), and a repaired
+collection is not repaired again until the check reports it clear or
+`REPAIR_COOLDOWN_ROUNDS` rounds have passed. A repair that does **not**
+complete takes the same cooldown: a replay advances its window on every
+round that completes, so one handed out `REPAIR_ATTEMPTS` times without
+advancing is a round that keeps failing or a snapshot that does not fit
+the request timeout, and it is abandoned rather than retried every round
+for the life of the process.
+
+**The invariant, stated.** A member's witnessed position for an origin
+never exceeds the highest entry it has actually applied or deliberately
+superseded from that origin, and the servable vector a member advertises
+never names a stamp its own oplog does not hold contiguously below it.
+`OPLOG_VERSIONS` never names a stamp the committed oplog does not hold
+for the local origin.
+
+**Why.** A three-member cluster running 0.24.0 finished a bulk-load
+benchmark holding 142,026 / 142,026 / 141,746 documents in one
+collection. The short member was missing 280 documents and nothing else,
+in three contiguous runs of one origin's stamps, all from the most
+stressed cell of the load. No round failed on any member, no connection
+failed, no membership changed, no schema change was applied in the
+window, nothing was superseded or declined, and
+`kimmy_replication_lag_seconds` read 0 throughout on all three. The
+divergence gauge (ADR-145) read 1 on every member, correctly, and was the
+only signal that moved — and it had no way to act on what it found: the
+tracker knew which collection disagreed, and anti-entropy went on asking
+from a position that was already above the missing entries. Two hours of
+rounds, a hard kill, a restart and a full rolling restart repaired
+nothing, which is the signature of a position, not of a transfer.
+
+Two mechanisms produce exactly that, and both were live.
+
+The first is the threshold. `VersionVector::behind` is a *single* stamp —
+this node's own position at whichever origin it trails most — because the
+oplog sorts by time and one range read is the point (ADR-036). A window
+served from that threshold therefore need not begin where this node's
+history of any *particular* origin ends. Meanwhile the peer answers
+`AskVersions` and `AskEntries` in two separate read transactions and goes
+on replicating between them; under the benchmark that interval was
+seconds. An entry the peer appended in that gap, from a third origin,
+sits in the window above what the peer advertised for it — and
+`apply_batch_absorbing` observed every entry it took. Observing that one
+raised this node's position for that origin over everything of it between
+the node's real position and the window's start, which the window never
+carried and no later round asks for. One relay, one contiguous run of one
+origin's stamps, gone, with every counter quiet: the shape the field
+finding named exactly.
+
+The second is the mint. A stamp minted before the writer is taken sorts
+below every entry that commits while the call waits for it, and under the
+benchmark the writer queue was long — the affected cell overran to 32.4 s
+with a server-side p99 of 9.9 s. So a member's own oplog could go
+non-monotonic in commit order against stamp order: `OPLOG_VERSIONS`
+already named a stamp the committed oplog did not hold, a peer reading
+that vector and then that window was served neither the entry nor a
+reason to come back for it, and the lost unit is exactly one write
+transaction's worth of consecutive stamps. Both mechanisms leave the same
+fingerprint, and closing one without the other leaves the finding
+reproducible.
+
+**Why a tombstone at all, and not the stamp comparison.** The first form
+of this rule stopped the batch whenever the collection was missing and
+the entry was not older than a local drop, which reads as the same thing
+and is not. An entry stamped after the drop — B drops a collection while
+A, not yet knowing, inserts into it, which is a race two members run
+routinely — fell through to the stop, and the collection it waited for
+was never coming: five rounds of `unknown=1 applied=0`, the drop applied,
+five more the same, and everything behind that one entry stranded. That
+is ADR-123's wedge exactly, reached through the rule written to avoid it,
+and this ADR's own justification for stopping — "re-delivering the entry
+unchanged can never succeed is false of a document whose collection has
+not arrived yet" — is false in that case. Worse, through the real loop it
+did eventually pass, because the snapshot the stop planned ends in
+`absorb_version_vector`, which merges the peer's servable vector and
+carries the position past the entry: the very "witness past an entry you
+were never served" move this ADR forbids, performed by accident. And it
+paid a full-database snapshot for a single dropped collection — on the
+field cluster's 142k documents, 278 `AskSnapshot` round trips inside one
+30 s request timeout, which if it does not fit leaves the repair
+unfinished and retrying. So the test is presence, and the cost of a
+concurrent drop-and-write is one superseded entry.
+
+The unknown-collection skip is a third hole, found on the way and closed
+here too. It was not this loss — the member logged the skip twice, ten
+minutes before the batches, one entry each, during the 49 s a collection
+creation took to propagate — but it is the same defect in a different
+dress: an entry witnessed without being applied, for a reason that is not
+a fact about this node's data. ADR-123's argument for skipping is that
+re-delivering the entry unchanged *can never succeed*, which is true of a
+definition this build cannot apply and false of a document whose
+collection has not arrived yet: that one succeeds the moment the
+collection does. So it is not skipped, it is left.
+
+**Cost.** A round that leaves entries reports `exhausted: false` and so
+does not run the divergence check that round — correct, because it did
+not reach the peer's tail, and the entries it left arrive next round.
+Worth stating plainly, because it is the fix's own deferral suppressing
+the fix's own trigger: the check is the detector the repair depends on,
+and it is skipped on exactly the rounds this change is aimed at, under
+exactly the load that produces them. It is not a regression — before
+this, those rounds *did* check, on the strength of a window that had
+absorbed entries it was never served, which is the belief ADR-133 says a
+truncated window can fake — and the deferral is rare and clears on the
+next round, where the check runs. But a member under sustained relay
+churn checks less often than one at rest, and
+`kimmy_sync_divergence_checks_total{outcome="skipped"}` is where that
+shows.
+`SyncOutcome` gains `deferred`, `unknown`, and `repairing`; `Message::Push`'s
+answer gains `deferred`, defaulted so a receiver on the previous release
+reads unchanged. `RoundReport` gains three counters, and `/metrics` two
+series. A repair costs one round per window of the collection's history,
+or one snapshot, per confirmed collection per peer, bounded by the
+cooldown. Minting under the writer moves a stamp a few milliseconds later
+than before and changes no ordering a client can observe: the entry and
+its stamp were always committed together.
+
+**Alternatives.** *Ask per origin instead of one threshold.* The range
+read the whole oplog layout exists for (ADR-036), given up to close a hole
+that a bound on what a window may claim closes without it. *Fail the
+round on an entry above the advertised vector.* It is a race a correct
+peer runs into routinely under load, not a fault; failing would back off
+the peer that is furthest ahead, which is the one worth pulling from.
+*Fail the round on a collection this node lacks.* ADR-123's wedge, exactly
+— every later round dies on the same entry and the member's whole inbound
+stream stops. Stopping the batch keeps the rounds succeeding, the
+position honest, and the window re-served, which is what a repair needs.
+*Let anti-entropy repair the hole on its own.* It cannot: once
+`witnessed[origin]` is above a stamp, nothing asks for it again (ADR-054),
+which is why every restart in the field left the hole exactly where it
+was. *Lower the witnessed vector when the check confirms a divergence.* A
+vector that moves backwards re-requests history the node has processed and
+correctly discarded, which is ADR-054 and ADR-082 both; the repair asks
+from a lower position for one peer for as long as the repair runs, and
+never lowers what the node has recorded.
+
+**How it is tested.** By `kimmy-storage`'s
+`entries_above_the_advertised_vector_are_left_for_the_next_window` (three
+engines, a relay in the gap between the peer's two reads — it fails on
+the unfixed code with the receiver's position jumped past a hundred
+documents it was never sent),
+`a_bulk_load_with_rotating_contacts_and_relays_leaves_no_member_a_hole`
+(three engines under a load shaped like the benchmark's: one fast origin
+whose windows are always truncated at the cap, two slower ones, contacts
+rotating, relays in the gaps, asserting per-member id-set equality and
+the invariant above against every member's actual oplog),
+`a_stamp_is_minted_only_under_the_writer` (one thread holding the writer
+while another creates a collection),
+`no_write_path_mints_a_stamp_before_it_takes_the_writer`,
+`coverage_at_a_windows_end_does_not_claim_a_tie_from_a_later_node`,
+`an_entry_tied_at_a_truncated_windows_end_from_a_later_node_is_served_next_round`,
+the two stop tests, and
+`a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall`
+(the concurrent drop-and-write, which fails on the stamp comparison with
+`unknown_collection: 1` and everything behind the entry stranded); by
+`kimmy-cluster`'s
+`entries_above_the_advertised_vector_are_neither_applied_nor_witnessed`
+and `a_planned_replay_asks_below_the_position_until_the_tail_is_reached`
+against fake peers over an in-process stream,
+`a_repaired_collection_waits_out_the_cooldown_before_repairing_again` and
+`a_repair_that_never_advances_is_abandoned_and_takes_the_cooldown`; and
+by
+`kimmy-cluster/tests/replication.rs`'s
+`a_confirmed_count_divergence_is_repaired_through_the_real_loop` and
+`a_member_lacking_a_collection_stops_plans_a_snapshot_and_catches_up`,
+each inducing the hole an upgrade finds — a position already above
+entries never applied — and requiring the real loop to detect it, repair
+it, and return the gauge to 0.
+
+**Residuals, stated.** A repair is driven by the divergence check, so
+what the check cannot see it cannot repair: a document present in equal
+numbers on every member with different content, and a count divergence in
+a collection that has not yet been probed twice running against the peer
+that holds the missing entries (ADR-133's own limits, unchanged). A
+member whose hole is in a collection *no* peer disagrees about by count —
+because the same run is missing on two members — is not repaired by this
+and is not made worse by it; the operations guide says so where an
+operator reads it, because a cluster in that state produces no gauge
+movement, no repair and no counter, which reads as health.
+
+One pre-existing defect this change makes more reachable, recorded rather
+than fixed here: `snapshot::restore_collection` recreates a collection
+from a snapshot page without consulting the collection tombstones, so a
+snapshot pulled while a drop is in flight can bring a dropped collection
+back — seen once in review, resurrected holding two documents. The route
+existed before (a snapshot is served to any member below the horizon) and
+this ADR adds a second way to reach it, since a stopped batch plans a
+snapshot. Fixing it belongs with the drop rules (ADR-034, ADR-123), not
+with the coverage rules, and wants its own record. And `exhausted` remains a claim a receiver
+cannot check, as ADR-127 left it.

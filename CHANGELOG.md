@@ -134,6 +134,81 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   [Operations](docs/operations.md#settings) now carries them with their
   defaults beside every other key.
 
+- **A replica could witness a run of documents it was never served, and no
+  round, counter or gauge said so.** A three-member cluster finished a bulk
+  load holding 142,026 / 142,026 / 141,746 documents in one collection: one
+  member was missing 280 documents, in three contiguous runs of one member's
+  writes, and stayed missing them through two hours of anti-entropy, a hard
+  kill, a restart and a full rolling restart. No sync round failed, no
+  connection failed, no schema change was refused, and
+  `kimmy_replication_lag_seconds` read 0 on every member throughout — a hole
+  in a member's *position* reads as perfect health, by construction, because
+  the position is what the gauge is measured from.
+
+  Two things caused it, and both are fixed. A peer answers "what do you
+  hold" and "give me your entries" in two separate reads and keeps
+  replicating in between; under load that gap is seconds, and an entry the
+  peer appended in it arrives in the window *above* the vector the peer
+  advertised. Absorbing it raised the receiver's position for that entry's
+  origin over everything of that origin between where the receiver really
+  stood and where the window began — which the window never carried, and
+  which nothing asks for again. A window is now trusted only as far as the
+  vector that introduced it: entries above it are left, and the next window
+  carries them. Separately, several write paths minted an entry's stamp
+  *before* waiting for the storage writer, so under a long writer queue an
+  entry could commit below entries already served to a peer; every path now
+  mints inside the transaction that carries the entry, which is what makes a
+  member's advertised vector a promise its own oplog keeps.
+
+  A third hole is closed with them: a replicated document for a collection
+  this member has no record of — it neither holds the collection nor a
+  tombstone for it — was counted and skipped for good. It is now left: the
+  batch stops at it, nothing past it is witnessed, the window is re-served,
+  and the member pulls a snapshot from the peer to bring the collection,
+  because unlike a schema change this member cannot apply, that entry
+  succeeds the moment the collection arrives. A collection this member
+  *dropped* is history as it always was, whichever way the stamps fall — so
+  an ordinary concurrent drop-and-write costs one superseded entry and
+  stops nothing. The warning names the collection, which it did not
+  ([ADR-148](docs/decisions.md)).
+
+- **A confirmed divergence is now repaired, not only reported.**
+  `kimmy_sync_divergent_collections` correctly read 1 on all three members
+  of the cluster above and nothing acted on it: anti-entropy went on asking
+  from a position already past the missing documents. A collection the
+  cross-member check confirms against a peer is now re-served from that
+  collection's creation on the next round with that peer, window by window
+  until one reaches the peer's tail — or pulled as a snapshot when this
+  member does not hold the collection at all. This is also what repairs a
+  member upgraded into this release while already holding a hole: the check
+  finds it, the repair closes it, and the gauge returns to 0. A repaired
+  collection is not repaired again until the check reports it clear or five
+  minutes of rounds have passed.
+
+  What it does not reach, said plainly: the check compares this member against
+  a peer, so a run of documents missing on *two* of three members leaves all
+  three counts agreeing — the gauge stays at 0, nothing is repaired, and the
+  cluster reads as converged. If you have independent reason to suspect a
+  loss, compare the members' counts directly; that case still needs a restore
+  or a re-seed ([ADR-148](docs/decisions.md)).
+
+
+- **`kimmy_sync_entries_skipped_total{reason}`** — replicated entries a round
+  left rather than took. `unknown_collection` is a batch stopped at an entry
+  for a collection this member has no record of — it neither holds the
+  collection nor a tombstone for it: the window is re-served every round
+  until a snapshot brings the collection, and the warning names it. A
+  collection this member dropped is history and stops nothing.
+  `beyond_advertised` is an entry above the vector the peer advertised before
+  serving the window, taken by the next round. **Alert on
+  `unknown_collection` sustained**: it is a member that cannot place what its
+  peers are sending it.
+- **`kimmy_sync_repair_rounds_total`** — rounds spent repairing against a
+  peer: re-serving its oplog from a divergent collection's creation, or
+  pulling its snapshot. Rising is a repair under way; it stops when the
+  repair reaches the peer's tail. Both series are on the OTLP bridge
+  ([ADR-148](docs/decisions.md)).
+
 ## 0.24.0 - 2026-09-06
 
 ### Changed

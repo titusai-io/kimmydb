@@ -1032,10 +1032,10 @@ impl Engine {
 
     pub fn create_database(&self, name: &str) -> Result<DatabaseMeta> {
         CoreError::validate_name(name)?;
+        let txn = self.begin_write()?;
+        // Minted under the writer, as every stamp is (ADR-148).
         let stamp = self.next_stamp();
         let meta = DatabaseMeta { name: name.to_string(), created: stamp.hlc };
-
-        let txn = self.begin_write()?;
         {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             if dbs.get(name)?.is_some() {
@@ -1138,8 +1138,16 @@ impl Engine {
         log: bool,
         origin: Option<Hlc>,
     ) -> Result<CollectionMeta> {
-        let stamp = self.next_stamp();
         let txn = self.begin_write()?;
+        // Minted *after* the writer is held, never before (ADR-148). A stamp
+        // minted while another transaction holds the writer sorts below the
+        // entries that transaction commits first, and a peer that reads this
+        // node's vector and window in that interval witnesses past the stamp
+        // without ever being served the entry it will belong to. Under the
+        // writer, stamp order is commit order: the oplog this node serves is
+        // contiguous for its own origin, which is what makes its advertised
+        // vector a promise a peer can trust.
+        let stamp = self.next_stamp();
 
         let meta = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -1300,9 +1308,10 @@ impl Engine {
             .then(|| self.get_collection(db, &vector_meta::shadow_name(name)).ok())
             .flatten();
 
-        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
         let txn = self.begin_write()?;
+        // Under the writer, as `create_collection_inner` mints (ADR-148).
+        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
@@ -1672,6 +1681,122 @@ mod tests {
         );
     }
 
+    /// The same invariant checked against the source, because the way it
+    /// goes quietly false is a new write path minting its stamp where the
+    /// value is convenient rather than where the writer is held (ADR-148).
+    ///
+    /// The shape, not the spacing: every function in this crate that both
+    /// mints a stamp and opens a write transaction of its own must mint
+    /// *after* it opens one. A function that takes a transaction its caller
+    /// owns is exempt — the caller is already holding the writer, which is
+    /// the whole point — and so is a function that never opens one, whose
+    /// stamp goes nowhere near an entry. Whole files are scanned, including
+    /// subdirectories, and each file is read only as far as its test module:
+    /// a test may mint a stamp to build a fixture and open a transaction
+    /// afterwards to check what it did, which is not this defect.
+    #[test]
+    fn no_write_path_mints_a_stamp_before_it_takes_the_writer() {
+        /// Every `.rs` file under `dir`, at any depth.
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        /// Each function in `body`, as (line number, signature, its text).
+        ///
+        /// A function runs from its `fn` line to the first line that closes
+        /// it at the same indentation, which is what `rustfmt` guarantees
+        /// and this crate is formatted by.
+        fn functions(body: &str) -> Vec<(usize, String, String)> {
+            let lines: Vec<&str> = body.lines().collect();
+            let mut out = Vec::new();
+            for (n, line) in lines.iter().enumerate() {
+                let indent = line.len() - line.trim_start().len();
+                let head = line.trim_start();
+                let is_fn = [
+                    "fn ",
+                    "pub fn ",
+                    "pub(crate) fn ",
+                    "pub(super) fn ",
+                    "pub unsafe fn ",
+                    "unsafe fn ",
+                    "async fn ",
+                    "pub async fn ",
+                    "pub(crate) async fn ",
+                    "pub(super) async fn ",
+                ]
+                .iter()
+                .any(|prefix| head.starts_with(prefix));
+                if !is_fn {
+                    continue;
+                }
+                let closing = format!("{}}}", " ".repeat(indent));
+                let end = lines[n..]
+                    .iter()
+                    .position(|l| *l == closing)
+                    .map_or(lines.len(), |offset| n + offset);
+                // The signature may wrap over several lines; it ends at the
+                // line holding the opening brace.
+                let signature_end = lines[n..=end]
+                    .iter()
+                    .position(|l| l.trim_end().ends_with('{'))
+                    .map_or(0, |offset| n + offset);
+                out.push((n + 1, lines[n..=signature_end].join(" "), lines[n..=end].join("\n")));
+            }
+            out
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        sources(&src, &mut paths);
+        assert!(paths.len() > 10, "the scan of this crate's sources broke: {paths:?}");
+        let mut offenders = Vec::new();
+
+        for path in paths {
+            let name = path.strip_prefix(&src).unwrap().to_string_lossy().to_string();
+            let whole = std::fs::read_to_string(&path).unwrap();
+            // Tests build fixtures; the invariant is about write paths. Cut
+            // at the test *module*, not at any `#[cfg(test)]` — an earlier
+            // one on a helper would hide every write path below it.
+            let body = match whole.find("#[cfg(test)]\nmod tests") {
+                Some(at) => &whole[..at],
+                None => &whole[..],
+            };
+            for (line, signature, text) in functions(body) {
+                // A *write* transaction the caller owns means the caller
+                // holds the writer already, which is where those paths
+                // mint. Named by type rather than by the parameter's name:
+                // a read transaction called `txn` is not a writer, and
+                // must not buy a write path an exemption.
+                if signature.contains("txn: &WriteTxn")
+                    || signature.contains("txn: &redb::WriteTransaction")
+                {
+                    continue;
+                }
+                let Some(mint) = text.find("next_stamp()") else { continue };
+                let Some(writer) = text.find("begin_write()") else { continue };
+                if mint < writer {
+                    offenders.push(format!("{name}:{line}: {}", signature.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these paths mint a stamp before opening the transaction that will carry its \
+             entry, so an entry can be committed below one a peer has already been served — \
+             the hole ADR-148 closes. Mint after `begin_write`, or inside the caller's \
+             transaction:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     #[test]
     fn node_identity_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1680,6 +1805,72 @@ mod tests {
         let first = Engine::open(&path).unwrap().node_id();
         let second = Engine::open(&path).unwrap().node_id();
         assert_eq!(first, second, "identity must live with the data");
+    }
+
+    /// The origin-side half of ADR-148's invariant: a stamp is minted only
+    /// while this node holds the writer, so stamp order is commit order for
+    /// its own origin and its advertised vector never names a stamp the
+    /// committed oplog lacks below it.
+    ///
+    /// Before this, a schema change minted its stamp and *then* waited for
+    /// the writer. Under a bulk load that wait is long, and every insert
+    /// that committed meanwhile carried a higher stamp — so the change
+    /// landed below entries a peer had already been served, behind a
+    /// position that peer never asks about again. Here one thread holds
+    /// the writer while another creates a collection; the creation must
+    /// commit after the inserts and sort after them too.
+    #[test]
+    fn a_stamp_is_minted_only_under_the_writer() {
+        use std::sync::mpsc::channel;
+
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let docs = engine.create_collection("app", "docs").unwrap();
+
+        let (held_tx, held_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        let writer = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let txn = engine.begin_write().unwrap();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                let mut last = Hlc::ZERO;
+                for i in 0..3 {
+                    let (_, entry) =
+                        engine.insert_in_txn(&txn, &docs, bson::doc! { "_id": i }).unwrap();
+                    last = entry.stamp.hlc;
+                }
+                txn.commit().unwrap();
+                last
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // Asked for while the writer is held: it blocks until the inserts
+        // commit, and must mint nothing until then.
+        let creating = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.create_collection("app", "late").unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        go_tx.send(()).unwrap();
+        let last_insert = writer.join().unwrap();
+        let late = creating.join().unwrap();
+
+        assert!(
+            late.created > last_insert,
+            "the creation committed after the inserts and must sort after them; \
+             {:?} is below {last_insert:?}, a stamp minted before the writer was held",
+            late.created
+        );
+        // The same fact as the oplog states it: arrival order is stamp
+        // order for this node's own entries.
+        let arrived: Vec<_> =
+            engine.read_arrival_from(0, 100).unwrap().iter().map(|e| e.stamp).collect();
+        let mut sorted = arrived.clone();
+        sorted.sort();
+        assert_eq!(arrived, sorted, "an entry arrived below one already committed");
     }
 
     #[test]

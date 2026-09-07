@@ -802,10 +802,14 @@ impl crate::Engine {
 
         // A local create takes the stamp of the entry it is about to mint, so
         // that the definition every peer receives and the one stored here name
-        // the same moment. Minted before the transaction opens, as
-        // `drop_index_inner` mints its own.
-        let stamp = match origin {
-            CreateOrigin::Local => Some(self.next_stamp()),
+        // the same moment. Minted once the transaction below holds the
+        // writer, not here (ADR-148): the backfill between here and there
+        // can take a while, and a stamp minted before it sorts below every
+        // entry other transactions commit meanwhile, which a peer reading
+        // this node's vector and window in that interval witnesses past
+        // without ever being served the index.
+        let mut stamp = match origin {
+            CreateOrigin::Local => None,
             CreateOrigin::Replicated(created) => created,
         };
 
@@ -950,6 +954,11 @@ impl crate::Engine {
         }
 
         let txn = self.begin_write()?;
+        if matches!(origin, CreateOrigin::Local) {
+            let minted = self.next_stamp();
+            stamp = Some(minted);
+            index.created = Some(minted);
+        }
 
         // The loser of a concurrent creation goes in the same transaction as
         // the winner's build, so a definition this node's documents cannot be
@@ -1183,9 +1192,10 @@ impl crate::Engine {
         // key agrees with what a `CreateIndex` replay will compute whether or
         // not the index is here.
         let index_id = IndexMeta::derive_id(name);
-        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
-        let drop_entry = || {
+        // A local drop's stamp is minted under the writer, in whichever of
+        // the two transactions below the drop lands in (ADR-148).
+        let drop_entry = |stamp: Stamp| {
             crate::engine::ddl_entry(
                 stamp,
                 kimmy_core::OpKind::DropIndex,
@@ -1199,7 +1209,7 @@ impl crate::Engine {
         };
 
         let Some(index) = meta.index(name).cloned() else {
-            if !log {
+            if let Some(stamp) = replicated {
                 self.record_index_drop(meta.id, index_id, stamp)?;
                 return Ok(Dropped { stamp: Some(stamp), removed: false });
             }
@@ -1207,8 +1217,9 @@ impl crate::Engine {
             // entry go in one transaction, as they do below, so there is no
             // instant in which the drop is recorded and not yet replicable.
             let txn = self.begin_write()?;
+            let stamp = self.next_stamp();
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
-            let entry = drop_entry()?;
+            let entry = drop_entry(stamp)?;
             crate::engine::append_oplog(&txn, &entry)?;
             txn.commit()?;
             self.publish(vec![entry]);
@@ -1222,6 +1233,7 @@ impl crate::Engine {
         };
 
         let txn = self.begin_write()?;
+        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             entries.retain_in(index_id_range(meta.id, index.id), |_, _| false)?;
@@ -1236,7 +1248,7 @@ impl crate::Engine {
         crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
 
         let logged = if log {
-            let entry = drop_entry()?;
+            let entry = drop_entry(stamp)?;
             crate::engine::append_oplog(&txn, &entry)?;
             Some(entry)
         } else {

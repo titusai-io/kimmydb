@@ -122,7 +122,7 @@ pub enum Message {
     /// withheld as readily as one it shipped — and `exhausted` says it stopped
     /// there because the oplog ended rather than because the batch filled.
     /// Together they are the receiver's coverage rule
-    /// (`kimmy_storage::sync::coverage_after_batch`).
+    /// (`kimmy_storage::sync::coverage_up_to`).
     ///
     /// **The sender reports the window's end; the receiver never infers it.**
     /// It used to be deduced from the batch's length, on the reasoning that a
@@ -232,6 +232,11 @@ pub enum Message {
         ddl_refused: usize,
         unknown_collection: usize,
         ddl_declined: usize,
+        /// Entries the receiver left for its next pull rather than
+        /// witnessing (ADR-148). Absent from a receiver on a version before
+        /// the field, which never left any.
+        #[serde(default)]
+        deferred: usize,
     },
     /// Something went wrong; the sender is closing.
     Fault(String),
@@ -531,6 +536,7 @@ mod tests {
                 ddl_refused: 0,
                 unknown_collection: 0,
                 ddl_declined: 3,
+                deferred: 4,
             },
             Message::Fault("nope".into()),
         ];
