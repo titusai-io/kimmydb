@@ -11603,9 +11603,15 @@ a sender that predates the field ignores it and serves its whole database,
 which the requester applies as it comes — the snapshot a repair pulled before
 this record, correct and only dearer, granting no coverage under a scope
 either — and logs once; a requester that predates it sends no scope and is
-served the whole database as before. Nothing is misread in either direction,
-and nothing fails; the mixed-version window costs what every repair cost
-until it closes.
+served the whole database as before. Nothing fails in either direction and
+the whole-database snapshot is applied as it always was; what the
+mixed-version window does not have is this record's first-page guarantee
+below. An older sender reads its vector *after* walking a page's documents,
+so the first-page vector a rolled receiver adopts can cover a document the
+older sender committed behind page one's cursor during that one walk — one
+page's walk, once, only while the sender is not yet rolled, and narrower
+than the last-page adoption every snapshot had before this record. The
+mixed-version window costs what every repair cost until it closes.
 
 *A snapshot resumes across rounds.* Where a pull stands is a
 `kimmy_storage::SnapshotProgress` — the scope, the cursor after the last
@@ -11706,15 +11712,43 @@ and a series that only moves during a repair reads 0 for ever after.
 
 **Cost.** One protocol field and one page field, both optional on the wire.
 `Engine::snapshot_page` takes the scope and `Engine::apply_snapshot_page`
-takes the progress; `SnapshotApplied` is unchanged. A snapshot document no
-longer raises the receiver's vectors as it lands; a member restarted between
-a snapshot's final page and its next round re-derives its vector from the
-oplog on open, which raises it to the highest snapshot entry it holds — the
-open-time raise ADR-036 made deliberate — and a document the sender wrote
-behind the cursor below that stamp is then not asked for. One round wide, and
-recorded rather than closed: closing it means opening not raising over
-entries a snapshot appended, which is a change to what opening means. A
-snapshot that runs longer than `oplog_retention_secs` grants a vector the
+takes the progress; `SnapshotApplied` is unchanged.
+
+The residual, stated as it is: **a receiver restarted during a multi-round
+snapshot.** `PeerStalls` is process memory, so the restart forgets the cursor
+and, for a repair, the repair. The snapshot's documents were appended under
+`Position::Hold`, so the oplog holds stamps the vectors do not name — by
+design — and `Engine::open` then re-derives both vectors from the oplog
+(ADR-036's open-time raise), taking the newest stamp per origin among every
+entry it holds without telling a snapshot document from a window's. The
+member's position for each origin jumps to the newest stamp among the pages
+it had applied, which is arbitrary against stamp order because pages arrive
+in key order. What follows is data-dependent. If some origin the member
+trails is still below the peer's per-origin horizon, the peer answers
+`BeyondHorizon`, a fresh whole-database walk starts from page one, and the
+hole closes. If every trailing origin is at or above it — the ordinary case
+for a fresh member on an actively written cluster, whose first pages carry
+a recent stamp from every writing origin — the peer answers `Entries`, the
+progress is forgotten, the window is absorbed on exhaustion, and the
+un-walked remainder of the snapshot below those stamps is never asked for.
+On the scoped path the jump is worse than a remainder: a member stopped at
+stamp *s* on some origin pulls a scoped snapshot of an actively written
+collection whose stamps sit far above *s*, and the restart carries its
+position on that origin over the whole stopped window — documents of other
+collections, index and drop entries — which the re-served window would have
+delivered and now never does. Nothing counts it; only the count half of
+ADR-133's check can notice it, one collection per contact. Before this
+record the same state was reached by a timeout alone — every applied
+document raised both vectors, and a cancelled round left them raised, on
+every one of the 108 rounds — so this is narrower, not new, but it is not
+bounded by one round. It is recorded rather than closed because closing it
+is a decision of its own, filed separately: persisting `SnapshotProgress`
+so an interrupted snapshot is resumed rather than forgotten, and either
+skipping the open-time raise while an incomplete snapshot is recorded or
+confining that raise to the cases ADR-036 wrote it for — which touches what
+opening means, and does not belong in a record about the repair's shape.
+
+A snapshot that runs longer than `oplog_retention_secs` grants a vector the
 sender can no longer serve from, and the receiver is told `BeyondHorizon`
 again and pulls again; a snapshot that long is a member that cannot keep up
 by any route. `restore_collection` still recreates a collection without

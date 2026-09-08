@@ -453,6 +453,16 @@ position the member already holds carries the rest — and, when the sender has
 since dropped the collection, carries the drop instead so the entries the
 member was stopped at become history ([ADR-152](decisions.md)).
 
+Where a pull stands is process memory. A member restarted *during* a
+multi-round snapshot forgets the cursor, and opening re-derives its vectors
+from the oplog — over the snapshot documents it already holds, which sit in
+key order, not stamp order — so its position can jump past the un-walked
+remainder of the snapshot and, on a repair, past the window it was stopped
+at; unless some origin it trails is still below the peer's horizon, that
+remainder is never asked for. Narrower than before ADR-152, when a timed-out
+snapshot left the same state on every round, and recorded there as an open
+decision rather than closed.
+
 **The horizon is judged per origin.** `oplog_collected_through` is one stamp
 across every origin, and the threshold a peer asks from is its own coverage of
 whichever origin it trails *most* — so an origin that wrote nothing for longer

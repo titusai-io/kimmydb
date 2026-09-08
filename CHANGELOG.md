@@ -63,7 +63,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   with its *first* page, and a snapshot's documents no longer move the
   receiver's version vectors as they land — the previous form could carry the
   receiver's position past a document the peer wrote behind the cursor while
-  the snapshot ran, which nothing then re-served. A snapshot of a collection
+  the snapshot ran, which nothing then re-served. One residual is recorded
+  rather than closed: a member restarted *during* a multi-round snapshot
+  forgets where it stood and, on opening, re-derives its position from the
+  snapshot documents it already holds, which can carry it past the un-walked
+  remainder (on a repair, past the stopped window too) — narrower than
+  before, when a timed-out snapshot left the same state on every round, and
+  the subject of a separate decision. A snapshot of a collection
   the peer has since dropped carries the drop, so a member stopped at entries
   for it records the tombstone rather than stopping forever. The round logs
   one `INFO` line when it leaves a snapshot to resume, with pages, documents

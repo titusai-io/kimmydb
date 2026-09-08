@@ -1234,14 +1234,21 @@ pub enum Repair {
 struct Repairs {
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
-    /// Rounds the repair in progress has been handed out for without
-    /// making progress — a round that failed, or a snapshot round that
-    /// applied no page. Reset whenever the repair advances (a replay's
-    /// window moves, a snapshot's page lands — ADR-152) or finishes. At
-    /// [`REPAIR_ATTEMPTS`] the repair is abandoned and takes the cooldown,
-    /// so a repair that cannot complete costs the same as one that can
-    /// rather than retrying every round for the life of the process.
+    /// Consecutive rounds the repair in progress has been handed out for
+    /// without making progress — a round that failed, or a snapshot round
+    /// that applied no page. Counted when the next round opens, from
+    /// `advanced`; reset by a round that advanced. At [`REPAIR_ATTEMPTS`]
+    /// the repair is abandoned and takes the cooldown, so a repair that
+    /// cannot complete costs the same as one that can rather than retrying
+    /// every round for the life of the process.
     stalled: u32,
+    /// Whether the round last handed the repair advanced it — a replay's
+    /// window moved, a snapshot's page landed (ADR-152). Read and cleared
+    /// when the next round opens, so that round is the first of a new run
+    /// rather than the second: the count is incremented before a round
+    /// runs, because a round that fails never returns here, and a reset
+    /// inside the round would otherwise leave the advancing round counted.
+    advanced: bool,
     /// Planned behind it, one per collection.
     queued: BTreeMap<CollectionId, Repair>,
     /// Collections repaired against this peer, with the rounds since: not
@@ -1319,11 +1326,18 @@ impl PeerStalls {
             *rounds < REPAIR_COOLDOWN_ROUNDS
         });
         // A repair handed out on the previous round and neither advanced
-        // nor finished since: the round failed, or the snapshot did not
-        // complete. Counted here rather than at the failure, because a
-        // round that fails never returns to this module at all.
+        // nor finished since: the round failed, or the snapshot landed no
+        // page. Counted here rather than at the failure, because a round
+        // that fails never returns to this module at all; a round that
+        // advanced says so and starts the run again, so exactly
+        // `REPAIR_ATTEMPTS` rounds landing nothing abandon a repair whether
+        // or not it had advanced before them.
         if repairs.active.is_some() {
-            repairs.stalled += 1;
+            if std::mem::take(&mut repairs.advanced) {
+                repairs.stalled = 0;
+            } else {
+                repairs.stalled += 1;
+            }
             if repairs.stalled >= REPAIR_ATTEMPTS
                 && let Some((collection, _)) = repairs.active.take()
             {
@@ -1336,6 +1350,7 @@ impl PeerStalls {
                 );
                 repairs.done.insert(collection, 0);
                 repairs.stalled = 0;
+                repairs.advanced = false;
                 // Whatever of its snapshot was pulled is kept — the pages
                 // are applied — but not resumed: the next repair of the
                 // collection, after the cooldown, starts over.
@@ -1347,6 +1362,7 @@ impl PeerStalls {
         if repairs.active.is_none() {
             repairs.active = repairs.queued.pop_first();
             repairs.stalled = 0;
+            repairs.advanced = false;
         }
         repairs.active
     }
@@ -1385,7 +1401,7 @@ impl PeerStalls {
         if let Some(repairs) = self.repairs.get_mut(&peer)
             && matches!(repairs.active, Some((_, Repair::Snapshot)))
         {
-            repairs.stalled = 0;
+            repairs.advanced = true;
         }
     }
 
@@ -1410,8 +1426,8 @@ impl PeerStalls {
             && let Some(active) = &mut repairs.active
         {
             active.1 = next;
-            // It advanced, so the stall run starts again.
-            repairs.stalled = 0;
+            // It advanced, so the stall run starts again at the next round.
+            repairs.advanced = true;
         }
     }
 
@@ -1422,6 +1438,9 @@ impl PeerStalls {
         {
             repairs.done.insert(collection, 0);
             repairs.stalled = 0;
+            // The page that finished it must not be read as advancing the
+            // next repair planned for this peer.
+            repairs.advanced = false;
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
             }
@@ -1650,8 +1669,8 @@ where
         // A sender before the field ignores the scope and serves its whole
         // database. Applied as it comes: that is the snapshot a repair
         // pulled before ADR-152, correct and only dearer, and it grants no
-        // coverage under a scope either. Said once, because the log is
-        // where an operator learns the roll is not finished.
+        // coverage under a scope either. Said once a round, because the log
+        // is where an operator learns the roll is not finished.
         if let Some(id) = scope
             && !whole_from_older_peer
             && served_beyond_scope(&page, id)
@@ -2581,6 +2600,50 @@ mod tests {
             stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(wall, 0) });
         }
         assert!(stalls.repairing(peer), "a repair making progress is never abandoned");
+    }
+
+    /// The count after progress (ADR-152). A repair that advanced — a page
+    /// landed, a window moved — is handed out for exactly `REPAIR_ATTEMPTS`
+    /// rounds that land nothing before it is abandoned, the same as one
+    /// that never advanced: the round that advanced is not the first of
+    /// the run. The count was incremented when a round opened and reset
+    /// inside the round that advanced, so the next round opened at one
+    /// and two empty rounds abandoned a repair that had just made
+    /// progress.
+    #[test]
+    fn a_repair_that_advanced_survives_three_rounds_landing_nothing_and_not_a_fourth() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+
+        // A snapshot repair: a page landed in the round it was handed to.
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        stalls.snapshot_advanced(peer);
+        for empty in 1..=REPAIR_ATTEMPTS {
+            assert_eq!(
+                stalls.repair_due(peer),
+                Some((collection, Repair::Snapshot)),
+                "empty round {empty} after the page: still handed out"
+            );
+        }
+        assert_eq!(stalls.repair_due(peer), None, "and abandoned on the round after");
+        assert!(!stalls.repairing(peer));
+
+        // A replay, and a run that restarts: two empty rounds, then the
+        // window moves, then three more before the fourth abandons it.
+        let mut stalls = PeerStalls::new();
+        let replay = Repair::Replay { from: Hlc::new(1, 0) };
+        assert!(stalls.plan_repair(peer, collection, replay));
+        assert_eq!(stalls.repair_due(peer), Some((collection, replay)));
+        stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(2, 0) });
+        assert!(stalls.repair_due(peer).is_some(), "first empty round");
+        assert!(stalls.repair_due(peer).is_some(), "second empty round");
+        stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(3, 0) });
+        for empty in 1..=REPAIR_ATTEMPTS {
+            assert!(stalls.repair_due(peer).is_some(), "empty round {empty} after the move");
+        }
+        assert_eq!(stalls.repair_due(peer), None, "abandoned on the fourth");
     }
 
     /// The cooldown: a repair done for a collection is not planned again
