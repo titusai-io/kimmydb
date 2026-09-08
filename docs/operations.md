@@ -1323,7 +1323,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.25.1; A=kimmy-aarch64-apple-darwin.tar.xz
+V=0.26.0; A=kimmy-aarch64-apple-darwin.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -1343,7 +1343,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmy-aarch64-apple-darwin.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.25.1 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.26.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
