@@ -1395,13 +1395,24 @@ fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::
 
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // A pass that overruns the interval must not be followed by the next
+        // one at once: the default catches up on missed ticks immediately,
+        // which ran passes back to back on a member whose pass took longer
+        // than the interval, and left its writer held almost continuously
+        // (ADR-151). Delay reschedules from when the late pass finished.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick fires immediately, which would collect during startup
         // while the node is still opening for business. Skip it.
         ticker.tick().await;
 
         loop {
             ticker.tick().await;
-            match engine.collect_garbage(policy) {
+            let started = std::time::Instant::now();
+            // A pass reads whole tables; on a cold cache that is minutes of
+            // disk, and a worker thread must not be held for it.
+            let result = kimmy_storage::blocking(|| engine.collect_garbage(policy));
+            let elapsed = started.elapsed();
+            match result {
                 // A failed pass is not fatal — the garbage is still there and
                 // the next tick will find it — so it is logged and retried
                 // rather than taking the node down.
@@ -1410,8 +1421,17 @@ fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
+                    elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),
+            }
+            if elapsed >= interval {
+                warn!(
+                    elapsed_secs = elapsed.as_secs(),
+                    interval_secs = interval.as_secs(),
+                    "a retention pass took longer than storage.gc_interval_secs; the next \
+                     runs a full interval after this one finished"
+                );
             }
         }
     }))

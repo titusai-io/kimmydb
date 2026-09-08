@@ -11445,3 +11445,104 @@ small beside anything this record is about. `shape::compare` stays as it was
 for the aggregation sort, which sorts documents it is already holding, with
 `taken_sort_keys_order_exactly_as_the_documents_do` in `kimmy-query` holding
 the two comparisons to one ordering.
+
+## ADR-151 — The retention pass never holds the writer for a walk, and a write waits a bounded time for it
+
+**Decision.** A retention pass holds the single writer only to remove what it
+has already found, never to look for it. Expired oplog entries are read as a
+key range — the oplog is keyed by stamp, so the expired prefix ends at the
+cutoff and nothing past it is read — under a read transaction, and removed in
+chunks of 1,000 per commit with the writer released between chunks. Expired
+tombstones, which live in the one table with every live document and are
+indexed by nothing, are found by a scan under a read transaction that visits
+at most 100,000 documents per pass and resumes on the next pass where it
+stopped, and are removed the same way; a tombstone the scan saw is removed only
+if it is still the same record when the writer is held, so a document
+re-created at that key in between is data and is kept. The collector's ticker
+no longer catches up on missed ticks: a pass that overruns
+`storage.gc_interval_secs` is followed by the next a full interval after it
+finished, and is logged at `WARN`. The pass itself runs under `block_in_place`,
+so the worker it occupies gives up its queue.
+
+Every write transaction queues at one gate in front of redb's writer lock,
+`parking_lot`'s mutex, which has two properties redb's does not: a wait that a
+caller can bound, and eventual fairness, so a path that takes and releases the
+writer in a tight loop is made to hand it over rather than winning every time
+against a waiter that was woken and had to race for it. The request path bounds
+its wait to `server.request_timeout_secs` through a task-local the timeout
+middleware sets; a write that cannot take the writer inside it fails with
+`StorageError::WriterBusy`, having written, minted and published nothing, and
+the API answers the documented `503 timeout` with `retry: wait`. Replication,
+retention, TTL and the embedding worker set no budget and wait as long as it
+takes, as before. The wait is a histogram, `kimmy_write_lock_wait_seconds`;
+the refusals are `kimmy_write_lock_wait_timeouts_total`; the longest hold since
+start is `kimmy_write_lock_held_seconds_max`; and a transaction that held the
+writer longer than five seconds is logged at `WARN` when it lets go, with the
+span it was opened under — `replace`, `bulk`, `cluster.sync`,
+`storage.retention` — so the line names the cause.
+
+**Why.** A sustained-load round on a three-member test cluster, each member
+under a 2 GiB container limit with a database file that had grown past 4 GiB,
+ended with two of the three members unable to complete a single-document write
+inside 30 seconds for over an hour after all load had stopped, while reads on
+the same members answered in under a second. No member restarted, none was
+killed for memory, and not one line was logged at any level. Replication and
+the embedding worker's position checkpoints still committed in bursts; a
+client's write never did. The members diverged by tens of thousands of
+documents while the divergence gauge on the member that was behind read zero,
+because that member's anti-entropy loop was itself waiting for the writer.
+
+The thread holding the writer was read directly. Its user stack, innermost
+first: a page read in redb, inside a B-tree range iterator, inside
+`BtreeMut::retain_in` with the closure from `Engine::collect_oplog`, from
+`Engine::collect_garbage_at`. Its kernel stack was a 64 KiB `pread64` waiting
+on a page-cache miss; a syscall profile of the process over several minutes
+showed 109,367 reads against 5 fsyncs. The retention pass ran a `retain` over
+every oplog entry and then every document, each inside a write transaction; at
+the deployed retention of a day nothing was old enough to remove, so each pass
+walked both tables under the writer, removed nothing, and — since it logs only
+what it removed — said nothing. Locally a no-op pass over 300,000 documents on
+a 1 GiB file takes 425 ms with a warm page cache and holds the writer for the
+whole of it, which is the shape of the defect but not its size; on a member
+whose cgroup was pinned at its limit by page cache the kernel had already
+evicted, with the file's active cache at zero, the same walk ran from disk at
+about 5 MB/s and took ten to twelve minutes, and the scheduler's default of
+firing a missed tick immediately started the next pass the moment one ended.
+The sampler's commit series shows it: gaps of 689, 710, 603 and 592 seconds
+between the lone commits on the worst member, each the length of one pass, and
+the member that kept an active page cache had every gap under the interval,
+finished each pass inside it, and recovered on its own. The container limit
+and the cold cache are the aggravator, not the mechanism: a walk of the whole
+database under the writer is wrong at any speed, and at disk speed it is a
+write outage.
+
+Nothing said so, and that is the second defect. The request timeout is a
+`tokio::time::timeout` around the handler, and a handler blocked in
+`block_in_place` waiting for the writer never yields, so the deadline was seen
+only when the wait ended; the client saw a transport timeout and the server
+recorded nothing. No series on `/metrics` distinguished "no writes are
+arriving" from "writes are arriving and cannot get the writer". Finding the
+holder took an hour of bisection on a live cluster, a kernel stack, a syscall
+profile and a raw read of a thread's stack against the container's binary; one
+scrape of the wait histogram, or the one `WARN` line, would have named it.
+
+**Alternatives.** *Only stop passes running back to back* — the one-line
+change — was rejected as the whole answer: it halves the hold and leaves a
+walk of the database under the writer every interval, which at disk speed is
+still minutes of write outage per pass. *A tombstone index by stamp*, so
+tombstones could be collected by range as the oplog is, was rejected for now:
+it adds a table every delete writes to, for a scan that a bounded, resumable
+read walk already keeps off the writer and off any one pass; it remains the
+right change if the tombstone scan's disk cost ever matters on its own.
+*Bounding every writer's wait, background work included*, was rejected: a
+sync round or a TTL pass that gave up on the writer would retry next tick
+with a warning, which is bounded and honest, but it changes the semantics of
+every background loop to fix a request-path symptom, and the request path is
+where a bounded wait has a client to answer. *Cancelling a blocked handler*
+cannot be done: the wait is a synchronous lock acquisition, and the only way
+to bound it is at the lock. *Bridging the wait histogram to OTLP* is deferred
+with the latency histogram for the reason recorded against that one; its two
+summaries are bridged. *A configuration knob for the scan budget or the chunk
+size* was not added: the numbers bound a hold and a pass to what a member can
+carry at any size, and a knob set before anyone has measured a case the
+defaults do not fit is a knob that is wrong for that case.

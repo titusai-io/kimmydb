@@ -112,7 +112,14 @@ pub async fn enforce_timeout(
     request: Request,
     next: Next,
 ) -> Response {
-    match tokio::time::timeout(limits.request_timeout, next.run(request)).await {
+    // The same deadline bounds a handler's wait for the storage writer
+    // (ADR-151). This timeout alone cannot: a handler blocked waiting for the
+    // writer never yields, so the deadline here is only seen once the wait
+    // ends — a write that could not get the writer hung for as long as it
+    // was held, and the client saw a transport timeout rather than the
+    // documented refusal.
+    let handler = kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request));
+    match tokio::time::timeout(limits.request_timeout, handler).await {
         Ok(response) => response,
         Err(_elapsed) => ApiError::timeout(limits.request_timeout).into_response(),
     }

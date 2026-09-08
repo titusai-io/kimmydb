@@ -176,6 +176,23 @@ impl TelemetryGuard {
             "Commits made durable by a shared flush rather than their own fsync.",
             commits_grouped
         );
+        // The wait for the single writer (ADR-151): the histogram itself is a
+        // synchronous instrument and stays off the bridge with the latency
+        // one (see `NOT_BRIDGED`); its two summaries are observable.
+        observe!(
+            u64_observable_counter,
+            "kimmy.write_lock.wait_timeouts",
+            "{write}",
+            "Writes that gave up waiting for the storage writer inside server.request_timeout_secs; nothing was written and the client was told to retry.",
+            write_lock_wait_timeouts
+        );
+        observe!(
+            f64_observable_gauge,
+            "kimmy.write_lock.held_seconds.max",
+            "s",
+            "The longest any one transaction has held the storage writer since start.",
+            |s| s.write_lock_held_max_us as f64 / 1e6
+        );
         observe!(
             u64_observable_gauge,
             "kimmy.storage.bytes",
@@ -799,17 +816,26 @@ fn meter_provider(cfg: &TelemetryConfig, resource: Resource) -> Result<SdkMeterP
 /// requirement (ADR-070), so the default is bridged and an exception has to be
 /// written down here to compile.
 #[cfg(test)]
-const NOT_BRIDGED: &[(&str, &str)] = &[(
-    "kimmy_request_duration_seconds",
-    "A histogram. Every instrument on this bridge is observable (async): a \
-     callback reads the latest snapshot when the collector asks. OpenTelemetry \
-     has no observable histogram — a histogram is recorded synchronously, at \
-     the point each observation happens — so bridging this one means \
-     instrumenting the request path rather than adding a callback here, which \
-     is a different change with its own design (bucket boundaries against the \
-     Prometheus ones, and what the collector should export back). Deliberately \
-     left for that change.",
-)];
+const NOT_BRIDGED: &[(&str, &str)] = &[
+    (
+        "kimmy_request_duration_seconds",
+        "A histogram. Every instrument on this bridge is observable (async): a \
+         callback reads the latest snapshot when the collector asks. OpenTelemetry \
+         has no observable histogram — a histogram is recorded synchronously, at \
+         the point each observation happens — so bridging this one means \
+         instrumenting the request path rather than adding a callback here, which \
+         is a different change with its own design (bucket boundaries against the \
+         Prometheus ones, and what the collector should export back). Deliberately \
+         left for that change.",
+    ),
+    (
+        "kimmy_write_lock_wait_seconds",
+        "A histogram, for the same reason as the latency one, and to be bridged by \
+         the same change: it is recorded synchronously where a transaction takes \
+         the writer (ADR-151). Its two summaries — the writes that gave up waiting, \
+         and the longest hold — are observable and are on the bridge.",
+    ),
+];
 
 #[cfg(test)]
 mod tests {

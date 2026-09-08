@@ -33,7 +33,10 @@ pub use divergence::{
 };
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
-pub use engine::{DurabilityClass, Engine, blocking};
+pub use engine::{
+    DurabilityClass, Engine, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterWaitSnapshot,
+    blocking, with_write_wait_budget,
+};
 pub use error::{Result, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};

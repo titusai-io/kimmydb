@@ -558,6 +558,9 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         process_resident_bytes: 9,
         process_resident_peak_bytes: 10,
         index_unkeyed: 11,
+        writer_wait: kimmy_storage::WriterWaitSnapshot::default(),
+        writer_wait_timeouts: 12,
+        writer_hold_max_us: 13,
     };
     assert_eq!(
         exposed_series(&metrics.render()).keys().collect::<Vec<_>>(),
