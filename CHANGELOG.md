@@ -96,6 +96,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   some 720 rounds fired back to back; the discovery ticker gets the same
   treatment
   ([ADR-154](docs/decisions.md)).
+- **A read that walks a collection or an index range no longer holds an
+  async worker while it walks, so `/metrics`, `/healthz`, `/v1/version` and
+  small reads keep answering while a node is saturated with scans.** `find`,
+  `count` and `aggregate` ran their scan inline on a tokio worker, and a scan
+  never yields: with as many scans in flight as the runtime has workers (one
+  per core), nothing else on the node ran — not a scrape, not a one-document
+  `find`, not the request timeout that should have abandoned the request. In
+  a load round, seventeen scrapes of `/metrics` across a three-member test
+  cluster failed exactly while sixty-four clients counted a 30,000-document
+  collection. Reproduced on a two-worker runtime over 300,000 documents: ten
+  of fourteen scrapes past a 5 s timeout, and `/v1/version` and a
+  `limit: 1` `find` failed the same way. The walk now runs under the same
+  `block_in_place` the writer's wait already uses, so the worker hands its
+  queue to another thread first; the same cell afterwards answered every
+  scrape in 0.8 ms at the median, and `count` throughput was unchanged on a
+  runtime with spare workers and rose 8.7 → 21.3 requests/s on one without
+  ([ADR-153](docs/decisions.md)). Reads by `_id` are unchanged: a primary-key
+  probe is one page and stays on the worker.
+- **Opening a database no longer walks the whole oplog twice to decide that
+  its arrival index is current.** The check compared the two tables' lengths
+  by iterating each to its end, so every start read the entire oplog and the
+  entire index through the page cache before the node served a request — at a
+  4 GiB file, seconds of disk reads at start and a page cache already full of
+  oplog pages by the time the first client arrived. It now reads the length
+  redb keeps in each table's header. A third walk at open, the one that
+  raises the version vector over the oplog, remains and is recorded in
+  [ADR-153](docs/decisions.md) with the measurement.
 
 ### Added
 

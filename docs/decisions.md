@@ -11781,6 +11781,135 @@ and the repair abandoned — and `ask_snapshot_crosses_a_version_boundary_in_bot
 for the frame each side of an upgrade sees; and by the existing
 `kimmy-cluster/tests/replication.rs` snapshot and repair tests through the
 real loop, which now pull one collection.
+## ADR-153 — A read's walk runs under `block_in_place`; a primary-key probe stays on the worker
+
+**Decision.** The two walking access paths of `exec::visit_matching` — an
+index range through `visit_index_candidates` and the collection through
+`for_each_record_after` — run inside `kimmy_storage::blocking`, the same
+`block_in_place` a write's wait for the writer already runs inside
+(ADR-151). Every read verb that walks goes through that one function —
+`find`, `count`, `aggregate`'s source, the `explain` of `update` and
+`delete`, and a vector search's candidate page — so the change is made once.
+The primary-key path is not wrapped: a filter that pins `_id` is answered by
+one page read per key, on the worker, as before. Nothing about what a read
+returns, holds or examines changes, and no runtime setting is added.
+
+From the same investigation: `Engine::open`'s check that the oplog arrival
+index is current compares the two tables' `len()` — the count redb keeps in
+each table's root header — where it iterated both tables to their ends. The
+rebuild it guards is unchanged, and so is its rule, which the check's own
+comment already stated: comparing counts is enough.
+
+**Why.** In a 0.25.1 load round, seventeen scrapes of `/metrics` across a
+three-member test cluster failed during the sustained-load step and nowhere
+else — the step where 8, 32 and 64 clients ran `count` over a
+30,000-document collection at about 25 requests a second per member with a
+server-side median of 550–707 ms. The scrape was suspected because it is the
+one route that lists every database and collection per call. It was not the
+cause: that listing is two metadata reads and costs 0.7 ms at the median on
+an idle node and 3.7 ms with eight counters running.
+
+The cause is where a scan runs. `exec::count` and `exec::find` are
+synchronous functions called inline from the async handlers, the runtime is
+built with tokio's defaults (one worker per core), and a scan never yields:
+it is a loop over the table inside one read transaction. A `count` with no
+usable index is the whole collection. Sixty-four of them against ten workers
+is every worker running a scan and six more queued on each, and a scrape
+arriving then sits on a worker's queue behind whole scans — as does
+`/v1/version`, which touches no storage at all, and the timer that would have
+enforced the request timeout, which is itself a task that needs a worker.
+Measured on one ten-core machine, a 30,000-document collection and one
+probe per second with a 5 s timeout, median latency of each probe with 0, 8,
+32 and 64 counters: `/metrics` 0.7, 3.7, 135 and 258 ms; `/v1/version` 0.8,
+2.3, 149 and 273 ms; a `limit: 1` `find` 0.9, 2.5, 149 and 258 ms. The three
+move together, and they track the count's own latency (44, 189 and 296 ms),
+which is what queueing behind it looks like. Restricting the runtime to two
+workers over 300,000 documents reproduced the round's failures outright:
+ten of fourteen scrapes past 5 s, and eleven of thirteen `/v1/version` and
+`find` probes with them. With eight counters against ten workers every probe
+stayed at about 2 ms: the two idle workers served them.
+
+`block_in_place` is the fix already in the tree for this shape of problem.
+Before the walk the worker gives its queue to another thread and carries on
+with the walk on the thread it has; the runtime spawns or wakes a thread to
+take the queue, bounded by tokio's blocking-thread limit. The same cells
+afterwards: `/metrics` at 64 counters over 300,000 documents fell from a
+2.5 s median and 4.6 s p99 to 0.7 ms and 30 ms, and on the two-worker
+runtime from ten failures in fourteen to none in sixty at 0.8 ms; `count`
+throughput was 20.7 against 19.9 requests/s on ten workers and rose from
+8.7 to 21.3 on two, because the scans now run on as many threads as there
+are scans rather than as many as there are workers. Over the 30,000-document
+collection, interleaved runs of the two binaries gave 214 against 216
+counts/s at 64 clients and 213 against 212 at 8 — no cost to read throughput
+on either side of the worker count.
+
+The primary-key probe is left where it was because the cost of
+`block_in_place` is a thread hand-off per call, paid before any work is done,
+and a point read is the one path where that would be a measurable fraction:
+it reads one page. A walk pays the hand-off once and amortises it over the
+collection.
+
+**Alternatives.** *`spawn_blocking` for the scan.* Rejected: it needs the
+closure to be `Send` and `'static`, which the streaming visitor over a
+borrowed `Recheck` is not, and it moves the work to another thread where
+`block_in_place` keeps it on this one; the tree already chose the latter for
+writes (ADR-151), and one mechanism is easier to reason about than two.
+*Wrapping the handlers rather than the scan.* Rejected: MCP's `find`, `count`
+and `aggregate` call the same `exec` functions and would have been missed,
+and the primary-key path would have paid the hand-off. *More workers.*
+Rejected: the number of scans in flight is the client's to choose, and any
+fixed count is one fewer than the next load. *A dedicated pool with a
+bounded number of concurrent scans, refusing or queueing the rest.* Not
+taken here: it is a capacity decision with a client-visible refusal, and the
+worker-starvation defect is fixed without it; it remains the right shape if a
+node is ever to promise read latency under an unbounded scan load.
+*Yielding inside the walk every N records.* Rejected: it would hold a redb
+read transaction across await points and change every storage visitor's
+signature to fix what one call to the existing helper fixes.
+
+**What was measured about resident memory, and what was not found.** The
+same round recorded freshly restarted, idle members at 794–927 MiB of
+`kimmy_process_resident_bytes` over files of 2.5–3.2 GB with a 256 MiB page
+cache — seventeen times what members with small files read — and asked what
+scales with the file. From source, three things at open read the whole oplog:
+the arrival-index check (two walks, removed above), and
+`rebuild_version_vector_if_stale`, which decodes every oplog key to raise the
+stored vector and cannot know it has nothing to raise without looking. redb's
+own per-database state outside the page cache is bitmaps over at most a
+million pages per 4 GiB region — under 1 MiB per region — and its cache is a
+hard bound on read pages plus write buffer together. Measured on one machine
+(macOS, so the trend and not the figure): the release binary opened on files
+of 133 MiB, 1.0 GiB and 3.0 GiB of 1 KiB documents and left idle for two
+minutes read 118, 382 and 362–397 MiB resident with the 256 MiB cache, and
+97, 104 and 104 MiB with a 64 MiB cache. The floor follows the cache setting
+and stops following the file once the file exceeds the cache: about 1.5× the
+cache plus a 35 MiB process, the excess over the cache being what the
+allocator keeps of the page buffers the open-time walks churned through it.
+A file closed without redb's allocator state, so that the open ran redb's
+repair walk, idled at 392 MiB against 382. The three walks cost time rather
+than memory: the 3.0 GiB file took 22–25 s to open before this change and
+11–15 s after, all of it now the version vector's walk. Nothing found here
+scales resident memory with the file, and the round's figure is not
+reproduced on this machine; the candidates that remain are recorded in the
+investigation's report rather than here, because none is established.
+
+**Cost.** One thread hand-off per walking read, and under a scan storm as
+many OS threads as scans (bounded by tokio's blocking limit of 512) rather
+than as many as cores — more context switching, which the interleaved
+measurement above did not detect in throughput, and one allocator heap per
+thread rather than per worker: after sixty-four concurrent counts over a
+312 MiB file, resident memory settled at 403 MiB against 366 MiB before this
+change, from the same 227 MiB idle, and stayed there — the retention ADR-117
+and ADR-147 record, spread over more heaps. The version vector's walk at
+open is left as it is: removing it means either trusting the stored vector
+outright, which ADR-054's repair case forbids, or keeping a per-origin
+high-water mark the oplog does not hold, which is a format change. `kimmy_runtime_stall_seconds`
+no longer reports a scan as a stall, which is correct: a scan no longer stalls
+the runtime. The test is `crates/kimmy-api/tests/scan_yields.rs`: on a
+one-worker runtime, a task spawned while a `count` over 30,000 documents is
+running is polled before the count finishes; before this change it was polled
+19 µs after.
+
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
 **Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a
