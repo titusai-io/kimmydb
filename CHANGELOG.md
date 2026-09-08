@@ -32,6 +32,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   correct today; what was missing was anything that would notice when it
   stopped being.
 
+### Documentation
+
+- **The query-language page no longer says a `$expr` literal is refused with
+  the filter message.** It listed "a literal anywhere in a `$expr`
+  expression" among the positions refused as *cannot be compared in a
+  filter*; the server hands `$expr` to the expression parser, so the refusal
+  is *a Decimal128 literal is not supported in an expression*, which the HTTP
+  API and aggregation pages already said. The sentence now says so and points
+  at them. Found by the 0.25.0 test round's Decimal128 cases, which assert
+  the message and not only the status.
 ## 0.25.0 - 2026-09-07
 
 ### Changed
