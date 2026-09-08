@@ -8,7 +8,7 @@ use kimmy_core::{
     CollectionId, Error as CoreError, Hlc, HlcClock, NodeId, OpKind, OplogEntry, Stamp, vector_meta,
 };
 use parking_lot::{Condvar, Mutex};
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -650,7 +650,14 @@ impl Engine {
             let txn = db.begin_read()?;
             let oplog = txn.open_table(tables::OPLOG)?;
             let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
-            if oplog.iter()?.count() == arrival.iter()?.count() {
+            // `len()` is the count redb keeps in each table's root header,
+            // read without visiting a page of the table. This used to be
+            // `iter().count()` on both, which walked the whole oplog and the
+            // whole index through the page cache on every open — at a 4 GiB
+            // file, the oplog twice over before the node served anything
+            // (ADR-153's investigation; the third walk, the version vector's,
+            // is recorded there as the one that remains).
+            if oplog.len()? == arrival.len()? {
                 return Ok(());
             }
         }
@@ -1927,6 +1934,84 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A file backend that counts the bytes redb asks it for.
+    ///
+    /// What an open *reads* is not observable from outside otherwise: redb's
+    /// cache statistics are behind a feature this crate does not enable, and
+    /// timing a walk is a flaky proxy for it. The backend is where every page
+    /// miss ends, so its count is the walk.
+    #[derive(Debug)]
+    struct CountingBackend {
+        inner: redb::backends::FileBackend,
+        read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl redb::StorageBackend for CountingBackend {
+        fn len(&self) -> std::result::Result<u64, std::io::Error> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
+            self.read.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
+            self.inner.write(offset, data)
+        }
+    }
+
+    /// The arrival-index staleness check reads two table headers, not two
+    /// tables (ADR-153's investigation).
+    ///
+    /// It compared the lengths by iterating both tables to the end, which on
+    /// every open walked the whole oplog and the whole index through the page
+    /// cache before the node served anything. Sixteen thousand kilobyte
+    /// documents make an oplog of over 16 MiB; the check is run on a database
+    /// opened with a 1 MiB cache, so a walk cannot be hidden in it, and the
+    /// bytes the backend was asked for are asserted to be a small fraction of
+    /// the table rather than the table.
+    #[test]
+    fn the_arrival_index_check_reads_headers_not_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.redb");
+        {
+            let engine = super::Engine::open(&path).unwrap();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            let filler = "x".repeat(1_000);
+            for _ in 0..16 {
+                let docs =
+                    (0..1_000).map(|i| bson::doc! { "n": i, "body": filler.clone() }).collect();
+                engine.insert_many(&coll, docs).unwrap();
+            }
+        }
+        let oplog_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(oplog_bytes > 16 << 20, "the fixture must be larger than the cache by far");
+
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let backend = CountingBackend {
+            inner: redb::backends::FileBackend::new(file).unwrap(),
+            read: std::sync::Arc::clone(&read),
+        };
+        let db = Database::builder().set_cache_size(1 << 20).create_with_backend(backend).unwrap();
+        // The open itself reads what it reads; only the check is measured.
+        read.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        super::Engine::rebuild_arrival_index_if_stale(&db).unwrap();
+
+        let checked = read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            checked < 256 << 10,
+            "the staleness check read {checked} bytes of a {oplog_bytes}-byte database: it \
+             walked the tables rather than reading their headers"
+        );
+    }
+
     #[test]
     fn dropping_the_last_collection_removes_the_database() {
         let dir = tempfile::tempdir().unwrap();
