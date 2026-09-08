@@ -850,6 +850,17 @@ where
         });
     }
 
+    // From here the read is a walk — of an index range or of the collection —
+    // and it runs under `blocking` for the reason a write's wait for the
+    // writer does (ADR-153): a walk is as long as the collection, it never
+    // yields, and one per worker is every worker gone. Sixty-four `count`
+    // clients over 300,000 documents on a two-worker runtime held every
+    // scrape of `/metrics`, every `/v1/version` and every one-document `find`
+    // past a 5 s timeout; the scan was the only thing running. Under
+    // `block_in_place` the runtime hands the worker's queue to another thread
+    // and the walk keeps the thread it is on. The primary-key probes above
+    // stay inline: each is one page read, and the cost of giving up a worker
+    // for it would be paid on the fastest path there is.
     let mut plan = plan::choose(filter, &meta.indexes);
     let mut entries = None;
     let mut unkeyed = None;
@@ -875,10 +886,11 @@ where
             }
             Order::Any => kimmy_storage::CandidateOrder::Any,
         };
-        let outcome =
+        let outcome = kimmy_storage::blocking(|| {
             state.engine.visit_index_candidates(meta, &scan, delivery, |_, stamp, doc| {
                 Ok(recheck.take(stamp, doc))
-            })?;
+            })
+        })?;
         match outcome {
             Some(outcome) => {
                 entries = Some(outcome.entries);
@@ -888,9 +900,11 @@ where
         }
     }
     if plan.is_none() {
-        state
-            .engine
-            .for_each_record_after(meta, after, |_, stamp, doc| Ok(recheck.take(stamp, doc)))?;
+        kimmy_storage::blocking(|| {
+            state
+                .engine
+                .for_each_record_after(meta, after, |_, stamp, doc| Ok(recheck.take(stamp, doc)))
+        })?;
     }
 
     Ok(QueryStats {

@@ -1261,9 +1261,12 @@ without a log line ([ADR-147](decisions.md) has the record). What holds the
 memory there is not settled, and nothing is tuned for it yet — a knob set
 before the cause is known is a knob that is wrong for the next cause. In the
 order the source supports: the allocator's per-thread heaps (every find,
-aggregation, sync round and retention pass runs on a long-lived worker
-thread, and mimalloc returns a thread's freed segments on its own delayed
-schedule — the figure ADR-117 measured and did not chase); concurrent
+aggregation, sync round and retention pass allocates on the thread that runs
+it — a runtime worker, or that same thread turned blocking under
+`block_in_place` for a walk since [ADR-151](decisions.md) and
+[ADR-153](decisions.md) — and mimalloc returns a thread's freed segments on
+its own delayed schedule — the figure ADR-117 measured and did not chase);
+concurrent
 aggregations, each of which may hold up to 100,000 documents per stage while
 it runs, which explains a climb but not a hold; HNSW graphs above the
 estimate their budget is enforced by; and sync rounds allocating while the
