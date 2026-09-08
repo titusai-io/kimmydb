@@ -11458,11 +11458,15 @@ indexed by nothing, are found by a scan under a read transaction that visits
 at most 100,000 documents per pass and resumes on the next pass where it
 stopped, and are removed the same way; a tombstone the scan saw is removed only
 if it is still the same record when the writer is held, so a document
-re-created at that key in between is data and is kept. The collector's ticker
-no longer catches up on missed ticks: a pass that overruns
-`storage.gc_interval_secs` is followed by the next a full interval after it
-finished, and is logged at `WARN`. The pass itself runs under `block_in_place`,
-so the worker it occupies gives up its queue.
+re-created at that key in between is data and is kept. The collector no longer
+runs on a ticker at all: it sleeps the whole of `storage.gc_interval_secs`
+*after* each pass, so a pass that overruns the interval is followed by the next
+a full interval after it finished, and is logged at `WARN`. A ticker cannot
+promise that — tokio's default catches up on every missed tick at once, and
+its `Delay` behaviour still fires the one tick that was already due the moment
+a late pass ends, so a pass that always overran would still chain. The pass
+itself runs under `block_in_place`, so the worker it occupies gives up its
+queue.
 
 Every write transaction queues at one gate in front of redb's writer lock,
 `parking_lot`'s mutex, which has two properties redb's does not: a wait that a

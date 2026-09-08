@@ -1394,19 +1394,19 @@ fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::
     );
 
     Some(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // A pass that overruns the interval must not be followed by the next
-        // one at once: the default catches up on missed ticks immediately,
-        // which ran passes back to back on a member whose pass took longer
-        // than the interval, and left its writer held almost continuously
-        // (ADR-151). Delay reschedules from when the late pass finished.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires immediately, which would collect during startup
-        // while the node is still opening for business. Skip it.
-        ticker.tick().await;
-
+        // A sleep of the whole interval *after* each pass, not a ticker. A
+        // pass that overruns the interval must not be followed by the next
+        // one at once: a ticker's default catches up on every missed tick
+        // immediately, which ran passes back to back on a member whose pass
+        // took longer than the interval and left its writer held almost
+        // continuously (ADR-151) — and its `Delay` behaviour still fires the
+        // one tick that was already due the moment the late pass ends, so a
+        // pass that always overruns would still chain. Sleeping after the
+        // pass is the only schedule under which the writer is guaranteed a
+        // full interval free between passes. It also means nothing collects
+        // during start-up, while the node is still opening for business.
         loop {
-            ticker.tick().await;
+            tokio::time::sleep(interval).await;
             let started = std::time::Instant::now();
             // A pass reads whole tables; on a cold cache that is minutes of
             // disk, and a worker thread must not be held for it.
