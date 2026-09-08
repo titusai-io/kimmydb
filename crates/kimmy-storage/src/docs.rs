@@ -18,7 +18,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
 use crate::codec;
-use crate::engine::{Engine, WriteTxn, append_oplog, doc_range_after};
+use crate::engine::{Engine, Position, WriteTxn, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
@@ -881,7 +881,7 @@ impl Engine {
         }
         let txn = self.begin_write()?;
         let RemoteApplied::Applied { id, violations } =
-            self.apply_remote_in_txn(&txn, coll, entry)?
+            self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)?
         else {
             // Nothing was written, so nothing is committed — a superseded
             // entry must not cost an fsync.
@@ -913,11 +913,17 @@ impl Engine {
     /// can be one commit rather than one per entry (ADR-119); on a
     /// three-member cluster the per-entry form replicated at 8–13 documents
     /// a second under `durable`, one fsync each.
+    ///
+    /// `position` says whether the appended entry moves this node's version
+    /// vectors: it does for a window served from this node's own position,
+    /// and must not for a snapshot document, whose coverage is granted once
+    /// when the snapshot completes (ADR-152; see [`Position`]).
     pub(crate) fn apply_remote_in_txn(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         entry: &OplogEntry,
+        position: Position,
     ) -> Result<RemoteApplied> {
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
@@ -987,7 +993,7 @@ impl Engine {
             violations
         };
 
-        append_oplog(txn, entry)?;
+        crate::engine::append_oplog_at(txn, entry, position)?;
 
         // Advance the local clock past what we just accepted, so a subsequent
         // local write is ordered after it.

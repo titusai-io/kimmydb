@@ -41,6 +41,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   retention, TTL and the embedding worker wait as long as it takes, as before.
   Writers now queue with eventual fairness, so a path that takes and releases
   the writer in a tight loop hands it over rather than winning every time.
+- **A snapshot repair now completes on a large database: it pulls the one
+  collection it was planned for, applies a page per commit, and resumes
+  across rounds from the last page applied.** A repair planned for one
+  divergent collection pulled the peer's *whole* database, one write
+  transaction per document, inside the 30-second round timeout — and a
+  snapshot that could not finish in 30 s was cut off mid-page and started
+  again from page one on the next round, three times, then cooled down for
+  five minutes and was planned again. On a three-member test cluster one
+  member spent 108 repair rounds in six minutes with its lag still growing
+  ([ADR-152](docs/decisions.md)). A snapshot is now scoped to the collection
+  being repaired (`AskSnapshot` carries the collection; a peer on an earlier
+  release ignores it and serves the whole database, so a rolling upgrade
+  needs no stop), every page is one transaction — none at all for a page the
+  member already holds — and where the pull stands is kept between rounds, so
+  a round that runs out of budget leaves its pages applied and the next round
+  continues from its cursor; only three rounds that apply *no* page abandon a
+  repair. The whole-database snapshot a member below a peer's retention
+  horizon pulls resumes the same way. Two rules changed with it, on purpose:
+  the coverage a completed snapshot grants is the peer's vector as served
+  with its *first* page, and a snapshot's documents no longer move the
+  receiver's version vectors as they land — the previous form could carry the
+  receiver's position past a document the peer wrote behind the cursor while
+  the snapshot ran, which nothing then re-served. A snapshot of a collection
+  the peer has since dropped carries the drop, so a member stopped at entries
+  for it records the tombstone rather than stopping forever. The round logs
+  one `INFO` line when it leaves a snapshot to resume, with pages, documents
+  and the cursor.
 
 ### Added
 

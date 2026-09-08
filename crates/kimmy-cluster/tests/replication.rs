@@ -967,7 +967,7 @@ async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node
             Some("by_email".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -975,7 +975,9 @@ async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
 
     a.engine.create_collection("shop", "orders").unwrap();
     a.engine
@@ -2236,7 +2238,7 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
             Some("by_email".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -2246,7 +2248,9 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
     // Granting B no coverage of another node's history: this fixture is
     // about the stored shape of the definition, nothing else.
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     assert!(
         b.engine
             .get_collection("shop", "orders")
@@ -2315,7 +2319,7 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
             Some("probe".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = Some(ancient);
@@ -2323,7 +2327,9 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     assert_eq!(
         b.engine.get_collection("shop", "orders").unwrap().index("probe").unwrap().created,
         Some(ancient),
@@ -2586,7 +2592,7 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
         .engine
         .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -2594,7 +2600,9 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    engine.apply_snapshot_page(&page).unwrap();
+    engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
     a.engine
         .create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))

@@ -1,4 +1,5 @@
-//! Catching up a peer whose history has been collected.
+//! Catching up a peer whose history has been collected, and repairing one
+//! collection on a peer that holds a hole in it.
 //!
 //! Anti-entropy works by replaying oplog entries, which only reaches back as
 //! far as `oplog_retention_secs`. A node joining a cluster older than that
@@ -13,9 +14,9 @@
 //!
 //! # Why documents arrive as oplog entries
 //!
-//! Each snapshot document is applied through the same `apply_remote` that
-//! replication uses, carrying the stamp the document actually has. That is not
-//! a trick to save code — it is what makes the result *correct*:
+//! Each snapshot document is applied through the same `apply_remote_in_txn`
+//! that replication uses, carrying the stamp the document actually has. That
+//! is not a trick to save code — it is what makes the result *correct*:
 //!
 //! - last-writer-wins still decides, so a receiver that already holds a newer
 //!   version of a document keeps it;
@@ -27,6 +28,52 @@
 //! Collection definitions are *not* logged, because unlike a document's stamp,
 //! this node holds no honest record of when or where the collection was created
 //! — only that it exists. Inventing history would be worse than omitting it.
+//!
+//! # A page is one transaction
+//!
+//! Every document of a page goes into one write transaction, committed once,
+//! and not at all when every document on the page lost last-writer-wins here
+//! — a page a member already holds must not cost an fsync (ADR-152). The
+//! first form of this restore applied one document per transaction, 512 per
+//! page, which on a member that already held the documents was hundreds of
+//! thousands of transactions taken and released against the single writer for
+//! a repair that changed nothing. What has to follow the commit — recording
+//! unique violations, publishing to change streams — is done after it, in
+//! document order, exactly as a replicated batch's run does (ADR-119).
+//! Collection definitions still go through the DDL path with transactions of
+//! their own, for the reason ADR-119 gives for a run ending at a schema change.
+//!
+//! # A snapshot can be of one collection
+//!
+//! A repair (ADR-148) is planned for *one* collection, and a snapshot scoped
+//! to it walks only that collection's key range and sends only its definition
+//! — or, when the sender has since dropped it, the drop's stamp, so the
+//! receiver records the tombstone and the entries it was stopped at become
+//! history rather than a stop that repeats. The whole-database snapshot
+//! remains what a member below a peer's retention horizon is served; a scoped
+//! one grants no coverage, because coverage is per origin and cannot be
+//! scoped to a collection.
+//!
+//! # A snapshot resumes, and the coverage it grants
+//!
+//! [`SnapshotProgress`] is what the receiver carries between pages and, since
+//! ADR-152, between rounds: a page applied stays applied, and the next round
+//! asks for the page after it rather than page one. The coverage a completed
+//! whole-database snapshot grants is the sender's vector **as served with the
+//! first page**, which the sender reads before that page's documents, and it
+//! is recorded only when the final page lands. The first page's, not the
+//! last's: a document the sender wrote *behind* the cursor while the snapshot
+//! ran is not in the snapshot, and the final page's vector covers its entry —
+//! adopting that would witness past an entry this node was never served, the
+//! hole ADR-148 exists to close. Every document committed before the first
+//! page's vector was read is at or ahead of the cursor when its range is
+//! walked, so the first page's vector never claims a document the snapshot
+//! did not carry; whatever the sender wrote after it is above that vector and
+//! the next round pulls it from the oplog, which is where it still is.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 
 use kimmy_core::{
     CollectionId, DocId, Hlc, IndexMeta, OpKind, OplogEntry, Stamp, VectorConfig, VersionVector,
@@ -36,8 +83,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::codec;
-use crate::engine::Engine;
+use crate::docs::RemoteApplied;
+use crate::engine::{Engine, Position};
 use crate::error::Result;
+use crate::meta::CollectionMeta;
+use crate::sync::Pending;
 use crate::tables;
 
 /// Documents per page.
@@ -59,6 +109,17 @@ pub struct SnapshotCursor {
     pub after_key: Vec<u8>,
 }
 
+/// `collection/hex-key`, for a log line that says where a snapshot stands.
+impl fmt::Display for SnapshotCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/", self.collection)?;
+        for byte in &self.after_key {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A collection's definition, without its documents.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CollectionState {
@@ -66,6 +127,12 @@ pub struct CollectionState {
     pub name: String,
     pub indexes: Vec<IndexMeta>,
     pub vector: Option<VectorConfig>,
+}
+
+impl From<CollectionMeta> for CollectionState {
+    fn from(meta: CollectionMeta) -> Self {
+        CollectionState { db: meta.db, name: meta.name, indexes: meta.indexes, vector: meta.vector }
+    }
 }
 
 /// One document, as it currently stands.
@@ -101,25 +168,137 @@ pub struct SnapshotApplied {
 /// One page of a snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotPage {
-    /// Collection definitions. Sent with the first page only.
+    /// Collection definitions. Sent with the first page only: every
+    /// collection for a whole-database snapshot, the one collection for a
+    /// scoped one — or none, when the sender no longer holds it.
     pub collections: Vec<CollectionState>,
     pub documents: Vec<SnapshotDoc>,
     /// Where to resume, or `None` when the snapshot is complete.
     pub next: Option<SnapshotCursor>,
-    /// The sender's coverage. Only adopted once `next` is `None`, because a
-    /// partial snapshot has not granted it yet.
+    /// The sender's coverage, read before this page's documents. A
+    /// whole-database snapshot grants the vector served with its *first*
+    /// page, and only once the final page has landed — see the module docs
+    /// for why that vector and not the last one. A scoped snapshot grants
+    /// none.
     pub versions: VersionVector,
+    /// For a snapshot of one collection the sender no longer holds: the
+    /// stamp of its drop, when a tombstone still records it. First page only,
+    /// and absent from a whole-database snapshot, whose receiver never had
+    /// the collection. Optional on the wire, because a sender that predates
+    /// the field never writes it (ADR-152).
+    #[serde(default)]
+    pub dropped: Option<Stamp>,
+}
+
+/// Where a snapshot pull stands on the receiver.
+///
+/// Carried between pages and, since ADR-152, between rounds: a page applied
+/// stays applied, and the next round asks for the page after it rather than
+/// page one. Holds the coverage a completed whole-database snapshot grants —
+/// the sender's vector as served with the first page — so that a snapshot
+/// resumed rounds later still adopts the one vector every document it carried
+/// is at or below.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotProgress {
+    /// The one collection the snapshot is of, or `None` for the whole
+    /// database.
+    scope: Option<CollectionId>,
+    /// Where the next page begins. `None` before the first page has been
+    /// applied, and again — with `complete` set — after the last.
+    after: Option<SnapshotCursor>,
+    /// The sender's vector as served with the first page; what the snapshot
+    /// grants once complete. `None` for a scoped snapshot, which grants
+    /// nothing, and before the first page.
+    granted: Option<VersionVector>,
+    /// Pages applied so far, across every round.
+    pages: usize,
+    /// Documents written so far — those that won last-writer-wins here.
+    documents: usize,
+    /// Whether the final page has been applied.
+    complete: bool,
+}
+
+impl SnapshotProgress {
+    /// A whole-database snapshot, not yet started: what a member below a
+    /// peer's retention horizon pulls.
+    pub fn whole_database() -> Self {
+        Self::new(None)
+    }
+
+    /// A snapshot of one collection, not yet started: what a repair pulls
+    /// (ADR-148).
+    pub fn of_collection(id: CollectionId) -> Self {
+        Self::new(Some(id))
+    }
+
+    fn new(scope: Option<CollectionId>) -> Self {
+        SnapshotProgress {
+            scope,
+            after: None,
+            granted: None,
+            pages: 0,
+            documents: 0,
+            complete: false,
+        }
+    }
+
+    /// The collection the snapshot is scoped to, if any.
+    pub fn scope(&self) -> Option<CollectionId> {
+        self.scope
+    }
+
+    /// Where the next page begins; what to ask the sender for.
+    pub fn after(&self) -> Option<&SnapshotCursor> {
+        self.after.as_ref()
+    }
+
+    /// Pages applied so far.
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    /// Documents written so far.
+    pub fn documents(&self) -> usize {
+        self.documents
+    }
+
+    /// Whether the final page has been applied.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 impl Engine {
-    /// Produce one page of a snapshot of current state.
-    pub fn snapshot_page(&self, after: Option<SnapshotCursor>) -> Result<SnapshotPage> {
-        // Definitions ride the first page, so the receiver can create the
-        // collections before any document needs one.
-        let collections = if after.is_none() { self.collection_states()? } else { Vec::new() };
+    /// Produce one page of a snapshot of current state: the whole database,
+    /// or — for a repair — the one collection `scope` names.
+    pub fn snapshot_page(
+        &self,
+        after: Option<SnapshotCursor>,
+        scope: Option<CollectionId>,
+    ) -> Result<SnapshotPage> {
+        // Read before the documents, on every page. The receiver adopts the
+        // first page's vector once the snapshot completes, and the order is
+        // what makes that safe: a document committed before this read is at
+        // or ahead of the cursor when its range is walked, so the vector
+        // never claims a document the snapshot does not carry. Read after
+        // the documents, as it was, it could name an entry for a document
+        // written behind the cursor in between.
+        let versions = self.version_vector()?;
 
-        let (documents, next) = self.snapshot_documents(after)?;
-        Ok(SnapshotPage { collections, documents, next, versions: self.version_vector()? })
+        // Definitions ride the first page, so the receiver can create the
+        // collections before any document needs one. For a scoped snapshot
+        // that is the one collection — or, when it is gone here, its drop.
+        let (collections, dropped) = match (after.is_none(), scope) {
+            (false, _) => (Vec::new(), None),
+            (true, None) => (self.collection_states()?, None),
+            (true, Some(id)) => match self.collection_by_id(id)? {
+                Some(meta) => (vec![CollectionState::from(meta)], None),
+                None => (Vec::new(), self.collection_dropped_at(id)?),
+            },
+        };
+
+        let (documents, next) = self.snapshot_documents(after, scope)?;
+        Ok(SnapshotPage { collections, documents, next, versions, dropped })
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
@@ -129,13 +308,8 @@ impl Engine {
         let mut out = Vec::new();
         for row in collections.iter()? {
             let (_, value) = row?;
-            let meta: crate::CollectionMeta = serde_json::from_slice(value.value())?;
-            out.push(CollectionState {
-                db: meta.db,
-                name: meta.name,
-                indexes: meta.indexes,
-                vector: meta.vector,
-            });
+            let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+            out.push(CollectionState::from(meta));
         }
         Ok(out)
     }
@@ -144,25 +318,53 @@ impl Engine {
     ///
     /// Walks the `docs` table in key order, which is `(collection, id)` — so a
     /// single cursor covers every collection without needing to track which one
-    /// is in progress.
+    /// is in progress, and a scoped snapshot is the same walk bounded to one
+    /// collection's key range.
     fn snapshot_documents(
         &self,
         after: Option<SnapshotCursor>,
+        scope: Option<CollectionId>,
     ) -> Result<(Vec<SnapshotDoc>, Option<SnapshotCursor>)> {
+        use std::ops::Bound;
+
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
 
         let mut out = Vec::new();
         let mut cursor = None;
+        let empty: &[u8] = &[];
 
         // `Excluded` on the resume point, so the document that ended the last
-        // page is not sent twice.
-        let start = match &after {
-            Some(c) => std::ops::Bound::Excluded((c.collection.0, c.after_key.as_slice())),
-            None => std::ops::Bound::Unbounded,
+        // page is not sent twice; from the scoped collection's first key
+        // otherwise, and from the beginning for the whole database.
+        let start = match (&after, scope) {
+            (Some(c), _) => Bound::Excluded((c.collection.0, c.after_key.as_slice())),
+            (None, Some(id)) => Bound::Included((id.0, empty)),
+            (None, None) => Bound::Unbounded,
+        };
+        // A scoped walk ends where the next collection's keys begin. The
+        // top id has no successor, and an unbounded end reads the same for
+        // it: nothing sorts after its keys.
+        let end = match scope.and_then(|id| id.0.checked_add(1)) {
+            Some(next_collection) => Bound::Excluded((next_collection, empty)),
+            None => Bound::Unbounded,
         };
 
-        for row in docs.range::<(u64, &[u8])>((start, std::ops::Bound::Unbounded))? {
+        // The key that ended a full page, kept only once the page is full.
+        let mut last_sent: Option<(u64, Vec<u8>)> = None;
+        for row in docs.range::<(u64, &[u8])>((start, end))? {
+            if out.len() >= SNAPSHOT_PAGE {
+                // Another row exists past a full page, so there is a next
+                // page; the cursor names the last document sent. Looking
+                // one row ahead is what lets a snapshot of exactly a page's
+                // worth end here rather than with an empty page after it.
+                cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
+                    collection: CollectionId(collection),
+                    after_key,
+                });
+                break;
+            }
+
             let (key, value) = row?;
             let (collection, doc_key) = key.value();
             let record = codec::decode_doc_record(value.value())?;
@@ -185,57 +387,185 @@ impl Engine {
                 stamp: record.stamp,
                 body: Some(record.body),
             });
-
-            if out.len() >= SNAPSHOT_PAGE {
-                cursor = Some(SnapshotCursor {
-                    collection: CollectionId(collection),
-                    after_key: doc_key.to_vec(),
-                });
-                break;
+            if out.len() == SNAPSHOT_PAGE {
+                last_sent = Some((collection, doc_key.to_vec()));
             }
         }
 
         Ok((out, cursor))
     }
 
-    /// Apply one page of a peer's snapshot.
-    pub fn apply_snapshot_page(&self, page: &SnapshotPage) -> Result<SnapshotApplied> {
+    /// Apply one page of a peer's snapshot, and move `progress` past it.
+    ///
+    /// The page's documents are one transaction: every one that wins
+    /// last-writer-wins is written into it through `apply_remote_in_txn`,
+    /// it is committed once if anything was written and aborted if nothing
+    /// was, and what has to follow the commit — unique-violation records,
+    /// change-stream publishes — is done after it in document order, the
+    /// shape `commit_run` gives a replicated batch (ADR-119, ADR-152). The
+    /// final page of a whole-database snapshot records the coverage the
+    /// snapshot grants in that same transaction. A failure after the commit
+    /// still advances `progress`: the page is durable, and asking for it
+    /// again would only re-apply it as superseded.
+    ///
+    /// `progress` is the receiver's, carried between pages and rounds; a
+    /// page applied under it is never asked for again.
+    pub fn apply_snapshot_page(
+        &self,
+        progress: &mut SnapshotProgress,
+        page: &SnapshotPage,
+    ) -> Result<SnapshotApplied> {
+        // Definitions first, through the DDL path with transactions of its
+        // own — the reason a replicated run ends at a schema change
+        // (ADR-119) — so every document below has a collection to land in.
         let mut ddl_refused = 0usize;
         for state in &page.collections {
             ddl_refused += self.restore_collection(state)?;
         }
+        if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
+            self.restore_collection_drop(id, dropped)?;
+        }
+
+        // The coverage a whole-database snapshot grants is the first page's
+        // vector (module docs), remembered here and recorded with the last.
+        if progress.scope.is_none() && progress.pages == 0 {
+            progress.granted = Some(page.versions.clone());
+        }
+        let complete = page.next.is_none();
+        let grant = if complete { progress.granted.as_ref() } else { None };
 
         let mut applied = 0usize;
-        for document in &page.documents {
-            let Some(collection) = self.collection_by_id(document.collection)? else {
-                // The definition should have arrived on the first page; a
-                // document without one means a truncated or reordered snapshot.
-                debug!(collection = document.collection.0, "snapshot document has no collection");
-                continue;
-            };
+        let mut failed = None;
+        if !page.documents.is_empty() || grant.is_some() {
+            // Resolved per distinct collection rather than per document —
+            // a page is one collection's worth of documents, usually — and
+            // outside the writer, from the state the definitions above left.
+            let mut collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>> =
+                HashMap::new();
+            let txn = self.begin_write()?;
+            let mut pending = Vec::new();
+            for document in &page.documents {
+                let collection = match collections.get(&document.collection) {
+                    Some(found) => found.clone(),
+                    None => {
+                        let found = self.collection_by_id(document.collection)?.map(Arc::new);
+                        collections.insert(document.collection, found.clone());
+                        found
+                    }
+                };
+                let Some(collection) = collection else {
+                    // The definition should have arrived on the first page;
+                    // a document without one means a truncated or reordered
+                    // snapshot.
+                    debug!(
+                        collection = document.collection.0,
+                        "snapshot document has no collection"
+                    );
+                    continue;
+                };
 
-            // Reconstructed as an ordinary replicated write, so last-writer-wins
-            // decides, indexes are maintained, and a unique violation is
-            // reported rather than smuggled past the check.
-            let entry = OplogEntry {
-                stamp: document.stamp,
-                kind: OpKind::Replace,
-                collection: collection.id,
-                doc_id: Some(document.id.clone()),
-                body: document.body.clone(),
-            };
-            if self.apply_remote(&collection, &entry)? {
-                applied += 1;
+                // Reconstructed as an ordinary replicated write, so
+                // last-writer-wins decides, indexes are maintained, and a
+                // unique violation is reported rather than smuggled past the
+                // check.
+                let entry = OplogEntry {
+                    stamp: document.stamp,
+                    kind: OpKind::Replace,
+                    collection: collection.id,
+                    doc_id: Some(document.id.clone()),
+                    body: document.body.clone(),
+                };
+                // `Hold`: a snapshot document must not move the vectors —
+                // the coverage is granted once, below, and the reason is on
+                // `Position::Hold`.
+                if let RemoteApplied::Applied { id, violations } =
+                    self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
+                {
+                    pending.push(Pending { collection, entry, id, violations });
+                }
+            }
+
+            // Only a *completed* snapshot grants coverage: adopting it
+            // earlier would stop the receiver asking for pages it has not
+            // been sent. It rides in the last page's transaction, so a
+            // snapshot costs no commit of bookkeeping (ADR-119's rule for a
+            // batch's vector).
+            let mut wrote = !pending.is_empty();
+            if let Some(granted) = grant {
+                wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
+            }
+            if wrote {
+                txn.commit()?;
+            } else {
+                // Nothing was written, so nothing is committed — a page
+                // this node already holds must not cost an fsync.
+                txn.abort()?;
+            }
+
+            // What had to wait for the commit, for every applied document
+            // whether or not an earlier report failed, and the first error
+            // afterwards: a report skipped for an entry that is already
+            // durable would never publish and never mint its violation
+            // (`commit_run`, ADR-029).
+            applied = pending.len();
+            let mut published = Vec::with_capacity(pending.len());
+            for Pending { collection, entry, id, violations } in pending {
+                match self.report_remote_write(&collection, &entry, &id, &violations) {
+                    Ok(entries) => published.extend(entries),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                    }
+                }
+            }
+            self.publish(published);
+        }
+
+        progress.after = page.next.clone();
+        progress.pages += 1;
+        progress.documents += applied;
+        progress.complete = complete;
+        if complete {
+            match progress.scope {
+                None => info!(
+                    pages = progress.pages,
+                    documents = progress.documents,
+                    "snapshot complete; the coverage it grants is recorded"
+                ),
+                Some(collection) => info!(
+                    %collection,
+                    pages = progress.pages,
+                    documents = progress.documents,
+                    "snapshot of the collection complete"
+                ),
             }
         }
-
-        // Only a *completed* snapshot grants coverage: adopting it earlier would
-        // stop the receiver asking for pages it has not been sent.
-        if page.next.is_none() {
-            self.absorb_version_vector(&page.versions)?;
-            info!("snapshot complete");
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(SnapshotApplied { applied, ddl_refused }),
         }
-        Ok(SnapshotApplied { applied, ddl_refused })
+    }
+
+    /// Record the sender's drop of the one collection a scoped snapshot is
+    /// of, so the entries this node was stopped at for it become history
+    /// (ADR-148's tombstone rule) rather than a stop that repeats for the
+    /// life of the process.
+    ///
+    /// Only for a collection this node has no record of, which is the one
+    /// case a scoped snapshot is planned for; a collection standing here
+    /// under the id is left alone, since the drop rules (ADR-034, ADR-123)
+    /// settle that through the oplog and not through a snapshot.
+    fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
+        if self.collection_by_id(id)?.is_some() {
+            debug!(collection = %id, "a snapshot carried a drop of a collection this node holds; ignored");
+            return Ok(());
+        }
+        warn!(
+            collection = %id,
+            stamp = ?dropped,
+            "the peer has dropped the collection this snapshot was to repair; its tombstone is \
+             recorded here so the entries addressed to it are history"
+        );
+        self.record_collection_drop(id, dropped)
     }
 
     /// Recreate a collection and its indexes from a snapshot.
@@ -370,19 +700,20 @@ mod tests {
         crate::meta::IndexField { path: path.into(), descending: false }
     }
 
-    /// Transfer a full snapshot from `from` into `into`.
-    fn transfer(into: &Engine, from: &Engine) -> usize {
-        let mut cursor = None;
+    /// Transfer a snapshot from `from` into `into` under `progress`, page by
+    /// page, exactly as the transport does across its rounds.
+    fn transfer_under(into: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> usize {
         let mut applied = 0;
-        loop {
-            let page = from.snapshot_page(cursor.clone()).unwrap();
-            applied += into.apply_snapshot_page(&page).unwrap().applied;
-            match page.next {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            applied += into.apply_snapshot_page(progress, &page).unwrap().applied;
         }
         applied
+    }
+
+    /// Transfer a full snapshot from `from` into `into`.
+    fn transfer(into: &Engine, from: &Engine) -> usize {
+        transfer_under(into, from, &mut SnapshotProgress::whole_database())
     }
 
     /// A `(db, name)` whose derived id has the top bit set — the half of the
@@ -407,7 +738,7 @@ mod tests {
             a.insert(&ca, doc! { "_id": i }).unwrap();
         }
 
-        let page = a.snapshot_page(None).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
         assert!(page.next.is_some(), "the cursor must be exercised too");
         let bytes = bson::serialize_to_vec(&page).expect("a page must always encode");
         let back: SnapshotPage = bson::deserialize_from_slice(&bytes).unwrap();
@@ -456,8 +787,10 @@ mod tests {
         let cb = b.create_collection("shop", "orders").unwrap();
         b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
-        let page = a.snapshot_page(None).unwrap();
-        let outcome = b.apply_snapshot_page(&page).expect("the page applies");
+        let page = a.snapshot_page(None, None).unwrap();
+        let outcome = b
+            .apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page)
+            .expect("the page applies");
         assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
         assert_eq!(outcome.applied, 2, "the documents restore: {outcome:?}");
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -483,13 +816,15 @@ mod tests {
         a.insert(&ca, doc! { "_id": "a-1", "tags": ["x"] }).unwrap();
         b.create_collection("shop", "orders").unwrap();
 
-        let mut page = a.snapshot_page(None).unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
         for state in &mut page.collections {
             for index in &mut state.indexes {
                 index.expire_after_secs = Some(60);
             }
         }
-        let outcome = b.apply_snapshot_page(&page).expect("a refused index must not fail the page");
+        let outcome = b
+            .apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page)
+            .expect("a refused index must not fail the page");
         assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
         assert_eq!(outcome.applied, 1, "the documents restore: {outcome:?}");
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -544,15 +879,15 @@ mod tests {
             Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1)),
         );
 
-        let page = a.snapshot_page(None).unwrap();
-        let into_b = b.apply_snapshot_page(&page).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let into_b = b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
         assert_eq!(into_b.ddl_refused, 0, "the later definition is not a refusal: {into_b:?}");
         assert!(
             b.get_collection("shop", "orders").unwrap().index("by_item").unwrap().unique,
             "the snapshot's definition is the later one and replaces B's"
         );
 
-        let into_c = c.apply_snapshot_page(&page).unwrap();
+        let into_c = c.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
         assert_eq!(
             into_c.ddl_refused, 0,
             "an older definition is history, not a refusal: {into_c:?}"
@@ -577,6 +912,258 @@ mod tests {
 
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(b.count(&cb).unwrap(), total as u64, "every page must arrive exactly once");
+    }
+
+    /// The transaction rule (ADR-152): a page of `SNAPSHOT_PAGE` documents is
+    /// one commit on the receiver — the final page's coverage included, so a
+    /// snapshot that fits one page is one commit in all — where it was one
+    /// per document. Fails on the per-document form with a delta of 512.
+    #[test]
+    fn a_snapshot_page_is_one_commit_however_many_documents_it_holds() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..SNAPSHOT_PAGE as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        // The collection is here already, so the page's definitions cost no
+        // DDL commit and what is measured is the documents alone.
+        b.create_collection("shop", "orders").unwrap();
+
+        let page = a.snapshot_page(None, None).unwrap();
+        assert_eq!(page.documents.len(), SNAPSHOT_PAGE);
+        assert!(page.next.is_none(), "exactly a page's worth ends the snapshot without a trailer");
+
+        let before = b.commits();
+        let mut progress = SnapshotProgress::whole_database();
+        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert_eq!(outcome.applied, SNAPSHOT_PAGE);
+        assert_eq!(b.commits() - before, 1, "one page, one commit, coverage included");
+        assert!(progress.is_complete());
+        assert!(
+            b.version_vector().unwrap().covers(&page.versions),
+            "and the coverage rode in that commit"
+        );
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE);
+    }
+
+    /// The other half of the rule: a page whose every document this node
+    /// already holds — the ordinary case for a repair, which re-sends a
+    /// collection the member mostly has — writes nothing and commits
+    /// nothing. Fails on the per-document form, which aborted 512 times and
+    /// committed none, but only because it never opened the page's own
+    /// transaction; here the page's transaction is opened and let go.
+    #[test]
+    fn a_page_whose_documents_are_all_superseded_commits_nothing() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 1) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+
+        // Again, scoped: a repair's shape, and the shape with no coverage to
+        // record on the final page either.
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        let before = b.commits();
+        let first = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert!(first.next.is_some());
+        let outcome = b.apply_snapshot_page(&mut progress, &first).unwrap();
+        assert_eq!(outcome.applied, 0, "every document already here: {outcome:?}");
+        let last = a.snapshot_page(progress.after().cloned(), Some(ca.id)).unwrap();
+        assert!(last.next.is_none());
+        let outcome = b.apply_snapshot_page(&mut progress, &last).unwrap();
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(b.commits() - before, 0, "a superseded page must not cost a commit");
+        assert!(progress.is_complete());
+        assert_eq!(progress.documents(), 0);
+        assert_eq!(progress.pages(), 2);
+    }
+
+    /// A scoped snapshot (ADR-152) carries one collection: its definition on
+    /// the first page, its documents and nothing else's, a cursor that
+    /// resumes inside it, and an end at the collection's end. It grants no
+    /// coverage, because coverage is per origin and cannot be scoped.
+    #[test]
+    fn a_snapshot_scoped_to_one_collection_carries_only_that_collection() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        // Three collections, so the scoped one has neighbours on both sides
+        // of its key range whichever ids the names derive.
+        let mut ids = Vec::new();
+        for name in ["alpha", "orders", "zeta"] {
+            let c = a.create_collection("shop", name).unwrap();
+            for i in 0..10i64 {
+                a.insert(&c, doc! { "_id": i, "in": name }).unwrap();
+            }
+            ids.push(c.id);
+        }
+        let orders = a.get_collection("shop", "orders").unwrap();
+        for i in 10..(SNAPSHOT_PAGE as i64 + 5) {
+            a.insert(&orders, doc! { "_id": i, "in": "orders" }).unwrap();
+        }
+        let b_before = b.version_vector().unwrap();
+
+        let first = a.snapshot_page(None, Some(orders.id)).unwrap();
+        assert_eq!(first.collections.len(), 1, "the one definition: {:?}", first.collections);
+        assert_eq!(first.collections[0].name, "orders");
+        assert_eq!(first.documents.len(), SNAPSHOT_PAGE);
+        assert!(first.documents.iter().all(|d| d.collection == orders.id));
+        let cursor = first.next.clone().expect("more of the collection follows");
+        assert_eq!(cursor.collection, orders.id, "the cursor is inside the collection");
+        assert_eq!(first.dropped, None);
+
+        let last = a.snapshot_page(Some(cursor), Some(orders.id)).unwrap();
+        assert!(last.collections.is_empty(), "definitions ride the first page only");
+        assert_eq!(last.documents.len(), 5, "the rest of the collection and nothing else");
+        assert!(last.documents.iter().all(|d| d.collection == orders.id));
+        assert!(last.next.is_none(), "ends at the collection's end");
+
+        let mut progress = SnapshotProgress::of_collection(orders.id);
+        assert_eq!(b.apply_snapshot_page(&mut progress, &first).unwrap().applied, SNAPSHOT_PAGE);
+        assert_eq!(b.apply_snapshot_page(&mut progress, &last).unwrap().applied, 5);
+        assert!(progress.is_complete());
+        assert_eq!(progress.documents(), SNAPSHOT_PAGE + 5);
+
+        let ob = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&ob).unwrap() as usize, SNAPSHOT_PAGE + 5);
+        assert!(b.get_collection("shop", "alpha").is_err(), "a scoped snapshot brings one");
+        assert!(b.get_collection("shop", "zeta").is_err());
+        // B's own origin moved — creating the collection here minted an
+        // entry — and A's did not: a scoped snapshot grants no coverage, and
+        // its documents move no vector either. The position carries the rest.
+        assert_eq!(b.version_vector().unwrap().get(a.node_id()), b_before.get(a.node_id()));
+        assert_eq!(b.witnessed_vector().unwrap().get(a.node_id()), Hlc::ZERO);
+
+        // The whole-database snapshot is what it was: every collection,
+        // every document, coverage at the end.
+        let (c, _dc) = engine();
+        assert_eq!(transfer(&c, &a), 30 + SNAPSHOT_PAGE - 5);
+        for name in ["alpha", "orders", "zeta"] {
+            assert!(c.get_collection("shop", name).is_ok(), "{name}");
+        }
+        assert!(c.version_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// The last collection in id order is scoped by a range with no upper
+    /// bound, and a scope on an id with no successor must not panic or
+    /// overrun; both are the same walk bounded correctly.
+    #[test]
+    fn a_scoped_snapshot_of_the_top_id_walks_to_the_end_of_the_table() {
+        let (a, _da) = engine();
+        let names = ["alpha", "beta", "gamma", "delta"];
+        for name in names {
+            let c = a.create_collection("shop", name).unwrap();
+            a.insert(&c, doc! { "_id": 1, "in": name }).unwrap();
+        }
+        let top = names
+            .iter()
+            .map(|name| a.get_collection("shop", name).unwrap())
+            .max_by_key(|c| c.id.0)
+            .unwrap();
+        let page = a.snapshot_page(None, Some(top.id)).unwrap();
+        assert_eq!(page.documents.len(), 1, "{:?}", page.documents);
+        assert_eq!(page.documents[0].collection, top.id);
+        assert!(page.next.is_none());
+
+        // And an id nothing derives, at the very top: an empty snapshot,
+        // not a panic on the successor.
+        let page = a.snapshot_page(None, Some(CollectionId(u64::MAX))).unwrap();
+        assert!(page.collections.is_empty() && page.documents.is_empty() && page.next.is_none());
+    }
+
+    /// The coverage a snapshot grants is the vector served with its first
+    /// page (ADR-152). A document the sender writes behind the cursor while
+    /// the snapshot runs is not carried, and its entry sits above that vector
+    /// — so the receiver still asks for it — where the final page's vector
+    /// covers it and would have left a hole nothing re-serves. A document
+    /// written ahead of the cursor is carried, and is above the vector too,
+    /// which only costs a superseded re-delivery — and applying it must not
+    /// move the vector to its stamp either, which is what appending a
+    /// replicated entry does for a window and what the first form of this
+    /// restore did per document: that carried the position over the
+    /// document behind the cursor just the same.
+    #[test]
+    fn the_coverage_a_snapshot_grants_is_the_vector_served_with_its_first_page() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 1) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let mut progress = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(None, None).unwrap();
+        let first_vector = first.versions.clone();
+        b.apply_snapshot_page(&mut progress, &first).unwrap();
+        assert!(!progress.is_complete());
+
+        // Between pages: one document behind the cursor, one ahead of it.
+        // Int64 keys sort numerically, so -1 is behind every id sent.
+        a.insert(&ca, doc! { "_id": -1, "written": "behind" }).unwrap();
+        a.insert(&ca, doc! { "_id": 100_000, "written": "ahead" }).unwrap();
+        let last = a.snapshot_page(progress.after().cloned(), None).unwrap();
+        assert!(last.next.is_none());
+        assert!(last.versions != first_vector, "the final page's vector names the new writes");
+        b.apply_snapshot_page(&mut progress, &last).unwrap();
+        assert!(progress.is_complete());
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::Int64(100_000)).unwrap().is_some(), "ahead: carried");
+        assert!(b.get(&cb, &DocId::Int64(-1)).unwrap().is_none(), "behind: not carried");
+        let granted = b.witnessed_vector().unwrap();
+        assert!(granted.covers(&first_vector), "the first page's vector was adopted");
+        assert!(
+            !granted.covers(&last.versions),
+            "and not the last page's: the receiver still asks for what was written behind \
+             the cursor"
+        );
+        assert_eq!(
+            granted.behind(&a.version_vector().unwrap()),
+            Some(first_vector.get(a.node_id())),
+            "the next round asks from where the snapshot's vector left it"
+        );
+    }
+
+    /// A scoped snapshot of a collection the sender has since dropped
+    /// carries the drop (ADR-152): the receiver, which was stopped at
+    /// entries for a collection it has no record of, records the tombstone
+    /// and those entries are history on the next batch rather than a stop
+    /// that repeats.
+    #[test]
+    fn a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        let entry = a.entries_for_peer(Hlc::ZERO, 10).unwrap().entries.pop().unwrap();
+        assert_eq!(entry.collection, ca.id, "the insert, which B is about to be stopped at");
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped_at = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        // B has no record of the collection: the entry stops its batch.
+        let stopped = b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(stopped.unknown_collection, 1, "{stopped:?}");
+
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert!(page.collections.is_empty() && page.documents.is_empty(), "{page:?}");
+        assert_eq!(page.dropped, Some(dropped_at), "the drop travels in its place");
+        assert!(page.next.is_none());
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert!(progress.is_complete());
+        assert_eq!(b.collection_dropped_at(ca.id).unwrap(), Some(dropped_at));
+
+        let history = b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(history.unknown_collection, 0, "history now: {history:?}");
+        assert_eq!(history.superseded, 1, "{history:?}");
+        assert!(b.get_collection("shop", "orders").is_err(), "and nothing was resurrected");
+
+        // A whole-database snapshot never carries a drop: its receiver
+        // never had the collection.
+        assert_eq!(a.snapshot_page(None, None).unwrap().dropped, None);
     }
 
     #[test]

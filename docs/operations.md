@@ -263,6 +263,17 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > per such member; see "The divergence check" below for what that does to
 > `deferred` while the roll is in progress.
 
+> **Upgrading a cluster to a version whose snapshot repair pulls one
+> collection.** `AskSnapshot` gained an optional collection
+> ([ADR-152](decisions.md)), and neither side of the roll fails a round on it:
+> a member on an earlier release ignores the field and serves its whole
+> database, which the upgraded requester applies as it comes and logs once as
+> `the peer answered a snapshot of one collection with its whole database`; an
+> earlier-release requester sends no field and is served as it always was. A
+> repair against a not-yet-rolled peer therefore costs what it cost before the
+> roll, and completes once the peer is rolled. No stop, roll one member at a
+> time.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback
@@ -565,7 +576,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because the peer is behind this node — has not *processed* everything this node has ([ADR-146](decisions.md)) — and still catching up. `deferred` rising on a busy cluster is ordinary, and on a converged idle cluster it should not rise at all; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
 | `kimmy_sync_divergence_check_age_seconds` | Seconds since the last contact, with any peer, in which the check ran, as of the last sync tick; 0 before the first, when `ran` is also 0. **Alert on this above *k* × `cluster.sync_interval_secs`** (three is a reasonable *k*): the gauge above is then holding a value nothing has re-examined, whatever it reads — look at `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`. The one divergence series that keeps moving on a member whose every round fails, which leaves `ran` flat and the gauge serving its last value: measured on a three-member cluster, one member's gauge read 0 for half an hour after its last completed round ([ADR-145](decisions.md)) |
 | `kimmy_sync_entries_skipped_total{reason}` | Replicated entries a sync round left rather than took ([ADR-148](decisions.md)). **`unknown_collection`**: batches stopped at an entry for a collection this member has *no record of* — it neither holds the collection nor a tombstone for it — because the creation was witnessed here without being applied, or has aged out of the peer's oplog. One per stopped batch, at the entry the warning names. Nothing past the stop is witnessed, the same window is re-served every round, and the round plans a snapshot from that peer to bring the collection. A collection this member *dropped* is history and stops nothing, so an ordinary concurrent drop-and-write does not move this. **Alert on this sustained**: one or two while a creation propagates is ordinary, a rate that does not stop is a member that cannot place what its peers keep sending it, and `kimmy_sync_repair_rounds_total` is what says the snapshot is being pulled. **`beyond_advertised`**: entries above the vector the peer advertised before serving the window — it appended them in between — left for the next round, which asks for them from the right position. Ordinary and rare on a busy cluster; it is the counter for a race, not a fault |
-| `kimmy_sync_repair_rounds_total` | Sync rounds spent repairing against a peer ([ADR-148](decisions.md)): re-serving its oplog from a divergent collection's creation, window by window until one reaches the peer's tail, or pulling its snapshot. Rises after `kimmy_sync_divergent_collections` goes above 0, or after a batch stops at a collection this member lacks, and stops when the repair is done — so a burst here followed by the gauge returning to 0 is the repair working. Rising steadily while the gauge stays above 0 is a divergence the repair cannot close: the same collection is repaired again at most once every five minutes of rounds, and the warning at the time names it and the peer |
+| `kimmy_sync_repair_rounds_total` | Sync rounds spent repairing against a peer ([ADR-148](decisions.md)): re-serving its oplog from a divergent collection's creation, window by window until one reaches the peer's tail, or pulling its snapshot of that one collection — a page per commit, resumed on the next round from the last page applied when one round's budget is not enough ([ADR-152](decisions.md)). Rises after `kimmy_sync_divergent_collections` goes above 0, or after a batch stops at a collection this member lacks, and stops when the repair is done — so a burst here followed by the gauge returning to 0 is the repair working. A snapshot of a large collection is several rounds of this with an `INFO` line per round saying how many pages and documents landed and where the cursor stands; that is the repair working too. Rising steadily while the gauge stays above 0 with no page landing is a divergence the repair cannot close: a repair is abandoned after three rounds that apply nothing, the same collection is repaired again at most once every five minutes of rounds, and the warning at the time names it and the peer |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 | `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
@@ -601,11 +612,13 @@ when a member cannot place what it is being sent, and
 `kimmy_sync_repair_rounds_total`, which rises while the repair runs and stops
 when it is done ([ADR-148](decisions.md)). Since ADR-148 a confirmed
 divergence is repaired rather than only reported — the collection is re-served
-from its creation, or pulled as a snapshot — so the shape to expect is the
-gauge going above 0, repair rounds rising, and the gauge returning to 0. A
-gauge that stays above 0 while repair rounds keep rising is a divergence the
-repair cannot close, and the warning at the time names the collection and the
-peer.
+from its creation, or pulled as a snapshot of that one collection, a page per
+commit, across as many rounds as it needs ([ADR-152](decisions.md)) — so the
+shape to expect is the gauge going above 0, repair rounds rising, and the
+gauge returning to 0. A gauge that stays above 0 while repair rounds keep
+rising, with no `snapshot left to resume` line saying pages are landing, is a
+divergence the repair cannot close, and the warning at the time names the
+collection and the peer.
 
 **The reading to be careful of is no reading at all.** The check compares this
 member against a *peer*, so a hole no peer disagrees about is invisible to it:

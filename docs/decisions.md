@@ -6647,7 +6647,9 @@ also holds a second copy of each applied entry until it commits — the
 `Pending` list carries the entry and the document id, with the collection
 metadata shared through the batch's memo rather than copied — bounded by the
 batch size, 1,024 entries. Snapshot restore still applies one document per
-transaction; it is a one-time path and is left as it is.
+transaction; it is a one-time path and is left as it is — until
+[ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped), which makes a snapshot page one transaction too, because a
+repair made the path a recurring one.
 
 ---
 
@@ -10932,6 +10934,16 @@ fails, which logs its exit and is read as clean by the start after it.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
+> **Amended by [ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped).**
+> The snapshot a repair pulls is of the one collection the repair was
+> planned for, a page per commit, resumed across rounds from the last page
+> applied; a repair is abandoned only after `REPAIR_ATTEMPTS` rounds that
+> applied *nothing*, not after three in which a snapshot did not fit the
+> request timeout. The full-database snapshot "for a single dropped
+> collection" below, and the accidental carry of the position past the
+> stopped entry that its coverage performed, are both gone: a scoped
+> snapshot grants no coverage and carries the sender's drop instead.
+
 **Decision.** Three rules, one invariant.
 
 *A stamp is minted inside the write transaction that will carry its
@@ -11550,3 +11562,188 @@ summaries are bridged. *A configuration knob for the scan budget or the chunk
 size* was not added: the numbers bound a hold and a pass to what a member can
 carry at any size, and a knob set before anyone has measured a case the
 defaults do not fit is a knob that is wrong for that case.
+
+---
+
+## ADR-152 — A snapshot repair pulls one collection, a page per commit, and resumes where it stopped
+
+**Decision.** Five rules for a snapshot, on the receiving side unless said
+otherwise.
+
+*A page is one transaction.* `Engine::apply_snapshot_page` opens one write
+transaction for the page, applies every document of it through
+`apply_remote_in_txn`, commits once if anything was written and aborts if
+nothing was — a page a member already holds must not cost an fsync — and then
+does what has to follow the commit, recording unique violations and
+publishing to change streams, for the applied documents in order, the shape
+`commit_run` gives a replicated batch (ADR-119). Collection definitions on
+the first page still go through the DDL path with transactions of their own,
+for the reason ADR-119 gives for a run ending at a schema change. The final
+page of a whole-database snapshot records the coverage the snapshot grants
+inside that same transaction (`absorb_version_vector_in_txn`), so a snapshot
+that fits one page is one commit in all.
+
+*A repair's snapshot is scoped to the collection it was planned for.*
+`Message::AskSnapshot` gains `collection: Option<CollectionId>`. `None` is
+the whole-database snapshot a member below a peer's retention horizon needs,
+and is what it always was; `Some(id)` walks only that collection's key range
+in `docs` — the walk is the same, bounded — and the first page carries only
+that collection's definition or, when the sender has since dropped it, the
+drop's stamp (`SnapshotPage::dropped`), which the receiver records as a
+tombstone when it holds no collection under the id, so the entries it was
+stopped at become history under ADR-148's tombstone rule rather than a stop
+that repeats for the life of the process. A scoped snapshot grants no
+coverage: coverage is per origin and cannot be scoped to a collection, and
+the position the receiver already holds carries the rest — the window it was
+stopped at is re-served and, with the collection here, taken. The field is
+`#[serde(default)]`, the way `AskEntries::held` (ADR-097) and
+`AskVersions::witnessed` (ADR-146) crossed versions, and the handshake
+negotiates no version, so in the minutes a rolling roll has mixed versions:
+a sender that predates the field ignores it and serves its whole database,
+which the requester applies as it comes — the snapshot a repair pulled before
+this record, correct and only dearer, granting no coverage under a scope
+either — and logs once; a requester that predates it sends no scope and is
+served the whole database as before. Nothing is misread in either direction,
+and nothing fails; the mixed-version window costs what every repair cost
+until it closes.
+
+*A snapshot resumes across rounds.* Where a pull stands is a
+`kimmy_storage::SnapshotProgress` — the scope, the cursor after the last
+page applied, the coverage the completed snapshot will grant, and the pages
+and documents so far — and the transport keeps one per peer in `PeerStalls`
+beside the repairs, for the reason they are there: it is read and written
+inside the round, against the peer the round is with. It is moved after every
+page is applied and *before* the next frame is awaited, so a round the
+timeout cancels mid-frame, or one that fails, leaves every page it applied
+recorded, and the next round with that peer asks for the page after them
+rather than page one. Every page applied is the repair advancing: the
+repair's stall count is reset by the page, as a replay's is by a window that
+moved, so `REPAIR_ATTEMPTS` now counts rounds that landed *nothing*, and a
+slow-but-moving snapshot is never abandoned. The whole-database catch-up of a
+member below the horizon resumes the same way, and its progress is forgotten
+on a round in which the peer answers `Entries` — the position has moved on
+from the walk. `sync_once`, a round with no memory, starts one over, as it
+always did.
+
+*A round has a snapshot budget.* `REQUEST_TIMEOUT` still wraps the round;
+the pull is handed the round's deadline less `SNAPSHOT_PAGE_RESERVE` (five
+seconds) and checks it between pages, never inside one. A page in flight when
+the deadline passes is finished — it is one transaction — and its cursor
+recorded; what the reserve buys is that the round ends on a page boundary of
+its own choosing rather than wherever the timeout fell. A round that leaves a
+snapshot to resume logs one line at `INFO` with the pages and documents it
+applied and the cursor; a completed pull logs `caught up from a snapshot` as
+before, with the totals across rounds beside this round's.
+
+*The coverage a snapshot grants is the vector served with its first page, and
+a snapshot document moves no vector.* The sender reads its version vector
+*before* the page's documents, on every page. The receiver remembers the first
+page's and records it when the final page lands; the vectors served with
+later pages are not adopted. A snapshot document is appended to the oplog
+without raising the servable or witnessed vector to its stamp
+(`engine::Position::Hold`), where every other appended entry raises both
+(ADR-054). Both halves are the same rule: a snapshot is *state*, arriving in
+key order rather than stamp order, and the only vector every document it
+carried is at or below is the one read before any of them.
+
+**Why.** Measured in the 0.25.1 round on a three-member test cluster: one
+member spent 108 repair rounds in six minutes with its replication lag still
+growing, and the repair never completed. The mechanism was four defects in
+one path. `pull_snapshot` started every round from `cursor = None` and looped
+until `page.next` was `None`, inside the round's 30-second `REQUEST_TIMEOUT`;
+a snapshot that could not finish in 30 s was cancelled at whatever await point
+the timeout found, its page in flight lost, and the next round started from
+page one. `PeerStalls::repair_due` counted a repair that did not advance and
+abandoned it after `REPAIR_ATTEMPTS` rounds to a cooldown of
+`REPAIR_COOLDOWN_ROUNDS`, the divergence check then reported the collection
+again, and the same three rounds ran again — 108 rounds, three at a time, of
+page one. The snapshot a repair planned for *one* collection (ADR-148 carries
+the `CollectionId`) walked the whole `docs` table, every collection, so the
+work per round was the database's size and not the collection's. And each
+document was applied through `apply_remote`, one transaction per document, 512
+per page, most of them aborted as superseded on a member that already held
+the document: the tight take-and-release loop on the single writer that
+ADR-151's gate made fair, still hundreds of thousands of transactions for a
+repair that changed little. ADR-119 left the restore per document as "a
+one-time path"; a repair made it a recurring one.
+
+The fifth rule was found writing the third. With the restore resumed across
+rounds it was easy to see what the first form had done inside one: the
+sender's vector rode every page, read *after* that page's documents, and the
+receiver adopted the last one; and every document applied raised the
+receiver's vectors to its stamp as it landed. A document the sender wrote
+*behind* the cursor while the snapshot ran is not in the snapshot, and both
+the last page's vector and the stamp of any later document ahead of the cursor
+cover its entry — so the receiver's position moved past an entry it was never
+served, and nothing re-serves it (ADR-054): the hole ADR-148 closed for a
+window, opened by a snapshot on every page, inside one round then and across
+several now. The brief for this change asked that the vector adopted be the
+one served with the final page rather than an earlier round's; that is the
+direction that widens the hole, and the rule here is the other way for the
+reason above. Under-claiming is the safe error: the round after a snapshot
+asks from the first page's vector and is re-served whatever the sender wrote
+during it, superseded where the snapshot already carried it.
+
+**Alternatives.** *Leave whole-database snapshots and only page the
+commits.* Removes the per-document transactions and nothing else: a repair
+of one collection would still walk every collection, and still restart from
+page one when it did not fit the round; on the measured database the
+restart, not the commits, was what kept it from completing. *Carry the cursor
+on the wire instead of in the repair state.* The sender has no state to hold
+it in — it serves whatever cursor it is asked from, as it did — and the
+receiver is the side that knows what it applied; a cursor the receiver did
+not record is one it cannot trust. *Raise `REQUEST_TIMEOUT`.* Moves the size
+of database a repair can complete on, and lengthens every other round's
+failure with it; a snapshot of any size now completes at the same timeout,
+over as many rounds as it needs. *Adopt the vector served with the final
+page.* Rejected above. *Put the cursor on `Repair::Snapshot`.* The horizon
+catch-up needs the same home and is not a repair, so the progress lives
+beside the repairs and the repair's stall count is reset by the page; the
+enum stays a unit variant and `Copy`. *A new `/metrics` series for pages or
+documents applied.* `kimmy_sync_repair_rounds_total` already counts the
+rounds, the log line carries the page and document counts and the cursor,
+and a series that only moves during a repair reads 0 for ever after.
+
+**Cost.** One protocol field and one page field, both optional on the wire.
+`Engine::snapshot_page` takes the scope and `Engine::apply_snapshot_page`
+takes the progress; `SnapshotApplied` is unchanged. A snapshot document no
+longer raises the receiver's vectors as it lands; a member restarted between
+a snapshot's final page and its next round re-derives its vector from the
+oplog on open, which raises it to the highest snapshot entry it holds — the
+open-time raise ADR-036 made deliberate — and a document the sender wrote
+behind the cursor below that stamp is then not asked for. One round wide, and
+recorded rather than closed: closing it means opening not raising over
+entries a snapshot appended, which is a change to what opening means. A
+snapshot that runs longer than `oplog_retention_secs` grants a vector the
+sender can no longer serve from, and the receiver is told `BeyondHorizon`
+again and pulls again; a snapshot that long is a member that cannot keep up
+by any route. `restore_collection` still recreates a collection without
+consulting this node's own tombstones, as ADR-148 recorded; a scoped snapshot
+now carries the *sender's* drop, which is the other half of that case. The
+tests that pinned the per-document restore did not exist as such; the
+restore's tests are adapted to the progress and the new ones are below.
+
+**How it is tested.** By `kimmy-storage`'s
+`a_snapshot_page_is_one_commit_however_many_documents_it_holds` (a page of
+512, `Engine::commits` delta 1, coverage included),
+`a_page_whose_documents_are_all_superseded_commits_nothing` (delta 0 across
+a scoped snapshot a member already holds),
+`a_snapshot_scoped_to_one_collection_carries_only_that_collection` (one
+definition, only its documents, a cursor inside it, `next: None` at its end,
+no coverage, the whole-database snapshot beside it unchanged),
+`a_scoped_snapshot_of_the_top_id_walks_to_the_end_of_the_table`,
+`the_coverage_a_snapshot_grants_is_the_vector_served_with_its_first_page` (a
+document written behind the cursor between pages is still asked for; one
+written ahead is carried and moves no vector), and
+`a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone` (a batch
+stopped at the collection is history after the page); by `kimmy-cluster`'s
+`a_snapshot_cut_short_resumes_from_its_cursor_and_grants_the_first_pages_vector`
+and
+`a_snapshot_repair_pulls_one_collection_resumes_and_is_abandoned_only_when_nothing_lands`
+against fake peers over an in-process stream, driving `sync_round` with a
+spent and then an ample deadline — a page per round for twice
+`REPAIR_ATTEMPTS` rounds and the repair kept, three rounds landing nothing
+and the repair abandoned — and `ask_snapshot_crosses_a_version_boundary_in_both_directions`
+for the frame each side of an upgrade sees; and by the existing
+`kimmy-cluster/tests/replication.rs` snapshot and repair tests through the
+real loop, which now pull one collection.
