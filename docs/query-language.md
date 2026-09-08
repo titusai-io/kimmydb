@@ -286,8 +286,11 @@ so `{"v": {"$numberDecimal": "1.5"}}` would match every numeric `v` and
 could never use an index. It is refused instead, `400` with a message saying
 a Decimal128 *cannot be compared in a filter*: as a bare equality, under
 `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin` and `$all`, inside
-a document or array literal, under `$not` and `$elemMatch`, as an `_id`, and
-as a literal anywhere in a `$expr` expression. `$type: "decimal"` and
+a document or array literal, under `$not` and `$elemMatch`, and as an `_id`.
+A literal anywhere in a `$expr` expression is refused too, but by the
+expression parser, so that message is the one every expression gives — *a
+Decimal128 literal is not supported in an expression* ([HTTP API](http-api.md#the-json-boundary),
+[Aggregation](aggregation.md#not-supported)). `$type: "decimal"` and
 `$exists` compare nothing and find such documents as ever. The refusal is
 deliberate: through 0.24.0 the same filter was refused only by accident, as
 `unsupported operator "$numberDecimal"`, because the JSON edge did not read
