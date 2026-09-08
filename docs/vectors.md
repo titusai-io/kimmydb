@@ -538,6 +538,31 @@ k-NN returns the `k` nearest vectors, and "nearest" does not mean "similar". A
 query against wholly unrelated content still returns `k` results, with scores
 near zero. **Callers must threshold themselves.**
 
+### A repeated `query` is not guaranteed the same scores
+
+A search that sends `query` text embeds it through the provider on every
+request, and a provider may return a slightly different vector for the same
+text on repeated calls. The stored vectors and the scoring are deterministic;
+the query vector is the one input the server does not control. So two
+identical searches, on identical data, can answer with scores that differ in
+the low decimals — the whole result set shifted together, since one query
+vector scored every candidate — and a ranking that is normally unchanged. On
+a cluster this shows as one member's scores differing from the others' on
+one repetition and agreeing on the next: whichever member embedded the query
+that time is the one that shifted, not the one that holds different data.
+Nothing here promises otherwise, and a test that compared two such searches
+byte for byte would be testing the provider, not the server.
+
+**A client that needs reproducible scores supplies the query vector itself.**
+A request carrying `vector` never builds a provider ([above](#search)); the
+same vector against the same data scores identically on every call and on
+every member, by construction — that is `client-supplied-vectors`, and it is
+the form to use for a regression suite or for comparing members. The one
+determinism the server *does* promise about a server-embedded query is
+within the request: the approximate and the exact path agree on the nearest
+neighbour with a byte-identical score for the same query vector
+([below](#how-this-is-verified)).
+
 ---
 
 ## The two search paths
