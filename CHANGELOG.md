@@ -10,6 +10,28 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The metrics table in the operations guide is now held to what `/metrics`
+  actually renders.** The section promises that every series the endpoint
+  exposes has a row, and nothing in this repository checked it. It has been
+  wrong once: fourteen series were exposed with no row until the 0.20.0 test
+  round found them, a release after the last of them shipped, which is a
+  release in which nobody could have built a dashboard on the embedding
+  worker, the webhook block or either TTL counter without reading the source.
+  Every series since has landed with its row in the same commit
+  ([ADR-145](docs/decisions.md), [ADR-147](docs/decisions.md),
+  [ADR-148](docs/decisions.md) each did), but nothing required it. A test now
+  compares the rendered exposition against the table in both directions — a
+  series with no row fails, a row with no series fails — and requires every
+  label key a series carries to be named in its row, so a dimension you could
+  split on cannot go unpublished. It reads label keys and not their values, so
+  the values a row enumerates are still prose. The table is complete and
+  correct today; what was missing was anything that would notice when it
+  stopped being.
+
 ## 0.25.0 - 2026-09-07
 
 ### Changed

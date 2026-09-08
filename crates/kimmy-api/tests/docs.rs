@@ -153,19 +153,24 @@ fn the_threat_model_still_explains_what_the_marker_means() {
 /// The heading of the section this checks, and the level it sits at.
 const LEVELS_SECTION: &str = "#### What a failed request logs, and what to alert on";
 
-/// The lines of `operations.md` under [`LEVELS_SECTION`], to the next heading.
+/// The lines of `operations.md` under `heading`, to the next heading.
 ///
 /// Any heading, at any depth: the `skip(1)` has already eaten this section's
 /// own, so the first `#` after it belongs to something else. A sibling `####`
 /// would otherwise be absorbed, and its backticked prose read as part of the
 /// silent-code list — which could paper over a code deleted from the real one.
-fn levels_section(operations: &str) -> Vec<&str> {
+fn section<'a>(operations: &'a str, heading: &str) -> Vec<&'a str> {
     operations
         .lines()
-        .skip_while(|line| line.trim() != LEVELS_SECTION)
+        .skip_while(|line| line.trim() != heading)
         .skip(1)
         .take_while(|line| !line.starts_with('#'))
         .collect()
+}
+
+/// The lines of `operations.md` under [`LEVELS_SECTION`], to the next heading.
+fn levels_section(operations: &str) -> Vec<&str> {
+    section(operations, LEVELS_SECTION)
 }
 
 /// The `| \`code\` | \`LEVEL\` | …` rows of that section, as code and level.
@@ -320,6 +325,295 @@ fn operations_names_every_code_that_is_never_logged() {
         served.difference(&documented).collect::<Vec<_>>(),
         documented.difference(&served).collect::<Vec<_>>(),
     );
+}
+
+// ---------------------------------------------------------------------------
+// The metrics table lists every series `/metrics` exposes
+// ---------------------------------------------------------------------------
+//
+// The Metrics section of `docs/operations.md` says of its table that "every
+// series the endpoint exposes has a row", and until now nothing in this
+// repository made that true. It has been wrong once, and expensively: the
+// 0.20.0 test round found fourteen exposed series with no row — the whole
+// embedding worker, the webhook block, both TTL counters, `kimmy_fsyncs` and
+// `kimmy_commits_grouped_total` — and it took a harness outside this
+// repository to notice, a release after the last of them shipped. Every series
+// since has landed with its row in the same commit that added it to
+// `metrics.rs` (ADR-145, ADR-147, ADR-148 each did). That is a habit; this is
+// what makes it a rule.
+//
+// A missing row is not a documentation defect the way a typo is. This table is
+// where an operator goes to find out what they can alert on; a series that is
+// not in it is one nobody builds a dashboard against, and several the section
+// tells you to alert on by name arrived that way. So the table is held to the
+// render here, both ways round and down to the label keys, for the same reason
+// the levels above are held to the enum.
+//
+// What this gate does *not* cover: label values. It compares series names and
+// label keys, and a row's enumerated values — `ran`/`skipped` on
+// `{outcome}`, `2xx`/`4xx`/`5xx` on `{class}` — live in the description cell,
+// which nothing here reads. A series can gain a value for a label it already
+// carries and this test will pass. The dimensions are held; the vocabulary of
+// a dimension is not.
+
+/// The heading of the metrics table's section, and the level it sits at.
+const METRICS_SECTION: &str = "### Metrics";
+
+/// The series an exposition contains, as base name to the label keys on it.
+///
+/// `# TYPE` lines are the register of names — one per series, whatever the
+/// sample lines beneath it are called — and the labels come from the samples,
+/// folded back onto the base name so a histogram is one entry here exactly as
+/// it is one row in the table. `le` is dropped with them: it is the bucket
+/// dimension of the histogram type itself, not a label the series carries, and
+/// the table documents `_bucket`/`_sum`/`_count` no more than it documents the
+/// exposition format.
+fn exposed_series(exposition: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let kinds: BTreeMap<&str, &str> = exposition
+        .lines()
+        .filter_map(|line| line.strip_prefix("# TYPE "))
+        .filter_map(|rest| rest.split_once(' '))
+        .map(|(name, kind)| (name.trim(), kind.trim()))
+        .collect();
+
+    // The base series a sample line belongs to: itself, or the histogram whose
+    // suffixed sample it is. `None` is a sample with no `# TYPE` above it,
+    // which the caller reports rather than skips.
+    let base_of = |sample: &str| -> Option<&str> {
+        if let Some((name, _)) = kinds.get_key_value(sample) {
+            return Some(name);
+        }
+        ["_bucket", "_sum", "_count"].iter().find_map(|suffix| {
+            let base = sample.strip_suffix(suffix)?;
+            let (name, kind) = kinds.get_key_value(base)?;
+            (*kind == "histogram").then_some(*name)
+        })
+    };
+
+    let mut series: BTreeMap<String, BTreeSet<String>> =
+        kinds.keys().map(|name| ((*name).to_string(), BTreeSet::new())).collect();
+
+    for line in exposition.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        let (name, labels) = match line.split_once('{') {
+            Some((name, rest)) => {
+                let inside = rest.split_once('}').map_or(rest, |(inside, _)| inside);
+                let keys: Vec<&str> = inside
+                    .split(',')
+                    .filter_map(|kv| kv.split_once('='))
+                    .map(|(k, _)| k.trim())
+                    .collect();
+                (name, keys)
+            }
+            None => (line.split(' ').next().unwrap_or(line), Vec::new()),
+        };
+        let base = base_of(name)
+            .unwrap_or_else(|| panic!("`{name}` is sampled with no `# TYPE` line above it"));
+        let histogram = kinds.get(base) == Some(&"histogram");
+        let entry = series.entry(base.to_string()).or_default();
+        for key in labels {
+            if histogram && key == "le" {
+                continue;
+            }
+            entry.insert(key.to_string());
+        }
+    }
+    series
+}
+
+/// The metrics table's rows, as series name to the label keys its row names.
+///
+/// The first cell only, so the descriptions beside it can go on naming other
+/// series in backticks without being read as rows of their own — and one cell
+/// may carry several names, as `kimmy_databases`, `kimmy_collections` does.
+/// A name is followed by its labels in braces, `{outcome}` or `{a,b}`, which is
+/// how the table has always written them.
+fn documented_series(section: &[&str]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut rows = BTreeMap::new();
+    for line in section.iter().filter(|line| line.trim_start().starts_with('|')) {
+        let Some(first) = line.split('|').nth(1) else { continue };
+        for token in first.split('`').skip(1).step_by(2) {
+            if !token.starts_with("kimmy_") {
+                continue;
+            }
+            let (name, labels) = match token.split_once('{') {
+                Some((name, rest)) => (
+                    name,
+                    rest.trim_end_matches('}')
+                        .split(',')
+                        .map(|key| key.trim().to_string())
+                        .filter(|key| !key.is_empty())
+                        .collect(),
+                ),
+                None => (token, BTreeSet::new()),
+            };
+            assert!(
+                rows.insert(name.to_string(), labels).is_none(),
+                "`{name}` has two rows in the metrics table. Whichever is read second wins \
+                 here, so one of them could disagree with the render and never be checked"
+            );
+        }
+    }
+    rows
+}
+
+#[test]
+fn an_exposition_is_read_as_one_entry_per_series_whatever_its_samples_are_called() {
+    let page = "# HELP kimmy_up Always 1.\n\
+                # TYPE kimmy_up gauge\n\
+                kimmy_up 1\n\
+                # HELP kimmy_responses_total By class.\n\
+                # TYPE kimmy_responses_total counter\n\
+                kimmy_responses_total{class=\"2xx\"} 3\n\
+                kimmy_responses_total{class=\"5xx\"} 0\n\
+                # HELP kimmy_request_duration_seconds Latency.\n\
+                # TYPE kimmy_request_duration_seconds histogram\n\
+                kimmy_request_duration_seconds_bucket{le=\"0.001\"} 2\n\
+                kimmy_request_duration_seconds_bucket{le=\"+Inf\"} 3\n\
+                kimmy_request_duration_seconds_sum 0.0034\n\
+                kimmy_request_duration_seconds_count 3\n";
+
+    let series = exposed_series(page);
+    assert_eq!(
+        series.keys().collect::<Vec<_>>(),
+        vec!["kimmy_request_duration_seconds", "kimmy_responses_total", "kimmy_up"],
+        "the three suffixed samples are the histogram, not three series: {series:#?}"
+    );
+    assert_eq!(series["kimmy_responses_total"], BTreeSet::from(["class".to_string()]));
+    assert!(series["kimmy_up"].is_empty());
+    assert!(
+        series["kimmy_request_duration_seconds"].is_empty(),
+        "`le` is the histogram's own bucket dimension, not a label a row would name"
+    );
+}
+
+#[test]
+fn a_metrics_table_is_read_from_the_first_cell_of_its_rows() {
+    let doc = "### Metrics\n\
+               \n\
+               Prose naming `kimmy_never_exposed` in passing.\n\
+               \n\
+               | Series | |\n\
+               |---|---|\n\
+               | `kimmy_up` | Always 1 |\n\
+               | `kimmy_databases`, `kimmy_collections` | Counts, not names |\n\
+               | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |\n\
+               | `kimmy_sync_entries_skipped_total{reason,peer}` | Two labels |\n\
+               \n\
+               ### The next section\n\
+               \n\
+               | `kimmy_out_of_section` | not this table |\n";
+
+    let rows = documented_series(&section(doc, METRICS_SECTION));
+    assert_eq!(
+        rows.keys().collect::<Vec<_>>(),
+        vec![
+            "kimmy_collections",
+            "kimmy_databases",
+            "kimmy_responses_total",
+            "kimmy_sync_entries_skipped_total",
+            "kimmy_up",
+        ],
+        "prose, description cells and the next section are all out: {rows:#?}"
+    );
+    assert_eq!(rows["kimmy_responses_total"], BTreeSet::from(["class".to_string()]));
+    assert_eq!(
+        rows["kimmy_sync_entries_skipped_total"],
+        BTreeSet::from(["reason".to_string(), "peer".to_string()])
+    );
+    assert!(rows["kimmy_up"].is_empty());
+}
+
+#[test]
+#[should_panic(expected = "`kimmy_up` has two rows in the metrics table")]
+fn a_series_documented_twice_is_a_finding_and_not_the_second_row_winning() {
+    // Two rows for one series is how a correct row and a stale one coexist:
+    // the equality below would read whichever came second and pass, while the
+    // operator reads whichever they scrolled to first.
+    let doc = "### Metrics\n\
+               \n\
+               | `kimmy_up` | Always 1 |\n\
+               | `kimmy_up` | Also always 1, said differently |\n";
+    documented_series(&section(doc, METRICS_SECTION));
+}
+
+#[test]
+fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
+    // What lets the test below render the page without a database and still
+    // claim to have seen every series: the readings are values in the page,
+    // never the reason a series is on it. The two `/proc` gauges are the ones
+    // to watch — they read 0 on a platform without `/proc` rather than being
+    // left out, deliberately, so a dashboard does not go blank (ADR-147).
+    use kimmy_api::metrics::{Metrics, StorageReadings};
+
+    let metrics = Metrics::default();
+    let readings = StorageReadings {
+        databases: 1,
+        collections: 2,
+        unique_violations: 3,
+        commits: 4,
+        fsyncs: 5,
+        commits_grouped: 6,
+        storage_bytes: 7,
+        vector_index_cache_bytes: 8,
+        process_resident_bytes: 9,
+        process_resident_peak_bytes: 10,
+        index_unkeyed: 11,
+    };
+    assert_eq!(
+        exposed_series(&metrics.render()).keys().collect::<Vec<_>>(),
+        exposed_series(&metrics.render_with(&readings)).keys().collect::<Vec<_>>(),
+        "a series appears or vanishes with the engine readings, so an empty render is no \
+         longer the whole endpoint and the gate below has stopped covering it"
+    );
+}
+
+#[test]
+fn operations_lists_every_series_the_metrics_endpoint_exposes() {
+    // The page the `/metrics` route serves, rendered the way the route renders
+    // it — `render_with`, through `render`'s zeroed readings. Nothing here is
+    // conditional: every series is written by one of the two unconditional
+    // writes — `render_with`'s `format!` and the `render_latency` it calls,
+    // which is where the histogram is — the embedding series render 0 with no
+    // worker attached, and the two `/proc` gauges render 0
+    // where there is no `/proc`. So there is no allowlist, and there should
+    // not need to be one: a series that could be absent from this render is a
+    // series an operator's dashboard can lose, which is a defect in the
+    // exposition rather than an exception for this test to carry.
+    use kimmy_api::metrics::Metrics;
+
+    let exposed = exposed_series(&Metrics::default().render());
+    let section = section(OPERATIONS, METRICS_SECTION);
+    assert!(
+        !section.is_empty(),
+        "{METRICS_SECTION:?} is gone from docs/operations.md — an operator has nowhere to read \
+         what the endpoint offers"
+    );
+    let documented = documented_series(&section);
+
+    for name in exposed.keys() {
+        assert!(
+            documented.contains_key(name),
+            "`{name}` is exposed but has no row in docs/operations.md#metrics. The section \
+             promises that every series the endpoint exposes has one, and a series with no row \
+             is one nobody alerts on"
+        );
+    }
+    for name in documented.keys() {
+        assert!(
+            exposed.contains_key(name),
+            "docs/operations.md#metrics documents `{name}` but the server does not expose it"
+        );
+    }
+
+    for (name, labels) in &exposed {
+        let row = &documented[name];
+        assert_eq!(
+            labels, row,
+            "`{name}` carries the labels {labels:?} and its row in docs/operations.md#metrics \
+             names {row:?}. A label the row does not name is a dimension nobody knows they can \
+             split on; one it names that is not there is a query that returns nothing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
