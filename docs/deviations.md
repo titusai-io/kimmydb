@@ -2682,6 +2682,13 @@ tokenization can still be overshot. Set it below the provider's limit.
 when nothing is genuinely similar, so a query against unrelated content still
 returns results with near-zero scores. Callers must threshold themselves.
 
+**A repeated `query` is not guaranteed the same scores.** A server-embedded
+query goes through the provider on every request, and a provider may return a
+slightly different vector for the same text; the scores then differ in the
+low decimals and the ranking normally does not. Stored vectors and scoring are
+deterministic, so a request that supplies `vector` is reproducible on every
+call and every member ([Vectors](vectors.md#a-repeated-query-is-not-guaranteed-the-same-scores)).
+
 **`skip` is O(n)** even with an index. Deep paging stays expensive.
 
 **Result order without an explicit `sort` is unspecified**, and differs between
