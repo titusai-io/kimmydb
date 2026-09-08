@@ -261,7 +261,7 @@ document rewritten after the restart could lose to its own older version.
 | Read-your-writes | **Only on the node you wrote to** |
 | Cross-node reads | No guarantee — a peer may not have converged yet |
 | Conflict resolution | Whole-document LWW; losing write discarded |
-| Multi-document atomicity | **None across requests.** One `multi: true` update or delete commits as a single transaction on the accepting node, but nothing spans two operations |
+| Multi-document atomicity | **None across requests, and per chunk within a `multi: true` request.** A `multi: true` update or delete commits in chunks of `storage.multi_chunk_docs` documents (default 1,000), each chunk one transaction on the accepting node with the writer released between chunks ([ADR-086](decisions.md)). What a client can rely on: each chunk lands whole or not at all; a failure loses at most the chunk in flight, the earlier chunks stay committed and the response is an error; a concurrent reader can observe the state between two chunks, a partially applied `multi`, exactly as it can between any two requests. Nothing spans two operations. The per-operation rows are in [Compatibility](compatibility.md#what-each-operation-guarantees) |
 | Convergence | Eventual, given the partition is shorter than tombstone retention |
 | Monotonic reads | Not guaranteed across nodes |
 
