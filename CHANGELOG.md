@@ -14,6 +14,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A `find` page now holds what it returns.** The projection was applied to
+  the page after it was assembled, so a read that asked for `{"_id": 1}` still
+  held every stored document of the page while it built the answer — and a
+  sorted read held them for the whole `skip + limit` window. Over a collection
+  of large documents that is the difference between a list of ids and
+  gigabytes: a vector chunk's embedding is `dim × 8` bytes stored and about
+  fourteen times that decoded, so one `limit: 10000` page over a `__vectors`
+  shadow collection at 4,096 dimensions took a member from 690 MiB to 2,034
+  MiB of a 2,048 MiB limit and ended it. The projection is now applied where
+  each match is visited, and the sort window holds each match's sort keys and
+  its projected document instead of the stored one. Pages, cursors, sort order
+  and refusals are unchanged — including a walk whose projection drops `_id`,
+  whose cursor is now taken from the scan rather than from the projected page.
+  Measured under a counting allocator, a 1,000-document page of ids fell from
+  438.7 MiB held to 1.3 MiB ([ADR-150](docs/decisions.md)). Reading a vector
+  shadow collection is worth projecting and paging;
+  [Vectors](docs/vectors.md#what-a-page-over-the-shadow-collection-costs) has
+  the arithmetic.
+
 - **The metrics table in the operations guide is now held to what `/metrics`
   actually renders.** The section promises that every series the endpoint
   exposes has a row, and nothing in this repository checked it. It has been
@@ -42,6 +61,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   API and aggregation pages already said. The sentence now says so and points
   at them. Found by the 0.25.0 test round's Decimal128 cases, which assert
   the message and not only the status.
+
 ## 0.25.0 - 2026-09-07
 
 ### Changed

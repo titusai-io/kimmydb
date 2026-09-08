@@ -643,6 +643,26 @@ search comes back through its snapshot when there is one, and rebuilds
 otherwise. `kimmy_vector_index_cache_bytes` reports the resident total by the
 same estimate ([ADR-103](decisions.md)).
 
+### What a page over the shadow collection costs
+
+The shadow is an ordinary collection, so an ordinary `find` reads it — and its
+documents are the largest this server stores. A chunk's vector is a BSON array
+of doubles: `dim × 8` bytes stored, **32 KB per chunk at 4,096 dimensions**,
+12 KB at 1,536. Decoded it is a `Vec<Bson>` of `dim` elements, and a `Bson` is
+an enum as wide as its widest variant — 112 bytes — so those 32 KB come back
+as **448 KB in memory**, fourteen times the stored width, before the chunk's
+text. A page of 10,000 unprojected chunks is therefore gigabytes, held by one
+request, and the largest one `limit` allows.
+
+**Project, and page with a cursor.** Ask for the fields you want — `{"_id": 1}`
+to see what is there, `{"text": 1}` to read the chunks back — and walk with a
+modest `limit` and `nextCursor` rather than taking one large page. Since
+[ADR-150](decisions.md) a page holds what it *returns*: the projection is
+applied where each match is visited, so a projected walk costs its page plus
+the one document in hand, whatever the collection holds. An unprojected page
+still holds every document in it — that is what the default `limit` of 100 is
+there for.
+
 ### Why a stale vector index is safe when a stale secondary index is not
 
 A stale secondary index returns **wrong documents** — it is the source of truth

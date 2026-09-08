@@ -320,6 +320,15 @@ another order, narrow the filter on the sort field to where the last page
 ended — `{"score": {"$lt": <last score seen>}}` — which costs a page rather
 than everything before it ([ADR-098](decisions.md)).
 
+**A page holds what it returns**, projection included: the projection is
+applied as each match is visited, not to the page afterwards, so asking for
+`{"_id": 1}` costs ids and not documents ([ADR-150](decisions.md)). Over a
+collection of very large documents the projection is as much a capacity
+setting as the limit is —
+[Vectors](vectors.md#what-a-page-over-the-shadow-collection-costs) has the
+arithmetic for a vector shadow collection, where one page of 10,000
+unprojected chunks is gigabytes.
+
 ### Count, update, delete by filter
 
 ```bash

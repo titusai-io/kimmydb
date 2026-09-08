@@ -5533,6 +5533,43 @@ async fn paging_a_filtered_query_sees_every_match_exactly_once() {
 }
 
 #[tokio::test]
+async fn a_walk_whose_projection_drops_id_still_pages_to_the_end() {
+    // The cursor says where the *scan* got to, and a page holds projected
+    // documents (ADR-150) — so `{"_id": 0}` leaves the page with no `_id` to
+    // read a cursor out of. Taken from the page, this walk would stop after
+    // its first page, and stopping is indistinguishable from the end of the
+    // collection: a client would report 37 documents where there are 250 and
+    // have nothing to say was wrong.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 250).await;
+
+    let body = json!({"filter": {}, "projection": {"parity": 1, "_id": 0}, "limit": 37});
+    let mut seen = 0usize;
+    let mut cursor: Option<String> = None;
+    for _ in 0..200 {
+        let mut req = body.clone();
+        if let Some(c) = &cursor {
+            req["cursor"] = json!(c);
+        }
+        let res = server.post("/v1/db/shop/coll/orders/find", Some(&token), req).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        for doc in res.body["documents"].as_array().unwrap() {
+            assert!(doc.get("_id").is_none(), "the projection drops _id: {doc}");
+            assert!(doc.get("parity").is_some(), "and keeps what it asked for: {doc}");
+            seen += 1;
+        }
+        match res.body.get("nextCursor").and_then(|c| c.as_str()) {
+            Some(next) => cursor = Some(next.to_string()),
+            None => {
+                assert_eq!(seen, 250, "the walk must reach every document");
+                return;
+            }
+        }
+    }
+    panic!("pagination did not terminate");
+}
+
+#[tokio::test]
 async fn paging_through_an_index_agrees_with_paging_through_a_scan() {
     // Index candidates arrive in document-key order too, so the cursor bound
     // applies to both paths — and both must produce the same walk.
