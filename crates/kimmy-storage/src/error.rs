@@ -34,6 +34,17 @@ pub enum StorageError {
     /// Nothing was written, minted or published.
     #[error("the document is not at the expected version; re-read it and retry")]
     Stale { current: Option<kimmy_core::Stamp> },
+
+    /// The single writer did not become free within the caller's budget
+    /// (ADR-151). Nothing was written, minted or published; the caller may
+    /// retry. Only a caller that set a budget can see this — one that did
+    /// not waits for the writer however long it takes.
+    #[error(
+        "the write waited {} ms for the storage writer and gave up; the writer was held by \
+         another transaction for the whole wait",
+        waited.as_millis()
+    )]
+    WriterBusy { waited: std::time::Duration },
 }
 
 // redb splits failures across several error types that all mean "the storage

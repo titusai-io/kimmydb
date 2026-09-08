@@ -283,6 +283,15 @@ impl Server {
         Self::build_with(insecure_no_auth, limits, kimmy_api::RequestLimits::default()).await
     }
 
+    /// A server whose requests are abandoned after `timeout`.
+    async fn start_with_request_timeout(timeout: std::time::Duration) -> Self {
+        let limits = kimmy_api::RequestLimits {
+            request_timeout: timeout,
+            ..kimmy_api::RequestLimits::default()
+        };
+        Self::build_with(false, kimmy_api::RateLimits::disabled(), limits).await
+    }
+
     async fn build_with(
         insecure_no_auth: bool,
         limits: kimmy_api::RateLimits,
@@ -7853,6 +7862,19 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_commits",
             "kimmy_fsyncs",
             "kimmy_commits_grouped_total",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_bucket",
+            "kimmy_write_lock_wait_seconds_sum",
+            "kimmy_write_lock_wait_seconds_count",
+            "kimmy_write_lock_wait_timeouts_total",
+            "kimmy_write_lock_held_seconds_max",
             "kimmy_storage_bytes",
             "kimmy_vector_index_cache_bytes",
             "kimmy_process_resident_bytes",
@@ -10728,4 +10750,46 @@ async fn storing_vectors_for_a_document_leaves_the_collection_s_snapshot_alone()
 
     assert!(snapshot.is_dir(), "a vector write must not throw away the persisted graph");
     assert_eq!(server.state.vectors.len(), 1, "nor the resident one");
+}
+
+/// A write that cannot take the storage writer inside
+/// `server.request_timeout_secs` is refused with the documented `503
+/// timeout`, having written nothing, rather than hanging for as long as the
+/// writer is held (ADR-151). The timeout middleware cannot do this on its
+/// own: a handler blocked waiting for the writer never yields.
+#[tokio::test]
+async fn a_write_that_cannot_get_the_writer_in_time_is_a_503_timeout() {
+    let timeout = std::time::Duration::from_millis(300);
+    let server = Server::start_with_request_timeout(timeout).await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+
+    let hold = server.state.engine.hold_writer();
+    let started = std::time::Instant::now();
+    let refused = server
+        .put("/v1/db/shop/coll/orders/docs/1?upsert=true", Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "timeout", "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "wait", "{:?}", refused.body);
+    assert!(
+        refused.body["message"].as_str().unwrap_or_default().contains("storage writer"),
+        "{:?}",
+        refused.body
+    );
+    assert!(started.elapsed() >= timeout, "refused before the budget: {:?}", started.elapsed());
+    assert_eq!(server.state.engine.writer_wait_timeouts(), 1, "the refusal is counted");
+    drop(hold);
+
+    let read = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(read.status, 404, "nothing was written: {:?}", read.body);
+
+    let written = server
+        .put("/v1/db/shop/coll/orders/docs/1?upsert=true", Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(
+        written.body["upserted"], true,
+        "the same write lands once the writer is free: {:?}",
+        written.body
+    );
 }

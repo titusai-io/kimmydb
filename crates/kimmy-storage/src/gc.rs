@@ -54,6 +54,33 @@ impl RetentionPolicy {
     }
 }
 
+/// Oplog entries removed per write transaction of a retention pass.
+///
+/// Each chunk is one commit, and the writer is released between chunks, so
+/// this bounds how long one pass can hold it at a stretch while a day's
+/// worth of expired entries is collected in as many chunks as it takes
+/// (ADR-151).
+pub const OPLOG_COLLECT_CHUNK: usize = 1_000;
+
+/// Documents the tombstone scan visits per pass, under a read transaction.
+///
+/// A pass over a table larger than this covers the rest on the passes that
+/// follow, resuming where it stopped; a tombstone is collected within
+/// `ceil(documents / budget)` passes of expiring. At the default interval
+/// that is a few passes for a million documents, against a retention of a
+/// day (ADR-151).
+pub const TOMBSTONE_SCAN_BUDGET: usize = 100_000;
+
+/// Tombstones removed per write transaction of a retention pass.
+pub const TOMBSTONE_COLLECT_CHUNK: usize = 1_000;
+
+/// A tombstone the scan found expired, as it was when seen.
+struct ExpiredTombstone {
+    collection: u64,
+    key: Vec<u8>,
+    stamp: kimmy_core::Stamp,
+}
+
 /// What one collection pass removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GcOutcome {
@@ -78,6 +105,10 @@ impl Engine {
     /// Taking the time as a parameter is what makes retention testable at all:
     /// the alternative is a test that sleeps for the retention window.
     pub fn collect_garbage_at(&self, now_ms: u64, policy: RetentionPolicy) -> Result<GcOutcome> {
+        // Named, so a transaction this pass holds too long is reported
+        // under it (ADR-151).
+        let _span = tracing::info_span!("storage.retention").entered();
+        let started = std::time::Instant::now();
         let tombstone_cutoff = cutoff(now_ms, policy.tombstone_secs);
         let outcome = GcOutcome {
             oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
@@ -86,24 +117,77 @@ impl Engine {
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
         };
 
-        if !outcome.is_empty() {
-            debug!(
-                oplog = outcome.oplog_removed,
-                tombstones = outcome.tombstones_removed,
-                "collected expired records"
-            );
-        }
+        // Always, not only when something was removed: a pass that collects
+        // nothing still reads, and how long it took is the one thing an
+        // operator reading the log for a slow member needs to see.
+        debug!(
+            oplog = outcome.oplog_removed,
+            tombstones = outcome.tombstones_removed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "retention pass"
+        );
         Ok(outcome)
     }
 
     /// Drop oplog entries older than `cutoff`, **except the newest**.
+    ///
+    /// The oplog is keyed by stamp, so the expired prefix is a key range and
+    /// nothing past it is read. It is scanned under a read transaction and
+    /// removed in chunks of [`OPLOG_COLLECT_CHUNK`], each its own commit, so
+    /// the single writer is held for one chunk's removal at a time and never
+    /// for the scan (ADR-151).
     fn collect_oplog(&self, cutoff: Hlc) -> Result<usize> {
-        // Resolved before the write transaction so the retain closure — which
-        // cannot fail — has a plain value to compare against.
+        // Resolved before anything is removed so the comparison has a plain
+        // value; the tail cannot move below itself while this runs.
         let Some(newest) = self.oplog_tail()? else {
             return Ok(0);
         };
+        // Every key below this bound decodes to a stamp older than `cutoff`.
+        let bound = codec::oplog_key_lower_bound(cutoff);
 
+        let mut removed = 0usize;
+        loop {
+            let expired = {
+                let txn = self.db().begin_read()?;
+                let oplog = txn.open_table(tables::OPLOG)?;
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                for row in oplog.range::<&[u8]>(..bound.as_slice())? {
+                    let (key, _) = row?;
+                    let key = key.value();
+                    let Ok(stamp) = codec::decode_oplog_key(key) else {
+                        // An entry whose key will not decode cannot be aged,
+                        // so it is kept rather than silently dropped. Keeping
+                        // unreadable data is recoverable; deleting it is not.
+                        warn!("undecodable oplog key retained");
+                        continue;
+                    };
+                    // The tail is load-bearing: it is where the logical clock
+                    // resumes from. See this module's documentation.
+                    if stamp == newest {
+                        continue;
+                    }
+                    keys.push(key.to_vec());
+                    if keys.len() >= OPLOG_COLLECT_CHUNK {
+                        break;
+                    }
+                }
+                keys
+            };
+            if expired.is_empty() {
+                break;
+            }
+            let full = expired.len() >= OPLOG_COLLECT_CHUNK;
+            removed += self.remove_oplog_entries(&expired)?;
+            if !full {
+                break;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Remove `keys` from the oplog and its arrival index, and record the
+    /// horizon they leave behind, in one transaction.
+    fn remove_oplog_entries(&self, keys: &[Vec<u8>]) -> Result<usize> {
         let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
@@ -111,38 +195,21 @@ impl Engine {
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
 
-            // Collected in one transaction with the entries themselves, so the
-            // arrival index can never point at something that is gone. A stream
-            // reading it mid-collection sees either state, never a mixture.
-            let mut dropped_keys: Vec<Vec<u8>> = Vec::new();
-            oplog.retain(|key, _| {
-                let Ok(stamp) = codec::decode_oplog_key(key) else {
-                    // An entry whose key will not decode cannot be aged, so it
-                    // is kept rather than silently dropped. Keeping unreadable
-                    // data is recoverable; deleting it is not.
-                    warn!("undecodable oplog key retained");
-                    return true;
-                };
-                // The tail is load-bearing: it is where the logical clock
-                // resumes from. See this module's documentation.
-                if stamp == newest {
-                    return true;
-                }
-                let expired = stamp.hlc < cutoff;
-                if expired {
-                    removed += 1;
-                    dropped_keys.push(key.to_vec());
-                }
-                !expired
-            })?;
-
             let mut highest = None;
             // The same high-water mark per origin: the coarse horizon says a
             // peer below it may lack something collected, this says at which
             // origins it actually does (ADR-097).
             let mut per_origin = kimmy_core::VersionVector::new();
-            for key in dropped_keys {
-                if let Ok(stamp) = codec::decode_oplog_key(&key) {
+            for key in keys {
+                // Collected in one transaction with the entries themselves,
+                // so the arrival index can never point at something that is
+                // gone. A stream reading it mid-collection sees either state,
+                // never a mixture.
+                if oplog.remove(key.as_slice())?.is_none() {
+                    continue;
+                }
+                removed += 1;
+                if let Ok(stamp) = codec::decode_oplog_key(key) {
                     highest = Some(highest.map_or(stamp.hlc, |h: Hlc| h.max(stamp.hlc)));
                     per_origin.observe(stamp);
                 }
@@ -184,22 +251,108 @@ impl Engine {
     /// Only tombstones: a live record is data, however old. Index entries were
     /// already removed when the delete was applied, so nothing else refers to
     /// the key being dropped.
+    ///
+    /// A tombstone is a document record with the deleted flag, in the one
+    /// table with every live document, and nothing indexes it by age; finding
+    /// them is a walk. So the walk is done under a read transaction, which
+    /// holds no writer, visits at most [`TOMBSTONE_SCAN_BUDGET`] documents per
+    /// pass, and resumes next pass where it stopped; what it finds is removed
+    /// in chunks of [`TOMBSTONE_COLLECT_CHUNK`], each its own short commit
+    /// (ADR-151). A tombstone the scan saw is removed only if it is still the
+    /// same tombstone when the writer is held: a document re-created at that
+    /// key in between is data.
     fn collect_tombstones(&self, cutoff: Hlc) -> Result<usize> {
+        self.collect_tombstones_within(cutoff, TOMBSTONE_SCAN_BUDGET)
+    }
+
+    /// [`Self::collect_tombstones`] with the scan budget as a parameter, so
+    /// a test can see a scan stop and resume without a table of a hundred
+    /// thousand documents.
+    fn collect_tombstones_within(&self, cutoff: Hlc, budget: usize) -> Result<usize> {
+        let mut cursor = self.gc_scan_cursor();
+        let mut visited = 0usize;
+        let mut removed = 0usize;
+        loop {
+            let (expired, last, exhausted, seen) = {
+                let txn = self.db().begin_read()?;
+                let docs = txn.open_table(tables::DOCS)?;
+                let start = match &cursor {
+                    Some((collection, key)) => {
+                        std::ops::Bound::Excluded((*collection, key.as_slice()))
+                    }
+                    None => std::ops::Bound::Unbounded,
+                };
+                let mut expired: Vec<ExpiredTombstone> = Vec::new();
+                let mut last = None;
+                let mut seen = 0usize;
+                let mut exhausted = true;
+                for row in docs.range::<(u64, &[u8])>((start, std::ops::Bound::Unbounded))? {
+                    let (key, value) = row?;
+                    let (collection, doc_key) = key.value();
+                    last = Some((collection, doc_key.to_vec()));
+                    seen += 1;
+                    match codec::decode_doc_record(value.value()) {
+                        Ok(record) if record.deleted && record.stamp.hlc < cutoff => {
+                            expired.push(ExpiredTombstone {
+                                collection,
+                                key: doc_key.to_vec(),
+                                stamp: record.stamp,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(_) => warn!("undecodable document record retained"),
+                    }
+                    if expired.len() >= TOMBSTONE_COLLECT_CHUNK || visited + seen >= budget {
+                        exhausted = false;
+                        break;
+                    }
+                }
+                (expired, last, exhausted, seen)
+            };
+            visited += seen;
+            removed += self.remove_tombstones(&expired, cutoff)?;
+            if exhausted {
+                // The whole table has been walked: the next pass starts over.
+                cursor = None;
+                break;
+            }
+            cursor = last;
+            if visited >= budget {
+                break;
+            }
+        }
+        self.set_gc_scan_cursor(cursor);
+        Ok(removed)
+    }
+
+    /// Remove the tombstones a scan found, re-checking each under the writer.
+    fn remove_tombstones(&self, expired: &[ExpiredTombstone], cutoff: Hlc) -> Result<usize> {
+        // Nothing to do, and no transaction: a scan that found nothing must
+        // not cost a commit.
+        if expired.is_empty() {
+            return Ok(0);
+        }
         let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut docs = txn.open_table(tables::DOCS)?;
-            docs.retain(|_, value| {
-                let Ok(record) = codec::decode_doc_record(value) else {
-                    warn!("undecodable document record retained");
-                    return true;
+            for tombstone in expired {
+                let key = (tombstone.collection, tombstone.key.as_slice());
+                let unchanged = match docs.get(key)? {
+                    Some(value) => match codec::decode_doc_record(value.value()) {
+                        Ok(record) => {
+                            record.deleted
+                                && record.stamp == tombstone.stamp
+                                && record.stamp.hlc < cutoff
+                        }
+                        Err(_) => false,
+                    },
+                    None => false,
                 };
-                let expired = record.deleted && record.stamp.hlc < cutoff;
-                if expired {
+                if unchanged && docs.remove(key)?.is_some() {
                     removed += 1;
                 }
-                !expired
-            })?;
+            }
         }
         txn.commit()?;
         Ok(removed)
@@ -211,21 +364,42 @@ impl Engine {
     /// question over the same window: "was this deleted more recently than the
     /// thing a peer is trying to replay?"
     fn collect_dropped_collections(&self, cutoff: Hlc) -> Result<usize> {
+        // Found under a read transaction, removed under the writer only when
+        // there is something to remove, so a pass with nothing to collect
+        // never takes the writer (ADR-151). One row per dropped collection, so the
+        // table is walked whole.
+        let expired = {
+            let txn = self.db().begin_read()?;
+            let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let mut expired = Vec::new();
+            for row in dropped.iter()? {
+                let (key, value) = row?;
+                let Ok(stamp) = codec::decode_oplog_key(value.value()) else {
+                    warn!("undecodable collection tombstone retained");
+                    continue;
+                };
+                if stamp.hlc < cutoff {
+                    expired.push((key.value(), value.value().to_vec()));
+                }
+            }
+            expired
+        };
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
         let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-            dropped.retain(|_, value| {
-                let Ok(stamp) = codec::decode_oplog_key(value) else {
-                    warn!("undecodable collection tombstone retained");
-                    return true;
-                };
-                let expired = stamp.hlc < cutoff;
-                if expired {
+            for (key, seen) in &expired {
+                // Still the tombstone the scan saw: a drop recorded again
+                // since then carries a newer stamp and is kept.
+                let unchanged = dropped.get(*key)?.is_some_and(|v| v.value() == seen);
+                if unchanged && dropped.remove(*key)?.is_some() {
                     removed += 1;
                 }
-                !expired
-            })?;
+            }
         }
         txn.commit()?;
         Ok(removed)
@@ -238,21 +412,42 @@ impl Engine {
     /// the creation a peer is replaying?" — and so is the window in which the
     /// answer can be trusted (ADR-123).
     fn collect_dropped_indexes(&self, cutoff: Hlc) -> Result<usize> {
+        // Found under a read transaction, removed under the writer only when
+        // there is something to remove, so a pass with nothing to collect
+        // never takes the writer (ADR-151). One row per dropped index, so the
+        // table is walked whole.
+        let expired = {
+            let txn = self.db().begin_read()?;
+            let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+            let mut expired = Vec::new();
+            for row in dropped.iter()? {
+                let (key, value) = row?;
+                let Ok(stamp) = codec::decode_oplog_key(value.value()) else {
+                    warn!("undecodable index tombstone retained");
+                    continue;
+                };
+                if stamp.hlc < cutoff {
+                    expired.push((key.value(), value.value().to_vec()));
+                }
+            }
+            expired
+        };
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
         let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::INDEXES_DROPPED)?;
-            dropped.retain(|_, value| {
-                let Ok(stamp) = codec::decode_oplog_key(value) else {
-                    warn!("undecodable index tombstone retained");
-                    return true;
-                };
-                let expired = stamp.hlc < cutoff;
-                if expired {
+            for (key, seen) in &expired {
+                // Still the tombstone the scan saw: a drop recorded again
+                // since then carries a newer stamp and is kept.
+                let unchanged = dropped.get(*key)?.is_some_and(|v| v.value() == seen);
+                if unchanged && dropped.remove(*key)?.is_some() {
                     removed += 1;
                 }
-                !expired
-            })?;
+            }
         }
         txn.commit()?;
         Ok(removed)
@@ -599,5 +794,114 @@ mod tests {
         let reopened = Engine::open(&path).unwrap();
         assert!(reopened.oplog_collected().unwrap().is_empty());
         assert!(reopened.can_serve_peer_holding(&kimmy_core::VersionVector::default()).unwrap());
+    }
+
+    /// The expired prefix is removed a chunk per commit, and the writer is
+    /// released between chunks (ADR-151): a day of entries costs as many
+    /// short transactions as it takes, never one long one.
+    #[test]
+    fn an_expired_oplog_is_collected_a_chunk_per_commit() {
+        let (engine, _dir) = engine();
+        let meta = engine.create_collection("db", "c").unwrap();
+        let batches = 3;
+        for batch in 0..batches {
+            let docs = (0..OPLOG_COLLECT_CHUNK)
+                .map(|i| doc! { "_id": (batch * OPLOG_COLLECT_CHUNK + i) as i64 })
+                .collect();
+            engine.insert_many(&meta, docs).unwrap();
+        }
+        let entries = oplog_len(&engine);
+        assert!(entries > batches * OPLOG_COLLECT_CHUNK, "{entries} entries to collect");
+        let before = engine.commits();
+
+        let outcome = engine.collect_garbage_at(much_later(), policy()).unwrap();
+
+        assert_eq!(outcome.oplog_removed, entries - 1, "everything but the tail");
+        assert_eq!(oplog_len(&engine), 1);
+        let commits = (engine.commits() - before) as usize;
+        let chunks = (entries - 1).div_ceil(OPLOG_COLLECT_CHUNK);
+        assert_eq!(commits, chunks, "one commit per chunk of {OPLOG_COLLECT_CHUNK}");
+    }
+
+    /// A pass that collects nothing opens no write transaction at all: the
+    /// scans run under readers, and the writer is taken only to remove.
+    #[test]
+    fn a_pass_with_nothing_to_collect_holds_the_writer_for_nothing() {
+        let (engine, _dir) = engine();
+        let meta = engine.create_collection("db", "c").unwrap();
+        for i in 0..50 {
+            engine.insert(&meta, doc! { "_id": i }).unwrap();
+        }
+        let before = engine.commits();
+        let waits = engine.writer_wait().count;
+
+        let outcome = engine.collect_garbage(policy()).unwrap();
+
+        assert_eq!(outcome, GcOutcome::default());
+        assert_eq!(engine.commits(), before, "a no-op pass must not commit");
+        assert_eq!(engine.writer_wait().count, waits, "a no-op pass must not take the writer");
+    }
+
+    /// The tombstone scan visits a bounded number of documents per pass and
+    /// resumes where it stopped, so every expired tombstone is collected
+    /// within a few passes without any one pass walking the whole table.
+    #[test]
+    fn the_tombstone_scan_resumes_where_the_budget_stopped_it() {
+        let (engine, _dir) = engine();
+        let meta = engine.create_collection("db", "c").unwrap();
+        for i in 0..10 {
+            engine.insert(&meta, doc! { "_id": i }).unwrap();
+        }
+        // Tombstones spread through the key range, including the last key.
+        for i in [1, 4, 9] {
+            engine.delete(&meta, &DocId::Int64(i)).unwrap();
+        }
+        let cutoff = cutoff(much_later(), 0);
+
+        let mut removed = 0;
+        let mut passes = 0;
+        loop {
+            removed += engine.collect_tombstones_within(cutoff, 4).unwrap();
+            passes += 1;
+            if engine.gc_scan_cursor().is_none() {
+                break;
+            }
+            assert!(passes < 10, "the scan never reached the end of the table");
+        }
+        assert_eq!(removed, 3, "every expired tombstone, across passes");
+        assert_eq!(passes, 3, "ten documents at four per pass");
+        for i in 0..10 {
+            let held = engine.get(&meta, &DocId::Int64(i)).unwrap().is_some();
+            assert_eq!(held, ![1, 4, 9].contains(&i), "document {i}");
+        }
+    }
+
+    /// A tombstone the scan saw is removed only if it is still the same
+    /// record when the writer is held: a document re-created at that key in
+    /// between is data, and a key that changed since the scan is left for
+    /// the next pass to look at again.
+    #[test]
+    fn a_tombstone_that_changed_since_the_scan_is_kept() {
+        let (engine, _dir) = engine();
+        let meta = engine.create_collection("db", "c").unwrap();
+        engine.insert(&meta, doc! { "_id": "a" }).unwrap();
+        engine.delete(&meta, &DocId::String("a".into())).unwrap();
+        let stale = {
+            let txn = engine.db().begin_read().unwrap();
+            let docs = txn.open_table(tables::DOCS).unwrap();
+            let key = crate::docs::doc_key(&DocId::String("a".into())).unwrap();
+            let raw = docs.get((meta.id.0, key.as_slice())).unwrap().unwrap();
+            let record = codec::decode_doc_record(raw.value()).unwrap();
+            assert!(record.deleted);
+            ExpiredTombstone { collection: meta.id.0, key, stamp: record.stamp }
+        };
+        // Re-created after the scan: the key now holds a live document with
+        // a newer stamp.
+        engine.insert(&meta, doc! { "_id": "a", "back": true }).unwrap();
+
+        let removed = engine.remove_tombstones(&[stale], cutoff(much_later(), 0)).unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(engine.get(&meta, &DocId::String("a".into())).unwrap().is_some(), "data kept");
     }
 }

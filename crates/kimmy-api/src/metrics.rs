@@ -65,6 +65,13 @@ pub struct StorageReadings {
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
+    /// How long writes waited for the single writer, the writes that gave
+    /// up waiting inside their budget, and the longest any one transaction
+    /// held it (ADR-151). The wait is the part of a write's latency that
+    /// is not its own work, and nothing else on this page separates the two.
+    pub writer_wait: kimmy_storage::WriterWaitSnapshot,
+    pub writer_wait_timeouts: u64,
+    pub writer_hold_max_us: u64,
 }
 
 /// The process's resident memory, read from the kernel.
@@ -160,6 +167,10 @@ pub struct MetricsSnapshot {
     /// key the index could derive, so every scan of that index rechecks
     /// them (ADR-139). One of the engine's readings.
     pub index_unkeyed: u64,
+    /// Writes that gave up waiting for the writer, and the longest hold in
+    /// microseconds (ADR-151); the wait histogram itself is not bridged.
+    pub write_lock_wait_timeouts: u64,
+    pub write_lock_held_max_us: u64,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -698,6 +709,8 @@ impl Metrics {
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
             process_resident_bytes: readings.process_resident_bytes,
             process_resident_peak_bytes: readings.process_resident_peak_bytes,
+            write_lock_wait_timeouts: readings.writer_wait_timeouts,
+            write_lock_held_max_us: readings.writer_hold_max_us,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -821,6 +834,13 @@ impl Metrics {
              # HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.\n\
              # TYPE kimmy_commits_grouped_total counter\n\
              kimmy_commits_grouped_total {grouped}\n\
+             {writer_wait}\
+             # HELP kimmy_write_lock_wait_timeouts_total Writes that gave up waiting for the storage writer inside server.request_timeout_secs; nothing was written and the client was told to retry.\n\
+             # TYPE kimmy_write_lock_wait_timeouts_total counter\n\
+             kimmy_write_lock_wait_timeouts_total {writer_wait_timeouts}\n\
+             # HELP kimmy_write_lock_held_seconds_max The longest any one transaction has held the storage writer since start. Every other write on the node waited behind it.\n\
+             # TYPE kimmy_write_lock_held_seconds_max gauge\n\
+             kimmy_write_lock_held_seconds_max {writer_hold_max}\n\
              # HELP kimmy_storage_bytes Size of the database file on disk.\n\
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
@@ -968,6 +988,9 @@ impl Metrics {
             commits = readings.commits,
             fsyncs = readings.fsyncs,
             grouped = readings.commits_grouped,
+            writer_wait = render_writer_wait(&readings.writer_wait),
+            writer_wait_timeouts = readings.writer_wait_timeouts,
+            writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
             index_cache = readings.vector_index_cache_bytes,
             resident = readings.process_resident_bytes,
@@ -1052,6 +1075,28 @@ impl Metrics {
         let _ = writeln!(out, "kimmy_request_duration_seconds_sum {sum}");
         let _ = writeln!(out, "kimmy_request_duration_seconds_count {count}");
     }
+}
+
+/// The writer-wait histogram, in Prometheus's cumulative-bucket form
+/// (ADR-151); the same shape as `render_latency`, from the engine's buckets.
+fn render_writer_wait(wait: &kimmy_storage::WriterWaitSnapshot) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::from(
+        "# HELP kimmy_write_lock_wait_seconds How long a write transaction waited for the storage writer before it could begin. The part of a write's latency that is not its own work: a bulk, a repair or a retention pass holding the writer shows here on every other write.\n\
+         # TYPE kimmy_write_lock_wait_seconds histogram\n",
+    );
+    let mut cumulative = 0u64;
+    for (slot, upper) in kimmy_storage::WRITER_WAIT_BUCKETS_US.iter().enumerate() {
+        cumulative += wait.buckets[slot];
+        let le = *upper as f64 / 1e6;
+        let _ = writeln!(out, "kimmy_write_lock_wait_seconds_bucket{{le=\"{le}\"}} {cumulative}");
+    }
+    let sum = wait.sum_us as f64 / 1e6;
+    let _ = writeln!(out, "kimmy_write_lock_wait_seconds_bucket{{le=\"+Inf\"}} {}", wait.count);
+    let _ = writeln!(out, "kimmy_write_lock_wait_seconds_sum {sum}");
+    let _ = writeln!(out, "kimmy_write_lock_wait_seconds_count {}", wait.count);
+    out
 }
 
 #[cfg(test)]
@@ -1163,6 +1208,13 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
+            writer_wait: kimmy_storage::WriterWaitSnapshot {
+                buckets: [1, 2, 0, 0, 3, 0, 0, 1],
+                count: 8,
+                sum_us: 6_500_000,
+            },
+            writer_wait_timeouts: 51,
+            writer_hold_max_us: 52_500_000,
         }
     }
 
@@ -1201,6 +1253,25 @@ kimmy_fsyncs 45
 # HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.
 # TYPE kimmy_commits_grouped_total counter
 kimmy_commits_grouped_total 46
+# HELP kimmy_write_lock_wait_seconds How long a write transaction waited for the storage writer before it could begin. The part of a write's latency that is not its own work: a bulk, a repair or a retention pass holding the writer shows here on every other write.
+# TYPE kimmy_write_lock_wait_seconds histogram
+kimmy_write_lock_wait_seconds_bucket{le=\"0.001\"} 1
+kimmy_write_lock_wait_seconds_bucket{le=\"0.005\"} 3
+kimmy_write_lock_wait_seconds_bucket{le=\"0.025\"} 3
+kimmy_write_lock_wait_seconds_bucket{le=\"0.1\"} 3
+kimmy_write_lock_wait_seconds_bucket{le=\"0.5\"} 6
+kimmy_write_lock_wait_seconds_bucket{le=\"1\"} 6
+kimmy_write_lock_wait_seconds_bucket{le=\"5\"} 6
+kimmy_write_lock_wait_seconds_bucket{le=\"30\"} 7
+kimmy_write_lock_wait_seconds_bucket{le=\"+Inf\"} 8
+kimmy_write_lock_wait_seconds_sum 6.5
+kimmy_write_lock_wait_seconds_count 8
+# HELP kimmy_write_lock_wait_timeouts_total Writes that gave up waiting for the storage writer inside server.request_timeout_secs; nothing was written and the client was told to retry.
+# TYPE kimmy_write_lock_wait_timeouts_total counter
+kimmy_write_lock_wait_timeouts_total 51
+# HELP kimmy_write_lock_held_seconds_max The longest any one transaction has held the storage writer since start. Every other write on the node waited behind it.
+# TYPE kimmy_write_lock_held_seconds_max gauge
+kimmy_write_lock_held_seconds_max 52.5
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
@@ -1522,9 +1593,10 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 53 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
-        // count.
-        assert_eq!(samples, 76, "expected one sample per series: {out}");
+        // 55 scalar sample lines plus two histograms: the latency one's 12
+        // buckets, +Inf, sum and count, and the writer wait's 8 buckets,
+        // +Inf, sum and count (ADR-151).
+        assert_eq!(samples, 89, "expected one sample per series: {out}");
     }
 
     #[test]

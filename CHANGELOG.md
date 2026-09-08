@@ -10,6 +10,52 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A retention pass no longer holds the single writer for a walk of the
+  database, and passes no longer run back to back.** Every
+  `storage.gc_interval_secs` the pass collected expired oplog entries and
+  tombstones by walking the *whole* oplog table and then the *whole* document
+  table inside write transactions — at the default retention of a day, a walk
+  that removed nothing, logged nothing, and still read every page of both
+  tables while every other write on the node waited. On a member whose
+  container had no page-cache room for its file, one pass took longer than the
+  interval, the scheduler fired the missed tick at once, and the writer was
+  held almost continuously: single-document writes timed out for over an hour
+  on two of three members while reads stayed under a second and not one line
+  was logged ([ADR-151](docs/decisions.md)). The oplog is now collected by key
+  range, so nothing past the expired prefix is read; tombstones are found by a
+  scan under a read transaction that visits at most 100,000 documents per pass
+  and resumes where it stopped; both are removed in chunks of 1,000 per commit
+  with the writer released between chunks; a pass that overruns the interval
+  is followed by the next a full interval later, and is logged at `WARN`.
+- **A write that cannot take the storage writer inside
+  `server.request_timeout_secs` is refused with the documented `503 timeout`
+  (retry: `wait`) instead of hanging for as long as the writer is held.** The
+  request timeout could not do this on its own: a handler blocked waiting for
+  the writer never yields, so the deadline was only seen once the wait ended,
+  and a client saw a transport timeout with nothing logged. The wait itself is
+  now bounded to the request timeout on the request path; replication,
+  retention, TTL and the embedding worker wait as long as it takes, as before.
+  Writers now queue with eventual fairness, so a path that takes and releases
+  the writer in a tight loop hands it over rather than winning every time.
+
+### Added
+
+- **The wait for the single writer is measured.** `kimmy_write_lock_wait_seconds`
+  is a histogram of how long each write transaction waited before it could
+  begin — the part of a write's latency that is not its own work, which
+  nothing else on `/metrics` separated out; `kimmy_write_lock_wait_timeouts_total`
+  counts the writes refused for waiting past their budget; and
+  `kimmy_write_lock_held_seconds_max` is the longest any one transaction has
+  held the writer since start. A transaction that holds the writer longer than
+  five seconds is logged at `WARN` when it lets go, naming the operation it ran
+  under. The two summaries are on the OTLP bridge; the histogram is a
+  synchronous instrument and stays off it with the latency histogram, for the
+  reason recorded there.
+
 ## 0.25.1 - 2026-09-08
 
 ### Fixed

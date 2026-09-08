@@ -498,6 +498,25 @@ impl ApiError {
         )
     }
 
+    /// A write that waited its whole budget for the storage writer (ADR-151).
+    ///
+    /// The same code and status as [`Self::timeout`]: to the client it is
+    /// the same fact — the request did not complete inside
+    /// `server.request_timeout_secs` and nothing was done — and the retry
+    /// hint is the same. The message says what the time went on.
+    pub fn writer_busy(waited: std::time::Duration) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Timeout,
+            format!(
+                "the write waited {} seconds (server.request_timeout_secs) for the storage \
+                 writer, which another transaction held throughout, and was abandoned; \
+                 nothing was written",
+                waited.as_secs()
+            ),
+        )
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, message)
     }
@@ -706,6 +725,10 @@ impl From<StorageError> for ApiError {
             // The caller's condition did not hold. Theirs to act on, and the
             // current stamp is the one thing they need to act.
             StorageError::Stale { current } => ApiError::stale(current),
+            // The writer stayed held for the whole of the request's budget
+            // (ADR-151). Nothing was written; the documented `timeout`
+            // refusal, whose retry hint is to wait, is the honest answer.
+            StorageError::WriterBusy { waited } => ApiError::writer_busy(waited),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.

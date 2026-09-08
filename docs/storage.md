@@ -215,6 +215,21 @@ tombstones are kept; a background pass collects expired ones every
 data, however old — and the index entries were already removed when the delete
 was applied, so nothing is left referring to the collected key.
 
+**What a pass costs, and what it never does.** A pass never holds the single
+writer for a walk ([ADR-151](decisions.md)). Expired oplog entries are a key
+range — the oplog is keyed by stamp — so nothing past the expired prefix is
+read. Tombstones live in the one table with every live document and nothing
+indexes them by age, so finding them is a walk: it runs under a read
+transaction, visits at most 100,000 documents per pass, and resumes next pass
+where it stopped, so a tombstone is collected within
+`ceil(documents / 100,000)` passes of expiring. What either scan finds is
+removed in chunks of 1,000 per commit, each a short write transaction, with the
+writer released between chunks; a tombstone is removed only if it is still the
+same record when the writer is held, so a document re-created at that key in
+between is kept. A pass that takes longer than `gc_interval_secs` is logged at
+`WARN`, and the next runs a full interval after it finished rather than at
+once.
+
 **Dropped collections leave a tombstone too**, in `collections_dropped`, keyed
 by collection id and collected on the same window. Without one, the
 `DropCollection` oplog entry was the only record of the drop — bounded by

@@ -10,7 +10,7 @@ use kimmy_core::{
 use parking_lot::{Condvar, Mutex};
 use redb::{Database, ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::error::{Result, StorageError};
@@ -97,6 +97,93 @@ pub struct Engine {
     /// Commits that skipped their own fsync and were made durable by a
     /// barrier flush shared with others (ADR-088).
     grouped_commits: std::sync::atomic::AtomicU64,
+    /// The queue for the single writer (ADR-151). Taken before redb's own
+    /// writer lock, held for the life of the [`WriteTxn`], and released when
+    /// the transaction commits, aborts or is dropped. Two things redb's lock
+    /// does not give: a wait a caller can bound, and eventual fairness — a
+    /// path that takes and releases the writer in a tight loop is made to
+    /// hand it over rather than winning every time against a thread that
+    /// was woken and had to race for it.
+    writer_gate: parking_lot::Mutex<()>,
+    /// How long callers waited for the writer, as a histogram over
+    /// [`WRITER_WAIT_BUCKETS_US`]; `count` and `sum` beside it.
+    writer_wait_buckets: [std::sync::atomic::AtomicU64; WRITER_WAIT_BUCKETS_US.len()],
+    writer_wait_count: std::sync::atomic::AtomicU64,
+    writer_wait_sum_us: std::sync::atomic::AtomicU64,
+    /// Writes that gave up waiting for the writer inside their budget.
+    writer_wait_timeouts: std::sync::atomic::AtomicU64,
+    /// The longest any one transaction has held the writer, since start.
+    writer_hold_max_us: std::sync::atomic::AtomicU64,
+    /// Where the retention pass's tombstone scan resumes next pass
+    /// (ADR-151): the last document key it visited, or `None` to start from
+    /// the top. The scan visits a bounded number of documents per pass.
+    gc_scan_cursor: parking_lot::Mutex<Option<(u64, Vec<u8>)>>,
+}
+
+/// Upper bounds of the writer-wait histogram, in microseconds.
+///
+/// One millisecond is what a wait costs when the writer is free and another
+/// commit's fsync is finishing; the top bucket is the request timeout's
+/// default. Everything between is where a client write sits while a long
+/// transaction — a bulk, a repair, a retention pass — holds the writer.
+pub const WRITER_WAIT_BUCKETS_US: [u64; 8] =
+    [1_000, 5_000, 25_000, 100_000, 500_000, 1_000_000, 5_000_000, 30_000_000];
+
+/// A transaction that held the writer longer than this is logged at WARN,
+/// with the span it was opened under, when it lets go. Five seconds is
+/// more than a bulk of ten thousand documents costs and a small fraction of
+/// the request timeout a client write is waiting under.
+pub const WRITER_HOLD_WARN: std::time::Duration = std::time::Duration::from_secs(5);
+
+tokio::task_local! {
+    /// The longest the current task is prepared to wait for the writer.
+    static WRITE_WAIT_BUDGET: std::time::Duration;
+}
+
+/// Run `f` with every write it opens bounded to `budget` of waiting for the
+/// writer (ADR-151).
+///
+/// A write that cannot take the writer inside the budget fails with
+/// [`StorageError::WriterBusy`] rather than blocking, having written nothing.
+/// The request path sets this to `server.request_timeout_secs`, so a client
+/// sees the documented `503 timeout` instead of a hang: the timeout
+/// middleware cannot abandon a handler that is blocked inside
+/// [`blocking`], because the future never yields while it waits. Background
+/// work — replication, retention, TTL, the embedding worker — sets no budget
+/// and waits as long as it takes.
+pub async fn with_write_wait_budget<F: std::future::Future>(
+    budget: std::time::Duration,
+    f: F,
+) -> F::Output {
+    WRITE_WAIT_BUDGET.scope(budget, f).await
+}
+
+/// The budget the current task set, if any.
+fn write_wait_budget() -> Option<std::time::Duration> {
+    WRITE_WAIT_BUDGET.try_with(|budget| *budget).ok()
+}
+
+/// An exclusive hold of the writer; see [`Engine::hold_writer`].
+pub struct WriterHold<'a> {
+    _gate: parking_lot::MutexGuard<'a, ()>,
+    engine: &'a Engine,
+    held_from: std::time::Instant,
+}
+
+impl Drop for WriterHold<'_> {
+    fn drop(&mut self) {
+        self.engine.record_writer_hold(self.held_from.elapsed(), "hold_writer");
+    }
+}
+
+/// The writer-wait histogram, as a scrape reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriterWaitSnapshot {
+    /// Waits in each bucket of [`WRITER_WAIT_BUCKETS_US`], **not**
+    /// cumulative.
+    pub buckets: [u64; WRITER_WAIT_BUCKETS_US.len()],
+    pub count: u64,
+    pub sum_us: u64,
 }
 
 /// How a commit becomes durable (ADR-088).
@@ -187,15 +274,33 @@ impl Coalescer {
 /// disk. Derefs to the redb transaction, so `open_table` and the rest are
 /// unchanged at the call sites.
 pub(crate) struct WriteTxn<'a> {
-    txn: redb::WriteTransaction,
+    /// `None` only once `commit` or `abort` has taken it; `Drop` handles the
+    /// transaction that was neither, which redb aborts.
+    txn: Option<redb::WriteTransaction>,
     engine: &'a Engine,
     /// Whether this transaction was opened without its own fsync and must
     /// wait at the barrier after committing.
     coalesced: bool,
+    /// The place in the writer queue (ADR-151). `None` once released, which
+    /// `commit` does before waiting at the coalescing barrier — the flush
+    /// leader takes the gate for its own transaction.
+    gate: Option<parking_lot::MutexGuard<'a, ()>>,
+    /// When the writer was taken, for the hold measurement.
+    held_from: std::time::Instant,
+    /// The span this transaction was opened under — `replace`, `bulk`,
+    /// `cluster.sync`, `storage.retention` — so a long hold names its cause.
+    holder: &'static str,
 }
 
 impl WriteTxn<'_> {
-    pub(crate) fn commit(self) -> std::result::Result<(), redb::CommitError> {
+    /// Let go of the writer and record how long it was held.
+    fn release(&mut self) {
+        if self.gate.take().is_some() {
+            self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+        }
+    }
+
+    pub(crate) fn commit(mut self) -> std::result::Result<(), redb::CommitError> {
         // The one span in this crate, at the one place a write reaches the
         // disk. `commits_are_counted_at_one_chokepoint` already proves this is
         // the only such place, so the span inherits that proof: redb has a
@@ -208,12 +313,17 @@ impl WriteTxn<'_> {
         // configured a collector, and if none is configured this is the same
         // disabled-span check every other `tracing` call site already pays.
         let _span = tracing::info_span!("storage.commit").entered();
-        let WriteTxn { txn, engine, coalesced } = self;
+        let txn = self.txn.take().expect("a transaction is taken once");
+        let engine = self.engine;
+        let coalesced = self.coalesced;
         // The fsync (or the wait at the barrier) is the blocking part; see
         // [`blocking`] for why it must not happen on an async worker.
         blocking(move || {
             txn.commit()?;
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The writer is free from here: what follows is the barrier,
+            // whose leader opens a transaction of its own (ADR-088).
+            self.release();
             if coalesced {
                 engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 engine.wait_for_flush()?;
@@ -224,8 +334,20 @@ impl WriteTxn<'_> {
         })
     }
 
-    pub(crate) fn abort(self) -> std::result::Result<(), redb::StorageError> {
-        self.txn.abort()
+    pub(crate) fn abort(mut self) -> std::result::Result<(), redb::StorageError> {
+        let txn = self.txn.take().expect("a transaction is taken once");
+        let result = txn.abort();
+        self.release();
+        result
+    }
+}
+
+impl Drop for WriteTxn<'_> {
+    fn drop(&mut self) {
+        // A transaction dropped on an error path: redb aborts it, and the
+        // writer is let go after that, never before.
+        drop(self.txn.take());
+        self.release();
     }
 }
 
@@ -233,7 +355,7 @@ impl std::ops::Deref for WriteTxn<'_> {
     type Target = redb::WriteTransaction;
 
     fn deref(&self) -> &Self::Target {
-        &self.txn
+        self.txn.as_ref().expect("a transaction is taken only by commit or abort")
     }
 }
 
@@ -322,7 +444,80 @@ impl Engine {
             coalesce_woken: Condvar::new(),
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
+            writer_gate: parking_lot::Mutex::new(()),
+            writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            writer_wait_count: std::sync::atomic::AtomicU64::new(0),
+            writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
+            writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
+            writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
+            gc_scan_cursor: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// How long callers have waited for the writer, since start (ADR-151).
+    pub fn writer_wait(&self) -> WriterWaitSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        WriterWaitSnapshot {
+            buckets: std::array::from_fn(|slot| self.writer_wait_buckets[slot].load(Relaxed)),
+            count: self.writer_wait_count.load(Relaxed),
+            sum_us: self.writer_wait_sum_us.load(Relaxed),
+        }
+    }
+
+    /// Writes that gave up waiting for the writer inside their budget, since
+    /// start (ADR-151).
+    pub fn writer_wait_timeouts(&self) -> u64 {
+        self.writer_wait_timeouts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The longest any one transaction has held the writer, since start.
+    pub fn writer_hold_max(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(
+            self.writer_hold_max_us.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Take the writer and hold it until the guard is dropped (ADR-151).
+    ///
+    /// Every write on this engine waits behind the hold, exactly as behind
+    /// a transaction; a caller with a budget gives up inside it. For a test
+    /// that needs the writer busy, and for nothing on a request path.
+    pub fn hold_writer(&self) -> WriterHold<'_> {
+        let gate = blocking(|| self.writer_gate.lock());
+        WriterHold { _gate: gate, engine: self, held_from: std::time::Instant::now() }
+    }
+
+    fn record_writer_wait(&self, waited: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+        if let Some(slot) = WRITER_WAIT_BUCKETS_US.iter().position(|upper| us <= *upper) {
+            self.writer_wait_buckets[slot].fetch_add(1, Relaxed);
+        }
+        self.writer_wait_count.fetch_add(1, Relaxed);
+        self.writer_wait_sum_us.fetch_add(us, Relaxed);
+    }
+
+    fn record_writer_hold(&self, held: std::time::Duration, holder: &'static str) {
+        let us = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
+        self.writer_hold_max_us.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        if held >= WRITER_HOLD_WARN {
+            warn!(
+                held_ms = held.as_millis() as u64,
+                holder,
+                "a transaction held the single writer for longer than {} s; every other \
+                 write on this node waited behind it",
+                WRITER_HOLD_WARN.as_secs()
+            );
+        }
+    }
+
+    /// Where the retention pass's tombstone scan resumes (ADR-151).
+    pub(crate) fn gc_scan_cursor(&self) -> Option<(u64, Vec<u8>)> {
+        self.gc_scan_cursor.lock().clone()
+    }
+
+    pub(crate) fn set_gc_scan_cursor(&self, cursor: Option<(u64, Vec<u8>)>) {
+        *self.gc_scan_cursor.lock() = cursor;
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -924,8 +1119,29 @@ impl Engine {
     /// pass through here all happen where there is no `Engine` yet to count
     /// them: opening the database, migrating it, and restoring a backup into a
     /// fresh file.
-    pub(crate) fn begin_write(&self) -> std::result::Result<WriteTxn<'_>, redb::TransactionError> {
-        // Waiting for redb's single writer lock is the other blocking step.
+    pub(crate) fn begin_write(&self) -> Result<WriteTxn<'_>> {
+        let holder = tracing::Span::current().metadata().map_or("none", |m| m.name());
+        let budget = write_wait_budget();
+        let waited_from = std::time::Instant::now();
+        // Waiting for the writer is the other blocking step. The queue is
+        // this engine's gate (ADR-151), which a caller can wait at for a
+        // bounded time; redb's own lock behind it is then uncontended.
+        let gate = blocking(|| match budget {
+            Some(budget) => self.writer_gate.try_lock_for(budget),
+            None => Some(self.writer_gate.lock()),
+        });
+        let waited = waited_from.elapsed();
+        self.record_writer_wait(waited);
+        let Some(gate) = gate else {
+            self.writer_wait_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                waited_ms = waited.as_millis() as u64,
+                caller = holder,
+                "a write gave up waiting for the single writer; another transaction held it \
+                 for the whole wait"
+            );
+            return Err(StorageError::WriterBusy { waited });
+        };
         let mut txn = blocking(|| self.db.begin_write())?;
         let coalesced = self.coalescer.lock().is_some();
         if coalesced {
@@ -934,7 +1150,14 @@ impl Engine {
             txn.set_durability(redb::Durability::None)
                 .expect("no persistent savepoint was touched in a fresh transaction");
         }
-        Ok(WriteTxn { txn, engine: self, coalesced })
+        Ok(WriteTxn {
+            txn: Some(txn),
+            engine: self,
+            coalesced,
+            gate: Some(gate),
+            held_from: std::time::Instant::now(),
+            holder,
+        })
     }
 
     /// The durability class this engine commits under (ADR-088).
@@ -1018,6 +1241,9 @@ impl Engine {
     /// empty commit is one redb could reasonably skip, and the point here is
     /// the fsync.
     fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
+        // The leader's own transaction queues like any other (ADR-151); the
+        // committer it flushes for released the gate before it began to wait.
+        let _gate = blocking(|| self.writer_gate.lock());
         let mut txn = blocking(|| self.db.begin_write()).map_err(|e| {
             redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
         })?;
@@ -2350,5 +2576,69 @@ mod tests {
         assert_eq!(DurabilityClass::parse("coalesced"), Some(DurabilityClass::Coalesced));
         assert_eq!(DurabilityClass::parse("fast"), None, "there is no such class");
         assert_eq!(DurabilityClass::Durable.as_str(), "durable");
+    }
+
+    /// The bounded wait (ADR-151): a caller with a budget gives up inside
+    /// it and writes nothing; one without waits for however long the writer
+    /// is held. Both are on a runtime, because the budget is a task-local
+    /// the request path sets and the engine reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_with_a_budget_gives_up_while_the_writer_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let meta = engine.create_collection("db", "c").unwrap();
+
+        let waits_before = engine.writer_wait().count;
+        let hold = engine.hold_writer();
+        let budget = std::time::Duration::from_millis(100);
+        let refused = {
+            let engine = Arc::clone(&engine);
+            let meta = meta.clone();
+            tokio::spawn(with_write_wait_budget(budget, async move {
+                engine.insert(&meta, bson::doc! { "n": 1 })
+            }))
+            .await
+            .unwrap()
+        };
+        assert!(
+            matches!(refused, Err(StorageError::WriterBusy { waited }) if waited >= budget),
+            "expected WriterBusy after the budget, got {refused:?}"
+        );
+        assert_eq!(engine.writer_wait_timeouts(), 1);
+        assert_eq!(engine.writer_wait().count, waits_before + 1, "a refused wait is still a wait");
+        assert_eq!(engine.count(&meta).unwrap(), 0, "nothing was written");
+
+        // Released after a while: a caller with no budget outlasts it.
+        let release = {
+            let engine = Arc::clone(&engine);
+            let meta = meta.clone();
+            tokio::spawn(async move { engine.insert(&meta, bson::doc! { "n": 2 }) })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(hold);
+        release.await.unwrap().expect("a write with no budget waits out the hold");
+        assert_eq!(engine.count(&meta).unwrap(), 1);
+        assert_eq!(engine.writer_wait_timeouts(), 1, "the unbounded wait did not time out");
+        assert!(
+            engine.writer_hold_max() >= std::time::Duration::from_millis(150),
+            "the hold was measured: {:?}",
+            engine.writer_hold_max()
+        );
+    }
+
+    /// A budget bounds the wait, not the transaction: a write that gets the
+    /// writer inside its budget proceeds however long its own work takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_budget_only_bounds_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let meta = engine.create_collection("db", "c").unwrap();
+        let written =
+            tokio::spawn(with_write_wait_budget(std::time::Duration::from_millis(1), async move {
+                engine.insert(&meta, bson::doc! { "n": 1 })
+            }))
+            .await
+            .unwrap();
+        assert!(written.is_ok(), "{written:?}");
     }
 }
