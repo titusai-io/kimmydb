@@ -38,7 +38,7 @@ What each crate is *for* does not rot, so that is what the table keeps.
 | `kimmy-egress` | The outbound-request policy: loopback, private, carrier-NAT and reserved ranges refused, the cloud metadata endpoint by name, IPv4-mapped IPv6 smuggling, the operator allowlist, and the resolver that enforces all of it at dial time |
 | `kimmy-vector` | Providers, chunking, the embedding worker and its backfill, HNSW recall, index-cache policy |
 | `kimmy-auth` | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | Unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics, ownership, session revocation) plus end-to-end over a real socket and webhook delivery against a real receiver |
+| `kimmy-api` | Unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics, ownership, session revocation) plus end-to-end over a real socket, webhook delivery against a real receiver, and one binary of its own that measures what a read *holds* ([What a read holds](#what-a-read-holds)) |
 | `kimmy-mcp` | Unit (resource URIs, internal-object filter) plus end-to-end JSON-RPC over a real socket |
 | `kimmyd` | Config layering and validation, TLS termination, certificate reload, and the serving stack |
 | `kimmy-cli` | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -765,6 +765,36 @@ Security properties are asserted as behaviour, not assumed:
 | A query parameter the route does not define, or cannot parse, is `400` in the envelope | `a_query_parameter_the_route_does_not_define_is_refused_by_name` |
 | A misspelt grant field is refused rather than widening the grant to `*` | `a_misspelt_grant_field_is_refused_rather_than_widening_the_grant` |
 | A document body takes any field — it is content, not a shape | `a_document_body_may_carry_any_field` |
+
+### What a read holds
+
+`crates/kimmy-api/tests/memory.rs` is the only test here whose subject is
+*memory*, and it is its own binary for a mechanical reason: it installs a
+counting `#[global_allocator]` over `std::alloc::System`, and an allocator is
+a property of a whole test binary. Putting it in `api.rs` would put the
+counter under every test in that file.
+
+[ADR-098](decisions.md) says a read may hold memory proportional to its result
+and never to the collection it walks, and nothing checked the first half —
+every other test of a page asserts what the page *contains*, which is the same
+whether the page was built from projected documents or from stored ones. It
+was built from stored ones, and over a collection of large documents that was
+the difference between a list of ids and gigabytes ([ADR-150](decisions.md)).
+
+The fixture is 1,000 documents each holding 4,096 doubles — the shape of a
+vector chunk, about 448 KB apiece once decoded. Each measurement runs the same
+`find` twice and reads the second: redb's page cache is filled by the first
+pass, and it belongs to the node rather than to the request.
+
+| Property | Test |
+|---|---|
+| An unsorted page of ids holds the ids, not the documents | `an_unsorted_page_of_ids_holds_the_ids_and_not_the_documents` |
+| A sorted page of ids holds its sort keys, not the documents | `a_sorted_page_of_ids_holds_its_sort_keys_and_not_the_documents` |
+| A walk whose projection drops `_id` still pages to the end | `a_walk_whose_projection_drops_id_still_pages_to_the_end` (in `api.rs`) |
+
+Both measurements were run against the code before the fix and failed by two
+orders of magnitude — 438.7 MiB held where the bound is 4.5 MiB — which is the
+only thing that says the bound has teeth.
 
 ### The protocol contract
 

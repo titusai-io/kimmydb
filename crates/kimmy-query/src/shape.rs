@@ -55,6 +55,34 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
     Ordering::Equal
 }
 
+/// The values a document sorts by, one per key, in `keys` order.
+///
+/// What [`compare`] reads out of a document, taken once and kept — so a
+/// bounded sort can rank a match without holding the document it came from
+/// (ADR-150). A missing path yields `Null` here exactly as it does there, so
+/// the vector is always as long as `keys` and the two comparisons line up
+/// position for position.
+pub fn sort_keys(keys: &[SortKey], doc: &Document) -> Vec<Bson> {
+    keys.iter().map(|key| sort_value(doc, &key.path)).collect()
+}
+
+/// [`compare`], over values already taken by [`sort_keys`].
+///
+/// The same ordering, arrived at from the same values: `canonical_cmp` on each
+/// key in turn, reversed where the key is descending, `Equal` when every key
+/// agrees. A vector shorter than `keys` — which nothing this crate produces
+/// can be — compares as though the missing keys were absent from both sides.
+pub fn compare_keys(keys: &[SortKey], a: &[Bson], b: &[Bson]) -> Ordering {
+    for (i, key) in keys.iter().enumerate() {
+        let (Some(va), Some(vb)) = (a.get(i), b.get(i)) else { break };
+        let ordering = canonical_cmp(va, vb);
+        if ordering != Ordering::Equal {
+            return if key.descending { ordering.reverse() } else { ordering };
+        }
+    }
+    Ordering::Equal
+}
+
 /// The value a document sorts by for one key.
 ///
 /// When a path resolves to several values — because it passes through an array
@@ -329,6 +357,59 @@ mod tests {
         let docs = vec![doc! { "a": [5, 6] }, doc! { "a": [1, 9] }];
         let out = sorted(doc! { "a": 1 }, docs);
         assert_eq!(out[0].get_array("a").unwrap()[0], Bson::Int32(1));
+    }
+
+    #[test]
+    fn taken_sort_keys_order_exactly_as_the_documents_do() {
+        // The property the bounded sort rests on (ADR-150): a window that
+        // holds `sort_keys` instead of documents must rank them the way
+        // `compare` ranked the documents — every rule included. Missing
+        // fields, a path through an array (smallest element, in both
+        // directions), a path into a sub-document, mixed numeric types, and
+        // the `_id` key the executor appends to make the order total.
+        let docs = vec![
+            doc! { "_id": 1, "a": [5, 6], "m": { "r": 2 } },
+            doc! { "_id": 2, "a": [1, 9], "m": { "r": 2 } },
+            doc! { "_id": 3, "a": 1i64, "m": { "r": 1.5 } },
+            doc! { "_id": 4, "m": { "r": 2 } },
+            doc! { "_id": 5, "a": [1, 9], "m": { "r": 2 } },
+            doc! { "_id": 6, "a": Bson::Null },
+            doc! { "_id": 7, "a": "x", "m": { "r": 2 } },
+            // An empty array has no element to reduce to, so it is compared
+            // as the array itself, at the rank arrays hold — a rule of its
+            // own in query-language.md, and one a taken key must carry too.
+            doc! { "_id": 8, "a": [] },
+        ];
+        for spec in [
+            doc! { "a": 1, "_id": 1 },
+            doc! { "a": -1, "_id": 1 },
+            doc! { "m.r": 1, "a": -1, "_id": 1 },
+            doc! { "missing": 1, "_id": -1 },
+        ] {
+            let order = parse_sort(&spec).unwrap();
+            let taken: Vec<Vec<Bson>> = docs.iter().map(|d| sort_keys(&order, d)).collect();
+            for (i, a) in docs.iter().enumerate() {
+                for (j, b) in docs.iter().enumerate() {
+                    assert_eq!(
+                        compare(&order, a, b),
+                        compare_keys(&order, &taken[i], &taken[j]),
+                        "{spec} disagreed on {a} vs {b}"
+                    );
+                }
+            }
+            // And the order is total once `_id` is a key, which is what lets
+            // a heap under it return one page rather than an arrival-order one.
+            let mut by_doc = docs.clone();
+            by_doc.sort_by(|a, b| compare(&order, a, b));
+            let mut by_key: Vec<(Vec<Bson>, &Document)> =
+                docs.iter().map(|d| (sort_keys(&order, d), d)).collect();
+            by_key.sort_by(|(a, _), (b, _)| compare_keys(&order, a, b));
+            assert_eq!(
+                by_doc.iter().collect::<Vec<_>>(),
+                by_key.into_iter().map(|(_, d)| d).collect::<Vec<_>>(),
+                "{spec} sorted differently through taken keys"
+            );
+        }
     }
 
     #[test]

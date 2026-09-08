@@ -332,6 +332,29 @@ pub fn find(
     let sorted = !sort.is_empty() && !sort_is_id_ascending(&sort);
     let window = skip.saturating_add(limit);
 
+    // Offered whenever this query *could* be continued, so a caller's first
+    // request needs no cursor and no flag — it asks for a page, and the reply
+    // says how to get the next one. Requiring a cursor to receive a cursor
+    // would leave a client with no way to start except a magic constant.
+    //
+    // Three conditions, and each of them is a way of being wrong otherwise:
+    // a short page is the end; a `skip` means the caller is offsetting rather
+    // than paging; and a sort other than `_id` ascending would hand back a
+    // token that silently pages in a different order from the one asked for.
+    // Decided here, before the scan, because it says whether the scan has to
+    // keep the last `_id` it visited — a projection may drop `_id` from the
+    // page, and a cursor read out of the projected document would then be a
+    // walk that stopped after one page.
+    let continuable = skip == 0 && (sort.is_empty() || sort_is_id_ascending(&sort));
+
+    // The `_id` of the last document put into the page, kept beside it rather
+    // than read back out of it (ADR-150).
+    let mut last_id: Option<bson::Bson> = None;
+
+    // What a page holds is what it returns: the projection is applied where a
+    // document is visited, so the vector below never holds a stored document
+    // (ADR-150). How many documents each path shapes to fill it differs, and
+    // each branch says which.
     let (page_stamps, page_docs, stats): (Vec<kimmy_core::Stamp>, Vec<bson::Document>, _) =
         if sorted {
             // A sort has to see every match before it can page, but it need
@@ -352,7 +375,7 @@ pub fn find(
             // feed a stable sort — so the page is the one the full sort gave,
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
-            let mut top = TopK::new(window, &order);
+            let mut top = TopK::new(window, &order, projection.as_ref());
             // A match the order has no position for — a Decimal128 where the
             // sort would read it — refuses the whole query by name, after
             // the visit: the visitor cannot fail, and offering nothing more
@@ -362,6 +385,9 @@ pub fn find(
                 if unsortable.is_some() {
                     return;
                 }
+                // Asked of the stored document, before the projection: a
+                // Decimal128 at a sort path refuses the query whether or not
+                // the page would have carried it.
                 match shape::unsortable(&order, &doc) {
                     None => top.offer(stamp, doc),
                     Some(why) => unsortable = Some(why),
@@ -370,10 +396,18 @@ pub fn find(
             if let Some(why) = unsortable {
                 return Err(ApiError::bad_request(why));
             }
+            // The window shaped `skip + limit` documents and `skip` of them
+            // are dropped here. Nothing cheaper is available: which matches
+            // the offset steps over is not known until the sort is done, and
+            // the alternative — holding stored documents and projecting the
+            // survivors — is the thing this record is about.
             let (stamps, docs) = top.into_sorted().into_iter().skip(skip).unzip();
             (stamps, docs, stats)
         } else {
-            // What is skipped is counted past, not held.
+            // What is skipped is counted past, not held — and not shaped
+            // either: matches arrive in the order they will be returned in,
+            // so this path knows a match is skipped before it would project
+            // it, and projects exactly the documents the page returns.
             let mut seen = 0usize;
             let (mut stamps, mut docs) = (Vec::new(), Vec::new());
             let stats = visit_matching(
@@ -385,31 +419,28 @@ pub fn find(
                 |stamp, doc| {
                     seen += 1;
                     if seen > skip {
+                        if continuable {
+                            last_id = doc.get(kimmy_storage::ID_FIELD).cloned();
+                        }
                         stamps.push(stamp);
-                        docs.push(doc);
+                        // Moved rather than shaped when there is no
+                        // projection: `shape::project(None, ..)` is a clone,
+                        // and an unprojected page has no reason to copy the
+                        // document it was handed.
+                        docs.push(match projection.as_ref() {
+                            None => doc,
+                            Some(projection) => shape::project(Some(projection), &doc),
+                        });
                     }
                 },
             )?;
             (stamps, docs, stats)
         };
 
-    // Offered whenever this query *could* be continued, so a caller's first
-    // request needs no cursor and no flag — it asks for a page, and the reply
-    // says how to get the next one. Requiring a cursor to receive a cursor
-    // would leave a client with no way to start except a magic constant.
-    //
-    // Three conditions, and each of them is a way of being wrong otherwise:
-    // a short page is the end; a `skip` means the caller is offsetting rather
-    // than paging; and a sort other than `_id` ascending would hand back a
-    // token that silently pages in a different order from the one asked for.
-    let continuable = skip == 0 && (sort.is_empty() || sort_is_id_ascending(&sort));
     let next =
-        (continuable && page_docs.len() == limit).then(|| next_cursor(page_docs.last())).flatten();
+        (continuable && page_docs.len() == limit).then(|| next_cursor(last_id.as_ref())).flatten();
 
-    let page: Vec<Value> = page_docs
-        .iter()
-        .map(|doc| document_to_json(&shape::project(projection.as_ref(), doc)))
-        .collect();
+    let page: Vec<Value> = page_docs.iter().map(document_to_json).collect();
 
     let mut body = json!({ "documents": page, "count": page.len() });
     if params.stamps {
@@ -438,8 +469,13 @@ fn sort_is_id_ascending(sort: &[shape::SortKey]) -> bool {
 }
 
 /// The cursor pointing just past a page's last document.
-fn next_cursor(last: Option<&bson::Document>) -> Option<kimmy_core::Cursor> {
-    let id = DocId::try_from_bson(last?.get(kimmy_storage::ID_FIELD)?).ok()?;
+///
+/// Takes the `_id` rather than the document, because the page holds projected
+/// documents and a projection may have dropped `_id` from them (ADR-150).
+/// Reading it back out of the page would have made `{"_id": 0}` a walk that
+/// ended after one page, silently and looking like the end of the collection.
+fn next_cursor(last: Option<&bson::Bson>) -> Option<kimmy_core::Cursor> {
+    let id = DocId::try_from_bson(last?).ok()?;
     let key = kimmy_core::keyenc::encode(&id.to_bson()).ok()?;
     Some(kimmy_core::Cursor::from_key(key))
 }
@@ -464,26 +500,34 @@ fn with_id_tiebreak(sort: &[shape::SortKey]) -> Vec<shape::SortKey> {
 /// A sorted `find` used to collect every match and sort the lot, so its
 /// memory was the size of the match set. This holds `skip + limit`: the
 /// largest held sits at the top of a max-heap, and an offer that would not
-/// displace it is dropped on the spot. The comparison is `shape::compare`,
-/// the same one the full sort used, over a key list the caller has made total
-/// with [`with_id_tiebreak`] — a heap under a partial order would return a
-/// page that depended on arrival order.
+/// displace it is dropped on the spot. The key list the caller has made total
+/// with [`with_id_tiebreak`] is what orders it — a heap under a partial order
+/// would return a page that depended on arrival order.
+///
+/// **What it holds of a match is its sort keys and its projected document**,
+/// never the stored one (ADR-150). The keys are `shape::sort_keys`, which is
+/// what `shape::compare` reads out of a document and nothing more, so
+/// `shape::compare_keys` over them is the same ordering the document
+/// comparison gave. The projection is applied only once a match is being
+/// kept: an offer the heap turns away costs the keys and nothing else.
 struct TopK<'a> {
     n: usize,
     order: &'a [shape::SortKey],
+    projection: Option<&'a shape::Projection>,
     heap: std::collections::BinaryHeap<Ranked<'a>>,
 }
 
-/// One held match, ordered by the sort it was offered under.
+/// One held match: what ranks it, and what it will return.
 struct Ranked<'a> {
     order: &'a [shape::SortKey],
     stamp: kimmy_core::Stamp,
+    keys: Vec<bson::Bson>,
     doc: bson::Document,
 }
 
 impl Ord for Ranked<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        shape::compare(self.order, &self.doc, &other.doc)
+        shape::compare_keys(self.order, &self.keys, &other.keys)
     }
 }
 
@@ -502,21 +546,43 @@ impl PartialEq for Ranked<'_> {
 impl Eq for Ranked<'_> {}
 
 impl<'a> TopK<'a> {
-    fn new(n: usize, order: &'a [shape::SortKey]) -> Self {
-        Self { n, order, heap: std::collections::BinaryHeap::with_capacity(n.min(MAX_LIMIT) + 1) }
+    fn new(
+        n: usize,
+        order: &'a [shape::SortKey],
+        projection: Option<&'a shape::Projection>,
+    ) -> Self {
+        Self {
+            n,
+            order,
+            projection,
+            heap: std::collections::BinaryHeap::with_capacity(n.min(MAX_LIMIT) + 1),
+        }
     }
 
     fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) {
         if self.n == 0 {
             return;
         }
-        let candidate = Ranked { order: self.order, stamp, doc };
-        if self.heap.len() < self.n {
-            self.heap.push(candidate);
-        } else if self.heap.peek().is_some_and(|largest| candidate < *largest) {
+        let keys = shape::sort_keys(self.order, &doc);
+        if self.heap.len() == self.n {
+            // Would not displace the largest held, so it is dropped where it
+            // stands — unprojected, and never a document this window holds.
+            let displaces = self.heap.peek().is_some_and(|largest| {
+                shape::compare_keys(self.order, &keys, &largest.keys).is_lt()
+            });
+            if !displaces {
+                return;
+            }
             self.heap.pop();
-            self.heap.push(candidate);
         }
+        // Moved rather than shaped when there is no projection:
+        // `shape::project(None, ..)` is a clone, and the window may as well
+        // hold the document it was handed.
+        let doc = match self.projection {
+            None => doc,
+            Some(projection) => shape::project(Some(projection), &doc),
+        };
+        self.heap.push(Ranked { order: self.order, stamp, keys, doc });
     }
 
     /// Everything held, least first.
@@ -2342,7 +2408,7 @@ mod tests {
                     .collect();
 
                 let order = with_id_tiebreak(&sort);
-                let mut top = TopK::new(skip + limit, &order);
+                let mut top = TopK::new(skip + limit, &order, None);
                 for (stamp, doc) in scrambled.iter().cloned() {
                     top.offer(stamp, doc);
                 }
@@ -2464,7 +2530,7 @@ mod tests {
         let (all, _) = collect_matching_stamped_after(&state, &meta, &filter, None, None).unwrap();
 
         let order = with_id_tiebreak(&[]);
-        let mut top = TopK::new(0, &order);
+        let mut top = TopK::new(0, &order, None);
         for (stamp, doc) in all {
             top.offer(stamp, doc);
         }

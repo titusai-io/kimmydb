@@ -11321,3 +11321,127 @@ entries must sort above those inserts). Each was checked to fail with its
 mechanism removed: a scope committing per write, committing on error,
 committing an empty scope, forgetting a failed write, and minting a stamp
 before the writer.
+
+## ADR-150 — A page holds what it returns: the projection is applied where a match is visited
+
+**Decision.** The projection is part of what a read *returns*, so it is applied
+where a document is visited rather than to a page already assembled. `find`'s
+unsorted path projects each match as it is kept, so the page it builds holds
+projected documents and never stored ones; the `_id` its `nextCursor` is minted
+from is kept beside the page rather than read back out of it, because a
+projection may have dropped `_id` and a cursor taken from a projected document
+would end a `{"_id": 0}` walk after its first page — which is
+indistinguishable, to a client, from the end of the collection. The sorted
+path's bounded window holds, per match, its stamp, the values the sort orders
+it by, and its projected document; never the stored one. Those values are
+`shape::sort_keys`, which is exactly what `shape::compare` reads out of a
+document and nothing else, taken once in the order of the key list
+ADR-098's `with_id_tiebreak` made total, and the window ranks
+by `shape::compare_keys` over them: the same `canonical_cmp` on the same
+values, reversed on the same `descending` flags, in the same key order. So the
+page is the page the document comparison gave — the `_id` tie-break, a missing
+field placed as `null`, and the array rule that orders a document by its
+smallest element in both directions, all unchanged. A match the window turns
+away costs its keys and is not projected. `shape::unsortable` still runs on the
+stored document, before any projection, so a Decimal128 where the sort would
+read it refuses the query whether or not the page would have carried the field.
+
+**Why.** One request took a cluster member out of its process. A
+`POST /v1/db/{db}/coll/{coll}/find` of
+`{"filter": {}, "projection": {"_id": 1}, "limit": 10000, "sort": {"_id": 1}}`
+over a vector shadow collection of 12,829 chunks at 4,096 dimensions took a
+member from about 690 MiB to 2,034 MiB of a 2,048 MiB container limit and then
+ended it; a second member reached 1,982 MiB on the same request shape at
+smaller pages. Two non-vector collections walked at the same page size did not
+move resident memory at all, which is what named the documents rather than the
+paging as the cause. The request asked for ten thousand ids and was answered
+with ten thousand ids — and held ten thousand embeddings to do it, because
+`shape::project` ran over the completed page.
+
+The amplification is in the decode, not on disk. A chunk's vector is a BSON
+array of doubles, `dim × 8` bytes stored — 32 KB at 4,096 dimensions — and
+decodes into a `Vec<Bson>` of `dim` elements, where a `Bson` is an enum as wide
+as its widest variant, measured at 112 bytes. That is 448 KB in memory for
+32 KB on disk, fourteen times, before the chunk's text; ten thousand of them is
+gigabytes, which is the observed rise. ADR-098 said a read may hold memory
+proportional to its result and never to the collection it walks, and it was
+half true: `count` holds nothing, the index paths stream, the sort window is
+bounded — and then every one of those paths held whole stored documents for the
+documents it returned. Nothing tested it, because every test of a page asserts
+what the page *contains*, which is identical either way.
+`crates/kimmy-api/tests/memory.rs` is that test, in its own binary so it can
+install a counting `#[global_allocator]`: 1,000 documents of 4,096 doubles,
+`{"_id": 1}`, `limit: 1000`, measured on a second identical request so that
+redb's page cache is filled and the reading is the request's own. It held
+438.7 MiB before this change and 1.3 MiB after on the unsorted path, 1.5 MiB on
+the sorted one, against a bound of eight decoded documents plus a kilobyte per
+id returned.
+
+**A hypothesis about the 0.24.0 memory incident, stated as one.**
+[Operations](operations.md#capacity) records, and still records, a member
+climbing from 110 MiB to exactly its 2,048 MiB limit during a concurrent
+read-heavy gate, holding about 2,030 MiB for eleven minutes after every request
+to it had ended, falling to 680 MiB, and returning to 2,045 MiB with nothing
+running — cause unsettled. That account is consistent with this defect feeding
+the allocator: concurrent unprojected pages each holding every stored document
+of the page produce the climb, and mimalloc returning a thread's freed segments
+on its own delayed schedule (ADR-117) produces the hold. A
+baseline taken since, on an idle, empty cluster with the vector index cache at
+zero, has members holding roughly 13–20× their fresh-start resident floor —
+about 500–780 MiB against 36–42 MiB — and the residue does not track request
+volume: the member that served the most holds the least, which points at
+per-thread allocator arenas filled by whichever threads served the large pages
+rather than at anything still referenced. The falsifiable prediction is this:
+with the projection applied in the visitor, the idle residue after a read round
+should approach the fresh floor rather than 13–20× it. A re-measurement of
+`kimmy_process_resident_bytes` after this lands is what would let
+`operations.md` stop calling the cause unsettled; if the residue persists at
+that scale with this change in, the holder is something else and the 0.24.0
+retention finding stays open on its own terms. Nothing in that account is
+edited here on the strength of a hypothesis.
+
+**Alternatives.** *A byte-bounded page — measure what the page has accrued and
+return `nextCursor` early* was rejected for this change: "a short page is the
+end" is the documented client contract, in
+[the HTTP reference](http-api.md#find) and in
+[Cursors](query-language.md#cursors), and a page that ended short for a reason
+the client cannot see would make every walk's termination condition a guess. It
+remains available if a page ever needs a ceiling it can meet without refusing.
+*A decoded-byte ceiling, refused with `400`* — the shape `MAX_SORT_WINDOW`
+already has, and the preferred design for the residual hazard, which is an
+*unprojected* page of large documents: that still holds every document it
+returns, correctly and by definition, and a client that asks for 10,000 chunks
+with no projection will still be handed gigabytes. It is deferred because the
+number cannot be chosen yet — [Benchmarks](benchmarks.md) lists peak read memory
+against collection size as argued from the code and not measured, and a ceiling
+picked without that measurement is a refusal for a workload nobody has sized.
+*Decoding only the projected fields out of the raw BSON*, never building the
+whole document, is deferred for a different reason: the filter's recheck needs
+the document, so the decode cannot be avoided, only narrowed — and with the
+projection in the visitor the amplification is already one document at a time.
+*Storing a vector as BSON binary rather than an array of doubles* would cut both
+the stored width and the decode, and is noted rather than taken: it is a change
+to the stored format, with a migration and a compatibility story of its own,
+and it is out of scope for a memory fix in the executor.
+
+**Cost.** The unsorted path pays a projection per match kept past `skip`,
+which is a projection per document returned — the same count the page-shaped
+projection paid, and matches arrive in the order they are returned in, so the
+offset costs nothing to shape. Where there is *no* projection it pays nothing
+at all, but only because both paths were written to move the visited document
+into what holds it rather than to call `shape::project(None, ..)`, which is a
+clone: an unprojected `find` used to move its documents, and putting a
+projection in the visitor is exactly the shape that would have started copying
+them. The sorted path
+pays a sort-key extraction per match *offered* — one resolution of each sort
+path per match, where before the paths were resolved inside every heap
+comparison, so a window under pressure resolves fewer paths than it did, not
+more — and a projection per offer the window *accepts*, which is bounded by the
+matches but can exceed `skip + limit` when matches arrive worst-case ordered,
+each displacing the largest held. A sorted `find` with no projection now holds
+its window's documents plus their sort keys, slightly more than the documents
+alone; that is the price of not holding them to compare them, and the keys are
+small beside anything this record is about. `shape::compare` stays as it was
+for the aggregation sort, which sorts documents it is already holding, with
+`taken_sort_keys_order_exactly_as_the_documents_do` in `kimmy-query` holding
+the two comparisons to one ordering.
