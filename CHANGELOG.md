@@ -41,6 +41,61 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   retention, TTL and the embedding worker wait as long as it takes, as before.
   Writers now queue with eventual fairness, so a path that takes and releases
   the writer in a tight loop hands it over rather than winning every time.
+- **A snapshot repair now completes on a large database: it pulls the one
+  collection it was planned for, applies a page per commit, and resumes
+  across rounds from the last page applied.** A repair planned for one
+  divergent collection pulled the peer's *whole* database, one write
+  transaction per document, inside the 30-second round timeout — and a
+  snapshot that could not finish in 30 s was cut off mid-page and started
+  again from page one on the next round, three times, then cooled down for
+  five minutes and was planned again. On a three-member test cluster one
+  member spent 108 repair rounds in six minutes with its lag still growing
+  ([ADR-152](docs/decisions.md)). A snapshot is now scoped to the collection
+  being repaired (`AskSnapshot` carries the collection; a peer on an earlier
+  release ignores it and serves the whole database, so a rolling upgrade
+  needs no stop), every page is one transaction — none at all for a page the
+  member already holds — and where the pull stands is kept between rounds, so
+  a round that runs out of budget leaves its pages applied and the next round
+  continues from its cursor; only three rounds that apply *no* page abandon a
+  repair. The whole-database snapshot a member below a peer's retention
+  horizon pulls resumes the same way. Two rules changed with it, on purpose:
+  the coverage a completed snapshot grants is the peer's vector as served
+  with its *first* page, and a snapshot's documents no longer move the
+  receiver's version vectors as they land — the previous form could carry the
+  receiver's position past a document the peer wrote behind the cursor while
+  the snapshot ran, which nothing then re-served. One residual is recorded
+  rather than closed: a member restarted *during* a multi-round snapshot
+  forgets where it stood and, on opening, re-derives its position from the
+  snapshot documents it already holds, which can carry it past the un-walked
+  remainder (on a repair, past the stopped window too) — narrower than
+  before, when a timed-out snapshot left the same state on every round, and
+  the subject of a separate decision. A snapshot of a collection
+  the peer has since dropped carries the drop, so a member stopped at entries
+  for it records the tombstone rather than stopping forever. The round logs
+  one `INFO` line when it leaves a snapshot to resume, with pages, documents
+  and the cursor.
+
+- **`kimmy_sync_divergence_check_age_seconds` is computed when it is read,
+  so a stuck anti-entropy loop cannot freeze it.** The age exists to say
+  that `kimmy_sync_divergent_collections` is serving a stale reading, but it
+  was computed by the loop at the end of each tick and pushed with the gauge
+  — so a loop whose tick did not end froze the age with everything else. On
+  the three-member cluster above, the two members whose loops waited on the
+  writer for over an hour read the same age on every scrape, `ran` flat,
+  nothing failing and nothing backed off, while one of them fell some 30,000
+  documents behind with the gauge at 0; the documented alert on the age
+  never crossed its threshold. The loop now reports the instant of the last
+  check and every scrape and OTLP export subtracts it from its own clock, so
+  the age rises through a stuck tick exactly as it rises through a run of
+  failed rounds. Every documented reading holds: 0 before the first check
+  beside `ran` at 0, reset by a check, unmoved by a failed round. A sync
+  tick that took longer than `cluster.sync_interval_secs` is logged at
+  `WARN` when it ends, and is followed by one tick at once and then the
+  next a full interval later, rather than by a burst of every tick it
+  missed — an hour-long tick at the default interval used to be followed by
+  some 720 rounds fired back to back; the discovery ticker gets the same
+  treatment
+  ([ADR-154](docs/decisions.md)).
 
 ### Added
 

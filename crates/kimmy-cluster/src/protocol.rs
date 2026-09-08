@@ -169,7 +169,25 @@ pub enum Message {
     /// served the entry (ADR-097).
     BeyondHorizon {},
     /// "Send me current state instead of history."
-    AskSnapshot { after: Option<SnapshotCursor> },
+    ///
+    /// `collection` scopes the snapshot to one collection (ADR-152): a
+    /// repair is planned for one (ADR-148), and the whole database was what
+    /// it pulled. `None` is the whole-database snapshot a member below the
+    /// sender's retention horizon needs. `after` is where to resume — the
+    /// requester carries it between rounds, so a snapshot that does not fit
+    /// one round goes on from its last page rather than page one.
+    ///
+    /// Optional on the wire, for the reason `AskEntries::held` is: the
+    /// handshake negotiates no version. A sender that predates the field
+    /// ignores it and serves the whole database, which the requester
+    /// applies as it always did — a repair then costs what it cost before
+    /// this field, and nothing is misread; a requester that predates it
+    /// sends none and is served the whole database as before.
+    AskSnapshot {
+        after: Option<SnapshotCursor>,
+        #[serde(default)]
+        collection: Option<CollectionId>,
+    },
     /// One page of it.
     Snapshot(Box<SnapshotPage>),
     /// "Which collections do you hold, and — for one of them — how many
@@ -517,6 +535,17 @@ mod tests {
             Message::Confirm { proof: vec![9, 9] },
             Message::AskDivergence { probe: Some(CollectionId(42)) },
             Message::AskDivergence { probe: None },
+            Message::AskSnapshot { after: None, collection: None },
+            // The unencodable half of the id space, and a cursor: the shape
+            // every scoped repair of such a collection sends.
+            Message::AskSnapshot { after: None, collection: Some(CollectionId(u64::MAX)) },
+            Message::AskSnapshot {
+                after: Some(SnapshotCursor {
+                    collection: CollectionId(u64::MAX),
+                    after_key: vec![1, 2],
+                }),
+                collection: Some(CollectionId(u64::MAX)),
+            },
             Message::Divergence {
                 collections: vec![CollectionId(1), CollectionId(2)],
                 probe_count: Some(7),
@@ -641,6 +670,50 @@ mod tests {
         write_frame(&mut asked, &Message::AskVersions { witnessed: true }).await.unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
         assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
+    }
+
+    /// The same boundary for `AskSnapshot::collection` (ADR-152). A
+    /// requester before the field sends `after` alone, which reads as a
+    /// whole-database snapshot; a sender before the field sees a field it
+    /// does not know and must ignore it, serving the whole database — the
+    /// fallback the ADR names for the minutes a rolling upgrade has mixed
+    /// versions — rather than fail the frame.
+    #[tokio::test]
+    async fn ask_snapshot_crosses_a_version_boundary_in_both_directions() {
+        let frame = |body: bson::Document| {
+            let mut buffer = Vec::new();
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+
+        let old_request = frame(bson::doc! { "AskSnapshot": { "after": bson::Bson::Null } });
+        assert_eq!(
+            read_frame(&mut old_request.as_slice()).await.unwrap(),
+            Message::AskSnapshot { after: None, collection: None },
+            "a request without the field is a whole-database snapshot"
+        );
+
+        let future = frame(
+            bson::doc! { "AskSnapshot": { "after": bson::Bson::Null, "somethingNewer": true } },
+        );
+        assert_eq!(
+            read_frame(&mut future.as_slice()).await.unwrap(),
+            Message::AskSnapshot { after: None, collection: None },
+            "a field this build does not know must not fail the frame"
+        );
+
+        // What this build writes for a scoped request is exactly that shape
+        // to an old sender: `after` it knows, and one field it does not.
+        let mut asked = Vec::new();
+        let scoped = Message::AskSnapshot { after: None, collection: Some(CollectionId(7)) };
+        write_frame(&mut asked, &scoped).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
+        assert_eq!(
+            body,
+            bson::doc! { "AskSnapshot": { "after": bson::Bson::Null, "collection": 7i64 } }
+        );
     }
 
     #[tokio::test]

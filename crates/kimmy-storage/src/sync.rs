@@ -769,12 +769,13 @@ struct Run<'e> {
 ///
 /// One copy of the entry per applied entry until the run commits, bounded by
 /// the batch size the transport asks for; the collection is shared with the
-/// batch's memo rather than copied.
-struct Pending {
-    collection: Arc<CollectionMeta>,
-    entry: OplogEntry,
-    id: DocId,
-    violations: Vec<UniqueViolation>,
+/// batch's memo rather than copied. A snapshot page, which is one transaction
+/// too (ADR-152), keeps the same list for the same reason.
+pub(crate) struct Pending {
+    pub(crate) collection: Arc<CollectionMeta>,
+    pub(crate) entry: OplogEntry,
+    pub(crate) id: DocId,
+    pub(crate) violations: Vec<UniqueViolation>,
 }
 
 /// How one replicated schema change went against this node's state.
@@ -987,7 +988,7 @@ impl Engine {
         }
 
         let txn = self.run_txn(run)?;
-        match self.apply_remote_in_txn(txn, &collection, entry)? {
+        match self.apply_remote_in_txn(txn, &collection, entry, crate::engine::Position::Raise)? {
             RemoteApplied::Applied { id, violations } => {
                 outcome.applied += 1;
                 run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
@@ -4500,11 +4501,10 @@ mod tests {
             return Default::default();
         };
         engine
-            .snapshot_page(None)
+            .snapshot_page(None, Some(coll.id))
             .unwrap()
             .documents
             .iter()
-            .filter(|d| d.collection == coll.id)
             .map(|d| d.id.to_string())
             .collect()
     }

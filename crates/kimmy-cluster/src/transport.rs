@@ -28,9 +28,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kimmy_core::{CollectionId, Hlc, NodeId, VersionVector};
-use kimmy_storage::{Engine, SyncOutcome};
+use kimmy_storage::{Engine, SnapshotPage, SnapshotProgress, SyncOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use kimmy_core::oplog::OplogEntry;
@@ -84,6 +85,21 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a round's [`REQUEST_TIMEOUT`] a snapshot pull leaves unspent
+/// before it stops asking for pages (ADR-152).
+///
+/// The timeout wraps the whole round and cancels it at whatever await point
+/// it reaches, which for a snapshot was the middle of a frame: the page in
+/// flight was lost, and the next round asked for page one again. A pull now
+/// checks the round's deadline *between* pages and asks for no more once it
+/// is this close. A page in flight when the deadline passes is still applied
+/// — it is one transaction — and the cursor after it recorded before the
+/// next frame; what the reserve buys is that the round ends on a page
+/// boundary of its own choosing rather than wherever the timeout fell. Five
+/// seconds is several pages' worth on a loaded member and a small fraction
+/// of the round.
+const SNAPSHOT_PAGE_RESERVE: Duration = Duration::from_secs(5);
 
 /// How long dialling a peer may take, covering the TCP connect and the TLS
 /// handshake that follows it.
@@ -280,9 +296,11 @@ where
                     }
                 }
             }
-            Message::AskSnapshot { after } => {
+            Message::AskSnapshot { after, collection } => {
+                // The whole database, or the one collection a repair named
+                // (ADR-152); resumed from wherever the requester says.
                 let page = engine
-                    .snapshot_page(after)
+                    .snapshot_page(after, collection)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
@@ -418,7 +436,9 @@ pub struct DivergenceProbe {
 /// while the peer has not processed everything this node has — because a
 /// peer can only be read as *frozen* rather than catching up across
 /// contacts, and this call has seen none. The loop, which has, calls
-/// [`sync_once_with`] and carries a [`PeerStalls`] between rounds.
+/// [`sync_once_with`] and carries a [`PeerStalls`] between rounds — which is
+/// also where a snapshot that did not fit the round is left to resume
+/// (ADR-152); this call, with no memory, starts one over.
 pub async fn sync_once(
     engine: &Engine,
     peer: SocketAddr,
@@ -646,7 +666,8 @@ async fn dial(
     Ok((stream, their_node))
 }
 
-/// The body of [`sync_once`], over a connection [`dial`] opened.
+/// The body of [`sync_once`], over a connection [`dial`] opened: one round,
+/// bounded by [`REQUEST_TIMEOUT`].
 async fn sync_over<S>(
     engine: &Engine,
     mut stream: S,
@@ -658,298 +679,343 @@ async fn sync_over<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let round = async {
-        // Both of the peer's vectors, on the one frame every round spends
-        // anyway (ADR-146): what it can serve drives the pull, and what it
-        // has processed drives the count half's gate below. A peer that
-        // predates the flag answers with the first alone.
-        write_frame(&mut stream, &Message::AskVersions { witnessed: true }).await?;
-        let (theirs, their_witnessed) = match read_frame(&mut stream).await? {
-            Message::Vectors { servable, witnessed } => (servable, Some(witnessed)),
-            Message::Versions(servable) => (servable, None),
-            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
-            other => {
-                return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
-            }
-        };
-        let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
+    // What a snapshot pull checks between pages (ADR-152): the round's own
+    // deadline, less the reserve, so the round ends on a page boundary
+    // rather than wherever the timeout below cuts it.
+    let snapshot_deadline = Instant::now() + REQUEST_TIMEOUT - SNAPSHOT_PAGE_RESERVE;
+    tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        sync_round(engine, &mut stream, peer, their_node, probe, stalls, snapshot_deadline),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed("sync round timed out".into()))?
+}
 
-        // What we have *seen*, not what we could serve. Asking against the
-        // servable vector re-requests everything a node processed without
-        // appending — last-writer-wins losers, DDL it refused, declined or
-        // judged history, and stamps covered by a batch's window that it was
-        // never sent, such as a withheld `UniqueViolation` — on every round,
-        // forever (ADR-054). Replicated DDL that applies is *not* among them:
-        // `apply_ddl` appends the originating entry.
-        let mine =
-            engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+/// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
+/// the timeout around it and hands it `snapshot_deadline`, the instant past
+/// which a snapshot pull asks for no more pages this round (ADR-152). Separate
+/// so a test can hand it a deadline of its own.
+async fn sync_round<S>(
+    engine: &Engine,
+    stream: &mut S,
+    peer: SocketAddr,
+    their_node: kimmy_core::NodeId,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+    snapshot_deadline: Instant,
+) -> Result<SyncOutcome, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Both of the peer's vectors, on the one frame every round spends
+    // anyway (ADR-146): what it can serve drives the pull, and what it
+    // has processed drives the count half's gate below. A peer that
+    // predates the flag answers with the first alone.
+    write_frame(stream, &Message::AskVersions { witnessed: true }).await?;
+    let (theirs, their_witnessed) = match read_frame(stream).await? {
+        Message::Vectors { servable, witnessed } => (servable, Some(witnessed)),
+        Message::Versions(servable) => (servable, None),
+        Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+        other => {
+            return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
+        }
+    };
+    let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
 
-        // A repair planned against this peer (ADR-148) asks from below
-        // this node's position — from the divergent collection's creation,
-        // or for the peer's snapshot — where the position alone would say
-        // there is nothing to pull. A replay is judged against the peer's
-        // horizon by the threshold it asks from rather than by the vector
-        // it holds, so a floor below what the peer retains becomes the
-        // snapshot it would have been anyway.
-        let repair = stalls.repair_due(their_node);
-        let replay_floor = match repair {
-            Some((_, Repair::Replay { from })) => Some(from),
-            _ => None,
-        };
-        let from = match (mine.behind(&theirs), repair) {
-            (behind, Some((_, Repair::Replay { from: floor }))) => {
-                Some(behind.map_or(floor, |behind| behind.min(floor)))
-            }
-            (behind, Some((_, Repair::Snapshot))) => Some(behind.unwrap_or(Hlc::ZERO)),
-            (behind, None) => behind,
-        };
-        let Some(from) = from else {
-            // Nothing to pull, but the peer's own position is still news:
-            // how far *it* trails *us* is what says whether it has been
-            // away longer than tombstone retention.
-            //
-            // It is also the one belief a truncated sync window can hold
-            // falsely without anything on the anti-entropy path noticing
-            // (ADR-133): `mine` already claims to cover every origin `theirs`
-            // advertised, which is exactly finding 14's signature. Asking the
-            // peer what it actually holds is cheap precisely because this
-            // branch is common on a converged cluster — though not, on its
-            // own, on a busy one; see the `exhausted` branch below for the
-            // other place this check runs.
-            let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
-            let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
-            return Ok(SyncOutcome {
-                peer: Some(their_node),
-                behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
-                divergent: Some(findings.existence),
-                count_probe: findings.count,
-                count_probe_deferred: gate.deferred,
-                exhausted: true,
-                ..SyncOutcome::default()
-            });
-        };
+    // What we have *seen*, not what we could serve. Asking against the
+    // servable vector re-requests everything a node processed without
+    // appending — last-writer-wins losers, DDL it refused, declined or
+    // judged history, and stamps covered by a batch's window that it was
+    // never sent, such as a withheld `UniqueViolation` — on every round,
+    // forever (ADR-054). Replicated DDL that applies is *not* among them:
+    // `apply_ddl` appends the originating entry.
+    let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
-        // Ask for a full batch; if the peer says that will not fit, ask again for the
-        // number it named. At most one retry, because the peer answers with a count
-        // rather than a refusal. The retry re-reads the window at the smaller limit,
-        // so the window end the peer reports matches the entries it sends and the
-        // coverage rules are untouched.
+    // A repair planned against this peer (ADR-148) asks from below
+    // this node's position — from the divergent collection's creation,
+    // or for the peer's snapshot — where the position alone would say
+    // there is nothing to pull. A replay is judged against the peer's
+    // horizon by the threshold it asks from rather than by the vector
+    // it holds, so a floor below what the peer retains becomes the
+    // snapshot it would have been anyway.
+    let repair = stalls.repair_due(their_node);
+    let replay_floor = match repair {
+        Some((_, Repair::Replay { from })) => Some(from),
+        _ => None,
+    };
+    let from = match (mine.behind(&theirs), repair) {
+        (behind, Some((_, Repair::Replay { from: floor }))) => {
+            Some(behind.map_or(floor, |behind| behind.min(floor)))
+        }
+        (behind, Some((_, Repair::Snapshot))) => Some(behind.unwrap_or(Hlc::ZERO)),
+        (behind, None) => behind,
+    };
+    let Some(from) = from else {
+        // Nothing to pull, but the peer's own position is still news:
+        // how far *it* trails *us* is what says whether it has been
+        // away longer than tombstone retention.
         //
-        // The vector `from` came from travels with it, so the peer can judge
-        // its horizon per origin rather than by the threshold alone.
-        let mut limit = MAX_BATCH;
-        let held = if replay_floor.is_some() { None } else { Some(mine.clone()) };
-        let mut answer = match repair {
-            Some((collection, Repair::Snapshot)) => {
+        // It is also the one belief a truncated sync window can hold
+        // falsely without anything on the anti-entropy path noticing
+        // (ADR-133): `mine` already claims to cover every origin `theirs`
+        // advertised, which is exactly finding 14's signature. Asking the
+        // peer what it actually holds is cheap precisely because this
+        // branch is common on a converged cluster — though not, on its
+        // own, on a busy one; see the `exhausted` branch below for the
+        // other place this check runs.
+        //
+        // A whole-database snapshot left to resume with this peer is moot:
+        // the position says there is nothing below the horizon to pull.
+        stalls.snapshot_forgotten(their_node, None);
+        let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
+        let findings = ask_divergence(engine, stream, gate.probe).await?;
+        return Ok(SyncOutcome {
+            peer: Some(their_node),
+            behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+            divergent: Some(findings.existence),
+            count_probe: findings.count,
+            count_probe_deferred: gate.deferred,
+            exhausted: true,
+            ..SyncOutcome::default()
+        });
+    };
+
+    // Ask for a full batch; if the peer says that will not fit, ask again for the
+    // number it named. At most one retry, because the peer answers with a count
+    // rather than a refusal. The retry re-reads the window at the smaller limit,
+    // so the window end the peer reports matches the entries it sends and the
+    // coverage rules are untouched.
+    //
+    // The vector `from` came from travels with it, so the peer can judge
+    // its horizon per origin rather than by the threshold alone.
+    let mut limit = MAX_BATCH;
+    let held = if replay_floor.is_some() { None } else { Some(mine.clone()) };
+    let mut answer = match repair {
+        Some((collection, Repair::Snapshot)) => {
+            if stalls.snapshot_resumes(their_node, Some(collection)) {
+                info!(
+                    %peer,
+                    collection = %collection,
+                    "repairing: resuming the peer's snapshot of the collection from where \
+                     the last round left it"
+                );
+            } else {
                 warn!(
                     %peer,
                     collection = %collection,
-                    "repairing: pulling the peer's snapshot for a collection this node lacks \
+                    "repairing: pulling the peer's snapshot of a collection this node lacks \
                      or holds a confirmed divergence in"
                 );
-                Message::BeyondHorizon {}
             }
-            _ => {
-                write_frame(&mut stream, &Message::AskEntries { from, limit, held: held.clone() })
-                    .await?;
-                read_frame(&mut stream).await?
-            }
-        };
-
-        if let Message::BatchTooLarge { fits } = answer {
-            if fits == 0 {
-                // One entry alone exceeds the frame, so no limit can carry it. Name it
-                // rather than probing: this cannot replicate until the entry is gone.
-                return Err(ProtocolError::Malformed(format!(
-                    "a single oplog entry at or after {from:?} exceeds the {MAX_FRAME} \
-                     byte frame limit and cannot replicate"
-                )));
-            }
-            limit = fits;
-            warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
-            write_frame(&mut stream, &Message::AskEntries { from, limit, held }).await?;
-            answer = read_frame(&mut stream).await?;
+            Message::BeyondHorizon {}
         }
-
-        // Whether this round's own pull reached the peer's true tail — the
-        // fact that lets the divergence check also run on a round that
-        // pulled something, rather than only on a round that found nothing
-        // left to pull (ADR-133). A completed snapshot pull earns the same
-        // reading: `pull_snapshot` does not return until `page.next` is
-        // `None`, which is every page the peer had as of the pull, the
-        // snapshot's own version of "reached the tail".
-        let mut window_exhausted = false;
-        let mut outcome = match answer {
-            // The batch, and what it proved: an exhausted window is the peer's
-            // whole tail, any other ends at the stamp the peer says it scanned
-            // to. Either way the witnessed vector is raised for every origin
-            // the peer advertised, including stamps it holds but never ships —
-            // a `UniqueViolation` (ADR-029) — because otherwise such a stamp
-            // pins `behind` at its floor and the same window is re-served
-            // every round for the life of the cluster (ADR-082). The peer
-            // reports where its window ended rather than leaving it to be
-            // deduced from how many entries arrived, which a withheld entry
-            // could make a lie (ADR-127). The decision lives in storage
-            // (`coverage_up_to`), where it is tested between engines
-            // without a network.
-            Message::Entries { entries, scanned_to, exhausted } => {
-                // A correct sender cannot produce an empty, non-exhausted
-                // window: `read_oplog_from_where` only stops short of the
-                // limit by reaching the true end of the oplog, and it never
-                // breaks without having pushed at least one kept entry
-                // first when it does not (U1's proof, over every withheld
-                // arrangement and limit). This combination is therefore not
-                // an ordinary capped pull with nothing new to offer — it is
-                // a peer claiming both "nothing here" and "more exists",
-                // which nothing downstream can safely read as convergence.
-                // Failed as a malformed round rather than silently treated
-                // as "not exhausted, do not check": that would fold a
-                // genuine signal into the same bucket as an unremarkable
-                // capped pull, and a failed round is exactly the shape
-                // `kimmy_sync_failures_total` exists to make visible.
-                if is_unreachable_from_a_correct_sender(entries.len(), exhausted) {
-                    // Logged unconditionally, not left to the caller's
-                    // generic per-peer failure debounce: that debounce is
-                    // right for the ordinary noise of a peer going up and
-                    // down, and wrong here, because it can route this
-                    // occurrence's very first sighting to `debug` if the
-                    // same peer already had an unrelated failure recently —
-                    // leaving nothing but a bare counter increment for a
-                    // condition whose whole point is that it should never
-                    // occur at all. The counter says something is wrong;
-                    // this is what says what.
-                    warn!(
-                        %peer,
-                        ?from,
-                        "peer answered an empty batch while reporting its tail was not \
-                         reached; a correct sender cannot produce this, refusing the round"
-                    );
-                    return Err(ProtocolError::Malformed(format!(
-                        "peer at {peer} answered an empty batch from {from:?} while reporting \
-                         its tail was not reached — a correct sender cannot produce this"
-                    )));
-                }
-                let last = entries.last().map(|entry| entry.stamp.hlc);
-                let outcome = engine
-                    .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-                // The peer's tail was reached if the batch took the whole
-                // window up to the vector the peer advertised. An entry
-                // deferred above that vector does not change that: it lies
-                // past the tail the peer announced, and the divergence check
-                // compares against that announced vector, so the check may
-                // run. Gating it on nothing deferred would silence the check
-                // for as long as writes keep landing between the peer's two
-                // reads — exactly the busy cluster the check exists for. A
-                // batch stopped at a collection this node lacks did not reach
-                // the tail (ADR-148).
-                window_exhausted = exhausted && outcome.unknown_collection == 0;
-                match (repair, &outcome.unknown) {
-                    // A replay under way: done when it reached the tail,
-                    // escalated to a snapshot if it stopped at a collection
-                    // this node lacks — the peer's oplog cannot supply the
-                    // creation either — and otherwise continued from where
-                    // the window ended.
-                    (Some((collection, Repair::Replay { .. })), unknown) => {
-                        if unknown.is_some() {
-                            stalls.repair_continues(their_node, Repair::Snapshot);
-                        } else if window_exhausted {
-                            stalls.repair_finished(their_node);
-                            info!(
-                                %peer,
-                                collection = %collection,
-                                "repair complete: the peer's oplog was re-served to the tail"
-                            );
-                        } else {
-                            let next = last.unwrap_or(from);
-                            stalls.repair_continues(their_node, Repair::Replay { from: next });
-                        }
-                    }
-                    // A batch stopped at a collection this node does not
-                    // hold: its creation was witnessed here without being
-                    // applied, or has aged out of the peer's oplog, and
-                    // only the peer's snapshot brings it. Planned here, on
-                    // the strength of the stop itself, rather than left to
-                    // the divergence check — which cannot run on a round
-                    // that did not reach the tail, and this one never will
-                    // until the collection is here.
-                    (None, Some(unknown))
-                        if stalls.plan_repair(their_node, unknown.id, Repair::Snapshot) =>
-                    {
-                        warn!(
-                            %peer,
-                            collection = %unknown.id,
-                            name = unknown.name.as_deref().unwrap_or("unknown"),
-                            "planned a snapshot from this peer to repair a collection this \
-                             node lacks; the next round with it pulls the snapshot"
-                        );
-                    }
-                    _ => {}
-                }
-                Ok(outcome)
-            }
-            // The peer has collected what we need — or a repair asked for
-            // its snapshot outright. Fall back to current state.
-            Message::BeyondHorizon {} => {
-                if repair.is_none() {
-                    warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
-                }
-                window_exhausted = true;
-                let pulled = pull_snapshot(engine, &mut stream).await;
-                if let Some((collection, _)) = repair
-                    && pulled.is_ok()
-                {
-                    stalls.repair_finished(their_node);
-                    info!(%peer, collection = %collection, "repair complete: snapshot pulled");
-                }
-                pulled
-            }
-            other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
-        }?;
-        outcome.repairing = repair.is_some();
-
-        // How far behind in time this node is after the round: the age of
-        // the newest entry it holds from any origin the peer, as of the vector
-        // it opened with, holds newer entries of. Zero in the caught-up steady
-        // state; while a backlog wider than one batch drains, it grows with
-        // the clock — which is what an operator wants a gauge for, and what
-        // the span of missing history did not do for a bulk insert whose
-        // stamps all lay within a second (ADR-122). `theirs` is a round old
-        // by now, so this is a floor — a peer that raced ahead during the
-        // round shows up next round.
-        let mine =
-            engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        outcome.lag_ms =
-            kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
-        outcome.exhausted = window_exhausted;
-        // Only when the pull reached the peer's tail: a round still working
-        // through a backlog deeper than one batch has not earned the belief
-        // the check depends on, and must not spend a message finding out
-        // (ADR-133). This is what lets a busy cluster — many small rounds,
-        // each comfortably under the batch cap — still get checked on
-        // nearly every round, unlike a single global "nothing to pull" gate,
-        // which a continuous trickle of new writes can starve indefinitely.
-        if window_exhausted {
-            let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
-            let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
-            outcome.divergent = Some(findings.existence);
-            outcome.count_probe = findings.count;
-            outcome.count_probe_deferred = gate.deferred;
+        _ => {
+            write_frame(stream, &Message::AskEntries { from, limit, held: held.clone() }).await?;
+            read_frame(stream).await?
         }
-        // The other direction is a different question: how far the peer
-        // trails this node, in history it can no longer be served. A peer
-        // that is more than tombstone retention behind may be holding
-        // documents this node has deleted and already collected the
-        // tombstones for — the resurrection case (ADR-085). Reported, not
-        // acted on: the loop decides what to say about it.
-        outcome.behind_ms = behind_beyond_horizon(engine, &theirs, &mine)?;
-        outcome.peer = Some(their_node);
-        Ok(outcome)
     };
 
-    tokio::time::timeout(REQUEST_TIMEOUT, round)
-        .await
-        .map_err(|_| ProtocolError::Malformed("sync round timed out".into()))?
+    if let Message::BatchTooLarge { fits } = answer {
+        if fits == 0 {
+            // One entry alone exceeds the frame, so no limit can carry it. Name it
+            // rather than probing: this cannot replicate until the entry is gone.
+            return Err(ProtocolError::Malformed(format!(
+                "a single oplog entry at or after {from:?} exceeds the {MAX_FRAME} \
+                 byte frame limit and cannot replicate"
+            )));
+        }
+        limit = fits;
+        warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
+        write_frame(stream, &Message::AskEntries { from, limit, held }).await?;
+        answer = read_frame(stream).await?;
+    }
+
+    // Whether this round's own pull reached the peer's true tail — the
+    // fact that lets the divergence check also run on a round that
+    // pulled something, rather than only on a round that found nothing
+    // left to pull (ADR-133). A *completed* snapshot pull earns the same
+    // reading — every page the peer had as of the pull, the snapshot's own
+    // version of "reached the tail" — and one left to resume for the next
+    // round (ADR-152) does not.
+    let mut window_exhausted = false;
+    let mut outcome = match answer {
+        // The batch, and what it proved: an exhausted window is the peer's
+        // whole tail, any other ends at the stamp the peer says it scanned
+        // to. Either way the witnessed vector is raised for every origin
+        // the peer advertised, including stamps it holds but never ships —
+        // a `UniqueViolation` (ADR-029) — because otherwise such a stamp
+        // pins `behind` at its floor and the same window is re-served
+        // every round for the life of the cluster (ADR-082). The peer
+        // reports where its window ended rather than leaving it to be
+        // deduced from how many entries arrived, which a withheld entry
+        // could make a lie (ADR-127). The decision lives in storage
+        // (`coverage_up_to`), where it is tested between engines
+        // without a network.
+        Message::Entries { entries, scanned_to, exhausted } => {
+            // A correct sender cannot produce an empty, non-exhausted
+            // window: `read_oplog_from_where` only stops short of the
+            // limit by reaching the true end of the oplog, and it never
+            // breaks without having pushed at least one kept entry
+            // first when it does not (U1's proof, over every withheld
+            // arrangement and limit). This combination is therefore not
+            // an ordinary capped pull with nothing new to offer — it is
+            // a peer claiming both "nothing here" and "more exists",
+            // which nothing downstream can safely read as convergence.
+            // Failed as a malformed round rather than silently treated
+            // as "not exhausted, do not check": that would fold a
+            // genuine signal into the same bucket as an unremarkable
+            // capped pull, and a failed round is exactly the shape
+            // `kimmy_sync_failures_total` exists to make visible.
+            if is_unreachable_from_a_correct_sender(entries.len(), exhausted) {
+                // Logged unconditionally, not left to the caller's
+                // generic per-peer failure debounce: that debounce is
+                // right for the ordinary noise of a peer going up and
+                // down, and wrong here, because it can route this
+                // occurrence's very first sighting to `debug` if the
+                // same peer already had an unrelated failure recently —
+                // leaving nothing but a bare counter increment for a
+                // condition whose whole point is that it should never
+                // occur at all. The counter says something is wrong;
+                // this is what says what.
+                warn!(
+                    %peer,
+                    ?from,
+                    "peer answered an empty batch while reporting its tail was not \
+                     reached; a correct sender cannot produce this, refusing the round"
+                );
+                return Err(ProtocolError::Malformed(format!(
+                    "peer at {peer} answered an empty batch from {from:?} while reporting \
+                     its tail was not reached — a correct sender cannot produce this"
+                )));
+            }
+            // The peer serves this node from its oplog, so a whole-database
+            // snapshot left to resume with it is moot; a cursor kept past
+            // this point would resume a walk the position has moved on from.
+            stalls.snapshot_forgotten(their_node, None);
+            let last = entries.last().map(|entry| entry.stamp.hlc);
+            let outcome = engine
+                .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
+                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            // The peer's tail was reached if the batch took the whole
+            // window up to the vector the peer advertised. An entry
+            // deferred above that vector does not change that: it lies
+            // past the tail the peer announced, and the divergence check
+            // compares against that announced vector, so the check may
+            // run. Gating it on nothing deferred would silence the check
+            // for as long as writes keep landing between the peer's two
+            // reads — exactly the busy cluster the check exists for. A
+            // batch stopped at a collection this node lacks did not reach
+            // the tail (ADR-148).
+            window_exhausted = exhausted && outcome.unknown_collection == 0;
+            match (repair, &outcome.unknown) {
+                // A replay under way: done when it reached the tail,
+                // escalated to a snapshot if it stopped at a collection
+                // this node lacks — the peer's oplog cannot supply the
+                // creation either — and otherwise continued from where
+                // the window ended.
+                (Some((collection, Repair::Replay { .. })), unknown) => {
+                    if unknown.is_some() {
+                        stalls.repair_continues(their_node, Repair::Snapshot);
+                    } else if window_exhausted {
+                        stalls.repair_finished(their_node);
+                        info!(
+                            %peer,
+                            collection = %collection,
+                            "repair complete: the peer's oplog was re-served to the tail"
+                        );
+                    } else {
+                        let next = last.unwrap_or(from);
+                        stalls.repair_continues(their_node, Repair::Replay { from: next });
+                    }
+                }
+                // A batch stopped at a collection this node does not
+                // hold: its creation was witnessed here without being
+                // applied, or has aged out of the peer's oplog, and
+                // only the peer's snapshot brings it. Planned here, on
+                // the strength of the stop itself, rather than left to
+                // the divergence check — which cannot run on a round
+                // that did not reach the tail, and this one never will
+                // until the collection is here.
+                (None, Some(unknown))
+                    if stalls.plan_repair(their_node, unknown.id, Repair::Snapshot) =>
+                {
+                    warn!(
+                        %peer,
+                        collection = %unknown.id,
+                        name = unknown.name.as_deref().unwrap_or("unknown"),
+                        "planned a snapshot from this peer to repair a collection this \
+                         node lacks; the next round with it pulls the snapshot"
+                    );
+                }
+                _ => {}
+            }
+            Ok(outcome)
+        }
+        // The peer has collected what we need — or a repair asked for
+        // its snapshot outright. Fall back to current state: the whole
+        // database for the horizon, the one collection for the repair
+        // (ADR-152). A pull that does not finish inside the round leaves
+        // its pages applied and its cursor with `stalls`, and the next
+        // round with this peer goes on from there.
+        Message::BeyondHorizon {} => {
+            let scope = match repair {
+                Some((collection, Repair::Snapshot)) => Some(collection),
+                _ => None,
+            };
+            if repair.is_none() && !stalls.snapshot_resumes(their_node, None) {
+                warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
+            }
+            let pulled =
+                pull_snapshot(engine, stream, peer, their_node, scope, stalls, snapshot_deadline)
+                    .await?;
+            window_exhausted = pulled.complete;
+            if let Some((collection, _)) = repair
+                && pulled.complete
+            {
+                stalls.repair_finished(their_node);
+                info!(%peer, collection = %collection, "repair complete: snapshot pulled");
+            }
+            Ok(pulled.outcome)
+        }
+        other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
+    }?;
+    outcome.repairing = repair.is_some();
+
+    // How far behind in time this node is after the round: the age of
+    // the newest entry it holds from any origin the peer, as of the vector
+    // it opened with, holds newer entries of. Zero in the caught-up steady
+    // state; while a backlog wider than one batch drains, it grows with
+    // the clock — which is what an operator wants a gauge for, and what
+    // the span of missing history did not do for a bulk insert whose
+    // stamps all lay within a second (ADR-122). `theirs` is a round old
+    // by now, so this is a floor — a peer that raced ahead during the
+    // round shows up next round.
+    let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+    outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
+    outcome.exhausted = window_exhausted;
+    // Only when the pull reached the peer's tail: a round still working
+    // through a backlog deeper than one batch has not earned the belief
+    // the check depends on, and must not spend a message finding out
+    // (ADR-133). This is what lets a busy cluster — many small rounds,
+    // each comfortably under the batch cap — still get checked on
+    // nearly every round, unlike a single global "nothing to pull" gate,
+    // which a continuous trickle of new writes can starve indefinitely.
+    if window_exhausted {
+        let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
+        let findings = ask_divergence(engine, stream, gate.probe).await?;
+        outcome.divergent = Some(findings.existence);
+        outcome.count_probe = findings.count;
+        outcome.count_probe_deferred = gate.deferred;
+    }
+    // The other direction is a different question: how far the peer
+    // trails this node, in history it can no longer be served. A peer
+    // that is more than tombstone retention behind may be holding
+    // documents this node has deleted and already collected the
+    // tombstones for — the resurrection case (ADR-085). Reported, not
+    // acted on: the loop decides what to say about it.
+    outcome.behind_ms = behind_beyond_horizon(engine, &theirs, &mine)?;
+    outcome.peer = Some(their_node);
+    Ok(outcome)
 }
 
 /// How far the peer trails this node where it can no longer catch up
@@ -1139,6 +1205,14 @@ pub struct PeerStalls {
     /// the log says so once rather than every round.
     without_witnessed: HashSet<NodeId>,
     repairs: HashMap<NodeId, Repairs>,
+    /// Snapshot pulls left to resume, one per peer (ADR-152): where the next
+    /// page begins and what the completed snapshot grants, carried across
+    /// rounds so a snapshot that does not fit one round goes on from its
+    /// last page rather than page one. Beside the repairs for the reason
+    /// they are here — written inside the round, against the peer the round
+    /// is with — and written after every page, before the next frame, so a
+    /// round the timeout cancels leaves the pages it applied recorded.
+    snapshots: HashMap<NodeId, SnapshotProgress>,
 }
 
 /// How a round repairs a hole against one peer (ADR-148).
@@ -1160,14 +1234,21 @@ pub enum Repair {
 struct Repairs {
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
-    /// Rounds the repair in progress has been handed out for without
-    /// making progress — a round that failed, or one whose snapshot did
-    /// not complete inside the request timeout. Reset whenever the repair
-    /// advances or finishes. At [`REPAIR_ATTEMPTS`] the repair is
-    /// abandoned and takes the cooldown, so a repair that cannot complete
-    /// costs the same as one that can rather than retrying every round for
-    /// the life of the process.
+    /// Consecutive rounds the repair in progress has been handed out for
+    /// without making progress — a round that failed, or a snapshot round
+    /// that applied no page. Counted when the next round opens, from
+    /// `advanced`; reset by a round that advanced. At [`REPAIR_ATTEMPTS`]
+    /// the repair is abandoned and takes the cooldown, so a repair that
+    /// cannot complete costs the same as one that can rather than retrying
+    /// every round for the life of the process.
     stalled: u32,
+    /// Whether the round last handed the repair advanced it — a replay's
+    /// window moved, a snapshot's page landed (ADR-152). Read and cleared
+    /// when the next round opens, so that round is the first of a new run
+    /// rather than the second: the count is incremented before a round
+    /// runs, because a round that fails never returns here, and a reset
+    /// inside the round would otherwise leave the advancing round counted.
+    advanced: bool,
     /// Planned behind it, one per collection.
     queued: BTreeMap<CollectionId, Repair>,
     /// Collections repaired against this peer, with the rounds since: not
@@ -1189,10 +1270,13 @@ pub const REPAIR_COOLDOWN_ROUNDS: u32 = 60;
 /// Rounds a repair may be handed out for without advancing before it is
 /// abandoned and takes the cooldown (ADR-148).
 ///
-/// A replay advances every round that completes — its window moves — so a
-/// repair that does not advance is one whose round failed or whose
-/// snapshot did not finish inside `REQUEST_TIMEOUT`, and a full snapshot
-/// of a large database is exactly the repair that can keep not finishing.
+/// A replay advances every round that completes — its window moves — and a
+/// snapshot advances on every page it applies, across rounds (ADR-152), so
+/// a repair that does not advance is one whose round keeps failing before a
+/// page lands. Before ADR-152 a snapshot advanced only by completing inside
+/// `REQUEST_TIMEOUT`, and one of a large database was exactly the repair
+/// that could keep not finishing; now it is abandoned only when three
+/// rounds in a row apply nothing.
 /// Three, for the reason [`FROZEN_CONTACTS`] is three: one is a peer
 /// having a bad moment, three in a row is a repair that is not going to
 /// complete on this route, and the cooldown then keeps it to one attempt
@@ -1242,11 +1326,18 @@ impl PeerStalls {
             *rounds < REPAIR_COOLDOWN_ROUNDS
         });
         // A repair handed out on the previous round and neither advanced
-        // nor finished since: the round failed, or the snapshot did not
-        // complete. Counted here rather than at the failure, because a
-        // round that fails never returns to this module at all.
+        // nor finished since: the round failed, or the snapshot landed no
+        // page. Counted here rather than at the failure, because a round
+        // that fails never returns to this module at all; a round that
+        // advanced says so and starts the run again, so exactly
+        // `REPAIR_ATTEMPTS` rounds landing nothing abandon a repair whether
+        // or not it had advanced before them.
         if repairs.active.is_some() {
-            repairs.stalled += 1;
+            if std::mem::take(&mut repairs.advanced) {
+                repairs.stalled = 0;
+            } else {
+                repairs.stalled += 1;
+            }
             if repairs.stalled >= REPAIR_ATTEMPTS
                 && let Some((collection, _)) = repairs.active.take()
             {
@@ -1259,13 +1350,74 @@ impl PeerStalls {
                 );
                 repairs.done.insert(collection, 0);
                 repairs.stalled = 0;
+                repairs.advanced = false;
+                // Whatever of its snapshot was pulled is kept — the pages
+                // are applied — but not resumed: the next repair of the
+                // collection, after the cooldown, starts over.
+                if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
+                    self.snapshots.remove(&peer);
+                }
             }
         }
         if repairs.active.is_none() {
             repairs.active = repairs.queued.pop_first();
             repairs.stalled = 0;
+            repairs.advanced = false;
         }
         repairs.active
+    }
+
+    /// Whether a snapshot pull scoped to `scope` was left to resume with
+    /// `peer`: one that applied at least a page and has not completed.
+    fn snapshot_resumes(&self, peer: NodeId, scope: Option<CollectionId>) -> bool {
+        self.snapshots
+            .get(&peer)
+            .is_some_and(|p| p.scope() == scope && p.pages() > 0 && !p.is_complete())
+    }
+
+    /// The snapshot pull with `peer` scoped to `scope`: the one left to
+    /// resume, or a fresh one. A pull left over for another scope is
+    /// dropped — a round pulls one snapshot, and the one it wants is this.
+    fn snapshot_progress(
+        &mut self,
+        peer: NodeId,
+        scope: Option<CollectionId>,
+    ) -> &mut SnapshotProgress {
+        let fresh = || match scope {
+            Some(id) => SnapshotProgress::of_collection(id),
+            None => SnapshotProgress::whole_database(),
+        };
+        let progress = self.snapshots.entry(peer).or_insert_with(fresh);
+        if progress.scope() != scope || progress.is_complete() {
+            *progress = fresh();
+        }
+        progress
+    }
+
+    /// A page of the snapshot with `peer` was applied: the repair it
+    /// serves, if it serves one, advanced, and its stall run starts again —
+    /// exactly as a replay's does when its window moves (ADR-152).
+    fn snapshot_advanced(&mut self, peer: NodeId) {
+        if let Some(repairs) = self.repairs.get_mut(&peer)
+            && matches!(repairs.active, Some((_, Repair::Snapshot)))
+        {
+            repairs.advanced = true;
+        }
+    }
+
+    /// The snapshot pull with `peer` is complete: nothing to resume.
+    fn snapshot_done(&mut self, peer: NodeId) {
+        self.snapshots.remove(&peer);
+    }
+
+    /// Forget a snapshot pull scoped to `scope` left to resume with `peer`,
+    /// if there is one. The pages it applied stay applied; what is dropped
+    /// is the cursor, for a round that showed the pull is no longer the
+    /// one wanted.
+    fn snapshot_forgotten(&mut self, peer: NodeId, scope: Option<CollectionId>) {
+        if self.snapshots.get(&peer).is_some_and(|p| p.scope() == scope) {
+            self.snapshots.remove(&peer);
+        }
     }
 
     /// The repair under way against `peer` continues next round as `next`.
@@ -1274,8 +1426,8 @@ impl PeerStalls {
             && let Some(active) = &mut repairs.active
         {
             active.1 = next;
-            // It advanced, so the stall run starts again.
-            repairs.stalled = 0;
+            // It advanced, so the stall run starts again at the next round.
+            repairs.advanced = true;
         }
     }
 
@@ -1286,6 +1438,12 @@ impl PeerStalls {
         {
             repairs.done.insert(collection, 0);
             repairs.stalled = 0;
+            // The page that finished it must not be read as advancing the
+            // next repair planned for this peer.
+            repairs.advanced = false;
+            if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
+                self.snapshots.remove(&peer);
+            }
         }
     }
 
@@ -1447,19 +1605,59 @@ where
     Ok(kimmy_storage::compare_divergence(&mine, &peer))
 }
 
-/// Pull a full snapshot, page by page, until the peer says it is complete.
+/// What one round's snapshot pull came to (ADR-152).
+struct SnapshotPulled {
+    /// What applying the pages changed, so a caller sees a snapshot the
+    /// same way it sees an incremental round.
+    outcome: SyncOutcome,
+    /// Whether the final page landed. `false` is a pull left to resume: its
+    /// pages stay applied, its cursor is with the [`PeerStalls`], and the
+    /// next round with the peer goes on from it.
+    complete: bool,
+}
+
+/// Whether a page answering a snapshot scoped to `id` carries anything of
+/// another collection — what a sender that predates the scope serves.
+fn served_beyond_scope(page: &SnapshotPage, id: CollectionId) -> bool {
+    page.documents.iter().any(|d| d.collection != id)
+        || page.collections.iter().any(|c| CollectionId::derive(&c.db, &c.name) != id)
+}
+
+/// Pull a snapshot, page by page, until the peer says it is complete or the
+/// round's budget is spent (ADR-152).
 ///
-/// Returns what applying it changed, so a caller sees a snapshot the same way
-/// it sees an incremental round.
-async fn pull_snapshot<S>(engine: &Engine, stream: &mut S) -> Result<SyncOutcome, ProtocolError>
+/// `scope` is the one collection to pull, for a repair (ADR-148), or `None`
+/// for the whole database a member below the peer's retention horizon
+/// needs. Where the pull stands is kept in `stalls`, against `node`, and is
+/// moved after every page *before* the next is asked for: a page applied is
+/// one transaction, so a round the timeout cancels at the next frame leaves
+/// every page it applied recorded, and the next round asks for the page
+/// after them rather than page one. `deadline` is checked between pages,
+/// never inside one — a page in flight when it passes is finished and
+/// recorded. Every page applied is the repair advancing
+/// ([`PeerStalls::snapshot_advanced`]), so a slow-but-moving snapshot is
+/// never abandoned as stalled; [`REPAIR_ATTEMPTS`] counts rounds that
+/// applied nothing.
+async fn pull_snapshot<S>(
+    engine: &Engine,
+    stream: &mut S,
+    peer: SocketAddr,
+    node: NodeId,
+    scope: Option<CollectionId>,
+    stalls: &mut PeerStalls,
+    deadline: Instant,
+) -> Result<SnapshotPulled, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut cursor = None;
     let mut outcome = SyncOutcome::default();
+    let mut pages = 0usize;
+    let resumed = stalls.snapshot_resumes(node, scope);
+    let mut whole_from_older_peer = false;
 
     loop {
-        write_frame(stream, &Message::AskSnapshot { after: cursor.clone() }).await?;
+        let after = stalls.snapshot_progress(node, scope).after().cloned();
+        write_frame(stream, &Message::AskSnapshot { after, collection: scope }).await?;
         let page = match read_frame(stream).await? {
             Message::Snapshot(page) => page,
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
@@ -1468,22 +1666,70 @@ where
             }
         };
 
-        let page_outcome = engine
-            .apply_snapshot_page(&page)
-            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        outcome.applied += page_outcome.applied;
+        // A sender before the field ignores the scope and serves its whole
+        // database. Applied as it comes: that is the snapshot a repair
+        // pulled before ADR-152, correct and only dearer, and it grants no
+        // coverage under a scope either. Said once a round, because the log
+        // is where an operator learns the roll is not finished.
+        if let Some(id) = scope
+            && !whole_from_older_peer
+            && served_beyond_scope(&page, id)
+        {
+            whole_from_older_peer = true;
+            info!(
+                %peer,
+                collection = %id,
+                "the peer answered a snapshot of one collection with its whole database (a \
+                 version before the field); applying it as it comes"
+            );
+        }
+
+        // Applied, and the progress moved, before anything else is awaited:
+        // this is the point a cancelled round resumes from.
+        let progress = stalls.snapshot_progress(node, scope);
+        let before = progress.pages();
+        let applied = engine.apply_snapshot_page(progress, &page);
+        let advanced = progress.pages() > before;
+        let complete = progress.is_complete();
+        let (total_pages, total_documents) = (progress.pages(), progress.documents());
+        let cursor = progress.after().map(ToString::to_string);
+        if advanced {
+            stalls.snapshot_advanced(node);
+            pages += 1;
+        }
+        let applied = applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        outcome.applied += applied.applied;
         // Counted where a refusal reached through the oplog is, so the
         // metric and the round report do not depend on the route (ADR-123).
-        outcome.ddl_refused += page_outcome.ddl_refused;
+        outcome.ddl_refused += applied.ddl_refused;
 
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => break,
+        if complete {
+            stalls.snapshot_done(node);
+            info!(
+                %peer,
+                documents = outcome.applied,
+                pages,
+                total_pages,
+                total_documents,
+                resumed,
+                "caught up from a snapshot"
+            );
+            return Ok(SnapshotPulled { outcome, complete: true });
+        }
+        if Instant::now() >= deadline {
+            info!(
+                %peer,
+                pages,
+                documents = outcome.applied,
+                total_pages,
+                total_documents,
+                cursor = cursor.as_deref().unwrap_or("-"),
+                "snapshot left to resume on the next round with this peer: the round's \
+                 budget is spent"
+            );
+            return Ok(SnapshotPulled { outcome, complete: false });
         }
     }
-
-    info!(documents = outcome.applied, "caught up from a snapshot");
-    Ok(outcome)
 }
 
 /// Open a handshake: challenge them, check the answer, then answer theirs.
@@ -2009,6 +2255,315 @@ mod tests {
         assert!(stalls.plan_repair(node(9), orders.id, Repair::Snapshot), "cleared, so again");
     }
 
+    /// A snapshot page as a fake peer serves it: one collection, documents
+    /// with `origin`'s stamps at `walls`, the cursor and the vector given.
+    fn snapshot_page(
+        origin: NodeId,
+        walls: &[u64],
+        next: Option<kimmy_storage::SnapshotCursor>,
+        versions: VersionVector,
+        first: bool,
+    ) -> SnapshotPage {
+        let collection = CollectionId::derive("shop", "orders");
+        let collections = if first {
+            vec![kimmy_storage::CollectionState {
+                db: "shop".into(),
+                name: "orders".into(),
+                indexes: Vec::new(),
+                vector: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let documents = walls
+            .iter()
+            .map(|&wall| kimmy_storage::SnapshotDoc {
+                collection,
+                id: kimmy_core::DocId::Int64(wall as i64),
+                stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+                body: Some(bson::serialize_to_vec(&bson::doc! { "_id": wall as i64 }).unwrap()),
+            })
+            .collect();
+        SnapshotPage { collections, documents, next, versions, dropped: None }
+    }
+
+    fn cursor(after: u64) -> kimmy_storage::SnapshotCursor {
+        kimmy_storage::SnapshotCursor {
+            collection: CollectionId::derive("shop", "orders"),
+            after_key: after.to_be_bytes().to_vec(),
+        }
+    }
+
+    /// A deadline a snapshot pull has already passed, and one it never
+    /// reaches within a test.
+    fn spent() -> Instant {
+        Instant::now() - Duration::from_secs(1)
+    }
+    fn ample() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    /// ADR-152 on the horizon path, over the wire. A whole-database snapshot
+    /// whose round budget is spent after one page leaves that page applied
+    /// and its cursor with the `PeerStalls`; the next round asks for the
+    /// page after it, not page one, and the coverage adopted when the final
+    /// page lands is the vector served with the *first* page — the peer's
+    /// later vector, served with the last page, is not covered, so the next
+    /// round still asks for what the peer wrote in between. Nothing is
+    /// witnessed before the end: the pages' documents move no vector.
+    #[tokio::test]
+    async fn a_snapshot_cut_short_resumes_from_its_cursor_and_grants_the_first_pages_vector() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let first_vector = vector(&[(origin, 3_000)]);
+        let last_vector = vector(&[(origin, 9_000)]);
+        let their_node = node(9);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        /// One round of the peer's side: vectors, `BeyondHorizon` to the
+        /// pull, then the snapshot pages it is asked for, in order, each
+        /// asked for from the cursor expected.
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            pages: Vec<(Option<kimmy_storage::SnapshotCursor>, SnapshotPage)>,
+            then_check: bool,
+        ) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { .. } => {}
+                other => panic!("expected AskEntries, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::BeyondHorizon {}).await.unwrap();
+            for (expect_after, page) in pages {
+                match read_frame(&mut stream).await.unwrap() {
+                    Message::AskSnapshot { after, collection: None } => {
+                        assert_eq!(after, expect_after, "asked from where the last page ended");
+                    }
+                    other => panic!("expected a whole-database AskSnapshot, got {other:?}"),
+                }
+                write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+            }
+            if then_check {
+                match read_frame(&mut stream).await.unwrap() {
+                    Message::AskDivergence { .. } => {}
+                    other => panic!("a completed snapshot reached the tail, got {other:?}"),
+                }
+                let divergence = Message::Divergence { collections: Vec::new(), probe_count: None };
+                write_frame(&mut stream, &divergence).await.unwrap();
+            }
+            // Nothing more must be asked: the round's budget is spent, or
+            // the round is over.
+            assert!(
+                matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)),
+                "the requester asked for more than the round allowed"
+            );
+        }
+
+        let mut stalls = PeerStalls::new();
+        let orders = CollectionId::derive("shop", "orders");
+
+        // Round one: budget already spent, so one page and no more.
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let page1 =
+            snapshot_page(origin, &[1_000, 2_000], Some(cursor(2_000)), first_vector.clone(), true);
+        let peer =
+            tokio::spawn(fake_peer(peer_end, last_vector.clone(), vec![(None, page1)], false));
+        let mut ours = ours;
+        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, spent())
+            .await
+            .unwrap();
+        drop(ours);
+        peer.await.unwrap();
+        assert_eq!(outcome.applied, 2, "the page landed: {outcome:?}");
+        assert!(!outcome.exhausted, "left to resume is not the tail: {outcome:?}");
+        assert!(stalls.snapshot_resumes(their_node, None), "the cursor is kept");
+        assert_eq!(stalls.snapshots[&their_node].after(), Some(&cursor(2_000)));
+        let meta = engine.collection_by_id(orders).unwrap().expect("the definition arrived");
+        assert_eq!(engine.count(&meta).unwrap(), 2);
+        assert_eq!(
+            engine.witnessed_vector().unwrap().get(origin),
+            Hlc::ZERO,
+            "nothing is witnessed until the snapshot completes"
+        );
+
+        // Round two: from the cursor, with the budget intact, to the end.
+        // The peer has written on: the final page's vector is higher.
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let page2 =
+            snapshot_page(origin, &[4_000], Some(cursor(4_000)), last_vector.clone(), false);
+        let page3 = snapshot_page(origin, &[9_000], None, last_vector.clone(), false);
+        let peer = tokio::spawn(fake_peer(
+            peer_end,
+            last_vector.clone(),
+            vec![(Some(cursor(2_000)), page2), (Some(cursor(4_000)), page3)],
+            true,
+        ));
+        let mut ours = ours;
+        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample())
+            .await
+            .unwrap();
+        drop(ours);
+        peer.await.unwrap();
+        assert_eq!(outcome.applied, 2, "{outcome:?}");
+        assert!(outcome.exhausted, "a completed snapshot is the tail: {outcome:?}");
+        assert!(outcome.divergent.is_some(), "so the check ran: {outcome:?}");
+        assert!(!stalls.snapshot_resumes(their_node, None), "nothing left to resume");
+        assert_eq!(engine.count(&meta).unwrap(), 4, "every page, each exactly once");
+        let mine = engine.witnessed_vector().unwrap();
+        assert!(mine.covers(&first_vector), "the first page's vector is adopted: {mine:?}");
+        assert!(
+            !mine.covers(&last_vector),
+            "not the last page's: what the peer wrote behind the cursor since is still asked \
+             for — {mine:?}"
+        );
+        assert_eq!(mine.behind(&last_vector), Some(Hlc::new(3_000, 0)));
+    }
+
+    /// ADR-152 on the repair path. A snapshot repair asks for the one
+    /// collection it was planned for, resumes from its cursor on the next
+    /// round, is not abandoned while pages keep landing — one page per round
+    /// for more rounds than `REPAIR_ATTEMPTS` — finishes when the final
+    /// page lands, and grants no coverage on the way or at the end: the
+    /// position carries the rest. Three rounds that apply nothing still
+    /// abandon it.
+    #[tokio::test]
+    async fn a_snapshot_repair_pulls_one_collection_resumes_and_is_abandoned_only_when_nothing_lands()
+     {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        let their_node = node(9);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let orders = CollectionId::derive("shop", "orders");
+        // The hole: the position already claims the origin, so nothing
+        // says the collection is missing except the repair.
+        engine.absorb_witnessed(&theirs).unwrap();
+
+        /// One round of the peer's side of a snapshot repair: vectors, then
+        /// straight to a scoped `AskSnapshot` — no `AskEntries`, the repair
+        /// asks for the snapshot outright — answered with `page`; a
+        /// completed page is followed by the check.
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            expect_after: Option<kimmy_storage::SnapshotCursor>,
+            page: Option<SnapshotPage>,
+        ) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            // A round that fails before a page lands: the peer goes away.
+            let Some(page) = page else { return };
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskSnapshot { after, collection } => {
+                    assert_eq!(collection, Some(CollectionId::derive("shop", "orders")));
+                    assert_eq!(after, expect_after, "resumed from the last page applied");
+                }
+                other => panic!("expected a scoped AskSnapshot, got {other:?}"),
+            }
+            let complete = page.next.is_none();
+            write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+            if complete {
+                match read_frame(&mut stream).await.unwrap() {
+                    Message::AskDivergence { .. } => {}
+                    other => panic!("expected AskDivergence, got {other:?}"),
+                }
+                let divergence = Message::Divergence { collections: Vec::new(), probe_count: None };
+                write_frame(&mut stream, &divergence).await.unwrap();
+            }
+            assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
+        }
+
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(their_node, orders, Repair::Snapshot));
+
+        // More rounds than a stalled repair survives, each landing one page
+        // and stopping on a spent budget.
+        let rounds = REPAIR_ATTEMPTS as u64 * 2;
+        for round in 0..rounds {
+            let wall = 1_000 * (round + 1);
+            let after = (round > 0).then(|| cursor(wall - 1_000));
+            let page =
+                snapshot_page(origin, &[wall], Some(cursor(wall)), theirs.clone(), round == 0);
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), after, Some(page)));
+            let mut ours = ours;
+            let outcome =
+                sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, spent())
+                    .await
+                    .unwrap();
+            drop(ours);
+            peer.await.unwrap();
+            assert_eq!(outcome.applied, 1, "round {round}: {outcome:?}");
+            assert!(outcome.repairing && !outcome.exhausted, "round {round}: {outcome:?}");
+            assert!(stalls.repairing(their_node), "round {round}: a moving repair is kept");
+            assert!(stalls.snapshot_resumes(their_node, Some(orders)), "round {round}");
+        }
+
+        // The final page, with the budget intact: done, and the check runs.
+        let last = snapshot_page(origin, &[9_000], None, theirs.clone(), false);
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(
+            peer_end,
+            theirs.clone(),
+            Some(cursor(1_000 * rounds)),
+            Some(last),
+        ));
+        let mut ours = ours;
+        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample())
+            .await
+            .unwrap();
+        drop(ours);
+        peer.await.unwrap();
+        assert!(outcome.repairing && outcome.exhausted, "{outcome:?}");
+        assert!(outcome.divergent.is_some(), "{outcome:?}");
+        assert!(!stalls.repairing(their_node), "done");
+        assert!(!stalls.snapshot_resumes(their_node, Some(orders)));
+        let meta = engine.collection_by_id(orders).unwrap().expect("the collection arrived");
+        assert_eq!(engine.count(&meta).unwrap(), rounds + 1, "every page exactly once");
+        assert_eq!(
+            engine.witnessed_vector().unwrap(),
+            theirs,
+            "a scoped snapshot grants nothing: the position is what it was"
+        );
+
+        // A second repair whose every round fails before a page lands is
+        // abandoned after `REPAIR_ATTEMPTS` of them, snapshot or not.
+        stalls.retain_repaired(their_node, &BTreeSet::new());
+        assert!(stalls.plan_repair(their_node, orders, Repair::Snapshot));
+        for attempt in 0..REPAIR_ATTEMPTS {
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), None, None));
+            let mut ours = ours;
+            let failed =
+                sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample()).await;
+            drop(ours);
+            peer.await.unwrap();
+            assert!(failed.is_err(), "attempt {attempt}: the peer went away");
+        }
+        assert_eq!(
+            stalls.repair_due(their_node),
+            None,
+            "abandoned after three rounds that landed nothing"
+        );
+        assert!(!stalls.repairing(their_node));
+    }
+
     /// A repair that never completes — every round with the peer failing,
     /// or a snapshot too large to finish inside the request timeout — is
     /// abandoned after `REPAIR_ATTEMPTS` rounds that did not advance it,
@@ -2045,6 +2600,50 @@ mod tests {
             stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(wall, 0) });
         }
         assert!(stalls.repairing(peer), "a repair making progress is never abandoned");
+    }
+
+    /// The count after progress (ADR-152). A repair that advanced — a page
+    /// landed, a window moved — is handed out for exactly `REPAIR_ATTEMPTS`
+    /// rounds that land nothing before it is abandoned, the same as one
+    /// that never advanced: the round that advanced is not the first of
+    /// the run. The count was incremented when a round opened and reset
+    /// inside the round that advanced, so the next round opened at one
+    /// and two empty rounds abandoned a repair that had just made
+    /// progress.
+    #[test]
+    fn a_repair_that_advanced_survives_three_rounds_landing_nothing_and_not_a_fourth() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+
+        // A snapshot repair: a page landed in the round it was handed to.
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        stalls.snapshot_advanced(peer);
+        for empty in 1..=REPAIR_ATTEMPTS {
+            assert_eq!(
+                stalls.repair_due(peer),
+                Some((collection, Repair::Snapshot)),
+                "empty round {empty} after the page: still handed out"
+            );
+        }
+        assert_eq!(stalls.repair_due(peer), None, "and abandoned on the round after");
+        assert!(!stalls.repairing(peer));
+
+        // A replay, and a run that restarts: two empty rounds, then the
+        // window moves, then three more before the fourth abandons it.
+        let mut stalls = PeerStalls::new();
+        let replay = Repair::Replay { from: Hlc::new(1, 0) };
+        assert!(stalls.plan_repair(peer, collection, replay));
+        assert_eq!(stalls.repair_due(peer), Some((collection, replay)));
+        stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(2, 0) });
+        assert!(stalls.repair_due(peer).is_some(), "first empty round");
+        assert!(stalls.repair_due(peer).is_some(), "second empty round");
+        stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(3, 0) });
+        for empty in 1..=REPAIR_ATTEMPTS {
+            assert!(stalls.repair_due(peer).is_some(), "empty round {empty} after the move");
+        }
+        assert_eq!(stalls.repair_due(peer), None, "abandoned on the fourth");
     }
 
     /// The cooldown: a repair done for a collection is not planned again

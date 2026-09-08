@@ -6647,7 +6647,9 @@ also holds a second copy of each applied entry until it commits — the
 `Pending` list carries the entry and the document id, with the collection
 metadata shared through the batch's memo rather than copied — bounded by the
 batch size, 1,024 entries. Snapshot restore still applies one document per
-transaction; it is a one-time path and is left as it is.
+transaction; it is a one-time path and is left as it is — until
+[ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped), which makes a snapshot page one transaction too, because a
+repair made the path a recurring one.
 
 ---
 
@@ -10932,6 +10934,16 @@ fails, which logs its exit and is read as clean by the start after it.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
+> **Amended by [ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped).**
+> The snapshot a repair pulls is of the one collection the repair was
+> planned for, a page per commit, resumed across rounds from the last page
+> applied; a repair is abandoned only after `REPAIR_ATTEMPTS` rounds that
+> applied *nothing*, not after three in which a snapshot did not fit the
+> request timeout. The full-database snapshot "for a single dropped
+> collection" below, and the accidental carry of the position past the
+> stopped entry that its coverage performed, are both gone: a scoped
+> snapshot grants no coverage and carries the sender's drop instead.
+
 **Decision.** Three rules, one invariant.
 
 *A stamp is minted inside the write transaction that will carry its
@@ -11550,3 +11562,373 @@ summaries are bridged. *A configuration knob for the scan budget or the chunk
 size* was not added: the numbers bound a hold and a pass to what a member can
 carry at any size, and a knob set before anyone has measured a case the
 defaults do not fit is a knob that is wrong for that case.
+
+---
+
+## ADR-152 — A snapshot repair pulls one collection, a page per commit, and resumes where it stopped
+
+**Decision.** Five rules for a snapshot, on the receiving side unless said
+otherwise.
+
+*A page is one transaction.* `Engine::apply_snapshot_page` opens one write
+transaction for the page, applies every document of it through
+`apply_remote_in_txn`, commits once if anything was written and aborts if
+nothing was — a page a member already holds must not cost an fsync — and then
+does what has to follow the commit, recording unique violations and
+publishing to change streams, for the applied documents in order, the shape
+`commit_run` gives a replicated batch (ADR-119). Collection definitions on
+the first page still go through the DDL path with transactions of their own,
+for the reason ADR-119 gives for a run ending at a schema change. The final
+page of a whole-database snapshot records the coverage the snapshot grants
+inside that same transaction (`absorb_version_vector_in_txn`), so a snapshot
+that fits one page is one commit in all.
+
+*A repair's snapshot is scoped to the collection it was planned for.*
+`Message::AskSnapshot` gains `collection: Option<CollectionId>`. `None` is
+the whole-database snapshot a member below a peer's retention horizon needs,
+and is what it always was; `Some(id)` walks only that collection's key range
+in `docs` — the walk is the same, bounded — and the first page carries only
+that collection's definition or, when the sender has since dropped it, the
+drop's stamp (`SnapshotPage::dropped`), which the receiver records as a
+tombstone when it holds no collection under the id, so the entries it was
+stopped at become history under ADR-148's tombstone rule rather than a stop
+that repeats for the life of the process. A scoped snapshot grants no
+coverage: coverage is per origin and cannot be scoped to a collection, and
+the position the receiver already holds carries the rest — the window it was
+stopped at is re-served and, with the collection here, taken. The field is
+`#[serde(default)]`, the way `AskEntries::held` (ADR-097) and
+`AskVersions::witnessed` (ADR-146) crossed versions, and the handshake
+negotiates no version, so in the minutes a rolling roll has mixed versions:
+a sender that predates the field ignores it and serves its whole database,
+which the requester applies as it comes — the snapshot a repair pulled before
+this record, correct and only dearer, granting no coverage under a scope
+either — and logs once; a requester that predates it sends no scope and is
+served the whole database as before. Nothing fails in either direction and
+the whole-database snapshot is applied as it always was; what the
+mixed-version window does not have is this record's first-page guarantee
+below. An older sender reads its vector *after* walking a page's documents,
+so the first-page vector a rolled receiver adopts can cover a document the
+older sender committed behind page one's cursor during that one walk — one
+page's walk, once, only while the sender is not yet rolled, and narrower
+than the last-page adoption every snapshot had before this record. The
+mixed-version window costs what every repair cost until it closes.
+
+*A snapshot resumes across rounds.* Where a pull stands is a
+`kimmy_storage::SnapshotProgress` — the scope, the cursor after the last
+page applied, the coverage the completed snapshot will grant, and the pages
+and documents so far — and the transport keeps one per peer in `PeerStalls`
+beside the repairs, for the reason they are there: it is read and written
+inside the round, against the peer the round is with. It is moved after every
+page is applied and *before* the next frame is awaited, so a round the
+timeout cancels mid-frame, or one that fails, leaves every page it applied
+recorded, and the next round with that peer asks for the page after them
+rather than page one. Every page applied is the repair advancing: the
+repair's stall count is reset by the page, as a replay's is by a window that
+moved, so `REPAIR_ATTEMPTS` now counts rounds that landed *nothing*, and a
+slow-but-moving snapshot is never abandoned. The whole-database catch-up of a
+member below the horizon resumes the same way, and its progress is forgotten
+on a round in which the peer answers `Entries` — the position has moved on
+from the walk. `sync_once`, a round with no memory, starts one over, as it
+always did.
+
+*A round has a snapshot budget.* `REQUEST_TIMEOUT` still wraps the round;
+the pull is handed the round's deadline less `SNAPSHOT_PAGE_RESERVE` (five
+seconds) and checks it between pages, never inside one. A page in flight when
+the deadline passes is finished — it is one transaction — and its cursor
+recorded; what the reserve buys is that the round ends on a page boundary of
+its own choosing rather than wherever the timeout fell. A round that leaves a
+snapshot to resume logs one line at `INFO` with the pages and documents it
+applied and the cursor; a completed pull logs `caught up from a snapshot` as
+before, with the totals across rounds beside this round's.
+
+*The coverage a snapshot grants is the vector served with its first page, and
+a snapshot document moves no vector.* The sender reads its version vector
+*before* the page's documents, on every page. The receiver remembers the first
+page's and records it when the final page lands; the vectors served with
+later pages are not adopted. A snapshot document is appended to the oplog
+without raising the servable or witnessed vector to its stamp
+(`engine::Position::Hold`), where every other appended entry raises both
+(ADR-054). Both halves are the same rule: a snapshot is *state*, arriving in
+key order rather than stamp order, and the only vector every document it
+carried is at or below is the one read before any of them.
+
+**Why.** Measured in the 0.25.1 round on a three-member test cluster: one
+member spent 108 repair rounds in six minutes with its replication lag still
+growing, and the repair never completed. The mechanism was four defects in
+one path. `pull_snapshot` started every round from `cursor = None` and looped
+until `page.next` was `None`, inside the round's 30-second `REQUEST_TIMEOUT`;
+a snapshot that could not finish in 30 s was cancelled at whatever await point
+the timeout found, its page in flight lost, and the next round started from
+page one. `PeerStalls::repair_due` counted a repair that did not advance and
+abandoned it after `REPAIR_ATTEMPTS` rounds to a cooldown of
+`REPAIR_COOLDOWN_ROUNDS`, the divergence check then reported the collection
+again, and the same three rounds ran again — 108 rounds, three at a time, of
+page one. The snapshot a repair planned for *one* collection (ADR-148 carries
+the `CollectionId`) walked the whole `docs` table, every collection, so the
+work per round was the database's size and not the collection's. And each
+document was applied through `apply_remote`, one transaction per document, 512
+per page, most of them aborted as superseded on a member that already held
+the document: the tight take-and-release loop on the single writer that
+ADR-151's gate made fair, still hundreds of thousands of transactions for a
+repair that changed little. ADR-119 left the restore per document as "a
+one-time path"; a repair made it a recurring one.
+
+The fifth rule was found writing the third. With the restore resumed across
+rounds it was easy to see what the first form had done inside one: the
+sender's vector rode every page, read *after* that page's documents, and the
+receiver adopted the last one; and every document applied raised the
+receiver's vectors to its stamp as it landed. A document the sender wrote
+*behind* the cursor while the snapshot ran is not in the snapshot, and both
+the last page's vector and the stamp of any later document ahead of the cursor
+cover its entry — so the receiver's position moved past an entry it was never
+served, and nothing re-serves it (ADR-054): the hole ADR-148 closed for a
+window, opened by a snapshot on every page, inside one round then and across
+several now. The brief for this change asked that the vector adopted be the
+one served with the final page rather than an earlier round's; that is the
+direction that widens the hole, and the rule here is the other way for the
+reason above. Under-claiming is the safe error: the round after a snapshot
+asks from the first page's vector and is re-served whatever the sender wrote
+during it, superseded where the snapshot already carried it.
+
+**Alternatives.** *Leave whole-database snapshots and only page the
+commits.* Removes the per-document transactions and nothing else: a repair
+of one collection would still walk every collection, and still restart from
+page one when it did not fit the round; on the measured database the
+restart, not the commits, was what kept it from completing. *Carry the cursor
+on the wire instead of in the repair state.* The sender has no state to hold
+it in — it serves whatever cursor it is asked from, as it did — and the
+receiver is the side that knows what it applied; a cursor the receiver did
+not record is one it cannot trust. *Raise `REQUEST_TIMEOUT`.* Moves the size
+of database a repair can complete on, and lengthens every other round's
+failure with it; a snapshot of any size now completes at the same timeout,
+over as many rounds as it needs. *Adopt the vector served with the final
+page.* Rejected above. *Put the cursor on `Repair::Snapshot`.* The horizon
+catch-up needs the same home and is not a repair, so the progress lives
+beside the repairs and the repair's stall count is reset by the page; the
+enum stays a unit variant and `Copy`. *A new `/metrics` series for pages or
+documents applied.* `kimmy_sync_repair_rounds_total` already counts the
+rounds, the log line carries the page and document counts and the cursor,
+and a series that only moves during a repair reads 0 for ever after.
+
+**Cost.** One protocol field and one page field, both optional on the wire.
+`Engine::snapshot_page` takes the scope and `Engine::apply_snapshot_page`
+takes the progress; `SnapshotApplied` is unchanged.
+
+The residual, stated as it is: **a receiver restarted during a multi-round
+snapshot.** `PeerStalls` is process memory, so the restart forgets the cursor
+and, for a repair, the repair. The snapshot's documents were appended under
+`Position::Hold`, so the oplog holds stamps the vectors do not name — by
+design — and `Engine::open` then re-derives both vectors from the oplog
+(ADR-036's open-time raise), taking the newest stamp per origin among every
+entry it holds without telling a snapshot document from a window's. The
+member's position for each origin jumps to the newest stamp among the pages
+it had applied, which is arbitrary against stamp order because pages arrive
+in key order. What follows is data-dependent. If some origin the member
+trails is still below the peer's per-origin horizon, the peer answers
+`BeyondHorizon`, a fresh whole-database walk starts from page one, and the
+hole closes. If every trailing origin is at or above it — the ordinary case
+for a fresh member on an actively written cluster, whose first pages carry
+a recent stamp from every writing origin — the peer answers `Entries`, the
+progress is forgotten, the window is absorbed on exhaustion, and the
+un-walked remainder of the snapshot below those stamps is never asked for.
+On the scoped path the jump is worse than a remainder: a member stopped at
+stamp *s* on some origin pulls a scoped snapshot of an actively written
+collection whose stamps sit far above *s*, and the restart carries its
+position on that origin over the whole stopped window — documents of other
+collections, index and drop entries — which the re-served window would have
+delivered and now never does. Nothing counts it; only the count half of
+ADR-133's check can notice it, one collection per contact. Before this
+record the same state was reached by a timeout alone — every applied
+document raised both vectors, and a cancelled round left them raised, on
+every one of the 108 rounds — so this is narrower, not new, but it is not
+bounded by one round. It is recorded rather than closed because closing it
+is a decision of its own, filed separately: persisting `SnapshotProgress`
+so an interrupted snapshot is resumed rather than forgotten, and either
+skipping the open-time raise while an incomplete snapshot is recorded or
+confining that raise to the cases ADR-036 wrote it for — which touches what
+opening means, and does not belong in a record about the repair's shape.
+
+A snapshot that runs longer than `oplog_retention_secs` grants a vector the
+sender can no longer serve from, and the receiver is told `BeyondHorizon`
+again and pulls again; a snapshot that long is a member that cannot keep up
+by any route. `restore_collection` still recreates a collection without
+consulting this node's own tombstones, as ADR-148 recorded; a scoped snapshot
+now carries the *sender's* drop, which is the other half of that case. The
+tests that pinned the per-document restore did not exist as such; the
+restore's tests are adapted to the progress and the new ones are below.
+
+**How it is tested.** By `kimmy-storage`'s
+`a_snapshot_page_is_one_commit_however_many_documents_it_holds` (a page of
+512, `Engine::commits` delta 1, coverage included),
+`a_page_whose_documents_are_all_superseded_commits_nothing` (delta 0 across
+a scoped snapshot a member already holds),
+`a_snapshot_scoped_to_one_collection_carries_only_that_collection` (one
+definition, only its documents, a cursor inside it, `next: None` at its end,
+no coverage, the whole-database snapshot beside it unchanged),
+`a_scoped_snapshot_of_the_top_id_walks_to_the_end_of_the_table`,
+`the_coverage_a_snapshot_grants_is_the_vector_served_with_its_first_page` (a
+document written behind the cursor between pages is still asked for; one
+written ahead is carried and moves no vector), and
+`a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone` (a batch
+stopped at the collection is history after the page); by `kimmy-cluster`'s
+`a_snapshot_cut_short_resumes_from_its_cursor_and_grants_the_first_pages_vector`
+and
+`a_snapshot_repair_pulls_one_collection_resumes_and_is_abandoned_only_when_nothing_lands`
+against fake peers over an in-process stream, driving `sync_round` with a
+spent and then an ample deadline — a page per round for twice
+`REPAIR_ATTEMPTS` rounds and the repair kept, three rounds landing nothing
+and the repair abandoned — and `ask_snapshot_crosses_a_version_boundary_in_both_directions`
+for the frame each side of an upgrade sees; and by the existing
+`kimmy-cluster/tests/replication.rs` snapshot and repair tests through the
+real loop, which now pull one collection.
+## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
+
+**Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a
+subtraction the reader does, not a number the anti-entropy loop reports. The
+loop's `RoundReport` carries the *instant* of the last contact whose round
+ran the cross-member divergence check — `divergence_last_check`, `None`
+before the first — in place of the age it used to compute at the end of its
+tick. `kimmy-api`'s `Metrics` stores that instant and computes the age at
+every `/metrics` render and at every snapshot the OTLP bridge takes:
+`now − last_check`, `0` while there is no instant. Every reading ADR-145
+documented for the series holds unchanged — `0` before the first check
+beside a `ran` counter that also reads `0`, reset to `0` by a check, rising
+through a run of failed rounds, and the operator's rule of "above *k* ×
+`cluster.sync_interval_secs` means the gauge is unknown" — and one that was
+wrong is corrected: the age now rises through a tick of the loop that never
+ends, as it rises through a tick in which every round failed. `render_at`,
+`render_with_at` and `snapshot_with_at` take the moment of the read as a
+parameter, so a test can read the age ninety seconds after a check without
+waiting ninety seconds. The series' name, type, position and the bridge's
+instrument name are unchanged; its HELP text says it is computed at the read.
+A sync tick that took longer than `cluster.sync_interval_secs` is logged at
+`WARN` when it ends, with how long it took, and it is followed by one tick
+at once — the one that was due — and then by the next a full interval later:
+the loop's sync and discovery tickers no longer catch up on the ticks they
+missed (`MissedTickBehavior::Delay`, as ADR-151 set on the retention
+collector). ADR-145 is extended, not
+replaced: the age is still a fact about the loop's contacts, still advanced
+only in the arm that folds a finding into the tracker, and still crosses
+into `/metrics` once per tick through `RoundReport`; what crosses is the
+instant rather than the age.
+
+**Why.** The series was added for exactly one purpose: so an operator can
+tell that `kimmy_sync_divergent_collections` is serving a value nothing has
+re-examined. ADR-145's case was a member whose every round failed, and for
+that case the loop computing the age at the end of its tick was enough — a
+failed round completes, the tick ends, the age is pushed and it has risen.
+The sustained-load round on 0.25.1 (ADR-151) found the case that argument
+does not cover. Two members' anti-entropy loops were waiting on the single
+writer, inside a sync round, for over an hour; the tick that contained the
+round never ended, so nothing was pushed: the gauge, both check counters and
+the age sat at whatever the last completed tick had left. One member was
+some 30,000 documents behind with its gauge at 0 and nothing on `/metrics`
+moving. The age read the same number on every scrape, `kimmy_sync_failures_total`
+was flat, nothing was backed off, and the documented alert — age above *k*
+× the interval — never crossed its threshold, because the age was frozen
+with the gauge it exists to qualify. The one signature was that the age did
+not change between scrapes, which no threshold rule reads and which is
+indistinguishable, on any single scrape, from a member checked a moment ago.
+
+The defect is that the age depended on the loop running. "Seconds since the
+last check" is a subtraction of an instant from a clock, and only the
+instant is the loop's to report; the clock is the reader's, and the reader
+is the scrape, which runs whether or not the loop does. ADR-145 already
+placed the age's *reset* in the loop for a reason that stands — the age
+must not reset on a contact the tracker was not told about — and this
+change keeps that: `LastCheck::ran` is still called in the one arm that
+folds a finding in, and what the report carries is what it holds. The
+difference is that the report carries `LastCheck`'s instant rather than the
+result of asking `LastCheck` for an age at the tick's end, so the answer no
+longer has an "as of" that ages with the loop. ADR-145's "up to one interval
+stale at a scrape" and its consequence, the rule of "above *k* × the
+interval rather than above the interval", both stand for a different reason:
+a healthy member's age cycles from 0 up to one interval between checks, so
+the threshold is multiples of the interval whatever the precision of a
+read.
+
+The bridge exports the same number. `Metrics::snapshot_with` is the read
+surface the OTLP bridge observes, and it computes the age at the snapshot
+from the same stored instant, so a collector and a scrape at the same moment
+agree and both keep rising through a stuck tick. The snapshot field keeps
+its name and type; what changed is when its value is decided.
+
+The stored instant is a mutex around an `Option<Instant>` rather than an
+atomic, where every other series here is an atomic. An `Instant` has no
+lock-free encoding that is not an offset from some chosen epoch, and the
+obvious epoch — the `Metrics` instance's own start — is a fiction in exactly
+the test that has to place a check ninety seconds before a read on a
+fresh instance. The lock is taken for one copy on a tick and one on a
+scrape and never held across anything, which is nothing beside the render
+that reads it.
+
+On logging: the brief question was whether the loop can say, at `WARN`,
+that no round has completed for *k* intervals, and the answer is that it
+cannot say so *while* that is true. `replicate` is a `select!` loop whose
+sync arm runs its rounds to completion; a tick that starts while the
+previous one has not finished does not exist in it, because the stuck tick
+*is* the arm, and the runtime does not poll the next tick until the arm
+returns. So during the stall the loop is the one component that cannot
+speak, and the live signal is the age computed at the read, which is this
+ADR. What the loop *can* say cheaply, on a tick, is that the tick it just
+finished took longer than the interval — one `Instant` per tick, compared
+at its end — and it says that, at `WARN`, with the duration: the line that
+turns "the age was high for an hour" into "this member's sync tick took an
+hour", which the age on its own cannot say after a check has reset it.
+ADR-151's writer-hold warning names the transaction that held the writer;
+this names the loop that waited for it.
+
+The tickers stop catching up for the same stuck-loop reason. Tokio's
+default fires every missed tick at once, so the hour-long tick on the
+0.25.1 round would have been followed, the moment it ended, by some 720
+sync ticks back to back — each a real round against every peer the fanout
+selects, on a cluster that had just come out of a stall, to make up for
+ticks whose work the next one does anyway. `Delay` fires the one tick that
+was due and schedules the rest a full interval apart from there, which is
+the behaviour ADR-151 chose for the retention collector and for the same
+reason; discovery gets it too, since a resolve that stalled on DNS has the
+same shape. It also means the overrun line above is one line per stall, not
+one per stall followed by a burst of short ticks. The test is cheap because
+the ticker is a function of the interval alone: under paused time, a ticker
+whose tick took an hour is asked for its next ticks, and the one that was
+due comes at once, the one after it a full interval later.
+
+**Alternatives.** *Leave the age as it was and document the frozen-age
+signature* — "an age that reads the same on every scrape is a loop that is
+not completing ticks" — was rejected: it is the signature the round
+produced and it is true, but no threshold rule reads it, a single scrape
+cannot see it, and it asks the operator to notice that a number has
+*stopped changing*, which is the same failure ADR-145 was written against
+one level up. The series has one job, and a series that needs a second
+series or a second scrape to do it is not doing it. *A separate "loop
+alive" heartbeat series* — seconds since the loop last completed a tick —
+was rejected: it is the same subtraction against the same kind of instant,
+and once the age is computed at the read it *is* that heartbeat for the
+only reading anyone wanted it for; a second series would be two numbers for
+one fact, with a rule for when they disagree. *A `WARN` from a watchdog
+task* that notices the loop has not ticked was rejected: a task that
+exists to watch another task is a second scheduler for a symptom `/metrics`
+now reports on every scrape, it would need its own interval and its own
+threshold, and the loop's own overrun line says the same thing once the
+stall ends, with the duration, at the cost of one `Instant` per tick.
+*Computing the age from a wall-clock timestamp in an atomic* was rejected in
+favour of the monotonic `Instant`: a clock step would make the age jump or
+go negative, which is a fault the series would then report and nothing else
+would explain.
+
+Defended by `kimmy-api`'s
+`the_check_age_is_computed_when_it_is_read_so_a_stuck_loop_cannot_freeze_it`
+— a check is recorded and the loop is never heard from again, and the render
+and the bridge's snapshot read 90 at ninety seconds and 3,600 at an hour, a
+tick without a check resets nothing, a check resets it — beside
+`an_age_the_loop_has_not_got_renders_as_zero`, which now also reads the
+never-checked case an hour later and still gets `0`; by the byte-for-byte
+render test, whose read is taken at an instant of its choosing; by
+`peers.rs`'s
+`the_check_age_is_absent_then_rises_through_failed_rounds_and_resets_on_a_check`,
+on the loop's half of the contract; by `kimmyd`'s
+`every_metrics_series_reaches_the_bridge`; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
+which computes the frozen member's age from the instant its real loop
+reports, as a scrape does.

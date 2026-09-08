@@ -435,6 +435,34 @@ is no longer derived from the oplog: coverage can be granted by a snapshot for
 entries this node will never hold, so opening only ever *raises* the vector to
 cover the log. See [ADR-036](decisions.md).
 
+**A snapshot is paged, one transaction a page, and resumes across rounds.**
+Documents arrive 512 to a page; the receiver applies a page in one write
+transaction — none when it already holds every document on the page — and
+records where the next page begins before it asks for it, so a round that runs
+out of budget leaves its pages applied and the next round with that peer
+continues from the cursor rather than page one. The coverage adopted when the
+final page lands is the sender's vector **as served with the first page**,
+read before that page's documents, and a snapshot's documents do not move the
+receiver's vectors as they land: a snapshot is state in key order, not history
+in stamp order, and a document the sender wrote behind the cursor while the
+snapshot ran is not in it — its entry is above the first page's vector, so the
+next round pulls it from the oplog, where the last page's vector would have
+covered it and left a hole. A repair ([ADR-148](decisions.md)) pulls a snapshot
+of the **one collection** it was planned for, which grants no coverage — the
+position the member already holds carries the rest — and, when the sender has
+since dropped the collection, carries the drop instead so the entries the
+member was stopped at become history ([ADR-152](decisions.md)).
+
+Where a pull stands is process memory. A member restarted *during* a
+multi-round snapshot forgets the cursor, and opening re-derives its vectors
+from the oplog — over the snapshot documents it already holds, which sit in
+key order, not stamp order — so its position can jump past the un-walked
+remainder of the snapshot and, on a repair, past the window it was stopped
+at; unless some origin it trails is still below the peer's horizon, that
+remainder is never asked for. Narrower than before ADR-152, when a timed-out
+snapshot left the same state on every round, and recorded there as an open
+decision rather than closed.
+
 **The horizon is judged per origin.** `oplog_collected_through` is one stamp
 across every origin, and the threshold a peer asks from is its own coverage of
 whichever origin it trails *most* — so an origin that wrote nothing for longer

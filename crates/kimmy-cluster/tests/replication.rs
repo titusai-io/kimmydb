@@ -967,7 +967,7 @@ async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node
             Some("by_email".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -975,7 +975,9 @@ async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
 
     a.engine.create_collection("shop", "orders").unwrap();
     a.engine
@@ -2033,10 +2035,14 @@ async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_repo
             .unwrap_or_else(|_| panic!("the one relayed round never ran the check"))
             .expect("the loop must keep reporting");
         if report.divergence_checks > 0 {
-            assert_eq!(report.divergence_check_age_secs, Some(0), "just checked: {report:?}");
+            // The report carries the instant of the check, not an age
+            // (ADR-154); the age is the reader's subtraction.
+            let checked =
+                report.divergence_last_check.unwrap_or_else(|| panic!("just checked: {report:?}"));
+            assert!(checked.elapsed() < Duration::from_secs(1), "just checked: {report:?}");
             break;
         }
-        assert_eq!(report.divergence_check_age_secs, None, "nothing has run yet: {report:?}");
+        assert_eq!(report.divergence_last_check, None, "nothing has run yet: {report:?}");
     }
 
     // The healthy member keeps writing into the collection both hold. The
@@ -2100,19 +2106,26 @@ async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_repo
     // failed round is a skip, and the age of the reading rises.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let (mut later_checks, mut failed, mut skips) = (0usize, 0usize, 0usize);
-    let mut age = Some(0u64);
-    while age < Some(1) {
+    let mut age = 0u64;
+    let mut last_check: Option<std::time::Instant> = None;
+    while age < 1 {
         let report = tokio::time::timeout_at(deadline, frozen_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("the frozen member's check age never rose"))
             .expect("the loop must keep reporting");
-        assert!(report.divergence_check_age_secs.is_some(), "a reading exists: {report:?}");
-        assert!(report.divergence_check_age_secs >= age, "the age does not fall: {report:?}");
+        let checked =
+            report.divergence_last_check.unwrap_or_else(|| panic!("a reading exists: {report:?}"));
+        if let Some(previous) = last_check {
+            assert_eq!(checked, previous, "no check ran, so the instant stands: {report:?}");
+        }
         assert_eq!(report.divergent_collections, 0, "the reading it is holding: {report:?}");
         later_checks += report.divergence_checks;
         failed += report.failed;
         skips += report.divergence_skips;
-        age = report.divergence_check_age_secs;
+        // The age is computed where it is read (ADR-154): here, from the
+        // instant the report carries, as `/metrics` does on a scrape.
+        age = checked.elapsed().as_secs();
+        last_check = Some(checked);
     }
     assert_eq!(later_checks, 0, "no round completed after the freeze, so nothing re-examined");
     assert!(failed >= 1, "the freeze is a run of failed rounds");
@@ -2236,7 +2249,7 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
             Some("by_email".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -2246,7 +2259,9 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
     // Granting B no coverage of another node's history: this fixture is
     // about the stored shape of the definition, nothing else.
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     assert!(
         b.engine
             .get_collection("shop", "orders")
@@ -2315,7 +2330,7 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
             Some("probe".into()),
         )
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = Some(ancient);
@@ -2323,7 +2338,9 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    b.engine.apply_snapshot_page(&page).unwrap();
+    b.engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     assert_eq!(
         b.engine.get_collection("shop", "orders").unwrap().index("probe").unwrap().created,
         Some(ancient),
@@ -2586,7 +2603,7 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
         .engine
         .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
         .unwrap();
-    let mut page = source.engine.snapshot_page(None).unwrap();
+    let mut page = source.engine.snapshot_page(None, None).unwrap();
     for state in &mut page.collections {
         for index in &mut state.indexes {
             index.created = None;
@@ -2594,7 +2611,9 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
     }
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
-    engine.apply_snapshot_page(&page).unwrap();
+    engine
+        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
     a.engine
         .create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))

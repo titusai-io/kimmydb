@@ -894,31 +894,38 @@ impl Engine {
     /// Record coverage granted by a snapshot.
     ///
     /// Merged rather than replaced, so writes this node made that the sender
-    /// never saw are not claimed to be forgotten.
+    /// never saw are not claimed to be forgotten. A transaction of its own;
+    /// a snapshot's final page records it inside the page's transaction
+    /// through [`Self::absorb_version_vector_in_txn`] instead (ADR-152).
     pub fn absorb_version_vector(&self, granted: &kimmy_core::VersionVector) -> Result<()> {
-        let mut current = Self::read_versions(&self.db, tables::OPLOG_VERSIONS)?;
-        current.merge(granted);
-
-        // Both: a snapshot hands over state, which is the strongest form of
-        // having processed everything behind it. Raising only the servable
-        // vector would leave the node still asking for the history the
-        // snapshot replaced.
-        let mut witnessed = Self::read_versions(&self.db, tables::OPLOG_WITNESSED)?;
-        witnessed.merge(&current);
-
         let txn = self.begin_write()?;
-        {
-            let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
-            for (node, hlc) in witnessed.iter() {
-                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
-            }
-            let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-            for (node, hlc) in current.iter() {
-                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
-            }
-        }
+        Self::absorb_version_vector_in_txn(&txn, granted)?;
         txn.commit()?;
         Ok(())
+    }
+
+    /// [`Self::absorb_version_vector`] inside a transaction the caller owns.
+    ///
+    /// Both vectors: a snapshot hands over state, which is the strongest
+    /// form of having processed everything behind it. Raising only the
+    /// servable vector would leave the node still asking for the history the
+    /// snapshot replaced. Each origin only ever moves up, as every movement
+    /// of a version vector does; the witnessed vector stands at or above the
+    /// servable one by construction (ADR-054), so raising both by `granted`
+    /// is the merge the first form of this computed by reading the tables.
+    /// Returns whether anything moved, so a caller can let a transaction go
+    /// rather than commit one that wrote nothing.
+    pub(crate) fn absorb_version_vector_in_txn(
+        txn: &redb::WriteTransaction,
+        granted: &kimmy_core::VersionVector,
+    ) -> Result<bool> {
+        let mut raised = false;
+        for (node, hlc) in granted.iter() {
+            let stamp = Stamp::new(hlc, node);
+            raised |= raise_version(txn, tables::OPLOG_VERSIONS, &stamp)?;
+            raised |= raise_version(txn, tables::OPLOG_WITNESSED, &stamp)?;
+        }
+        Ok(raised)
     }
 
     /// The highest `Hlc` retention has removed from the oplog.
@@ -1765,7 +1772,7 @@ pub(crate) fn raise_version(
     txn: &redb::WriteTransaction,
     table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     stamp: &Stamp,
-) -> Result<()> {
+) -> Result<bool> {
     let mut versions = txn.open_table(table)?;
     let node = stamp.node.to_bytes();
     let higher = match versions.get(node.as_slice())? {
@@ -1775,7 +1782,7 @@ pub(crate) fn raise_version(
     if higher {
         versions.insert(node.as_slice(), stamp.hlc.to_bytes().as_slice())?;
     }
-    Ok(())
+    Ok(higher)
 }
 
 impl Engine {
@@ -1796,7 +1803,35 @@ impl Engine {
     }
 }
 
+/// Whether appending an entry moves this node's version vectors to its stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Position {
+    /// The entry is the next thing this node has seen of its origin — a
+    /// local write, or a replicated window served contiguously from this
+    /// node's own position — so both vectors move to it: appending is the
+    /// strongest form of having seen it (ADR-054).
+    Raise,
+    /// The entry is a snapshot document (ADR-152): state, arriving in key
+    /// order rather than stamp order, from a snapshot that may still be
+    /// running. The coverage a snapshot grants is recorded once, when it
+    /// completes, and is the vector served with its first page; moving the
+    /// vectors per document would carry the position to whatever stamp
+    /// arrived last, over an entry for a document the sender wrote behind
+    /// the cursor and the snapshot never carried — the hole ADR-148 forbids,
+    /// which the first form of the restore opened on every page.
+    Hold,
+}
+
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
+    append_oplog_at(txn, entry, Position::Raise)
+}
+
+/// [`append_oplog`], with the caller saying whether the vectors move.
+pub(crate) fn append_oplog_at(
+    txn: &redb::WriteTransaction,
+    entry: &OplogEntry,
+    position: Position,
+) -> Result<()> {
     let key = codec::oplog_key(&entry.stamp);
     let mut oplog = txn.open_table(tables::OPLOG)?;
     let existed =
@@ -1813,9 +1848,13 @@ pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> 
     // something that was rolled back — a peer would then never be sent it.
     //
     // Both vectors: appending is also the strongest form of having seen it, so
-    // witnessed stays at or above servable by construction (ADR-054).
-    raise_version(txn, tables::OPLOG_VERSIONS, &entry.stamp)?;
-    raise_version(txn, tables::OPLOG_WITNESSED, &entry.stamp)?;
+    // witnessed stays at or above servable by construction (ADR-054). Not for
+    // a snapshot document, whose coverage is granted once at the end — see
+    // [`Position::Hold`].
+    if position == Position::Raise {
+        raise_version(txn, tables::OPLOG_VERSIONS, &entry.stamp)?;
+        raise_version(txn, tables::OPLOG_WITNESSED, &entry.stamp)?;
+    }
 
     let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
     let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;

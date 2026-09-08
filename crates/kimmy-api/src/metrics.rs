@@ -207,9 +207,12 @@ pub struct MetricsSnapshot {
     /// looked at anything.
     pub sync_divergence_count_compared: u64,
     pub sync_divergence_count_deferred: u64,
-    /// Seconds since the last contact whose round ran the check, as of the
-    /// last sync tick; 0 before the first (ADR-145). How old the gauge's
-    /// reading is, on a member whose rounds have stopped completing.
+    /// Seconds since the last contact whose round ran the check, computed
+    /// when this snapshot was taken from the instant the loop last
+    /// reported; 0 before the first (ADR-145, ADR-154). How old the gauge's
+    /// reading is, on a member whose rounds have stopped completing — or
+    /// whose loop has stopped ticking, which is why it is computed here and
+    /// not carried from the loop's last tick.
     pub sync_divergence_check_age_secs: u64,
     /// Batches a sync round stopped at an entry for a collection this node
     /// does not hold, and entries a round left for a later window because
@@ -275,12 +278,22 @@ pub struct Metrics {
     /// above and for the same reason.
     sync_divergence_count_compared: AtomicU64,
     sync_divergence_count_deferred: AtomicU64,
-    /// How old the gauge's reading is: seconds since the last contact whose
-    /// round ran the check, as the loop reported it at its last tick
-    /// (ADR-145). A level. The one divergence series that keeps moving on a
-    /// member whose rounds all fail, where the two counters above stop and
-    /// the gauge holds its last value.
-    sync_divergence_check_age_secs: AtomicU64,
+    /// When the loop last ran the check against any peer, as the loop
+    /// reported it at its last tick; `None` before the first check
+    /// (ADR-145, ADR-154). What `kimmy_sync_divergence_check_age_seconds`
+    /// is computed from *at the moment it is read*, so the age keeps
+    /// rising on a member whose rounds all fail — where the two counters
+    /// above stop and the gauge holds its last value — and equally on a
+    /// member whose loop has stopped completing ticks and pushes nothing at
+    /// all. Under ADR-145 this held the age the loop computed at the end of
+    /// its tick, and a loop stuck behind the single writer for an hour left
+    /// it reading the same number on every scrape: the one series meant to
+    /// say the gauge was stale was frozen with it.
+    ///
+    /// A mutex rather than an atomic because it holds an `Instant`, which
+    /// has no lock-free encoding that is not a fiction about some epoch;
+    /// it is taken for one copy on a tick and one on a scrape, never held.
+    sync_divergence_last_check: parking_lot::Mutex<Option<Instant>>,
     sync_entries_skipped_unknown_collection: AtomicU64,
     sync_entries_skipped_beyond_advertised: AtomicU64,
     sync_repair_rounds: AtomicU64,
@@ -349,7 +362,7 @@ impl Default for Metrics {
             sync_divergence_skips: AtomicU64::new(0),
             sync_divergence_count_compared: AtomicU64::new(0),
             sync_divergence_count_deferred: AtomicU64::new(0),
-            sync_divergence_check_age_secs: AtomicU64::new(0),
+            sync_divergence_last_check: parking_lot::Mutex::new(None),
             sync_entries_skipped_unknown_collection: AtomicU64::new(0),
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
             sync_repair_rounds: AtomicU64::new(0),
@@ -518,12 +531,14 @@ impl Metrics {
     /// `divergence_count_compared` and `divergence_count_deferred` qualify
     /// the check one level further (ADR-145): whether the half that
     /// compares a document count ran, or was held back for a peer still
-    /// catching up. Both accumulate. `divergence_check_age_secs` is a level
-    /// and replaces the last one: how many seconds old the divergent count
-    /// is, which is the number that keeps moving when a member's rounds
-    /// stop completing and every counter here stops with them. `None` — no
-    /// check has ever run — lands as `0`, beside a `ran` count that also
-    /// reads `0`.
+    /// catching up. Both accumulate. `divergence_last_check` is a level
+    /// and replaces the last one: *when* the divergent count was last
+    /// re-examined, from which every read of the age series subtracts its
+    /// own clock (ADR-154) — the number that keeps moving when a member's
+    /// rounds stop completing and every counter here stops with them, and
+    /// when the loop itself stops and this method is not called again.
+    /// `None` — no check has ever run — renders as an age of `0`, beside a
+    /// `ran` count that also reads `0`.
     ///
     /// **The report is taken whole, not field by field.** Six of its numbers
     /// now reach `/metrics`, all of them `usize`, four of them counting
@@ -550,8 +565,7 @@ impl Metrics {
             .fetch_add(round.divergence_count_compared as u64, Ordering::Relaxed);
         self.sync_divergence_count_deferred
             .fetch_add(round.divergence_count_deferred as u64, Ordering::Relaxed);
-        self.sync_divergence_check_age_secs
-            .store(round.divergence_check_age_secs.unwrap_or(0), Ordering::Relaxed);
+        *self.sync_divergence_last_check.lock() = round.divergence_last_check;
         self.record_entries_skipped(
             round.entries_skipped_unknown_collection as u64,
             round.entries_skipped_beyond_advertised as u64,
@@ -640,6 +654,21 @@ impl Metrics {
         self.started.elapsed().as_secs()
     }
 
+    /// `kimmy_sync_divergence_check_age_seconds` as of `now`: seconds since
+    /// the instant the replication loop last reported a check, 0 before the
+    /// first (ADR-145, ADR-154).
+    ///
+    /// Computed here, at the read, and not stored: a stored age is as old
+    /// as the tick that stored it, and the member this was written for had
+    /// a tick that did not end for an hour. `now` is a parameter so a test
+    /// can read the age ninety seconds after a check without waiting ninety
+    /// seconds; every caller outside a test passes `Instant::now()`.
+    fn sync_divergence_check_age_secs_at(&self, now: Instant) -> u64 {
+        self.sync_divergence_last_check
+            .lock()
+            .map_or(0, |at| now.saturating_duration_since(at).as_secs())
+    }
+
     /// Record how late the runtime probe woke up. Keeps the maximum until the
     /// next scrape reads it, so a one-off stall between scrapes is not lost.
     ///
@@ -698,6 +727,14 @@ impl Metrics {
     /// here (ADR-142). The reading-free form above is for a caller with no
     /// engine in hand, which is a test.
     pub fn snapshot_with(&self, readings: &StorageReadings) -> MetricsSnapshot {
+        self.snapshot_with_at(readings, Instant::now())
+    }
+
+    /// [`Self::snapshot_with`], with the age of the divergence check's
+    /// reading measured against `now` rather than the clock (ADR-154). For
+    /// a test; nothing else has a reason to read the age as of any moment
+    /// but this one.
+    pub fn snapshot_with_at(&self, readings: &StorageReadings, now: Instant) -> MetricsSnapshot {
         MetricsSnapshot {
             databases: readings.databases,
             collections: readings.collections,
@@ -741,7 +778,7 @@ impl Metrics {
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
             sync_divergence_count_compared: self.get(&self.sync_divergence_count_compared),
             sync_divergence_count_deferred: self.get(&self.sync_divergence_count_deferred),
-            sync_divergence_check_age_secs: self.get(&self.sync_divergence_check_age_secs),
+            sync_divergence_check_age_secs: self.sync_divergence_check_age_secs_at(now),
             sync_entries_skipped_unknown_collection: self
                 .get(&self.sync_entries_skipped_unknown_collection),
             sync_entries_skipped_beyond_advertised: self
@@ -789,6 +826,12 @@ impl Metrics {
         self.render_with(&StorageReadings::default())
     }
 
+    /// [`Self::render`], with the age of the divergence check's reading
+    /// measured against `now` rather than the clock (ADR-154). For a test.
+    pub fn render_at(&self, now: Instant) -> String {
+        self.render_with_at(&StorageReadings::default(), now)
+    }
+
     /// Render the whole `/metrics` page: the engine's readings first, then
     /// the process counters, in the order a scrape has always seen them.
     ///
@@ -799,6 +842,17 @@ impl Metrics {
     /// series were not in it (ADR-142). The readings are handed in rather
     /// than read here, so this type still holds no database handle.
     pub fn render_with(&self, readings: &StorageReadings) -> String {
+        self.render_with_at(readings, Instant::now())
+    }
+
+    /// [`Self::render_with`], with the age of the divergence check's
+    /// reading measured against `now` rather than the clock (ADR-154). The
+    /// one series on the page that is a subtraction against the moment of
+    /// the read rather than a load of something stored — so it is the one
+    /// a test has to be able to read at a moment of its choosing. Uptime
+    /// reads the process clock as it always has; it has no test that needs
+    /// otherwise.
+    pub fn render_with_at(&self, readings: &StorageReadings, now: Instant) -> String {
         // Read once: the worker's atomics move as it runs, and a render that
         // straddled an increment would show mismatched document/chunk pairs.
         let vc = self.vector_counters.get();
@@ -937,7 +991,7 @@ impl Metrics {
              # TYPE kimmy_sync_divergence_count_probes_total counter\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"compared\"}} {sync_div_compared}\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"deferred\"}} {sync_div_deferred}\n\
-             # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, as of the last sync tick. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined - look at kimmy_sync_failures_total and kimmy_sync_peers_backing_off.\n\
+             # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
              # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.\n\
@@ -1028,7 +1082,7 @@ impl Metrics {
             sync_div_skipped = self.get(&self.sync_divergence_skips),
             sync_div_compared = self.get(&self.sync_divergence_count_compared),
             sync_div_deferred = self.get(&self.sync_divergence_count_deferred),
-            sync_div_age = self.get(&self.sync_divergence_check_age_secs),
+            sync_div_age = self.sync_divergence_check_age_secs_at(now),
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
@@ -1101,15 +1155,20 @@ fn render_writer_wait(wait: &kimmy_storage::WriterWaitSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// One instance with every counter at a value nothing else has.
     ///
     /// Distinct on purpose: with several counters sharing a value, a render
     /// that printed the wrong one would still match.
-    fn every_counter_distinct() -> Metrics {
-        use std::time::Duration;
-
+    ///
+    /// `now` is the moment the render or snapshot under test is taken at:
+    /// the divergence check's age is computed at the read, from an instant
+    /// the loop reported (ADR-154), so the instant recorded here is placed
+    /// relative to it.
+    fn every_counter_distinct(now: Instant) -> Metrics {
         let m = Metrics::default();
         // 2 × 2xx, 3 × 4xx (one each of 401/403/429), 4 × 5xx, and one 304
         // that lands in the total alone: ten requests, no two classes equal.
@@ -1139,9 +1198,11 @@ mod tests {
         m.set_webhook_gauges(15, 16, 17);
         m.set_cluster_members(18);
         m.set_replication_lag_secs(19);
-        // Two ticks: the counters accumulate, the backoff level and the
-        // divergence count are each replaced. A render that printed the
-        // first tick's level, or a level that accumulated, would not match.
+        // Two ticks: the counters accumulate, the backoff level, the
+        // divergence count and the check's instant are each replaced. A
+        // render that printed the first tick's level, or a level that
+        // accumulated, would not match: the age is 71 at `now` only if the
+        // second tick's instant is the one kept.
         // Every field written out rather than `..Default::default()`: a
         // field added to the report must break this and be given a distinct
         // value here, not default silently into the golden below.
@@ -1155,7 +1216,7 @@ mod tests {
             divergence_skips: 33,
             divergence_count_compared: 61,
             divergence_count_deferred: 64,
-            divergence_check_age_secs: Some(70),
+            divergence_last_check: Some(now - Duration::from_secs(70)),
             entries_skipped_unknown_collection: 72,
             entries_skipped_beyond_advertised: 74,
             repair_rounds: 76,
@@ -1170,7 +1231,7 @@ mod tests {
             divergence_skips: 1,
             divergence_count_compared: 2,
             divergence_count_deferred: 3,
-            divergence_check_age_secs: Some(71),
+            divergence_last_check: Some(now - Duration::from_secs(71)),
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
             repair_rounds: 1,
@@ -1226,8 +1287,10 @@ mod tests {
     /// because the failure this guards against is the one `contains` cannot
     /// see: a series *added*, a HELP line reworded, a blank line appearing
     /// between two samples. `render` is fully deterministic in a test —
-    /// `uptime_secs` is 0 on a fresh instance and nothing else reads a clock —
-    /// so there is no reason to check it loosely.
+    /// `uptime_secs` is 0 on a fresh instance, and the one other series that
+    /// is a subtraction against a clock, the divergence check's age, is
+    /// read at an instant this test chooses (ADR-154) — so there is no
+    /// reason to check it loosely.
     ///
     /// If this fails because you meant to change the output, read the diff as
     /// the release note it is: every line here is something a scrape config or
@@ -1368,7 +1431,7 @@ kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 34
 # TYPE kimmy_sync_divergence_count_probes_total counter
 kimmy_sync_divergence_count_probes_total{outcome=\"compared\"} 63
 kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
-# HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, as of the last sync tick. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined - look at kimmy_sync_failures_total and kimmy_sync_peers_backing_off.
+# HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
 # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.
@@ -1432,7 +1495,11 @@ kimmy_request_duration_seconds_sum 0.03049
 kimmy_request_duration_seconds_count 3
 ";
 
-        assert_eq!(every_counter_distinct().render_with(&distinct_readings()), expected);
+        // The read is taken at a moment placed ahead of the clock, so the
+        // instants the helper records relative to it are safely after any
+        // epoch `Instant` might count from.
+        let now = Instant::now() + Duration::from_secs(100);
+        assert_eq!(every_counter_distinct(now).render_with_at(&distinct_readings(), now), expected);
     }
 
     #[test]
@@ -1441,10 +1508,14 @@ kimmy_request_duration_seconds_count 3
         // truth per counter. A snapshot that drifted from the render would be
         // the duplication this was written to avoid, arrived at by accident —
         // so every field is checked against the text a scrape would see.
-        let m = every_counter_distinct();
+        let now = Instant::now() + Duration::from_secs(100);
+        let m = every_counter_distinct(now);
         let readings = distinct_readings();
-        let s = m.snapshot_with(&readings);
-        let out = m.render_with(&readings);
+        // Both at one instant: the check's age is computed at the read
+        // (ADR-154), and two reads a second boundary apart would disagree
+        // by one without either being wrong.
+        let s = m.snapshot_with_at(&readings, now);
+        let out = m.render_with_at(&readings, now);
 
         let expect = |line: &str| {
             assert!(out.contains(line), "the render disagrees with the snapshot: {line}\n{out}")
@@ -1601,7 +1672,6 @@ kimmy_request_duration_seconds_count 3
 
     #[test]
     fn latency_buckets_are_cumulative_and_the_sum_is_in_seconds() {
-        use std::time::Duration;
         let m = Metrics::default();
         m.record_latency(Duration::from_micros(200)); // ≤ 250µs
         m.record_latency(Duration::from_micros(200));
@@ -1621,7 +1691,6 @@ kimmy_request_duration_seconds_count 3
 
     #[test]
     fn an_observation_above_every_bound_reaches_only_inf() {
-        use std::time::Duration;
         let m = Metrics::default();
         m.record_latency(Duration::from_secs(60));
         let out = m.render();
@@ -1722,6 +1791,7 @@ kimmy_request_duration_seconds_count 3
         // **zero**, which is exactly what a setter that does nothing reports.
         // A non-zero value is the only one that distinguishes the two.
         let m = Metrics::default();
+        let now = Instant::now() + Duration::from_secs(100);
         m.set_replication_lag_secs(7);
         m.set_cluster_members(2);
         m.record_sync_round(&kimmy_cluster::RoundReport {
@@ -1734,7 +1804,7 @@ kimmy_request_duration_seconds_count 3
             divergence_skips: 0,
             divergence_count_compared: 2,
             divergence_count_deferred: 1,
-            divergence_check_age_secs: Some(30),
+            divergence_last_check: Some(now - Duration::from_secs(30)),
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
@@ -1749,7 +1819,7 @@ kimmy_request_duration_seconds_count 3
             divergence_skips: 5,
             divergence_count_compared: 0,
             divergence_count_deferred: 4,
-            divergence_check_age_secs: Some(8),
+            divergence_last_check: Some(now - Duration::from_secs(8)),
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
@@ -1761,7 +1831,7 @@ kimmy_request_duration_seconds_count 3
         m.record_jwks_refresh(true);
         m.record_jwks_refresh(false);
 
-        let out = m.render();
+        let out = m.render_at(now);
         assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
         assert!(out.contains("kimmy_cluster_members 2"), "{out}");
         // The failure signals are pushed per tick: counters accumulate across
@@ -1784,9 +1854,10 @@ kimmy_request_duration_seconds_count 3
             out.contains("kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 5"),
             "a counter, not a level: {out}"
         );
-        // The count half's pair accumulates too, and the age is the latest
-        // tick's (ADR-145): thirty seconds old at the first tick, eight at
-        // the second, and the gauge says eight.
+        // The count half's pair accumulates too, and the age is computed
+        // at the read from the latest tick's instant (ADR-145, ADR-154): a
+        // check thirty seconds before the read at the first tick, eight
+        // before it at the second, and the gauge says eight.
         assert!(
             out.contains("kimmy_sync_divergence_count_probes_total{outcome=\"compared\"} 2"),
             "a counter, not a level: {out}"
@@ -1825,7 +1896,7 @@ kimmy_request_duration_seconds_count 3
             divergence_skips: 1,
             divergence_count_compared: 0,
             divergence_count_deferred: 0,
-            divergence_check_age_secs: None,
+            divergence_last_check: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
@@ -1833,6 +1904,84 @@ kimmy_request_duration_seconds_count 3
         let out = m.render();
         assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
         assert!(out.contains("kimmy_sync_divergence_checks_total{outcome=\"ran\"} 0\n"), "{out}");
+        // And it stays 0 however long the loop goes without a check: there
+        // is no instant to age. "Never" is not "long ago" (ADR-135's
+        // objection, ADR-145's answer), and computing the age at the read
+        // (ADR-154) must not turn one into the other.
+        let out = m.render_at(Instant::now() + Duration::from_secs(3_600));
+        assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
+    }
+
+    /// The age is computed when it is read, not when the loop pushed it
+    /// (ADR-154). Under ADR-145 the loop computed the age at the end of its
+    /// tick and this type stored the number, so a loop whose tick did not
+    /// end — stuck behind the single writer for over an hour, in the round
+    /// that found this — left the age reading the same number on every
+    /// scrape: the series that exists to say the gauge is stale was frozen
+    /// with the gauge. Now the loop reports the instant of the check and
+    /// every render and snapshot subtracts it from its own clock, so the
+    /// age rises through a stuck tick exactly as it rises through a run of
+    /// failed rounds, and a scrape needs nothing from the loop to read it.
+    ///
+    /// The stuck loop is simulated by what it is: a check is recorded, and
+    /// `record_sync_round` is never called again.
+    #[test]
+    fn the_check_age_is_computed_when_it_is_read_so_a_stuck_loop_cannot_freeze_it() {
+        let m = Metrics::default();
+        let checked = Instant::now();
+        let tick = |at: Option<Instant>| kimmy_cluster::RoundReport {
+            failed: 0,
+            backing_off: 0,
+            ddl_refused: 0,
+            ddl_declined: 0,
+            divergent_collections: 0,
+            divergence_checks: usize::from(at == Some(checked)),
+            divergence_skips: 0,
+            divergence_count_compared: 0,
+            divergence_count_deferred: 0,
+            divergence_last_check: at,
+            entries_skipped_unknown_collection: 0,
+            entries_skipped_beyond_advertised: 0,
+            repair_rounds: 0,
+        };
+        let age_in = |out: &str| -> u64 {
+            out.lines()
+                .find_map(|l| l.strip_prefix("kimmy_sync_divergence_check_age_seconds "))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("no age line: {out}"))
+        };
+
+        // The tick that ran the check reports its instant, and a read at
+        // that instant says the reading is fresh.
+        m.record_sync_round(&tick(Some(checked)));
+        assert_eq!(age_in(&m.render_at(checked)), 0, "just checked");
+
+        // The loop's next tick starts and never ends. Nothing is pushed for
+        // ninety seconds, then for an hour; the age is what a scrape at each
+        // moment computes, and it rises. Under ADR-145 every one of these
+        // reads would have said 0.
+        let ninety = checked + Duration::from_secs(90);
+        assert_eq!(age_in(&m.render_at(ninety)), 90, "the render computes the age at the read");
+        assert_eq!(
+            m.snapshot_with_at(&StorageReadings::default(), ninety).sync_divergence_check_age_secs,
+            90,
+            "the snapshot the OTLP bridge exports carries the same computed age"
+        );
+        let hour = checked + Duration::from_secs(3_600);
+        assert_eq!(age_in(&m.render_at(hour)), 3_600, "and keeps rising while nothing is pushed");
+
+        // A tick that completed without a check — every round failed, say —
+        // carries the old instant, and the age goes on rising from it.
+        m.record_sync_round(&tick(Some(checked)));
+        let later = hour + Duration::from_secs(5);
+        assert_eq!(age_in(&m.render_at(later)), 3_605, "a tick without a check resets nothing");
+
+        // A check resets it, and the reset is the loop's to make: a fresh
+        // instant, and the age is measured from there.
+        let rechecked = later;
+        m.record_sync_round(&tick(Some(rechecked)));
+        assert_eq!(age_in(&m.render_at(rechecked)), 0, "a check resets the age");
+        assert_eq!(age_in(&m.render_at(rechecked + Duration::from_secs(12))), 12);
     }
     #[test]
     fn resident_memory_is_read_from_the_two_status_lines_in_bytes() {
