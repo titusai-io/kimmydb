@@ -11802,7 +11802,11 @@ parameter, so a test can read the age ninety seconds after a check without
 waiting ninety seconds. The series' name, type, position and the bridge's
 instrument name are unchanged; its HELP text says it is computed at the read.
 A sync tick that took longer than `cluster.sync_interval_secs` is logged at
-`WARN` when it ends, with how long it took. ADR-145 is extended, not
+`WARN` when it ends, with how long it took, and it is followed by one tick
+at once — the one that was due — and then by the next a full interval later:
+the loop's sync and discovery tickers no longer catch up on the ticks they
+missed (`MissedTickBehavior::Delay`, as ADR-151 set on the retention
+collector). ADR-145 is extended, not
 replaced: the age is still a fact about the loop's contacts, still advanced
 only in the arm that folds a finding into the tracker, and still crosses
 into `/metrics` once per tick through `RoundReport`; what crosses is the
@@ -11871,9 +11875,23 @@ finished took longer than the interval — one `Instant` per tick, compared
 at its end — and it says that, at `WARN`, with the duration: the line that
 turns "the age was high for an hour" into "this member's sync tick took an
 hour", which the age on its own cannot say after a check has reset it.
-Missed ticks fire back to back after a long one and each is short, so a
-stall of any length is one line. ADR-151's writer-hold warning names the
-transaction that held the writer; this names the loop that waited for it.
+ADR-151's writer-hold warning names the transaction that held the writer;
+this names the loop that waited for it.
+
+The tickers stop catching up for the same stuck-loop reason. Tokio's
+default fires every missed tick at once, so the hour-long tick on the
+0.25.1 round would have been followed, the moment it ended, by some 720
+sync ticks back to back — each a real round against every peer the fanout
+selects, on a cluster that had just come out of a stall, to make up for
+ticks whose work the next one does anyway. `Delay` fires the one tick that
+was due and schedules the rest a full interval apart from there, which is
+the behaviour ADR-151 chose for the retention collector and for the same
+reason; discovery gets it too, since a resolve that stalled on DNS has the
+same shape. It also means the overrun line above is one line per stall, not
+one per stall followed by a burst of short ticks. The test is cheap because
+the ticker is a function of the interval alone: under paused time, a ticker
+whose tick took an hour is asked for its next ticks, and the one that was
+due comes at once, the one after it a full interval later.
 
 **Alternatives.** *Leave the age as it was and document the frozen-age
 signature* — "an age that reads the same on every scrape is a loop that is

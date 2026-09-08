@@ -90,7 +90,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   failed rounds. Every documented reading holds: 0 before the first check
   beside `ran` at 0, reset by a check, unmoved by a failed round. A sync
   tick that took longer than `cluster.sync_interval_secs` is logged at
-  `WARN` when it ends ([ADR-154](docs/decisions.md)).
+  `WARN` when it ends, and is followed by one tick at once and then the
+  next a full interval later, rather than by a burst of every tick it
+  missed — an hour-long tick at the default interval used to be followed by
+  some 720 rounds fired back to back; the discovery ticker gets the same
+  treatment
+  ([ADR-154](docs/decisions.md)).
 
 ### Added
 

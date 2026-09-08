@@ -234,8 +234,8 @@ impl ReplicationConfig {
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovered: BTreeSet<SocketAddr> = BTreeSet::new();
     let mut health = PeerHealth::new(config.fanout, config.sync_interval);
-    let mut discovery = tokio::time::interval(config.discovery_interval);
-    let mut sync = tokio::time::interval(config.sync_interval);
+    let mut discovery = ticker(config.discovery_interval);
+    let mut sync = ticker(config.sync_interval);
 
     // The cross-member divergence check (ADR-133): which collection this
     // tick probes for a document count, and which findings have recurred
@@ -551,8 +551,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // rounds run one after another inside the tick, and it is
                 // the tick's length, not any one round's, that the age
                 // series and the operator's threshold are written against.
-                // Missed ticks fire back to back after a long one and each
-                // is short, so a stall of any length is one line.
+                // The ticker does not catch up on missed ticks (`ticker`
+                // below): one tick follows this one at once, the rest a full
+                // interval apart, so a stall of any length is one line.
                 let tick_took = tick_started.elapsed();
                 if tick_took >= config.sync_interval {
                     warn!(
@@ -566,6 +567,26 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
             }
         }
     }
+}
+
+/// A ticker for one of the loop's two arms, which does not catch up on
+/// ticks it missed (ADR-154).
+///
+/// Tokio's default fires every missed tick at once, back to back, after a
+/// tick that overran. A sync tick that waited on the single writer for an
+/// hour at the default five-second interval would be followed by some 720
+/// rounds against every peer the fanout selects, fired as fast as they
+/// complete — a stampede on a cluster that has just come out of a stall,
+/// to make up for ticks whose work the next one does anyway. `Delay` fires
+/// the one tick that was due and schedules the rest a full interval apart
+/// from there, as ADR-151 set on the retention collector for the same
+/// reason. Discovery
+/// gets the same for the same shape: a resolve that stalled on DNS should
+/// not be followed by a burst of resolves.
+fn ticker(period: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 /// When the cross-member divergence check last ran against any peer
@@ -779,6 +800,37 @@ mod tests {
             1,
             "a read failure must not be read as \"this node holds nothing\""
         );
+    }
+
+    /// A tick that overran is followed by *one* tick at once — the one that
+    /// was already due — and then by the next a full interval later, not by
+    /// a burst of every tick it missed (ADR-154). Under paused time the
+    /// runtime advances the clock to the next due tick when nothing else
+    /// can run, so "how long until the next tick" is the elapsed time around
+    /// the await: nothing for the due one, one interval for the one after
+    /// it, where tokio's default would give nothing 720 times over.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_that_overran_is_followed_by_the_next_a_full_interval_later() {
+        let period = Duration::from_secs(5);
+        let mut sync = ticker(period);
+        sync.tick().await; // the first tick fires at once
+
+        // The tick's work took an hour: 720 ticks fell due while it ran.
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+
+        let before = tokio::time::Instant::now();
+        sync.tick().await;
+        assert_eq!(before.elapsed(), Duration::ZERO, "the tick that was due fires at once");
+        let before = tokio::time::Instant::now();
+        sync.tick().await;
+        assert_eq!(
+            before.elapsed(),
+            period,
+            "the one after it is a full interval later: no burst of the 719 others"
+        );
+        let before = tokio::time::Instant::now();
+        sync.tick().await;
+        assert_eq!(before.elapsed(), period, "and the spacing holds from there");
     }
 
     /// The age the reader computes from what the report carries (ADR-145,
