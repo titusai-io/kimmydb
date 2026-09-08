@@ -117,13 +117,19 @@ pub struct RoundReport {
     /// `divergence_checks` rise is a count half that has not looked at
     /// anything.
     pub divergence_count_deferred: usize,
-    /// Seconds since the last contact, with any peer, whose round ran the
-    /// check — as of the end of this tick; `None` before the first such
-    /// contact (ADR-145). A level, for a gauge. The one number that keeps
-    /// moving on a member whose rounds all fail: the two counters above
-    /// stop, `divergent_collections` holds its last value, and this says
-    /// how old that value is.
-    pub divergence_check_age_secs: Option<u64>,
+    /// When the check last ran against any peer — the instant of the last
+    /// contact whose round ran it; `None` before the first such contact
+    /// (ADR-145, ADR-154). Carried on every tick, checked or not, so it is
+    /// a level the receiver replaces. The receiver computes the age from it
+    /// *when the age is read*, not when this report was made: a report
+    /// that carried the age itself, as ADR-145 first had it, froze the age
+    /// with everything else on a member whose tick did not end — a loop
+    /// waiting on the single writer pushed nothing for an hour, and the one
+    /// series meant to say its gauge was old read the same number on every
+    /// scrape (ADR-154). An instant cannot go stale: seconds since it is a
+    /// subtraction the reader does against its own clock, whether or not
+    /// this loop ever ticks again.
+    pub divergence_last_check: Option<Instant>,
     /// Batches the rounds in this tick stopped short at an entry for a
     /// collection this node does not hold — `SyncOutcome::unknown_collection`,
     /// summed over the peers reached (ADR-148). A counter. Each one is a
@@ -245,7 +251,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut stalls = PeerStalls::new();
     // When the check last ran against anyone, so the report can say how old
     // the tracker's reading is (ADR-145). A tick in which every round fails
-    // moves nothing else about the check.
+    // moves nothing else about the check. The report carries the instant,
+    // not the age (ADR-154): the age is the reader's subtraction, so it
+    // keeps rising while a tick of this loop is stuck and nothing here runs.
     let mut last_check = LastCheck::default();
 
     // Peers currently flagged as stale rejoiners, so the warning fires on the
@@ -270,6 +278,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
             }
             _ = sync.tick() => {
+                // When this tick began, so the tick that overran the
+                // interval is named once it ends (ADR-154). The loop cannot
+                // say anything *while* a tick is stuck — the stuck tick is
+                // this arm, and a tick that starts while the previous one
+                // has not finished does not exist in a `select!` loop, whose
+                // arms run to completion — so the live signal for a stuck
+                // tick is the age series computed on read, and this is the
+                // line that says afterwards how long it was and that it was
+                // this loop.
+                let tick_started = Instant::now();
                 // A subset, not everyone: anti-entropy is transitive, so a
                 // write reaches the cluster through intermediate peers without
                 // every node contacting every other one every interval.
@@ -512,17 +530,38 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // on whether a caller wired up `on_round`, only `observe`
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
-                // And how old that reading is (ADR-145): the tracker keeps
-                // its last value through any number of ticks in which no
-                // check ran, and this is what says so.
-                report.divergence_check_age_secs =
-                    last_check.age(Instant::now()).map(|age| age.as_secs());
+                // And when that reading was last re-examined (ADR-145): the
+                // tracker keeps its last value through any number of ticks
+                // in which no check ran, and this is what lets the reader
+                // say how old it is. The instant rather than the age
+                // (ADR-154), so that the reader's number goes on rising
+                // through a tick of this loop that never ends.
+                report.divergence_last_check = last_check.at();
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.
                 if let Some(on_round) = &config.on_round {
                     report.backing_off = health.backing_off(Instant::now());
                     on_round(report);
+                }
+                // A tick that took longer than the interval is the shape of
+                // a loop that was stuck — behind the single writer, in the
+                // round that found this — and it is logged once it is back,
+                // with how long it was gone (ADR-154). Not per round: the
+                // rounds run one after another inside the tick, and it is
+                // the tick's length, not any one round's, that the age
+                // series and the operator's threshold are written against.
+                // Missed ticks fire back to back after a long one and each
+                // is short, so a stall of any length is one line.
+                let tick_took = tick_started.elapsed();
+                if tick_took >= config.sync_interval {
+                    warn!(
+                        elapsed_secs = tick_took.as_secs(),
+                        interval_secs = config.sync_interval.as_secs(),
+                        peers = peers.len(),
+                        "a sync tick took longer than cluster.sync_interval_secs; \
+                         kimmy_sync_divergent_collections was not re-examined while it ran"
+                    );
                 }
             }
         }
@@ -547,6 +586,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
 /// beside a `ran` counter that also reads `0`, which is what ADR-135's
 /// objection to an age gauge — that the never-checked case has no honest
 /// number — comes down to once the counter is there to carry it.
+///
+/// The loop hands the reader the instant, not an age it computed
+/// (ADR-154): an age computed here is as of the moment this loop last got
+/// to the end of a tick, and on the member whose tick was stuck behind the
+/// writer for an hour that moment was an hour old, so the age froze with
+/// the gauge it was meant to qualify. The instant is what the reader
+/// subtracts from its own clock, and that subtraction needs nothing from
+/// this loop.
 #[derive(Debug, Default)]
 struct LastCheck(Option<Instant>);
 
@@ -556,9 +603,18 @@ impl LastCheck {
         self.0 = Some(now);
     }
 
+    /// When the last check ran; `None` if none has.
+    fn at(&self) -> Option<Instant> {
+        self.0
+    }
+
     /// How long ago the last check ran, as of `now`; `None` if none has.
+    /// The reader's subtraction (`Metrics` in `kimmy-api` does it against
+    /// its own clock, ADR-154); here so the loop's half of the contract has
+    /// a test of its own.
+    #[cfg(test)]
     fn age(&self, now: Instant) -> Option<Duration> {
-        self.0.map(|at| now.saturating_duration_since(at))
+        self.at().map(|at| now.saturating_duration_since(at))
     }
 }
 
@@ -725,17 +781,21 @@ mod tests {
         );
     }
 
-    /// The age the report carries (ADR-145): absent before any check has
-    /// run, rising through ticks in which every round failed — nothing
-    /// touches the clock on a failed round — and back to zero the moment a
-    /// check runs.
+    /// The age the reader computes from what the report carries (ADR-145,
+    /// ADR-154): absent before any check has run, rising through ticks in
+    /// which every round failed — nothing touches the clock on a failed
+    /// round — and back to zero the moment a check runs. The report carries
+    /// the instant; the age is a subtraction against whatever clock reads
+    /// it, which is why it also rises through a tick that never ends.
     #[test]
     fn the_check_age_is_absent_then_rises_through_failed_rounds_and_resets_on_a_check() {
         let mut last = LastCheck::default();
         let t0 = Instant::now();
+        assert_eq!(last.at(), None, "nothing has run, so there is no instant to carry");
         assert_eq!(last.age(t0), None, "nothing has run, so nothing is old");
 
         last.ran(t0);
+        assert_eq!(last.at(), Some(t0), "the report carries the instant itself");
         assert_eq!(last.age(t0), Some(Duration::ZERO));
 
         // Three ticks of failed rounds: the `Err` arm never calls `ran`, so

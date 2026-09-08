@@ -75,6 +75,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   one `INFO` line when it leaves a snapshot to resume, with pages, documents
   and the cursor.
 
+- **`kimmy_sync_divergence_check_age_seconds` is computed when it is read,
+  so a stuck anti-entropy loop cannot freeze it.** The age exists to say
+  that `kimmy_sync_divergent_collections` is serving a stale reading, but it
+  was computed by the loop at the end of each tick and pushed with the gauge
+  — so a loop whose tick did not end froze the age with everything else. On
+  the three-member cluster above, the two members whose loops waited on the
+  writer for over an hour read the same age on every scrape, `ran` flat,
+  nothing failing and nothing backed off, while one of them fell some 30,000
+  documents behind with the gauge at 0; the documented alert on the age
+  never crossed its threshold. The loop now reports the instant of the last
+  check and every scrape and OTLP export subtracts it from its own clock, so
+  the age rises through a stuck tick exactly as it rises through a run of
+  failed rounds. Every documented reading holds: 0 before the first check
+  beside `ran` at 0, reset by a check, unmoved by a failed round. A sync
+  tick that took longer than `cluster.sync_interval_secs` is logged at
+  `WARN` when it ends ([ADR-154](docs/decisions.md)).
+
 ### Added
 
 - **The wait for the single writer is measured.** `kimmy_write_lock_wait_seconds`

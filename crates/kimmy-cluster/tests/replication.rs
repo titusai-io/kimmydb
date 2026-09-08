@@ -2035,10 +2035,14 @@ async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_repo
             .unwrap_or_else(|_| panic!("the one relayed round never ran the check"))
             .expect("the loop must keep reporting");
         if report.divergence_checks > 0 {
-            assert_eq!(report.divergence_check_age_secs, Some(0), "just checked: {report:?}");
+            // The report carries the instant of the check, not an age
+            // (ADR-154); the age is the reader's subtraction.
+            let checked =
+                report.divergence_last_check.unwrap_or_else(|| panic!("just checked: {report:?}"));
+            assert!(checked.elapsed() < Duration::from_secs(1), "just checked: {report:?}");
             break;
         }
-        assert_eq!(report.divergence_check_age_secs, None, "nothing has run yet: {report:?}");
+        assert_eq!(report.divergence_last_check, None, "nothing has run yet: {report:?}");
     }
 
     // The healthy member keeps writing into the collection both hold. The
@@ -2102,19 +2106,26 @@ async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_repo
     // failed round is a skip, and the age of the reading rises.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let (mut later_checks, mut failed, mut skips) = (0usize, 0usize, 0usize);
-    let mut age = Some(0u64);
-    while age < Some(1) {
+    let mut age = 0u64;
+    let mut last_check: Option<std::time::Instant> = None;
+    while age < 1 {
         let report = tokio::time::timeout_at(deadline, frozen_rx.recv())
             .await
             .unwrap_or_else(|_| panic!("the frozen member's check age never rose"))
             .expect("the loop must keep reporting");
-        assert!(report.divergence_check_age_secs.is_some(), "a reading exists: {report:?}");
-        assert!(report.divergence_check_age_secs >= age, "the age does not fall: {report:?}");
+        let checked =
+            report.divergence_last_check.unwrap_or_else(|| panic!("a reading exists: {report:?}"));
+        if let Some(previous) = last_check {
+            assert_eq!(checked, previous, "no check ran, so the instant stands: {report:?}");
+        }
         assert_eq!(report.divergent_collections, 0, "the reading it is holding: {report:?}");
         later_checks += report.divergence_checks;
         failed += report.failed;
         skips += report.divergence_skips;
-        age = report.divergence_check_age_secs;
+        // The age is computed where it is read (ADR-154): here, from the
+        // instant the report carries, as `/metrics` does on a scrape.
+        age = checked.elapsed().as_secs();
+        last_check = Some(checked);
     }
     assert_eq!(later_checks, 0, "no round completed after the freeze, so nothing re-examined");
     assert!(failed >= 1, "the freeze is a run of failed rounds");
