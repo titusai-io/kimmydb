@@ -11781,3 +11781,154 @@ and the repair abandoned — and `ask_snapshot_crosses_a_version_boundary_in_bot
 for the frame each side of an upgrade sees; and by the existing
 `kimmy-cluster/tests/replication.rs` snapshot and repair tests through the
 real loop, which now pull one collection.
+## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
+
+**Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a
+subtraction the reader does, not a number the anti-entropy loop reports. The
+loop's `RoundReport` carries the *instant* of the last contact whose round
+ran the cross-member divergence check — `divergence_last_check`, `None`
+before the first — in place of the age it used to compute at the end of its
+tick. `kimmy-api`'s `Metrics` stores that instant and computes the age at
+every `/metrics` render and at every snapshot the OTLP bridge takes:
+`now − last_check`, `0` while there is no instant. Every reading ADR-145
+documented for the series holds unchanged — `0` before the first check
+beside a `ran` counter that also reads `0`, reset to `0` by a check, rising
+through a run of failed rounds, and the operator's rule of "above *k* ×
+`cluster.sync_interval_secs` means the gauge is unknown" — and one that was
+wrong is corrected: the age now rises through a tick of the loop that never
+ends, as it rises through a tick in which every round failed. `render_at`,
+`render_with_at` and `snapshot_with_at` take the moment of the read as a
+parameter, so a test can read the age ninety seconds after a check without
+waiting ninety seconds. The series' name, type, position and the bridge's
+instrument name are unchanged; its HELP text says it is computed at the read.
+A sync tick that took longer than `cluster.sync_interval_secs` is logged at
+`WARN` when it ends, with how long it took, and it is followed by one tick
+at once — the one that was due — and then by the next a full interval later:
+the loop's sync and discovery tickers no longer catch up on the ticks they
+missed (`MissedTickBehavior::Delay`, as ADR-151 set on the retention
+collector). ADR-145 is extended, not
+replaced: the age is still a fact about the loop's contacts, still advanced
+only in the arm that folds a finding into the tracker, and still crosses
+into `/metrics` once per tick through `RoundReport`; what crosses is the
+instant rather than the age.
+
+**Why.** The series was added for exactly one purpose: so an operator can
+tell that `kimmy_sync_divergent_collections` is serving a value nothing has
+re-examined. ADR-145's case was a member whose every round failed, and for
+that case the loop computing the age at the end of its tick was enough — a
+failed round completes, the tick ends, the age is pushed and it has risen.
+The sustained-load round on 0.25.1 (ADR-151) found the case that argument
+does not cover. Two members' anti-entropy loops were waiting on the single
+writer, inside a sync round, for over an hour; the tick that contained the
+round never ended, so nothing was pushed: the gauge, both check counters and
+the age sat at whatever the last completed tick had left. One member was
+some 30,000 documents behind with its gauge at 0 and nothing on `/metrics`
+moving. The age read the same number on every scrape, `kimmy_sync_failures_total`
+was flat, nothing was backed off, and the documented alert — age above *k*
+× the interval — never crossed its threshold, because the age was frozen
+with the gauge it exists to qualify. The one signature was that the age did
+not change between scrapes, which no threshold rule reads and which is
+indistinguishable, on any single scrape, from a member checked a moment ago.
+
+The defect is that the age depended on the loop running. "Seconds since the
+last check" is a subtraction of an instant from a clock, and only the
+instant is the loop's to report; the clock is the reader's, and the reader
+is the scrape, which runs whether or not the loop does. ADR-145 already
+placed the age's *reset* in the loop for a reason that stands — the age
+must not reset on a contact the tracker was not told about — and this
+change keeps that: `LastCheck::ran` is still called in the one arm that
+folds a finding in, and what the report carries is what it holds. The
+difference is that the report carries `LastCheck`'s instant rather than the
+result of asking `LastCheck` for an age at the tick's end, so the answer no
+longer has an "as of" that ages with the loop. ADR-145's "up to one interval
+stale at a scrape" and its consequence, the rule of "above *k* × the
+interval rather than above the interval", both stand for a different reason:
+a healthy member's age cycles from 0 up to one interval between checks, so
+the threshold is multiples of the interval whatever the precision of a
+read.
+
+The bridge exports the same number. `Metrics::snapshot_with` is the read
+surface the OTLP bridge observes, and it computes the age at the snapshot
+from the same stored instant, so a collector and a scrape at the same moment
+agree and both keep rising through a stuck tick. The snapshot field keeps
+its name and type; what changed is when its value is decided.
+
+The stored instant is a mutex around an `Option<Instant>` rather than an
+atomic, where every other series here is an atomic. An `Instant` has no
+lock-free encoding that is not an offset from some chosen epoch, and the
+obvious epoch — the `Metrics` instance's own start — is a fiction in exactly
+the test that has to place a check ninety seconds before a read on a
+fresh instance. The lock is taken for one copy on a tick and one on a
+scrape and never held across anything, which is nothing beside the render
+that reads it.
+
+On logging: the brief question was whether the loop can say, at `WARN`,
+that no round has completed for *k* intervals, and the answer is that it
+cannot say so *while* that is true. `replicate` is a `select!` loop whose
+sync arm runs its rounds to completion; a tick that starts while the
+previous one has not finished does not exist in it, because the stuck tick
+*is* the arm, and the runtime does not poll the next tick until the arm
+returns. So during the stall the loop is the one component that cannot
+speak, and the live signal is the age computed at the read, which is this
+ADR. What the loop *can* say cheaply, on a tick, is that the tick it just
+finished took longer than the interval — one `Instant` per tick, compared
+at its end — and it says that, at `WARN`, with the duration: the line that
+turns "the age was high for an hour" into "this member's sync tick took an
+hour", which the age on its own cannot say after a check has reset it.
+ADR-151's writer-hold warning names the transaction that held the writer;
+this names the loop that waited for it.
+
+The tickers stop catching up for the same stuck-loop reason. Tokio's
+default fires every missed tick at once, so the hour-long tick on the
+0.25.1 round would have been followed, the moment it ended, by some 720
+sync ticks back to back — each a real round against every peer the fanout
+selects, on a cluster that had just come out of a stall, to make up for
+ticks whose work the next one does anyway. `Delay` fires the one tick that
+was due and schedules the rest a full interval apart from there, which is
+the behaviour ADR-151 chose for the retention collector and for the same
+reason; discovery gets it too, since a resolve that stalled on DNS has the
+same shape. It also means the overrun line above is one line per stall, not
+one per stall followed by a burst of short ticks. The test is cheap because
+the ticker is a function of the interval alone: under paused time, a ticker
+whose tick took an hour is asked for its next ticks, and the one that was
+due comes at once, the one after it a full interval later.
+
+**Alternatives.** *Leave the age as it was and document the frozen-age
+signature* — "an age that reads the same on every scrape is a loop that is
+not completing ticks" — was rejected: it is the signature the round
+produced and it is true, but no threshold rule reads it, a single scrape
+cannot see it, and it asks the operator to notice that a number has
+*stopped changing*, which is the same failure ADR-145 was written against
+one level up. The series has one job, and a series that needs a second
+series or a second scrape to do it is not doing it. *A separate "loop
+alive" heartbeat series* — seconds since the loop last completed a tick —
+was rejected: it is the same subtraction against the same kind of instant,
+and once the age is computed at the read it *is* that heartbeat for the
+only reading anyone wanted it for; a second series would be two numbers for
+one fact, with a rule for when they disagree. *A `WARN` from a watchdog
+task* that notices the loop has not ticked was rejected: a task that
+exists to watch another task is a second scheduler for a symptom `/metrics`
+now reports on every scrape, it would need its own interval and its own
+threshold, and the loop's own overrun line says the same thing once the
+stall ends, with the duration, at the cost of one `Instant` per tick.
+*Computing the age from a wall-clock timestamp in an atomic* was rejected in
+favour of the monotonic `Instant`: a clock step would make the age jump or
+go negative, which is a fault the series would then report and nothing else
+would explain.
+
+Defended by `kimmy-api`'s
+`the_check_age_is_computed_when_it_is_read_so_a_stuck_loop_cannot_freeze_it`
+— a check is recorded and the loop is never heard from again, and the render
+and the bridge's snapshot read 90 at ninety seconds and 3,600 at an hour, a
+tick without a check resets nothing, a check resets it — beside
+`an_age_the_loop_has_not_got_renders_as_zero`, which now also reads the
+never-checked case an hour later and still gets `0`; by the byte-for-byte
+render test, whose read is taken at an instant of its choosing; by
+`peers.rs`'s
+`the_check_age_is_absent_then_rises_through_failed_rounds_and_resets_on_a_check`,
+on the loop's half of the contract; by `kimmyd`'s
+`every_metrics_series_reaches_the_bridge`; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
+which computes the frozen member's age from the instant its real loop
+reports, as a scrape does.

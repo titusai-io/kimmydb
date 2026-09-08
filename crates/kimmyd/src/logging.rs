@@ -457,7 +457,11 @@ impl TelemetryGuard {
         // whether the half that compares a document count ever did against
         // a peer permanently behind; and a member whose rounds all fail
         // moves neither counter while the gauge holds its last value, which
-        // the age is the one series to say.
+        // the age is the one series to say. The age is computed when the
+        // snapshot is taken, from the instant the loop last reported
+        // (ADR-154), so this export and a `/metrics` scrape at the same
+        // moment read the same number, and both keep rising through a tick
+        // of the loop that never ends.
         observe!(
             u64_observable_counter,
             "kimmy.sync.divergence_count_probes.compared",
@@ -476,7 +480,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",
-            "Seconds since the last peer contact in which the cross-member divergence check ran, as of the last sync tick; 0 before the first.",
+            "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; 0 before the first.",
             sync_divergence_check_age_secs
         );
         // What a batch left rather than took, and the repairs that follow
