@@ -10934,6 +10934,18 @@ fails, which logs its exit and is read as clean by the start after it.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
+> **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
+> The pre-existing defect the last residual below records rather than fixes —
+> `snapshot::restore_collection` recreating a collection from a snapshot page
+> without consulting the collection tombstones, which this record's stopped
+> batch made a second way to reach — is closed there. That is the record the
+> residual says the fix wants, and it is filed with the drop rules as the
+> residual asks. The tombstone rule stated above is applied on the snapshot
+> route and in the cross-member divergence check as well as on the entries
+> path: a collection this node has dropped is neither recreated by a repair
+> nor reported as a divergence while a peer still holds the incarnation that
+> was dropped.
+>
 > **Amended by [ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped).**
 > The snapshot a repair pulls is of the one collection the repair was
 > planned for, a page per commit, resumed across rounds from the last page
@@ -11581,9 +11593,11 @@ defaults do not fit is a knob that is wrong for that case.
 > receiver as a page with nothing on it, which it read as the end of the
 > snapshot, and it kept a partial copy of the incarnation the cluster had just
 > agreed to delete. A snapshot also no longer recreates, or writes into, an
-> incarnation older than a tombstone this node holds — the
-> `restore_collection` defect this record repeats from ADR-148 is closed
-> there.
+> incarnation older than a tombstone this node holds. That closes the third
+> sentence below that no longer holds: the residual's "`restore_collection`
+> still recreates a collection without consulting this node's tombstones, as
+> ADR-148 recorded". It does consult them, on both halves of that case — the
+> tombstone this node holds and the drop the sender carries.
 
 **Decision.** Five rules for a snapshot, on the receiving side unless said
 otherwise.
@@ -12472,10 +12486,15 @@ On arrival `aims_at_a_previous_incarnation` is asked against the receiver's
 life-1 meta, whose `created` is the sender's own life-1 stamp and which carries
 no floor, so in the ordinary case the drop does not read as aimed at a life that
 had already ended: it applies, and the mixed copy goes with it. The state is
-durable only when that entry cannot land — it has aged out of the sender's oplog,
-which is the condition a repair runs under in the first place, or the receiver's
-copy carries a `created` that sorts above the drop, which is what an un-upgraded
-`restore_collection`'s local-clock origin can produce.
+durable only where that entry cannot land, and neither way of reaching that is
+the ordinary one. The drop is minted on the sender *during* the repair, so it is
+among the newest entries in that oplog and can age out only if the repair
+outlives `storage.oplog_retention_secs`; what aged out to cause the repair is
+the collection's **creation**, a different entry, and the two must not be read
+as one. The other way is a receiver whose copy carries a `created` sorting above
+the drop, which an un-upgraded `restore_collection`'s local-clock origin can
+produce. Both are narrow. The ordinary outcome is that the entries path closes
+it.
 
 Nor is it invisible while it lasts. The receiver ends with its life-1 documents
 plus whatever of life 2 sorts after the resume cursor — the walk resumes at an
@@ -12493,19 +12512,31 @@ cost. `snapshot_documents` skips a deleted document rather than sending it,
 with the comment that this "is safe, because the receiver never had the
 document". That was true while a snapshot served only a first-time catch-up. It
 is false since ADR-152 made a snapshot the *repair* of a collection the receiver
-already holds: the receiver may hold a document the sender deleted, and the
-repair cannot remove it, because nothing on the page denies it.
+already holds: the receiver may hold a document the sender deleted, and no page
+of that snapshot can remove it, because nothing on the page denies it.
 
-The consequence lands on the one detector that can see it and cannot act. The
-receiver keeps the document, so the next probe of that collection compares
-*n+1* here against *n* there, the count half confirms a divergence on two
-consecutive probes, and the repair the finding plans is a snapshot that carries
-nothing which closes it — it re-sends the documents the sender holds and says
-nothing about the one it does not. That is exactly the shape `docs/operations.md`
-already tells an operator to look at on `kimmy_sync_repair_rounds_total`:
-"rising steadily while the gauge stays above 0 with no page landing", arriving
-with no cause an operator could name from any page in this repository. It is
-also visible in the type, which is where it should be fixed: `SnapshotDoc::body`
+The consequence runs through the detector, and it is narrower in the common case
+and worse in the worst one than that alone would suggest — a repair is not
+always a snapshot, and which form it takes is what decides this. The
+receiver keeps the document, so the next probe of that collection compares *n+1*
+here against *n* there and the count half confirms on two consecutive probes.
+What that finding plans is **not** a snapshot: the collection is held here by
+construction — this member has the extra document of it — so the repair planned
+is a `Repair::Replay` from the collection's creation, and a replay re-serves the
+sender's oplog, which carries the delete entry. Wherever that entry is still
+servable the repair closes the finding on a round of replay, and the state
+described above does not arise at all.
+
+Where it is not servable the fallback is what makes it permanent. A replay
+asking from below the sender's retention horizon is answered `BeyondHorizon`,
+and the scoped fallback is reserved for a repair that asked for a snapshot
+outright — a replay falls back to the **whole-database** snapshot, which grants
+coverage. After that the delete entry is at or below the receiver's witnessed
+vector and no peer will serve it again, so the kept document is permanent by the
+first residual's own mechanism, and the gauge holds a divergence the repair
+cannot close. That the third item reaches the first through the same coverage
+grant is the point of stating them together. It is also
+visible in the type, which is where it should be fixed: `SnapshotDoc::body`
 still documents itself as `None` for a tombstone "which travels so a delete is
 not undone by a peer that still holds the document", and the producer beside it
 drops exactly that. The wire type claims the delete travels; it does not.
