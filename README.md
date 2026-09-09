@@ -43,8 +43,8 @@ seen a peer.
 
 ## Install
 
-Releases are cut by tag. The server ships as a container image, the CLI ships
-everywhere.
+Releases are cut by tag. The server ships as a container image; the CLI ships
+as a prebuilt Linux tarball, and from source anywhere else.
 
 ```bash
 # The server — multi-arch (amd64 + arm64) image on GHCR. Pick a root password
@@ -58,16 +58,25 @@ docker run --rm -p 7878:7878 \
   -v kimmy-data:/var/lib/kimmy \
   ghcr.io/titusai-io/kimmydb:latest
 
-# The CLI — Homebrew (macOS, arm64 and x86_64)
-brew install titusai-io/tap/kimmy
+# The CLI — from source, on any platform
+cargo install --path crates/kimmy-cli
 ```
 
-Prebuilt tarballs with SHA256 checksums for both binaries — macOS (arm64,
-x86_64) and Linux (arm64, x86_64, statically linked against musl, so they run
-on any distribution) — are on the
-[releases page](https://github.com/titusai-io/kimmydb/releases). Versioning
-policy is in [Compatibility](docs/compatibility.md): pre-1.0, a minor may
-break things and the [changelog](CHANGELOG.md) says so; a patch never does.
+Prebuilt tarballs with SHA256 checksums for both binaries — Linux arm64 and
+x86_64, statically linked against musl, so they run on any distribution — are
+on the [releases page](https://github.com/titusai-io/kimmydb/releases).
+
+**macOS archives and the Homebrew tap are not being published at present.**
+A release builds only what the container image needs
+([ADR-156](docs/decisions.md)), so no `aarch64-apple-darwin` archive is
+attached and `titusai-io/homebrew-tap` still carries the formula from the
+last release that published one — `brew install titusai-io/tap/kimmy` gets
+that version and no newer. On a Mac, build the CLI from source as above, and
+run the server from the container image, which is its channel either way.
+
+Versioning policy is in [Compatibility](docs/compatibility.md): pre-1.0, a
+minor may break things and the [changelog](CHANGELOG.md) says so; a patch
+never does.
 
 ## Quick start
 

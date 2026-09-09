@@ -4,10 +4,11 @@
 #
 # Why this exists
 # ---------------
-# A release is two binaries on three targets, each linking a few hundred
-# crates. Which crates, at which versions, under which licences, is knowable
-# from `Cargo.lock` — but only by whoever has the source at the right commit
-# and a Rust toolchain. An SBOM beside each archive answers the question for
+# A release is two binaries on every target it builds — two of them today,
+# with macOS paused (ADR-156) — each linking a few hundred crates. Which
+# crates, at which versions, under which licences, is knowable from
+# `Cargo.lock` — but only by whoever has the source at the right commit and a
+# Rust toolchain. An SBOM beside each archive answers the question for
 # whoever downloaded the archive, in the format their scanner already reads
 # (ADR-110).
 #
@@ -32,7 +33,7 @@
 # uploads each named file to the Release and checksums it like any other
 # artifact. Run it by hand the same way:
 #
-#     scripts/sbom.sh x86_64-unknown-linux-musl aarch64-apple-darwin
+#     scripts/sbom.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 #
 # The tool
 # --------

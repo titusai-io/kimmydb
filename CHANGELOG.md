@@ -12,6 +12,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **A release ships Linux archives only, and the Homebrew tap stops
+  updating.** `aarch64-apple-darwin` is paused, so a tag attaches no macOS
+  archives and no bills of materials for them, and no formula is generated or
+  pushed to `titusai-io/homebrew-tap` — a formula built from a release with no
+  macOS binary pins Linux musl archives and installs nothing a Mac can run,
+  which is worse than publishing none. Unchanged: `kimmyd` and `kimmy` for
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, each with its
+  checksum and its CycloneDX bill, `source.tar.gz`, and the multi-arch
+  container image at `ghcr.io/titusai-io/kimmydb` — the image is built from
+  those Linux archives, so it is exactly what it was. On a Mac,
+  `cargo install --path crates/kimmy-cli` builds the CLI and the container
+  image runs the server; `brew install titusai-io/tap/kimmy` still resolves,
+  but to the last version that published a formula, and it will not move while
+  this holds. The build is paused rather than retired
+  ([ADR-156](docs/decisions.md) has the measurements and exactly how to bring
+  it back).
+
 ### Fixed
 
 - **A dropped collection came back from a peer that had not applied the drop

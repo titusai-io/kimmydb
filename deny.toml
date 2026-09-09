@@ -15,10 +15,17 @@
 # has one, rustls on `ring` (ADR-016, ADR-039). **Sources**: crates.io only.
 
 [graph]
-# The targets dist builds releases for (dist-workspace.toml) plus the glibc
-# Linux targets CI and local development use. Without this cargo-deny
-# evaluates the graph for every target Rust knows about, and reports on
-# Windows- and wasm-only crates that never compile here.
+# The targets dist builds releases for (dist-workspace.toml), plus the glibc
+# Linux targets CI uses and the macOS one development happens on. Without
+# this cargo-deny evaluates the graph for every target Rust knows about, and
+# reports on Windows- and wasm-only crates that never compile here.
+#
+# `aarch64-apple-darwin` stays although its release build is paused
+# (ADR-156). It is still the target the workspace is compiled on daily, and
+# the only one in this list that pulls the Darwin `-sys` crates, so dropping
+# it would take a graph that is still built here out of the licence and
+# advisory checks — which is the opposite of what pausing a release artifact
+# is meant to cost.
 targets = [
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
