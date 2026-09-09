@@ -59,9 +59,11 @@
 //!
 //! A repair (ADR-148) is planned for *one* collection, and a snapshot scoped
 //! to it walks only that collection's key range and sends only its definition
-//! — or, when the sender has since dropped it, the drop's stamp, so the
-//! receiver records the tombstone and the entries it was stopped at become
-//! history rather than a stop that repeats. Where the receiver still holds the
+//! — or, when the sender has since dropped it, the drop's stamp, on every page
+//! and not the first alone, because a repair runs for as long as the
+//! collection takes and the drop lands where it lands. The receiver records
+//! the tombstone and the entries it was stopped at become history rather than
+//! a stop that repeats. Where the receiver still holds the
 //! incarnation that stamp names, it goes with the tombstone: keeping it would
 //! leave this node advertising a collection the cluster has agreed is deleted,
 //! and re-seeding it onto the members that applied the drop. The
@@ -232,10 +234,21 @@ pub struct SnapshotPage {
     /// none.
     pub versions: VersionVector,
     /// For a snapshot of one collection the sender no longer holds: the
-    /// stamp of its drop, when a tombstone still records it. First page only,
-    /// and absent from a whole-database snapshot, whose receiver never had
-    /// the collection. Optional on the wire, because a sender that predates
-    /// the field never writes it (ADR-152).
+    /// stamp of its drop, when a tombstone still records it.
+    ///
+    /// On **every** page of a scoped snapshot, not the first alone: the drop
+    /// can land between two pages of a repair that runs for minutes, and a
+    /// resumed page that could not carry it left the receiver holding a
+    /// partial copy of the dropped incarnation and calling the pull complete.
+    /// Absent from a whole-database snapshot, which carries no drops at all —
+    /// a separate gap, tracked separately, and not one this field closes.
+    ///
+    /// Optional on the wire, because a sender that predates the field never
+    /// writes it (ADR-152). Nothing about the field changed to carry it on
+    /// later pages; what changed is when a sender fills it, and a receiver
+    /// that predates *that* reads a resumed page's drop exactly as it reads a
+    /// first page's, because its own gate is on the snapshot being scoped and
+    /// never was on the page being the first.
     #[serde(default)]
     pub dropped: Option<Stamp>,
 }
@@ -337,14 +350,36 @@ impl Engine {
 
         // Definitions ride the first page, so the receiver can create the
         // collections before any document needs one. For a scoped snapshot
-        // that is the one collection — or, when it is gone here, its drop.
-        let (collections, dropped) = match (after.is_none(), scope) {
-            (false, _) => (Vec::new(), None),
-            (true, None) => (self.collection_states()?, None),
-            (true, Some(id)) => match self.collection_by_id(id)? {
-                Some(meta) => (vec![CollectionState::from(meta)], None),
+        // that is the one collection — or, when it is gone here, its drop,
+        // and **that rides every page, resumed pages included**.
+        //
+        // A repair runs for as long as the collection takes, and a drop
+        // lands where it lands. Sent on the first page alone, a drop between
+        // pages reached the receiver as an empty page with no definition, no
+        // documents, no drop and no cursor — indistinguishable from a
+        // snapshot that had simply run out — so the pull reported itself
+        // complete and the receiver kept a partial copy of the incarnation
+        // the cluster had just agreed to delete, with no tombstone of its
+        // own. Measured on a live-shaped fixture, not inferred: 512 documents
+        // applied, sender drops, resumed page empty, receiver still holding
+        // 512. That receiver is then the member that re-seeds the collection
+        // onto the ones that applied the drop, which is the finding, and the
+        // window is permanent exactly when the drop entry has already aged
+        // out of the oplog — which is when a repair is running at all.
+        //
+        // The tombstone is not read on its own: a collection recreated after
+        // a drop keeps the tombstone that floored it, so "a tombstone exists"
+        // does not mean "the collection is gone", and a page that carried one
+        // regardless would tell a receiver holding an older incarnation to
+        // destroy the copy this very snapshot is filling.
+        let (collections, dropped) = match scope {
+            Some(id) => match self.collection_by_id(id)? {
+                Some(meta) if after.is_none() => (vec![CollectionState::from(meta)], None),
+                Some(_) => (Vec::new(), None),
                 None => (Vec::new(), self.collection_dropped_at(id)?),
             },
+            None if after.is_none() => (self.collection_states()?, None),
+            None => (Vec::new(), None),
         };
 
         let (documents, next) = self.snapshot_documents(after, scope)?;
@@ -1533,6 +1568,90 @@ mod tests {
 
         assert_eq!(b.get_collection("shop", "orders").unwrap().created, cb.created);
         assert_eq!(b.count(&cb).unwrap(), 1, "the newer incarnation and its documents stand");
+    }
+
+    /// The drop landing **between two pages** of a repair, which is where it
+    /// lands whenever a repair runs long enough to matter.
+    ///
+    /// The resumed page carries it, so the receiver's partial copy of the
+    /// dropped incarnation goes with it. Before this, that page came back with
+    /// no definition, no documents, no drop and no cursor — the same thing a
+    /// snapshot that had run out looks like — so the pull reported itself
+    /// complete and left the receiver advertising a collection the cluster had
+    /// agreed to delete, with no tombstone of its own to stop it being served
+    /// or re-seeded.
+    #[test]
+    fn a_scoped_snapshot_resumed_after_its_sender_dropped_the_collection_carries_the_drop() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 88) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        let first = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert!(first.next.is_some(), "the fixture needs a page left to resume");
+        let outcome = b.apply_snapshot_page(&mut progress, &first).unwrap();
+        assert_eq!(outcome.applied, SNAPSHOT_PAGE, "{outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE, "the partial copy is here");
+        // Read after the first page, which created the collection: what must
+        // not move is B's own coverage, because a replicated drop mints no
+        // entry of the receiver's own.
+        let b_own = b.version_vector().unwrap().get(b.node_id());
+
+        // Between the pages.
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        let resumed = a.snapshot_page(progress.after().cloned(), Some(ca.id)).unwrap();
+        assert_eq!(resumed.dropped, Some(dropped), "a resumed page carries the drop too");
+        assert!(resumed.collections.is_empty(), "definitions still ride the first page alone");
+        assert!(resumed.documents.is_empty() && resumed.next.is_none(), "{resumed:?}");
+        b.apply_snapshot_page(&mut progress, &resumed).unwrap();
+        assert!(progress.is_complete());
+
+        assert!(
+            b.get_collection("shop", "orders").is_err(),
+            "the partial copy of the dropped incarnation goes with the drop"
+        );
+        assert_eq!(b.count_by_id(ca.id).unwrap(), None, "and its documents with it");
+        assert_eq!(
+            b.collection_dropped_at(ca.id).unwrap(),
+            Some(dropped),
+            "at the sender's stamp, so a recreation that follows it is still usable"
+        );
+        assert_eq!(b.version_vector().unwrap().get(b.node_id()), b_own, "no entry of its own");
+
+        // The whole-database route is untouched: it carries no drop on any
+        // page, which is a separate gap and not this one.
+        assert_eq!(a.snapshot_page(progress.after().cloned(), None).unwrap().dropped, None);
+    }
+
+    /// A tombstone alone cannot stand for "the collection is gone": a
+    /// collection recreated after a drop keeps the tombstone that floored it.
+    /// A resumed page that read the tombstone without checking would tell a
+    /// receiver holding an older incarnation to destroy the very copy this
+    /// snapshot is filling.
+    #[test]
+    fn a_resumed_scoped_page_of_a_collection_recreated_after_a_drop_carries_no_drop() {
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        assert!(ca.incarnation_floor.is_some(), "the tombstone survives the recreation");
+        for i in 0..(SNAPSHOT_PAGE + 1) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let first = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert_eq!(first.dropped, None);
+        assert_eq!(first.collections.len(), 1, "the definition rides the first page");
+        let resumed = a.snapshot_page(first.next.clone(), Some(ca.id)).unwrap();
+        assert_eq!(resumed.dropped, None, "the sender holds it; a floor is not news");
+        assert!(resumed.collections.is_empty(), "definitions still ride the first page alone");
+        assert_eq!(resumed.documents.len(), 1, "and the page it was asked for still arrives");
     }
 
     /// Two nodes minting the same `Hlc` in the same millisecond, with the
