@@ -851,7 +851,14 @@ pub struct ClusterConfig {
     pub seeds: Vec<SeedSource>,
     /// Shared secret authenticating node-to-node traffic.
     pub cluster_secret: Option<String>,
-    /// How often to run an anti-entropy round against each known peer.
+    /// How often to contact each known peer for an anti-entropy round.
+    ///
+    /// A tick makes several pulls from a peer while it is behind, until every
+    /// pull comes back short of the batch cap or the tick has spent this
+    /// interval (ADR-157) — another pull is started only when the pull before
+    /// it would have fitted in what is left, so a draining tick stops short
+    /// of its own period. This bounds a tick's own length rather than how
+    /// fast a backlog drains.
     pub sync_interval_secs: u64,
     /// How often to re-resolve the seed sources.
     ///

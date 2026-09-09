@@ -172,6 +172,30 @@ pub struct SyncOutcome {
     /// from one that runs and agrees. Set only by `kimmy-cluster`'s
     /// `sync_once`, like the two fields above.
     pub count_probe_deferred: bool,
+    /// Whether an immediate second pull from the same peer would carry more
+    /// (ADR-157): the peer said its scan stopped at the batch limit rather
+    /// than at the end of its oplog, and this node took the whole window it
+    /// was served, so the next pull starts strictly later.
+    ///
+    /// Not the negation of [`Self::exhausted`], and deliberately narrower.
+    /// `exhausted` answers whether the round earned the divergence check;
+    /// this answers whether pulling again *now* makes progress, which two
+    /// unexhausted states do not: a batch that stopped at a collection this
+    /// node lacks re-serves the same window and stops at the same entry
+    /// however often it is asked for — the repair planned at that stop is
+    /// what moves it — and a snapshot pull left to resume goes on at the
+    /// next round with the peer, a page at a time, on ADR-152's terms. Read
+    /// by the loop to decide whether to spend another of the tick's pulls on
+    /// this peer; the pull that comes back with it `false` is the tick's
+    /// last contact with the peer, and the one the divergence accounting is
+    /// decided on.
+    ///
+    /// Taken from what the peer *said* about its own window (ADR-127's
+    /// `exhausted`), never re-derived from how many entries arrived: a short
+    /// batch means the tail, and that inference is the one ADR-126 removed.
+    /// Set only by `kimmy-cluster`'s `sync_once`, like the three fields
+    /// above.
+    pub truncated: bool,
     /// Whether this round was spent repairing (ADR-148): re-serving the
     /// peer's oplog from below this node's position, or pulling its
     /// snapshot, because a divergence had been confirmed against it or a
