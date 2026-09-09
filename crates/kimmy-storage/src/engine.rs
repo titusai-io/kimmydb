@@ -468,8 +468,9 @@ impl Engine {
 
         // Here rather than beside the rebuilds above, because it is the one
         // repair that needs an engine: it takes the writer, a chunk at a time,
-        // through the same path a drop does. Before the engine is returned, so
-        // nothing can create a collection over what an interrupted drop left.
+        // through the same path a drop does. Ahead of any retention pass on
+        // this process, which is the ordering it needs — see its own
+        // documentation.
         engine.resume_interrupted_drops()?;
 
         Ok(engine)
@@ -1673,6 +1674,12 @@ impl Engine {
     /// by the retry while the rows stayed exactly where they are. The next
     /// start finishes it, as it finishes a drop a restart interrupted; a
     /// collection created under the name before then finishes it first.
+    ///
+    /// Both of those endings need the tombstone, and on a process that stays
+    /// up past `storage.tombstone_retention_secs` the collector takes it: the
+    /// rows are then reachable only by a creation under the same name. A disk
+    /// leak of unreachable pages rather than a correctness hole, stated as a
+    /// residual in ADR-158 rather than defended against here.
     fn purge_what_the_drop_left(&self, id: CollectionId, db: &str, name: &str) -> Result<()> {
         match self.purge_dropped_collection(id) {
             Ok(_) => Ok(()),
@@ -1873,6 +1880,15 @@ impl Engine {
             // the removing, so the two cannot interleave: redb has one writer,
             // and a creation either commits before this chunk sees it or after
             // this chunk has finished.
+            //
+            // A backstop rather than the primary mechanism: the creation
+            // drains the range itself before it writes its definition, so in
+            // a real race the purge's loop usually ends at its own
+            // emptiness check and never reaches here. What is left for this
+            // is the narrow ordering where the dropper's last chunk was full,
+            // and the creation then drains, creates and writes before the
+            // dropper looks again — narrow, reachable, and what the
+            // sequential test pins.
             let collections = txn.open_table(tables::COLLECTIONS)?;
             if collection_stands_under(&collections, id)? {
                 0
@@ -1933,42 +1949,87 @@ impl Engine {
     /// before the first chunk — but a collection created again under the same
     /// name derives the same id and would stand over them. There is nothing to
     /// replay: the drop is durable and has already replicated, so what is left
-    /// is the removal, and it is finished here before the engine is handed to
-    /// anything that could create over it.
+    /// is the removal.
+    ///
+    /// It is finished **here**, in `open`, to be ahead of the retention pass:
+    /// the residue is identified by a tombstone with no collection over it,
+    /// and `gc::collect_dropped_collections` removes that tombstone past
+    /// `storage.tombstone_retention_secs`, so a collector that ran first would
+    /// take the only marker this reads. Running inside `open` puts this ahead
+    /// of any collector on this process by construction. Being ahead of a
+    /// *creation* is not the reason — `create_collection_inner` purges the
+    /// derived id unconditionally, which covers that case whenever it happens.
     fn resume_interrupted_drops(&self) -> Result<()> {
-        let orphaned = {
-            let live: std::collections::HashSet<CollectionId> =
-                self.all_collections()?.into_iter().map(|c| c.id).collect();
-            // One row per dropped collection, so the table is walked whole, as
-            // the retention pass walks it.
-            let txn = self.db.begin_read()?;
-            let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-            let mut orphaned = Vec::new();
-            for row in dropped.iter()? {
-                let (key, _) = row?;
-                let id = CollectionId(key.value());
-                if !live.contains(&id) {
-                    orphaned.push(id);
-                }
-            }
-            orphaned
-        };
+        let owed = self.drops_left_unfinished()?;
+        // An ordinary start finds every drop finished and says nothing.
+        if owed.is_empty() {
+            return Ok(());
+        }
 
-        let mut collections = 0usize;
+        // Said **before** the work and not only after it. This runs on the
+        // way to opening, so a member restarted part-way through a large
+        // drop finishes it before it serves anything — up to the length of
+        // what is left of that drop. Each chunk is short, so the
+        // writer-hold `WARN` never fires either, and a purge that speaks
+        // only when it ends is indistinguishable from a start that has hung.
+        // The row count is what lets an operator size the wait.
+        for (id, rows) in &owed {
+            info!(
+                collection = %id,
+                rows,
+                "a collection drop was interrupted; finishing it before this node opens"
+            );
+        }
+
         let mut rows = 0usize;
-        for id in orphaned {
-            let removed = self.purge_dropped_collection(id)?;
-            if removed > 0 {
-                collections += 1;
-                rows += removed;
+        for (id, _) in &owed {
+            rows += self.purge_dropped_collection(*id)?;
+        }
+        info!(
+            collections = owed.len(),
+            rows, "finished the collection drops that a restart interrupted"
+        );
+        Ok(())
+    }
+
+    /// Every collection id a drop left rows under, with how many: a tombstone
+    /// with no collection standing over it, and something still filed beneath.
+    ///
+    /// Counted rather than merely detected, because the number is the only
+    /// thing that tells an operator how long the start is about to take. One
+    /// read transaction, and it walks only the ranges that are about to be
+    /// removed anyway; an id with nothing under it costs the two seeks that
+    /// find that out, which is what every start pays and nothing more.
+    fn drops_left_unfinished(&self) -> Result<Vec<(CollectionId, usize)>> {
+        let live: std::collections::HashSet<CollectionId> =
+            self.all_collections()?.into_iter().map(|c| c.id).collect();
+        // One row per dropped collection, so the table is walked whole, as
+        // the retention pass walks it.
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let indexes = txn.open_table(tables::INDEX_ENTRIES)?;
+        let mut owed = Vec::new();
+        for row in dropped.iter()? {
+            let (key, _) = row?;
+            let id = CollectionId(key.value());
+            if live.contains(&id) {
+                continue;
+            }
+            let mut rows = 0usize;
+            for row in docs.range(doc_range(id))? {
+                row?;
+                rows += 1;
+            }
+            for row in indexes.range(index_range(id))? {
+                row?;
+                rows += 1;
+            }
+            if rows > 0 {
+                owed.push((id, rows));
             }
         }
-        // Only when there was something: an ordinary start finds every drop
-        // already finished and says nothing.
-        if rows > 0 {
-            info!(collections, rows, "finished a collection drop that a restart interrupted");
-        }
-        Ok(())
+        Ok(owed)
     }
 
     /// Persist a modified collection definition (used when adding an index).
@@ -2935,6 +2996,17 @@ mod tests {
             assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK);
             assert!(engine.get_collection("shop", "orders").is_err(), "gone, not half-held");
             assert!(rows_under(&engine, coll.id).0 > 0, "the fixture must leave rows behind");
+
+            // What the next start names before it does the work, which is
+            // all an operator has to tell a long start from a hung one: both
+            // ids, and how many rows each still owes.
+            let owed: std::collections::BTreeMap<CollectionId, usize> =
+                engine.drops_left_unfinished().unwrap().into_iter().collect();
+            for id in [coll.id, shadow.id] {
+                let (docs, indexes) = rows_under(&engine, id);
+                assert_eq!(owed.get(&id), Some(&(docs + indexes)), "what is owed under {id}");
+            }
+            assert_eq!(owed.len(), 2, "and nothing else: {owed:?}");
             (coll, shadow)
         };
 

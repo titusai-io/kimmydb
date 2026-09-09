@@ -12801,7 +12801,15 @@ work rather than at the drop's full length:
 
 None of that is inferred from the ordering: each is asserted under a drop
 stopped after its burial, which is exactly the state every chunk of a purge
-runs in. See **How it is tested**.
+runs in. See **How it is tested**. And the resurrection is not argued for
+either — it was reproduced. Recording the tombstone after the purge instead,
+which is the honest shape of "at the end", and then relaxing the snapshot test
+past the fixture assertion that trips first, leaves `get_collection` on the
+dropping node **succeeding** after it applies a page from a peer that has not
+applied the drop: the collection recreated on the member that was in the middle
+of dropping it, which is ADR-155's finding reached during any chunk of any
+drop. This ordering is not a defensive preference; it is the only one that can
+ship on top of ADR-155.
 
 **The purge is guarded on the id still being dead, in the transaction that
 removes.** A collection id is derived from its name, so a name created again
@@ -12816,6 +12824,18 @@ over it. Ordinarily that is two seeks against an empty range; where it is not,
 it is the same bounded chunks the drop was making, so a recreation does not
 hold the writer either.
 
+Of those two the **creation side is the primary mechanism and the chunk's guard
+is the backstop**, which is worth saying because the order they are written in
+suggests the reverse. The creation drains the range before it writes its
+definition, so in a genuine race the dropper's loop ordinarily ends at its own
+emptiness check and never reaches the guard at all — a concurrent probe over a
+40,000-document collection, one thread dropping and one recreating and writing
+the moment the burial was visible, loses nothing with the guard removed. What
+the guard is for is the narrow ordering that probe does not reliably produce:
+the dropper's previous chunk removed a full thousand, and the creation then
+drains, creates and inserts before the dropper looks at the range again. Narrow
+and real, which is why it is pinned by a sequential test rather than by a race.
+
 **An interrupted drop and a drop in progress are the same state on disk**, and
 one mechanism resolves both. What either leaves is rows under an id that
 `COLLECTIONS` does not resolve and `COLLECTIONS_DROPPED` has a tombstone for:
@@ -12824,20 +12844,32 @@ collection created under the same name. There is nothing to replay — the
 definition's removal, the tombstone and the entry were durable and served
 before the first chunk — so what is left is the removal. `Engine::open` walks
 the tombstone table, takes every id with no collection standing under it, and
-finishes the purge, before the engine is returned to anything that could create
-over it. It logs only when it removed something: an ordinary start finds every
+finishes the purge before the engine is returned. An ordinary start finds every
 drop finished and says nothing.
 
-That sweep is placed inside `open` rather than beside the retention pass for a
-reason worth stating, because the alternative looks tidier. The residue is
-identified by *a tombstone with no live collection under it*, and the retention
-pass collects tombstones past `storage.tombstone_retention_secs` — so a
-collector that ran before the sweep could take the only marker the sweep reads.
-Running inside `open` puts the sweep ahead of the first pass of any collector
-on that process by construction, rather than by a claim about scheduling. It is
-also why the creation path purges by id unconditionally rather than only when a
-tombstone is there: residue whose tombstone has since been collected is still
-residue, and the create is the one moment it can do harm.
+**The sweep is inside `open` to be ahead of the collector, and that is the only
+reason it needs.** The residue is identified by *a tombstone with no live
+collection under it*, and `gc::collect_dropped_collections` removes that
+tombstone past `storage.tombstone_retention_secs` — so a collector that ran
+before the sweep would take the only marker the sweep reads. Running inside
+`open` puts it ahead of the first pass of any collector on that process by
+construction rather than by a claim about scheduling. It is *not* placed there
+to be ahead of a creation: `create_collection_inner` purges the derived id
+unconditionally, which covers that case whenever it happens and is why the
+creation path does not gate on a tombstone being present — residue whose
+tombstone has since been collected is still residue, and the create is the one
+moment it can do harm.
+
+**It says what it is doing before it does it.** `open` is on the way to
+binding, so a member restarted part-way through a large drop finishes that drop
+before it serves anything — up to the length of what is left of it, which on
+the measurement below is a minute. Each chunk is short, so ADR-151's
+writer-hold `WARN` never fires; a sweep that spoke only when it ended would be
+indistinguishable from a start that had hung, on a node whose open is already
+long. So each collection it owes is logged at `INFO` before the first chunk,
+with the id and the number of rows, and the totals again at the end. Counting
+those rows is a read walk of exactly the ranges that are about to be removed,
+and it happens only when something is owed.
 
 **One failure is not the drop's to report.** A chunk runs under whatever writer
 budget the caller set (ADR-151), which on the request path is
@@ -12846,10 +12878,21 @@ the drop: by then the definition is gone, the tombstone is durable and the
 entry is published, so the drop happened, and a client told to retry would be
 answered `dropped: false` by the retry while the rows sat where they were. It
 is logged at `WARN`, and the removal is finished by the next start or by the
-next creation under the name. This is a state chunking makes reachable and the
-single transaction did not — a drop now queues for the writer once per chunk
-rather than once — and it is the one place the change trades an honest answer
-for a deferred one.
+next creation under the name — while the tombstone lasts; see the residual
+below. This is a state chunking makes reachable and the single transaction did
+not, and it is the one place the change trades an honest answer for a deferred
+one.
+
+The same shift changes what a drop can occupy, and it is worth naming even
+though it wants no code. A drop now queues for the writer once per chunk rather
+than once, and **each chunk gets the caller's full budget afresh**, so what
+bounds a drop's hold on a request handler is chunks × `server.request_timeout_secs`
+rather than one budget plus the removal. The pathological case needs every one
+of a collection's chunks to wait very nearly the whole timeout and none of them
+to exceed it, since the first that does ends the purge; a member in that state
+is in ADR-151's write outage, where every request is already at the timeout.
+Named rather than bounded, because bounding the whole drop would mean carrying
+a deadline through the loop for a case where the node is already failing.
 
 **`DROP_PURGE_CHUNK` is 1,000 rows and is not configurable.** A thousand is
 what the retention pass removes per commit (ADR-151) and what a `multi: true`
@@ -12896,7 +12939,12 @@ metadata only, a JSON parse per collection and never a document, against a
 transaction that is already removing a thousand rows. And `Engine::open` reads
 the tombstone table and, for each id with no collection over it, seeks the two
 ranges — one read transaction and two seeks per tombstone on a database with
-nothing owed.
+nothing owed, which is the ordinary start. Measured on a release build against
+2,000 retained tombstones and nothing owed: 15 ms, against an open that already
+takes minutes on a large file. Where something *is* owed it also counts the
+rows before removing them, so the line an operator reads can say how long the
+start will be; that is a read walk of exactly the ranges the purge is about to
+remove, and it happens only in the case that is already going to be slow.
 
 **What did not change.** The drop is still synchronous with its caller, so
 `DELETE /v1/db/{db}/coll/{coll}` still takes as long as the removal takes;
@@ -12932,11 +12980,23 @@ retention pass is what *collects* the tombstone the residue is identified by,
 so the two would have to agree about an order they currently do not need to.
 
 **Residuals, stated.** **A purge deferred on a long-running process is not
-retried until that process restarts or the name is created again.** The only
-way to reach it is a chunk giving up on the writer, which is the state ADR-151
-calls a write outage; the rows are unreachable and cost disk, nothing serves
-them, and both endings are ordinary. The retention-pass closure above is the
-candidate if it is ever seen. **A drop's caller still waits for the whole
+retried until that process restarts or the name is created again, and past one
+tombstone-retention window neither ending is guaranteed.** The only way to
+reach the deferral at all is a chunk giving up on the writer, which is the
+state ADR-151 calls a write outage. Both endings read the tombstone — the sweep
+finds the residue by it, and the creation is the only other thing that clears
+the id — and on a process that stays up past
+`storage.tombstone_retention_secs` the retention pass collects it. From there
+nothing will remove those rows except a collection created under the same name:
+demonstrated, a thousand document rows under a dead id surviving a clean
+restart with neither tombstone nor definition. It is a **disk leak and not a
+correctness hole** — the rows have no definition, so no reader, no peer and no
+check can reach them, and `create_collection_inner`'s purge is unconditional so
+a recreation is still safe — and redb does not return freed pages to the
+filesystem in any case, so what an operator can measure barely moves. The
+retention-pass closure above is the candidate if it is ever seen; it is the one
+pass that could both notice the residue and hold the marker still while it
+did. **A drop's caller still waits for the whole
 purge**, so a very large drop is still a very long request for the client that
 issued it — the request timeout applies to the writer wait, not to the
 transaction (ADR-151), so a drop that is making progress is not cut off by it.
@@ -12954,7 +13014,9 @@ collection is absent from `get_collection`, the listing and
 `the_writer_is_released_between_the_chunks_of_a_drop` (the burial's commit and
 exactly one per chunk of a thousand rows, each queueing for the writer on
 its own),
-`a_drop_interrupted_between_chunks_is_finished_by_the_next_start`,
+`a_drop_interrupted_between_chunks_is_finished_by_the_next_start` (which also
+pins what that start *says* before it works: both ids, and the rows each still
+owes),
 `a_collection_created_again_between_two_chunks_of_its_drop_keeps_its_documents`
 (the guard, from both sides: the creation clears what the drop had not reached,
 and the rest of the drop then takes nothing), and

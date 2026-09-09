@@ -10,7 +10,8 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## 0.26.1 - 2026-09-09
+
+## Unreleased
 
 ### Changed
 
@@ -42,12 +43,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
   **Nothing to do before or after upgrading.** No wire field, no message, no
   HTTP shape and no new `/metrics` series. A member restarted part-way through
-  a drop finishes the removal at its next start, before it serves anything; the
-  drop itself was durable and replicated before the first row went. On a member
-  that stays up, a `WARN` saying a chunk of a drop gave up waiting for the
-  single writer means the same thing — the collection is dropped and the rows
-  are removed at the next start — and, like every wait of that length, it is a
-  member whose writer is held for longer than a request is allowed to take.
+  a drop finishes the removal at its next start, **before it binds** — so that
+  start can take up to what was left of the drop, and it now logs the
+  collections it owes and their row counts before it begins rather than only
+  when it ends. The drop itself was durable and replicated before the first row
+  went. On a member that stays up, a `WARN` saying a chunk of a drop gave up
+  waiting for the single writer means the collection is dropped and the rows
+  are removed at the next start — provided the collection tombstone outlives
+  the process, since that is what the start reads to find them; past
+  `storage.tombstone_retention_secs` the rows are unreachable disk rather than
+  data, cleared only by a collection created under the same name. Like every
+  wait of that length, the `WARN` is a member whose writer is held for longer
+  than a request is allowed to take.
+## 0.26.1 - 2026-09-09
+
+### Changed
+
 
 - **A release ships Linux archives only, and the Homebrew tap stops
   updating.** `aarch64-apple-darwin` is paused, so a tag attaches no macOS
