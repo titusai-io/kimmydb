@@ -637,23 +637,31 @@ with a restore or by removing and re-seeding the odd member out
 ([ADR-148](decisions.md)).
 
 **A collection only one member holds is invisible to that member's own
-check**, and there is one way to reach that state on purpose. The existence
+check**, and there are two ways to reach that state. The existence
 half reports what a *peer* holds and this member does not, never the reverse,
 and the count half has nothing to compare when the peer holds no such
 collection — so a member holding a collection every other member has dropped
 sees a clean gauge, and the members that dropped it now subtract it rather
-than reporting it ([ADR-155](decisions.md)). The way in is the whole-database
-catch-up a member below a peer's retention horizon pulls: that snapshot
-carries no collection drops, and completing it grants the member coverage of
-the sender's history, so the drop entry it never applied is below that
-coverage and no peer will serve it. The member keeps the collection, live and
-writable, until the dropping member's tombstone expires — at which point that
-member's check reports it and repairs it back onto the cluster. The tell is
-the `WARN` that starts the catch-up, `behind the peer's retention horizon;
-falling back to a snapshot`, followed by `caught up from a snapshot`: **a
-member that has logged that pair may hold collections the rest of the cluster
-dropped while it was away.** Compare its collection list against a member that
-stayed up, and drop anything only it holds. Recorded rather than closed
+than reporting it ([ADR-155](decisions.md)). Both ways in are the
+**whole-database** snapshot, which carries no collection drops and, on
+completing, grants the member coverage of the sender's history — so the drop
+entry it never applied is below that coverage and no peer will serve it. The
+member keeps the collection, live and writable, until the dropping member's
+tombstone expires, at which point that member's check reports it and repairs it
+back onto the cluster.
+
+**The tell is only half reliable, so know which half.** `caught up from a
+snapshot` is logged whenever a pull completes, whether it was the whole database
+or the one collection of a repair, so on its own it does not say which. The
+`WARN` that names the cause — `behind the peer's retention horizon; falling back
+to a snapshot` — is logged only when no repair is already in flight, so it marks
+the first way in and not the second: a repair that was re-serving a peer's oplog,
+found its window below that peer's horizon and fell back to the whole database
+logs the completion line alone. The `WARN` is therefore sufficient and not
+necessary. **Where it appears, compare that member's collection list against one
+that stayed up and drop anything only it holds** — and do the same on suspicion
+for a member that has been repairing against a peer over many rounds, because
+nothing will have named that one. Recorded rather than closed
 ([ADR-155](decisions.md)).
 
 **What runs, and when.** Every anti-entropy round whose pull reaches the

@@ -10935,7 +10935,7 @@ fails, which logs its exit and is read as clean by the start after it.
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
 > **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
-> The pre-existing defect the last residual below records rather than fixes —
+> The pre-existing defect recorded below rather than fixed —
 > `snapshot::restore_collection` recreating a collection from a snapshot page
 > without consulting the collection tombstones, which this record's stopped
 > batch made a second way to reach — is closed there. That is the record the
@@ -11595,8 +11595,8 @@ defaults do not fit is a knob that is wrong for that case.
 > agreed to delete. A snapshot also no longer recreates, or writes into, an
 > incarnation older than a tombstone this node holds. That closes the third
 > sentence below that no longer holds: the residual's "`restore_collection`
-> still recreates a collection without consulting this node's tombstones, as
-> ADR-148 recorded". It does consult them, on both halves of that case — the
+> still recreates a collection without consulting this node's own tombstones,
+> as ADR-148 recorded". It does consult them, on both halves of that case — the
 > tombstone this node holds and the drop the sender carries.
 
 **Decision.** Five rules for a snapshot, on the receiving side unless said
@@ -12370,7 +12370,9 @@ re-seeded the members that had it right. The second event was the first one's
 repair.
 
 The tombstone that would have stopped all of it was sitting in
-`COLLECTIONS_DROPPED` on every member the whole time. ADR-148 saw the
+`COLLECTIONS_DROPPED` on every member the whole time — a drop has left one
+since [ADR-034](#adr-034--dropping-a-collection-leaves-a-tombstone), the record
+this one extends. ADR-148 saw the
 `restore_collection` half of this in review — "resurrected holding two
 documents" — recorded it as a defect its own change made more reachable, and
 left it for the drop rules; what the field finding added is that the divergence
