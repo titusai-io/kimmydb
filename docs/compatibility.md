@@ -193,10 +193,10 @@ something an operator needs, and `## Unreleased` in
 This is worth stating because the alternative habit — a tag per round of merges
 — is easy to fall into, and the cost is paid by the people downstream rather
 than by the person tagging. Every tag is a published release with notes, a
-Homebrew formula update, a container image and a set of SBOMs; twenty of those
-in a week is version churn that tells a reader nothing about which one they
-should be running. Trying a change on a cluster does **not** need a tag: the
-container image workflow can be dispatched by hand for that.
+container image and a set of SBOMs; twenty of those in a week is version churn
+that tells a reader nothing about which one they should be running. Trying a
+change on a cluster does **not** need a tag: the container image workflow can
+be dispatched by hand for that.
 
 ---
 

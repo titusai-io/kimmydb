@@ -36,6 +36,10 @@ tokio.workspace = true
 # through `kimmy-client`, and a test would notice if that stopped being true.
 reqwest.workspace = true
 
-# Homebrew installs the binary's name, not the crate's.
+# Homebrew installs the binary's name, not the crate's. Commented out with the
+# rest of the Homebrew half (ADR-156): dist emits `kimmy.rb` for any package
+# that names a formula, whatever `installers` says, and a formula on the
+# Release page pinning Linux musl archives is the state that record is about.
+# Uncomment it when `aarch64-apple-darwin` comes back to dist-workspace.toml.
 [package.metadata.dist]
-formula = "kimmy"
+# formula = "kimmy"

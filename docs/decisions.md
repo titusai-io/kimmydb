@@ -2851,6 +2851,16 @@ announce.
 
 ## ADR-063 — cargo-dist builds the release; the container image is the server's channel
 
+> **Amended by [ADR-156](#adr-156--the-release-builds-only-what-the-container-image-needs).**
+> The four targets below are two. A tag builds the
+> `*-unknown-linux-musl` pair only: `x86_64-apple-darwin` went in August, and
+> `aarch64-apple-darwin` is now commented out in `dist-workspace.toml`. The
+> Homebrew half of this record is paused with it — no formula is generated and
+> nothing is pushed to the tap — because a formula built from a release with no
+> macOS binary installs nothing a Mac can run. The container image, its two
+> native runners and the manifest merge are untouched, and the musl builds stay
+> precisely because the image is built from their archives (ADR-107).
+
 **Decision.** Releases are built by **`dist` (cargo-dist)**, configured in
 `dist-workspace.toml`, which generates `.github/workflows/release.yml` — a
 file nobody edits by hand. Pushing a `v*` tag builds `kimmyd` and `kimmy` for
@@ -12601,3 +12611,125 @@ for the frame each side of an upgrade sees; and by ADR-148's
 `a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall` and
 ADR-152's `a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone`,
 which pass unchanged through the move of the predicate they exercise.
+
+## ADR-156 — The release builds only what the container image needs
+
+**Decision.** A tag builds the two `*-unknown-linux-musl` targets and nothing
+else. `aarch64-apple-darwin` is **paused**: commented out in
+`dist-workspace.toml`'s `targets` and in the four macOS paths of
+`[[dist.extra-artifacts]]`. Homebrew is paused with it — `installers = []`,
+`tap` commented out, `homebrew` out of `publish-jobs`, and `formula = "kimmy"`
+commented out in `crates/kimmy-cli/Cargo.toml`. `./publish-ghcr` stays in
+`publish-jobs`, the container image is unchanged, and `ci.yml` is untouched.
+This amends ADR-063, whose four targets and Homebrew half are what is being
+narrowed; ADR-107 is not amended, it is the reason the Linux half stays.
+
+**What a release still carries.** Both Linux archives with their `.sha256`
+files and `sha256.sum`, the four SBOMs for them, `source.tar.gz`, the GitHub
+Release itself with its notes lifted from `CHANGELOG.md`, and the multi-arch
+image at `ghcr.io/titusai-io/kimmydb` with its manifest and its provenance
+attestation. Nothing about the image changed, because nothing about the image
+*could* change without undoing ADR-107.
+
+**Why the macOS build goes and the Linux builds stay.** Measured on the
+v0.26.0 release, wall-clock: macOS arm64 6.9 minutes, Linux x86-64 5.8, Linux
+arm64 5.6, both image builds plus the manifest merge 1.7, everything else
+about 2. GitHub bills macOS runners at ten times the Linux rate, so that one
+job is roughly 69 of the release's ~85 billed minutes — about four fifths of
+the cost in one job, for an artifact nobody is running.
+
+Those are wall-clock sums, and the bill is not: GitHub rounds **each job**
+up to a whole minute before applying the multiplier, and a release runs
+roughly eight jobs short enough for that rounding to be most of what they
+cost. Computed per job instead, the macOS share is nearer 78% than 82% and
+the saving nearer 79%. The figures are quoted as sums because that is how
+they were measured; the conclusion does not turn on the difference, and the
+paragraphs below use the per-job numbers where a number matters.
+
+The Linux builds cannot go the same way, and the reason is mechanical rather
+than a preference. `publish-ghcr.yml` compiles nothing: it takes `kimmyd` out
+of the `kimmyd-<target>.tar.xz` that `build-local-artifacts` produced in the
+same run, checks it against dist's checksum, and hands it to the Dockerfile's
+`prebuilt` stage (ADR-107). That is why the two image jobs are about
+35 seconds each instead of the nine minutes each architecture took when it
+compiled the workspace a second time. Turning the musl builds off would either
+break the image or send it back to compiling from source — more minutes than
+the pause saves, and it would give back the guarantee that the file on the
+Release page and the file in the image are one file rather than two builds of
+one commit.
+
+**Why Homebrew goes with macOS rather than staying behind.** The tap carries
+the `kimmy` CLI, and it carries it for Macs. A formula generated from a
+release with no macOS binary pins Linux musl archives, so it installs nothing
+a Mac can run: an install route that exists and fails is worse than one that
+is openly not being published, because the first is discovered by a user and
+the second by a reader.
+
+Two mechanisms have to be turned off, not one, and the second is the
+surprise. `installers` and `publish-jobs` control whether the formula is
+*published*; the `formula` key in a package's `[package.metadata.dist]` is on
+its own enough for dist to *generate* `kimmy.rb` and attach it to the
+Release. Left alone it would have put exactly the broken formula described
+above on the Release page while the tap stayed still — checked with
+`dist plan`, which listed `kimmy.rb` with six Linux target triples and no
+macOS one, and which no longer lists it.
+
+And the formula is not only a file among the assets, which is the strongest
+argument for commenting that one line out. dist writes the install
+instructions at the top of the generated release notes from the installers a
+release has, so with the key left in place every Release page would have
+opened with "Install prebuilt binaries via Homebrew: `brew install kimmy`" —
+an instruction printed on the front of the release, for a tap that is no
+longer being pushed to, resolving to a formula that cannot install on a Mac.
+A broken asset is found by whoever downloads it; a broken instruction at the
+top of the page is offered to everybody.
+
+**What this costs, stated rather than discovered later.** The tap is not
+emptied; it keeps the formula from the last release that published one, so
+`brew install titusai-io/tap/kimmy` installs that version and never a newer
+one. That is a stale install route rather than a broken one, and README.md
+and `docs/cli.md` say so and point at the source build and the container
+image. There is no macOS archive to attest and no macOS bill of materials, so
+a release describes four binaries rather than six.
+`aarch64-apple-darwin` stays in `deny.toml`'s target list even so: it is
+still the target the workspace is compiled on daily and the only one there
+that pulls the Darwin `-sys` crates, and dropping it would take a graph that
+is still built here out of the licence and advisory checks — a cost the
+pause was not meant to have.
+
+**Rejected: deleting the macOS target rather than commenting it out.** The
+build may be wanted again, and the arguments for it — ADR-063's, and
+ADR-113's observation that macOS binaries can be built nowhere but GitHub —
+are unchanged; only their price against current use is. A commented line with
+the reason beside it is what makes this an hour's work to undo instead of a
+re-derivation.
+
+**Rejected: keeping the macOS build and cutting elsewhere.** There is nowhere
+else to cut. Everything but the macOS job is nearer 19 or 20 billed minutes
+than the 15 its wall-clock sum suggests — the eight short jobs a release runs
+cost a whole minute each however brief they are — and about 12 of those
+minutes are the two builds the image is made from. What is left is the plan,
+the global-artifacts and host jobs, the two image builds and the merge, and
+the announce job: the parts that turn the builds into a release.
+
+**Exactly how to reverse it.**
+
+1. `dist-workspace.toml`: uncomment `"aarch64-apple-darwin"` in `targets`, and
+   in `[[dist.extra-artifacts]]` uncomment the same triple in `build` and the
+   four `target/sbom/*-aarch64-apple-darwin.*` paths in `artifacts`.
+2. `dist-workspace.toml`: set `installers = ["homebrew"]`, uncomment `tap`,
+   and put `"homebrew"` back at the front of `publish-jobs`.
+3. `crates/kimmy-cli/Cargo.toml`: uncomment `formula = "kimmy"`.
+4. Run `dist generate` at the pinned `cargo-dist-version` and commit the
+   regenerated `.github/workflows/release.yml`. Never edit it by hand; the
+   `plan` job fails a pull request whose copy has drifted.
+5. Put the documentation back: the install sections of `README.md` and
+   `docs/cli.md`, "Verifying a release" and "What a release contains" in
+   `docs/operations.md`, the bill count in `docs/security.md`, the tag-cost
+   sentence in `docs/compatibility.md`, the header and example in
+   `scripts/sbom.sh`, and the cache note in
+   `.github/release-build-setup.yml`, which describes what the macOS entry of
+   the matrix does. That last file is read by `dist generate`, but only its
+   steps are — its comments are not inlined into `release.yml`, so a comment
+   change there needs no regeneration. `deny.toml` needs no change, having
+   kept the target.

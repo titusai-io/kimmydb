@@ -5,11 +5,15 @@
 One-shot commands that speak the ordinary HTTP API, print JSON on stdout, and
 exit non-zero when they fail.
 
-Install with `brew install titusai-io/tap/kimmy` on macOS, or take a prebuilt
-tarball from the [releases page](https://github.com/titusai-io/kimmydb/releases)
-— the Linux binaries are static, so they run on any distribution. `kimmy
---version` prints the version, commit and build date, which is what to include
-in a bug report.
+Take a prebuilt tarball from the
+[releases page](https://github.com/titusai-io/kimmydb/releases) — the Linux
+binaries are static, so they run on any distribution — or build it from source
+with `cargo install --git https://github.com/titusai-io/kimmydb kimmy-cli`, or
+`cargo install --path crates/kimmy-cli` from a clone. macOS archives and the
+Homebrew tap are not being published at present ([ADR-156](decisions.md)): the
+tap carries the formula from the last release that had one, so on a Mac the
+source build is the current route. `kimmy --version` prints the version,
+commit and build date, which is what to include in a bug report.
 
 ```bash
 export KIMMY_URL=http://localhost:7878

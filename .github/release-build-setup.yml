@@ -26,9 +26,9 @@
 # named differently in another workflow write a cache this one can read.
 # `save-if: false` without exception: a cache written from a tag is readable
 # only from that tag, so nothing could ever read it, and it would cost the
-# 10 GiB budget a gigabyte per release. The macOS entry of the matrix runs
-# this too, finds nothing (no job on main builds that target), and carries
-# on cold, as it did before.
+# 10 GiB budget a gigabyte per release. Every entry of the matrix now finds
+# a cache: the macOS entry, which ran this step, found nothing (no job on
+# main builds that target) and carried on cold, is paused (ADR-156).
 - name: Restore the dependency cache CI wrote from main
   uses: Swatinem/rust-cache@v2
   with:

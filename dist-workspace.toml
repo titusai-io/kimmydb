@@ -3,8 +3,9 @@ members = ["cargo:."]
 
 # Release engineering, generated and driven by `dist` (cargo-dist). See
 # ADR-063: pushing a `v*` tag builds both binaries for every target below,
-# checksums them, drafts the GitHub Release from CHANGELOG.md, publishes the
-# Homebrew formula, and calls the GHCR publish workflow.
+# checksums them, drafts the GitHub Release from CHANGELOG.md, and calls the
+# GHCR publish workflow. The Homebrew half of ADR-063 is paused with the macOS
+# target it needs (ADR-156), which is what the commented lines below are.
 #
 # `.github/workflows/release.yml` is GENERATED from this file. Do not edit it
 # by hand — change this file and run `dist generate`. The `plan` job that runs
@@ -14,18 +15,24 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app. Homebrew carries `kimmy` only —
-# the server distributes as the GHCR container image (ADR-063) — which is why
-# crates/kimmyd/Cargo.toml opts out with `installers = []`.
-installers = ["homebrew"]
+# The installers to generate for each app. Homebrew is paused with the macOS
+# build it needs (ADR-156): the tap carries `kimmy` for macOS, and a formula
+# generated from a release that built no macOS binary would pin Linux musl
+# archives and install nothing a Mac can run, which is worse than publishing
+# nothing. crates/kimmyd/Cargo.toml opts the server out with
+# `installers = []` either way — the server distributes as the GHCR container
+# image (ADR-063).
+installers = []
 # A GitHub repo to push Homebrew formulas to
-tap = "titusai-io/homebrew-tap"
-# Publish jobs to run in CI. `./publish-ghcr` is ours:
+# tap = "titusai-io/homebrew-tap"
+# Publish jobs to run in CI. `homebrew` is paused with the macOS build
+# (ADR-156); put it back at the front of this list when the target returns.
+# `./publish-ghcr` is ours:
 # .github/workflows/publish-ghcr.yml, the multi-arch container image. dist
 # runs publish jobs after `host`, which runs after every build job, so the
 # image job can take the Linux archives from the run's own workflow artifacts
 # (`artifacts-build-local-<target>`) rather than compiling again (ADR-107).
-publish-jobs = ["homebrew", "./publish-ghcr"]
+publish-jobs = ["./publish-ghcr"]
 # The Linux builds start from the dependency cache CI writes on main. dist's
 # own `cache-builds` stays off: it keys a rust-cache on this workflow's job
 # name, and a cache is readable only from the ref that wrote it or from the
@@ -34,7 +41,8 @@ publish-jobs = ["homebrew", "./publish-ghcr"]
 # .github/release-build-setup.yml are inlined into `build-local-artifacts`
 # just before `dist build`: they restore, and never save, the cache that the
 # `build kimmyd` jobs in ci.yml write from main for the same target under the
-# same `shared-key` (ADR-118). The macOS build finds no cache and runs cold.
+# same `shared-key` (ADR-118). Every target that builds now has one; the
+# macOS build, which found no cache and ran cold, is paused (ADR-156).
 github-build-setup = "../release-build-setup.yml"
 # Target platforms to build apps for (Rust target-triple syntax).
 #
@@ -46,8 +54,16 @@ github-build-setup = "../release-build-setup.yml"
 # It was also the release's longest build at over twelve minutes — the macOS
 # x86_64 runners are the slowest dist offers — for a platform Apple stopped
 # selling in 2023.
+#
+# aarch64-apple-darwin is paused rather than dropped (ADR-156). The container
+# image is the only artifact in day-to-day use, and GitHub bills macOS at ten
+# times the Linux rate, so that one job was about four fifths of a release's
+# billed minutes. The two musl targets stay because the image is built from
+# their archives (ADR-107). To bring macOS back: uncomment the line below and
+# the four macOS paths in `[[dist.extra-artifacts]]`, restore Homebrew above,
+# then run `dist generate`.
 targets = [
-    "aarch64-apple-darwin",
+    # "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 ]
@@ -63,15 +79,15 @@ targets = [
 [[dist.extra-artifacts]]
 build = [
     "scripts/sbom.sh",
-    "aarch64-apple-darwin",
+    # "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 ]
 artifacts = [
-    "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json",
-    "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json.sha256",
-    "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json",
-    "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json.sha256",
+    # "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json",
+    # "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json.sha256",
+    # "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json",
+    # "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json.sha256",
     "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json",
     "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json.sha256",
     "target/sbom/kimmy-cli-aarch64-unknown-linux-musl.cdx.json",

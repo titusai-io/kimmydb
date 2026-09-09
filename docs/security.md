@@ -1544,9 +1544,10 @@ kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256
 One per binary per target rather than one for the workspace: the dependency
 graph is not the same on every platform, and a bill that listed the Windows
 crates against a Linux image would have a scanner reporting advisories for
-code that is not there. Six per release — `kimmyd` and `kimmy-cli` on each of
-the three targets. The container image ships the musl `kimmyd`, so its bill is
-the one for that target.
+code that is not there. Four per release today — `kimmyd` and `kimmy-cli` on
+each of the two Linux musl targets — with the macOS pair paused alongside the
+build that produced it ([ADR-156](decisions.md)). The container image ships
+the musl `kimmyd`, so its bill is the one for that target.
 
 The bills are generated from `Cargo.lock` at the release commit by
 `scripts/sbom.sh`, which runs `cargo cyclonedx` at a version pinned in the
