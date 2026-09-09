@@ -486,11 +486,13 @@ drop neither reports the collection as missing against a peer still holding
 it, nor lets a repair from that peer recreate it or write into it
 ([ADR-155](decisions.md)). So the interval between `200 {"dropped": true}` on
 one member and the drop landing on the rest is a wait, not a race — the peers
-converge on the drop, not on the copy. One route is outside that guarantee and
-is recorded rather than closed: a member so far behind that it catches up by
-copying a peer's *whole database* rather than by replaying changes is not told
-about drops that way, and keeps a collection it already held (ADR-155 states
-what follows from that). Past `storage.tombstone_retention_secs`
+converge on the drop, not on the copy. One route in a converged cluster is
+outside that guarantee and is recorded rather than closed: a member so far
+behind that it catches up by copying a peer's *whole database* rather than by
+replaying changes is not told about drops that way, and keeps a collection it
+already held (ADR-155 states what follows from that). During a rolling upgrade
+there is a second and temporary one, for a member not yet on the release that
+carries this. Past `storage.tombstone_retention_secs`
 the tombstone is collected and the ordinary resurrection case applies, the same
 one a deleted document is subject to ([ADR-085](decisions.md)); the retention
 setting is the width of that window and [Operations](operations.md) says how to
