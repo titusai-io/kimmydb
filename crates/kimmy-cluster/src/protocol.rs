@@ -210,7 +210,27 @@ pub enum Message {
     /// bound `Engine::all_collection_ids` states. `probe_count` is the one
     /// piece of this exchange that reads documents, and it reads exactly one
     /// collection's worth.
-    Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
+    ///
+    /// `incarnations` is the `created` stamp of each of those collections,
+    /// which is what lets the requester tell a collection it dropped and this
+    /// node has not heard about yet from one recreated since: a name dropped
+    /// and created again derives the same id, so `collections` alone cannot.
+    /// A `Vec` on the wire like `collections`, made a map at the boundary.
+    ///
+    /// Optional on the wire, for the reason `AskEntries::held` is: the
+    /// handshake negotiates no version. A requester that predates the field
+    /// ignores it and compares names alone as before; a sender that predates
+    /// it writes none, which the requester reads as "the incarnation I
+    /// dropped" for anything it holds a tombstone for
+    /// (`kimmy_storage::compare_divergence`, which states what that costs).
+    /// `collections` is untouched, so an older receiver reads the answer
+    /// exactly as it always did.
+    Divergence {
+        collections: Vec<CollectionId>,
+        probe_count: Option<u64>,
+        #[serde(default)]
+        incarnations: Vec<(CollectionId, Hlc)>,
+    },
     /// "What have you processed?"
     ///
     /// The receiver's *witnessed* vector — what it has processed per origin,
@@ -549,8 +569,19 @@ mod tests {
             Message::Divergence {
                 collections: vec![CollectionId(1), CollectionId(2)],
                 probe_count: Some(7),
+                // An incarnation rides beside its id, so the pair has to
+                // survive BSON — the unencodable half of the id space
+                // included, as the ids themselves already are.
+                incarnations: vec![
+                    (CollectionId(1), Hlc::new(3, 1)),
+                    (CollectionId(u64::MAX), Hlc::new(4, 0)),
+                ],
             },
-            Message::Divergence { collections: Vec::new(), probe_count: None },
+            Message::Divergence {
+                collections: Vec::new(),
+                probe_count: None,
+                incarnations: Vec::new(),
+            },
             Message::AskWitnessed {},
             Message::Witnessed(populated_vector()),
             Message::Push {
@@ -713,6 +744,66 @@ mod tests {
         assert_eq!(
             body,
             bson::doc! { "AskSnapshot": { "after": bson::Bson::Null, "collection": 7i64 } }
+        );
+    }
+
+    /// The same boundary for `Divergence::incarnations`. The answer is what
+    /// crosses the version line here rather than the request: a requester
+    /// that predates the field ignores it and compares names alone; an
+    /// answering peer that predates it writes none, which a requester that
+    /// knows the field reads as "the incarnation you dropped" for every id it
+    /// holds a tombstone for (`kimmy_storage::compare_divergence`).
+    /// `collections` is untouched either way, so nothing an older receiver
+    /// already read changes shape.
+    #[tokio::test]
+    async fn divergence_crosses_a_version_boundary_in_both_directions() {
+        let frame = |body: bson::Document| {
+            let mut buffer = Vec::new();
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let answered = |collections| Message::Divergence {
+            collections,
+            probe_count: Some(7),
+            incarnations: Vec::new(),
+        };
+
+        let old_answer =
+            frame(bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64 } });
+        assert_eq!(
+            read_frame(&mut old_answer.as_slice()).await.unwrap(),
+            answered(vec![CollectionId(1)]),
+            "an answer without the field must read as one that named no incarnation"
+        );
+
+        let future = frame(
+            bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64, "somethingNewer": true } },
+        );
+        assert_eq!(
+            read_frame(&mut future.as_slice()).await.unwrap(),
+            answered(vec![CollectionId(1)]),
+            "a field this build does not know must not fail the frame"
+        );
+
+        // And the frame this build answers with is exactly that shape to an
+        // older requester: the two fields it knows, and one it ignores.
+        let mut written = Vec::new();
+        let held = Message::Divergence {
+            collections: vec![CollectionId(1)],
+            probe_count: Some(7),
+            incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
+        };
+        write_frame(&mut written, &held).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        assert_eq!(
+            body,
+            bson::doc! { "Divergence": {
+                "collections": [1i64],
+                "probe_count": 7i64,
+                "incarnations": [[1i64, { "wall_ms": 9i64, "counter": 2i32 }]],
+            } }
         );
     }
 
