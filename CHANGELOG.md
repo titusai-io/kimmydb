@@ -24,12 +24,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   checksum and its CycloneDX bill, `source.tar.gz`, and the multi-arch
   container image at `ghcr.io/titusai-io/kimmydb` — the image is built from
   those Linux archives, so it is exactly what it was. On a Mac,
-  `cargo install --path crates/kimmy-cli` builds the CLI and the container
-  image runs the server; `brew install titusai-io/tap/kimmy` still resolves,
-  but to the last version that published a formula, and it will not move while
-  this holds. The build is paused rather than retired
-  ([ADR-156](docs/decisions.md) has the measurements and exactly how to bring
-  it back).
+  `cargo install --git https://github.com/titusai-io/kimmydb kimmy-cli` builds
+  the CLI and the container image runs the server; `brew install
+  titusai-io/tap/kimmy` still resolves, but to the last version that published
+  a formula, and it will not move while this holds. The build is paused rather
+  than retired ([ADR-156](docs/decisions.md) has the measurements and exactly
+  how to bring it back).
 
 ### Fixed
 

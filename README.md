@@ -58,8 +58,9 @@ docker run --rm -p 7878:7878 \
   -v kimmy-data:/var/lib/kimmy \
   ghcr.io/titusai-io/kimmydb:latest
 
-# The CLI — from source, on any platform
-cargo install --path crates/kimmy-cli
+# The CLI — from source, on any platform. From a clone of this repository,
+# `cargo install --path crates/kimmy-cli` does the same thing.
+cargo install --git https://github.com/titusai-io/kimmydb kimmy-cli
 ```
 
 Prebuilt tarballs with SHA256 checksums for both binaries — Linux arm64 and

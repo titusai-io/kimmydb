@@ -12638,6 +12638,14 @@ about 2. GitHub bills macOS runners at ten times the Linux rate, so that one
 job is roughly 69 of the release's ~85 billed minutes — about four fifths of
 the cost in one job, for an artifact nobody is running.
 
+Those are wall-clock sums, and the bill is not: GitHub rounds **each job**
+up to a whole minute before applying the multiplier, and a release runs
+roughly eight jobs short enough for that rounding to be most of what they
+cost. Computed per job instead, the macOS share is nearer 78% than 82% and
+the saving nearer 79%. The figures are quoted as sums because that is how
+they were measured; the conclusion does not turn on the difference, and the
+paragraphs below use the per-job numbers where a number matters.
+
 The Linux builds cannot go the same way, and the reason is mechanical rather
 than a preference. `publish-ghcr.yml` compiles nothing: it takes `kimmyd` out
 of the `kimmyd-<target>.tar.xz` that `build-local-artifacts` produced in the
@@ -12666,6 +12674,16 @@ above on the Release page while the tap stayed still — checked with
 `dist plan`, which listed `kimmy.rb` with six Linux target triples and no
 macOS one, and which no longer lists it.
 
+And the formula is not only a file among the assets, which is the strongest
+argument for commenting that one line out. dist writes the install
+instructions at the top of the generated release notes from the installers a
+release has, so with the key left in place every Release page would have
+opened with "Install prebuilt binaries via Homebrew: `brew install kimmy`" —
+an instruction printed on the front of the release, for a tap that is no
+longer being pushed to, resolving to a formula that cannot install on a Mac.
+A broken asset is found by whoever downloads it; a broken instruction at the
+top of the page is offered to everybody.
+
 **What this costs, stated rather than discovered later.** The tap is not
 emptied; it keeps the formula from the last release that published one, so
 `brew install titusai-io/tap/kimmy` installs that version and never a newer
@@ -12687,8 +12705,12 @@ the reason beside it is what makes this an hour's work to undo instead of a
 re-derivation.
 
 **Rejected: keeping the macOS build and cutting elsewhere.** There is nowhere
-else to cut. Everything but the macOS job accounts for about 15 of the 85
-billed minutes, and most of that is the two builds the image is made from.
+else to cut. Everything but the macOS job is nearer 19 or 20 billed minutes
+than the 15 its wall-clock sum suggests — the eight short jobs a release runs
+cost a whole minute each however brief they are — and about 12 of those
+minutes are the two builds the image is made from. What is left is the plan,
+the global-artifacts and host jobs, the two image builds and the merge, and
+the announce job: the parts that turn the builds into a release.
 
 **Exactly how to reverse it.**
 
@@ -12704,5 +12726,10 @@ billed minutes, and most of that is the two builds the image is made from.
 5. Put the documentation back: the install sections of `README.md` and
    `docs/cli.md`, "Verifying a release" and "What a release contains" in
    `docs/operations.md`, the bill count in `docs/security.md`, the tag-cost
-   sentence in `docs/compatibility.md`, and the header and example in
-   `scripts/sbom.sh`. `deny.toml` needs no change, having kept the target.
+   sentence in `docs/compatibility.md`, the header and example in
+   `scripts/sbom.sh`, and the cache note in
+   `.github/release-build-setup.yml`, which describes what the macOS entry of
+   the matrix does. That last file is read by `dist generate`, but only its
+   steps are — its comments are not inlined into `release.yml`, so a comment
+   change there needs no regeneration. `deny.toml` needs no change, having
+   kept the target.

@@ -8,9 +8,10 @@ exit non-zero when they fail.
 Take a prebuilt tarball from the
 [releases page](https://github.com/titusai-io/kimmydb/releases) — the Linux
 binaries are static, so they run on any distribution — or build it from source
-with `cargo install --path crates/kimmy-cli`. macOS archives and the Homebrew
-tap are not being published at present ([ADR-156](decisions.md)): the tap
-carries the formula from the last release that had one, so on a Mac the
+with `cargo install --git https://github.com/titusai-io/kimmydb kimmy-cli`, or
+`cargo install --path crates/kimmy-cli` from a clone. macOS archives and the
+Homebrew tap are not being published at present ([ADR-156](decisions.md)): the
+tap carries the formula from the last release that had one, so on a Mac the
 source build is the current route. `kimmy --version` prints the version,
 commit and build date, which is what to include in a bug report.
 
