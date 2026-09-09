@@ -306,9 +306,12 @@ where
             }
             Message::AskDivergence { probe } => {
                 // Metadata only, whatever `probe` is — see
-                // `Engine::all_collection_ids`.
-                let collections = engine
-                    .all_collection_ids()
+                // `Engine::all_collection_ids`. One walk answers both halves
+                // of what this node holds: the ids, and the incarnation each
+                // stands at, which is what the requester's tombstones are
+                // compared against.
+                let held = engine
+                    .collection_incarnations()
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 // The one document read in this exchange, bounded to the
                 // single collection the requester named (ADR-133).
@@ -321,8 +324,9 @@ where
                 write_frame(
                     &mut stream,
                     &Message::Divergence {
-                        collections: collections.into_iter().collect(),
+                        collections: held.keys().copied().collect(),
                         probe_count,
+                        incarnations: held.into_iter().collect(),
                     },
                 )
                 .await?;
@@ -1584,10 +1588,19 @@ where
     // this module bounds (see the module docs on `Engine::all_collection_ids`).
     let mine_collections =
         engine.all_collection_ids().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+    // Read on the same rhythm and for the same reason: one row per dropped
+    // collection, no document. Without it a collection this node destroyed
+    // on purpose reads as one it is merely missing, and the repair the
+    // finding plans pulls it back from whichever peer has not applied the
+    // drop yet.
+    let mine_dropped =
+        engine.collection_tombstones().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
     write_frame(stream, &Message::AskDivergence { probe: probe.map(|p| p.id) }).await?;
-    let (peer_collections, probe_count) = match read_frame(stream).await? {
-        Message::Divergence { collections, probe_count } => (collections, probe_count),
+    let (peer_collections, probe_count, peer_incarnations) = match read_frame(stream).await? {
+        Message::Divergence { collections, probe_count, incarnations } => {
+            (collections, probe_count, incarnations)
+        }
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
             return Err(ProtocolError::Malformed(format!("expected Divergence, got {other:?}")));
@@ -1597,10 +1610,12 @@ where
     let mine = kimmy_storage::DivergenceLocalState {
         collections: mine_collections,
         probe: probe.map(|p| (p.id, p.mine_count)),
+        dropped: mine_dropped,
     };
     let peer = kimmy_storage::DivergencePeerAnswer {
         collections: peer_collections.into_iter().collect(),
         probe_count,
+        incarnations: peer_incarnations.into_iter().collect(),
     };
     Ok(kimmy_storage::compare_divergence(&mine, &peer))
 }
@@ -1652,6 +1667,14 @@ where
 {
     let mut outcome = SyncOutcome::default();
     let mut pages = 0usize;
+    // Documents the pages carried that were history here (`is_history`), or
+    // whose collection this node holds a tombstone for. Kept for the log
+    // rather than folded into the round's outcome: it says a repair that
+    // wrote nothing did so because everything on it was already buried, not
+    // because it stalled, and reading it as the round's `superseded` would
+    // count on this route what only part of the entries path counts on that
+    // one.
+    let mut superseded = 0usize;
     let resumed = stalls.snapshot_resumes(node, scope);
     let mut whole_from_older_peer = false;
 
@@ -1702,12 +1725,14 @@ where
         // Counted where a refusal reached through the oplog is, so the
         // metric and the round report do not depend on the route (ADR-123).
         outcome.ddl_refused += applied.ddl_refused;
+        superseded += applied.superseded;
 
         if complete {
             stalls.snapshot_done(node);
             info!(
                 %peer,
                 documents = outcome.applied,
+                superseded,
                 pages,
                 total_pages,
                 total_documents,
@@ -1721,6 +1746,7 @@ where
                 %peer,
                 pages,
                 documents = outcome.applied,
+                superseded,
                 total_pages,
                 total_documents,
                 cursor = cursor.as_deref().unwrap_or("-"),
@@ -2040,7 +2066,11 @@ mod tests {
                 Message::AskDivergence { .. } => {}
                 other => panic!("nothing to pull, so the check comes next, got {other:?}"),
             }
-            let divergence = Message::Divergence { collections: Vec::new(), probe_count: Some(1) };
+            let divergence = Message::Divergence {
+                collections: Vec::new(),
+                probe_count: Some(1),
+                incarnations: Vec::new(),
+            };
             write_frame(&mut stream, &divergence).await.unwrap();
         }
 
@@ -2121,7 +2151,11 @@ mod tests {
                 Message::AskDivergence { .. } => {}
                 other => panic!("expected AskDivergence, got {other:?}"),
             }
-            let answer = Message::Divergence { collections: Vec::new(), probe_count: None };
+            let answer = Message::Divergence {
+                collections: Vec::new(),
+                probe_count: None,
+                incarnations: Vec::new(),
+            };
             write_frame(&mut stream, &answer).await.unwrap();
         }
 
@@ -2207,7 +2241,11 @@ mod tests {
                     Message::AskDivergence { .. } => {}
                     other => panic!("the tail was reached, so the check follows, got {other:?}"),
                 }
-                let divergence = Message::Divergence { collections: Vec::new(), probe_count: None };
+                let divergence = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
         }
@@ -2271,6 +2309,9 @@ mod tests {
                 name: "orders".into(),
                 indexes: Vec::new(),
                 vector: None,
+                // The incarnation the sender holds, older than every
+                // document it carries, as a real sender's would be.
+                created: Some(Hlc::ZERO),
             }]
         } else {
             Vec::new()
@@ -2357,7 +2398,11 @@ mod tests {
                     Message::AskDivergence { .. } => {}
                     other => panic!("a completed snapshot reached the tail, got {other:?}"),
                 }
-                let divergence = Message::Divergence { collections: Vec::new(), probe_count: None };
+                let divergence = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
             // Nothing more must be asked: the round's budget is spent, or
@@ -2483,7 +2528,11 @@ mod tests {
                     Message::AskDivergence { .. } => {}
                     other => panic!("expected AskDivergence, got {other:?}"),
                 }
-                let divergence = Message::Divergence { collections: Vec::new(), probe_count: None };
+                let divergence = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
             assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
@@ -2562,6 +2611,101 @@ mod tests {
             "abandoned after three rounds that landed nothing"
         );
         assert!(!stalls.repairing(their_node));
+    }
+
+    /// The rolling-upgrade half of the tombstone rule, over the wire. A
+    /// peer running a version before `incarnations` answers without the
+    /// field, which arrives here as an empty one (`protocol.rs` pins that
+    /// on the bytes), and so says nothing about which life of a collection
+    /// it holds. For an id this node has a tombstone for, that silence is
+    /// read as the incarnation this node dropped: not reported, so nothing
+    /// plans a repair that would pull the buried life back from the member
+    /// that has not applied the drop yet. Deliberate, and what it costs is
+    /// stated on `divergence::compare`.
+    ///
+    /// The controls sit against the same engine and the same answer, so the
+    /// rule cannot pass by quietly reporting nothing at all: a collection
+    /// this node holds no tombstone for is reported from that very answer,
+    /// and the same peer naming an incarnation *after* the drop is reported
+    /// too — which is also what pins the field's journey from the wire into
+    /// the comparison, rather than being read as absent whatever arrives.
+    /// Level with the drop is the same-millisecond tie, and is the life
+    /// that was dropped.
+    #[tokio::test]
+    async fn a_peer_that_names_no_incarnation_does_not_reopen_a_collection_dropped_here() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let bench = CollectionId::derive("shop", "bench");
+        let ledger = CollectionId::derive("shop", "ledger");
+        engine.create_collection("shop", "bench").unwrap();
+        assert!(engine.drop_collection("shop", "bench").unwrap());
+        let dropped = engine.collection_dropped_at(bench).unwrap().expect("the tombstone");
+
+        /// The peer's side: the vectors, then an answer naming both
+        /// collections and whatever it knows of their incarnations.
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            incarnations: Vec<(CollectionId, Hlc)>,
+        ) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("expected AskDivergence, got {other:?}"),
+            }
+            let divergence = Message::Divergence {
+                collections: vec![
+                    CollectionId::derive("shop", "bench"),
+                    CollectionId::derive("shop", "ledger"),
+                ],
+                probe_count: None,
+                incarnations,
+            };
+            write_frame(&mut stream, &divergence).await.unwrap();
+            assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
+        }
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let their_node = node(9);
+        // Nothing to pull, so the round is the check and nothing else.
+        let theirs = VersionVector::new();
+        let mut stalls = PeerStalls::new();
+
+        for (incarnations, expected, what) in [
+            (
+                Vec::new(),
+                vec![ledger],
+                "a peer that names no incarnation holds the one this node dropped",
+            ),
+            (
+                vec![(bench, dropped.hlc), (ledger, Hlc::ZERO)],
+                vec![ledger],
+                "an incarnation level with the drop is the life the drop ended",
+            ),
+            (
+                vec![(bench, dropped.hlc.successor()), (ledger, Hlc::ZERO)],
+                vec![bench, ledger],
+                "an incarnation after the drop is a genuine recreation",
+            ),
+        ] {
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), incarnations));
+            let outcome =
+                sync_over(&engine, ours, addr, their_node, None, &mut stalls).await.unwrap();
+            peer.await.unwrap();
+            assert_eq!(
+                outcome.divergent,
+                Some(expected.into_iter().collect()),
+                "{what}: {outcome:?}"
+            );
+        }
     }
 
     /// A repair that never completes — every round with the peer failing,

@@ -12,10 +12,14 @@
 //! reconciliation would check:
 //!
 //! - **Which collections exist**, on this node and not the peer's advertised
-//!   set. Metadata only — a scan of the database and collection tables, not
-//!   a document — so it costs the same whether a collection holds ten rows
-//!   or ten million, and it is what would have caught the two collections
-//!   finding 14 stranded on one member.
+//!   set, *less* the ones this node holds a tombstone for at the incarnation
+//!   the peer is advertising. Metadata only — a scan of the database and
+//!   collection tables and one of the tombstone table, not a document — so it
+//!   costs the same whether a collection holds ten rows or ten million, and it
+//!   is what would have caught the two collections finding 14 stranded on one
+//!   member. The subtraction is what stops it undoing a drop the cluster has
+//!   agreed on, by repairing the collection back from whichever peer has not
+//!   applied that drop yet; see [`compare`].
 //! - **One collection's live document count**, chosen in turn by
 //!   [`next_probe`] so a round pays for at most one collection's scan rather
 //!   than the whole database. It is what would have caught the 500- and
@@ -48,12 +52,16 @@
 //! node holds that a peer does not, which is that peer's own discovery to
 //! make.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use kimmy_core::{CollectionId, NodeId};
+use kimmy_core::{CollectionId, Hlc, NodeId};
+use redb::{ReadableDatabase, ReadableTable};
+use tracing::warn;
 
+use crate::codec;
 use crate::engine::{Engine, PairedShadows};
 use crate::error::Result;
+use crate::tables;
 
 impl Engine {
     /// Every collection id this node holds, across every database — **less
@@ -90,7 +98,59 @@ impl Engine {
     /// the same walk with `PairedShadows::Included`, and that one argument is
     /// the whole difference between them.
     pub fn all_collection_ids(&self) -> Result<BTreeSet<CollectionId>> {
-        Ok(self.collections(PairedShadows::Hidden)?.into_iter().map(|c| c.id).collect())
+        Ok(self.collection_incarnations()?.into_keys().collect())
+    }
+
+    /// [`Self::all_collection_ids`] with the incarnation each id stands at:
+    /// `CollectionMeta.created`, the stamp of the create that produced it at
+    /// its origin.
+    ///
+    /// The set is exactly the one above — the same walk, the same ADR-138
+    /// rule — because it is the same answer with the one fact an id cannot
+    /// carry. A peer compares it against the tombstones it holds
+    /// ([`Self::collection_tombstones`]): the id alone cannot tell a
+    /// collection the peer dropped and this node has not heard about yet
+    /// from one recreated since, because a name dropped and created again
+    /// derives the same id.
+    pub fn collection_incarnations(&self) -> Result<BTreeMap<CollectionId, Hlc>> {
+        Ok(self
+            .collections(PairedShadows::Hidden)?
+            .into_iter()
+            .map(|c| (c.id, c.created))
+            .collect())
+    }
+
+    /// Every collection tombstone this node holds, as the id and the `Hlc`
+    /// of the drop that wrote it.
+    ///
+    /// The whole table under one read transaction, one row per dropped
+    /// collection — the same walk `gc::collect_dropped_collections` makes,
+    /// down to what it does with a row it cannot read, and for the same
+    /// reason: this is the only shape in which the answer is complete.
+    ///
+    /// **No cutoff, deliberately.** Retention is decided in exactly one
+    /// place, by the collector, and a second opinion about which tombstones
+    /// still count is how the two would drift — which is the shape of the
+    /// bug this reading exists to prevent. What the collector has removed is
+    /// gone from here too, which is what `tombstone_retention_secs` means.
+    pub fn collection_tombstones(&self) -> Result<BTreeMap<CollectionId, Hlc>> {
+        let txn = self.db().begin_read()?;
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let mut out = BTreeMap::new();
+        for row in dropped.iter()? {
+            let (id, stamp) = row?;
+            // Warned and stepped over, as the collector steps over it: one
+            // unreadable row must not be able to fail every divergence check
+            // this node makes, for ever, against every peer. The id it names
+            // is then simply not known to have been dropped, which is the
+            // same position a collected tombstone leaves this node in.
+            let Ok(stamp) = codec::decode_oplog_key(stamp.value()) else {
+                warn!("undecodable collection tombstone skipped by the divergence check");
+                continue;
+            };
+            out.insert(CollectionId(id.value()), stamp.hlc);
+        }
+        Ok(out)
     }
 
     /// The live document count of collection `id`, or `None` if this node
@@ -120,6 +180,10 @@ pub struct LocalState {
     /// count this round (see `divergence_probe_for` in `kimmy-cluster`) —
     /// the existence half is unaffected either way.
     pub probe: Option<(CollectionId, Option<u64>)>,
+    /// Every collection tombstone this node holds
+    /// (`Engine::collection_tombstones`), which is what tells a collection
+    /// this node never had from one it destroyed on purpose.
+    pub dropped: BTreeMap<CollectionId, Hlc>,
 }
 
 /// What a peer answered a divergence check with.
@@ -130,6 +194,12 @@ pub struct PeerAnswer {
     /// The peer's own live count of the probed collection, `None` if it does
     /// not hold it.
     pub probe_count: Option<u64>,
+    /// The incarnation the peer holds each of those collections at
+    /// (`Engine::collection_incarnations`). Empty from a peer that predates
+    /// the field, which [`compare`] reads as "the incarnation I dropped" for
+    /// any id this node holds a tombstone for — see its own documentation
+    /// for why that direction, and what it costs.
+    pub incarnations: BTreeMap<CollectionId, Hlc>,
 }
 
 /// What a divergence check found this contact, split by which half found
@@ -181,8 +251,37 @@ pub struct Findings {
 /// `None` whenever the caller has judged the peer's answer untrustworthy for
 /// a count this round, and this function trusts that judgement rather than
 /// re-deriving it.
+///
+/// **A collection this node dropped is not a divergence while the peer still
+/// holds the incarnation that was dropped.** Anti-entropy repairs what this
+/// half reports, so reporting one meant pulling the dropped collection back
+/// from whichever peer had not applied the drop yet, and the recreated copy
+/// then re-seeded the members that had it right: a deletion the cluster had
+/// already agreed on, undone by the machinery meant to converge it. A drop
+/// travels through the entries path like any other change; a peer that has
+/// not applied it yet is behind, which is the one thing the existence half
+/// must never read as divergence (above).
+///
+/// A peer that predates `PeerAnswer::incarnations` reports no stamp, and for
+/// an id this node holds a tombstone for that reads as the incarnation this
+/// node dropped: not reported. The cost is a collection genuinely recreated
+/// on such a peer, whose `CreateCollection` entry has already aged out of the
+/// oplog, which this check leaves alone until the roll completes or the
+/// tombstone expires. That is chosen over resurrecting a drop, which is not
+/// recoverable by waiting; and the ordinary recreation is unaffected, because
+/// its entry still arrives through the entries path and is applied there.
 pub fn compare(mine: &LocalState, peer: &PeerAnswer) -> Findings {
-    let existence = peer.collections.difference(&mine.collections).copied().collect();
+    let existence = peer
+        .collections
+        .difference(&mine.collections)
+        .copied()
+        .filter(|id| match mine.dropped.get(id) {
+            Some(dropped) => {
+                peer.incarnations.get(id).is_some_and(|incarnation| incarnation > dropped)
+            }
+            None => true,
+        })
+        .collect();
     let count = match mine.probe {
         Some((id, Some(mine_count))) => {
             peer.probe_count.map(|their_count| (id, mine_count != their_count))
@@ -523,13 +622,47 @@ mod tests {
         let (stranded, _d1) = engine_with(false, true);
         let (empty, _d2) = engine_with(false, false);
 
-        let mine = LocalState { collections: empty.all_collection_ids().unwrap(), probe: None };
-        let peer =
-            PeerAnswer { collections: stranded.all_collection_ids().unwrap(), probe_count: None };
+        let mine = LocalState {
+            collections: empty.all_collection_ids().unwrap(),
+            probe: None,
+            ..Default::default()
+        };
+        let peer = PeerAnswer {
+            collections: stranded.all_collection_ids().unwrap(),
+            probe_count: None,
+            ..Default::default()
+        };
         assert_eq!(
             compare(&mine, &peer).existence.len(),
             1,
             "a shadow-only database the peer holds and this node does not must be reported"
+        );
+    }
+
+    #[test]
+    fn the_incarnations_and_the_tombstones_are_the_two_halves_of_one_answer() {
+        // What the two sides of a divergence check read. The incarnations
+        // are the ids `all_collection_ids` reports with the one fact an id
+        // cannot carry, and the tombstones are the whole table — no cutoff,
+        // because the collector already decides retention and a second
+        // opinion about it is how the two would drift.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let docs = engine.create_collection("app", "docs").unwrap();
+        let notes = engine.create_collection("app", "notes").unwrap();
+        engine.drop_collection("app", "notes").unwrap();
+        let dropped = engine.collection_dropped_at(notes.id).unwrap().expect("a tombstone");
+
+        let incarnations = engine.collection_incarnations().unwrap();
+        assert_eq!(incarnations, [(docs.id, docs.created)].into_iter().collect());
+        assert_eq!(
+            incarnations.keys().copied().collect::<BTreeSet<_>>(),
+            engine.all_collection_ids().unwrap(),
+            "the same set, the same walk"
+        );
+        assert_eq!(
+            engine.collection_tombstones().unwrap(),
+            [(notes.id, dropped.hlc)].into_iter().collect()
         );
     }
 
@@ -555,8 +688,9 @@ mod tests {
 
     #[test]
     fn a_collection_the_peer_holds_and_this_node_does_not_is_divergent() {
-        let mine = LocalState { collections: set(&[1, 2]), probe: None };
-        let peer = PeerAnswer { collections: set(&[1, 2, 3]), probe_count: None };
+        let mine = LocalState { collections: set(&[1, 2]), probe: None, ..Default::default() };
+        let peer =
+            PeerAnswer { collections: set(&[1, 2, 3]), probe_count: None, ..Default::default() };
         assert_eq!(compare(&mine, &peer).existence, set(&[3]));
     }
 
@@ -564,15 +698,21 @@ mod tests {
     fn a_collection_only_this_node_holds_is_not_reported_here() {
         // The peer's own loop finds this when it pulls from this node and
         // reaches the same `behind == None` gate on its side.
-        let mine = LocalState { collections: set(&[1, 2, 3]), probe: None };
-        let peer = PeerAnswer { collections: set(&[1, 2]), probe_count: None };
+        let mine = LocalState { collections: set(&[1, 2, 3]), probe: None, ..Default::default() };
+        let peer =
+            PeerAnswer { collections: set(&[1, 2]), probe_count: None, ..Default::default() };
         assert_eq!(compare(&mine, &peer).existence, BTreeSet::new());
     }
 
     #[test]
     fn a_converged_cluster_reports_nothing() {
-        let mine = LocalState { collections: set(&[1, 2]), probe: Some((id(1), Some(40))) };
-        let peer = PeerAnswer { collections: set(&[1, 2]), probe_count: Some(40) };
+        let mine = LocalState {
+            collections: set(&[1, 2]),
+            probe: Some((id(1), Some(40))),
+            ..Default::default()
+        };
+        let peer =
+            PeerAnswer { collections: set(&[1, 2]), probe_count: Some(40), ..Default::default() };
         let findings = compare(&mine, &peer);
         assert_eq!(findings.existence, BTreeSet::new());
         assert_eq!(findings.count, Some((id(1), false)));
@@ -582,8 +722,13 @@ mod tests {
     fn a_disagreeing_probe_count_is_divergent_even_with_matching_names() {
         // Finding 14's more serious half: names alone would have missed 500
         // and 517 missing documents in collections that existed everywhere.
-        let mine = LocalState { collections: set(&[1]), probe: Some((id(1), Some(1518))) };
-        let peer = PeerAnswer { collections: set(&[1]), probe_count: Some(2018) };
+        let mine = LocalState {
+            collections: set(&[1]),
+            probe: Some((id(1), Some(1518))),
+            ..Default::default()
+        };
+        let peer =
+            PeerAnswer { collections: set(&[1]), probe_count: Some(2018), ..Default::default() };
         let findings = compare(&mine, &peer);
         assert_eq!(findings.existence, BTreeSet::new());
         assert_eq!(findings.count, Some((id(1), true)));
@@ -594,11 +739,89 @@ mod tests {
         // This node lacks the probed collection outright; that is the
         // existence check's business (it is absent from `mine.collections`
         // too), not a spurious count mismatch.
-        let mine = LocalState { collections: set(&[]), probe: Some((id(9), None)) };
-        let peer = PeerAnswer { collections: set(&[9]), probe_count: Some(3) };
+        let mine =
+            LocalState { collections: set(&[]), probe: Some((id(9), None)), ..Default::default() };
+        let peer =
+            PeerAnswer { collections: set(&[9]), probe_count: Some(3), ..Default::default() };
         let findings = compare(&mine, &peer);
         assert_eq!(findings.existence, set(&[9]), "caught by existence, not double-counted");
         assert_eq!(findings.count, None, "this node cannot compare a count it does not have");
+    }
+
+    /// The stamps a tombstone and a peer's answer are compared by, keyed by
+    /// the same short ids the other `compare` tests use.
+    fn stamps(entries: &[(u64, u64)]) -> BTreeMap<CollectionId, Hlc> {
+        entries.iter().map(|&(n, wall)| (id(n), Hlc::new(wall, 0))).collect()
+    }
+
+    #[test]
+    fn a_collection_this_node_dropped_is_not_divergent_while_the_peer_still_holds_it() {
+        // The finding: a drop answered `200`, and minutes later the
+        // collection was back on all three members with every document,
+        // twice — pulled from whichever peer had not applied the drop yet,
+        // then re-seeded onto the members that had it right. A peer that has
+        // not applied a change yet is behind, which is the one thing this
+        // half must never report.
+        //
+        // Id 4 is the same case with the peer's incarnation landing in the
+        // same millisecond as the drop: at the boundary it is still the life
+        // that was dropped.
+        let mine = LocalState {
+            collections: set(&[1]),
+            dropped: stamps(&[(3, 50), (4, 50)]),
+            ..Default::default()
+        };
+        let peer = PeerAnswer {
+            collections: set(&[1, 3, 4]),
+            incarnations: stamps(&[(1, 10), (3, 20), (4, 50)]),
+            ..Default::default()
+        };
+        assert_eq!(compare(&mine, &peer).existence, BTreeSet::new());
+    }
+
+    #[test]
+    fn a_collection_recreated_since_this_node_dropped_it_is_divergent() {
+        // Why the incarnation travels at all: ids are derived from names, so
+        // a collection recreated after the drop wears the id of the one this
+        // node buried. Its stamp is the only thing that separates a genuine
+        // recreation, which must be pulled, from the copy the drop was aimed
+        // at, which must not.
+        let mine = LocalState {
+            collections: BTreeSet::new(),
+            dropped: stamps(&[(3, 50)]),
+            ..Default::default()
+        };
+        let peer = PeerAnswer {
+            collections: set(&[3]),
+            incarnations: stamps(&[(3, 51)]),
+            ..Default::default()
+        };
+        assert_eq!(compare(&mine, &peer).existence, set(&[3]));
+    }
+
+    #[test]
+    fn a_peer_that_names_no_incarnation_is_read_as_holding_the_one_this_node_dropped() {
+        // The mixed-version rule, and it is deliberate. A peer that predates
+        // the field answers with names alone; reading that as a recreation
+        // resurrects the drop, and no later round undoes that, where the
+        // recreation this refuses to report is pulled as soon as the roll
+        // finishes — or through the entries path, which is untouched.
+        let mine = LocalState {
+            collections: BTreeSet::new(),
+            dropped: stamps(&[(3, 50)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            compare(&mine, &PeerAnswer { collections: set(&[3]), ..Default::default() }).existence,
+            BTreeSet::new()
+        );
+        // It subtracts; it does not gate. An id with no tombstone here is
+        // reported from that same stampless answer exactly as before.
+        assert_eq!(
+            compare(&mine, &PeerAnswer { collections: set(&[3, 4]), ..Default::default() })
+                .existence,
+            set(&[4])
+        );
     }
 
     #[test]
@@ -606,8 +829,12 @@ mod tests {
         // What the caller does when it judges the peer's answer stale on its
         // own recent writes (`mine.probe = None`): the existence half, which
         // does not depend on the probe at all, still runs.
-        let mine = LocalState { collections: set(&[1, 2]), probe: None };
-        let peer = PeerAnswer { collections: set(&[1, 2, 3]), probe_count: Some(999) };
+        let mine = LocalState { collections: set(&[1, 2]), probe: None, ..Default::default() };
+        let peer = PeerAnswer {
+            collections: set(&[1, 2, 3]),
+            probe_count: Some(999),
+            ..Default::default()
+        };
         let findings = compare(&mine, &peer);
         assert_eq!(findings.existence, set(&[3]), "existence still runs with no probe trusted");
         assert_eq!(findings.count, None);

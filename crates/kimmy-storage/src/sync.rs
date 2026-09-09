@@ -715,7 +715,7 @@ impl Engine {
     ///
     /// `None` is memoised too: a batch for a collection this node lacks would
     /// otherwise rescan every database once per entry.
-    fn memo_collection(
+    pub(crate) fn memo_collection(
         &self,
         memo: &mut Memo,
         id: CollectionId,
@@ -729,7 +729,11 @@ impl Engine {
     }
 
     /// When the collection was dropped, as this batch last saw it.
-    fn memo_dropped_at(&self, memo: &mut Memo, id: CollectionId) -> Result<Option<Stamp>> {
+    pub(crate) fn memo_dropped_at(
+        &self,
+        memo: &mut Memo,
+        id: CollectionId,
+    ) -> Result<Option<Stamp>> {
         if let Some(found) = memo.dropped.get(&id) {
             return Ok(*found);
         }
@@ -737,6 +741,91 @@ impl Engine {
         memo.dropped.insert(id, found);
         Ok(found)
     }
+
+    /// Whether a change stamped `stamp` and addressed to collection `id`
+    /// belongs to a life of that collection this node has already buried.
+    ///
+    /// **The one place the rule is written.** Both routes a peer's data
+    /// reaches this node by consult it: the entries path ([`Self::apply_one`])
+    /// and the snapshot path (`Engine::apply_snapshot_page`). The snapshot
+    /// repair was written beside the entries path and consulted neither
+    /// tombstone nor floor, so a drop that had already been applied here came
+    /// back through it, documents and all — the two paths drifting apart is
+    /// the whole of that bug, and one predicate they share is what closes it.
+    ///
+    /// `collection` is what `id` resolves to here, or `None` when this node
+    /// holds no collection under it; a caller that has resolved it already
+    /// passes it rather than paying for the lookup twice. `None` is not
+    /// itself an answer — a collection that is simply absent is the caller's
+    /// business, because the entries path must tell "gone for good" from "not
+    /// arrived yet" and the snapshot path counts them differently.
+    ///
+    /// The two comparisons are deliberately not the same shape:
+    ///
+    /// - Against the **tombstone**, `Stamp` and strict. A drop the sender has
+    ///   not heard about yet must not be undone by the writes it is still
+    ///   replaying. Checked by id, because a node that dropped the collection
+    ///   can no longer resolve that id to a name.
+    /// - Against the **incarnation floor**, `Hlc` and *not* strict. A
+    ///   recreated collection derives the same id as its predecessor
+    ///   (`CollectionId::derive`), so an entry from the previous incarnation
+    ///   resolves here rather than missing. Its creation recorded the
+    ///   preceding drop's stamp as the floor; anything at or below it is the
+    ///   previous life, however the stamps sort against the drop itself — a
+    ///   peer's last pre-drop write can land in the same millisecond as the
+    ///   drop, where a strict comparison ties and the document slips through
+    ///   into the replacement. Collections created without a tombstone behind
+    ///   them carry no floor: independent creation on two nodes is
+    ///   convergence, not reincarnation.
+    pub(crate) fn is_history(
+        &self,
+        memo: &mut Memo,
+        collection: Option<&CollectionMeta>,
+        id: CollectionId,
+        stamp: Stamp,
+    ) -> Result<bool> {
+        if let Some(dropped_at) = self.memo_dropped_at(memo, id)?
+            && stamp < dropped_at
+        {
+            return Ok(true);
+        }
+        if let Some(floor) = collection.and_then(|c| c.incarnation_floor)
+            && stamp.hlc <= floor
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// Whether a drop stamped `dropped` is aimed at a life of `current` that has
+/// already ended, rather than at the collection standing here now.
+///
+/// **The one place that rule is written**, for the reason [`Engine::is_history`]
+/// is: a drop is the only change that destroys state, so it is the only one
+/// that has to know *which* incarnation it was aimed at, and a copy of the rule
+/// that implemented one of its two clauses would delete a collection the other
+/// copy defends. It has two callers — the replicated `DropCollection` arm of
+/// [`Engine::apply_ddl`], and the drop a scoped snapshot carries in place of a
+/// collection its sender no longer holds (`Engine::restore_collection_drop`).
+///
+/// Two clauses, and both are needed:
+///
+/// - It **predates the create** that produced this incarnation, origin stamps
+///   on both sides.
+/// - It is **at or before that incarnation's floor**, which is the drop it was
+///   created after. Not redundant with the first, because `created` and the
+///   floor can be the same `Hlc`: `apply_ddl`'s creation rule compares `Stamp`
+///   strictly, so a create minted at `(H, node)` by a node sorting above the
+///   node that stamped a drop at `(H, other)` is not history and is applied —
+///   with `created = H` from the origin and `floor = H` from the surviving
+///   tombstone. The drop that produced that floor then arrives again, as
+///   overlapping ranges and re-planned repairs both deliver it, and only this
+///   clause turns it away.
+pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: Hlc) -> bool {
+    let predates_create = dropped < current.created;
+    let at_or_before_floor = current.incarnation_floor.is_some_and(|floor| dropped <= floor);
+    predates_create || at_or_before_floor
 }
 
 /// Collection metadata as resolved during one batch.
@@ -748,8 +837,12 @@ impl Engine {
 /// show; nothing here reads it (the index paths re-read the definition
 /// through the write transaction), and `collection_by_id` returned the
 /// pre-run copy before the memo existed too.
+///
+/// A snapshot page is one transaction too (ADR-152) and resolves the same
+/// two questions over the same handful of collections, so it carries one of
+/// these for the page rather than a lookup per document.
 #[derive(Default)]
-struct Memo {
+pub(crate) struct Memo {
     collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>>,
     dropped: HashMap<CollectionId, Option<Stamp>>,
 }
@@ -943,49 +1036,27 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
-        // A drop the sender has not heard about yet must not be undone by
-        // the documents it is still replaying. Checked by id, because a
-        // node that dropped the collection can no longer resolve that id
-        // to a name.
-        if let Some(dropped_at) = self.memo_dropped_at(memo, entry.collection)?
-            && entry.stamp < dropped_at
-        {
+        let collection = self.memo_collection(memo, entry.collection)?;
+        if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
             outcome.superseded += 1;
             return Ok(Step::Taken);
         }
 
-        let Some(collection) = self.memo_collection(memo, entry.collection)? else {
+        let Some(collection) = collection else {
             // Gone here, and a tombstone says so: history, whichever way the
-            // stamps fall (ADR-148). The check above turns away a write from
-            // *before* a drop even when the collection was recreated; this
-            // one covers the collection that is simply not here, including
-            // the ordinary race in which a peer wrote into it before hearing
-            // the drop. Waiting for that collection would be waiting for
-            // something that is never coming, which is ADR-123's case and
-            // must not stop the batch.
+            // stamps fall (ADR-148). [`Self::is_history`] turns away a write
+            // from *before* a drop even when the collection was recreated;
+            // this one covers the collection that is simply not here,
+            // including the ordinary race in which a peer wrote into it
+            // before hearing the drop. Waiting for that collection would be
+            // waiting for something that is never coming, which is ADR-123's
+            // case and must not stop the batch.
             if self.memo_dropped_at(memo, entry.collection)?.is_some() {
                 outcome.superseded += 1;
                 return Ok(Step::Taken);
             }
             return Ok(Step::Unknown(None));
         };
-
-        // A recreated collection derives the *same* id as its predecessor
-        // (`CollectionId::derive`), so an entry from the previous incarnation
-        // resolves here rather than missing. Its creation recorded the
-        // preceding drop's stamp as an incarnation floor; anything at or below
-        // that floor is the previous life, however the stamps sort against the
-        // drop itself — a peer's last pre-drop write can land in the same
-        // millisecond as the drop, where a strict comparison ties and the
-        // document slips through into the replacement. Collections created
-        // without a tombstone behind them carry no floor: independent creation
-        // on two nodes is convergence, not reincarnation.
-        if let Some(floor) = collection.incarnation_floor
-            && entry.stamp.hlc <= floor
-        {
-            outcome.superseded += 1;
-            return Ok(Step::Taken);
-        }
 
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, crate::engine::Position::Raise)? {
@@ -1073,15 +1144,12 @@ impl Engine {
                 // cluster on 2026-08-28: one member left with 211 of 361
                 // documents, every member missing vectors, lag 0 throughout.
                 //
-                // Stale if it predates the create that produced the current
-                // incarnation (origin stamps on both sides), or is at or
-                // before the drop that incarnation was created after.
+                // Which incarnation it is aimed at is
+                // `aims_at_a_previous_incarnation`, which the snapshot route
+                // asks the same question of.
                 match self.get_collection(&target.db, &target.name) {
                     Ok(current) => {
-                        let predates_create = entry.stamp.hlc < current.created;
-                        let at_or_before_floor =
-                            current.incarnation_floor.is_some_and(|floor| entry.stamp.hlc <= floor);
-                        if predates_create || at_or_before_floor {
+                        if aims_at_a_previous_incarnation(&current, entry.stamp.hlc) {
                             debug!(
                                 db = %target.db,
                                 collection = %target.name,

@@ -13,7 +13,9 @@ use std::collections::BTreeSet;
 
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
-use kimmy_cluster::transport::{DivergenceProbe, push_entry, serve, serve_with, sync_once};
+use kimmy_cluster::transport::{
+    DivergenceProbe, push_entry, serve, serve_with, sync_once, sync_once_with,
+};
 use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
 use tokio::net::{TcpListener, TcpStream};
@@ -2855,4 +2857,422 @@ async fn a_member_lacking_a_collection_stops_plans_a_snapshot_and_catches_up() {
         b.engine.get(&base_on_b, &DocId::String("after".into())).unwrap().is_some(),
         "the document behind the stop landed too"
     );
+}
+
+/// The finding, reduced to two members: a collection dropped here stays
+/// dropped while the peer has not applied the drop yet.
+///
+/// A and B hold the same three thousand documents. A drops the collection;
+/// B is not syncing, so it goes on holding — and serving — the incarnation
+/// A buried. Every round A runs against B from then on sees a collection
+/// the peer holds and this node does not, which is character for character
+/// what the existence half of the check reports for a member that has lost
+/// one. A must read it as the life it ended rather than as a hole in
+/// itself: nothing reported, nothing confirmed, no repair planned, no
+/// snapshot pulled. On the cluster this came from, `DELETE /v1/db/shop/coll/bench`
+/// answered `200 {"dropped": true}` and 48,128 documents came back on all
+/// three members, minutes later, twice.
+///
+/// The controls are asserted alongside, because a check that had simply
+/// stopped running would satisfy the negative half on its own: the check
+/// runs on every round of the watch, no round fails, and B still holds all
+/// three thousand documents at the end of it — there was something to pull
+/// back for the whole time. Then the drop reaches B by the ordinary route
+/// and the two members agree about a collection neither of them has.
+#[tokio::test]
+async fn a_collection_dropped_here_is_not_pulled_back_from_a_peer_that_has_not_applied_the_drop() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    /// Checked rounds watched before the drop is called safe. A confirmed
+    /// existence finding takes two, and the repair it plans runs on the
+    /// third, so this is comfortably past the point the unfixed code has
+    /// already pulled the collection back.
+    const CHECKS_WATCHED: usize = 8;
+    const DOCUMENTS: u64 = 3_000;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "bench").unwrap();
+    let batch: Vec<_> = (0..DOCUMENTS as i64).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, batch).unwrap();
+    // Several times the batch cap, so converging takes a handful of rounds.
+    let mut rounds = 0;
+    let cb = loop {
+        sync(&a, &b).await;
+        rounds += 1;
+        match b.engine.get_collection("shop", "bench") {
+            Ok(cb) if b.engine.count(&cb).unwrap() == DOCUMENTS => break cb,
+            _ => assert!(rounds < 10, "B never caught up with A's {DOCUMENTS} documents"),
+        }
+    };
+
+    assert!(a.engine.drop_collection("shop", "bench").unwrap(), "dropped here");
+    let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("a tombstone records it");
+    assert!(a.engine.get_collection("shop", "bench").is_err());
+
+    // One round on its own first, so the failure is legible before the loop
+    // is involved at all: the check ran, and it found nothing.
+    let outcome = sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::new()),
+        "B holds the incarnation A dropped, which is not a divergence: {outcome:?}"
+    );
+    assert_eq!(outcome.applied, 0, "and nothing was pulled: {outcome:?}");
+
+    // And through the real loop, which is what plans a repair.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![b.addr])], SECRET.into(), a.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut checks = 0usize;
+    let mut repair_rounds = 0usize;
+    while checks < CHECKS_WATCHED {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the loop stopped reporting after {checks} checked rounds"))
+            .expect("the loop must keep reporting");
+        checks += report.divergence_checks;
+        repair_rounds += report.repair_rounds;
+        assert_eq!(
+            report.divergent_collections, 0,
+            "confirmed divergent after {checks} checks, against a peer that is merely \
+             holding what A dropped"
+        );
+        assert_eq!(repair_rounds, 0, "a repair was planned for a collection A dropped on purpose");
+        assert_eq!(report.failed, 0, "{report:?}");
+    }
+    looping.abort();
+
+    if let Ok(back) = a.engine.get_collection("shop", "bench") {
+        panic!(
+            "the drop was undone: {} documents are back on A, pulled from a peer that had \
+             not applied the drop",
+            a.engine.count(&back).unwrap()
+        );
+    }
+    assert_eq!(
+        b.engine.count(&cb).unwrap(),
+        DOCUMENTS,
+        "B held every document throughout, so there was something to pull back all along"
+    );
+
+    // The drop reaches B by the ordinary route, and the two members agree
+    // about a collection neither of them now has.
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(b.engine.get_collection("shop", "bench").is_err(), "B applied A's drop");
+    assert_eq!(
+        b.engine.collection_dropped_at(ca.id).unwrap(),
+        Some(dropped),
+        "at A's stamp, which is what makes the two tombstones the same fact"
+    );
+    for (from, to) in [(&a, &b), (&b, &a)] {
+        let outcome = sync_once(&from.engine, to.addr, SECRET, None).await.unwrap();
+        assert_eq!(outcome.divergent, Some(BTreeSet::new()), "nothing left to find: {outcome:?}");
+    }
+}
+
+/// A repair whose sender drops the collection brings the drop back instead,
+/// and the copy standing here goes with it.
+///
+/// B holds half of A's copy — the shape a repair exists to complete — when A
+/// drops the collection. The snapshot A then serves for it carries no
+/// definition and no documents, because there are none left to carry, but it
+/// does carry the stamp of the drop. B must apply that drop rather than keep
+/// what it had accumulated: a member left advertising a collection the
+/// cluster has agreed is deleted re-seeds it onto every member that applied
+/// the drop, which is the resurrection the tombstone exists to stop.
+///
+/// The tombstone lands at *A's* stamp rather than B's clock, and mints no
+/// entry here — the pair a replicated `DropCollection` writes — so B does
+/// not go on to re-broadcast the drop under a later stamp than it has.
+///
+/// This is the drop as it stands when the repair opens, which rides the
+/// snapshot's first page. The drop that lands *between* two pages of a
+/// repair already under way is the test that follows this one.
+#[tokio::test]
+async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here_too() {
+    use kimmy_cluster::{PeerStalls, Repair};
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "bench").unwrap();
+    let first: Vec<_> = (0..600i64).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, first).unwrap();
+    sync(&a, &b).await;
+    let cb = b.engine.get_collection("shop", "bench").unwrap();
+    assert_eq!(b.engine.count(&cb).unwrap(), 600);
+
+    // A writes on, and B's position moves past those writes without them:
+    // half a copy, and nothing in the position saying so.
+    let second: Vec<_> = (600..1_200i64).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, second).unwrap();
+    let past = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&past, &[], Hlc::ZERO, true).unwrap();
+    assert_eq!(b.engine.count(&cb).unwrap(), 600, "the partial copy the repair is planned for");
+
+    // A drops it while B is repairing from A.
+    assert!(a.engine.drop_collection("shop", "bench").unwrap());
+    let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
+    let minted = b.engine.version_vector().unwrap().get(b.engine.node_id());
+
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_repair(a.engine.node_id(), ca.id, Repair::Snapshot));
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(outcome.repairing, "the round ran the repair: {outcome:?}");
+    assert!(!stalls.repairing(a.engine.node_id()), "and finished it: the sender had nothing left");
+
+    if let Ok(kept) = b.engine.get_collection("shop", "bench") {
+        panic!(
+            "B kept {} documents of a collection A has dropped, and goes on advertising it",
+            b.engine.count(&kept).unwrap()
+        );
+    }
+    assert_eq!(
+        b.engine.collection_dropped_at(ca.id).unwrap(),
+        Some(dropped),
+        "the tombstone is at A's stamp, not B's clock"
+    );
+    assert_eq!(
+        b.engine.version_vector().unwrap().get(b.engine.node_id()),
+        minted,
+        "a replicated drop mints no entry here"
+    );
+}
+
+/// A byte relay to `target` that closes the connection it is carrying the
+/// moment `cut` is signalled — a peer that goes away mid-round. TLS runs end
+/// to end through it, so the round it carries is a real round, for the reason
+/// `relay_one_connection` gives. The listener stays bound for the life of the
+/// test.
+///
+/// One signal, one connection: a `Notify` with nothing parked on it keeps the
+/// permit, so a connection opened after the signal would take it and be cut
+/// at once. The round that resumes the pull dials the peer directly, so
+/// nothing here needs otherwise.
+async fn relay_until_cut(
+    target: std::net::SocketAddr,
+    cut: Arc<tokio::sync::Notify>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let cut = Arc::clone(&cut);
+            tokio::spawn(async move {
+                let Ok(mut upstream) = TcpStream::connect(target).await else { return };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream) => {}
+                    _ = cut.notified() => {}
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The sender dropping the collection **between two pages** of a repair, over
+/// two members and the wire.
+///
+/// B is pulling a scoped snapshot of a collection it does not hold; the round
+/// is cut with part of the copy applied and its cursor kept, and A drops the
+/// collection before the round that resumes the pull. The page that comes
+/// back carries the drop, so B ends with the collection absent, the partial
+/// copy it had accumulated gone, and the tombstone at A's stamp.
+///
+/// Until every page of a scoped snapshot carried the sender's drop, that
+/// resumed page came back with no definition, no documents, no drop and no
+/// cursor — the same thing a snapshot that had simply run out looks like — so
+/// B called the pull complete and went on advertising a partial copy of an
+/// incarnation the cluster had agreed to delete, with no tombstone of its own
+/// to stop it being served or re-seeded onto the members that applied the
+/// drop. That is the window this test defends, and the one nothing else here
+/// reaches: the test above it exercises the drop as it stands on the
+/// snapshot's *first* page. The resumed page has a test of its own in
+/// `kimmy-storage`; this is the same window through the round that pulls it.
+#[tokio::test]
+async fn a_repair_whose_sender_drops_the_collection_between_pages_discards_the_partial_copy() {
+    use kimmy_cluster::{PeerStalls, Repair};
+    use kimmy_storage::SNAPSHOT_PAGE;
+
+    // Wide enough that a page lands long before the last one does, so the
+    // cut below always finds the pull part-way through.
+    const DOCUMENTS: usize = SNAPSHOT_PAGE * 20;
+
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "bench").unwrap();
+    let batch: Vec<_> = (0..DOCUMENTS as i64).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, batch).unwrap();
+
+    // B holds none of it, which is what a snapshot repair is for. Nothing of
+    // A's oplog reaches B on either round: a repair asks for the snapshot
+    // outright rather than for a window.
+    let cut = Arc::new(tokio::sync::Notify::new());
+    let relayed = relay_until_cut(a.addr, Arc::clone(&cut)).await;
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_repair(a.engine.node_id(), ca.id, Repair::Snapshot));
+
+    let engine = Arc::clone(&b.engine);
+    let round = tokio::spawn(async move {
+        let outcome = sync_once_with(&engine, relayed, SECRET, None, &mut stalls).await;
+        (outcome, stalls)
+    });
+
+    // Cut the round once a page has landed: the pages applied and the cursor
+    // saying where they stopped are what the next round resumes from.
+    let mut waited = 0;
+    while b.engine.count_by_id(ca.id).unwrap().unwrap_or(0) < SNAPSHOT_PAGE as u64 {
+        waited += 1;
+        assert!(waited < 30_000, "the snapshot's first page never landed on B");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cut.notify_one();
+    let (outcome, mut stalls) = round.await.unwrap();
+    assert!(outcome.is_err(), "the round was cut, not completed: {outcome:?}");
+    let held = b.engine.count_by_id(ca.id).unwrap().expect("a partial copy stands here");
+    assert!(
+        held >= SNAPSHOT_PAGE as u64 && held < DOCUMENTS as u64,
+        "part of A's copy and not all of it, so there is a pull to resume: {held}"
+    );
+    assert!(stalls.repairing(a.engine.node_id()), "and the repair is still under way");
+
+    // Between the pages. The round that resumes the pull is the one that
+    // finds out.
+    assert!(a.engine.drop_collection("shop", "bench").unwrap());
+    let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
+    let minted = b.engine.version_vector().unwrap().get(b.engine.node_id());
+
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(outcome.repairing, "the resumed round is the repair: {outcome:?}");
+    assert!(!stalls.repairing(a.engine.node_id()), "which ended with the drop");
+
+    if let Ok(kept) = b.engine.get_collection("shop", "bench") {
+        panic!(
+            "B kept {} documents of the incarnation A dropped between pages, and goes on \
+             advertising it",
+            b.engine.count(&kept).unwrap()
+        );
+    }
+    assert_eq!(b.engine.count_by_id(ca.id).unwrap(), None, "the partial copy went with the drop");
+    assert_eq!(
+        b.engine.collection_dropped_at(ca.id).unwrap(),
+        Some(dropped),
+        "the tombstone is at A's stamp, not B's clock"
+    );
+    assert_eq!(
+        b.engine.version_vector().unwrap().get(b.engine.node_id()),
+        minted,
+        "a replicated drop mints no entry here"
+    );
+}
+
+/// A collection genuinely recreated on the peer after the drop is still
+/// pulled — the tombstone rule subtracts one incarnation, not the name.
+///
+/// A drops the collection and B applies the drop; B then creates it again,
+/// under a stamp later than the drop, and writes into the new life. The
+/// entry that carried that creation is gone — collected on B, and A's
+/// position has already moved past it — so the only thing that can find the
+/// new collection is the check, and the only thing that can bring it is a
+/// snapshot. Both must happen: A's tombstone is older than the incarnation
+/// B names, so the id is reported, confirmed, and repaired.
+///
+/// What arrives is the new life and nothing of the old one: the collection
+/// stands at *B's* creation stamp rather than A's apply clock — the
+/// incarnation A then advertises, and what a replayed drop is judged
+/// against — and its documents are the ones written since, with none of the
+/// buried life's coming back with them.
+#[tokio::test]
+async fn a_collection_recreated_on_the_peer_after_the_drop_is_still_pulled() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "bench").unwrap();
+    let old: Vec<_> = (0..10).map(|n| doc! { "_id": format!("old-{n}") }).collect();
+    a.engine.insert_many(&ca, old).unwrap();
+    sync(&a, &b).await;
+    assert_eq!(b.engine.count(&b.engine.get_collection("shop", "bench").unwrap()).unwrap(), 10);
+
+    // The drop, applied on both members.
+    assert!(a.engine.drop_collection("shop", "bench").unwrap());
+    let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(b.engine.get_collection("shop", "bench").is_err(), "B applied the drop");
+
+    // And a new life for the name, on B.
+    let recreated = b.engine.create_collection("shop", "bench").unwrap();
+    assert!(recreated.created > dropped.hlc, "the recreation is later than the drop it follows");
+    let new: Vec<_> = (0..10).map(|n| doc! { "_id": format!("new-{n}") }).collect();
+    b.engine.insert_many(&recreated, new).unwrap();
+
+    // A's position has moved past the creation without it, and B has since
+    // collected the history that carried it: the entries path can never
+    // bring this collection, whichever member asks.
+    let past = b.engine.version_vector().unwrap();
+    a.engine.apply_peer_batch(&past, &[], Hlc::ZERO, true).unwrap();
+    b.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    assert!(a.engine.get_collection("shop", "bench").is_err(), "A knows nothing of the new life");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![b.addr])], SECRET.into(), a.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut reported = false;
+    let mut repair_rounds = 0usize;
+    let restored = loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the recreation was never pulled: reported={reported} \
+                     repair_rounds={repair_rounds}"
+                )
+            })
+            .expect("the loop must keep reporting");
+        reported |= report.divergent_collections > 0;
+        repair_rounds += report.repair_rounds;
+        if let Ok(on_a) = a.engine.get_collection("shop", "bench")
+            && a.engine.count(&on_a).unwrap() == 10
+        {
+            break on_a;
+        }
+    };
+    looping.abort();
+
+    assert!(reported, "the check reported the id A holds a tombstone for");
+    assert!(repair_rounds >= 1, "and a round was spent repairing it: {repair_rounds}");
+    assert_eq!(
+        restored.created, recreated.created,
+        "restored under B's creation stamp, not A's apply clock"
+    );
+    for n in 0..10 {
+        let id = DocId::String(format!("new-{n}"));
+        assert!(a.engine.get(&restored, &id).unwrap().is_some(), "the new life's documents");
+        let buried = DocId::String(format!("old-{n}"));
+        assert!(a.engine.get(&restored, &buried).unwrap().is_none(), "and none of the old one's");
+    }
 }

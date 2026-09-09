@@ -10,6 +10,59 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A dropped collection came back from a peer that had not applied the drop
+  yet, with all its documents.** On a converged three-member cluster a database
+  drop answered `200 {"dropped": true}` and, minutes later, its collection was
+  back on all three members holding all 48,128 documents — twice, the second
+  time as the repair of the first. Nothing failed: no round, no handshake, and
+  `kimmy_replication_lag_seconds` at 0 on every member throughout. A drop
+  replicates as a change like any other, and while one was in flight the
+  cross-member divergence check read a peer that had not applied it yet as
+  divergent — which it is not, it is behind — so anti-entropy "repaired" the
+  difference by bringing the collection back and re-seeding it onto the members
+  that had it right. The collection tombstones that would have stopped it were
+  on every member the whole time: the replication entries path consulted them,
+  and the divergence check and the snapshot repair, written beside that path,
+  never did. Both do now, through the same predicates that path uses, so a drop
+  applied on one member is not undone by the machinery that converges the
+  cluster ([ADR-155](docs/decisions.md) has the rules and what they cost).
+
+  **Nothing to decide before upgrading, and no stop in the roll.** The two new
+  protocol fields are defaulted, and the drop a repair's snapshot now carries on
+  every page rather than the first alone adds no field at all — a page has
+  carried an optional drop stamp since 0.26.0, and only when a sender fills it
+  changed. No new `/metrics` series, no HTTP shape changed. While a roll is in
+  progress, a member not yet upgraded names no incarnation for what it holds and
+  is read as holding the incarnation its peer dropped, so a collection genuinely
+  recreated on it, whose creation has aged out of its oplog, is not pulled back
+  by the check until the roll finishes or the tombstone expires — the ordinary
+  recreation is unaffected, arriving by the entries path as before. And such a
+  member part-way through a repair ignores a drop for a collection it still
+  holds, as it always did, so that half closes for a pair only once both ends
+  have rolled; it gains nothing there and loses nothing.
+
+  **One route is not closed, and it is worth a check after any member catches up
+  from far behind.** A whole-database snapshot — what a member below a peer's
+  retention horizon pulls — carries no collection drops, and completing one
+  grants that member coverage of the sender's history, so the drop it never
+  applied is not served to it afterwards either. It keeps the collection, live
+  and writable, and nothing reports the disagreement, because a member's own
+  check only reports collections a *peer* holds and it does not. The members
+  that applied the drop no longer pull it straight back, which was the
+  re-seeding half of the finding — but when their tombstones expire the check
+  reports the collection again and repairs it from the member still holding it.
+  So compare the collection list of any member that logs `behind the peer's
+  retention horizon; falling back to a snapshot` against a member that stayed up,
+  and drop anything only it holds. That warning marks one of the two ways in, and
+  the `caught up from a snapshot` line after it is logged for a one-collection
+  repair too, so check on suspicion as well for a member that has been repairing
+  against a peer over many rounds: a repair that falls back to the whole database
+  reaches the same state and nothing names it.
+
 ## 0.26.0 - 2026-09-08
 
 ### Fixed

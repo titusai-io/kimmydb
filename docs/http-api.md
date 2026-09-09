@@ -238,7 +238,11 @@ that this creates the document writes nothing and passes.
 and `{"deleted": 0}` when there was none to remove — a count, like `PUT`, and
 not an error either way. The `stamp` is the **tombstone's** version, the one
 the delete produced, exactly as `POST .../delete` of one document reports it;
-it is present when and only when `deleted` is `1`.
+it is present when and only when `deleted` is `1`. The tombstone is what keeps
+a peer that never saw the delete from replaying its older image of the
+document, for as long as it is retained ([ADR-085](decisions.md)); dropping a
+*collection* carries the same guarantee, on its own tombstone — see
+[Databases and collections](#databases-and-collections).
 
 **Every write reports the version it produced**, as `stamp` — an opaque token
 — and a read by id carries the document's version as its `ETag`. Pass one
@@ -474,6 +478,25 @@ builds the shadow collection locally and it replicates a moment behind, leaving
 a peer holding a database whose only contents are a shadow whose base
 collection is gone. Drop on one member and confirm the drop on the others (a
 drop is not instant — see [Operations](operations.md)); do not drop on each.
+
+**A drop stays dropped.** It is applied where it lands, it replicates as a
+change like any other, and it is not undone by the anti-entropy that converges
+the cluster: while the tombstone is retained, a member that has applied the
+drop neither reports the collection as missing against a peer still holding
+it, nor lets a repair from that peer recreate it or write into it
+([ADR-155](decisions.md)). So the interval between `200 {"dropped": true}` on
+one member and the drop landing on the rest is a wait, not a race — the peers
+converge on the drop, not on the copy. One route in a converged cluster is
+outside that guarantee and is recorded rather than closed: a member so far
+behind that it catches up by copying a peer's *whole database* rather than by
+replaying changes is not told about drops that way, and keeps a collection it
+already held (ADR-155 states what follows from that). During a rolling upgrade
+there is a second and temporary one, for a member not yet on the release that
+carries this. Past `storage.tombstone_retention_secs`
+the tombstone is collected and the ordinary resurrection case applies, the same
+one a deleted document is subject to ([ADR-085](decisions.md)); the retention
+setting is the width of that window and [Operations](operations.md) says how to
+size it.
 
 Listing responses
 are **filtered by what the caller may read**, so they cannot be used to discover

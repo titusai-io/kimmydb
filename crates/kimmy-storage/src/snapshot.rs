@@ -25,9 +25,21 @@
 //! - unique violations are detected and reported, rather than being smuggled in
 //!   through a side door that skips the check.
 //!
-//! Collection definitions are *not* logged, because unlike a document's stamp,
-//! this node holds no honest record of when or where the collection was created
-//! — only that it exists. Inventing history would be worse than omitting it.
+//! What that path does *not* decide is whether a document belongs to a life of
+//! its collection this node has already buried: `apply_remote_in_txn` compares
+//! the document against the one standing under its id, and a document from a
+//! collection that was dropped has nothing there to lose to. So a page's
+//! documents are put to [`Engine::is_history`] first — the predicate the
+//! entries path applies, in the one place it is written — and a definition is
+//! not recreated over a tombstone this node holds. A snapshot is the sender's
+//! current state, not an instruction, and a sender that has not applied a drop
+//! yet still serves the collection.
+//!
+//! Collection definitions are *not* logged. One travels with the incarnation
+//! it began at (`CollectionState::created`), which is what a drop is judged
+//! against and what this node advertises once it holds it — but not with a
+//! place in this node's own history, which it has none of. Inventing one would
+//! be worse than omitting it.
 //!
 //! # A page is one transaction
 //!
@@ -47,12 +59,17 @@
 //!
 //! A repair (ADR-148) is planned for *one* collection, and a snapshot scoped
 //! to it walks only that collection's key range and sends only its definition
-//! — or, when the sender has since dropped it, the drop's stamp, so the
-//! receiver records the tombstone and the entries it was stopped at become
-//! history rather than a stop that repeats. The whole-database snapshot
-//! remains what a member below a peer's retention horizon is served; a scoped
-//! one grants no coverage, because coverage is per origin and cannot be
-//! scoped to a collection.
+//! — or, when the sender has since dropped it, the drop's stamp, on every page
+//! and not the first alone, because a repair runs for as long as the
+//! collection takes and the drop lands where it lands. The receiver records
+//! the tombstone and the entries it was stopped at become history rather than
+//! a stop that repeats. Where the receiver still holds the
+//! incarnation that stamp names, it goes with the tombstone: keeping it would
+//! leave this node advertising a collection the cluster has agreed is deleted,
+//! and re-seeding it onto the members that applied the drop. The
+//! whole-database snapshot remains what a member below a peer's retention
+//! horizon is served; a scoped one grants no coverage, because coverage is per
+//! origin and cannot be scoped to a collection.
 //!
 //! # A snapshot resumes, and the coverage it grants
 //!
@@ -71,9 +88,7 @@
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
 
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 use kimmy_core::{
     CollectionId, DocId, Hlc, IndexMeta, OpKind, OplogEntry, Stamp, VectorConfig, VersionVector,
@@ -87,7 +102,7 @@ use crate::docs::RemoteApplied;
 use crate::engine::{Engine, Position};
 use crate::error::Result;
 use crate::meta::CollectionMeta;
-use crate::sync::Pending;
+use crate::sync::{Memo, Pending};
 use crate::tables;
 
 /// Documents per page.
@@ -127,11 +142,35 @@ pub struct CollectionState {
     pub name: String,
     pub indexes: Vec<IndexMeta>,
     pub vector: Option<VectorConfig>,
+    /// The stamp of the create that produced this incarnation *at its
+    /// origin* (`CollectionMeta::created`), which the receiver restores it
+    /// under and judges its own tombstone against.
+    ///
+    /// Without it a restored collection's `created` was the receiver's clock
+    /// at apply time — later than the incarnation truly began, so a drop that
+    /// legitimately followed the create was judged to predate it and ignored
+    /// (`sync::apply_ddl`), and the incarnation advertised to a peer's
+    /// divergence check looked newer than the tombstone that peer holds for
+    /// it. Both are the same resurrection through different doors.
+    ///
+    /// An `Option`, and optional on the wire, because a sender that predates
+    /// the field sends no stamp at all: that is a fact the receiver has to be
+    /// able to see, and `Hlc::ZERO` would make it look like an incarnation
+    /// older than every tombstone rather than like an absence. What the
+    /// receiver does with the absence is on `Engine::restore_collection`.
+    #[serde(default)]
+    pub created: Option<Hlc>,
 }
 
 impl From<CollectionMeta> for CollectionState {
     fn from(meta: CollectionMeta) -> Self {
-        CollectionState { db: meta.db, name: meta.name, indexes: meta.indexes, vector: meta.vector }
+        CollectionState {
+            db: meta.db,
+            name: meta.name,
+            indexes: meta.indexes,
+            vector: meta.vector,
+            created: Some(meta.created),
+        }
     }
 }
 
@@ -163,6 +202,19 @@ pub struct SnapshotApplied {
     /// transport, so a refusal reached through a snapshot is counted where
     /// one reached through the oplog is.
     pub ddl_refused: usize,
+    /// Documents on the page that address a life of their collection this
+    /// node has buried — `Engine::is_history`, the predicate the entries
+    /// path applies — plus those whose collection the page tried and failed
+    /// to recreate over a tombstone held here.
+    ///
+    /// Logged by the transport rather than folded into the round's outcome:
+    /// it is what tells a repair that wrote nothing because everything on it
+    /// was already buried from one that is stalling, and reading it as the
+    /// round's `superseded` would count on this route only part of what that
+    /// name counts on the entries path (a last-writer-wins loser is not
+    /// counted here — a page a member already holds is the ordinary case for
+    /// a repair, and it is not news).
+    pub superseded: usize,
 }
 
 /// One page of a snapshot.
@@ -182,10 +234,21 @@ pub struct SnapshotPage {
     /// none.
     pub versions: VersionVector,
     /// For a snapshot of one collection the sender no longer holds: the
-    /// stamp of its drop, when a tombstone still records it. First page only,
-    /// and absent from a whole-database snapshot, whose receiver never had
-    /// the collection. Optional on the wire, because a sender that predates
-    /// the field never writes it (ADR-152).
+    /// stamp of its drop, when a tombstone still records it.
+    ///
+    /// On **every** page of a scoped snapshot, not the first alone: the drop
+    /// can land between two pages of a repair that runs for minutes, and a
+    /// resumed page that could not carry it left the receiver holding a
+    /// partial copy of the dropped incarnation and calling the pull complete.
+    /// Absent from a whole-database snapshot, which carries no drops at all —
+    /// a separate gap, tracked separately, and not one this field closes.
+    ///
+    /// Optional on the wire, because a sender that predates the field never
+    /// writes it (ADR-152). Nothing about the field changed to carry it on
+    /// later pages; what changed is when a sender fills it, and a receiver
+    /// that predates *that* reads a resumed page's drop exactly as it reads a
+    /// first page's, because its own gate is on the snapshot being scoped and
+    /// never was on the page being the first.
     #[serde(default)]
     pub dropped: Option<Stamp>,
 }
@@ -287,14 +350,36 @@ impl Engine {
 
         // Definitions ride the first page, so the receiver can create the
         // collections before any document needs one. For a scoped snapshot
-        // that is the one collection — or, when it is gone here, its drop.
-        let (collections, dropped) = match (after.is_none(), scope) {
-            (false, _) => (Vec::new(), None),
-            (true, None) => (self.collection_states()?, None),
-            (true, Some(id)) => match self.collection_by_id(id)? {
-                Some(meta) => (vec![CollectionState::from(meta)], None),
+        // that is the one collection — or, when it is gone here, its drop,
+        // and **that rides every page, resumed pages included**.
+        //
+        // A repair runs for as long as the collection takes, and a drop
+        // lands where it lands. Sent on the first page alone, a drop between
+        // pages reached the receiver as an empty page with no definition, no
+        // documents, no drop and no cursor — indistinguishable from a
+        // snapshot that had simply run out — so the pull reported itself
+        // complete and the receiver kept a partial copy of the incarnation
+        // the cluster had just agreed to delete, with no tombstone of its
+        // own. Measured on a live-shaped fixture, not inferred: 512 documents
+        // applied, sender drops, resumed page empty, receiver still holding
+        // 512. That receiver is then the member that re-seeds the collection
+        // onto the ones that applied the drop, which is the finding, and the
+        // window is permanent exactly when the drop entry has already aged
+        // out of the oplog — which is when a repair is running at all.
+        //
+        // The tombstone is not read on its own: a collection recreated after
+        // a drop keeps the tombstone that floored it, so "a tombstone exists"
+        // does not mean "the collection is gone", and a page that carried one
+        // regardless would tell a receiver holding an older incarnation to
+        // destroy the copy this very snapshot is filling.
+        let (collections, dropped) = match scope {
+            Some(id) => match self.collection_by_id(id)? {
+                Some(meta) if after.is_none() => (vec![CollectionState::from(meta)], None),
+                Some(_) => (Vec::new(), None),
                 None => (Vec::new(), self.collection_dropped_at(id)?),
             },
+            None if after.is_none() => (self.collection_states()?, None),
+            None => (Vec::new(), None),
         };
 
         let (documents, next) = self.snapshot_documents(after, scope)?;
@@ -435,28 +520,48 @@ impl Engine {
         let grant = if complete { progress.granted.as_ref() } else { None };
 
         let mut applied = 0usize;
+        let mut superseded = 0usize;
         let mut failed = None;
         if !page.documents.is_empty() || grant.is_some() {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
             // outside the writer, from the state the definitions above left.
-            let mut collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>> =
-                HashMap::new();
+            // The same memo a batch carries, for the same two questions
+            // (`sync::Memo`); nothing below is a schema change, so it stands
+            // for the whole page.
+            let mut memo = Memo::default();
             let txn = self.begin_write()?;
             let mut pending = Vec::new();
             for document in &page.documents {
-                let collection = match collections.get(&document.collection) {
-                    Some(found) => found.clone(),
-                    None => {
-                        let found = self.collection_by_id(document.collection)?.map(Arc::new);
-                        collections.insert(document.collection, found.clone());
-                        found
-                    }
-                };
+                let collection = self.memo_collection(&mut memo, document.collection)?;
+
+                // The predicate the entries path applies, applied here too:
+                // `apply_remote_in_txn` below decides last-writer-wins on the
+                // document's own stamp and consults neither the tombstone nor
+                // the incarnation floor, so a repair pulled from a peer that
+                // has not applied the drop yet wrote the buried life straight
+                // back in.
+                if self.is_history(
+                    &mut memo,
+                    collection.as_deref(),
+                    document.collection,
+                    document.stamp,
+                )? {
+                    superseded += 1;
+                    continue;
+                }
+
                 let Some(collection) = collection else {
-                    // The definition should have arrived on the first page;
-                    // a document without one means a truncated or reordered
-                    // snapshot.
+                    // Gone here with a tombstone to say so — including the
+                    // definition on this very page that `restore_collection`
+                    // refused to recreate over one — is history, exactly as
+                    // it is in `sync::apply_one`. Without one it means a
+                    // truncated or reordered snapshot: the definition should
+                    // have arrived on the first page.
+                    if self.memo_dropped_at(&mut memo, document.collection)?.is_some() {
+                        superseded += 1;
+                        continue;
+                    }
                     debug!(
                         collection = document.collection.0,
                         "snapshot document has no collection"
@@ -541,30 +646,57 @@ impl Engine {
         }
         match failed {
             Some(e) => Err(e),
-            None => Ok(SnapshotApplied { applied, ddl_refused }),
+            None => Ok(SnapshotApplied { applied, ddl_refused, superseded }),
         }
     }
 
     /// Record the sender's drop of the one collection a scoped snapshot is
     /// of, so the entries this node was stopped at for it become history
     /// (ADR-148's tombstone rule) rather than a stop that repeats for the
-    /// life of the process.
+    /// life of the process — and, when this node still holds the very
+    /// incarnation that was dropped, apply the drop here as well.
     ///
-    /// Only for a collection this node has no record of, which is the one
-    /// case a scoped snapshot is planned for; a collection standing here
-    /// under the id is left alone, since the drop rules (ADR-034, ADR-123)
-    /// settle that through the oplog and not through a snapshot.
+    /// Which incarnation it is aimed at decides it, and that question is
+    /// asked in one place — `sync::aims_at_a_previous_incarnation`, which the
+    /// replicated `DropCollection` arm asks too. A drop aimed at the copy
+    /// standing here takes it: leaving it is the resurrection the tombstone
+    /// exists to stop, since this node would go on advertising a collection
+    /// the cluster has agreed is deleted, and the peers that applied the drop
+    /// would pull it back from here. A drop aimed at a life that has already
+    /// ended is ignored outright, tombstone and all: the sender is simply
+    /// behind, and a tombstone below the incarnation standing here says
+    /// nothing that incarnation's own floor does not.
     fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
-        if self.collection_by_id(id)?.is_some() {
-            debug!(collection = %id, "a snapshot carried a drop of a collection this node holds; ignored");
-            return Ok(());
+        if let Some(current) = self.collection_by_id(id)? {
+            if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
+                debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
+                return Ok(());
+            }
+            // One transaction for the whole copy, as every drop is. On a
+            // collection a repair was part-way through that is a large write
+            // on the receiver, and it is the correct write: what is removed
+            // is a partial copy of a life that has ended everywhere else.
+            warn!(
+                db = %current.db,
+                collection = %current.name,
+                stamp = ?dropped,
+                "the peer has dropped the collection this snapshot was to repair, and the copy \
+                 held here is of the incarnation it dropped; dropping it too"
+            );
+            self.drop_collection_inner(&current.db, &current.name, Some(dropped))?;
+        } else {
+            warn!(
+                collection = %id,
+                stamp = ?dropped,
+                "the peer has dropped the collection this snapshot was to repair; its tombstone is \
+                 recorded here so the entries addressed to it are history"
+            );
         }
-        warn!(
-            collection = %id,
-            stamp = ?dropped,
-            "the peer has dropped the collection this snapshot was to repair; its tombstone is \
-             recorded here so the entries addressed to it are history"
-        );
+        // Recorded on both paths that reach here, and after the drop rather
+        // than instead of it: `drop_collection_inner` writes the tombstone at
+        // the sender's stamp in its own transaction, and a node that never
+        // held the collection still needs one. The pair `sync::apply_ddl`'s
+        // drop arm writes, for its reasons.
         self.record_collection_drop(id, dropped)
     }
 
@@ -584,7 +716,35 @@ impl Engine {
     /// the page.
     fn restore_collection(&self, state: &CollectionState) -> Result<usize> {
         if self.get_collection(&state.db, &state.name).is_err() {
-            self.create_collection_inner(&state.db, &state.name, false, None)?;
+            // A snapshot must not recreate a life this node has buried. The
+            // page is current state on its sender, not an instruction: a peer
+            // that has not applied the drop yet still serves the collection,
+            // and creating it here would put it back on every member that had
+            // it right. The same rule `sync::apply_ddl` applies to a replayed
+            // `CreateCollection`, in the one place a collection can otherwise
+            // arrive without an entry behind it.
+            //
+            // A page carrying no stamp comes from a sender that predates the
+            // field, and reads as the incarnation this node dropped rather
+            // than as a later one — the mixed-version choice, made this way
+            // because a genuine recreation still arrives through the entries
+            // path, where a resurrection cannot be undone.
+            let id = CollectionId::derive(&state.db, &state.name);
+            if let Some(dropped) = self.collection_dropped_at(id)?
+                && state.created.is_none_or(|created| created <= dropped.hlc)
+            {
+                debug!(
+                    db = %state.db,
+                    collection = %state.name,
+                    "ignored a creation older than the drop that removed it"
+                );
+                return Ok(0);
+            }
+            // `state.created` and not this node's clock: it is the stamp the
+            // create carries at its origin, which is what a replayed drop is
+            // judged against (`create_collection_inner`) and what this node
+            // then advertises as the incarnation it holds.
+            self.create_collection_inner(&state.db, &state.name, false, state.created)?;
         }
 
         let mut refused = 0usize;
@@ -1164,6 +1324,460 @@ mod tests {
         // A whole-database snapshot never carries a drop: its receiver
         // never had the collection.
         assert_eq!(a.snapshot_page(None, None).unwrap().dropped, None);
+    }
+
+    /// A moment, so an engine's clock separates what happens on either side
+    /// of it. The stamps these tests compare are minted from physical time,
+    /// and a fixture must not race the millisecond it is pinning.
+    fn a_moment() {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    /// A snapshot is current state on its sender, not an instruction: a peer
+    /// that has not applied the drop yet still holds the collection and still
+    /// serves it. Recreating it here would put it back on every member that
+    /// had it right — the finding, reached through the repair rather than
+    /// through a replayed `CreateCollection`, which `sync::apply_ddl` has
+    /// refused since ADR-034.
+    #[test]
+    fn a_snapshot_does_not_recreate_a_collection_this_node_has_dropped() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+
+        b.create_collection("shop", "orders").unwrap();
+        a_moment();
+        b.drop_collection("shop", "orders").unwrap();
+        let dropped = b.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+        assert!(ca.created <= dropped.hlc, "the fixture must drop after the sender's create");
+        // A second document, written on A *after* the drop it has not heard
+        // about: not history by its own stamp, and history only because the
+        // collection it names is one this node buried. The two documents are
+        // the two ways a page's document is turned away.
+        a_moment();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+        let outcome = b
+            .apply_snapshot_page(
+                &mut SnapshotProgress::whole_database(),
+                &a.snapshot_page(None, None).unwrap(),
+            )
+            .unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(
+            outcome.superseded, 2,
+            "both documents are history, counted rather than passed over: {outcome:?}"
+        );
+    }
+
+    /// The other side of the same rule, and the reason it is a comparison
+    /// rather than a refusal: a collection genuinely recreated after the drop
+    /// is restored, under the sender's incarnation.
+    #[test]
+    fn a_snapshot_recreates_a_collection_created_after_the_drop_held_here() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+        a_moment();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        let dropped = b.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+        assert!(ca.created > dropped.hlc, "the fixture must create after the drop");
+
+        let outcome = b
+            .apply_snapshot_page(
+                &mut SnapshotProgress::whole_database(),
+                &a.snapshot_page(None, None).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(cb.created, ca.created, "restored under the sender's incarnation");
+        assert_eq!(b.count(&cb).unwrap(), 1);
+    }
+
+    /// The mixed-version rule at the restore's door: a sender that predates
+    /// `CollectionState::created` names no incarnation, and an absent stamp
+    /// reads as the life this node dropped rather than as a later one. The
+    /// collection is not recreated for the minutes a roll is under way; a
+    /// genuine recreation still arrives through the entries path, where a
+    /// resurrection could not be undone.
+    #[test]
+    fn a_snapshot_that_names_no_incarnation_does_not_recreate_a_dropped_collection() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        a_moment();
+        b.drop_collection("shop", "orders").unwrap();
+
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            state.created = None;
+        }
+        let outcome =
+            b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
+        assert_eq!((outcome.applied, outcome.superseded), (0, 1), "{outcome:?}");
+    }
+
+    /// A restored collection carries the **sender's** `created`, not this
+    /// node's clock at apply time.
+    ///
+    /// Not tidying. `create_collection_inner` states what `created` is for: a
+    /// replayed drop is judged against it, and the local apply clock sits
+    /// after the whole catch-up backlog, so a drop that legitimately followed
+    /// the create reads as older than the incarnation and is ignored. It is
+    /// also the incarnation this node then advertises to a peer's divergence
+    /// check, which would read a local clock as a recreation newer than the
+    /// tombstone that peer holds — and pull the collection back.
+    #[test]
+    fn a_whole_database_snapshot_restores_every_collection_under_the_senders_incarnation() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let mut sent = Vec::new();
+        for name in ["alpha", "orders", "zeta"] {
+            let c = a.create_collection("shop", name).unwrap();
+            a.insert(&c, doc! { "_id": 1 }).unwrap();
+            sent.push((name, c.created));
+        }
+        // So that a `created` taken from this node's clock could not pass
+        // for the sender's.
+        a_moment();
+
+        transfer(&b, &a);
+
+        for (name, created) in sent {
+            assert_eq!(
+                b.get_collection("shop", name).unwrap().created,
+                created,
+                "collection {name} must keep the incarnation it began at"
+            );
+        }
+    }
+
+    /// The document half of the rule (`Engine::is_history`, the predicate the
+    /// entries path applies). Every snapshot document went straight to
+    /// `apply_remote_in_txn`, which decides last-writer-wins on the
+    /// document's own stamp and consults neither the tombstone nor the
+    /// incarnation floor — so a repair pulled from a peer that had not
+    /// applied the drop wrote the buried life back into its replacement.
+    #[test]
+    fn a_snapshot_document_from_a_life_buried_here_is_history_and_is_counted() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "life": "the first" }).unwrap();
+
+        // Dropped and created again here: the same derived id, and an
+        // incarnation floor at the drop.
+        b.create_collection("shop", "orders").unwrap();
+        a_moment();
+        b.drop_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        assert!(cb.incarnation_floor.is_some(), "the replacement must carry a floor");
+
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(outcome.superseded, 1, "{outcome:?}");
+        assert_eq!(b.count(&cb).unwrap(), 0, "the previous life must not enter the replacement");
+
+        // And the same page's next document, written after the drop, is not
+        // history and lands: this is a floor, not a gate on the collection.
+        a_moment();
+        a.insert(&ca, doc! { "_id": 2, "life": "after the drop" }).unwrap();
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert_eq!((outcome.applied, outcome.superseded), (1, 1), "{outcome:?}");
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some());
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none());
+    }
+
+    /// A scoped snapshot answering with a drop of the very incarnation this
+    /// node holds applies it here too.
+    ///
+    /// Recording the tombstone and keeping the copy leaves this node
+    /// advertising a collection the cluster has agreed is deleted, and every
+    /// peer that applied the drop then sees a divergence against it and
+    /// repairs the copy back out — after this node has re-seeded them from
+    /// it. It is a replicated drop: the sender's stamp on the tombstone, and
+    /// no entry of this node's own.
+    #[test]
+    fn a_snapshot_carrying_a_drop_of_the_incarnation_held_here_drops_it_here_too() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().created,
+            ca.created,
+            "B holds the incarnation A is about to drop"
+        );
+        let b_own = b.version_vector().unwrap().get(b.node_id());
+
+        a_moment();
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert_eq!(page.dropped, Some(dropped), "the drop travels in the collection's place");
+        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(ca.id), &page).unwrap();
+
+        assert!(b.get_collection("shop", "orders").is_err(), "the copy held here went with it");
+        assert_eq!(b.count_by_id(ca.id).unwrap(), None);
+        assert_eq!(
+            b.collection_dropped_at(ca.id).unwrap(),
+            Some(dropped),
+            "at the sender's stamp, so a recreation that followed it is still usable"
+        );
+        assert_eq!(
+            b.version_vector().unwrap().get(b.node_id()),
+            b_own,
+            "a replicated drop mints no entry of this node's own"
+        );
+    }
+
+    /// The sender is the one that is behind: it dropped a life this node has
+    /// already replaced. The collection standing here is not the one the drop
+    /// names, so it stays — the rule `sync::apply_ddl` applies to a replayed
+    /// `DropCollection`, for the same reason.
+    #[test]
+    fn a_snapshot_carrying_a_drop_older_than_the_incarnation_held_here_is_ignored() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        a_moment();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 1 }).unwrap();
+        assert!(cb.created > dropped.hlc, "the fixture must create after the sender's drop");
+
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert_eq!(page.dropped, Some(dropped));
+        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(ca.id), &page).unwrap();
+
+        assert_eq!(b.get_collection("shop", "orders").unwrap().created, cb.created);
+        assert_eq!(b.count(&cb).unwrap(), 1, "the newer incarnation and its documents stand");
+    }
+
+    /// The drop landing **between two pages** of a repair, which is where it
+    /// lands whenever a repair runs long enough to matter.
+    ///
+    /// The resumed page carries it, so the receiver's partial copy of the
+    /// dropped incarnation goes with it. Before this, that page came back with
+    /// no definition, no documents, no drop and no cursor — the same thing a
+    /// snapshot that had run out looks like — so the pull reported itself
+    /// complete and left the receiver advertising a collection the cluster had
+    /// agreed to delete, with no tombstone of its own to stop it being served
+    /// or re-seeded.
+    #[test]
+    fn a_scoped_snapshot_resumed_after_its_sender_dropped_the_collection_carries_the_drop() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 88) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        let first = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert!(first.next.is_some(), "the fixture needs a page left to resume");
+        let outcome = b.apply_snapshot_page(&mut progress, &first).unwrap();
+        assert_eq!(outcome.applied, SNAPSHOT_PAGE, "{outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE, "the partial copy is here");
+        // Read after the first page, which created the collection: what must
+        // not move is B's own coverage, because a replicated drop mints no
+        // entry of the receiver's own.
+        let b_own = b.version_vector().unwrap().get(b.node_id());
+
+        // Between the pages.
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        let resumed = a.snapshot_page(progress.after().cloned(), Some(ca.id)).unwrap();
+        assert_eq!(resumed.dropped, Some(dropped), "a resumed page carries the drop too");
+        assert!(resumed.collections.is_empty(), "definitions still ride the first page alone");
+        assert!(resumed.documents.is_empty() && resumed.next.is_none(), "{resumed:?}");
+        b.apply_snapshot_page(&mut progress, &resumed).unwrap();
+        assert!(progress.is_complete());
+
+        assert!(
+            b.get_collection("shop", "orders").is_err(),
+            "the partial copy of the dropped incarnation goes with the drop"
+        );
+        assert_eq!(b.count_by_id(ca.id).unwrap(), None, "and its documents with it");
+        assert_eq!(
+            b.collection_dropped_at(ca.id).unwrap(),
+            Some(dropped),
+            "at the sender's stamp, so a recreation that follows it is still usable"
+        );
+        assert_eq!(b.version_vector().unwrap().get(b.node_id()), b_own, "no entry of its own");
+
+        // The whole-database route is untouched: it carries no drop on any
+        // page, which is a separate gap and not this one. Asked with the
+        // first page's cursor rather than `progress.after()`, which is `None`
+        // by now — the resumed arm is the one this could regress, and a first
+        // page is already pinned elsewhere in this file.
+        assert_eq!(a.snapshot_page(first.next.clone(), None).unwrap().dropped, None);
+    }
+
+    /// A tombstone alone cannot stand for "the collection is gone": a
+    /// collection recreated after a drop keeps the tombstone that floored it.
+    /// A resumed page that read the tombstone without checking would tell a
+    /// receiver holding an older incarnation to destroy the very copy this
+    /// snapshot is filling.
+    #[test]
+    fn a_resumed_scoped_page_of_a_collection_recreated_after_a_drop_carries_no_drop() {
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        assert!(ca.incarnation_floor.is_some(), "the tombstone survives the recreation");
+        for i in 0..(SNAPSHOT_PAGE + 1) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let first = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert_eq!(first.dropped, None);
+        assert_eq!(first.collections.len(), 1, "the definition rides the first page");
+        let resumed = a.snapshot_page(first.next.clone(), Some(ca.id)).unwrap();
+        assert_eq!(resumed.dropped, None, "the sender holds it; a floor is not news");
+        assert!(resumed.collections.is_empty(), "definitions still ride the first page alone");
+        assert_eq!(resumed.documents.len(), 1, "and the page it was asked for still arrives");
+    }
+
+    /// Two nodes minting the same `Hlc` in the same millisecond, with the
+    /// create's node sorting above the drop's. `low` stamps the drop, `high`
+    /// the create.
+    fn tied_nodes() -> (kimmy_core::NodeId, kimmy_core::NodeId) {
+        let low = kimmy_core::NodeId::from_bytes([1; 16]);
+        let high = kimmy_core::NodeId::from_bytes([2; 16]);
+        assert!(high > low, "the fixture depends on the node ids breaking the tie this way");
+        (low, high)
+    }
+
+    /// A collection standing at exactly its own incarnation floor, which is
+    /// what a create that beat a same-millisecond drop on the node id leaves:
+    /// `apply_ddl`'s creation rule compares `Stamp` strictly, so the create is
+    /// not history and is applied, taking `created` from its origin and the
+    /// floor from the tombstone that survived it. Both are the same `Hlc`.
+    ///
+    /// Returned with the drop's stamp, which is the one a peer that applied
+    /// the drop and never saw the create still answers a repair with, and
+    /// with that same drop as the oplog entry the other route delivers.
+    fn at_its_own_floor(b: &Engine, wall: u64) -> (CollectionMeta, Stamp, OplogEntry) {
+        let (low, high) = tied_nodes();
+        let tie = Hlc::new(wall, 0);
+        let dropped = Stamp::new(tie, low);
+
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, 10).unwrap().entries;
+        let of = |kind| {
+            entries.iter().find(|e| e.kind == kind).cloned().expect("the entry the drop minted")
+        };
+        let create = of(OpKind::CreateCollection);
+        let drop = OplogEntry { stamp: dropped, ..of(OpKind::DropCollection) };
+
+        b.record_collection_drop(ca.id, dropped).unwrap();
+        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create }]).unwrap();
+
+        let current = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(current.created, tie, "the create was applied under its own origin stamp");
+        assert_eq!(current.incarnation_floor, Some(tie), "and over the tombstone that survived");
+        (current, dropped, drop)
+    }
+
+    /// The tie the whole change is built around, at the drop's door: a
+    /// collection whose `created` *equals* its floor, and the drop that
+    /// produced that floor arriving again through a repair.
+    ///
+    /// The two routes have to agree, and only the floor clause makes them:
+    /// the drop neither predates the incarnation standing here nor is newer
+    /// than it, so a comparison against `created` alone reads it as aimed at
+    /// this copy and destroys a collection the replicated `DropCollection`
+    /// arm defends. Reachable, not merely constructible — a repair planned
+    /// while this node lacked the collection runs a round later, after the
+    /// drop and the create have both landed.
+    #[test]
+    fn a_snapshot_carrying_the_drop_a_collection_was_created_over_is_ignored() {
+        let (b, _db) = engine();
+        let (current, dropped, as_an_entry) = at_its_own_floor(&b, 1_000);
+        b.insert(&current, doc! { "_id": 1 }).unwrap();
+
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            documents: Vec::new(),
+            next: None,
+            versions: VersionVector::new(),
+            dropped: Some(dropped),
+        };
+        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(current.id), &page).unwrap();
+
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().created,
+            current.created,
+            "the incarnation the drop was already accounted for must stand"
+        );
+        assert_eq!(b.count(&current).unwrap(), 1, "and its documents with it");
+
+        // The same drop down the other route, on the same state: the two
+        // answers are one predicate, so they cannot differ.
+        let outcome = b.apply_batch(std::slice::from_ref(&as_an_entry)).unwrap();
+        assert_eq!(outcome.ddl, 1, "{outcome:?}");
+        assert_eq!(b.get_collection("shop", "orders").unwrap().created, current.created);
+        assert_eq!(b.count(&current).unwrap(), 1, "however the drop reaches this node");
+    }
+
+    /// The floor half of `Engine::is_history` on the snapshot route, with the
+    /// tombstone half unable to account for it: the document is stamped in the
+    /// same millisecond as the drop by a node sorting above the one that
+    /// stamped it, so it sorts *after* the tombstone as a `Stamp` and only the
+    /// floor — `Hlc`, and not strict — turns it away. A last pre-drop write
+    /// racing the drop is exactly how it arrives.
+    #[test]
+    fn a_snapshot_document_at_the_incarnation_floor_is_history_though_it_outranks_the_tombstone() {
+        let (b, _db) = engine();
+        let (low, high) = tied_nodes();
+        let tie = Hlc::new(1, 0);
+        let id = CollectionId::derive("shop", "orders");
+        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        assert_eq!(cb.incarnation_floor, Some(tie));
+        assert!(Stamp::new(tie, high) > Stamp::new(tie, low), "the tombstone cannot turn it away");
+
+        let document = |wall: u64, key: i64| SnapshotDoc {
+            collection: id,
+            id: DocId::Int64(key),
+            stamp: Stamp::new(Hlc::new(wall, 0), high),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": key }).unwrap()),
+        };
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            // At the floor, and one above it: the floor is a boundary, not a
+            // gate on the collection.
+            documents: vec![document(1, 1), document(2, 2)],
+            next: None,
+            versions: VersionVector::new(),
+            dropped: None,
+        };
+        let outcome =
+            b.apply_snapshot_page(&mut SnapshotProgress::of_collection(id), &page).unwrap();
+        assert_eq!((outcome.applied, outcome.superseded), (1, 1), "{outcome:?}");
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none(), "the previous life stays buried");
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some(), "the one above the floor lands");
     }
 
     #[test]
