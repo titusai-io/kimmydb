@@ -11567,6 +11567,16 @@ defaults do not fit is a knob that is wrong for that case.
 
 ## ADR-152 — A snapshot repair pulls one collection, a page per commit, and resumes where it stopped
 
+> **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
+> The drop a scoped snapshot carries is recorded whether or not this node
+> holds a collection under the id. "Records as a tombstone when it holds no
+> collection under the id" below becomes an incarnation comparison: a copy of
+> the incarnation the sender dropped is dropped here too, and only a copy
+> created *after* that drop is kept. A snapshot also no longer recreates, or
+> writes into, an incarnation older than a tombstone this node holds — the
+> `restore_collection` defect this record repeats from ADR-148 is closed
+> there.
+
 **Decision.** Five rules for a snapshot, on the receiving side unless said
 otherwise.
 
@@ -12061,3 +12071,254 @@ on the loop's half of the contract; by `kimmyd`'s
 `a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
 which computes the frozen member's age from the instant its real loop
 reports, as a scrape does.
+
+## ADR-155 — A collection this node dropped is not a divergence, and a snapshot does not bring it back
+
+**Decision.** A collection this node holds a tombstone for is not a divergence
+while the peer's copy is the incarnation that was dropped, and a snapshot never
+recreates, or writes into, an incarnation older than a tombstone this node
+holds.
+
+*The document-history rule is written in one function.* `Engine::is_history`
+(`crates/kimmy-storage/src/sync.rs`) is the only place it lives. Given a
+change's stamp and the collection id it is addressed to, together with whatever
+that id resolves to here, it answers whether the change belongs to a life this
+node has already buried: ADR-148's tombstone comparison, on `Stamp` and strict,
+and ADR-081's incarnation floor, on `Hlc` and deliberately *not* strict.
+Neither comparison changed; where they live did. Both routes a peer's
+*documents* reach this node by now call it — the entries path
+(`sync::apply_one`) and the snapshot path (`Engine::apply_snapshot_page`).
+
+**That there is a single site for that rule is the point of this record, not
+tidying.** The entries path honoured the collection tombstones in five places.
+The divergence check and the snapshot repair were written *beside* that path,
+at different times, and consulted neither the tombstone nor the floor — and a
+rule that exists in one path and not in the one next to it is not a rule, it is
+a coincidence that holds until somebody adds a second way in. ADR-148 added one
+(a stopped batch plans a snapshot) and recorded the consequence rather than
+fixing it; this is the record it asked for. Every later route into the same
+question about a document is one call, or it is this finding again.
+
+*The creation-history rule stays in two shapes, and that is deliberate.*
+Whether a collection **definition** arriving here belongs to a life this node
+has buried is asked in two places — `sync::apply_ddl`'s `CreateCollection` arm,
+for a replayed entry, and `snapshot::restore_collection`, for a page — and they
+are not one predicate. An entry carries a full `Stamp` and its comparison is
+strict; a page carries an `Hlc` at best, its comparison is non-strict, and an
+*absent* one is refused outright, which is the mixed-version choice below and
+has no counterpart on the entries path, where a creation always has a stamp.
+Folding them would mean one predicate with two argument shapes and two readings
+of "absent" — more coupling than a shared rule buys, and the kind that reads as
+shared while behaving differently. What they share is the tombstone they read,
+the `debug` line they log, and this record; the code is two sites on purpose,
+said here so it is not later mistaken for the drift above.
+
+*The existence half subtracts what this node has dropped.*
+`Message::Divergence` gains `incarnations`, the `created` of every collection
+the answering node holds, beside the `collections` it already carried;
+`Engine::collection_incarnations` answers both halves from one walk.
+`Engine::collection_tombstones` reads `COLLECTIONS_DROPPED` whole under a read
+transaction — no cutoff and no retention parameter, because `gc.rs` already
+prunes that table by cutoff and walks it whole for the same reason, and two
+places deciding retention is how they drift apart. `divergence::compare` then
+drops from the existence set every id this node holds a tombstone for, unless
+the peer's incarnation is *strictly* newer than the drop. Equal subtracts: that
+is the same-millisecond tie ADR-081 was written for. The count half is
+untouched — it probes only collections this node holds, and a collection this
+node has dropped is not one of them.
+
+*A snapshot does not recreate an incarnation a tombstone closed.*
+`SnapshotPage`'s `CollectionState` gains `created`, the incarnation the sender
+holds the collection under. `restore_collection` derives the id, and where this
+node holds a tombstone at or after that incarnation it creates nothing and logs
+at `debug`, in the voice `sync::apply_ddl` uses for a replayed
+`CreateCollection` it ignores. The page is the sender's current state, not an
+instruction: a peer that has not applied the drop yet still serves the
+collection, and creating it here puts it back on every member that had it
+right.
+
+*A restored collection carries the sender's incarnation, not this node's
+clock.* The origin passed to `create_collection_inner` is the page's `created`,
+where it was hard-coded `None` before — which is ADR-081's own argument, met
+through a route ADR-081 predates. A replicated creation that records the
+receiver's apply clock claims an incarnation later than the true one, so a
+legitimate drop replayed afterwards reads as older than the collection standing
+here and is ignored, and the check above reads the restored copy as a genuine
+recreation and pulls it back. Without this the rest of the record does not
+hold.
+
+*A snapshot document is put to the same predicate before it is applied.*
+`apply_remote_in_txn` decides last-writer-wins on the document stamp and
+nothing else — every tombstone and floor guard lived in `sync::apply_one` — so
+a snapshot page could write into a collection the receiver had buried. Each
+document now goes to `is_history` first; one that is history is skipped and
+counted as `superseded` on `SnapshotApplied`, as is a document whose collection
+`restore_collection` refused. The count rides the two `INFO` lines
+`pull_snapshot` already writes, so a repair round that lands nothing because
+everything on the page was history reads as exactly that rather than as a
+stall. It is a log field and not a series: a metric that only moves during a
+repair reads 0 for ever after, which is ADR-152's own reason for not adding
+one. The repair's stall count is unaffected — `PeerStalls::snapshot_advanced`
+keys off pages applied, and a page of nothing but history is still a page.
+
+*A drop a snapshot carries is judged against the incarnation held here.* Where
+`restore_collection_drop` ignored the drop outright whenever this node held a
+collection under the id, it now compares: a drop at or after the held copy's
+`created` is aimed at *that* copy and is applied here as a replicated drop —
+the tombstone at the sender's stamp, no entry minted — exactly as
+`sync::apply_ddl`'s `DropCollection` arm does. A drop older than the
+incarnation standing here belongs to a previous life and is still ignored: the
+sender is simply behind. **This amends ADR-152**, whose scoped-snapshot rule
+recorded the drop as a tombstone only when this node held no collection under
+the id — which left the repair pulling a collection the sender had dropped, and
+the receiver keeping its half-repaired copy of exactly the incarnation the drop
+removed.
+
+**The mixed-version choice, stated plainly.** Both new fields are
+`#[serde(default)]`, the way `AskEntries::held` (ADR-097),
+`AskVersions::witnessed` (ADR-146) and `AskSnapshot::collection` (ADR-152)
+crossed versions. A peer that predates them sends no incarnation stamp, and for
+an id this node holds a tombstone for, "no stamp" is read as "the incarnation I
+dropped": not reported by the check, not restored by a snapshot. The cost is
+narrow and real. A collection genuinely recreated on an *older* peer, whose
+`CreateCollection` entry has already aged out of that peer's oplog, is not
+pulled by the check until the roll completes or the tombstone expires — so:
+recreate, then wait past `storage.oplog_retention_secs`, all inside the minutes
+a rolling upgrade takes. That is chosen over resurrecting a drop, because a
+drop undone is not recoverable by waiting and a recreation deferred is. The
+ordinary recreation is unaffected either way: an older peer's `CreateCollection`
+entry arrives through the entries path and is applied there by ADR-148's rule,
+as it always was, and neither field is on that path.
+
+**Why.** On a converged three-member cluster a database drop answered
+`200 {"dropped": true}`, and minutes later its collection was back on all three
+members holding all 48,128 documents it had held before. Twice. Nothing failed:
+no round, no handshake, no schema change; `kimmy_replication_lag_seconds` read
+0 throughout. What moved was `kimmy_sync_divergent_collections`, correctly and
+for the wrong reason. The drop was applied where it landed and replicated as an
+entry like any other change, and while it was in flight the existence half of
+the divergence check looked at a peer that had not applied it yet, saw a
+collection the peer held and this node did not, and confirmed it — which is the
+one thing that half must never do, because a peer that is behind is not
+divergent. Anti-entropy repairs what the check reports, so the finding became a
+snapshot pull, `restore_collection` recreated the collection without consulting
+this node's tombstones, and the recreated copy then advertised itself and
+re-seeded the members that had it right. The second event was the first one's
+repair.
+
+The tombstone that would have stopped all of it was sitting in
+`COLLECTIONS_DROPPED` on every member the whole time. ADR-148 saw the
+`restore_collection` half of this in review — "resurrected holding two
+documents" — recorded it as a defect its own change made more reachable, and
+left it for the drop rules; what the field finding added is that the divergence
+check reaches the same end without a snapshot needing to be planned for any
+other reason, and that the snapshot's *documents* pass through a path with no
+guard on them at all.
+
+**Alternatives.** *Report the divergence and let the repair settle it.* That is
+the finding: the repair is the mechanism that resurrects the drop, so a check
+that reports a dropped collection is a check that undoes drops. *Never report
+an id this node has ever dropped* — the tombstone as a gate rather than a
+comparison. Simpler, and it hides a genuine recreation for a whole
+`storage.tombstone_retention_secs` on every member, not only during a roll; the
+incarnation comparison costs one `Hlc` per collection on the answer and gives
+the recreation back. *Read a missing incarnation as a recreation.* The
+available-looking default and the wrong one: it restores the drop from any peer
+that predates the field, which is every peer for the length of a roll — the
+finding, reachable on schedule. *A cutoff on `collection_tombstones`.* Rejected
+above: `gc.rs` decides retention, and it decides it once. *Fold `superseded`
+into the round's counters.* It would feed the existing counter a partial count
+— it deliberately excludes last-writer-wins losers, which the entries path does
+count — and a number that means one thing on one route and another on the other
+is worse than no number. *Leave `restore_collection`'s origin at `None`.*
+ADR-081's mistake, on the other route.
+
+**Cost.** Two optional fields on the wire, one on `Message::Divergence` and one
+on a snapshot page's collection definition; one `usize` on `SnapshotApplied`
+and one field on two `INFO` lines. No new `/metrics` series. A divergence
+answer grows by an id and an `Hlc` per collection the answering node holds, on
+a message that already carried the ids.
+
+The receiver-side write of the amended `restore_collection_drop` is the one
+cost worth naming: applying a sender's drop of a collection held here at an
+older incarnation removes the whole copy in a single transaction, as every drop
+does, and on a collection a repair was part-way through that is a large write
+while the single writer is held. It is a known cost and it is the correct
+write — what is removed is a partial copy of a life that has ended everywhere
+else — and it is bounded by the chunked-drop work, not by this record.
+
+**Residuals, stated.** **A whole-database snapshot carries no collection drops
+at all, and this record does not close that route.** `SnapshotPage::dropped` is
+set on the scoped arm only, and a whole-database page's collection list is a
+walk of what the sender still holds, so what it dropped is simply absent from
+it — and an absence is not a drop. What this record closes is the *scoped*
+snapshot route and the divergence check.
+
+What makes the whole-database route worse than a gap the entries path fills is
+the coverage grant. That snapshot is what a receiver *below the sender's
+retention horizon* pulls, and on completing it the receiver absorbs the vector
+served with the snapshot's first page (ADR-152). The sender's drop entry sits
+at or below that vector, and coverage is per origin: a peer serves only what is
+above the receiver's witnessed vector, so once the grant is recorded nothing
+will serve that entry again (ADR-054). The snapshot closes the door the drop
+would otherwise have come through. It is not "the drop arrives later"; on this
+route it does not arrive.
+
+So the receiver keeps the collection — live, served and writable — and the
+state is stable rather than transient. Its own existence half never reports a
+collection *only it* holds; the count half cannot fire either, because the
+sender holds nothing under the id to answer a probe with; so nothing remains
+that tells the receiver to drop it. What this record does change on that route
+is the other half of the finding: the sender's existence half now subtracts the
+id, so the sender no longer pulls the collection straight back and re-seeds the
+members that had it right. But when the sender's tombstone ages out past
+`storage.tombstone_retention_secs`, the sender's check reports the collection
+again and repairs it by pulling a scoped snapshot from the receiver, which
+still holds it at its original incarnation with every document. The
+resurrection on this route is therefore narrowed from immediate to deferred by
+one tombstone-retention window, and the re-seeding half of it is gone; the
+price is that a state which used to correct itself is now a durable
+disagreement between those two members for the length of that window.
+
+**This is an open item, stated here and not fixed here**; it is tracked
+separately. Two closures are candidates, and both are decisions of their own
+rather than a line in this record. Either the whole-database first page carries
+the sender's tombstones alongside its collection list, so the receiver records
+them as it records the definitions — which puts a second kind of thing on a
+page whose contract is "what I hold". Or the receiver reconciles the
+collections it holds and the sender does not against the sender's tombstones at
+the moment it adopts the coverage — the one moment it is knowingly taking the
+sender's whole history on trust, and so the one moment the reconciliation is
+justified. Neither is attempted above, and the rule above must not be read as
+covering it.
+
+Past `storage.tombstone_retention_secs` the tombstone is collected, and from
+there ADR-085's resurrection case applies to a dropped collection exactly as it
+applies to a deleted document: a peer that never saw the drop, and whose
+`CreateCollection` is still servable, brings the collection back with nothing
+here to lose against. The retention setting is the width of that window and
+`docs/operations.md` says so where an operator reads it.
+
+**How it is tested.** By `kimmy-storage`'s
+`a_collection_this_node_dropped_is_not_divergent_while_the_peer_still_holds_it`
+(including an incarnation landing exactly on the drop stamp, the tie),
+`a_collection_recreated_since_this_node_dropped_it_is_divergent`,
+`a_peer_that_names_no_incarnation_is_read_as_holding_the_one_this_node_dropped`
+(which also pins that the rule subtracts rather than gates: an id with no
+tombstone here is still reported from the same stampless answer), and
+`the_incarnations_and_the_tombstones_are_the_two_halves_of_one_answer`; by
+`a_snapshot_does_not_recreate_a_collection_this_node_has_dropped`,
+`a_snapshot_recreates_a_collection_created_after_the_drop_held_here`,
+`a_snapshot_that_names_no_incarnation_does_not_recreate_a_dropped_collection`,
+`a_whole_database_snapshot_restores_every_collection_under_the_senders_incarnation`
+(the origin, against this node's apply clock),
+`a_snapshot_document_from_a_life_buried_here_is_history_and_is_counted`,
+`a_snapshot_carrying_a_drop_of_the_incarnation_held_here_drops_it_here_too`
+(the tombstone at the sender's stamp, and this node's own origin not advancing,
+so no entry is minted) and
+`a_snapshot_carrying_a_drop_older_than_the_incarnation_held_here_is_ignored`;
+by `kimmy-cluster`'s `divergence_crosses_a_version_boundary_in_both_directions`
+for the frame each side of an upgrade sees; and by ADR-148's
+`a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall` and
+ADR-152's `a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone`,
+which pass unchanged through the move of the predicate they exercise.

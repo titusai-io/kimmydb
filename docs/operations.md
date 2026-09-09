@@ -576,7 +576,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because the peer is behind this node — has not *processed* everything this node has ([ADR-146](decisions.md)) — and still catching up. `deferred` rising on a busy cluster is ordinary, and on a converged idle cluster it should not rise at all; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
 | `kimmy_sync_divergence_check_age_seconds` | Seconds since the last contact, with any peer, in which the check ran, computed at the moment it is read; 0 before the first, when `ran` is also 0. **Alert on this above *k* × `cluster.sync_interval_secs`** (three is a reasonable *k*): the gauge above is then holding a value nothing has re-examined, whatever it reads — look at `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`, and if both are quiet, at `kimmy_write_lock_wait_seconds`. The one divergence series that keeps moving on a member whose every round fails, which leaves `ran` flat and the gauge serving its last value — measured on a three-member cluster, one member's gauge read 0 for half an hour after its last completed round ([ADR-145](decisions.md)) — and equally on a member whose anti-entropy loop has stopped completing ticks and pushes nothing at all: the age is a subtraction against the scrape's own clock, not a number the loop reported, so a stuck loop cannot freeze it. It used to be pushed at the end of each tick, and on a member whose tick waited on the single writer for over an hour it read the same number on every scrape while the member fell some 30,000 documents behind with the gauge at 0 ([ADR-154](decisions.md)). A tick that took longer than the interval is logged at `WARN` when it ends, with how long it took |
 | `kimmy_sync_entries_skipped_total{reason}` | Replicated entries a sync round left rather than took ([ADR-148](decisions.md)). **`unknown_collection`**: batches stopped at an entry for a collection this member has *no record of* — it neither holds the collection nor a tombstone for it — because the creation was witnessed here without being applied, or has aged out of the peer's oplog. One per stopped batch, at the entry the warning names. Nothing past the stop is witnessed, the same window is re-served every round, and the round plans a snapshot from that peer to bring the collection. A collection this member *dropped* is history and stops nothing, so an ordinary concurrent drop-and-write does not move this. **Alert on this sustained**: one or two while a creation propagates is ordinary, a rate that does not stop is a member that cannot place what its peers keep sending it, and `kimmy_sync_repair_rounds_total` is what says the snapshot is being pulled. **`beyond_advertised`**: entries above the vector the peer advertised before serving the window — it appended them in between — left for the next round, which asks for them from the right position. Ordinary and rare on a busy cluster — the counter for a race, not a fault — and, since [ADR-152](decisions.md), routine for the length of a snapshot when this member pulls from a member that is *mid-snapshot*: that member's oplog holds the snapshot's documents above what it advertises until the snapshot completes, so every window it serves carries entries this member must leave, a batch at a time. Harmless — nothing is witnessed — and it stops when that member's `caught up from a snapshot` line lands; only a rate that outlives every snapshot on the cluster is worth a look |
-| `kimmy_sync_repair_rounds_total` | Sync rounds spent repairing against a peer ([ADR-148](decisions.md)): re-serving its oplog from a divergent collection's creation, window by window until one reaches the peer's tail, or pulling its snapshot of that one collection — a page per commit, resumed on the next round from the last page applied when one round's budget is not enough ([ADR-152](decisions.md)). Rises after `kimmy_sync_divergent_collections` goes above 0, or after a batch stops at a collection this member lacks, and stops when the repair is done — so a burst here followed by the gauge returning to 0 is the repair working. A snapshot of a large collection is several rounds of this with an `INFO` line per round saying how many pages and documents landed and where the cursor stands; that is the repair working too. Rising steadily while the gauge stays above 0 with no page landing is a divergence the repair cannot close: a repair is abandoned after three rounds that apply nothing, the same collection is repaired again at most once every five minutes of rounds, and the warning at the time names it and the peer |
+| `kimmy_sync_repair_rounds_total` | Sync rounds spent repairing against a peer ([ADR-148](decisions.md)): re-serving its oplog from a divergent collection's creation, window by window until one reaches the peer's tail, or pulling its snapshot of that one collection — a page per commit, resumed on the next round from the last page applied when one round's budget is not enough ([ADR-152](decisions.md)). Rises after `kimmy_sync_divergent_collections` goes above 0, or after a batch stops at a collection this member lacks, and stops when the repair is done — so a burst here followed by the gauge returning to 0 is the repair working. A snapshot of a large collection is several rounds of this with an `INFO` line per round saying how many pages and documents landed and where the cursor stands; that is the repair working too. Rising steadily while the gauge stays above 0 with no page landing is a divergence the repair cannot close: a repair is abandoned after three rounds that apply nothing, the same collection is repaired again at most once every five minutes of rounds, and the warning at the time names it and the peer. **A drop does not start a repair round.** A collection this member dropped is not reported by the existence half while a peer still holds the incarnation that was dropped, so a drop replicating through the cluster moves neither `kimmy_sync_divergent_collections` nor this counter — it used to move both, and the repair it started brought the dropped collection back ([ADR-155](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 | `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
@@ -618,7 +618,11 @@ shape to expect is the gauge going above 0, repair rounds rising, and the
 gauge returning to 0. A gauge that stays above 0 while repair rounds keep
 rising, with no `snapshot left to resume` line saying pages are landing, is a
 divergence the repair cannot close, and the warning at the time names the
-collection and the peer.
+collection and the peer. Both snapshot lines — `caught up from a snapshot` and
+`snapshot left to resume` — carry `superseded` beside `documents`: pages that
+landed nothing because everything on them belonged to a collection this member
+has since dropped, which is a repair finishing rather than a repair stuck
+([ADR-155](decisions.md)).
 
 **The reading to be careful of is no reading at all.** The check compares this
 member against a *peer*, so a hole no peer disagrees about is invisible to it:
@@ -631,6 +635,26 @@ own count, a bulk load whose totals do not match what it wrote — compare the
 members' document counts directly rather than reading this page, and repair
 with a restore or by removing and re-seeding the odd member out
 ([ADR-148](decisions.md)).
+
+**A collection only one member holds is invisible to that member's own
+check**, and there is one way to reach that state on purpose. The existence
+half reports what a *peer* holds and this member does not, never the reverse,
+and the count half has nothing to compare when the peer holds no such
+collection — so a member holding a collection every other member has dropped
+sees a clean gauge, and the members that dropped it now subtract it rather
+than reporting it ([ADR-155](decisions.md)). The way in is the whole-database
+catch-up a member below a peer's retention horizon pulls: that snapshot
+carries no collection drops, and completing it grants the member coverage of
+the sender's history, so the drop entry it never applied is below that
+coverage and no peer will serve it. The member keeps the collection, live and
+writable, until the dropping member's tombstone expires — at which point that
+member's check reports it and repairs it back onto the cluster. The tell is
+the `WARN` that starts the catch-up, `behind the peer's retention horizon;
+falling back to a snapshot`, followed by `caught up from a snapshot`: **a
+member that has logged that pair may hold collections the rest of the cluster
+dropped while it was away.** Compare its collection list against a member that
+stayed up, and drop anything only it holds. Recorded rather than closed
+([ADR-155](decisions.md)).
 
 **What runs, and when.** Every anti-entropy round whose pull reaches the
 peer's true tail also asks that peer what it holds, on the same connection —
@@ -789,7 +813,17 @@ reconciliation would:
 - **Which collections exist**, on this node and on the peer. Metadata only —
   a scan of the database and collection tables, never a document — so it
   costs the same regardless of how much data a collection holds and runs
-  whenever the check does.
+  whenever the check does. A collection this node **dropped** within
+  `storage.tombstone_retention_secs` is not reported as missing while the
+  peer still holds the incarnation that was dropped: that peer has not
+  applied the drop yet, which is being behind and not being divergent, and
+  reporting it meant repairing the drop away and re-seeding the members that
+  had it right ([ADR-155](decisions.md)). The peer names the incarnation it
+  holds in its answer, so a collection genuinely *recreated* since the drop
+  is still reported. A peer on a release that predates the field names none,
+  and is read as holding the dropped incarnation, so during a rolling upgrade
+  a recreation on a member not yet rolled is left to the ordinary entries
+  path rather than reported here.
 - **One collection's live document count**, chosen in turn from this node's
   own collection list so a check pays for at most one collection's scan
   rather than the whole database. Reaching every collection again after one

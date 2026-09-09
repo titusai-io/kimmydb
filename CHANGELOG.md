@@ -10,6 +10,69 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A dropped collection came back from a peer that had not applied the drop
+  yet, with all its documents.** On a converged three-member cluster a database
+  drop answered `200 {"dropped": true}` and, minutes later, its collection was
+  back on all three members holding all 48,128 documents it had held before —
+  twice, the second time as the repair of the first. Nothing failed while it
+  happened: no round, no handshake, no schema change, and
+  `kimmy_replication_lag_seconds` at 0 on every member throughout. A drop
+  replicates as a change like any other, and while it was in flight the
+  cross-member divergence check looked at a peer that had not applied it yet,
+  saw a collection that peer held and this member did not, and confirmed it as
+  a divergence — which anti-entropy then repaired by pulling that peer's
+  snapshot, recreating the collection here, and re-seeding the members that had
+  it right ([ADR-155](docs/decisions.md)). The collection tombstones that would
+  have stopped all of it were sitting on every member the whole time: the
+  replication entries path consulted them, and the divergence check and the
+  snapshot repair, written beside that path at different times, never did. Both
+  now consult them, through the single predicate the entries path uses, so the
+  rule lives in one place rather than in two that can drift. A collection this
+  member has dropped is no longer reported as missing while the peer still
+  holds the incarnation that was dropped; a snapshot no longer recreates, or
+  writes documents into, a collection whose drop this member has applied; a
+  snapshot that carries the *sender's* drop of a collection this member holds
+  at the incarnation dropped now applies that drop here instead of ignoring it;
+  and a collection a snapshot does legitimately restore is created under the
+  sender's incarnation rather than the receiving member's clock, so the next
+  check does not read it as a fresh recreation. The two snapshot `INFO` lines
+  gain a `superseded` count, so a repair round that lands nothing because the
+  page was all history reads as exactly that rather than as a stall; no new
+  `/metrics` series, and no HTTP shape changed. **The fix is compatible on the
+  wire, so it ships as a patch**: the two new fields — the incarnation a member
+  names for each collection it holds, and the incarnation a snapshot page names
+  for a collection definition — are defaulted, so a member on an earlier
+  release reads both messages exactly as it did before and a rolling upgrade
+  needs no stop. For the length of that roll a member that names no incarnation
+  is read as holding the incarnation this member dropped: not reported, not
+  restored. The cost of that reading is narrow and deliberate — a collection
+  genuinely recreated on a member not yet rolled, whose creation has already
+  aged out of that member's oplog, is not pulled by the check until the roll
+  finishes or the tombstone expires — and it is chosen over resurrecting a
+  drop, which no amount of waiting undoes; an ordinary recreation is
+  unaffected, because its `CreateCollection` still arrives by the entries path.
+  One route is **not** closed by this, and an operator should know it: a
+  **whole-database** snapshot carries no collection drops at all. That snapshot
+  is what a member below a peer's retention horizon pulls, and completing it
+  grants the member coverage of the sender's history — so a member that holds a
+  collection the sender has dropped finds the drop neither on the page nor,
+  afterwards, on the wire: the entry carrying it is below the coverage that
+  member has just adopted, and a peer serves only what is above it. The member
+  keeps the collection, live and writable, and nothing reports the
+  disagreement — a member's own check only reports collections a *peer* holds
+  and it does not, and the count half has nothing to compare against. What this
+  release changes there is the other half: the sender no longer pulls the
+  collection straight back and re-seeds the cluster with it. When the sender's
+  tombstone expires the sender's check reports the collection again and repairs
+  it from the member that still holds it, so on that one route the resurrection
+  is deferred by a `storage.tombstone_retention_secs` window rather than
+  prevented, and until then the two members durably disagree. It is tracked
+  separately.
+
 ## 0.26.0 - 2026-09-08
 
 ### Fixed
