@@ -12079,39 +12079,73 @@ while the peer's copy is the incarnation that was dropped, and a snapshot never
 recreates, or writes into, an incarnation older than a tombstone this node
 holds.
 
-*The document-history rule is written in one function.* `Engine::is_history`
-(`crates/kimmy-storage/src/sync.rs`) is the only place it lives. Given a
-change's stamp and the collection id it is addressed to, together with whatever
-that id resolves to here, it answers whether the change belongs to a life this
-node has already buried: ADR-148's tombstone comparison, on `Stamp` and strict,
-and ADR-081's incarnation floor, on `Hlc` and deliberately *not* strict.
-Neither comparison changed; where they live did. Both routes a peer's
-*documents* reach this node by now call it — the entries path
+**Two rules are named by this record, and each is written once**, both in
+`crates/kimmy-storage/src/sync.rs`.
+
+*`Engine::is_history` — whether a change belongs to a life already buried.*
+Given a change's stamp and the collection id it is addressed to, together with
+whatever that id resolves to here, it answers with ADR-148's tombstone
+comparison, on `Stamp` and strict, and ADR-081's incarnation floor, on `Hlc` and
+deliberately *not* strict. Neither comparison changed; where they live did. Both
+routes a peer's *documents* reach this node by now call it — the entries path
 (`sync::apply_one`) and the snapshot path (`Engine::apply_snapshot_page`).
 
-**That there is a single site for that rule is the point of this record, not
-tidying.** The entries path honoured the collection tombstones in five places.
-The divergence check and the snapshot repair were written *beside* that path,
-at different times, and consulted neither the tombstone nor the floor — and a
-rule that exists in one path and not in the one next to it is not a rule, it is
-a coincidence that holds until somebody adds a second way in. ADR-148 added one
-(a stopped batch plans a snapshot) and recorded the consequence rather than
-fixing it; this is the record it asked for. Every later route into the same
-question about a document is one call, or it is this finding again.
+*`aims_at_a_previous_incarnation(current, dropped)` — which incarnation a drop
+is aimed at.* Two clauses, and a drop is aimed at a life that has already ended
+if either holds: it **predates the `created`** of the incarnation standing here,
+or it is **at or before that incarnation's floor**, the drop it was created
+over. Its two callers are the replicated `DropCollection` arm of
+`sync::apply_ddl` and the drop a scoped snapshot carries,
+`snapshot::restore_collection_drop`. A drop is the only change that destroys
+state, so it is the only one that has to know which copy it was aimed at.
+
+**That each rule has a single site is the point of this record, not tidying.**
+The entries path honoured the collection tombstones in five places. The
+divergence check and the snapshot repair were written *beside* that path, at
+different times, and consulted neither the tombstone nor the floor — and a rule
+that exists in one path and not in the one next to it is not a rule, it is a
+coincidence that holds until somebody adds a second way in. ADR-148 added one (a
+stopped batch plans a snapshot) and recorded the consequence rather than fixing
+it; this is the record it asked for.
+
+The second rule is named because the same shape recurred inside the fix for the
+first, and it is worth stating without dressing it up. `restore_collection_drop`
+was first written with the `created` clause only, on the argument that the floor
+clause could not bite. It can. A create and a drop minted in the same
+millisecond on two nodes tie on the `Hlc`; `apply_ddl`'s creation rule breaks
+that tie on `Stamp`, so the create is applied with `created` equal to the floor
+it took from the surviving tombstone. When that drop is delivered again — which
+overlapping ranges and a re-planned repair both do routinely — the entries path
+turns it away on the floor clause and the one-clause copy read it as aimed at
+the copy standing here and destroyed the collection. Two paths disagreeing about
+one collection is the whole of the finding this record is about; a partial copy
+of the rule written to close it reproduced that disagreement in the direction
+that loses data, and review caught it before it shipped. That is the argument
+for a call rather than a copy, made twice, and it is why the drop rule has a
+name of its own rather than a comment saying the two arms agree.
 
 *The creation-history rule stays in two shapes, and that is deliberate.*
 Whether a collection **definition** arriving here belongs to a life this node
 has buried is asked in two places — `sync::apply_ddl`'s `CreateCollection` arm,
 for a replayed entry, and `snapshot::restore_collection`, for a page — and they
-are not one predicate. An entry carries a full `Stamp` and its comparison is
-strict; a page carries an `Hlc` at best, its comparison is non-strict, and an
-*absent* one is refused outright, which is the mixed-version choice below and
-has no counterpart on the entries path, where a creation always has a stamp.
-Folding them would mean one predicate with two argument shapes and two readings
-of "absent" — more coupling than a shared rule buys, and the kind that reads as
-shared while behaving differently. What they share is the tombstone they read,
-the `debug` line they log, and this record; the code is two sites on purpose,
-said here so it is not later mistaken for the drift above.
+are not one predicate. An entry carries a full `Stamp`, and the comparison is
+strict because the `Stamp` itself breaks a same-millisecond tie on node id. A
+page carries an `Hlc` at best, which cannot break that tie, so the comparison is
+non-strict; and it may carry nothing at all, which is refused outright and is
+the mixed-version choice below. There is no shared input type to write the
+question in, and both differences follow from that rather than from taste.
+
+These two sites are different in kind from the drop rule's two copies, and the
+difference is worth naming, because a deliberate duplication now sits beside one
+that turned out to be a defect. The drop rule's copies asked the same question
+of the same inputs and were meant to agree, so their disagreement was silent and
+it deleted a collection. The creation rule's two sites ask the same question of
+inputs that are not the same thing, and both answers are refusals — to create,
+or to apply a creation — so the worst a drift between them can do is leave a
+collection uncreated for a peer to bring again. Neither can destroy anything.
+Folding them would mean one predicate over a sum type, branching immediately
+into the two bodies that exist now, under a shared name asserting an agreement
+that does not hold.
 
 *The existence half subtracts what this node has dropped.*
 `Message::Divergence` gains `incarnations`, the `created` of every collection
@@ -12161,14 +12195,18 @@ repair reads 0 for ever after, which is ADR-152's own reason for not adding
 one. The repair's stall count is unaffected — `PeerStalls::snapshot_advanced`
 keys off pages applied, and a page of nothing but history is still a page.
 
-*A drop a snapshot carries is judged against the incarnation held here.* Where
-`restore_collection_drop` ignored the drop outright whenever this node held a
-collection under the id, it now compares: a drop at or after the held copy's
-`created` is aimed at *that* copy and is applied here as a replicated drop —
-the tombstone at the sender's stamp, no entry minted — exactly as
-`sync::apply_ddl`'s `DropCollection` arm does. A drop older than the
-incarnation standing here belongs to a previous life and is still ignored: the
-sender is simply behind. **This amends ADR-152**, whose scoped-snapshot rule
+*A drop a snapshot carries is judged against the incarnation held here, by the
+predicate the entries path uses.* Where `restore_collection_drop` ignored the
+drop outright whenever this node held a collection under the id, it now asks
+`aims_at_a_previous_incarnation`. A drop aimed at a life that has already ended
+is ignored, tombstone and all — the sender is simply behind, and a tombstone
+below the incarnation standing here says nothing that incarnation's own floor
+does not. A drop aimed at the copy standing here takes it, applied as a
+replicated drop: the tombstone at the sender's stamp and no entry minted,
+exactly as `sync::apply_ddl`'s `DropCollection` arm applies one. Because it is
+the same call and not a second reading of the same rule, the two routes reach
+the same answer for every state, the `created == floor` tie included.
+**This amends ADR-152**, whose scoped-snapshot rule
 recorded the drop as a tombstone only when this node held no collection under
 the id — which left the repair pulling a collection the sender had dropped, and
 the receiver keeping its half-repaired copy of exactly the incarnation the drop
@@ -12231,7 +12269,14 @@ into the round's counters.* It would feed the existing counter a partial count
 — it deliberately excludes last-writer-wins losers, which the entries path does
 count — and a number that means one thing on one route and another on the other
 is worse than no number. *Leave `restore_collection`'s origin at `None`.*
-ADR-081's mistake, on the other route.
+ADR-081's mistake, on the other route. *Judge a snapshot's drop by the
+incarnation's `created` alone,* on the argument that `created` at or below the
+floor is a state the create path does not produce. It is: the creation rule
+compares a `Stamp` and breaks a same-millisecond tie on node id, so a create can
+land at exactly the floor it took from the tombstone it survived. That
+one-clause form was written, and it deleted a collection the entries path keeps
+— which is why the rule is a call to `aims_at_a_previous_incarnation` and not a
+comparison written out a second time.
 
 **Cost.** Two optional fields on the wire, one on `Message::Divergence` and one
 on a snapshot page's collection definition; one `usize` on `SnapshotApplied`
@@ -12317,7 +12362,15 @@ tombstone here is still reported from the same stampless answer), and
 (the tombstone at the sender's stamp, and this node's own origin not advancing,
 so no entry is minted) and
 `a_snapshot_carrying_a_drop_older_than_the_incarnation_held_here_is_ignored`;
-by `kimmy-cluster`'s `divergence_crosses_a_version_boundary_in_both_directions`
+by the two that pin the tie the drop rule exists for —
+`a_snapshot_carrying_the_drop_a_collection_was_created_over_is_ignored`, a
+collection whose `created` equals its floor and the drop that produced that
+floor arriving again through a repair, which a comparison against `created`
+alone deletes and the entries path's own rule defends, and
+`a_snapshot_document_at_the_incarnation_floor_is_history_though_it_outranks_the_tombstone`,
+the same tie one door along, where a last pre-drop write sorts *after* the
+tombstone as a `Stamp` and only the floor, on `Hlc` and not strict, turns it
+away; by `kimmy-cluster`'s `divergence_crosses_a_version_boundary_in_both_directions`
 for the frame each side of an upgrade sees; and by ADR-148's
 `a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall` and
 ADR-152's `a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone`,
