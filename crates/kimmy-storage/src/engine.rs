@@ -321,7 +321,9 @@ fn write_wait_budget() -> Option<std::time::Duration> {
 
 /// An exclusive hold of the writer; see [`Engine::hold_writer`].
 pub struct WriterHold<'a> {
-    _gate: parking_lot::MutexGuard<'a, ()>,
+    /// `None` once let go, which happens *before* the hold is recorded —
+    /// the order [`WriteTxn::release`] takes and states its reason for.
+    gate: Option<parking_lot::MutexGuard<'a, ()>>,
     engine: &'a Engine,
     held_from: std::time::Instant,
     holder: WriterHolder,
@@ -329,7 +331,14 @@ pub struct WriterHold<'a> {
 
 impl Drop for WriterHold<'_> {
     fn drop(&mut self) {
-        self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+        // Let go first, then record, as `WriteTxn::release` does. What
+        // follows the release is a handful of atomics and, past
+        // `WRITER_HOLD_WARN`, a log call; small, but it is not work the
+        // next writer in the queue should be waiting through, and two
+        // paths that release the same gate should not do it in two orders.
+        if self.gate.take().is_some() {
+            self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+        }
     }
 }
 
@@ -670,7 +679,7 @@ impl Engine {
     /// the holder it is given is the one whose hold it is standing in for.
     pub fn hold_writer(&self, holder: WriterHolder) -> WriterHold<'_> {
         let gate = blocking(|| self.writer_gate.lock());
-        WriterHold { _gate: gate, engine: self, held_from: std::time::Instant::now(), holder }
+        WriterHold { gate: Some(gate), engine: self, held_from: std::time::Instant::now(), holder }
     }
 
     fn record_writer_wait(&self, waited: std::time::Duration) {
@@ -1454,12 +1463,13 @@ impl Engine {
     fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
         // The leader's own transaction queues like any other (ADR-151); the
         // committer it flushes for released the gate before it began to wait.
-        // Held through this whole function, so the guard measures the flush
-        // rather than the lock acquisition (ADR-159) — this is the one hold
-        // that does not open a counted transaction, and before it was
-        // attributed it was the one hold nothing recorded at all.
+        // The gate is held for exactly as long as it always was — to the end
+        // of this function — and is now wrapped so that the hold is recorded
+        // (ADR-159). This is the one path that takes the writer without
+        // opening a counted transaction, which is why it was the one hold
+        // nothing measured at all: not mislabelled, absent.
         let _gate = WriterHold {
-            _gate: blocking(|| self.writer_gate.lock()),
+            gate: Some(blocking(|| self.writer_gate.lock())),
             engine: self,
             held_from: std::time::Instant::now(),
             holder: WriterHolder::Durability,

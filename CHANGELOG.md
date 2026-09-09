@@ -42,6 +42,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   removals, no HTTP shape changed, no protocol field added. A dashboard or scrape
   config built on the three existing writer series is untouched.
 
+## 0.26.1 - 2026-09-09
+
 ### Changed
 
 - **Dropping a collection no longer stops every other write on the member.**
