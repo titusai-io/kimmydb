@@ -621,19 +621,20 @@ impl Engine {
     /// life of the process — and, when this node still holds the very
     /// incarnation that was dropped, apply the drop here as well.
     ///
-    /// Which incarnation decides it, exactly as it decides a replicated
-    /// `DropCollection` (`sync::apply_ddl`): a drop at or after the `created`
-    /// of the collection standing here is aimed at *this* copy, and leaving
-    /// that copy in place is the resurrection the tombstone exists to stop —
-    /// this node would go on advertising it, and the peers that applied the
-    /// drop would pull it back. A drop that predates the collection standing
-    /// here belongs to a previous life and is ignored outright, tombstone and
-    /// all: the sender is simply behind, and a tombstone below the incarnation
-    /// this node holds says nothing the incarnation's own floor does not.
+    /// Which incarnation it is aimed at decides it, and that question is
+    /// asked in one place — `sync::aims_at_a_previous_incarnation`, which the
+    /// replicated `DropCollection` arm asks too. A drop aimed at the copy
+    /// standing here takes it: leaving it is the resurrection the tombstone
+    /// exists to stop, since this node would go on advertising a collection
+    /// the cluster has agreed is deleted, and the peers that applied the drop
+    /// would pull it back from here. A drop aimed at a life that has already
+    /// ended is ignored outright, tombstone and all: the sender is simply
+    /// behind, and a tombstone below the incarnation standing here says
+    /// nothing that incarnation's own floor does not.
     fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
-            if current.created > dropped.hlc {
-                debug!(collection = %id, "a snapshot carried a drop older than the incarnation this node holds; ignored");
+            if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
+                debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
                 return Ok(());
             }
             // One transaction for the whole copy, as every drop is. On a
@@ -1532,6 +1533,129 @@ mod tests {
 
         assert_eq!(b.get_collection("shop", "orders").unwrap().created, cb.created);
         assert_eq!(b.count(&cb).unwrap(), 1, "the newer incarnation and its documents stand");
+    }
+
+    /// Two nodes minting the same `Hlc` in the same millisecond, with the
+    /// create's node sorting above the drop's. `low` stamps the drop, `high`
+    /// the create.
+    fn tied_nodes() -> (kimmy_core::NodeId, kimmy_core::NodeId) {
+        let low = kimmy_core::NodeId::from_bytes([1; 16]);
+        let high = kimmy_core::NodeId::from_bytes([2; 16]);
+        assert!(high > low, "the fixture depends on the node ids breaking the tie this way");
+        (low, high)
+    }
+
+    /// A collection standing at exactly its own incarnation floor, which is
+    /// what a create that beat a same-millisecond drop on the node id leaves:
+    /// `apply_ddl`'s creation rule compares `Stamp` strictly, so the create is
+    /// not history and is applied, taking `created` from its origin and the
+    /// floor from the tombstone that survived it. Both are the same `Hlc`.
+    ///
+    /// Returned with the drop's stamp, which is the one a peer that applied
+    /// the drop and never saw the create still answers a repair with, and
+    /// with that same drop as the oplog entry the other route delivers.
+    fn at_its_own_floor(b: &Engine, wall: u64) -> (CollectionMeta, Stamp, OplogEntry) {
+        let (low, high) = tied_nodes();
+        let tie = Hlc::new(wall, 0);
+        let dropped = Stamp::new(tie, low);
+
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, 10).unwrap().entries;
+        let of = |kind| {
+            entries.iter().find(|e| e.kind == kind).cloned().expect("the entry the drop minted")
+        };
+        let create = of(OpKind::CreateCollection);
+        let drop = OplogEntry { stamp: dropped, ..of(OpKind::DropCollection) };
+
+        b.record_collection_drop(ca.id, dropped).unwrap();
+        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create }]).unwrap();
+
+        let current = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(current.created, tie, "the create was applied under its own origin stamp");
+        assert_eq!(current.incarnation_floor, Some(tie), "and over the tombstone that survived");
+        (current, dropped, drop)
+    }
+
+    /// The tie the whole change is built around, at the drop's door: a
+    /// collection whose `created` *equals* its floor, and the drop that
+    /// produced that floor arriving again through a repair.
+    ///
+    /// The two routes have to agree, and only the floor clause makes them:
+    /// the drop neither predates the incarnation standing here nor is newer
+    /// than it, so a comparison against `created` alone reads it as aimed at
+    /// this copy and destroys a collection the replicated `DropCollection`
+    /// arm defends. Reachable, not merely constructible — a repair planned
+    /// while this node lacked the collection runs a round later, after the
+    /// drop and the create have both landed.
+    #[test]
+    fn a_snapshot_carrying_the_drop_a_collection_was_created_over_is_ignored() {
+        let (b, _db) = engine();
+        let (current, dropped, as_an_entry) = at_its_own_floor(&b, 1_000);
+        b.insert(&current, doc! { "_id": 1 }).unwrap();
+
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            documents: Vec::new(),
+            next: None,
+            versions: VersionVector::new(),
+            dropped: Some(dropped),
+        };
+        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(current.id), &page).unwrap();
+
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().created,
+            current.created,
+            "the incarnation the drop was already accounted for must stand"
+        );
+        assert_eq!(b.count(&current).unwrap(), 1, "and its documents with it");
+
+        // The same drop down the other route, on the same state: the two
+        // answers are one predicate, so they cannot differ.
+        let outcome = b.apply_batch(std::slice::from_ref(&as_an_entry)).unwrap();
+        assert_eq!(outcome.ddl, 1, "{outcome:?}");
+        assert_eq!(b.get_collection("shop", "orders").unwrap().created, current.created);
+        assert_eq!(b.count(&current).unwrap(), 1, "however the drop reaches this node");
+    }
+
+    /// The floor half of `Engine::is_history` on the snapshot route, with the
+    /// tombstone half unable to account for it: the document is stamped in the
+    /// same millisecond as the drop by a node sorting above the one that
+    /// stamped it, so it sorts *after* the tombstone as a `Stamp` and only the
+    /// floor — `Hlc`, and not strict — turns it away. A last pre-drop write
+    /// racing the drop is exactly how it arrives.
+    #[test]
+    fn a_snapshot_document_at_the_incarnation_floor_is_history_though_it_outranks_the_tombstone() {
+        let (b, _db) = engine();
+        let (low, high) = tied_nodes();
+        let tie = Hlc::new(1, 0);
+        let id = CollectionId::derive("shop", "orders");
+        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        assert_eq!(cb.incarnation_floor, Some(tie));
+        assert!(Stamp::new(tie, high) > Stamp::new(tie, low), "the tombstone cannot turn it away");
+
+        let document = |wall: u64, key: i64| SnapshotDoc {
+            collection: id,
+            id: DocId::Int64(key),
+            stamp: Stamp::new(Hlc::new(wall, 0), high),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": key }).unwrap()),
+        };
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            // At the floor, and one above it: the floor is a boundary, not a
+            // gate on the collection.
+            documents: vec![document(1, 1), document(2, 2)],
+            next: None,
+            versions: VersionVector::new(),
+            dropped: None,
+        };
+        let outcome =
+            b.apply_snapshot_page(&mut SnapshotProgress::of_collection(id), &page).unwrap();
+        assert_eq!((outcome.applied, outcome.superseded), (1, 1), "{outcome:?}");
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none(), "the previous life stays buried");
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some(), "the one above the floor lands");
     }
 
     #[test]

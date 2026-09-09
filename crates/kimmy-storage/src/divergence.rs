@@ -56,6 +56,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kimmy_core::{CollectionId, Hlc, NodeId};
 use redb::{ReadableDatabase, ReadableTable};
+use tracing::warn;
 
 use crate::codec;
 use crate::engine::{Engine, PairedShadows};
@@ -124,8 +125,8 @@ impl Engine {
     ///
     /// The whole table under one read transaction, one row per dropped
     /// collection — the same walk `gc::collect_dropped_collections` makes,
-    /// and for the same reason: this is the only shape in which the answer
-    /// is complete.
+    /// down to what it does with a row it cannot read, and for the same
+    /// reason: this is the only shape in which the answer is complete.
     ///
     /// **No cutoff, deliberately.** Retention is decided in exactly one
     /// place, by the collector, and a second opinion about which tombstones
@@ -138,7 +139,16 @@ impl Engine {
         let mut out = BTreeMap::new();
         for row in dropped.iter()? {
             let (id, stamp) = row?;
-            out.insert(CollectionId(id.value()), codec::decode_oplog_key(stamp.value())?.hlc);
+            // Warned and stepped over, as the collector steps over it: one
+            // unreadable row must not be able to fail every divergence check
+            // this node makes, for ever, against every peer. The id it names
+            // is then simply not known to have been dropped, which is the
+            // same position a collected tombstone leaves this node in.
+            let Ok(stamp) = codec::decode_oplog_key(stamp.value()) else {
+                warn!("undecodable collection tombstone skipped by the divergence check");
+                continue;
+            };
+            out.insert(CollectionId(id.value()), stamp.hlc);
         }
         Ok(out)
     }

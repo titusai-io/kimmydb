@@ -798,6 +798,36 @@ impl Engine {
     }
 }
 
+/// Whether a drop stamped `dropped` is aimed at a life of `current` that has
+/// already ended, rather than at the collection standing here now.
+///
+/// **The one place that rule is written**, for the reason [`Engine::is_history`]
+/// is: a drop is the only change that destroys state, so it is the only one
+/// that has to know *which* incarnation it was aimed at, and a copy of the rule
+/// that implemented one of its two clauses would delete a collection the other
+/// copy defends. It has two callers — the replicated `DropCollection` arm of
+/// [`Engine::apply_ddl`], and the drop a scoped snapshot carries in place of a
+/// collection its sender no longer holds (`Engine::restore_collection_drop`).
+///
+/// Two clauses, and both are needed:
+///
+/// - It **predates the create** that produced this incarnation, origin stamps
+///   on both sides.
+/// - It is **at or before that incarnation's floor**, which is the drop it was
+///   created after. Not redundant with the first, because `created` and the
+///   floor can be the same `Hlc`: `apply_ddl`'s creation rule compares `Stamp`
+///   strictly, so a create minted at `(H, node)` by a node sorting above the
+///   node that stamped a drop at `(H, other)` is not history and is applied —
+///   with `created = H` from the origin and `floor = H` from the surviving
+///   tombstone. The drop that produced that floor then arrives again, as
+///   overlapping ranges and re-planned repairs both deliver it, and only this
+///   clause turns it away.
+pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: Hlc) -> bool {
+    let predates_create = dropped < current.created;
+    let at_or_before_floor = current.incarnation_floor.is_some_and(|floor| dropped <= floor);
+    predates_create || at_or_before_floor
+}
+
 /// Collection metadata as resolved during one batch.
 ///
 /// Valid until the next schema change, which is the only thing in a batch
@@ -1114,15 +1144,12 @@ impl Engine {
                 // cluster on 2026-08-28: one member left with 211 of 361
                 // documents, every member missing vectors, lag 0 throughout.
                 //
-                // Stale if it predates the create that produced the current
-                // incarnation (origin stamps on both sides), or is at or
-                // before the drop that incarnation was created after.
+                // Which incarnation it is aimed at is
+                // `aims_at_a_previous_incarnation`, which the snapshot route
+                // asks the same question of.
                 match self.get_collection(&target.db, &target.name) {
                     Ok(current) => {
-                        let predates_create = entry.stamp.hlc < current.created;
-                        let at_or_before_floor =
-                            current.incarnation_floor.is_some_and(|floor| entry.stamp.hlc <= floor);
-                        if predates_create || at_or_before_floor {
+                        if aims_at_a_previous_incarnation(&current, entry.stamp.hlc) {
                             debug!(
                                 db = %target.db,
                                 collection = %target.name,
