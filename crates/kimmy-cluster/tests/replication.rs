@@ -3052,8 +3052,13 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
 /// A byte relay to `target` that closes the connection it is carrying the
 /// moment `cut` is signalled — a peer that goes away mid-round. TLS runs end
 /// to end through it, so the round it carries is a real round, for the reason
-/// `relay_one_connection` gives. Connections opened after the signal are
-/// carried normally; the listener stays bound for the life of the test.
+/// `relay_one_connection` gives. The listener stays bound for the life of the
+/// test.
+///
+/// One signal, one connection: a `Notify` with nothing parked on it keeps the
+/// permit, so a connection opened after the signal would take it and be cut
+/// at once. The round that resumes the pull dials the peer directly, so
+/// nothing here needs otherwise.
 async fn relay_until_cut(
     target: std::net::SocketAddr,
     cut: Arc<tokio::sync::Notify>,
