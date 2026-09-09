@@ -12099,7 +12099,10 @@ over. Its two callers are the replicated `DropCollection` arm of
 `snapshot::restore_collection_drop`. A drop is the only change that destroys
 state, so it is the only one that has to know which copy it was aimed at.
 
-**That each rule has a single site is the point of this record, not tidying.**
+**That each of those two rules has a single site is the point of this record,
+not tidying** — the claim is about those two and no others, and this record also
+keeps one duplicate on purpose, named below, so the two must not be read as one
+policy.
 The entries path honoured the collection tombstones in five places. The
 divergence check and the snapshot repair were written *beside* that path, at
 different times, and consulted neither the tombstone nor the floor — and a rule
@@ -12154,7 +12157,17 @@ the answering node holds, beside the `collections` it already carried;
 `Engine::collection_tombstones` reads `COLLECTIONS_DROPPED` whole under a read
 transaction — no cutoff and no retention parameter, because `gc.rs` already
 prunes that table by cutoff and walks it whole for the same reason, and two
-places deciding retention is how they drift apart. `divergence::compare` then
+places deciding retention is how they drift apart. It is also more tolerant than
+the point lookup beside it, deliberately: a row it cannot decode is warned and
+stepped over, matching the retention pass over the same table, where
+`Engine::collection_dropped_at` still fails loudly on that same row. The
+asymmetry is in the consequence, not in the standard. A skipped row means the id
+is simply not known here to have been dropped, which is the position a collected
+tombstone leaves this node in anyway — it can be reported divergent and repaired
+back, and that is recoverable. The alternative is one undecodable row failing
+every divergence check this node makes, against every peer, for as long as the
+row survives: the detector goes dark, which ADR-135 records as worse than a
+finding it gets wrong. `divergence::compare` then
 drops from the existence set every id this node holds a tombstone for, unless
 the peer's incarnation is *strictly* newer than the drop. Equal subtracts: that
 is the same-millisecond tie ADR-081 was written for. The count half is
@@ -12181,6 +12194,18 @@ here and is ignored, and the check above reads the restored copy as a genuine
 recreation and pulls it back. Without this the rest of the record does not
 hold.
 
+That last sentence is literal, and the dependency is worth stating because it is
+invisible from either half on its own. The rule below — a resumed page carrying
+the sender's drop, so a receiver part-way through a repair drops the partial
+copy — works **only** because the collection it is about to drop was created
+under the sender's stamp. Under the old local-clock origin, a receiver working
+through a backlog holds a `created` later than the sender's drop, so
+`aims_at_a_previous_incarnation` reads that drop as belonging to a life that
+ended before its own copy began, ignores it, and keeps the partial copy: the
+same outcome as sending no drop at all. The two are correct only together, and
+no test sees it, because a fixture's engines run in real time and never open the
+gap a backlog does.
+
 *A snapshot document is put to the same predicate before it is applied.*
 `apply_remote_in_txn` decides last-writer-wins on the document stamp and
 nothing else — every tombstone and floor guard lived in `sync::apply_one` — so
@@ -12195,6 +12220,32 @@ repair reads 0 for ever after, which is ADR-152's own reason for not adding
 one. The repair's stall count is unaffected — `PeerStalls::snapshot_advanced`
 keys off pages applied, and a page of nothing but history is still a page.
 
+*A scoped snapshot carries the sender's drop on **every** page, not the first
+alone.* A repair runs for as long as the collection takes, and a drop lands
+where it lands. Sent on the first page only, a drop between pages reached the
+receiver as a page with no definition, no documents, no drop and no cursor —
+which is exactly what a snapshot that has simply run out looks like — so the
+pull reported itself complete and the receiver kept a partial copy of the
+incarnation the cluster had just agreed to delete, with no tombstone of its own
+to stop it serving or re-seeding that copy. `Engine::snapshot_page` now matches
+on the scope first and lets the cursor decide only whether the *definition*
+rides along; the drop question is asked on every scoped page. Measured on a
+live-shaped fixture rather than inferred: 512 documents applied, the sender
+drops, the resumed page comes back empty, the receiver still holds 512. It is
+also the route the receiver-side rule below was written for — without this it
+was unreachable there, while the original round's logs show that route firing
+dozens of times.
+
+*And the sender asks whether the collection is **gone** here, not whether a
+tombstone exists.* A collection recreated after a drop keeps that drop's
+tombstone, because the tombstone is what floors the new incarnation (ADR-081) —
+so "a tombstone exists" does not mean "the collection is gone". A page that read
+the tombstone alone would carry a drop while the sender still held the
+collection, and a receiver at an older incarnation would then destroy the very
+copy the snapshot was filling. That arm of the match does nothing, which is
+precisely why it has to be there: it is what keeps this fix from becoming a new
+loss path of its own.
+
 *A drop a snapshot carries is judged against the incarnation held here, by the
 predicate the entries path uses.* Where `restore_collection_drop` ignored the
 drop outright whenever this node held a collection under the id, it now asks
@@ -12206,6 +12257,17 @@ replicated drop: the tombstone at the sender's stamp and no entry minted,
 exactly as `sync::apply_ddl`'s `DropCollection` arm applies one. Because it is
 the same call and not a second reading of the same rule, the two routes reach
 the same answer for every state, the `created == floor` tie included.
+
+One asymmetry between them survives, and is named here so it is not later
+rediscovered as a defect: on the **ignore** branch the entries path records the
+tombstone anyway and the snapshot path does not. Both reach that branch through
+the same predicate and agree about the answer; only what they do afterwards
+differs. `apply_ddl` records because it is holding an entry it has decided not
+to apply and must not re-serve, and the tombstone never moves backwards, so a
+straggling pre-drop write is superseded here as it would be anywhere else. The
+snapshot route is holding no entry, and a tombstone below the `created` of the
+incarnation standing here says nothing that incarnation's own floor does not.
+
 **This amends ADR-152**, whose scoped-snapshot rule
 recorded the drop as a tombstone only when this node held no collection under
 the id — which left the repair pulling a collection the sender had dropped, and
@@ -12227,6 +12289,25 @@ drop undone is not recoverable by waiting and a recreation deferred is. The
 ordinary recreation is unaffected either way: an older peer's `CreateCollection`
 entry arrives through the entries path and is applied there by ADR-148's rule,
 as it always was, and neither field is on that path.
+
+**The resumed page adds no field and changes no shape**, which is worth saying
+because it looks like a wire change and is not. `SnapshotPage::dropped` already
+existed and was already `#[serde(default)]` (ADR-152); what changed is *when a
+sender fills it*. A receiver that predates the change reads a resumed page's
+drop exactly as it reads a first page's, because its gate was always on the
+snapshot being scoped and never on the page being the first.
+
+**Its closure condition is both ends upgraded, not "after the roll".** The
+sender must be new for the drop to be sent on a resumed page at all, and the
+receiver must be new for that drop to be *acted on* when it holds the
+collection: at 0.26.0 `restore_collection_drop` returns before recording the
+tombstone in exactly the case this creates — a receiver holding a partial copy —
+so an un-upgraded receiver gains nothing here from an upgraded sender. It also
+loses nothing. It behaves as it did: the drop is ignored, no tombstone is
+written, no round fails, and the partial copy stands as it would have with no
+drop on the page. So during a roll this hole closes for a pair only once both
+ends of that pair have rolled, and is no wider in the meantime than it was
+before.
 
 **Why.** On a converged three-member cluster a database drop answered
 `200 {"dropped": true}`, and minutes later its collection was back on all three
@@ -12280,9 +12361,12 @@ comparison written out a second time.
 
 **Cost.** Two optional fields on the wire, one on `Message::Divergence` and one
 on a snapshot page's collection definition; one `usize` on `SnapshotApplied`
-and one field on two `INFO` lines. No new `/metrics` series. A divergence
-answer grows by an id and an `Hlc` per collection the answering node holds, on
-a message that already carried the ids.
+and one field on two `INFO` lines. No new `/metrics` series, and no third wire
+field for the resumed page — `SnapshotPage::dropped` is the one ADR-152 already
+put there. A divergence answer grows by an id and an `Hlc` per collection the
+answering node holds, on a message that already carried the ids. A resumed
+scoped page costs one `collection_by_id` lookup it did not make before, against
+a page that walks a key range.
 
 The receiver-side write of the amended `restore_collection_drop` is the one
 cost worth naming: applying a sender's drop of a collection held here at an
@@ -12337,6 +12421,33 @@ sender's whole history on trust, and so the one moment the reconciliation is
 justified. Neither is attempted above, and the rule above must not be read as
 covering it.
 
+**A snapshot does not reconcile a differing incarnation**, and that is the
+second open item, pre-existing and tracked with the first. A scoped page carries
+the sender's drop only while the collection is *gone* there — correctly, for the
+reason given above — so a sender that drops and immediately recreates between
+two pages of a repair sends the new life's documents on the resumed page with no
+definition and no drop beside them, and the receiver applies them into its copy
+of the **old** life. Nothing on either side notices: the receiver holds no
+tombstone for the id, so its floor is the old life's, and documents stamped
+after the new create sit above it and apply. The two members then agree by name
+and by count while holding one collection made of two lives. Closing it means a
+page saying which incarnation its documents belong to, and a receiver refusing —
+or replacing — on a mismatch, which is a decision about what a snapshot page
+*is* and belongs with the first item, not here.
+
+**All three are the same defect wearing three coats**, and the record is more
+useful for saying so than for listing them. A snapshot conveys **presence, never
+absence, and never says which life the presence belongs to**: it carries what
+the sender holds, so a collection the sender dropped is missing rather than
+denied (the whole-database route), a document the sender deleted is missing
+rather than denied (`snapshot_documents` skips tombstones, on a premise that was
+true when a snapshot only served a first-time catch-up and is false now that it
+serves a repair), and a collection the sender recreated arrives as documents
+with no incarnation attached (this item). The scoped drop this record adds is
+the one place a snapshot now states an absence, and it is scoped, deliberately,
+to the one collection the pull is about. Whatever closes any of the three is
+likely to be the thing that closes the others.
+
 Past `storage.tombstone_retention_secs` the tombstone is collected, and from
 there ADR-085's resurrection case applies to a dropped collection exactly as it
 applies to a deleted document: a peer that never saw the drop, and whose
@@ -12370,7 +12481,16 @@ alone deletes and the entries path's own rule defends, and
 `a_snapshot_document_at_the_incarnation_floor_is_history_though_it_outranks_the_tombstone`,
 the same tie one door along, where a last pre-drop write sorts *after* the
 tombstone as a `Stamp` and only the floor, on `Hlc` and not strict, turns it
-away; by `kimmy-cluster`'s `divergence_crosses_a_version_boundary_in_both_directions`
+away; by the pair that pins the resumed page —
+`a_scoped_snapshot_resumed_after_its_sender_dropped_the_collection_carries_the_drop`
+(a page applied, the sender drops between pages, and the resumed page takes the
+receiver's partial copy with it, at the sender's stamp and minting no entry of
+the receiver's own; it also asserts the whole-database route still carries no
+drop, which is the residual and not this fix) and
+`a_resumed_scoped_page_of_a_collection_recreated_after_a_drop_carries_no_drop`,
+the arm that must do nothing — a surviving floor is not news, and a page that
+read the tombstone alone would tell a receiver to destroy what it was
+filling; by `kimmy-cluster`'s `divergence_crosses_a_version_boundary_in_both_directions`
 for the frame each side of an upgrade sees; and by ADR-148's
 `a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall` and
 ADR-152's `a_scoped_snapshot_of_a_dropped_collection_carries_its_tombstone`,

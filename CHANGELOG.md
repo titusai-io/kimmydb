@@ -30,16 +30,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   have stopped all of it were sitting on every member the whole time: the
   replication entries path consulted them, and the divergence check and the
   snapshot repair, written beside that path at different times, never did. Both
-  now consult them, through the single predicate the entries path uses, so the
-  rule lives in one place rather than in two that can drift. A collection this
+  now consult them, through the same predicates the entries path uses, so each
+  rule lives in one place rather than in two copies that can drift apart. A collection this
   member has dropped is no longer reported as missing while the peer still
   holds the incarnation that was dropped; a snapshot no longer recreates, or
   writes documents into, a collection whose drop this member has applied; a
   snapshot that carries the *sender's* drop of a collection this member holds
   at the incarnation dropped now applies that drop here instead of ignoring it;
-  and a collection a snapshot does legitimately restore is created under the
-  sender's incarnation rather than the receiving member's clock, so the next
-  check does not read it as a fresh recreation. The two snapshot `INFO` lines
+  that drop rides **every** page of a repair's snapshot rather than the first
+  alone, so a drop landing between two pages no longer reaches a member as an
+  empty page it reads as "the snapshot has finished" while it keeps a
+  half-copied collection the cluster has agreed to delete; and a collection a
+  snapshot does legitimately restore is created under the sender's incarnation
+  rather than the receiving member's clock, so the next check does not read it
+  as a fresh recreation — which is also what makes the every-page drop work,
+  because a copy created under the receiver's own clock would judge the
+  sender's drop to predate it and keep the collection. The two snapshot `INFO` lines
   gain a `superseded` count, so a repair round that lands nothing because the
   page was all history reads as exactly that rather than as a stall; no new
   `/metrics` series, and no HTTP shape changed. **The fix is compatible on the
@@ -47,7 +53,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   names for each collection it holds, and the incarnation a snapshot page names
   for a collection definition — are defaulted, so a member on an earlier
   release reads both messages exactly as it did before and a rolling upgrade
-  needs no stop. For the length of that roll a member that names no incarnation
+  needs no stop. The every-page drop adds no field at all: a snapshot page has
+  carried an optional drop stamp since 0.26.0 and only *when a sender fills it*
+  changed, so a member on an earlier release reads a resumed page exactly as it
+  reads a first one. That one does need both ends of a pair upgraded before it
+  closes for that pair — an earlier-release member ignores a drop for a
+  collection it still holds, as it always did, so it gains nothing there and
+  loses nothing either. For the length of that roll a member that names no incarnation
   is read as holding the incarnation this member dropped: not reported, not
   restored. The cost of that reading is narrow and deliberate — a collection
   genuinely recreated on a member not yet rolled, whose creation has already
