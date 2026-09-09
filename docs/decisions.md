@@ -12106,6 +12106,23 @@ reports, as a scrape does.
 
 ## ADR-155 — A collection this node dropped is not a divergence, and a snapshot does not bring it back
 
+> **Amended by [ADR-158](#adr-158--a-collection-drop-is-chunked-and-its-tombstone-is-written-before-the-first-chunk).**
+> A drop is no longer one transaction, on either of the two routes this record
+> describes it as one — the local drop, and the receiver-side write of
+> `restore_collection_drop` that the **Cost** section below names as the one
+> worth stating. Both remove what the collection held a chunk of a thousand
+> rows per commit, so neither holds the single writer for the length of a
+> collection. That is the chunked drop this record names as the shape of the
+> fix and declines to propose, and the ordering note above is what decides
+> where its tombstone goes: recorded in the drop's **first** commit, before a
+> single document is removed, so every rule stated below applies for the whole
+> of the removal rather than from its end. The window this record narrowed is
+> therefore widened in wall-clock time and not in what this node answers while
+> it is open — the check subtracts the collection, a snapshot refuses to
+> recreate it, a write into it is history, and a client reads it as absent —
+> and ADR-158's tests assert each of those under a drop stopped mid-purge
+> rather than after one that finished.
+
 **Decision.** A collection this node holds a tombstone for is not a divergence
 while the peer's copy is the incarnation that was dropped, and a snapshot never
 recreates, or writes into, an incarnation older than a tombstone this node
@@ -12733,3 +12750,220 @@ the announce job: the parts that turn the builds into a release.
    steps are — its comments are not inlined into `release.yml`, so a comment
    change there needs no regeneration. `deny.toml` needs no change, having
    kept the target.
+
+---
+
+## ADR-158 — A collection drop is chunked, and its tombstone is written before the first chunk
+
+**Decision.** A drop is two stages, and the order between them is the whole
+record. The **burial** is one short transaction: the collection's definition is
+removed, its vector shadow's with it, the database row goes if that was the
+last collection in it, the tombstones for both ids are recorded, and a local
+drop's `DropCollection` entry is appended and published. The **purge** follows,
+outside that transaction: everything the ids still hold — documents first, then
+index entries — is removed a chunk of `DROP_PURGE_CHUNK` rows per commit, with
+the writer released between chunks. So a drop of any size holds the single
+writer for one chunk at a time, and from the drop's *first* commit the
+collection is gone to everything that asks about it.
+
+**The tombstone is not at the end of the drop, it is at the start of it, and
+that is what makes chunking safe.** ADR-155 made the divergence check and the
+snapshot repair honour collection tombstones, and its own ordering note says
+that a chunked drop widens the window in which a peer still holds the dropped
+incarnation — precisely the window ADR-155 narrowed. It is widened from the
+length of one transaction to the length of the whole removal: 62 seconds, on
+the measurement below. What that window costs depends entirely on what this
+node answers *during* it, and the burial is what fixes that at one chunk of
+work rather than at the drop's full length:
+
+- **A client's query reads it as absent, not as thinned out.** `COLLECTIONS`
+  no longer holds the row, so `get_collection` is `CollectionNotFound`, the
+  listing does not carry it, and every document path resolves through the
+  definition. There is no state in which the collection is served with most of
+  its documents missing. This is the requirement the ordering exists for as
+  much as the replication one: a half-dropped collection that still answers is
+  a collection that lies.
+- **The existence half of the divergence check subtracts it.**
+  `all_collection_ids` walks the same table, so the id leaves this node's set
+  at the burial, and `collection_tombstones` carries it from the burial, so
+  ADR-155's subtraction applies to a peer that still holds it. Without the
+  ordering, a drop's whole length is the state ADR-155 was written about — this
+  node holding the collection, the peer holding more of it — and that is a
+  count divergence, then a repair, then the collection back from the peer that
+  has not applied the drop yet.
+- **A snapshot page refuses to recreate it.** `restore_collection` compares the
+  page's incarnation against the tombstone this node holds; the tombstone is
+  there from the burial, so a repair landing during any chunk of the purge
+  creates nothing, and `is_history` turns away the page's documents.
+- **A peer's write into it is history.** The entries path resolves the id to
+  nothing and finds a tombstone, which is `sync::apply_one`'s superseded
+  branch — the ordinary concurrent drop-and-write, unchanged.
+
+None of that is inferred from the ordering: each is asserted under a drop
+stopped after its burial, which is exactly the state every chunk of a purge
+runs in. See **How it is tested**.
+
+**The purge is guarded on the id still being dead, in the transaction that
+removes.** A collection id is derived from its name, so a name created again
+lands on the id the purge is working through, and the rows the purge has not
+reached would become the new incarnation's data. Each chunk therefore asks,
+inside its own write transaction, whether a collection stands under the id, and
+removes nothing if one does; redb has a single writer, so a creation either
+commits before a chunk sees it or after that chunk has finished. The other half
+of the same rule is on the creation side: `create_collection_inner` finishes
+the purge for the derived id before it writes the definition that would stand
+over it. Ordinarily that is two seeks against an empty range; where it is not,
+it is the same bounded chunks the drop was making, so a recreation does not
+hold the writer either.
+
+**An interrupted drop and a drop in progress are the same state on disk**, and
+one mechanism resolves both. What either leaves is rows under an id that
+`COLLECTIONS` does not resolve and `COLLECTIONS_DROPPED` has a tombstone for:
+invisible to every reader, every peer and every check, and reachable only by a
+collection created under the same name. There is nothing to replay — the
+definition's removal, the tombstone and the entry were durable and served
+before the first chunk — so what is left is the removal. `Engine::open` walks
+the tombstone table, takes every id with no collection standing under it, and
+finishes the purge, before the engine is returned to anything that could create
+over it. It logs only when it removed something: an ordinary start finds every
+drop finished and says nothing.
+
+That sweep is placed inside `open` rather than beside the retention pass for a
+reason worth stating, because the alternative looks tidier. The residue is
+identified by *a tombstone with no live collection under it*, and the retention
+pass collects tombstones past `storage.tombstone_retention_secs` — so a
+collector that ran before the sweep could take the only marker the sweep reads.
+Running inside `open` puts the sweep ahead of the first pass of any collector
+on that process by construction, rather than by a claim about scheduling. It is
+also why the creation path purges by id unconditionally rather than only when a
+tombstone is there: residue whose tombstone has since been collected is still
+residue, and the create is the one moment it can do harm.
+
+**One failure is not the drop's to report.** A chunk runs under whatever writer
+budget the caller set (ADR-151), which on the request path is
+`server.request_timeout_secs`. A chunk that gives up inside it does **not** fail
+the drop: by then the definition is gone, the tombstone is durable and the
+entry is published, so the drop happened, and a client told to retry would be
+answered `dropped: false` by the retry while the rows sat where they were. It
+is logged at `WARN`, and the removal is finished by the next start or by the
+next creation under the name. This is a state chunking makes reachable and the
+single transaction did not — a drop now queues for the writer once per chunk
+rather than once — and it is the one place the change trades an honest answer
+for a deferred one.
+
+**`DROP_PURGE_CHUNK` is 1,000 rows and is not configurable.** A thousand is
+what the retention pass removes per commit (ADR-151) and what a `multi: true`
+write commits at a time (ADR-086): the same bound on the same writer, and one
+number an operator can hold in their head beats three that each need their own
+explanation. **Rows, not bytes**: the purge removes by key and never
+materialises a document, so a byte bound would mean reading values the work does
+not otherwise need, to bound a cost that is the key walk and the page writes
+rather than the document size. **No knob**, for ADR-151's own reason: the number
+bounds a hold to what a member can carry at any collection size, and a setting
+chosen before anyone has measured a case the default does not fit is a setting
+that is wrong for that case.
+
+**Why.** Measured on a three-member cluster: 62 seconds to drop a collection of
+261,000 small documents, and 238 seconds for a vector shadow of 12,829 rows —
+the shadow being the slower half, which is why it is purged in the same chunks
+under the same guard rather than left to a second call. For the whole of that
+the single writer was held, so every client write on that member queued behind
+it and, past the request timeout, was refused. The round also saw members
+briefly leave the cluster during a large drop, and one member's version
+endpoint time out at eight seconds while its container was healthy — ADR-151's
+finding in a second place, from a second unbounded write. At 1,000 rows per
+commit the 261,000-document drop is 261 short transactions instead of one long
+one, so the writer is free between each, and the same is true of the shadow.
+The stability round exercises a drop twice, which is why this is met on
+schedule rather than incidentally.
+
+ADR-155 named the fix and deliberately did not propose it: *"What would bound
+it is a chunked collection drop, and no record proposes one: it is named here
+as the shape of the fix rather than as work this record can point at."* This is
+that record, and the receiver-side write ADR-155 named as the one cost worth
+naming — `restore_collection_drop` removing a partial copy of a life that has
+ended everywhere else — is chunked by the same change, through the same
+function, because it applies the drop through `drop_collection_inner` like
+every other route.
+
+**Cost.** A drop pays one commit, and so one fsync, per chunk instead of one
+for the whole removal: 262 rather than 1 for the 261,000-document collection
+above. Against 62 seconds of removal that is noise, and under `coalesced`
+durability the fsyncs are shared; against a small collection it is one extra
+commit — the burial's — which is the honest price of the ordering. Each chunk
+also walks the collection catalogue once to ask whether the id is still dead:
+metadata only, a JSON parse per collection and never a document, against a
+transaction that is already removing a thousand rows. And `Engine::open` reads
+the tombstone table and, for each id with no collection over it, seeks the two
+ranges — one read transaction and two seeks per tombstone on a database with
+nothing owed.
+
+**What did not change.** The drop is still synchronous with its caller, so
+`DELETE /v1/db/{db}/coll/{coll}` still takes as long as the removal takes;
+what changed is that nobody else waits for it. The wire is untouched: no field,
+no message, no new `/metrics` series. A drop still mints one entry, at the
+burial, so replication sees the drop at the drop's first commit rather than at
+its last — a peer begins its own drop while this node is still purging, which
+is the ordering that was wanted anyway.
+
+**Alternatives.** *Remove the documents first and write the tombstone at the
+end,* which is what a chunked drop turns into if the ordering is not decided on
+purpose. It spends the drop's whole length in the one state that resurrects it:
+a collection this node holds, a peer holding more of it, no tombstone to say
+why. The check confirms a count divergence, anti-entropy repairs it, and the
+collection comes back — ADR-155's finding, reached without any peer having to
+be behind. *Answer the client at the burial and purge in the background.* It
+makes `DELETE` fast, and it costs a background task with an owner, a queue that
+survives restarts, and a `/metrics` series for its depth, to move a wait that
+now blocks only the caller. The sweep at `open` is the same idea without the
+runtime: what is owed is durable, and it is finished at the next start. Worth
+revisiting if a drop's own latency ever matters as much as the writer's did.
+*Bound the chunk by bytes.* Rejected above: it measures the one thing the purge
+does not read. *A configuration knob.* ADR-151's reason, unchanged. *Guard the
+purge with an in-memory set of ids being purged, rather than a check in the
+transaction.* Cheaper per chunk — no catalogue walk — and it says nothing after
+a restart, which is exactly the case the guard exists for; the durable check is
+the same rule written once, in the only place that can enforce it. *Have the
+retention pass finish an interrupted drop instead of `open`.* A candidate, and
+it would close the case where a purge is deferred on a process that then runs
+for days; it is not taken here because it would put a whole collection's
+removal inside a pass ADR-151 has just finished bounding, and because the
+retention pass is what *collects* the tombstone the residue is identified by,
+so the two would have to agree about an order they currently do not need to.
+
+**Residuals, stated.** **A purge deferred on a long-running process is not
+retried until that process restarts or the name is created again.** The only
+way to reach it is a chunk giving up on the writer, which is the state ADR-151
+calls a write outage; the rows are unreachable and cost disk, nothing serves
+them, and both endings are ordinary. The retention-pass closure above is the
+candidate if it is ever seen. **A drop's caller still waits for the whole
+purge**, so a very large drop is still a very long request for the client that
+issued it — the request timeout applies to the writer wait, not to the
+transaction (ADR-151), so a drop that is making progress is not cut off by it.
+**The file does not shrink**, before or after this change: redb reuses freed
+pages rather than returning them, so `kimmy_storage_bytes` does not fall when a
+drop finishes any more than it did before.
+
+**How it is tested.** By `kimmy-storage`'s
+`a_drop_of_more_than_one_chunk_leaves_nothing_behind_including_its_shadow`
+(documents, index entries and the vector shadow, over more than two chunks),
+`a_drop_records_its_tombstone_before_it_removes_the_first_document` (the
+ordering itself: the burial is one commit, both tombstones are recorded, the
+collection is absent from `get_collection`, the listing and
+`all_collection_ids`, and not one document has been removed),
+`the_writer_is_released_between_the_chunks_of_a_drop` (the burial's commit and
+exactly one per chunk of a thousand rows, each queueing for the writer on
+its own),
+`a_drop_interrupted_between_chunks_is_finished_by_the_next_start`,
+`a_collection_created_again_between_two_chunks_of_its_drop_keeps_its_documents`
+(the guard, from both sides: the creation clears what the drop had not reached,
+and the rest of the drop then takes nothing), and
+`a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing`. ADR-155's
+guards are exercised **under a drop stopped after its burial**, which is the
+state every chunk of a purge runs in, by
+`a_collection_whose_drop_is_still_purging_is_not_divergent_while_a_peer_holds_it`
+and `a_snapshot_does_not_recreate_a_collection_whose_drop_is_still_purging`.
+Each of those seven has been checked by reverting the production line it names
+— the purge loop, the tombstone's insert in the burial's transaction, the
+chunk bound, the sweep at `open`, the catalogue guard, the creation-side purge,
+and the tolerated `WriterBusy` — and watching it fail.

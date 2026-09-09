@@ -14,6 +14,41 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Dropping a collection no longer stops every other write on the member.**
+  A drop removed the whole collection in one write transaction, and redb has a
+  single writer: measured on a three-member cluster, 62 seconds for 261,000
+  small documents and 238 seconds for a 12,829-row vector shadow, for the whole
+  of which every client write on that member queued and, past
+  `server.request_timeout_secs`, was refused. The same round saw members
+  briefly leave the cluster during a large drop and one member's version
+  endpoint take eight seconds while its container was healthy. A drop is now
+  two stages: one short transaction removes the definition, records the
+  tombstone and mints the entry, and everything the collection held is removed
+  after it a thousand rows per commit — the vector shadow in the same chunks —
+  with the writer released between them. The drop still takes as long as it
+  takes, and now only its own caller waits for it
+  ([ADR-158](docs/decisions.md)).
+
+  **What a client sees is unchanged, deliberately.** The tombstone and the
+  removal of the definition are the drop's *first* commit, so from that instant
+  the collection is gone to every reader and every peer — not listed, not
+  served, not reported by the divergence check, and not brought back by a
+  repair from a member that has not applied the drop yet. There is no window in
+  which it reads as intact and missing most of its documents, which would have
+  been a count divergence, a repair, and the collection back: the state
+  [ADR-155](docs/decisions.md) was written about. `DELETE` still answers when
+  the removal is finished, so size a client timeout for a large drop and issue
+  it once — a retry answers `{"dropped": false}` for a drop already under way.
+
+  **Nothing to do before or after upgrading.** No wire field, no message, no
+  HTTP shape and no new `/metrics` series. A member restarted part-way through
+  a drop finishes the removal at its next start, before it serves anything; the
+  drop itself was durable and replicated before the first row went. On a member
+  that stays up, a `WARN` saying a chunk of a drop gave up waiting for the
+  single writer means the same thing — the collection is dropped and the rows
+  are removed at the next start — and, like every wait of that length, it is a
+  member whose writer is held for longer than a request is allowed to take.
+
 - **A release ships Linux archives only, and the Homebrew tap stops
   updating.** `aarch64-apple-darwin` is paused, so a tag attaches no macOS
   archives and no bills of materials for them, and no formula is generated or

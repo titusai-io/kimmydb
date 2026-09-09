@@ -672,10 +672,13 @@ impl Engine {
                 debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
                 return Ok(());
             }
-            // One transaction for the whole copy, as every drop is. On a
-            // collection a repair was part-way through that is a large write
-            // on the receiver, and it is the correct write: what is removed
-            // is a partial copy of a life that has ended everywhere else.
+            // What is removed is a partial copy of a life that has ended
+            // everywhere else, which on a collection a repair was part-way
+            // through can be a large removal. It is chunked, as every drop is
+            // since ADR-158, so the receiver's writer is held for one chunk of
+            // it at a time; the tombstone is recorded before the first of
+            // them, so this node stops serving and re-seeding that copy at the
+            // drop's first commit rather than at its last.
             warn!(
                 db = %current.db,
                 collection = %current.name,
@@ -1370,6 +1373,46 @@ mod tests {
             outcome.superseded, 2,
             "both documents are history, counted rather than passed over: {outcome:?}"
         );
+    }
+
+    /// The same rule under a **chunked** drop (ADR-158). A drop clears what
+    /// the collection held a chunk at a time, and a repair from a peer that
+    /// has not applied the drop yet can arrive during any of them — the
+    /// window that chunking widens and this is the guard on it. The tombstone
+    /// is recorded in the drop's first commit, so the refusal is in place for
+    /// the whole of the purge rather than from its end: neither the
+    /// definition nor a document of the buried life comes back.
+    #[test]
+    fn a_snapshot_does_not_recreate_a_collection_whose_drop_is_still_purging() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 1 }).unwrap();
+        a_moment();
+        // B's drop, stopped after its first commit: definition gone,
+        // tombstone written, every document still filed under the id.
+        b.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+        let dropped = b.collection_dropped_at(cb.id).unwrap().expect("a tombstone");
+        assert!(ca.created <= dropped.hlc, "the fixture must drop after the sender's create");
+        a_moment();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+        let outcome = b
+            .apply_snapshot_page(
+                &mut SnapshotProgress::whole_database(),
+                &a.snapshot_page(None, None).unwrap(),
+            )
+            .unwrap();
+
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands mid-purge");
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(outcome.superseded, 2, "both documents are history: {outcome:?}");
+        // And the purge finishes over the top of the refused page.
+        assert_eq!(b.purge_dropped_collection(cb.id).unwrap(), 1, "the one document it held");
+        assert!(b.get_collection("shop", "orders").is_err());
     }
 
     /// The other side of the same rule, and the reason it is a comparison
