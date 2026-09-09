@@ -96,9 +96,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   short of the cap or the tick has spent its own interval. The batch cap and
   the frame limit are unchanged — raising them would only move the work into a
   longer hold on the single writer — and neither is the interval, which is now
-  what bounds a tick's own length rather than what bounds a drain: a tick
-  never overruns its period merely by draining, and a tick that overruns it
-  anyway is still logged at `WARN` ([ADR-157](docs/decisions.md)).
+  what bounds a tick's own length rather than what bounds a drain: another
+  pull is started only when the pull before it would have fitted in what is
+  left of the interval, so a draining tick stops short of its own period
+  instead of one pull past it, and ADR-154's overrun `WARN` goes on meaning a
+  tick that was stuck rather than a tick that was busy
+  ([ADR-157](docs/decisions.md)).
 
   **The divergence counters keep their meanings, and one reading gets deeper.**
   `kimmy_sync_divergence_checks_total` is still one `ran` or one `skipped` per
@@ -112,8 +115,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and is never retried inside the tick. The `merged from peer` line and the
   `cluster.sync` span are now one per peer per tick, with `pulls` on the line
   saying how many the tick made, so a drain reads as one line rather than a
-  dozen. No new `/metrics` series, nothing on the wire, and nothing to decide
-  before upgrading.
+  dozen; `kimmy_sync_repair_rounds_total` counts those pulls, so its rate
+  reads higher during a drain. ADR-148's repair cooldown is counted per
+  contact rather than per pull, so "sixty rounds" is still the five minutes
+  its constant is argued in. No new `/metrics` series, nothing on the wire,
+  and nothing to decide before upgrading.
 
 ## 0.26.1 - 2026-09-09
 

@@ -2130,6 +2130,120 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
     );
 }
 
+/// Counts ADR-154's overrun warning, so a test can assert that a tick did
+/// not take longer than the interval it owns.
+///
+/// A hand-written `Subscriber` rather than a subscriber crate: the whole
+/// question is whether one particular line was emitted, which is a field
+/// visit, and it is not worth a test-only logging dependency. Installed with
+/// `set_default`, which scopes it to the thread that installs it — the same
+/// thread the current-thread runtime drives the loop's task on — so a test
+/// reads back exactly the lines it caused and parallel tests do not see each
+/// other's.
+#[derive(Clone, Default)]
+struct Overruns(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for Overruns {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut overran = OverrunLine(false);
+        event.record(&mut overran);
+        if overran.0 {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn enter(&self, _: &tracing::Id) {}
+
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+/// Whether an event is the tick-overran warning, by its message.
+struct OverrunLine(bool);
+
+impl tracing::field::Visit for OverrunLine {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" && format!("{value:?}").contains("a sync tick took longer") {
+            self.0 = true;
+        }
+    }
+}
+
+/// A tick that spends its whole budget draining must not overrun the interval
+/// it owns *as a matter of course*, because ADR-154's overrun warning means
+/// "this member's sync tick was stuck" and is written to be one line per
+/// stall. The budget is therefore spent against a margin: another pull is
+/// started only when the pull before it would have fitted in what is left.
+///
+/// The claim is exactly as strong as the margin is, and no stronger. The
+/// margin is an estimate — the slowest pull the contact has made — so a pull
+/// slower than every pull before it, by more than the slack left over, can
+/// still cross the line, and on a machine running the rest of this suite
+/// beside it one sometimes does. What must never happen is the systematic
+/// case: deciding on "is there any time left at all" makes *every* tick the
+/// budget cuts short end past its own period, so the warning fires on each
+/// and an operator watching a backlog drain sees nothing else.
+///
+/// Three claims, and it takes all three to pin the budget half of ADR-157 —
+/// the first alone is satisfied by a loop that does not drain, and the last
+/// two by one that drains without a margin. Reverting `Contact::fits_before`
+/// to `Instant::now() < deadline` makes the overruns equal the ticks the
+/// budget cut short, which is the first assertion below.
+#[tokio::test]
+async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    const BATCHES: usize = 24;
+    let entries = MAX_BATCH * BATCHES;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &ca, entries);
+
+    let overruns = Overruns::default();
+    let counted = Arc::clone(&overruns.0);
+    let _recording = tracing::subscriber::set_default(overruns);
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (mut contacts, mut cut_short) = (0usize, 0usize);
+    while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backlog never drained"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
+        contacts += report.divergence_checks + report.divergence_skips;
+        cut_short += report.divergence_skips;
+    }
+    looping.abort();
+
+    let overran = counted.load(Ordering::Relaxed);
+    assert!(cut_short >= 2, "the budget must have cut a drain short on the way: {cut_short}");
+    assert!(
+        overran < cut_short,
+        "a tick must not overrun the interval it owns because it drained: {overran} overruns \
+         across {cut_short} ticks the budget cut short, which is every one of them"
+    );
+    assert!(
+        contacts < BATCHES,
+        "the ticks must have drained several batches each: {contacts} contacts for {BATCHES} \
+         batches"
+    );
+}
+
 /// A pull that fails ends the tick's contact with that peer. The round goes
 /// through the health backoff it always did, and the tick does not spend the
 /// rest of its budget dialling a member that has just refused it — a

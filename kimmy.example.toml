@@ -519,8 +519,10 @@ seeds = []
 #
 # A tick makes several pulls from a peer while it is behind: a pull that came
 # back full at the batch cap is followed by another, until every pull comes
-# back short of the cap or the tick has spent this interval (ADR-157). So this
-# bounds a tick's own length, not how fast a backlog drains.
+# back short of the cap or the tick has spent this interval (ADR-157). Another
+# pull is started only if the one before it would have fitted in what is left,
+# so a draining tick stops short of its own period. This bounds a tick's own
+# length, not how fast a backlog drains.
 sync_interval_secs = 5
 
 # How often to re-resolve the seed sources.

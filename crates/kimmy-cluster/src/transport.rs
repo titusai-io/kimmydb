@@ -1276,17 +1276,30 @@ struct Repairs {
     advanced: bool,
     /// Planned behind it, one per collection.
     queued: BTreeMap<CollectionId, Repair>,
-    /// Collections repaired against this peer, with the rounds since: not
+    /// Collections repaired against this peer, with the contacts since: not
     /// repaired again until the check reports them clear, or
-    /// [`REPAIR_COOLDOWN_ROUNDS`] rounds have passed — so a divergence a
+    /// [`REPAIR_COOLDOWN_ROUNDS`] contacts have passed — so a divergence a
     /// repair cannot close costs one repair per cooldown, not one per
-    /// round.
+    /// contact.
     done: BTreeMap<CollectionId, u32>,
+    /// Whether this tick's contact with the peer has already been counted
+    /// against the cooldowns above (ADR-157). Cleared by
+    /// [`PeerStalls::tick_opened`].
+    ///
+    /// A tick makes several pulls at a peer while it is draining a backlog,
+    /// and each one asks [`PeerStalls::repair_due`] what to run — but the
+    /// cooldown is a wall-clock measure wearing a round's clothing, sixty
+    /// rounds being five minutes at the default interval. Counted per pull
+    /// it would expire in seconds during exactly the backlog a repair must
+    /// not be competing with for the tick's budget.
+    counted: bool,
 }
 
-/// Rounds with a peer after which a collection repaired against it may be
+/// Contacts with a peer after which a collection repaired against it may be
 /// repaired again without the check having reported it clear in between
-/// (ADR-148). Sixty is five minutes at the default interval: long enough
+/// (ADR-148). A contact is a peer per sync tick, however many pulls the tick
+/// made at it (ADR-157). Sixty is five minutes at the default interval: long
+/// enough
 /// that a divergence a repair cannot close — a definition this build
 /// refuses, say — does not cost a replay every round, short enough that a
 /// hole reopened after a repair is not left for the life of the process.
@@ -1324,6 +1337,19 @@ impl PeerStalls {
         Self::default()
     }
 
+    /// A sync tick has begun, so the next pull at each peer opens that
+    /// peer's contact for this tick (ADR-157).
+    ///
+    /// What [`Self::repair_due`] counts against [`REPAIR_COOLDOWN_ROUNDS`]
+    /// is contacts, and a tick's several pulls at one peer are one contact;
+    /// this is what tells them apart. The loop calls it once per tick,
+    /// before the tick's first pull.
+    pub fn tick_opened(&mut self) {
+        for repairs in self.repairs.values_mut() {
+            repairs.counted = false;
+        }
+    }
+
     /// Plan `repair` against `peer` on behalf of `collection` (ADR-148).
     /// `false` when one is already planned or under way for it, or one ran
     /// and the finding has not cleared or cooled down since.
@@ -1346,10 +1372,16 @@ impl PeerStalls {
     /// [`REPAIR_ATTEMPTS`] rounds that did not advance it.
     pub fn repair_due(&mut self, peer: NodeId) -> Option<(CollectionId, Repair)> {
         let repairs = self.repairs.get_mut(&peer)?;
-        repairs.done.retain(|_, rounds| {
-            *rounds += 1;
-            *rounds < REPAIR_COOLDOWN_ROUNDS
-        });
+        // Once per contact, not once per pull: a draining tick asks this
+        // several times, and the cooldown below is a constant argued in
+        // minutes (ADR-157). The stall accounting under it stays per pull,
+        // because a pull *is* a round the repair was handed out for.
+        if !std::mem::replace(&mut repairs.counted, true) {
+            repairs.done.retain(|_, contacts| {
+                *contacts += 1;
+                *contacts < REPAIR_COOLDOWN_ROUNDS
+            });
+        }
         // A repair handed out on the previous round and neither advanced
         // nor finished since: the round failed, or the snapshot landed no
         // page. Counted here rather than at the failure, because a round
@@ -2812,8 +2844,10 @@ mod tests {
     }
 
     /// The cooldown: a repair done for a collection is not planned again
-    /// for `REPAIR_COOLDOWN_ROUNDS` rounds with that peer unless the check
-    /// reports it clear, and is again after.
+    /// for `REPAIR_COOLDOWN_ROUNDS` contacts with that peer unless the check
+    /// reports it clear, and is again after. One `tick_opened` per round
+    /// here, because a contact is a peer per tick (ADR-157) and this is the
+    /// one-pull-per-tick shape a converged cluster has.
     #[test]
     fn a_repaired_collection_waits_out_the_cooldown_before_repairing_again() {
         let peer = node(1);
@@ -2824,10 +2858,48 @@ mod tests {
         stalls.repair_finished(peer);
         assert!(!stalls.repairing(peer));
         for _ in 1..REPAIR_COOLDOWN_ROUNDS {
+            stalls.tick_opened();
             assert_eq!(stalls.repair_due(peer), None);
             assert!(!stalls.plan_repair(peer, collection, Repair::Snapshot), "cooling down");
         }
+        stalls.tick_opened();
         assert_eq!(stalls.repair_due(peer), None);
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
+    }
+
+    /// A tick that pulls from a peer a dozen times while draining a backlog
+    /// spends **one** contact of the cooldown, not a dozen (ADR-157). The
+    /// constant is sixty because sixty is five minutes at the default
+    /// interval; counted per pull, a drain would spend it in seconds and a
+    /// divergence the repair cannot close would replay the collection's
+    /// whole history every few ticks, against the very backlog the tick's
+    /// budget is there to clear.
+    #[test]
+    fn a_tick_that_pulls_many_times_spends_one_contact_of_the_repair_cooldown() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        stalls.tick_opened();
+        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        stalls.repair_finished(peer);
+
+        // One tick, a hundred pulls: far past the cooldown's count, and it
+        // has not moved.
+        stalls.tick_opened();
+        for _ in 0..(REPAIR_COOLDOWN_ROUNDS as usize * 2) {
+            assert_eq!(stalls.repair_due(peer), None);
+        }
+        assert!(
+            !stalls.plan_repair(peer, collection, Repair::Snapshot),
+            "a drained tick is one contact, so the cooldown has barely started"
+        );
+
+        // And the ticks after it do move it.
+        for _ in 1..REPAIR_COOLDOWN_ROUNDS {
+            stalls.tick_opened();
+            assert_eq!(stalls.repair_due(peer), None);
+        }
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
 }

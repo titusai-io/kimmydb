@@ -12795,10 +12795,11 @@ the announce job: the parts that turn the builds into a release.
 **Decision.** A tick of the anti-entropy loop keeps pulling from a peer while
 the pull before it came back truncated by the batch cap, until either a pull
 comes back short of the cap or the tick has spent a wall-clock budget. The
-budget is `cluster.sync_interval_secs` itself. The pulls are round-robined
-across the tick's peers — one per peer per pass, repeated while any peer's
-last pull was truncated and budget remains — so a member behind on two
-origins advances on both.
+budget is `cluster.sync_interval_secs` itself, spent against a margin: another
+pull is started only when the pull before it would have fitted in the time
+left. The pulls are round-robined across the tick's peers — one per peer per
+pass, repeated while any peer's last pull was truncated and budget remains —
+so a member behind on two origins advances on both.
 
 `MAX_BATCH` and the frame budget are unchanged: they bound one frame, which
 is what they are for. `SyncOutcome` gains `truncated`, taken from what the
@@ -12818,7 +12819,11 @@ health backoff. Nothing is ever retried inside a tick.
 The `merged from peer` line and the `cluster.sync` span are per contact
 rather than per pull, and the line carries `pulls`: a drain reads as one line
 saying twelve pulls and twelve thousand entries rather than as twelve lines.
-No new metric series.
+The span is opened on the contact's first pull rather than when the tick
+queues the peer, because a subscriber stamps a span's start when it is
+created and a peer served last would otherwise show a duration inflated by
+every peer before it — which is the one reading ADR-135 keeps a span per peer
+for. No new metric series.
 
 **The defect.** A pull carries at most `MAX_BATCH` = 1,024 entries, and the
 loop ran one round per peer per tick of a five-second ticker. A round whose
@@ -12847,15 +12852,35 @@ declines to make the check run where it cannot be trusted, which is right.
 This closes the same gap from the other end: the backlog itself is what goes
 away, and with it the window in which the check has nothing it can trust.
 
-**Why the budget is the interval, and what the budget bounds.** The whole
-loop's timing hangs off `cluster.sync_interval_secs`: ADR-154's overrun
-warning fires on a tick longer than it, and the operator's rule for
+**Why the budget is the interval, and why it is spent against a margin.**
+The whole loop's timing hangs off `cluster.sync_interval_secs`: ADR-154's
+overrun warning fires on a tick longer than it, and the operator's rule for
 `kimmy_sync_divergence_check_age_seconds` is written as multiples of it. A
-drain that could push a tick past its own period would make both mean
-something else. So the budget is the interval, and it bounds the decision to
-pull *again* — never a pull already under way. A single round that overruns
-is ADR-154's stuck-tick case, unchanged and still warned about; what cannot
-happen is a tick overrunning merely because it chose to drain.
+drain that pushed a tick past its own period would make both mean something
+else. So the budget is the interval.
+
+**Spending it on "is there any time left" is not enough, and the first cut of
+this change did exactly that.** A pull started a millisecond before the
+deadline runs a whole pull past it, so *every* tick that saturated its budget
+ended after `tick_started + sync_interval` and fired the overrun warning —
+measured at 0.07 s to 2.33 s past a two-second interval, on every saturated
+tick, on an idle machine. ADR-154 is explicit about what that line is for:
+turning "the age was high for an hour" into "this member's sync tick took an
+hour", one line per stall rather than one per tick. Firing it on every tick of
+a drain would make it noise in precisely the condition this ADR exists to
+clear, and would have left four documents certifying a property the loop did
+not have.
+
+So the decision to pull again is taken against an estimate of what a pull
+costs: the slowest pull this contact has already made. The slowest rather than
+the last, because a drain's pulls are the same shape — a full batch each — so
+the longest is the honest estimate of the next, and one quick pull cannot talk
+the tick into a slow one. It is an estimate, and the claim is no stronger than
+that: a pull slower than every pull before it, by more than the slack left
+over, can still cross the line. That makes an overrun rare and worth reading
+rather than impossible, which is what ADR-154's warning needs of it, and it is
+the honest thing to write in an ADR. What is ruled out is the systematic case
+— a tick overrunning *because* it drained.
 
 The tickers do not catch up on missed ticks (ADR-154), so a tick that spends
 its whole budget is followed by the one that was due and then by the next a
@@ -12883,20 +12908,53 @@ scan stopped at the limit rather than at the end of its log — with two
 conditions beside it, and no count of entries anywhere. A short batch still
 means the tail, everywhere it did before.
 
-The two conditions are what make the next pull *move*. A batch that stopped
-at a collection this node does not hold (ADR-148) is re-served from the same
-place and stops at the same entry however often it is asked for; the repair
-planned at that stop is what moves it, and pulling again would spend the
-budget asking the same question. A window whose every entry sat above the
-vector the peer introduced it with left this node's position where it was,
-for the same reason. Both are states where the peer has more log and this
-node cannot yet take it, which is not the state a drain is for.
+**What actually makes the next pull move, and which condition carries it.**
+Not the entries applied: `apply_batch_absorbing` raises the witnessed vector
+both per taken entry *and* by merging `coverage_up_to(theirs, end)`, so a
+window ending `Through(last)` raises every origin the peer advertised to
+`min(theirs, last)` whether or not a single entry was applied — ADR-082's
+rule, and the reason a window of nothing but superseded entries still
+advances. A truncated window is a full batch wide, so each drained pull moves
+the position by about a batch.
+
+`unknown_collection == 0` is the load-bearing condition. A batch that stopped
+at a collection this node does not hold (ADR-148) ends `Before(stop)`, which
+raises coverage only to just below the stop — and once the position reaches
+that entry, the same window is re-served verbatim, for ever. Without the
+condition the drain would spend its whole budget on a hot loop of round trips
+in exactly ADR-148's documented "the same window is re-served from here"
+state; the repair planned at the stop is what moves it.
+
+`deferred < entries.len()` is defensive rather than load-bearing, and this ADR
+says so rather than claiming more for it. If every entry were deferred, the
+`Through(last)` merge would raise each advertised origin to `theirs` — every
+deferred entry sits above `theirs` at its origin — so `behind()` would answer
+`None` and the *next* pull would take the nothing-to-pull return with
+`exhausted: true`. The state resolves itself in one further pull. The
+condition costs a tick of drain in a state that needs the peer to append a
+full batch between reading its own vector and scanning its log, and it is kept
+because it is one comparison and it keeps the loop's own reasoning local.
 
 **A snapshot pull is not drained.** A whole-database or scoped snapshot left
 to resume (ADR-152) resumes on the next round with the peer, a page at a
 time, on its own terms; `truncated` is `false` for it. Its pages are already
 bounded by the round's deadline, and pulling its next round forward would put
-a second budget on a walk that has one.
+a second budget on a walk that has one. So the seventy minutes this ADR is
+argued against are not improved for a member that fell below a peer's
+retention horizon and is catching up by snapshot: that member still takes a
+round's worth of pages per tick, and the operations guide says so.
+
+**A residual, stated rather than left to be found.** The drain has no ceiling
+but the budget. A peer that answers a pull with a full window the sender
+reports as unexhausted but whose entries are all at or below where this node
+already stands moves nothing and still reads as truncated, so the loop would
+pull from it for the whole budget, every tick, for as long as it did that.
+That is a broken or hostile peer rather than a state a correct one can reach
+— a correct sender serves contiguously from the stamp it was asked for — and
+before this change it cost one wasted pull per tick rather than a budget's
+worth. It is recorded here because the change is what widens it, and a
+ceiling on the pulls one contact may make would close it in a line if it ever
+appears.
 
 **Why the divergence counters stay per contact.** ADR-135's series is a
 partition of the contacts a node made, and ADR-145 added the failed round to
@@ -12937,16 +12995,21 @@ one, which is the fresher reading of the same level.
 A peer being drained from serves several rounds in a tick instead of one, so
 a member catching up costs its peers more while it catches up — bounded, as
 before, by the fanout: a node answers at most the pullers that select it, and
-each pull is still one capped frame. The repair machinery (ADR-148) counts
-its cooldown and its attempts in rounds, and a drained tick is several
-rounds, so a repair that keeps being handed out reaches its attempt limit
-sooner in wall-clock terms while a backlog lasts. That is the same number of
-attempts against the same number of pulls, which is what the constant is
-about.
+each pull is still one capped frame. ADR-148's repair cooldown is counted per
+**contact**, not per pull: `REPAIR_COOLDOWN_ROUNDS` is sixty because sixty is
+five minutes at the default interval, and a drain spends sixty pulls in
+seconds. Counted per pull it would expire during exactly the backlog it must
+not be competing with — a divergence a repair cannot close would replay a
+collection's whole history every few ticks, out of the budget meant to be
+clearing the backlog — so `PeerStalls::tick_opened` marks the tick and
+`repair_due` counts the cooldown on the tick's first pull at a peer only.
+`REPAIR_ATTEMPTS` stays per pull, because a pull *is* a round the repair was
+handed out for, and a drained pull that advances the repair resets the run
+just as a whole round did.
 
-**Cost.** One `bool` on `SyncOutcome`, one comparison against the tick's
-deadline per pull, and a `VecDeque` of the tick's peers instead of an
-iterator over them. A drain makes one connection and one handshake per pull —
+**Cost.** One `bool` on `SyncOutcome`, one `Duration` and one comparison
+against the tick's deadline per pull, a `bool` per peer's repair record, and a
+`VecDeque` of the tick's peers instead of an iterator over them. A drain makes one connection and one handshake per pull —
 the same connections the old loop made, taken sooner rather than spread over
 ticks.
 
@@ -12958,7 +13021,16 @@ budget, and one skip per contact however many pulls it made),
 `a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull` (the tick's
 last pull decides the check) and
 `a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick`
-(the failure path, unchanged), and by ADR-133's and ADR-135's own accounting
+(the failure path, unchanged) and
+`a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval` (the
+margin, end to end: no overrun warning, several batches per contact, and the
+budget cutting a drain short on the way — all three, because the first alone
+passes against a loop that does not drain and the last two against one that
+drains without a margin); by `peers.rs`'s
+`a_pull_is_started_only_when_the_pull_before_it_would_have_fitted` (the
+margin's arithmetic) and `transport.rs`'s
+`a_tick_that_pulls_many_times_spends_one_contact_of_the_repair_cooldown`; and
+by ADR-133's and ADR-135's own accounting
 tests — `a_cap_truncated_round_counts_a_skip_and_never_a_check`,
 `a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` and
 `a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong` —

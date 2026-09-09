@@ -359,12 +359,17 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // so a member behind by more than one batch is not held to
                 // one batch per interval — 1,024 entries every five seconds
                 // whatever the wire or the writer could do. The budget is
-                // the interval itself, so draining never makes a tick
-                // overrun its own period: it bounds the decision to pull
-                // *again*, never a pull already under way, which is
-                // ADR-154's stuck-tick case and still says so at `WARN`
-                // below.
+                // the interval itself, and it is spent against a margin —
+                // see `Contact::fits_before` — so a tick that drains stops
+                // short of the period it owns rather than one pull past it,
+                // and ADR-154's overrun warning goes on meaning a tick that
+                // was stuck rather than a tick that was busy.
                 let deadline = tick_started + config.sync_interval;
+                // A new tick, so the next pull at each peer opens that
+                // peer's contact: what the repair machinery counts in
+                // rounds is counted once per contact, not once per pull
+                // (ADR-148's cooldown is stated in wall-clock terms).
+                stalls.tick_opened();
                 // Chosen once: `select` advances its own rotation, so
                 // asking it again mid-tick would move on to other peers
                 // rather than hand back the ones this tick is draining.
@@ -380,12 +385,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once_with(&engine, peer, &config.secret, probe, &mut stalls)
-                        .instrument(contact.span.clone())
-                        .await
-                    {
+                    let span = contact.span();
+                    let started = Instant::now();
+                    let pulled =
+                        sync_once_with(&engine, peer, &config.secret, probe, &mut stalls)
+                            .instrument(span)
+                            .await;
+                    let took = started.elapsed();
+                    match pulled {
                         Ok(mut outcome) => {
-                            contact.pulled(&outcome);
+                            contact.pulled(&outcome, took);
                             health.succeeded(peer);
                             report.ddl_refused += outcome.ddl_refused;
                             report.ddl_declined += outcome.ddl_declined;
@@ -404,7 +413,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // check to fold in and would otherwise be
                             // counted as a skip on a tick that goes on to
                             // check.
-                            if outcome.truncated && Instant::now() < deadline {
+                            if outcome.truncated && contact.fits_before(deadline) {
                                 draining.push_back(contact);
                                 continue;
                             }
@@ -412,7 +421,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // no `record_u64`, so an unsigned value is
                             // formatted with `Debug` and reaches a collector
                             // as a string nothing can graph.
-                            contact.span.record("lag_ms", outcome.lag_ms as i64);
+                            contact.record("lag_ms", outcome.lag_ms as i64);
                             // The last pull's reading, not the worst of the
                             // tick's: lag is a level, and a drain that
                             // closed a backlog has left the peer where the
@@ -607,8 +616,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     }
 }
 
-/// One tick's contact with one peer: the pulls it made and what they
-/// merged (ADR-157).
+/// One tick's contact with one peer: the pulls it made, what they merged,
+/// and how long the slowest of them took (ADR-157).
 ///
 /// A tick makes as many pulls from a peer as the batch cap and its budget
 /// call for, and they are one conversation, not one per pull. So the span
@@ -626,7 +635,14 @@ struct Contact {
     /// `applied`, `ddl` and `lag_ms` are declared empty and filled when the
     /// contact ends, so a contact whose pull failed still leaves a span with
     /// the peer on it rather than nothing at all.
-    span: tracing::Span,
+    ///
+    /// Built on the contact's first pull rather than when the tick queues
+    /// it, because a subscriber stamps a span's start when it is *created*:
+    /// building every peer's span at the top of the tick would start them
+    /// all at the same instant and give a peer served last a duration
+    /// inflated by however long the peers before it took, which is the one
+    /// reading this span exists for.
+    span: Option<tracing::Span>,
     pulls: usize,
     applied: usize,
     ddl: usize,
@@ -635,35 +651,79 @@ struct Contact {
     /// line, on the same terms as before a contact could make more than one
     /// pull.
     total: usize,
+    /// The longest any of this contact's pulls took, and the estimate of
+    /// what the next one would cost.
+    slowest: Duration,
 }
 
 impl Contact {
     fn new(peer: SocketAddr) -> Self {
-        let span = tracing::info_span!(
-            "cluster.sync",
-            otel.kind = "client",
-            peer = %peer,
-            applied = tracing::field::Empty,
-            ddl = tracing::field::Empty,
-            lag_ms = tracing::field::Empty,
-        );
-        Self { peer, span, pulls: 0, applied: 0, ddl: 0, total: 0 }
+        Self { peer, span: None, pulls: 0, applied: 0, ddl: 0, total: 0, slowest: Duration::ZERO }
     }
 
-    /// Fold in what one pull of this contact brought back.
-    fn pulled(&mut self, outcome: &kimmy_storage::SyncOutcome) {
+    /// The span this contact's pulls run under, created on the first of
+    /// them. See the field.
+    fn span(&mut self) -> tracing::Span {
+        let peer = self.peer;
+        self.span
+            .get_or_insert_with(|| {
+                tracing::info_span!(
+                    "cluster.sync",
+                    otel.kind = "client",
+                    peer = %peer,
+                    applied = tracing::field::Empty,
+                    ddl = tracing::field::Empty,
+                    lag_ms = tracing::field::Empty,
+                )
+            })
+            .clone()
+    }
+
+    /// Record a field on the contact's span, if it has one — it has, by the
+    /// time anything is recorded, since only a pull produces a value.
+    fn record(&self, field: &str, value: i64) {
+        if let Some(span) = &self.span {
+            span.record(field, value);
+        }
+    }
+
+    /// Fold in what one pull of this contact brought back, and what it cost.
+    fn pulled(&mut self, outcome: &kimmy_storage::SyncOutcome, took: Duration) {
         self.pulls += 1;
         self.applied += outcome.applied;
         self.ddl += outcome.ddl;
         self.total += outcome.total();
+        self.slowest = self.slowest.max(took);
+    }
+
+    /// Whether another pull of this contact can be expected to finish before
+    /// `deadline` — the tick's budget — judged on the slowest pull it has
+    /// already made (ADR-157).
+    ///
+    /// The estimate, rather than "is there any time left at all": a tick
+    /// that starts a pull with a millisecond to spare runs a whole pull past
+    /// its own period, so *every* tick that saturated its budget would
+    /// overrun it and fire ADR-154's warning — one line per tick for the
+    /// whole of the backlog this drain exists to clear, in place of the one
+    /// line per stall that warning was written to be.
+    ///
+    /// The slowest rather than the last, because a drain's pulls are the
+    /// same shape — a full batch each — so the longest one is the honest
+    /// estimate of the next, and one quick pull cannot talk the tick into a
+    /// slow one. It is still an estimate: a pull slower than every pull
+    /// before it, by more than the slack left over, can cross the line
+    /// anyway. That makes the overrun rare and worth reading rather than
+    /// impossible, which is what ADR-154's warning needs of it.
+    fn fits_before(&self, deadline: Instant) -> bool {
+        deadline.checked_duration_since(Instant::now()).is_some_and(|left| left > self.slowest)
     }
 
     /// The tick is done with this peer, having pulled from it or failed
     /// against it: record what the contact merged on its span, and say so
     /// once.
     fn finish(self) {
-        self.span.record("applied", self.applied as i64);
-        self.span.record("ddl", self.ddl as i64);
+        self.record("applied", self.applied as i64);
+        self.record("ddl", self.ddl as i64);
         if self.total > 0 {
             info!(
                 peer = %self.peer,
@@ -907,6 +967,47 @@ mod tests {
             1,
             "a read failure must not be read as \"this node holds nothing\""
         );
+    }
+
+    /// The margin the drain's budget is spent against (ADR-157): a tick
+    /// starts another pull only when the pull before it would have fitted
+    /// in the time left, so a tick that saturates its budget stops short of
+    /// its own period rather than one whole pull past it.
+    ///
+    /// Deciding on "is there any time left at all" instead makes every tick
+    /// that saturates its budget end *after* `tick_started + sync_interval`,
+    /// which fires ADR-154's overrun warning on every one of them — one line
+    /// per tick for the whole of a backlog, in place of the one line per
+    /// stall that warning was written to be, and in exactly the condition
+    /// draining exists to clear. Measured at 0.07 s to 2.33 s past a
+    /// two-second interval, on every saturated tick.
+    #[test]
+    fn a_pull_is_started_only_when_the_pull_before_it_would_have_fitted() {
+        let outcome = kimmy_storage::SyncOutcome::default();
+        let mut contact = Contact::new("127.0.0.1:7900".parse().unwrap());
+        let now = Instant::now();
+
+        // Nothing measured yet. The first pull of a contact is not decided
+        // here — the tick always makes it — so this only says a contact
+        // with no measurement is not held back by one.
+        assert!(contact.fits_before(now + Duration::from_millis(50)));
+        assert!(!contact.fits_before(now), "no budget left, no pull");
+
+        contact.pulled(&outcome, Duration::from_millis(400));
+        assert!(
+            contact.fits_before(now + Duration::from_millis(900)),
+            "a pull's worth of budget and more to spare"
+        );
+        assert!(
+            !contact.fits_before(now + Duration::from_millis(300)),
+            "less budget than the pull before it took"
+        );
+
+        // The slowest pull of the contact, not the last: a drain's pulls are
+        // a full batch each, so one quick one must not talk the tick into a
+        // slow one.
+        contact.pulled(&outcome, Duration::from_millis(10));
+        assert!(!contact.fits_before(now + Duration::from_millis(300)));
     }
 
     /// A tick that overran is followed by *one* tick at once — the one that
