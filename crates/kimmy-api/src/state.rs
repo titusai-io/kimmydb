@@ -191,6 +191,11 @@ impl AppState {
             writer_wait_timeouts: self.engine.writer_wait_timeouts(),
             writer_hold_max_us: u64::try_from(self.engine.writer_hold_max().as_micros())
                 .unwrap_or(u64::MAX),
+            // And what it cost *while* it ran, by what was running
+            // (ADR-159): the maximum above is one number about one moment,
+            // and says nothing about which path an operator should go and
+            // look at.
+            writer_hold: self.engine.writer_hold(),
         })
     }
 

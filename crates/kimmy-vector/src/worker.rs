@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kimmy_core::{ChunkConfig, Hlc, OpKind, VectorConfig, VectorRecord, path};
-use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope};
+use kimmy_storage::{
+    ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope, WriterHolder,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{Result, TransportKind, VectorError};
@@ -1442,7 +1444,7 @@ impl EmbeddingWorker {
         }
 
         let position = checkpoint.token;
-        let written: Vec<usize> = self.engine.write_batch(|scope| {
+        let written: Vec<usize> = self.engine.write_batch(WriterHolder::Embedding, |scope| {
             let mut written = Vec::new();
             for (source, hlc, count, write) in writes {
                 // The provider call is the long part, and the document can

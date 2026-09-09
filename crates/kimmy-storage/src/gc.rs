@@ -37,7 +37,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
 
 use crate::codec;
-use crate::engine::{Engine, physical_now_ms};
+use crate::engine::{Engine, WriterHolder, physical_now_ms};
 use crate::error::Result;
 use crate::tables;
 
@@ -188,7 +188,7 @@ impl Engine {
     /// Remove `keys` from the oplog and its arrival index, and record the
     /// horizon they leave behind, in one transaction.
     fn remove_oplog_entries(&self, keys: &[Vec<u8>]) -> Result<usize> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Retention)?;
         let mut removed = 0usize;
         {
             let mut oplog = txn.open_table(tables::OPLOG)?;
@@ -332,7 +332,7 @@ impl Engine {
         if expired.is_empty() {
             return Ok(0);
         }
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Retention)?;
         let mut removed = 0usize;
         {
             let mut docs = txn.open_table(tables::DOCS)?;
@@ -388,7 +388,7 @@ impl Engine {
             return Ok(0);
         }
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Retention)?;
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
@@ -436,7 +436,7 @@ impl Engine {
             return Ok(0);
         }
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Retention)?;
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::INDEXES_DROPPED)?;

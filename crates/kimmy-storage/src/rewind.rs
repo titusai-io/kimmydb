@@ -51,7 +51,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::info;
 
 use crate::codec;
-use crate::engine::Engine;
+use crate::engine::{Engine, WriterHolder};
 use crate::error::{Result, StorageError};
 use crate::{index, tables};
 
@@ -215,7 +215,7 @@ impl Engine {
 
         // Everything is decided. Now write.
         let mut outcome = RewindOutcome::default();
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Rewind)?;
         {
             // Index maintenance needs each collection's index definitions,
             // keyed by the id the oplog refers to.

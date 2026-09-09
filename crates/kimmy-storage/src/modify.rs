@@ -46,7 +46,7 @@ use kimmy_core::{DocId, DocRecord, OpKind, OplogEntry, Stamp};
 use redb::ReadableTable;
 
 use crate::docs::extract_id;
-use crate::engine::{append_oplog, doc_range_after};
+use crate::engine::{WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::{Engine, codec, index, tables};
@@ -200,6 +200,12 @@ impl Engine {
         stop_after: Option<usize>,
     ) -> Result<ModifyManyOutcome> {
         let chunk = self.multi_chunk_docs();
+        // A request that stops after one document is a client's ordinary
+        // write and is attributed as one; anything that may take a chunk is
+        // a bulk, whatever it ends up matching (ADR-159). Decided from the
+        // budget rather than from what matched, because the hold is bought
+        // before the match is known.
+        let holder = if stop_after == Some(1) { WriterHolder::Write } else { WriterHolder::Bulk };
         let mut outcome = ModifyManyOutcome::default();
         let mut after: Option<Vec<u8>> = None;
 
@@ -213,7 +219,7 @@ impl Engine {
                 break;
             }
 
-            let txn = self.begin_write()?;
+            let txn = self.begin_write(holder)?;
             let (matches, examined) = match self.collect_matches(
                 &txn,
                 coll,
@@ -285,7 +291,7 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
     ) -> Result<ModifyOutcome> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Write)?;
 
         let chosen = match self.choose(&txn, coll, candidates, spec) {
             Ok(chosen) => chosen,

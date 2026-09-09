@@ -19,7 +19,7 @@ use tracing::info;
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::docs::WriteScope;
-use crate::engine::WriteTxn;
+use crate::engine::{WriteTxn, WriterHolder};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 
@@ -117,7 +117,7 @@ impl crate::Engine {
         self.create_system_collection(db, &shadow)?;
 
         meta.vector = Some(config.clone());
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -166,7 +166,7 @@ impl crate::Engine {
         }
 
         meta.vector = None;
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -270,7 +270,7 @@ impl crate::Engine {
     /// rather than recomputed, because rebuilding it would mean re-reading the
     /// whole log on every restart.
     pub fn put_consumer_position(&self, consumer: &str, token: ResumeToken) -> Result<()> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Embedding)?;
         if let Err(e) = self.put_consumer_position_in_txn(&txn, consumer, token) {
             txn.abort()?;
             return Err(e);
@@ -321,7 +321,7 @@ impl crate::Engine {
     /// HLC cannot see a configuration change, because configurations do not
     /// touch documents.
     pub fn put_vector_fingerprint(&self, collection: CollectionId, fingerprint: u64) -> Result<()> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Embedding)?;
         {
             let mut meta = txn.open_table(crate::tables::META)?;
             meta.insert(fingerprint_key(collection).as_str(), &fingerprint.to_be_bytes()[..])?;
@@ -381,7 +381,7 @@ impl crate::Engine {
         records: &[VectorRecord],
     ) -> Result<()> {
         let write = VectorWrite::encode(source, records)?;
-        self.write_batch(|scope| scope.put_vectors(shadow, write))
+        self.write_batch(WriterHolder::Embedding, |scope| scope.put_vectors(shadow, write))
     }
 
     /// Every vector belonging to one source document, in chunk order.
@@ -481,7 +481,7 @@ impl crate::Engine {
     /// the set whole. The generation moves after the commit, and only when a
     /// chunk was removed; a document with no chunks costs no commit.
     pub fn delete_vectors(&self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
-        self.write_batch(|scope| scope.delete_vectors(shadow, source))
+        self.write_batch(WriterHolder::Embedding, |scope| scope.delete_vectors(shadow, source))
     }
 
     /// Visit every stored vector. Used by search and by index rebuilds.
@@ -806,7 +806,9 @@ mod tests {
         let token = ResumeToken::new(Hlc::new(7, 1), engine.node_id());
 
         let commits = engine.commits();
-        engine.write_batch(|scope| scope.put_consumer_position("worker", token)).unwrap();
+        engine
+            .write_batch(WriterHolder::Bulk, |scope| scope.put_consumer_position("worker", token))
+            .unwrap();
         assert_eq!(engine.commits() - commits, 1, "a position is a write, and a write commits");
         assert_eq!(engine.consumer_position("worker").unwrap(), Some(token), "and it is readable");
         assert!(rx.try_recv().is_err(), "a position is not an entry: nothing to publish");
@@ -826,7 +828,7 @@ mod tests {
         let commits = engine.commits();
         let one = VectorWrite::encode(&source, &[record(0, 20, "after")]).unwrap();
         engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 scope.put_vectors(&shadow, one)?;
                 assert_eq!(
                     engine.vector_generation(shadow.id),
@@ -844,7 +846,7 @@ mod tests {
 
         let two = VectorWrite::encode(&source, &[record(0, 30, "x"), record(1, 30, "y")]).unwrap();
         let err = engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 scope.put_vectors(&shadow, two)?;
                 Err::<(), _>(StorageError::Transaction("abandoned".into()))
             })

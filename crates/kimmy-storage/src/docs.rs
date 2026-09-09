@@ -18,7 +18,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
 use crate::codec;
-use crate::engine::{Engine, Position, WriteTxn, append_oplog, doc_range_after};
+use crate::engine::{Engine, Position, WriteTxn, WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
@@ -332,7 +332,7 @@ impl Engine {
     /// [`Engine::insert`], also returning the stamp the write produced — the
     /// version a caller needs for a conditional write that follows.
     pub fn insert_stamped(&self, coll: &CollectionMeta, doc: Document) -> Result<(DocId, Stamp)> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Write)?;
         let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
             Ok(pair) => pair,
             Err(e) => {
@@ -383,7 +383,7 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let txn = self.begin_write().map_err(BulkInsertError::transaction)?;
+        let txn = self.begin_write(WriterHolder::Bulk).map_err(BulkInsertError::transaction)?;
         let mut ids = Vec::with_capacity(docs.len());
         let mut entries = Vec::with_capacity(docs.len());
 
@@ -499,7 +499,7 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Write)?;
         match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
             Ok((outcome, Some(entry))) => {
                 txn.commit()?;
@@ -610,7 +610,7 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        Ok(self.delete_where(coll, id, |_, _| Ok(true))?.is_some())
+        Ok(self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true))?.is_some())
     }
 
     /// [`Engine::delete`], conditional on the document's current version,
@@ -630,11 +630,11 @@ impl Engine {
         expected: Option<Stamp>,
     ) -> Result<Option<Stamp>> {
         let Some(expected) = expected else {
-            return self.delete_where(coll, id, |_, _| Ok(true));
+            return self.delete_where(WriterHolder::Write, coll, id, |_, _| Ok(true));
         };
         // The absent case is decided here rather than in the guard, which
         // only ever sees a live document.
-        match self.delete_where(coll, id, |current, _| {
+        match self.delete_where(WriterHolder::Write, coll, id, |current, _| {
             if current == expected {
                 Ok(true)
             } else {
@@ -662,7 +662,10 @@ impl Engine {
         id: &DocId,
         guard: impl Fn(&Document) -> bool,
     ) -> Result<bool> {
-        Ok(self.delete_where(coll, id, |_, doc| Ok(guard(doc)))?.is_some())
+        // The expiry pass's own hold, not a client's: a TTL delete costs the
+        // same transaction as a client's delete, and an operator asking what
+        // held the writer needs the two apart (ADR-159).
+        Ok(self.delete_where(WriterHolder::Expiry, coll, id, |_, doc| Ok(guard(doc)))?.is_some())
     }
 
     /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
@@ -676,13 +679,18 @@ impl Engine {
     ///
     /// Answers with the tombstone's stamp when a document was removed, and
     /// `None` when there was nothing to remove or the guard declined.
+    ///
+    /// `holder` is the one thing the three callers do not share: the same
+    /// delete is a client's write or the expiry pass's, and the hold
+    /// histogram has to be told which (ADR-159).
     fn delete_where(
         &self,
+        holder: WriterHolder,
         coll: &CollectionMeta,
         id: &DocId,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<Stamp>> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(holder)?;
         match self.delete_in_txn(&txn, coll, id, guard) {
             Ok(Some(entry)) => {
                 txn.commit()?;
@@ -813,8 +821,16 @@ impl Engine {
     /// belongs inside: every other writer on the node waits behind the
     /// scope for as long as the closure runs, so the closure should hold
     /// its inputs ready and do nothing but write them. Reads are fine.
-    pub fn write_batch<T>(&self, f: impl FnOnce(&mut WriteScope<'_>) -> Result<T>) -> Result<T> {
-        let txn = self.begin_write()?;
+    ///
+    /// `holder` names what the scope is for, since every writer on the node
+    /// waits behind it and the hold histogram has to say which of them did
+    /// (ADR-159).
+    pub fn write_batch<T>(
+        &self,
+        holder: WriterHolder,
+        f: impl FnOnce(&mut WriteScope<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let txn = self.begin_write(holder)?;
         let mut scope = WriteScope {
             engine: self,
             txn,
@@ -879,7 +895,7 @@ impl Engine {
             self.witness(&entry.stamp);
             return Ok(false);
         }
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Replication)?;
         let RemoteApplied::Applied { id, violations } =
             self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)?
         else {
@@ -889,7 +905,8 @@ impl Engine {
             return Ok(false);
         };
         txn.commit()?;
-        let published = self.report_remote_write(coll, entry, &id, &violations)?;
+        let published =
+            self.report_remote_write(WriterHolder::Replication, coll, entry, &id, &violations)?;
         self.publish(published);
         Ok(true)
     }
@@ -1030,6 +1047,7 @@ impl Engine {
     /// and nothing under ADR-148 applies to it.
     pub(crate) fn report_remote_write(
         &self,
+        holder: WriterHolder,
         coll: &CollectionMeta,
         entry: &OplogEntry,
         id: &DocId,
@@ -1050,7 +1068,7 @@ impl Engine {
                 collection = %coll.name,
                 "a merged write broke a unique constraint"
             );
-            published.push(self.log_unique_violation(coll, id, violation)?);
+            published.push(self.log_unique_violation(holder, coll, id, violation)?);
         }
         Ok(published)
     }
@@ -1107,7 +1125,8 @@ impl Engine {
                 collection = %coll.name,
                 "a replicated unique index was built over documents that already share a key"
             );
-            match self.log_unique_violation(coll, &revealed_by, violation) {
+            match self.log_unique_violation(WriterHolder::IndexBuild, coll, &revealed_by, violation)
+            {
                 Ok(entry) => published.push(entry),
                 Err(e) => {
                     failed.get_or_insert(e);
@@ -1277,18 +1296,22 @@ impl Engine {
     /// A separate transaction from the merge itself, deliberately. The merge
     /// must not fail because reporting failed: a converged write with an
     /// unreported violation is bad, but a *rejected* replicated write is worse,
-    /// because the nodes then never agree.
+    /// because the nodes then never agree. It is attributed to whatever
+    /// revealed the collision, not to a holder of its own: the report is part
+    /// of that work's cost, and a label nobody could act on would be one more
+    /// row on the page (ADR-159).
     fn log_unique_violation(
         &self,
+        holder: WriterHolder,
         coll: &CollectionMeta,
         merged: &DocId,
         violation: &index::UniqueViolation,
     ) -> Result<OplogEntry> {
         let mut ids = Vec::with_capacity(violation.holders.len());
-        for holder in &violation.holders {
+        for key in &violation.holders {
             // The holder list is encoded document keys, which do not decode
             // back to ids; read each document to recover its `_id`.
-            match self.document_at_key(coll, holder)? {
+            match self.document_at_key(coll, key)? {
                 Some(id) => ids.push(id),
                 None => continue,
             }
@@ -1297,7 +1320,7 @@ impl Engine {
         let detail =
             kimmy_core::UniqueViolationDetail::new(violation.index.clone(), merged.clone(), ids);
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(holder)?;
         let entry = OplogEntry {
             // Under the writer, as every stamp is (ADR-148).
             stamp: self.next_stamp(),
@@ -1437,7 +1460,7 @@ mod tests {
         let commits = engine.commits();
         let fsyncs = engine.fsyncs();
         let written: Vec<(DocId, OpKind)> = engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 let mut written = Vec::new();
                 for n in 0..2 {
                     let id = DocId::Int64(n);
@@ -1505,7 +1528,7 @@ mod tests {
         let commits = engine.commits();
         let tail = engine.read_arrival_from(0, 100).unwrap().len();
         let err = engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 scope.replace(&coll, &DocId::Int64(1), doc! { "v": "after" }, false)?;
                 scope.delete(&coll, &DocId::Int64(2))?;
                 scope.replace(&coll, &DocId::Int64(3), doc! { "v": "after" }, true)?;
@@ -1541,7 +1564,7 @@ mod tests {
 
         let commits = engine.commits();
         let outcome = engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 let outcome = scope.replace(&coll, &DocId::Int64(7), doc! { "v": 1 }, false)?;
                 assert!(!scope.delete(&coll, &DocId::Int64(8))?, "nothing to delete");
                 Ok(outcome)
@@ -1574,7 +1597,7 @@ mod tests {
         // matters — nothing committed — is the one a missing poison fails.
         let mut answers = Vec::new();
         let err = engine
-            .write_batch(|scope| {
+            .write_batch(WriterHolder::Bulk, |scope| {
                 let b = scope.replace(
                     &coll,
                     &DocId::String("b".into()),

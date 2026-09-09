@@ -34,8 +34,8 @@ pub use divergence::{
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{
-    DurabilityClass, Engine, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterWaitSnapshot,
-    blocking, with_write_wait_budget,
+    DurabilityClass, Engine, WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US,
+    WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot, blocking, with_write_wait_budget,
 };
 pub use error::{Result, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};

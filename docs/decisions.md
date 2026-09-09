@@ -11482,6 +11482,17 @@ the two comparisons to one ordering.
 
 ## ADR-151 — The retention pass never holds the writer for a walk, and a write waits a bounded time for it
 
+> **Amended by [ADR-159](#adr-159--the-writer-hold-says-what-held-it).**
+> One clause below no longer holds. **"logged at `WARN` when it lets go, with
+> the span it was opened under — `replace`, `bulk`, `cluster.sync`,
+> `storage.retention`"** described a name the code never produced: the span a
+> client operation runs under is called `db.operation`, with the operation
+> carried in an `otel.name` *field*, so every client write, drop and index
+> build reached the line as one word, and a background path that enters no
+> span at all reached it as `none`. The `WARN` and its threshold stand; what
+> it names is now a holder the write path declares. The hold itself is a
+> histogram beside the maximum, `kimmy_write_lock_held_seconds{holder}`.
+
 **Decision.** A retention pass holds the single writer only to remove what it
 has already found, never to look for it. Expired oplog entries are read as a
 key range — the oplog is keyed by stamp, so the expired prefix ends at the
@@ -13029,3 +13040,138 @@ Each of those seven has been checked by reverting the production line it names
 — the purge loop, the tombstone's insert in the burial's transaction, the
 chunk bound, the sweep at `open`, the catalogue guard, the creation-side purge,
 and the tolerated `WriterBusy` — and watching it fail.
+
+---
+
+## ADR-159 — The writer hold says what held it
+
+**Decision.** Every path that takes the single writer **declares what it is
+doing**. `Engine::begin_write` takes a `WriterHolder`, `Engine::hold_writer`
+takes one, and the coalescing barrier's flush — which takes the gate without
+opening a counted transaction — holds one too. `record_writer_hold` files the
+hold in a histogram keyed by it, `kimmy_write_lock_held_seconds{holder}`, and
+the two things [ADR-151](#adr-151--the-retention-pass-never-holds-the-writer-for-a-walk-and-a-write-waits-a-bounded-time-for-it)
+built are unchanged beside it: the since-start maximum
+`kimmy_write_lock_held_seconds_max` still moves for every holder, and a hold
+past five seconds is still logged at `WARN` when it lets go — naming the
+declared holder now rather than the ambient span.
+
+Twelve holders, and the rule that produced them is that **a holder names the
+work the transaction does, not who asked for it**:
+
+| Holder | What it is | What bounds the hold |
+| --- | --- | --- |
+| `write` | One document from a client: an insert, a replace, an update, a delete, a find-and-modify | One document |
+| `bulk` | Many documents in one transaction: a bulk insert, a chunk of a multi-document update, a scoped batch | The batch, or `storage.multi_chunk_docs` |
+| `ddl` | A schema change writing metadata alone — a database or collection created, a vector configuration settled, a tombstone recorded | Nothing; it is O(1) whatever the collection holds |
+| `index_build` | Creating an index, which reads every document of the collection and files it under the new definition in the creating transaction | The collection |
+| `drop` | Dropping a collection or an index, which removes every document or entry it holds in one transaction | The collection |
+| `replication` | Applying a peer's entries: one run of an anti-entropy batch, or the entry a replicated schema change is recorded from | The batch cap |
+| `repair` | Applying a page of a peer's snapshot ([ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped)) | One page |
+| `retention` | The retention pass removing what its scans already found; never the scans, which take no writer | 1,000 records per commit |
+| `expiry` | A TTL index's delete | One document |
+| `embedding` | The embedding worker writing vectors or checkpointing its position | One batch of documents |
+| `durability` | The shared fsync of the coalescing barrier ([ADR-088](#adr-088--two-durability-classes-and-the-one-there-is-not)) | One marker write and one fsync |
+| `rewind` | Rewinding the database to a point in time | The oplog above the target |
+
+Three of those divisions are the ones the round below could not make, and each
+is a different cost class rather than a different caller: `ddl` is constant,
+`index_build` and `drop` are proportional to the collection, and folding the
+three into one word is how a schema change that stalls a node for a minute
+looks like the one that costs a millisecond. `replication` and `repair` are
+named for replication because there is nothing else they are — no local path
+applies a peer's batch or a peer's snapshot page — while a collection drop is
+`drop` whether a client issued it or a peer's entry carried it, because the
+hold is the same size and the drop is what an operator is hunting.
+
+**The buckets**, in seconds: `0.001`, `0.01`, `0.1`, `1`, `5`, `30`, `300`,
+`+Inf`. They are not the wait histogram's, because a hold is not a wait. One
+millisecond is a transaction that wrote nothing and aborted, which costs no
+fsync at all — a declined expiry, a snapshot page a member already held. Ten
+is an ordinary durable commit, measured at ~3.4 ms. A hundred milliseconds and
+a second are where a batch sits. **Five seconds is `WRITER_HOLD_WARN`**, so
+the bucket the operations guide tells an operator to alert on and the line the
+log writes are the same threshold, and a test holds the two constants
+together; every hold counted above that bound has a `WARN` naming the same
+holder. Thirty seconds is the request timeout's default: above it every client
+write that queued behind the hold has already been refused with `503 timeout`.
+Five minutes separates a bad hold from a write outage — the retention passes
+ADR-151 measured ran ten to twelve.
+
+**On the bridge**, one observable counter pair per holder:
+`kimmy.write_lock.held_seconds.<holder>` and `kimmy.write_lock.holds.<holder>`,
+which is the one-instrument-per-label-value convention every other labelled
+series on that bridge already uses. The bucket boundaries stay on `/metrics`
+alone, for the reason recorded against the other two histograms — every
+instrument on this bridge is observable, and OpenTelemetry has no observable
+histogram — but the attribution does not, because the attribution is the part
+an operator acts on and a collector is where the alerting lives.
+
+**Why.** A sustained-load round on the test cluster ended with roughly 11,900
+writes having waited more than five seconds for the writer and eighteen
+transactions having held it for more than five seconds, and **nothing in the
+system could say what those eighteen were**. `kimmy_write_lock_wait_seconds`
+counts the effect on every write that queued; `kimmy_write_lock_held_seconds_max`
+gives one number about one moment and names nothing. A retention pass, a
+replicated batch, a collection drop and an ordinary client write were one
+undifferentiated fact, and the next decision — what to bound, and to what —
+cannot be taken from it. This is the measurement that has to come first.
+
+The attribution had to be **declared rather than inferred**, and that is the
+half of this worth arguing. ADR-151 read the holder from
+`tracing::Span::current()`, which is wrong three ways at once. The span every
+client operation runs under is named `db.operation`, with `find`, `insert` and
+the rest carried in an `otel.name` field for the collector to rename by — so a
+collection drop and a single insert arrived at the log line as the same word,
+which is exactly the distinction the round needed. A background path that
+enters no span reads `none`, and replication, retention, TTL and the embedding
+worker are most of what holds the writer for a long time. And the barrier's
+flush takes the gate directly, outside any transaction, so it recorded no hold
+at all — the one holder that was not merely mislabelled but invisible. A
+parameter cannot go quiet in any of those ways: a new write path is a compile
+error until it says what it is, which is the only reason to believe the set is
+complete. A test holds the other end of that, failing on a holder no path in
+the crate names — a label the documentation promises and nothing fills is a
+dimension that splits to nothing for ever, with no way to tell that from a
+path that never ran.
+
+**Alternatives.** *Keep reading the span and map its name onto a closed set*
+was rejected as the whole answer for the reason above: the mapping would be
+`db.operation` → one label for every client operation there is, and the
+divisions the round needed are inside it. *A task-local the entry points set,
+read by `begin_write`* was rejected for the failure it shares with the span: a
+path that sets nothing lands in a default bucket silently, and "silently" is
+what this ADR exists to end. *Naming the holder by origin — local or
+replicated — rather than by work* was rejected because it answers the wrong
+question: an operator with a stalled member wants to know what to go and look
+at, and "replicated" does not distinguish a batch of documents from a drop
+that removed forty thousand of them. *One label per storage entry point* was
+rejected as a metric label made of function names, which is neither bounded in
+practice nor readable by anyone who has not read the crate. *A database or
+collection label* is refused outright and permanently: an operator can create
+collections, so it is unbounded cardinality by construction, and it is the
+thing [ADR-068](#adr-068--telemetry-attribute-privacy-names-are-off-by-default)
+keeps off telemetry anyway. *Bridging the buckets to OTLP* is deferred with
+the latency and wait histograms, for the reason recorded against those two.
+*Bounding a hold* — chunking an index build or a drop the way the retention
+pass and a multi-document update are already chunked — is deliberately not
+here: that is the change this measurement exists to inform, and choosing which
+holder to bound before knowing which one spends the writer's time is choosing
+blind. That is the whole argument for shipping a histogram on its own.
+
+**Residuals.** `write` folds an insert, a replace, a delete and a
+find-and-modify into one row: they are one document each and their holds are
+the same shape, and splitting them would be four labels answering a question
+`kimmy_requests_total` already answers. A multi-document update that stops
+after one document is attributed as `write` and not as `bulk`, decided from
+the request's budget rather than from what it matched, because the hold is
+bought before the match is known — so a filtered update that turns out to
+match one document still reads as `bulk`. `rewind` reads 0 on any node that
+serves: it runs only under `kimmyd restore --until`, in a process that exits
+before anything can scrape it. It is in the set anyway, because the set is
+meant to be the whole of what takes the writer and not the part of it a scrape
+happens to see. And a hold is measured from the moment the gate is taken to
+the moment it is released, which for a commit includes its fsync but not the
+wait at the coalescing barrier — a committer releases the gate before it waits
+there, as ADR-151 left it, so `durability` holds the writer for the flush and
+the waiter's own row does not carry it.

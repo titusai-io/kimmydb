@@ -72,6 +72,10 @@ pub struct StorageReadings {
     pub writer_wait: kimmy_storage::WriterWaitSnapshot,
     pub writer_wait_timeouts: u64,
     pub writer_hold_max_us: u64,
+    /// How long the writer was held, split by what held it (ADR-159). The
+    /// maximum above says how bad the worst hold was and nothing about what
+    /// caused it; this is the reading an operator acts on.
+    pub writer_hold: kimmy_storage::WriterHoldSnapshot,
 }
 
 /// The process's resident memory, read from the kernel.
@@ -171,6 +175,12 @@ pub struct MetricsSnapshot {
     /// microseconds (ADR-151); the wait histogram itself is not bridged.
     pub write_lock_wait_timeouts: u64,
     pub write_lock_held_max_us: u64,
+    /// Holds of the writer, and microseconds it was held for, by each
+    /// [`kimmy_storage::WriterHolder`] in `WriterHolder::ALL` order
+    /// (ADR-159). The histogram's buckets are on `/metrics` alone; these
+    /// two rows are what the bridge carries, one instrument per holder.
+    pub write_lock_holds: [u64; kimmy_storage::WriterHolder::COUNT],
+    pub write_lock_held_us: [u64; kimmy_storage::WriterHolder::COUNT],
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -748,6 +758,8 @@ impl Metrics {
             process_resident_peak_bytes: readings.process_resident_peak_bytes,
             write_lock_wait_timeouts: readings.writer_wait_timeouts,
             write_lock_held_max_us: readings.writer_hold_max_us,
+            write_lock_holds: readings.writer_hold.count,
+            write_lock_held_us: readings.writer_hold.sum_us,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -895,6 +907,7 @@ impl Metrics {
              # HELP kimmy_write_lock_held_seconds_max The longest any one transaction has held the storage writer since start. Every other write on the node waited behind it.\n\
              # TYPE kimmy_write_lock_held_seconds_max gauge\n\
              kimmy_write_lock_held_seconds_max {writer_hold_max}\n\
+             {writer_hold}\
              # HELP kimmy_storage_bytes Size of the database file on disk.\n\
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
@@ -1043,6 +1056,7 @@ impl Metrics {
             fsyncs = readings.fsyncs,
             grouped = readings.commits_grouped,
             writer_wait = render_writer_wait(&readings.writer_wait),
+            writer_hold = render_writer_hold(&readings.writer_hold),
             writer_wait_timeouts = readings.writer_wait_timeouts,
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
@@ -1153,6 +1167,44 @@ fn render_writer_wait(wait: &kimmy_storage::WriterWaitSnapshot) -> String {
     out
 }
 
+/// The writer-hold histogram, one row per holder (ADR-159).
+///
+/// The same cumulative-bucket shape as `render_writer_wait`, carrying the
+/// `holder` label. Every holder is rendered whether or not it has held the
+/// writer yet, for the reason the whole page renders counters at zero: a
+/// dashboard split by holder must not gain a series the first time a
+/// retention pass removes something.
+fn render_writer_hold(hold: &kimmy_storage::WriterHoldSnapshot) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::from(
+        "# HELP kimmy_write_lock_held_seconds How long a transaction held the storage writer, by what held it. Every other write on the node waited behind the hold, so this is the cause kimmy_write_lock_wait_seconds is the effect of.\n\
+         # TYPE kimmy_write_lock_held_seconds histogram\n",
+    );
+    for holder in kimmy_storage::WriterHolder::ALL {
+        let row = holder.slot();
+        let label = holder.label();
+        let mut cumulative = 0u64;
+        for (slot, upper) in kimmy_storage::WRITER_HOLD_BUCKETS_US.iter().enumerate() {
+            cumulative += hold.buckets[row][slot];
+            let le = *upper as f64 / 1e6;
+            let _ = writeln!(
+                out,
+                "kimmy_write_lock_held_seconds_bucket{{holder=\"{label}\",le=\"{le}\"}} {cumulative}"
+            );
+        }
+        let count = hold.count[row];
+        let sum = hold.sum_us[row] as f64 / 1e6;
+        let _ = writeln!(
+            out,
+            "kimmy_write_lock_held_seconds_bucket{{holder=\"{label}\",le=\"+Inf\"}} {count}"
+        );
+        let _ = writeln!(out, "kimmy_write_lock_held_seconds_sum{{holder=\"{label}\"}} {sum}");
+        let _ = writeln!(out, "kimmy_write_lock_held_seconds_count{{holder=\"{label}\"}} {count}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1253,6 +1305,27 @@ mod tests {
         m
     }
 
+    /// The hold histogram with every holder's row distinct from every
+    /// other's, so a row rendered under the wrong label cannot match the
+    /// golden (ADR-159).
+    ///
+    /// Each holder lands `slot + 1` holds in the bucket its own slot picks,
+    /// one more in the top bucket, and one hold above every bound — so the
+    /// cumulative sum, the `+Inf` overflow and the `holder` label are each
+    /// visible in the golden text rather than inferred from it.
+    fn distinct_hold() -> kimmy_storage::WriterHoldSnapshot {
+        let top = kimmy_storage::WRITER_HOLD_BUCKETS_US.len() - 1;
+        let mut hold = kimmy_storage::WriterHoldSnapshot::default();
+        for holder in kimmy_storage::WriterHolder::ALL {
+            let row = holder.slot();
+            hold.buckets[row][row % (top + 1)] += row as u64 + 1;
+            hold.buckets[row][top] += 1;
+            hold.count[row] = row as u64 + 3;
+            hold.sum_us[row] = (row as u64 + 1) * 1_500_000;
+        }
+        hold
+    }
+
     /// The engine's readings, every one distinct from every counter above
     /// and from each other, so a reading rendered under another's name
     /// cannot match the golden.
@@ -1276,6 +1349,10 @@ mod tests {
             },
             writer_wait_timeouts: 51,
             writer_hold_max_us: 52_500_000,
+            // One holder per row, none of them equal, so a row rendered
+            // under another holder's label cannot match the golden. The
+            // counts are the buckets' sum, as a real snapshot's are.
+            writer_hold: distinct_hold(),
         }
     }
 
@@ -1335,6 +1412,128 @@ kimmy_write_lock_wait_timeouts_total 51
 # HELP kimmy_write_lock_held_seconds_max The longest any one transaction has held the storage writer since start. Every other write on the node waited behind it.
 # TYPE kimmy_write_lock_held_seconds_max gauge
 kimmy_write_lock_held_seconds_max 52.5
+# HELP kimmy_write_lock_held_seconds How long a transaction held the storage writer, by what held it. Every other write on the node waited behind the hold, so this is the cause kimmy_write_lock_wait_seconds is the effect of.
+# TYPE kimmy_write_lock_held_seconds histogram
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"0.001\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"0.01\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"0.1\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"1\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"5\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"30\"} 1
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"300\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"write\",le=\"+Inf\"} 3
+kimmy_write_lock_held_seconds_sum{holder=\"write\"} 1.5
+kimmy_write_lock_held_seconds_count{holder=\"write\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"0.01\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"0.1\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"1\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"5\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"30\"} 2
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"300\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"bulk\",le=\"+Inf\"} 4
+kimmy_write_lock_held_seconds_sum{holder=\"bulk\"} 3
+kimmy_write_lock_held_seconds_count{holder=\"bulk\"} 4
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"0.1\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"1\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"5\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"30\"} 3
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"300\"} 4
+kimmy_write_lock_held_seconds_bucket{holder=\"ddl\",le=\"+Inf\"} 5
+kimmy_write_lock_held_seconds_sum{holder=\"ddl\"} 4.5
+kimmy_write_lock_held_seconds_count{holder=\"ddl\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"1\"} 4
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"5\"} 4
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"30\"} 4
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"300\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"+Inf\"} 6
+kimmy_write_lock_held_seconds_sum{holder=\"index_build\"} 6
+kimmy_write_lock_held_seconds_count{holder=\"index_build\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"5\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"30\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"300\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"+Inf\"} 7
+kimmy_write_lock_held_seconds_sum{holder=\"drop\"} 7.5
+kimmy_write_lock_held_seconds_count{holder=\"drop\"} 7
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"30\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"300\"} 7
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"+Inf\"} 8
+kimmy_write_lock_held_seconds_sum{holder=\"replication\"} 9
+kimmy_write_lock_held_seconds_count{holder=\"replication\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"30\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"300\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"+Inf\"} 9
+kimmy_write_lock_held_seconds_sum{holder=\"repair\"} 10.5
+kimmy_write_lock_held_seconds_count{holder=\"repair\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.001\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.01\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.1\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"1\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"5\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"30\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"300\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"+Inf\"} 10
+kimmy_write_lock_held_seconds_sum{holder=\"retention\"} 12
+kimmy_write_lock_held_seconds_count{holder=\"retention\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.01\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.1\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"1\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"5\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"30\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"300\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"+Inf\"} 11
+kimmy_write_lock_held_seconds_sum{holder=\"expiry\"} 13.5
+kimmy_write_lock_held_seconds_count{holder=\"expiry\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.1\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"1\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"5\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"30\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"300\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"+Inf\"} 12
+kimmy_write_lock_held_seconds_sum{holder=\"embedding\"} 15
+kimmy_write_lock_held_seconds_count{holder=\"embedding\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"1\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"5\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"30\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"300\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"+Inf\"} 13
+kimmy_write_lock_held_seconds_sum{holder=\"durability\"} 16.5
+kimmy_write_lock_held_seconds_count{holder=\"durability\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"5\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"30\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 14
+kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 18
+kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 14
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
@@ -1664,10 +1863,15 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 55 scalar sample lines plus two histograms: the latency one's 12
-        // buckets, +Inf, sum and count, and the writer wait's 8 buckets,
-        // +Inf, sum and count (ADR-151).
-        assert_eq!(samples, 89, "expected one sample per series: {out}");
+        // 55 scalar sample lines plus three histograms: the latency one's 12
+        // buckets, +Inf, sum and count; the writer wait's 8 buckets, +Inf,
+        // sum and count (ADR-151); and the writer hold's 7 buckets, +Inf,
+        // sum and count for each of the twelve holders (ADR-159).
+        assert_eq!(
+            samples,
+            89 + 10 * kimmy_storage::WriterHolder::COUNT,
+            "expected one sample per series: {out}"
+        );
     }
 
     #[test]
