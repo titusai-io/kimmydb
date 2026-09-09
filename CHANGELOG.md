@@ -55,9 +55,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   that applied the drop no longer pull it straight back, which was the
   re-seeding half of the finding — but when their tombstones expire the check
   reports the collection again and repairs it from the member still holding it.
-  So if a member logs `behind the peer's retention horizon; falling back to a
-  snapshot` and then `caught up from a snapshot`, compare its collection list
-  against a member that stayed up and drop anything only it holds.
+  So compare the collection list of any member that logs `behind the peer's
+  retention horizon; falling back to a snapshot` against a member that stayed up,
+  and drop anything only it holds. That warning marks one of the two ways in, and
+  the `caught up from a snapshot` line after it is logged for a one-collection
+  repair too, so check on suspicion as well for a member that has been repairing
+  against a peer over many rounds: a repair that falls back to the whole database
+  reaches the same state and nothing names it.
 
 ## 0.26.0 - 2026-09-08
 
