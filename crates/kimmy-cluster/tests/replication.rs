@@ -2869,7 +2869,7 @@ async fn a_member_lacking_a_collection_stops_plans_a_snapshot_and_catches_up() {
 /// what the existence half of the check reports for a member that has lost
 /// one. A must read it as the life it ended rather than as a hole in
 /// itself: nothing reported, nothing confirmed, no repair planned, no
-/// snapshot pulled. On the cluster this came from, `DELETE /v1/db/bench`
+/// snapshot pulled. On the cluster this came from, `DELETE /v1/db/shop/coll/bench`
 /// answered `200 {"dropped": true}` and 48,128 documents came back on all
 /// three members, minutes later, twice.
 ///
@@ -2993,9 +2993,11 @@ async fn a_collection_dropped_here_is_not_pulled_back_from_a_peer_that_has_not_a
 ///
 /// The tombstone lands at *A's* stamp rather than B's clock, and mints no
 /// entry here — the pair a replicated `DropCollection` writes — so B does
-/// not go on to re-broadcast the drop under a later stamp than it has. And
-/// the entries A still holds for the collection become history on the round
-/// after, rather than a stop that repeats for the life of the process.
+/// not go on to re-broadcast the drop under a later stamp than it has.
+///
+/// This is the drop as it stands when the repair opens, which rides the
+/// snapshot's first page. The drop that lands *between* two pages of a
+/// repair already under way is the test that follows this one.
 #[tokio::test]
 async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here_too() {
     use kimmy_cluster::{PeerStalls, Repair};
@@ -3045,11 +3047,128 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
         minted,
         "a replicated drop mints no entry here"
     );
+}
 
-    // What A still holds for it is history now, not a batch that stops.
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
-    assert_eq!(outcome.unknown_collection, 0, "the tombstone answers for them: {outcome:?}");
-    assert!(b.engine.get_collection("shop", "bench").is_err(), "and nothing recreated it");
+/// A byte relay to `target` that closes the connection it is carrying the
+/// moment `cut` is signalled — a peer that goes away mid-round. TLS runs end
+/// to end through it, so the round it carries is a real round, for the reason
+/// `relay_one_connection` gives. Connections opened after the signal are
+/// carried normally; the listener stays bound for the life of the test.
+async fn relay_until_cut(
+    target: std::net::SocketAddr,
+    cut: Arc<tokio::sync::Notify>,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let cut = Arc::clone(&cut);
+            tokio::spawn(async move {
+                let Ok(mut upstream) = TcpStream::connect(target).await else { return };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream) => {}
+                    _ = cut.notified() => {}
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The sender dropping the collection **between two pages** of a repair, over
+/// two members and the wire.
+///
+/// B is pulling a scoped snapshot of a collection it does not hold; the round
+/// is cut with part of the copy applied and its cursor kept, and A drops the
+/// collection before the round that resumes the pull. The page that comes
+/// back carries the drop, so B ends with the collection absent, the partial
+/// copy it had accumulated gone, and the tombstone at A's stamp.
+///
+/// Until every page of a scoped snapshot carried the sender's drop, that
+/// resumed page came back with no definition, no documents, no drop and no
+/// cursor — the same thing a snapshot that had simply run out looks like — so
+/// B called the pull complete and went on advertising a partial copy of an
+/// incarnation the cluster had agreed to delete, with no tombstone of its own
+/// to stop it being served or re-seeded onto the members that applied the
+/// drop. That is the window this test defends, and the one nothing else here
+/// reaches: the test above it exercises the drop as it stands on the
+/// snapshot's *first* page. The resumed page has a test of its own in
+/// `kimmy-storage`; this is the same window through the round that pulls it.
+#[tokio::test]
+async fn a_repair_whose_sender_drops_the_collection_between_pages_discards_the_partial_copy() {
+    use kimmy_cluster::{PeerStalls, Repair};
+    use kimmy_storage::SNAPSHOT_PAGE;
+
+    // Wide enough that a page lands long before the last one does, so the
+    // cut below always finds the pull part-way through.
+    const DOCUMENTS: usize = SNAPSHOT_PAGE * 20;
+
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "bench").unwrap();
+    let batch: Vec<_> = (0..DOCUMENTS as i64).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, batch).unwrap();
+
+    // B holds none of it, which is what a snapshot repair is for. Nothing of
+    // A's oplog reaches B on either round: a repair asks for the snapshot
+    // outright rather than for a window.
+    let cut = Arc::new(tokio::sync::Notify::new());
+    let relayed = relay_until_cut(a.addr, Arc::clone(&cut)).await;
+    let mut stalls = PeerStalls::new();
+    assert!(stalls.plan_repair(a.engine.node_id(), ca.id, Repair::Snapshot));
+
+    let engine = Arc::clone(&b.engine);
+    let round = tokio::spawn(async move {
+        let outcome = sync_once_with(&engine, relayed, SECRET, None, &mut stalls).await;
+        (outcome, stalls)
+    });
+
+    // Cut the round once a page has landed: the pages applied and the cursor
+    // saying where they stopped are what the next round resumes from.
+    let mut waited = 0;
+    while b.engine.count_by_id(ca.id).unwrap().unwrap_or(0) < SNAPSHOT_PAGE as u64 {
+        waited += 1;
+        assert!(waited < 30_000, "the snapshot's first page never landed on B");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    cut.notify_one();
+    let (outcome, mut stalls) = round.await.unwrap();
+    assert!(outcome.is_err(), "the round was cut, not completed: {outcome:?}");
+    let held = b.engine.count_by_id(ca.id).unwrap().expect("a partial copy stands here");
+    assert!(
+        held >= SNAPSHOT_PAGE as u64 && held < DOCUMENTS as u64,
+        "part of A's copy and not all of it, so there is a pull to resume: {held}"
+    );
+    assert!(stalls.repairing(a.engine.node_id()), "and the repair is still under way");
+
+    // Between the pages. The round that resumes the pull is the one that
+    // finds out.
+    assert!(a.engine.drop_collection("shop", "bench").unwrap());
+    let dropped = a.engine.collection_dropped_at(ca.id).unwrap().expect("A's tombstone");
+    let minted = b.engine.version_vector().unwrap().get(b.engine.node_id());
+
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(outcome.repairing, "the resumed round is the repair: {outcome:?}");
+    assert!(!stalls.repairing(a.engine.node_id()), "which ended with the drop");
+
+    if let Ok(kept) = b.engine.get_collection("shop", "bench") {
+        panic!(
+            "B kept {} documents of the incarnation A dropped between pages, and goes on \
+             advertising it",
+            b.engine.count(&kept).unwrap()
+        );
+    }
+    assert_eq!(b.engine.count_by_id(ca.id).unwrap(), None, "the partial copy went with the drop");
+    assert_eq!(
+        b.engine.collection_dropped_at(ca.id).unwrap(),
+        Some(dropped),
+        "the tombstone is at A's stamp, not B's clock"
+    );
+    assert_eq!(
+        b.engine.version_vector().unwrap().get(b.engine.node_id()),
+        minted,
+        "a replicated drop mints no entry here"
+    );
 }
 
 /// A collection genuinely recreated on the peer after the drop is still
