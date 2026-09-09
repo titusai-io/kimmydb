@@ -1625,8 +1625,11 @@ mod tests {
         assert_eq!(b.version_vector().unwrap().get(b.node_id()), b_own, "no entry of its own");
 
         // The whole-database route is untouched: it carries no drop on any
-        // page, which is a separate gap and not this one.
-        assert_eq!(a.snapshot_page(progress.after().cloned(), None).unwrap().dropped, None);
+        // page, which is a separate gap and not this one. Asked with the
+        // first page's cursor rather than `progress.after()`, which is `None`
+        // by now — the resumed arm is the one this could regress, and a first
+        // page is already pinned elsewhere in this file.
+        assert_eq!(a.snapshot_page(first.next.clone(), None).unwrap().dropped, None);
     }
 
     /// A tombstone alone cannot stand for "the collection is gone": a
