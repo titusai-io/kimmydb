@@ -779,6 +779,46 @@ mod tests {
         assert_eq!(compare(&mine, &peer).existence, BTreeSet::new());
     }
 
+    /// The same rule under a **chunked** drop (ADR-158), against a real
+    /// engine rather than a hand-built `LocalState`. A drop clears what the
+    /// collection held a chunk at a time, so for the whole of that the
+    /// documents are still on disk — and the check must already read the
+    /// collection as gone, because a peer that has not applied the drop yet
+    /// is exactly the peer this state would otherwise be repaired from.
+    #[test]
+    fn a_collection_whose_drop_is_still_purging_is_not_divergent_while_a_peer_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+
+        // The drop's first commit and nothing after it: the state the drop
+        // is in for every chunk of its purge, and the one a restart leaves.
+        engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+        let held = {
+            let txn = engine.db().begin_read().unwrap();
+            let docs = txn.open_table(crate::tables::DOCS).unwrap();
+            docs.range(crate::engine::doc_range(orders.id)).unwrap().count()
+        };
+        assert_eq!(held, 1, "the fixture must still hold what the purge has not reached");
+
+        let mine = LocalState {
+            collections: engine.all_collection_ids().unwrap(),
+            probe: None,
+            dropped: engine.collection_tombstones().unwrap(),
+        };
+        let peer = PeerAnswer {
+            collections: [orders.id].into_iter().collect(),
+            probe_count: None,
+            incarnations: [(orders.id, orders.created)].into_iter().collect(),
+        };
+        assert_eq!(
+            compare(&mine, &peer).existence,
+            BTreeSet::new(),
+            "a drop still purging is a drop: the peer is behind, not divergent"
+        );
+    }
+
     #[test]
     fn a_collection_recreated_since_this_node_dropped_it_is_divergent() {
         // Why the incarnation travels at all: ids are derived from names, so

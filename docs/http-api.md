@@ -479,6 +479,21 @@ a peer holding a database whose only contents are a shadow whose base
 collection is gone. Drop on one member and confirm the drop on the others (a
 drop is not instant — see [Operations](operations.md)); do not drop on each.
 
+**A drop is not atomic in one transaction, and it is atomic to a reader.**
+The collection's definition and its tombstone go in the drop's first commit and
+everything it held is removed after that, a thousand rows per commit, so the
+member's other writes are not held behind it ([ADR-158](decisions.md), and
+[Operations](operations.md) for the cost). From that first commit the
+collection is **gone** to every client and every peer: `GET
+/v1/db/{db}/collections` does not list it, reads and writes to it answer as
+they do for a collection that never existed, and there is no window in which it
+is served intact and short of documents. The `DELETE` itself still answers when
+the removal is finished, so a drop of a large collection is a long request —
+size a client timeout for it, and issue it once rather than retrying, since a
+retry answers `{"dropped": false}` for the drop that is already in progress or
+done. A member restarted mid-drop finishes the removal at its next start; the
+drop itself was durable and replicated before the first row went.
+
 **A drop stays dropped.** It is applied where it lands, it replicates as a
 change like any other, and it is not undone by the anti-entropy that converges
 the cluster: while the tombstone is retained, a member that has applied the
