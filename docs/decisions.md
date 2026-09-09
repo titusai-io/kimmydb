@@ -12873,9 +12873,9 @@ not have.
 
 So the decision to pull again is taken against an estimate of what a pull
 costs: the slowest pull this contact has already made. The slowest rather than
-the last, because a drain's pulls are the same shape — a full batch each — so
-the longest is the honest estimate of the next, and one quick pull cannot talk
-the tick into a slow one. It is an estimate, and the claim is no stronger than
+the last, because a drain's pulls are the same shape — a full batch each —
+so the longest is the honest estimate of the next, and one quick pull cannot
+talk the tick into a slow one. It is an estimate, and the claim is no stronger than
 that: a pull slower than every pull before it, by more than the slack left
 over, can still cross the line. That makes an overrun rare and worth reading
 rather than impossible, which is what ADR-154's warning needs of it, and it is
@@ -13009,9 +13009,9 @@ just as a whole round did.
 
 **Cost.** One `bool` on `SyncOutcome`, one `Duration` and one comparison
 against the tick's deadline per pull, a `bool` per peer's repair record, and a
-`VecDeque` of the tick's peers instead of an iterator over them. A drain makes one connection and one handshake per pull —
-the same connections the old loop made, taken sooner rather than spread over
-ticks.
+`VecDeque` of the tick's peers instead of an iterator over them. A drain makes
+one connection and one handshake per pull — the same connections the old loop
+made, taken sooner rather than spread over ticks.
 
 Defended by `kimmy-cluster/tests/replication.rs`'s
 `a_peer_five_batches_behind_is_drained_inside_one_tick` (the measure: five

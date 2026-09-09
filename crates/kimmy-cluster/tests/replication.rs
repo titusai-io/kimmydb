@@ -2189,17 +2189,32 @@ impl tracing::field::Visit for OverrunLine {
 /// The claim is exactly as strong as the margin is, and no stronger. The
 /// margin is an estimate — the slowest pull the contact has made — so a pull
 /// slower than every pull before it, by more than the slack left over, can
-/// still cross the line, and on a machine running the rest of this suite
-/// beside it one sometimes does. What must never happen is the systematic
-/// case: deciding on "is there any time left at all" makes *every* tick the
-/// budget cuts short end past its own period, so the warning fires on each
-/// and an operator watching a backlog drain sees nothing else.
+/// still cross the line, and a few in a run of a dozen ticks do. What must
+/// never happen is the systematic case: deciding on "is there any time left
+/// at all" makes *every* tick the budget cuts short end past its own period,
+/// so the warning fires on each and an operator watching a backlog drain sees
+/// nothing else.
 ///
-/// Three claims, and it takes all three to pin the budget half of ADR-157 —
-/// the first alone is satisfied by a loop that does not drain, and the last
-/// two by one that drains without a margin. Reverting `Contact::fits_before`
-/// to `Instant::now() < deadline` makes the overruns equal the ticks the
-/// budget cut short, which is the first assertion below.
+/// Three assertions, in the order they are made, and it takes all three to
+/// pin the budget half of ADR-157:
+///
+/// 1. **The budget cut a drain short more than once** — a precondition, not
+///    a claim: without several such ticks the run says nothing either way.
+/// 2. **Fewer of those ticks overran than there were of them.** This is the
+///    claim. Reverting `Contact::fits_before` to `Instant::now() < deadline`
+///    makes the two numbers equal, and this is what fails.
+/// 3. **The tick drained several batches per contact.** Reverting the drain
+///    arm in `peers.rs` makes contacts equal batches, and this is what fails.
+///
+/// **The interval is measured, not chosen**, because what this test needs is
+/// one a few pulls wide — wide enough that a tick can make more than one
+/// pull, narrow enough that the backlog takes many ticks — and a pull's cost
+/// belongs to the machine rather than to the test. A fixed two seconds drained
+/// this fixture in two ticks on an idle machine, only one of which the budget
+/// cut short, so assertion 1 failed there while a loaded machine passed: the
+/// test read as green in the suite and broken to anyone running it alone, and
+/// it failed identically against the fix and against the revert, which is the
+/// one thing a regression test may not do.
 #[tokio::test]
 async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() {
     use kimmy_cluster::protocol::MAX_BATCH;
@@ -2216,7 +2231,13 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     let counted = Arc::clone(&overruns.0);
     let _recording = tracing::subscriber::set_default(overruns);
 
-    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
+    // One round before the loop starts, to price a pull on this machine. It
+    // leaves the backlog a batch shorter, which is all it costs.
+    let priced = std::time::Instant::now();
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("a first round to price a pull by");
+    let interval = priced.elapsed() * 3;
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, interval);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let (mut contacts, mut cut_short) = (0usize, 0usize);
     while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
@@ -2231,7 +2252,11 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     looping.abort();
 
     let overran = counted.load(Ordering::Relaxed);
-    assert!(cut_short >= 2, "the budget must have cut a drain short on the way: {cut_short}");
+    assert!(
+        cut_short >= 2,
+        "the budget must have cut a drain short more than once, or this run says nothing: \
+         {cut_short} such ticks at an interval of {interval:?}"
+    );
     assert!(
         overran < cut_short,
         "a tick must not overrun the interval it owns because it drained: {overran} overruns \
