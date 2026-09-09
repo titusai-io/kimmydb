@@ -198,8 +198,12 @@ pub enum WriterHolder {
     /// Creating an index: every document of the collection is read and
     /// filed under the new definition in the transaction that creates it.
     IndexBuild,
-    /// Dropping a collection or an index: every document, or every index
-    /// entry, it holds is removed in one transaction.
+    /// The destructive half of a drop: one chunk of a collection's purge
+    /// (ADR-158), or an index drop, which is still one transaction. **Not**
+    /// the burial that precedes a collection's purge — that writes metadata
+    /// alone and is [`WriterHolder::Ddl`]. Also what a creation pays when it
+    /// finishes the residue of an earlier drop, and what the sweep at
+    /// [`Engine::open`] pays: the holder names the work, not who asked.
     Drop,
     /// Applying a peer's entries — one run of an anti-entropy batch
     /// (ADR-119), or the entry a replicated schema change is recorded from.
@@ -3660,6 +3664,83 @@ mod tests {
 
         // ADR-151's since-start maximum is unchanged by any of this.
         assert!(engine.writer_hold_max() > std::time::Duration::ZERO);
+    }
+
+    /// ADR-158 split a collection drop into a burial and a purge, and
+    /// ADR-159's rule splits their attribution with them: the burial writes
+    /// metadata and is `ddl`, every chunk of the purge is `drop`.
+    ///
+    /// The two are checked apart rather than together because folding them
+    /// would be the easy mistake and an invisible one — the burial is the
+    /// transaction whose cost does *not* grow with the collection, and
+    /// counting it as a drop would put an O(1) hold in the row an operator
+    /// reads to find out what is churning through the writer. Chunk counts
+    /// are the assertion for the same reason: after chunking, what names a
+    /// large drop is a `drop` count in the thousands beside a flat `ddl`.
+    #[test]
+    fn a_chunked_drop_buries_under_ddl_and_purges_under_drop() {
+        let (engine, _dir) = engine();
+        let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
+
+        let ddl = WriterHolder::Ddl.slot();
+        let drops = WriterHolder::Drop.slot();
+        let before = engine.writer_hold();
+
+        engine.drop_collection("shop", "orders").unwrap();
+        let after = engine.writer_hold();
+
+        assert_eq!(
+            after.count[ddl] - before.count[ddl],
+            1,
+            "the burial is one metadata transaction, and the only one"
+        );
+        // Two collections of `DROP_PURGE_CHUNK * 2 + 7` rows, the shadow
+        // among them, plus the index entries under the parent: more chunks
+        // than either collection has on its own, and every one of them here.
+        assert!(
+            after.count[drops] - before.count[drops] >= 4,
+            "each chunk of the purge is its own hold: {} chunks",
+            after.count[drops] - before.count[drops]
+        );
+        assert_eq!(rows_under(&engine, coll.id), (0, 0), "the fixture really did purge");
+    }
+
+    /// The sweep that finishes an interrupted drop runs inside
+    /// `Engine::open`, on an engine that is fully constructed by then, so its
+    /// chunks are attributed like any other purge — and are already on the
+    /// first scrape of a member that has served nothing yet.
+    ///
+    /// That is the reading an operator wants from a member whose start took a
+    /// minute, and it is the only series that offers it. It also puts the
+    /// line through `open` where `commits_are_counted_at_one_chokepoint`
+    /// puts it: the migrations and index rebuilds above write on the raw
+    /// database and stay outside this accounting, the sweep takes the gate
+    /// and is inside it.
+    #[test]
+    fn a_drop_finished_at_the_next_start_is_attributed_to_that_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let coll = {
+            let engine = Engine::open(&path).unwrap();
+            let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
+            engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+            assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK);
+            assert!(rows_under(&engine, coll.id).0 > 0, "the fixture must leave rows owed");
+            coll
+        };
+
+        let restarted = Engine::open(&path).unwrap();
+        let hold = restarted.writer_hold();
+        assert!(
+            hold.count[WriterHolder::Drop.slot()] >= 1,
+            "the sweep's chunks are on the engine it was returned with"
+        );
+        assert_eq!(
+            hold.count[WriterHolder::Ddl.slot()],
+            0,
+            "and the burial was another process's; this start buried nothing"
+        );
+        assert_eq!(rows_under(&restarted, coll.id), (0, 0), "the sweep did finish it");
     }
 
     /// The barrier's own flush holds the writer without opening a counted

@@ -13071,7 +13071,7 @@ work the transaction does, not who asked for it**:
 | `bulk` | Many documents in one transaction: a bulk insert, a chunk of a multi-document update, a scoped batch | The batch, or `storage.multi_chunk_docs` |
 | `ddl` | A schema change writing metadata alone — a database or collection created, a vector configuration settled, a tombstone recorded | Nothing; it is O(1) whatever the collection holds |
 | `index_build` | Creating an index, which reads every document of the collection and files it under the new definition in the creating transaction | The collection |
-| `drop` | Dropping a collection or an index, which removes every document or entry it holds in one transaction | The collection |
+| `drop` | The destructive half of a drop: one chunk of a collection's purge ([ADR-158](#adr-158--a-collection-drop-is-chunked-and-its-tombstone-is-written-before-the-first-chunk)), or an index drop, which is still one transaction. **Not** the burial that precedes a collection's purge, which is `ddl` | `DROP_PURGE_CHUNK`, or the index's entries |
 | `replication` | Applying a peer's entries: one run of an anti-entropy batch, or the entry a replicated schema change is recorded from | The batch cap |
 | `repair` | Applying a page of a peer's snapshot ([ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped)) | One page |
 | `retention` | The retention pass removing what its scans already found; never the scans, which take no writer | 1,000 records per commit |
@@ -13080,15 +13080,40 @@ work the transaction does, not who asked for it**:
 | `durability` | The shared fsync of the coalescing barrier ([ADR-088](#adr-088--two-durability-classes-and-the-one-there-is-not)) | One marker write and one fsync |
 | `rewind` | Rewinding the database to a point in time | The oplog above the target |
 
-Three of those divisions are the ones the round below could not make, and each
-is a different cost class rather than a different caller: `ddl` is constant,
-`index_build` and `drop` are proportional to the collection, and folding the
+Three of those divisions are the ones the round below could not make, and they
+are different work rather than different callers: `ddl` writes metadata and is
+constant, `index_build` reads and files a whole collection under the writer,
+and `drop` is the removal of what a collection or an index held. Folding the
 three into one word is how a schema change that stalls a node for a minute
 looks like the one that costs a millisecond. `replication` and `repair` are
 named for replication because there is nothing else they are — no local path
 applies a peer's batch or a peer's snapshot page — while a collection drop is
 `drop` whether a client issued it or a peer's entry carried it, because the
-hold is the same size and the drop is what an operator is hunting.
+drop is what an operator is hunting.
+
+**The rule decides a drop's two halves separately, and that is the clearest
+thing it does.** ADR-158 splits a collection drop into a burial — the
+definition removed, the tombstones recorded, the entry minted, all metadata and
+all O(1) — and a purge that removes what the collection held, a chunk per
+commit. The burial is `ddl` and each chunk is `drop`, because the holder names
+what the transaction writes and those two write different things. The same rule
+then settles two paths that are not a drop at all: a chunk run by
+`create_collection_inner` before a recreated name can stand over the residue,
+and a chunk run by the sweep in `Engine::open` finishing a drop a restart
+interrupted, are both `drop`. Neither has a client behind it, and neither is
+the creation's or the start's own cost; they are somebody's drop being
+finished, and `drop` is what an operator needs to see when the writer is busy
+during either. A hold, not a request, is what this histogram divides.
+
+Chunking also changes what the `drop` row *reads like*, which is worth saying
+because it looks at first like an argument for folding it into `bulk`. Before
+ADR-158 a `drop` hold was one transaction proportional to the collection: rare,
+and enormous. After it the holds are bounded like a bulk's and there are many
+of them, so what names a large drop is no longer one long hold but a count
+climbing in thousands beside a flat `ddl`, with `_sum` growing behind it. It
+stays its own holder regardless: `bulk` is client traffic and a purge is not —
+a purge can be running with no request in flight at all, which is exactly the
+member an operator is trying to explain.
 
 **The buckets**, in seconds: `0.001`, `0.01`, `0.1`, `1`, `5`, `30`, `300`,
 `+Inf`. They are not the wait histogram's, because a hold is not a wait. One
@@ -13200,7 +13225,21 @@ is exempted from at
 `commits_are_counted_at_one_chokepoint`. It is harmless where it is, because
 that process is single-threaded and serves nothing, and it is not changed
 here; but the set is the whole set of what takes *the gate*, and that call
-does not take it. And a hold is measured from the moment the gate is taken to
+does not take it.
+
+**A hold can be recorded before the node serves anything**, and that is
+intended rather than tolerated. The sweep ADR-158 puts in `Engine::open` takes
+the gate through `Engine::begin_write` like every other purge, so its chunks
+land in the `drop` row of the engine that is about to be returned — a member
+restarted part-way through a large drop therefore answers its first scrape with
+`drop` holds already counted and nothing served. That is the reading an
+operator wants: it is the only series that says why the start took a minute.
+It also draws the line through `open` in the right place. The rest of what
+`open` does — the migrations, the two index rebuilds — writes on the raw
+database and stays outside this accounting, because there is no engine to
+count against yet; the sweep runs on a fully constructed engine and is inside
+it. `commits_are_counted_at_one_chokepoint` already draws that same line, and
+the histogram now follows it. And a hold is measured from the moment the gate is taken to
 the moment it is released, which for a commit includes its fsync but not the
 wait at the coalescing barrier — a committer releases the gate before it waits
 there, as ADR-151 left it, so `durability` holds the writer for the flush and
