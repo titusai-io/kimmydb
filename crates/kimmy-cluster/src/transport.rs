@@ -2613,6 +2613,101 @@ mod tests {
         assert!(!stalls.repairing(their_node));
     }
 
+    /// The rolling-upgrade half of the tombstone rule, over the wire. A
+    /// peer running a version before `incarnations` answers without the
+    /// field, which arrives here as an empty one (`protocol.rs` pins that
+    /// on the bytes), and so says nothing about which life of a collection
+    /// it holds. For an id this node has a tombstone for, that silence is
+    /// read as the incarnation this node dropped: not reported, so nothing
+    /// plans a repair that would pull the buried life back from the member
+    /// that has not applied the drop yet. Deliberate, and what it costs is
+    /// stated on `divergence::compare`.
+    ///
+    /// The controls sit against the same engine and the same answer, so the
+    /// rule cannot pass by quietly reporting nothing at all: a collection
+    /// this node holds no tombstone for is reported from that very answer,
+    /// and the same peer naming an incarnation *after* the drop is reported
+    /// too — which is also what pins the field's journey from the wire into
+    /// the comparison, rather than being read as absent whatever arrives.
+    /// Level with the drop is the same-millisecond tie, and is the life
+    /// that was dropped.
+    #[tokio::test]
+    async fn a_peer_that_names_no_incarnation_does_not_reopen_a_collection_dropped_here() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let bench = CollectionId::derive("shop", "bench");
+        let ledger = CollectionId::derive("shop", "ledger");
+        engine.create_collection("shop", "bench").unwrap();
+        assert!(engine.drop_collection("shop", "bench").unwrap());
+        let dropped = engine.collection_dropped_at(bench).unwrap().expect("the tombstone");
+
+        /// The peer's side: the vectors, then an answer naming both
+        /// collections and whatever it knows of their incarnations.
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            incarnations: Vec<(CollectionId, Hlc)>,
+        ) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("expected AskDivergence, got {other:?}"),
+            }
+            let divergence = Message::Divergence {
+                collections: vec![
+                    CollectionId::derive("shop", "bench"),
+                    CollectionId::derive("shop", "ledger"),
+                ],
+                probe_count: None,
+                incarnations,
+            };
+            write_frame(&mut stream, &divergence).await.unwrap();
+            assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
+        }
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let their_node = node(9);
+        // Nothing to pull, so the round is the check and nothing else.
+        let theirs = VersionVector::new();
+        let mut stalls = PeerStalls::new();
+
+        for (incarnations, expected, what) in [
+            (
+                Vec::new(),
+                vec![ledger],
+                "a peer that names no incarnation holds the one this node dropped",
+            ),
+            (
+                vec![(bench, dropped.hlc), (ledger, Hlc::ZERO)],
+                vec![ledger],
+                "an incarnation level with the drop is the life the drop ended",
+            ),
+            (
+                vec![(bench, dropped.hlc.successor()), (ledger, Hlc::ZERO)],
+                vec![bench, ledger],
+                "an incarnation after the drop is a genuine recreation",
+            ),
+        ] {
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), incarnations));
+            let outcome =
+                sync_over(&engine, ours, addr, their_node, None, &mut stalls).await.unwrap();
+            peer.await.unwrap();
+            assert_eq!(
+                outcome.divergent,
+                Some(expected.into_iter().collect()),
+                "{what}: {outcome:?}"
+            );
+        }
+    }
+
     /// A repair that never completes — every round with the peer failing,
     /// or a snapshot too large to finish inside the request timeout — is
     /// abandoned after `REPAIR_ATTEMPTS` rounds that did not advance it,
