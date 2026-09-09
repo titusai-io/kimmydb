@@ -1956,6 +1956,221 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
     looping.abort();
 }
 
+/// Seed `count` documents into `collection` on `node` as one commit — one
+/// oplog entry each, which is what the tests below want, without paying an
+/// fsync per document to get them.
+fn seed(node: &Node, collection: &kimmy_storage::CollectionMeta, count: usize) {
+    let docs = (0..count).map(|i| doc! { "_id": format!("d{i}") }).collect();
+    node.engine.insert_many(collection, docs).unwrap();
+}
+
+/// Start `replicate` against one peer and report every tick, at `interval`.
+/// Discovery is left far shorter than the sync interval so the peer is
+/// resolved before the tick that matters, whichever arm of the loop wins the
+/// first race.
+fn drain_loop(
+    from: &Node,
+    peer: std::net::SocketAddr,
+    interval: Duration,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::UnboundedReceiver<kimmy_cluster::RoundReport>)
+{
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![peer])], SECRET.into(), from.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(10);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    (tokio::spawn(replicate(Arc::clone(&from.engine), config)), rx)
+}
+
+/// ADR-157's own measure. A member five batches behind catches up inside one
+/// tick, rather than one batch per tick with the member idle in between: a
+/// tick keeps pulling from a peer while the pull before it came back at the
+/// cap. Before this, 5,000 entries were five ticks — twenty-five seconds at
+/// the default interval, and the same arithmetic is the seventy minutes a
+/// quarter-million-entry backlog took to drain.
+///
+/// Counted in *contacts* rather than in seconds: a contact is a peer per
+/// tick, and `divergence_checks + divergence_skips` is exactly one per
+/// contact (ADR-145), so the report says how many ticks the peer was
+/// contacted on without the test timing anything. Reverting
+/// `draining.push_back(contact)` in `peers.rs` — the arm that sends a
+/// truncated peer round the queue again — puts it back at one batch per
+/// contact, and this reads five.
+#[tokio::test]
+async fn a_peer_five_batches_behind_is_drained_inside_one_tick() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let entries = MAX_BATCH * 4 + 904; // 5,000, and five pulls to carry them
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &ca, entries);
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut contacts = 0usize;
+    while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backlog never drained"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
+        contacts += report.divergence_checks + report.divergence_skips;
+    }
+    looping.abort();
+
+    assert!(
+        contacts <= 2,
+        "five batches must drain in one tick's contact, or two if the first tick found no \
+         peer yet; took {contacts}"
+    );
+}
+
+/// The other side of the drain, and the one that matters most: the budget is
+/// the tick's own interval, so a backlog deeper than a tick can drain leaves
+/// the rest for the next tick rather than overrunning the period the loop's
+/// timing and ADR-154's overrun warning hang off.
+///
+/// At an interval of one millisecond the budget is spent by the time the
+/// first pull of any tick returns, so every tick makes exactly one pull and
+/// three batches take three contacts. The two contacts that end on a
+/// truncated pull are counted as exactly one skip each and never as a check:
+/// ADR-133's cap-truncation skip is per contact, whatever a contact pulled,
+/// and a tick that gave up mid-drain has not earned the check any more than
+/// a single truncated round had. Reverting the `Instant::now() < deadline`
+/// half of that branch in `peers.rs` drains all three batches inside the
+/// first tick, which leaves one contact that ran the check and no truncated
+/// contact at all.
+#[tokio::test]
+async fn a_tick_stops_pulling_when_its_budget_is_spent_and_counts_one_skip() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &ca, MAX_BATCH * 2 + 100);
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_millis(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut truncated = 0usize;
+    loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the check never ran once the backlog drained"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
+        if report.divergence_checks > 0 {
+            assert_eq!(report.divergence_skips, 0, "the tick that drained it: {report:?}");
+            break;
+        }
+        if report.divergence_skips > 0 {
+            assert_eq!(
+                report.divergence_skips, 1,
+                "one contact, one skip, however many pulls it made: {report:?}"
+            );
+            truncated += 1;
+        }
+    }
+    looping.abort();
+
+    assert!(
+        truncated >= 2,
+        "a budget of a millisecond leaves a batch per tick, so two batches must have ended a \
+         tick still truncated; {truncated} did"
+    );
+}
+
+/// A drain that gets through the backlog ends on a pull short of the cap,
+/// and that pull reached the peer's tail: the tick's *last* contact with the
+/// peer decides, so the contact counts one check and no skip, where the same
+/// backlog was a skip on every tick until it drained before ADR-157. The
+/// pulls before the last one are not checked and not counted — a truncated
+/// pull earns the check no more inside a drain than it did on its own.
+///
+/// Reverting `outcome.truncated = window_truncated;` in `transport.rs`
+/// leaves the loop nothing to drain on, and the first contact is a skip.
+#[tokio::test]
+async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let entries = MAX_BATCH + 200;
+    seed(&a, &ca, entries);
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let report = loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the peer was never contacted"))
+            .expect("the loop must keep reporting");
+        if report.divergence_checks + report.divergence_skips > 0 {
+            break report;
+        }
+    };
+    looping.abort();
+
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert_eq!(report.divergence_checks, 1, "the last pull reached the tail: {report:?}");
+    assert_eq!(report.divergence_skips, 0, "and nothing before it was a skip: {report:?}");
+    assert_eq!(
+        b.engine.count_by_id(ca.id).unwrap(),
+        Some(entries as u64),
+        "both pulls landed inside the one tick"
+    );
+}
+
+/// A pull that fails ends the tick's contact with that peer. The round goes
+/// through the health backoff it always did, and the tick does not spend the
+/// rest of its budget dialling a member that has just refused it — a
+/// failure is not a truncation, and nothing about it says another pull would
+/// do better.
+///
+/// The relay hands exactly one connection through, so the tick's first pull
+/// is a real, cap-truncated round and the pull the drain wants next cannot
+/// connect at all. Exactly one failure, and the contact it ends is one skip
+/// (ADR-145). Reverting the `contact.finish()` in the `Err` arm of
+/// `peers.rs` to a `draining.push_back(contact)` retries the failure until
+/// the budget runs out, and this reads a tick of them.
+#[tokio::test]
+async fn a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &ca, MAX_BATCH + 200);
+    let relay = relay_one_connection(a.addr).await;
+
+    let (looping, mut rx) = drain_loop(&b, relay, Duration::from_secs(2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let report = loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the second pull never failed"))
+            .expect("the loop must keep reporting");
+        if report.failed > 0 {
+            break report;
+        }
+    };
+    looping.abort();
+
+    assert_eq!(report.failed, 1, "the failure ends the contact, it is not retried: {report:?}");
+    assert_eq!(report.divergence_checks, 0, "a failed round has not checked: {report:?}");
+    assert_eq!(report.divergence_skips, 1, "and is the contact's one skip: {report:?}");
+}
+
 /// A byte relay to `target` that hands exactly one connection through and
 /// closes every later one: a member whose inbound replication completes
 /// once and then never again. TLS runs end to end through it, so the

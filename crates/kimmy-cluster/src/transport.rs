@@ -842,6 +842,11 @@ where
     // version of "reached the tail" — and one left to resume for the next
     // round (ADR-152) does not.
     let mut window_exhausted = false;
+    // Whether pulling again from this peer at once would carry more
+    // (ADR-157): the fact the loop drains a backlog on rather than waiting
+    // a whole interval per batch. Narrower than `!window_exhausted` — see
+    // where it is set below, and `SyncOutcome::truncated`.
+    let mut window_truncated = false;
     let mut outcome = match answer {
         // The batch, and what it proved: an exhausted window is the peer's
         // whole tail, any other ends at the stamp the peer says it scanned
@@ -911,6 +916,21 @@ where
             // batch stopped at a collection this node lacks did not reach
             // the tail (ADR-148).
             window_exhausted = exhausted && outcome.unknown_collection == 0;
+            // And whether the loop should spend another of this tick's
+            // pulls here (ADR-157). `exhausted` is the peer's own statement
+            // that its scan stopped at the limit with more log behind it,
+            // which is what makes a second pull worth making — never the
+            // entry count, which is the inference ADR-126 removed. The two
+            // conditions beside it are what makes the second pull *move*:
+            // a batch that stopped at a collection this node lacks is
+            // re-served from the same place and stops at the same entry
+            // until the repair planned above brings the collection, and a
+            // window whose every entry sat above the vector the peer
+            // introduced it with left this node's position exactly where it
+            // was. Pulling again on either would spend the tick's budget
+            // asking the same question.
+            window_truncated =
+                !exhausted && outcome.unknown_collection == 0 && outcome.deferred < entries.len();
             match (repair, &outcome.unknown) {
                 // A replay under way: done when it reached the tail,
                 // escalated to a snapshot if it stopped at a collection
@@ -997,6 +1017,7 @@ where
     let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;
+    outcome.truncated = window_truncated;
     // Only when the pull reached the peer's tail: a round still working
     // through a backlog deeper than one batch has not earned the belief
     // the check depends on, and must not spend a message finding out

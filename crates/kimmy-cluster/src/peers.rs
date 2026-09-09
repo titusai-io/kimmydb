@@ -1,6 +1,6 @@
 //! The replication loop: find peers, sync with them, repeat.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,6 +39,15 @@ pub type PeerStalenessHook = Arc<dyn Fn(NodeId, Option<u64>) + Send + Sync>;
 /// lag at all, by design (ADR-122), so a cluster wedged on a round that
 /// fails every time read 0 lag and every member live for as long as it was
 /// wedged.
+///
+/// A tick makes one **contact** per peer and may make several **pulls**
+/// within it, draining a backlog while the batch cap keeps truncating it
+/// (ADR-157). The counters of what the entries did — `ddl_refused`,
+/// `ddl_declined`, the two `entries_skipped_*` and `repair_rounds` — sum
+/// over the pulls, which is the work the tick actually did. The divergence
+/// pair is per contact, one `divergence_checks` or one `divergence_skips`
+/// per peer, decided by the tick's last pull at it; and `failed` is per
+/// contact too, since a failure ends one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoundReport {
     /// Rounds in this tick that failed, whatever the cause: a peer that could
@@ -143,7 +152,7 @@ pub struct RoundReport {
     /// rare on a busy cluster: the peer appended them between advertising
     /// and serving, and the next round takes them from the right position.
     pub entries_skipped_beyond_advertised: usize,
-    /// Rounds in this tick spent repairing against a peer (ADR-148):
+    /// Pulls in this tick spent repairing against a peer (ADR-148):
     /// re-serving its oplog from below this node's position, or pulling its
     /// snapshot, because the check confirmed a divergence against it or a
     /// batch stopped at a collection this node lacks. A counter. Rising is
@@ -344,45 +353,71 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     };
                     DivergenceProbe { id, mine_count }
                 });
-                for peer in health.select(&peers, Instant::now()) {
-                    // One span per peer per round, not one per round: an
-                    // anti-entropy round against three peers is three
-                    // conversations with three different outcomes, and folding
-                    // them into one span would lose which peer was the slow
-                    // one — the only thing anybody opens this trace to find
-                    // out. `applied`, `ddl` and `lag_ms` are declared here and
-                    // filled from the outcome, so a failed round still leaves a
-                    // span with the peer on it rather than nothing at all.
-                    let span = tracing::info_span!(
-                        "cluster.sync",
-                        otel.kind = "client",
-                        peer = %peer,
-                        applied = tracing::field::Empty,
-                        ddl = tracing::field::Empty,
-                        lag_ms = tracing::field::Empty,
-                    );
+                // The tick's wall-clock budget for draining (ADR-157). A
+                // peer whose pull the batch cap truncated is pulled from
+                // again inside this tick rather than left for the next one,
+                // so a member behind by more than one batch is not held to
+                // one batch per interval — 1,024 entries every five seconds
+                // whatever the wire or the writer could do. The budget is
+                // the interval itself, so draining never makes a tick
+                // overrun its own period: it bounds the decision to pull
+                // *again*, never a pull already under way, which is
+                // ADR-154's stuck-tick case and still says so at `WARN`
+                // below.
+                let deadline = tick_started + config.sync_interval;
+                // Chosen once: `select` advances its own rotation, so
+                // asking it again mid-tick would move on to other peers
+                // rather than hand back the ones this tick is draining.
+                // A peer still truncated goes to the back of the queue, so
+                // the tick round-robins its peers rather than draining one
+                // to exhaustion: a member behind on two origins advances on
+                // both, and one deep backlog does not spend the whole
+                // budget.
+                let mut draining: VecDeque<Contact> =
+                    health.select(&peers, Instant::now()).into_iter().map(Contact::new).collect();
+                while let Some(mut contact) = draining.pop_front() {
+                    let peer = contact.peer;
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
                     match sync_once_with(&engine, peer, &config.secret, probe, &mut stalls)
-                        .instrument(span.clone())
+                        .instrument(contact.span.clone())
                         .await
                     {
                         Ok(mut outcome) => {
-                            // `i64` throughout: `tracing-opentelemetry` has
-                            // no `record_u64`, so an unsigned value is
-                            // formatted with `Debug` and reaches a collector
-                            // as a string nothing can graph.
-                            span.record("applied", outcome.applied as i64);
-                            span.record("ddl", outcome.ddl as i64);
-                            span.record("lag_ms", outcome.lag_ms as i64);
+                            contact.pulled(&outcome);
                             health.succeeded(peer);
-                            round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
                             report.ddl_declined += outcome.ddl_declined;
                             report.entries_skipped_unknown_collection += outcome.unknown_collection;
                             report.entries_skipped_beyond_advertised += outcome.deferred;
                             report.repair_rounds += usize::from(outcome.repairing);
+                            // More of the peer's oplog behind the cap, and
+                            // budget left to go and get it: this contact is
+                            // not over, so nothing below runs for it yet.
+                            // Everything below is decided by the tick's
+                            // *last* pull from the peer — the lag it left,
+                            // where the peer stands, and above all the
+                            // divergence accounting, which stays exactly one
+                            // check or one skip per peer per tick (ADR-133,
+                            // ADR-135, ADR-145). A truncated pull has no
+                            // check to fold in and would otherwise be
+                            // counted as a skip on a tick that goes on to
+                            // check.
+                            if outcome.truncated && Instant::now() < deadline {
+                                draining.push_back(contact);
+                                continue;
+                            }
+                            // `i64` throughout: `tracing-opentelemetry` has
+                            // no `record_u64`, so an unsigned value is
+                            // formatted with `Debug` and reaches a collector
+                            // as a string nothing can graph.
+                            contact.span.record("lag_ms", outcome.lag_ms as i64);
+                            // The last pull's reading, not the worst of the
+                            // tick's: lag is a level, and a drain that
+                            // closed a backlog has left the peer where the
+                            // final pull says it did.
+                            round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             if let Some(node) = outcome.peer {
                                 // Folded in only when the check actually ran
                                 // against this peer this contact
@@ -481,19 +516,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     report(node, stale.then_some(outcome.behind_ms));
                                 }
                             }
-                            if outcome.total() > 0 {
-                                info!(
-                                    %peer,
-                                    applied = outcome.applied,
-                                    ddl = outcome.ddl,
-                                    "merged from peer"
-                                );
-                            }
+                            contact.finish();
                         }
                         // A peer being unreachable is the normal state of a
                         // cluster, not an error worth stopping for — but it is
                         // worth backing off, so a node that is not coming back
                         // stops costing a connection every interval.
+                        //
+                        // A failure ends the tick's contact with this peer,
+                        // however much budget is left and however truncated
+                        // the pull before it was: a failed round goes
+                        // through the health backoff, and retrying it inside
+                        // the tick would spend the budget on a peer that has
+                        // just said it cannot answer (ADR-157).
                         Err(e) => {
                             let now = Instant::now();
                             // Reported on the first failure and then at a
@@ -518,6 +553,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             } else {
                                 debug!(%peer, error = %e, failures, "sync round failed");
                             }
+                            // Whatever earlier pulls of this contact merged
+                            // is still merged, and still worth one line.
+                            contact.finish();
                         }
                     }
                 }
@@ -565,6 +603,75 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     );
                 }
             }
+        }
+    }
+}
+
+/// One tick's contact with one peer: the pulls it made and what they
+/// merged (ADR-157).
+///
+/// A tick makes as many pulls from a peer as the batch cap and its budget
+/// call for, and they are one conversation, not one per pull. So the span
+/// and the merged line belong to the contact rather than to a pull: a drain
+/// reads as one line naming twelve pulls and twelve thousand entries, where
+/// a line per pull would bury the tick that made them in twelve identical
+/// ones. `pulls` is the number an operator reads a drain by — a steady 1 is
+/// a cluster keeping up, a number that keeps rising is one that is not.
+struct Contact {
+    peer: SocketAddr,
+    /// One span per peer per contact, not one per tick: an anti-entropy
+    /// tick against three peers is three conversations with three different
+    /// outcomes, and folding them into one span would lose which peer was
+    /// the slow one — the only thing anybody opens this trace to find out.
+    /// `applied`, `ddl` and `lag_ms` are declared empty and filled when the
+    /// contact ends, so a contact whose pull failed still leaves a span with
+    /// the peer on it rather than nothing at all.
+    span: tracing::Span,
+    pulls: usize,
+    applied: usize,
+    ddl: usize,
+    /// Everything the pulls accounted for, [`kimmy_storage::SyncOutcome::total`]
+    /// summed: what decides whether this contact merged anything worth a
+    /// line, on the same terms as before a contact could make more than one
+    /// pull.
+    total: usize,
+}
+
+impl Contact {
+    fn new(peer: SocketAddr) -> Self {
+        let span = tracing::info_span!(
+            "cluster.sync",
+            otel.kind = "client",
+            peer = %peer,
+            applied = tracing::field::Empty,
+            ddl = tracing::field::Empty,
+            lag_ms = tracing::field::Empty,
+        );
+        Self { peer, span, pulls: 0, applied: 0, ddl: 0, total: 0 }
+    }
+
+    /// Fold in what one pull of this contact brought back.
+    fn pulled(&mut self, outcome: &kimmy_storage::SyncOutcome) {
+        self.pulls += 1;
+        self.applied += outcome.applied;
+        self.ddl += outcome.ddl;
+        self.total += outcome.total();
+    }
+
+    /// The tick is done with this peer, having pulled from it or failed
+    /// against it: record what the contact merged on its span, and say so
+    /// once.
+    fn finish(self) {
+        self.span.record("applied", self.applied as i64);
+        self.span.record("ddl", self.ddl as i64);
+        if self.total > 0 {
+            info!(
+                peer = %self.peer,
+                pulls = self.pulls,
+                applied = self.applied,
+                ddl = self.ddl,
+                "merged from peer"
+            );
         }
     }
 }

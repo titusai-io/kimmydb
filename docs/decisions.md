@@ -8615,6 +8615,17 @@ which is unchanged.
 > runs is visible. Everything else here stands, the cap-truncation skip
 > included.
 
+> **Amended by [ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords).**
+> The skip below is unchanged, and so is everything it is argued from.
+> What changed is the state it describes: a *tick* now keeps pulling from
+> a peer while the pull before it came back truncated, until a pull comes
+> back short of the cap or the tick has spent its interval, and it is the
+> tick's last pull that decides whether the contact ran the check or
+> skipped it. So defect 1's residual — a backlog that never dips under
+> the cap is not checked — now needs a backlog a whole tick's worth of
+> pulls cannot drain rather than one deeper than a single batch, and it
+> lasts the ticks the drain takes rather than one tick per batch.
+
 **Decision.** Every anti-entropy round whose pull reaches the peer's true
 tail — whether because there was nothing left to pull, or because this
 round's own batch was not truncated by the cap — also asks that peer what it
@@ -9196,6 +9207,17 @@ fields to give.
 > for the case the rejection did not weigh — a peer permanently behind, on
 > which the count half never ran and nothing said so. The no-peer-label
 > rule, the cap-truncation skip and the fold-then-count rule all stand.
+
+> **Amended by [ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords).**
+> The counter below is unchanged — one `ran` or one `skipped` per contact
+> with a peer, and the skip itself stays for the reason the worked example
+> gives. A contact is now a tick's whole conversation with a peer rather
+> than a single round, since a tick keeps pulling while the batch cap
+> truncates it; the tick's last pull decides which outcome the contact is,
+> and the pulls in between move neither. So `skipped` rising means a
+> backlog that outlasted a tick's whole budget of pulls, which is a deeper
+> backlog than it used to mean, and the blind window is shorter by however
+> much faster the drain now is.
 
 **Decision.** Two things, one added and one deliberately left alone.
 
@@ -12768,6 +12790,179 @@ the announce job: the parts that turn the builds into a release.
    change there needs no regeneration. `deny.toml` needs no change, having
    kept the target.
 
+## ADR-157 — A sync tick drains what it can: one contact per peer, as many pulls as the interval affords
+
+**Decision.** A tick of the anti-entropy loop keeps pulling from a peer while
+the pull before it came back truncated by the batch cap, until either a pull
+comes back short of the cap or the tick has spent a wall-clock budget. The
+budget is `cluster.sync_interval_secs` itself. The pulls are round-robined
+across the tick's peers — one per peer per pass, repeated while any peer's
+last pull was truncated and budget remains — so a member behind on two
+origins advances on both.
+
+`MAX_BATCH` and the frame budget are unchanged: they bound one frame, which
+is what they are for. `SyncOutcome` gains `truncated`, taken from what the
+peer said about its own window rather than re-derived, and the loop reads it
+to decide whether to spend another pull here.
+
+A **contact** is a peer per tick, and the divergence accounting is per
+contact exactly as it was per round before: the tick's *last* pull from a
+peer decides. A pull that came back short of the cap reached the peer's tail,
+so the check runs on it and the contact is counted `ran`; a tick that spent
+its budget with the pull still truncated counts one `skipped`. Neither
+counter moves for the pulls in between. Failures are unchanged in every
+respect: a failed pull ends the tick's contact with that peer, is counted in
+`kimmy_sync_failures_total` and as one skip, and goes through the existing
+health backoff. Nothing is ever retried inside a tick.
+
+The `merged from peer` line and the `cluster.sync` span are per contact
+rather than per pull, and the line carries `pulls`: a drain reads as one line
+saying twelve pulls and twelve thousand entries rather than as twelve lines.
+No new metric series.
+
+**The defect.** A pull carries at most `MAX_BATCH` = 1,024 entries, and the
+loop ran one round per peer per tick of a five-second ticker. A round whose
+pull was truncated recorded the skip and waited for the next tick; nothing
+re-entered early because there was more to pull. So catch-up was capped near
+**205 entries a second per peer**, whatever the wire or the writer could do,
+and the member was idle between ticks — the writer is not the bottleneck,
+since a pull applies as one transaction per run of consecutive document
+entries, which is about one commit and one fsync, a few hundred milliseconds
+against a five-second wait.
+
+**Measured.** A sustained-ingest round on 0.26.0 ingested at up to 946
+documents a second. At the end of that load the three members were some
+250,000 documents apart and closing at 477, 163 and 293 documents a second;
+the backlog took about **seventy minutes** to drain. For the whole of it the
+cross-member divergence check was skipped — `{outcome="ran"}` frozen on one
+member for some 55 minutes while `{outcome="skipped"}` climbed 1,161 to 2,481
+— which is ADR-133's cap-truncation skip working exactly as designed, and is
+also the direct measure that every round in that window was truncated.
+
+The second consequence is why this was taken first. A member that fell behind
+for ten minutes under load was behind for an hour; and for that whole hour
+the cluster's own divergence signal was not being taken, so a run read as
+converged when it was not. ADR-135 states that residual in as many words and
+declines to make the check run where it cannot be trusted, which is right.
+This closes the same gap from the other end: the backlog itself is what goes
+away, and with it the window in which the check has nothing it can trust.
+
+**Why the budget is the interval, and what the budget bounds.** The whole
+loop's timing hangs off `cluster.sync_interval_secs`: ADR-154's overrun
+warning fires on a tick longer than it, and the operator's rule for
+`kimmy_sync_divergence_check_age_seconds` is written as multiples of it. A
+drain that could push a tick past its own period would make both mean
+something else. So the budget is the interval, and it bounds the decision to
+pull *again* — never a pull already under way. A single round that overruns
+is ADR-154's stuck-tick case, unchanged and still warned about; what cannot
+happen is a tick overrunning merely because it chose to drain.
+
+The tickers do not catch up on missed ticks (ADR-154), so a tick that spends
+its whole budget is followed by the one that was due and then by the next a
+full interval later, rather than by a burst.
+
+**Why not raise `MAX_BATCH`, or lower the interval.** Raising the batch moves
+the same work into a longer writer hold: a pull applies under the single
+writer, and the round this ADR is about is one where the writer was already
+contended enough for two members' loops to wait inside a round for over an
+hour (ADR-151, ADR-154). A bigger frame also costs the memory the cap exists
+to bound. Lowering the interval pays every round's fixed cost — a dial, a TLS
+handshake, two vector reads, and on a checked contact two metadata scans and
+a collection count on each side — more often on *every* cluster for the whole
+life of the process, to fix a state that is temporary by nature; and it is
+the one number the two rules above are written against. Draining inside the
+tick costs those things only while there is a backlog to drain, and costs
+nothing at all on a converged cluster, where the first pull of every contact
+comes back short of the cap.
+
+**Why the truncation is taken from the peer, not re-derived.** "A short pull
+means the tail" is load-bearing (ADR-126) and stated on the wire rather than
+inferred (ADR-127), and this change must not put weight back on the
+inference. `truncated` is `!exhausted` — the peer's own statement that its
+scan stopped at the limit rather than at the end of its log — with two
+conditions beside it, and no count of entries anywhere. A short batch still
+means the tail, everywhere it did before.
+
+The two conditions are what make the next pull *move*. A batch that stopped
+at a collection this node does not hold (ADR-148) is re-served from the same
+place and stops at the same entry however often it is asked for; the repair
+planned at that stop is what moves it, and pulling again would spend the
+budget asking the same question. A window whose every entry sat above the
+vector the peer introduced it with left this node's position where it was,
+for the same reason. Both are states where the peer has more log and this
+node cannot yet take it, which is not the state a drain is for.
+
+**A snapshot pull is not drained.** A whole-database or scoped snapshot left
+to resume (ADR-152) resumes on the next round with the peer, a page at a
+time, on its own terms; `truncated` is `false` for it. Its pages are already
+bounded by the round's deadline, and pulling its next round forward would put
+a second budget on a walk that has one.
+
+**Why the divergence counters stay per contact.** ADR-135's series is a
+partition of the contacts a node made, and ADR-145 added the failed round to
+it on the argument that what the counter says is whether the gauge was
+re-examined on that round. A tick that pulled twelve times and ended on a
+short pull re-examined the gauge exactly once, on the last pull, and a tick
+that gave up mid-drain did not re-examine it at all. Counting a skip for
+every truncated pull would make `skipped` rise with backlog *depth* rather
+than with blindness, and on a drain that ends in a check it would report
+eleven skips for a tick that was not blind at all. So the pulls in between
+move neither counter, and `ran + skipped` is still every contact the node
+attempted — one per peer per tick, whatever it pulled.
+
+ADR-145's stall memo and the count half's own pair follow from that without
+a change: `PeerStalls::observe` is called only on a checked contact, which is
+still at most one per peer per tick, so "consecutive checked contacts" counts
+what it always did. So does the check's clock (ADR-154): the last pull is the
+one that folds a finding into the tracker, and it is the one that advances
+`LastCheck`.
+
+**Why a failure is not a truncation.** A failed pull says nothing about
+whether another pull would carry more, and the cluster already has a policy
+for it: back the peer off and let the next tick decide. Retrying inside the
+tick would spend a whole interval's budget dialling a member that has just
+refused, and would multiply `kimmy_sync_failures_total` by however many
+attempts the budget afforded — a counter an operator reads as "how many
+rounds failed", not "how many times a wedged member was asked".
+
+**Consequences.** A backlog drains at what the member can apply rather than
+at 1,024 entries per interval, and the divergence check comes back as soon as
+it does rather than after the whole backlog. The counters keep their
+meanings, and one reading changes shape: `skipped` rising now means the
+backlog outlasted a tick's whole budget of pulls, not one pull, which is a
+strictly deeper backlog than it used to mean. `kimmy_replication_lag_seconds`
+is reported from the tick's last pull at each peer rather than from its only
+one, which is the fresher reading of the same level.
+
+A peer being drained from serves several rounds in a tick instead of one, so
+a member catching up costs its peers more while it catches up — bounded, as
+before, by the fanout: a node answers at most the pullers that select it, and
+each pull is still one capped frame. The repair machinery (ADR-148) counts
+its cooldown and its attempts in rounds, and a drained tick is several
+rounds, so a repair that keeps being handed out reaches its attempt limit
+sooner in wall-clock terms while a backlog lasts. That is the same number of
+attempts against the same number of pulls, which is what the constant is
+about.
+
+**Cost.** One `bool` on `SyncOutcome`, one comparison against the tick's
+deadline per pull, and a `VecDeque` of the tick's peers instead of an
+iterator over them. A drain makes one connection and one handshake per pull —
+the same connections the old loop made, taken sooner rather than spread over
+ticks.
+
+Defended by `kimmy-cluster/tests/replication.rs`'s
+`a_peer_five_batches_behind_is_drained_inside_one_tick` (the measure: five
+batches in one contact rather than five),
+`a_tick_stops_pulling_when_its_budget_is_spent_and_counts_one_skip` (the
+budget, and one skip per contact however many pulls it made),
+`a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull` (the tick's
+last pull decides the check) and
+`a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick`
+(the failure path, unchanged), and by ADR-133's and ADR-135's own accounting
+tests — `a_cap_truncated_round_counts_a_skip_and_never_a_check`,
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` and
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong` —
+which pass unchanged.
 ---
 
 ## ADR-158 — A collection drop is chunked, and its tombstone is written before the first chunk

@@ -42,8 +42,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   removals, no HTTP shape changed, no protocol field added. A dashboard or scrape
   config built on the three existing writer series is untouched.
 
-## 0.26.1 - 2026-09-09
-
 ### Changed
 
 - **Dropping a collection no longer stops every other write on the member.**
@@ -87,10 +85,39 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   wait of that length, the `WARN` is a member whose writer is held for longer
   than a request is allowed to take.
 
+- **A sync tick drains what it can from a peer instead of one batch per
+  interval.** A member more than 1,024 entries behind used to pull one batch
+  per peer per `cluster.sync_interval_secs` and sit idle until the next tick,
+  which capped catch-up near 205 entries a second per peer whatever the wire
+  or the writer could do: a sustained-ingest round left three members some
+  250,000 documents apart and took about seventy minutes to drain. A tick now
+  keeps pulling from a peer while the pull before it came back full at the
+  cap, round-robin across the peers it contacted, until every pull comes back
+  short of the cap or the tick has spent its own interval. The batch cap and
+  the frame limit are unchanged — raising them would only move the work into a
+  longer hold on the single writer — and neither is the interval, which is now
+  what bounds a tick's own length rather than what bounds a drain: a tick
+  never overruns its period merely by draining, and a tick that overruns it
+  anyway is still logged at `WARN` ([ADR-157](docs/decisions.md)).
+
+  **The divergence counters keep their meanings, and one reading gets deeper.**
+  `kimmy_sync_divergence_checks_total` is still one `ran` or one `skipped` per
+  peer per tick, decided by the tick's *last* pull at that peer: short of the
+  cap means the check ran on it, out of budget while still truncated means one
+  skip. The pulls in between move neither counter. So a rising `skipped` now
+  means a backlog that outlasted a whole tick's worth of pulls rather than one
+  pull — a strictly deeper backlog than before — and the check comes back as
+  soon as the backlog drains rather than after it. Failures are untouched: a
+  failed pull ends the tick's contact with that peer, backs it off as before,
+  and is never retried inside the tick. The `merged from peer` line and the
+  `cluster.sync` span are now one per peer per tick, with `pulls` on the line
+  saying how many the tick made, so a drain reads as one line rather than a
+  dozen. No new `/metrics` series, nothing on the wire, and nothing to decide
+  before upgrading.
+
 ## 0.26.1 - 2026-09-09
 
 ### Changed
-
 
 - **A release ships Linux archives only, and the Homebrew tap stops
   updating.** `aarch64-apple-darwin` is paused, so a tag attaches no macOS

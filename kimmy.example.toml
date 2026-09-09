@@ -515,7 +515,12 @@ seeds = []
 # placeholder below is refused when either listener is off loopback (ADR-093).
 # cluster_secret = "generate-me-with-openssl-rand-base64-32"
 
-# How often to run an anti-entropy round against each known peer.
+# How often to contact each known peer for an anti-entropy round.
+#
+# A tick makes several pulls from a peer while it is behind: a pull that came
+# back full at the batch cap is followed by another, until every pull comes
+# back short of the cap or the tick has spent this interval (ADR-157). So this
+# bounds a tick's own length, not how fast a backlog drains.
 sync_interval_secs = 5
 
 # How often to re-resolve the seed sources.
