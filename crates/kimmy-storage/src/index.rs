@@ -13,6 +13,7 @@ use bson::{Bson, Document};
 use kimmy_core::{CollectionId, DocId, Error as CoreError, Stamp, keyenc, path};
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::engine::WriterHolder;
 use crate::error::{Result, StorageError};
 use crate::meta::{Enforcement, IndexField, IndexMeta};
 use crate::tables;
@@ -902,7 +903,7 @@ impl crate::Engine {
                     // alone and only moves forward: a batch that fails after
                     // this commit leaves a value the same entry, re-delivered,
                     // computes again and does not move.
-                    let txn = self.begin_write()?;
+                    let txn = self.begin_write(WriterHolder::Ddl)?;
                     crate::Engine::put_collection_meta(&txn, &meta)?;
                     txn.commit()?;
                     return Ok((IndexCreated::Built(settled), Vec::new()));
@@ -953,7 +954,7 @@ impl crate::Engine {
             )));
         }
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::IndexBuild)?;
         if matches!(origin, CreateOrigin::Local) {
             let minted = self.next_stamp();
             stamp = Some(minted);
@@ -1216,7 +1217,7 @@ impl crate::Engine {
             // Not here, but the drop still happened: the tombstone and the
             // entry go in one transaction, as they do below, so there is no
             // instant in which the drop is recorded and not yet replicable.
-            let txn = self.begin_write()?;
+            let txn = self.begin_write(WriterHolder::Ddl)?;
             let stamp = self.next_stamp();
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
             let entry = drop_entry(stamp)?;
@@ -1232,7 +1233,7 @@ impl crate::Engine {
             return Ok(Dropped { stamp: Some(stamp), removed: false });
         };
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Drop)?;
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;

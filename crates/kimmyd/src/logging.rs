@@ -102,8 +102,12 @@ impl TelemetryGuard {
             }
         };
 
+        // `$description` is an `expr` rather than a `literal` so that a
+        // family of instruments can build one description from a shared
+        // stem with `concat!`; the name stays a literal, because the guard
+        // that compares this file against `/metrics` reads those literals.
         macro_rules! observe {
-            ($build:ident, $name:literal, $unit:literal, $description:literal, $field:ident) => {
+            ($build:ident, $name:literal, $unit:literal, $description:expr, $field:ident) => {
                 observe!($build, $name, $unit, $description, |s| s.$field)
             };
             // The same, for a series that is not a bare field of the snapshot
@@ -111,7 +115,7 @@ impl TelemetryGuard {
             // an index is not an `ident`. A series the macro cannot express is
             // a reason to extend the macro, not a reason to leave the series
             // off the bridge.
-            ($build:ident, $name:literal, $unit:literal, $description:literal, |$s:ident| $value:expr) => {{
+            ($build:ident, $name:literal, $unit:literal, $description:expr, |$s:ident| $value:expr) => {{
                 let snapshot = snapshot.clone();
                 let _ = meter
                     .$build($name)
@@ -123,6 +127,33 @@ impl TelemetryGuard {
                         }
                     })
                     .build();
+            }};
+        }
+
+        // The writer-hold histogram's two rows for one holder (ADR-159).
+        // Two instruments per holder rather than one instrument with a
+        // `holder` attribute, because that is how every other labelled
+        // series on this bridge is carried and a dashboard reading both
+        // surfaces should not have to learn a second convention. The
+        // holder's slot is a constant here, so the array index the value
+        // comes from and the name it is published under cannot drift apart:
+        // both are written on the same line.
+        macro_rules! held_by {
+            ($seconds:literal, $holds:literal, $holder:expr, $what:literal) => {{
+                observe!(
+                    f64_observable_counter,
+                    $seconds,
+                    "s",
+                    concat!("Seconds the storage writer was held by ", $what, "."),
+                    |s| s.write_lock_held_us[$holder.slot()] as f64 / 1e6
+                );
+                observe!(
+                    u64_observable_counter,
+                    $holds,
+                    "{hold}",
+                    concat!("Times the storage writer was held by ", $what, "."),
+                    |s| s.write_lock_holds[$holder.slot()]
+                );
             }};
         }
 
@@ -192,6 +223,85 @@ impl TelemetryGuard {
             "s",
             "The longest any one transaction has held the storage writer since start.",
             |s| s.write_lock_held_max_us as f64 / 1e6
+        );
+        // What held it, and for how long in total (ADR-159). The buckets of
+        // `kimmy_write_lock_held_seconds` stay off the bridge with the other
+        // two histograms (see `NOT_BRIDGED`); the attribution itself does
+        // not, because it is the reading an operator acts on and a
+        // collector is where the alerting lives. One pair per holder, in
+        // `WriterHolder::ALL` order.
+        use kimmy_storage::WriterHolder;
+        held_by!(
+            "kimmy.write_lock.held_seconds.write",
+            "kimmy.write_lock.holds.write",
+            WriterHolder::Write,
+            "one document written by a client"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.bulk",
+            "kimmy.write_lock.holds.bulk",
+            WriterHolder::Bulk,
+            "many documents in one transaction: a bulk insert, a chunk of a multi-document update, a scoped batch"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.ddl",
+            "kimmy.write_lock.holds.ddl",
+            WriterHolder::Ddl,
+            "a schema change writing metadata alone"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.index_build",
+            "kimmy.write_lock.holds.index_build",
+            WriterHolder::IndexBuild,
+            "an index build, which files every document of the collection in the transaction that creates it"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.drop",
+            "kimmy.write_lock.holds.drop",
+            WriterHolder::Drop,
+            "a collection or index drop, which removes everything it holds in one transaction"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.replication",
+            "kimmy.write_lock.holds.replication",
+            WriterHolder::Replication,
+            "applying a peer's entries"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.repair",
+            "kimmy.write_lock.holds.repair",
+            WriterHolder::Repair,
+            "applying a page of a peer's snapshot to repair a divergence"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.retention",
+            "kimmy.write_lock.holds.retention",
+            WriterHolder::Retention,
+            "the retention pass removing what its scans found"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.expiry",
+            "kimmy.write_lock.holds.expiry",
+            WriterHolder::Expiry,
+            "a TTL index's delete"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.embedding",
+            "kimmy.write_lock.holds.embedding",
+            WriterHolder::Embedding,
+            "the embedding worker writing vectors or checkpointing its position"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.durability",
+            "kimmy.write_lock.holds.durability",
+            WriterHolder::Durability,
+            "the shared fsync of the coalescing barrier"
+        );
+        held_by!(
+            "kimmy.write_lock.held_seconds.rewind",
+            "kimmy.write_lock.holds.rewind",
+            WriterHolder::Rewind,
+            "a rewind to a point in time, which runs only in a process that never serves"
         );
         observe!(
             u64_observable_gauge,

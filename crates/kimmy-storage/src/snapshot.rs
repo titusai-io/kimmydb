@@ -99,7 +99,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::docs::RemoteApplied;
-use crate::engine::{Engine, Position};
+use crate::engine::{Engine, Position, WriterHolder};
 use crate::error::Result;
 use crate::meta::CollectionMeta;
 use crate::sync::{Memo, Pending};
@@ -530,7 +530,7 @@ impl Engine {
             // (`sync::Memo`); nothing below is a schema change, so it stands
             // for the whole page.
             let mut memo = Memo::default();
-            let txn = self.begin_write()?;
+            let txn = self.begin_write(WriterHolder::Repair)?;
             let mut pending = Vec::new();
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
@@ -615,7 +615,13 @@ impl Engine {
             applied = pending.len();
             let mut published = Vec::with_capacity(pending.len());
             for Pending { collection, entry, id, violations } in pending {
-                match self.report_remote_write(&collection, &entry, &id, &violations) {
+                match self.report_remote_write(
+                    WriterHolder::Repair,
+                    &collection,
+                    &entry,
+                    &id,
+                    &violations,
+                ) {
                     Ok(entries) => published.extend(entries),
                     Err(e) => {
                         failed.get_or_insert(e);

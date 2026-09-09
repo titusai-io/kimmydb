@@ -24,7 +24,7 @@ use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, Ve
 use tracing::{debug, info, warn};
 
 use crate::docs::RemoteApplied;
-use crate::engine::{Engine, WriteTxn};
+use crate::engine::{Engine, WriteTxn, WriterHolder};
 use crate::error::Result;
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
@@ -670,7 +670,7 @@ impl Engine {
     /// keeps, does not hold redb's single writer for the duration.
     fn run_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
         if run.txn.is_none() {
-            run.txn = Some(self.begin_write()?);
+            run.txn = Some(self.begin_write(WriterHolder::Replication)?);
         }
         Ok(run.txn.as_ref().expect("opened just above"))
     }
@@ -697,7 +697,13 @@ impl Engine {
         let mut published = Vec::with_capacity(run.pending.len());
         let mut failed = None;
         for Pending { collection, entry, id, violations } in run.pending.drain(..) {
-            match self.report_remote_write(&collection, &entry, &id, &violations) {
+            match self.report_remote_write(
+                WriterHolder::Replication,
+                &collection,
+                &entry,
+                &id,
+                &violations,
+            ) {
                 Ok(entries) => published.extend(entries),
                 Err(e) => {
                     failed.get_or_insert(e);
@@ -1359,7 +1365,7 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Replication)?;
         crate::engine::append_oplog(&txn, entry)?;
         txn.commit()?;
         self.witness(&entry.stamp);

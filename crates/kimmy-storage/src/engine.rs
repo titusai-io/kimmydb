@@ -114,6 +114,14 @@ pub struct Engine {
     writer_wait_timeouts: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
+    /// How long the writer was held, as a histogram over
+    /// [`WRITER_HOLD_BUCKETS_US`] **per holder** (ADR-159); `count` and
+    /// `sum` beside it, also per holder. The maximum above says how bad the
+    /// worst hold was; this says what was holding it.
+    writer_hold_buckets:
+        [[std::sync::atomic::AtomicU64; WRITER_HOLD_BUCKETS_US.len()]; WriterHolder::COUNT],
+    writer_hold_count: [std::sync::atomic::AtomicU64; WriterHolder::COUNT],
+    writer_hold_sum_us: [std::sync::atomic::AtomicU64; WriterHolder::COUNT],
     /// Where the retention pass's tombstone scan resumes next pass
     /// (ADR-151): the last document key it visited, or `None` to start from
     /// the top. The scan visits a bounded number of documents per pass.
@@ -143,10 +151,149 @@ pub const WRITER_WAIT_BUCKETS_US: [u64; 8] =
 pub const DROP_PURGE_CHUNK: usize = 1_000;
 
 /// A transaction that held the writer longer than this is logged at WARN,
-/// with the span it was opened under, when it lets go. Five seconds is
-/// more than a bulk of ten thousand documents costs and a small fraction of
-/// the request timeout a client write is waiting under.
+/// naming its [`WriterHolder`], when it lets go. Five seconds is more than a
+/// bulk of ten thousand documents costs and a small fraction of the request
+/// timeout a client write is waiting under.
 pub const WRITER_HOLD_WARN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bounds of the writer-hold histogram, in microseconds (ADR-159).
+///
+/// A hold is not a wait, and the two do not want the same table. One
+/// millisecond is a transaction that wrote nothing and aborted, which costs
+/// no fsync; ten is an ordinary durable commit, measured at ~3.4 ms. A
+/// hundred milliseconds and a second are where a batch sits — a bulk, a
+/// sync run, a chunk of a retention removal. Five seconds is
+/// [`WRITER_HOLD_WARN`], so the bucket and the log line agree and a count
+/// can be reconciled against the lines. Thirty is the request timeout's
+/// default: above it every client write that queued behind the hold has
+/// already been refused. Five minutes separates a bad hold from a write
+/// outage — the retention passes ADR-151 measured ran ten to twelve.
+pub const WRITER_HOLD_BUCKETS_US: [u64; 7] =
+    [1_000, 10_000, 100_000, 1_000_000, 5_000_000, 30_000_000, 300_000_000];
+
+/// What kind of work a transaction holding the single writer is doing
+/// (ADR-159).
+///
+/// Every path that takes the writer names one where it opens its
+/// transaction, so the hold histogram can say *what* held it and not only
+/// for how long. The set is closed and small because it is a metric label,
+/// and it names **the work rather than who asked for it**: a collection
+/// drop costs the same hold whether a client issued it or a peer's entry
+/// carried it, and it is the drop an operator is hunting. The two holders
+/// that exist only because of replication — a batch of a peer's entries and
+/// a page of its snapshot — are named for that, because there is nothing
+/// else they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WriterHolder {
+    /// One document, from a client: an insert, a replace, an update, a
+    /// delete, a find-and-modify.
+    Write,
+    /// Many documents in one transaction: a bulk insert, a chunk of a
+    /// multi-document update, a scoped batch.
+    Bulk,
+    /// A schema change that writes metadata alone — a database or
+    /// collection created, a vector configuration settled, a tombstone
+    /// recorded. Costs the same whatever the collection holds.
+    Ddl,
+    /// Creating an index: every document of the collection is read and
+    /// filed under the new definition in the transaction that creates it.
+    IndexBuild,
+    /// The destructive half of a drop: one chunk of a collection's purge
+    /// (ADR-158), or an index drop, which is still one transaction. **Not**
+    /// the burial that precedes a collection's purge — that writes metadata
+    /// alone and is [`WriterHolder::Ddl`]. Also what a creation pays when it
+    /// finishes the residue of an earlier drop, and what the sweep at
+    /// [`Engine::open`] pays: the holder names the work, not who asked.
+    Drop,
+    /// Applying a peer's entries — one run of an anti-entropy batch
+    /// (ADR-119), or the entry a replicated schema change is recorded from.
+    Replication,
+    /// Applying a page of a peer's snapshot, repairing a divergence
+    /// (ADR-152).
+    Repair,
+    /// The retention pass, removing what its scans already found (ADR-151).
+    /// Never the scans themselves, which take no writer at all.
+    Retention,
+    /// A TTL index's delete.
+    Expiry,
+    /// The embedding worker: vectors written, its position checkpointed.
+    Embedding,
+    /// The shared fsync of the coalescing barrier (ADR-088) — the one hold
+    /// that is an fsync and nothing else, and the one that was invisible
+    /// before this histogram, because it takes the gate without opening a
+    /// counted transaction.
+    Durability,
+    /// Rewinding the database to a point in time. Reads zero on any node
+    /// that serves: it runs only under `kimmyd restore --until`, which
+    /// exits before anything can scrape it. Here so that the set is the
+    /// whole set of what takes the writer, rather than the part of it a
+    /// scrape happens to see.
+    Rewind,
+}
+
+impl WriterHolder {
+    /// Every holder, in the order the histogram renders them, which is the
+    /// order they are declared in.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Write,
+        Self::Bulk,
+        Self::Ddl,
+        Self::IndexBuild,
+        Self::Drop,
+        Self::Replication,
+        Self::Repair,
+        Self::Retention,
+        Self::Expiry,
+        Self::Embedding,
+        Self::Durability,
+        Self::Rewind,
+    ];
+
+    /// How many there are; the width of every per-holder array.
+    pub const COUNT: usize = 12;
+
+    /// The word a metric label and a log line name this holder by.
+    ///
+    /// What an operator already reads in the logs and the operations guide,
+    /// never the name of a function: `retention` is the pass ADR-151
+    /// describes, `repair` is the round `kimmy_sync_repair_rounds_total`
+    /// counts.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Bulk => "bulk",
+            Self::Ddl => "ddl",
+            Self::IndexBuild => "index_build",
+            Self::Drop => "drop",
+            Self::Replication => "replication",
+            Self::Repair => "repair",
+            Self::Retention => "retention",
+            Self::Expiry => "expiry",
+            Self::Embedding => "embedding",
+            Self::Durability => "durability",
+            Self::Rewind => "rewind",
+        }
+    }
+
+    /// Its row in the per-holder arrays; `ALL[h.slot()] == h`.
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// The writer-hold histogram, as a scrape reads it (ADR-159).
+///
+/// One row per [`WriterHolder`], in [`WriterHolder::ALL`] order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriterHoldSnapshot {
+    /// Holds in each bucket of [`WRITER_HOLD_BUCKETS_US`], **not**
+    /// cumulative, per holder.
+    pub buckets: [[u64; WRITER_HOLD_BUCKETS_US.len()]; WriterHolder::COUNT],
+    /// Holds per holder, which is the histogram's `+Inf` bucket.
+    pub count: [u64; WriterHolder::COUNT],
+    /// Microseconds the writer was held by each holder, since start.
+    pub sum_us: [u64; WriterHolder::COUNT],
+}
 
 tokio::task_local! {
     /// The longest the current task is prepared to wait for the writer.
@@ -178,14 +325,24 @@ fn write_wait_budget() -> Option<std::time::Duration> {
 
 /// An exclusive hold of the writer; see [`Engine::hold_writer`].
 pub struct WriterHold<'a> {
-    _gate: parking_lot::MutexGuard<'a, ()>,
+    /// `None` once let go, which happens *before* the hold is recorded —
+    /// the order [`WriteTxn::release`] takes and states its reason for.
+    gate: Option<parking_lot::MutexGuard<'a, ()>>,
     engine: &'a Engine,
     held_from: std::time::Instant,
+    holder: WriterHolder,
 }
 
 impl Drop for WriterHold<'_> {
     fn drop(&mut self) {
-        self.engine.record_writer_hold(self.held_from.elapsed(), "hold_writer");
+        // Let go first, then record, as `WriteTxn::release` does. What
+        // follows the release is a handful of atomics and, past
+        // `WRITER_HOLD_WARN`, a log call; small, but it is not work the
+        // next writer in the queue should be waiting through, and two
+        // paths that release the same gate should not do it in two orders.
+        if self.gate.take().is_some() {
+            self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+        }
     }
 }
 
@@ -300,9 +457,10 @@ pub(crate) struct WriteTxn<'a> {
     gate: Option<parking_lot::MutexGuard<'a, ()>>,
     /// When the writer was taken, for the hold measurement.
     held_from: std::time::Instant,
-    /// The span this transaction was opened under — `replace`, `bulk`,
-    /// `cluster.sync`, `storage.retention` — so a long hold names its cause.
-    holder: &'static str,
+    /// What this transaction is doing, declared by the path that opened it
+    /// (ADR-159), so a long hold names its cause and the hold histogram can
+    /// be split by it.
+    holder: WriterHolder,
 }
 
 impl WriteTxn<'_> {
@@ -463,6 +621,11 @@ impl Engine {
             writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
+            writer_hold_buckets: std::array::from_fn(|_| {
+                std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
+            }),
+            writer_hold_count: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            writer_hold_sum_us: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             gc_scan_cursor: parking_lot::Mutex::new(None),
         };
 
@@ -499,14 +662,28 @@ impl Engine {
         )
     }
 
-    /// Take the writer and hold it until the guard is dropped (ADR-151).
+    /// How long each holder has held the writer, since start (ADR-159).
+    pub fn writer_hold(&self) -> WriterHoldSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        WriterHoldSnapshot {
+            buckets: std::array::from_fn(|holder| {
+                std::array::from_fn(|slot| self.writer_hold_buckets[holder][slot].load(Relaxed))
+            }),
+            count: std::array::from_fn(|holder| self.writer_hold_count[holder].load(Relaxed)),
+            sum_us: std::array::from_fn(|holder| self.writer_hold_sum_us[holder].load(Relaxed)),
+        }
+    }
+
+    /// Take the writer as `holder` and hold it until the guard is dropped
+    /// (ADR-151).
     ///
     /// Every write on this engine waits behind the hold, exactly as behind
     /// a transaction; a caller with a budget gives up inside it. For a test
-    /// that needs the writer busy, and for nothing on a request path.
-    pub fn hold_writer(&self) -> WriterHold<'_> {
+    /// that needs the writer busy, and for nothing on a request path — so
+    /// the holder it is given is the one whose hold it is standing in for.
+    pub fn hold_writer(&self, holder: WriterHolder) -> WriterHold<'_> {
         let gate = blocking(|| self.writer_gate.lock());
-        WriterHold { _gate: gate, engine: self, held_from: std::time::Instant::now() }
+        WriterHold { gate: Some(gate), engine: self, held_from: std::time::Instant::now(), holder }
     }
 
     fn record_writer_wait(&self, waited: std::time::Duration) {
@@ -519,13 +696,20 @@ impl Engine {
         self.writer_wait_sum_us.fetch_add(us, Relaxed);
     }
 
-    fn record_writer_hold(&self, held: std::time::Duration, holder: &'static str) {
+    fn record_writer_hold(&self, held: std::time::Duration, holder: WriterHolder) {
+        use std::sync::atomic::Ordering::Relaxed;
         let us = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
-        self.writer_hold_max_us.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
+        self.writer_hold_max_us.fetch_max(us, Relaxed);
+        let row = holder.slot();
+        if let Some(slot) = WRITER_HOLD_BUCKETS_US.iter().position(|upper| us <= *upper) {
+            self.writer_hold_buckets[row][slot].fetch_add(1, Relaxed);
+        }
+        self.writer_hold_count[row].fetch_add(1, Relaxed);
+        self.writer_hold_sum_us[row].fetch_add(us, Relaxed);
         if held >= WRITER_HOLD_WARN {
             warn!(
                 held_ms = held.as_millis() as u64,
-                holder,
+                holder = holder.label(),
                 "a transaction held the single writer for longer than {} s; every other \
                  write on this node waited behind it",
                 WRITER_HOLD_WARN.as_secs()
@@ -846,7 +1030,7 @@ impl Engine {
 
     /// Record that a collection was dropped at `stamp`, if that is newer.
     pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let newer = match dropped.get(id.0)? {
@@ -914,7 +1098,7 @@ impl Engine {
         index_id: u32,
         stamp: Stamp,
     ) -> Result<()> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         Self::record_index_drop_in_txn(&txn, collection, index_id, stamp)?;
         txn.commit()?;
         Ok(())
@@ -927,7 +1111,7 @@ impl Engine {
     /// a snapshot's final page records it inside the page's transaction
     /// through [`Self::absorb_version_vector_in_txn`] instead (ADR-152).
     pub fn absorb_version_vector(&self, granted: &kimmy_core::VersionVector) -> Result<()> {
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Replication)?;
         Self::absorb_version_vector_in_txn(&txn, granted)?;
         txn.commit()?;
         Ok(())
@@ -1081,7 +1265,7 @@ impl Engine {
         if seen.is_empty() {
             return Ok(());
         }
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Replication)?;
         Self::absorb_witnessed_in_txn(&txn, seen)?;
         txn.commit()?;
         Ok(())
@@ -1110,7 +1294,7 @@ impl Engine {
     /// with it.
     pub fn witness_processed(&self, stamp: &Stamp) -> Result<()> {
         self.witness(stamp);
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Replication)?;
         raise_version(&txn, tables::OPLOG_WITNESSED, stamp)?;
         txn.commit()?;
         Ok(())
@@ -1145,7 +1329,7 @@ impl Engine {
         &self.db
     }
 
-    /// Begin a counted write transaction.
+    /// Begin a counted write transaction, held as `holder`.
     ///
     /// Every write an open engine performs goes through here rather than
     /// through [`Database::begin_write`] directly, so that [`Engine::commits`]
@@ -1155,8 +1339,12 @@ impl Engine {
     /// pass through here all happen where there is no `Engine` yet to count
     /// them: opening the database, migrating it, and restoring a backup into a
     /// fresh file.
-    pub(crate) fn begin_write(&self) -> Result<WriteTxn<'_>> {
-        let holder = tracing::Span::current().metadata().map_or("none", |m| m.name());
+    ///
+    /// `holder` is a parameter rather than something read from the ambient
+    /// span, so that a new write path cannot be added without naming what it
+    /// is: the attribution is a compile error to omit, which is the only way
+    /// it stays complete (ADR-159).
+    pub(crate) fn begin_write(&self, holder: WriterHolder) -> Result<WriteTxn<'_>> {
         let budget = write_wait_budget();
         let waited_from = std::time::Instant::now();
         // Waiting for the writer is the other blocking step. The queue is
@@ -1172,7 +1360,7 @@ impl Engine {
             self.writer_wait_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 waited_ms = waited.as_millis() as u64,
-                caller = holder,
+                caller = holder.label(),
                 "a write gave up waiting for the single writer; another transaction held it \
                  for the whole wait"
             );
@@ -1279,7 +1467,17 @@ impl Engine {
     fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
         // The leader's own transaction queues like any other (ADR-151); the
         // committer it flushes for released the gate before it began to wait.
-        let _gate = blocking(|| self.writer_gate.lock());
+        // The gate is held for exactly as long as it always was — to the end
+        // of this function — and is now wrapped so that the hold is recorded
+        // (ADR-159). This is the one path that takes the writer without
+        // opening a counted transaction, which is why it was the one hold
+        // nothing measured at all: not mislabelled, absent.
+        let _gate = WriterHold {
+            gate: Some(blocking(|| self.writer_gate.lock())),
+            engine: self,
+            held_from: std::time::Instant::now(),
+            holder: WriterHolder::Durability,
+        };
         let mut txn = blocking(|| self.db.begin_write()).map_err(|e| {
             redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
         })?;
@@ -1319,7 +1517,7 @@ impl Engine {
 
     pub fn create_database(&self, name: &str) -> Result<DatabaseMeta> {
         CoreError::validate_name(name)?;
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         // Minted under the writer, as every stamp is (ADR-148).
         let stamp = self.next_stamp();
         let meta = DatabaseMeta { name: name.to_string(), created: stamp.hlc };
@@ -1392,7 +1590,7 @@ impl Engine {
 
         // A database with no collections (the row exists, nothing else) still
         // has a row to remove.
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             dbs.remove(name)?;
@@ -1453,9 +1651,14 @@ impl Engine {
         // them exists. Ordinarily there is nothing to finish and this is two
         // seeks against an empty range; where there is, it is the same bounded
         // chunks the drop was making, so it does not hold the writer either.
+        //
+        // Those chunks are held as `drop` and not as `ddl` (ADR-159): the
+        // holder names the work, and finishing somebody else's drop is drop
+        // work whoever happens to be doing it. A creation that pays for one
+        // says so on the page.
         self.purge_dropped_collection(id)?;
 
-        let txn = self.begin_write()?;
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         // Minted *after* the writer is held, never before (ADR-148). A stamp
         // minted while another transaction holds the writer sorts below the
         // entries that transaction commits first, and a peer that reads this
@@ -1752,7 +1955,14 @@ impl Engine {
             .flatten();
 
         let log = replicated.is_none();
-        let txn = self.begin_write()?;
+        // `ddl` and not `drop`, and the split is the point of the pairing
+        // (ADR-159): the holder names what the transaction writes, and this
+        // one writes metadata — a definition removed, a tombstone, an entry —
+        // in time that does not grow with the collection. The destructive
+        // half is `purge_chunk`, and it is `drop`. Labelling the burial as a
+        // drop would put an O(1) transaction in the row an operator reads to
+        // find out what is churning through the writer.
+        let txn = self.begin_write(WriterHolder::Ddl)?;
         // Under the writer, as `create_collection_inner` mints (ADR-148).
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let database_emptied = {
@@ -1871,7 +2081,14 @@ impl Engine {
     /// the transaction — the read is bounded by the chunk, not by the size of
     /// the collection, so it is not the walk under the writer ADR-151 forbids.
     fn purge_chunk(&self, id: CollectionId) -> Result<usize> {
-        let txn = self.begin_write()?;
+        // The whole of a drop's destructive work is here, so this is the
+        // transaction `drop` counts (ADR-159) — once per chunk now rather
+        // than once per drop, which is what the count of that row is for:
+        // a `drop` count climbing in thousands beside a flat `ddl` is a large
+        // purge in progress, whoever started it. The same chunks are run by
+        // `create_collection_inner` and by the sweep at open, and they are
+        // `drop` there too: the holder names the work, not who asked.
+        let txn = self.begin_write(WriterHolder::Drop)?;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a
@@ -2476,8 +2693,11 @@ mod tests {
             for (n, line) in body.lines().enumerate() {
                 // Tests reach for a raw database on purpose — to prove what an
                 // engine does when the file underneath it was written by
-                // something else.
-                let raw = line.contains(".begin_write()") && !line.contains("self.begin_write()");
+                // something else. Empty parentheses are what makes a call
+                // raw: `Engine::begin_write` takes the holder its hold is
+                // measured under (ADR-159), so a call with nothing in them
+                // is redb's.
+                let raw = line.contains(".begin_write()");
                 if raw && !line.trim_start().starts_with("let txn = db.begin_write().unwrap()") {
                     offenders.push(format!("{name}:{}: {}", n + 1, line.trim()));
                 }
@@ -2591,7 +2811,7 @@ mod tests {
                     continue;
                 }
                 let Some(mint) = text.find("next_stamp()") else { continue };
-                let Some(writer) = text.find("begin_write()") else { continue };
+                let Some(writer) = text.find("begin_write(") else { continue };
                 if mint < writer {
                     offenders.push(format!("{name}:{line}: {}", signature.trim()));
                 }
@@ -2643,7 +2863,7 @@ mod tests {
         let writer = {
             let engine = Arc::clone(&engine);
             std::thread::spawn(move || {
-                let txn = engine.begin_write().unwrap();
+                let txn = engine.begin_write(WriterHolder::Bulk).unwrap();
                 held_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
                 let mut last = Hlc::ZERO;
@@ -2706,7 +2926,7 @@ mod tests {
             let engine = Arc::clone(&engine);
             let coll = coll.clone();
             std::thread::spawn(move || {
-                let txn = engine.begin_write().unwrap();
+                let txn = engine.begin_write(WriterHolder::Bulk).unwrap();
                 held_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
                 let mut last = Hlc::ZERO;
@@ -2729,7 +2949,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut rx = engine.subscribe();
                 engine
-                    .write_batch(|scope| {
+                    .write_batch(WriterHolder::Bulk, |scope| {
                         scope.replace(
                             &coll,
                             &kimmy_core::DocId::String("kept".into()),
@@ -3244,7 +3464,7 @@ mod tests {
         let meta = engine.create_collection("db", "c").unwrap();
 
         let waits_before = engine.writer_wait().count;
-        let hold = engine.hold_writer();
+        let hold = engine.hold_writer(WriterHolder::Bulk);
         let budget = std::time::Duration::from_millis(100);
         let refused = {
             let engine = Arc::clone(&engine);
@@ -3298,7 +3518,7 @@ mod tests {
             }
             engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
 
-            let hold = engine.hold_writer();
+            let hold = engine.hold_writer(WriterHolder::Bulk);
             let budget = std::time::Duration::from_millis(100);
             let owed = {
                 let engine = Arc::clone(&engine);
@@ -3319,6 +3539,229 @@ mod tests {
         };
 
         assert_eq!(rows_under(&Engine::open(&path).unwrap(), coll.id), (0, 0), "the next start");
+    }
+
+    /// The holder set is a metric label, so its shape is load-bearing: a
+    /// row per holder, in declaration order, and a word per row that a
+    /// Prometheus label can carry and an operator can read.
+    #[test]
+    fn every_holder_has_its_own_row_and_its_own_word() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (row, holder) in WriterHolder::ALL.iter().enumerate() {
+            assert_eq!(holder.slot(), row, "{holder:?} indexes a row that is not its own");
+            let label = holder.label();
+            assert!(
+                !label.is_empty()
+                    && label.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    && !label.starts_with('_'),
+                "{label:?} is not a label a scrape can carry"
+            );
+            assert!(seen.insert(label), "two holders share the word {label:?}");
+        }
+        assert_eq!(WriterHolder::ALL.len(), WriterHolder::COUNT);
+    }
+
+    /// A label nothing fills is worse than no label: the documentation
+    /// promises a dimension an operator can split on, and the split comes
+    /// back empty for ever with nothing to say the path was never named.
+    ///
+    /// So every holder has to be named by some path in this crate that
+    /// takes the writer, checked against the source the way
+    /// `commits_are_counted_at_one_chokepoint` checks its own invariant —
+    /// each file read only as far as its test module, since a test may
+    /// take the writer under any holder it likes to build a fixture.
+    #[test]
+    fn every_holder_is_named_by_a_path_that_takes_the_writer() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        sources(&src, &mut paths);
+        assert!(paths.len() > 10, "the scan of this crate's sources broke: {paths:?}");
+
+        let mut named = String::new();
+        for path in paths {
+            let whole = std::fs::read_to_string(&path).unwrap();
+            let body = match whole.find("#[cfg(test)]\nmod tests") {
+                Some(at) => &whole[..at],
+                None => &whole[..],
+            };
+            named.push_str(body);
+        }
+
+        let unnamed: Vec<&str> = WriterHolder::ALL
+            .iter()
+            .filter(|holder| !named.contains(&format!("WriterHolder::{holder:?}")))
+            .map(|holder| holder.label())
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "these holders are on `/metrics` and in the operations guide, and no write path \
+             names one: {unnamed:?}. Either a path lost its holder or the set has a word in it \
+             that describes nothing"
+        );
+    }
+
+    /// The bucket the operations guide tells an operator to alert on is the
+    /// threshold the `WARN` fires at, so a hold counted above that bound has
+    /// a log line naming the same holder. Two constants, one promise.
+    #[test]
+    fn the_warned_hold_is_a_bucket_boundary() {
+        let warn_us = u64::try_from(WRITER_HOLD_WARN.as_micros()).unwrap();
+        assert!(
+            WRITER_HOLD_BUCKETS_US.contains(&warn_us),
+            "{WRITER_HOLD_WARN:?} is not a bound of {WRITER_HOLD_BUCKETS_US:?}, so the bucket \
+             the guide names and the line the log writes no longer agree"
+        );
+    }
+
+    /// The measurement ADR-159 exists for: a hold lands in its own holder's
+    /// row and in no other, with the ADR-151 maximum still moving beside it.
+    #[test]
+    fn a_hold_is_recorded_against_what_held_the_writer() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("app", "docs").unwrap();
+
+        let before = engine.writer_hold();
+        engine.insert(&coll, bson::doc! { "_id": 1i64 }).unwrap();
+        let after = engine.writer_hold();
+
+        let write = WriterHolder::Write.slot();
+        assert_eq!(
+            after.count[write],
+            before.count[write] + 1,
+            "one document from a client is one hold under `write`"
+        );
+        assert!(after.sum_us[write] >= before.sum_us[write], "the hold was timed");
+        for holder in WriterHolder::ALL {
+            if holder == WriterHolder::Write {
+                continue;
+            }
+            assert_eq!(
+                after.count[holder.slot()],
+                before.count[holder.slot()],
+                "an insert moved {}'s row",
+                holder.label()
+            );
+        }
+
+        // Two holders on one engine stay apart, which is the whole point:
+        // a drop and a client write were one number before this.
+        let drops = WriterHolder::Drop.slot();
+        engine.drop_collection("app", "docs").unwrap();
+        let dropped = engine.writer_hold();
+        assert!(dropped.count[drops] >= 1, "the drop is its own holder");
+        assert_eq!(dropped.count[write], after.count[write], "and it is not a client's write");
+
+        // ADR-151's since-start maximum is unchanged by any of this.
+        assert!(engine.writer_hold_max() > std::time::Duration::ZERO);
+    }
+
+    /// ADR-158 split a collection drop into a burial and a purge, and
+    /// ADR-159's rule splits their attribution with them: the burial writes
+    /// metadata and is `ddl`, every chunk of the purge is `drop`.
+    ///
+    /// The two are checked apart rather than together because folding them
+    /// would be the easy mistake and an invisible one — the burial is the
+    /// transaction whose cost does *not* grow with the collection, and
+    /// counting it as a drop would put an O(1) hold in the row an operator
+    /// reads to find out what is churning through the writer. Chunk counts
+    /// are the assertion for the same reason: after chunking, what names a
+    /// large drop is a `drop` count in the thousands beside a flat `ddl`.
+    #[test]
+    fn a_chunked_drop_buries_under_ddl_and_purges_under_drop() {
+        let (engine, _dir) = engine();
+        let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
+
+        let ddl = WriterHolder::Ddl.slot();
+        let drops = WriterHolder::Drop.slot();
+        let before = engine.writer_hold();
+
+        engine.drop_collection("shop", "orders").unwrap();
+        let after = engine.writer_hold();
+
+        assert_eq!(
+            after.count[ddl] - before.count[ddl],
+            1,
+            "the burial is one metadata transaction, and the only one"
+        );
+        // Two collections of `DROP_PURGE_CHUNK * 2 + 7` rows, the shadow
+        // among them, plus the index entries under the parent: more chunks
+        // than either collection has on its own, and every one of them here.
+        assert!(
+            after.count[drops] - before.count[drops] >= 4,
+            "each chunk of the purge is its own hold: {} chunks",
+            after.count[drops] - before.count[drops]
+        );
+        assert_eq!(rows_under(&engine, coll.id), (0, 0), "the fixture really did purge");
+    }
+
+    /// The sweep that finishes an interrupted drop runs inside
+    /// `Engine::open`, on an engine that is fully constructed by then, so its
+    /// chunks are attributed like any other purge — and are already on the
+    /// first scrape of a member that has served nothing yet.
+    ///
+    /// That is the reading an operator wants from a member whose start took a
+    /// minute, and it is the only series that offers it. It also puts the
+    /// line through `open` where `commits_are_counted_at_one_chokepoint`
+    /// puts it: the migrations and index rebuilds above write on the raw
+    /// database and stay outside this accounting, the sweep takes the gate
+    /// and is inside it.
+    #[test]
+    fn a_drop_finished_at_the_next_start_is_attributed_to_that_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let coll = {
+            let engine = Engine::open(&path).unwrap();
+            let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
+            engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+            assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK);
+            assert!(rows_under(&engine, coll.id).0 > 0, "the fixture must leave rows owed");
+            coll
+        };
+
+        let restarted = Engine::open(&path).unwrap();
+        let hold = restarted.writer_hold();
+        assert!(
+            hold.count[WriterHolder::Drop.slot()] >= 1,
+            "the sweep's chunks are on the engine it was returned with"
+        );
+        assert_eq!(
+            hold.count[WriterHolder::Ddl.slot()],
+            0,
+            "and the burial was another process's; this start buried nothing"
+        );
+        assert_eq!(rows_under(&restarted, coll.id), (0, 0), "the sweep did finish it");
+    }
+
+    /// The barrier's own flush holds the writer without opening a counted
+    /// transaction, so it was the one hold nothing measured at all
+    /// (ADR-159). Under `coalesced` it is a holder like any other.
+    #[test]
+    fn the_barrier_flush_is_a_holder_rather_than_an_unmeasured_hold() {
+        use bson::doc;
+        let (engine, _dir) = engine();
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(5));
+        let coll = engine.create_collection("app", "c").unwrap();
+
+        let durability = WriterHolder::Durability.slot();
+        let before = engine.writer_hold().count[durability];
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! {"_id": i}).unwrap();
+        }
+        assert!(
+            engine.writer_hold().count[durability] > before,
+            "a shared flush held the writer and said so"
+        );
     }
 
     /// A budget bounds the wait, not the transaction: a write that gets the

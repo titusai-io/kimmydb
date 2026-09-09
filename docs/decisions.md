@@ -11482,6 +11482,23 @@ the two comparisons to one ordering.
 
 ## ADR-151 — The retention pass never holds the writer for a walk, and a write waits a bounded time for it
 
+> **Amended by [ADR-159](#adr-159--the-writer-hold-says-what-held-it).**
+> One clause below held for half of what it promised. **"logged at `WARN`
+> when it lets go, with the span it was opened under — `replace`, `bulk`,
+> `cluster.sync`, `storage.retention`"** was true of the two background names:
+> `cluster.sync` is applied around an anti-entropy round and is current where
+> that path takes the writer, and `storage.retention` is entered in the
+> collector on the same synchronous stack as all four of its writer sites. It
+> was never true of the two client ones. The span a client operation runs
+> under is called `db.operation`, with `replace`, `insert` and the rest
+> carried in an `otel.name` *field* for a collector to rename by, so every
+> client write, bulk, drop and index build reached the line as that one
+> generic word — and a path that enters no span at all, which is TTL, the
+> embedding worker, a snapshot repair and the coalescing barrier's flush,
+> reached it as `none`. The `WARN` and its threshold stand; what it names is
+> now a holder the write path declares. The hold itself is a histogram beside
+> the maximum, `kimmy_write_lock_held_seconds{holder}`.
+
 **Decision.** A retention pass holds the single writer only to remove what it
 has already found, never to look for it. Expired oplog entries are read as a
 key range — the oplog is keyed by stamp, so the expired prefix ends at the
@@ -13029,3 +13046,201 @@ Each of those seven has been checked by reverting the production line it names
 — the purge loop, the tombstone's insert in the burial's transaction, the
 chunk bound, the sweep at `open`, the catalogue guard, the creation-side purge,
 and the tolerated `WriterBusy` — and watching it fail.
+
+---
+
+## ADR-159 — The writer hold says what held it
+
+**Decision.** Every path that takes the single writer **declares what it is
+doing**. `Engine::begin_write` takes a `WriterHolder`, `Engine::hold_writer`
+takes one, and the coalescing barrier's flush — which takes the gate without
+opening a counted transaction — holds one too. `record_writer_hold` files the
+hold in a histogram keyed by it, `kimmy_write_lock_held_seconds{holder}`, and
+the two things [ADR-151](#adr-151--the-retention-pass-never-holds-the-writer-for-a-walk-and-a-write-waits-a-bounded-time-for-it)
+built are unchanged beside it: the since-start maximum
+`kimmy_write_lock_held_seconds_max` still moves for every holder, and a hold
+past five seconds is still logged at `WARN` when it lets go — naming the
+declared holder now rather than the ambient span.
+
+Twelve holders, and the rule that produced them is that **a holder names the
+work the transaction does, not who asked for it**:
+
+| Holder | What it is | What bounds the hold |
+| --- | --- | --- |
+| `write` | One document from a client: an insert, a replace, an update, a delete, a find-and-modify | One document |
+| `bulk` | Many documents in one transaction: a bulk insert, a chunk of a multi-document update, a scoped batch | The batch, or `storage.multi_chunk_docs` |
+| `ddl` | A schema change writing metadata alone — a database or collection created, a vector configuration settled, a tombstone recorded | Nothing; it is O(1) whatever the collection holds |
+| `index_build` | Creating an index, which reads every document of the collection and files it under the new definition in the creating transaction | The collection |
+| `drop` | The destructive half of a drop: one chunk of a collection's purge ([ADR-158](#adr-158--a-collection-drop-is-chunked-and-its-tombstone-is-written-before-the-first-chunk)), or an index drop, which is still one transaction. **Not** the burial that precedes a collection's purge, which is `ddl` | `DROP_PURGE_CHUNK`, or the index's entries |
+| `replication` | Applying a peer's entries: one run of an anti-entropy batch, or the entry a replicated schema change is recorded from | The batch cap |
+| `repair` | Applying a page of a peer's snapshot ([ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped)) | One page |
+| `retention` | The retention pass removing what its scans already found; never the scans, which take no writer | 1,000 records per commit |
+| `expiry` | A TTL index's delete | One document |
+| `embedding` | The embedding worker writing vectors or checkpointing its position | One batch of documents |
+| `durability` | The shared fsync of the coalescing barrier ([ADR-088](#adr-088--two-durability-classes-and-the-one-there-is-not)) | One marker write and one fsync |
+| `rewind` | Rewinding the database to a point in time | The oplog above the target |
+
+Three of those divisions are the ones the round below could not make, and they
+are different work rather than different callers: `ddl` writes metadata and is
+constant, `index_build` reads and files a whole collection under the writer,
+and `drop` is the removal of what a collection or an index held. Folding the
+three into one word is how a schema change that stalls a node for a minute
+looks like the one that costs a millisecond. `replication` and `repair` are
+named for replication because there is nothing else they are — no local path
+applies a peer's batch or a peer's snapshot page — while a collection drop is
+`drop` whether a client issued it or a peer's entry carried it, because the
+drop is what an operator is hunting.
+
+**The rule decides a drop's two halves separately, and that is the clearest
+thing it does.** ADR-158 splits a collection drop into a burial — the
+definition removed, the tombstones recorded, the entry minted, all metadata and
+all O(1) — and a purge that removes what the collection held, a chunk per
+commit. The burial is `ddl` and each chunk is `drop`, because the holder names
+what the transaction writes and those two write different things. The same rule
+then settles two paths that are not a drop at all: a chunk run by
+`create_collection_inner` before a recreated name can stand over the residue,
+and a chunk run by the sweep in `Engine::open` finishing a drop a restart
+interrupted, are both `drop`. Neither has a client behind it, and neither is
+the creation's or the start's own cost; they are somebody's drop being
+finished, and `drop` is what an operator needs to see when the writer is busy
+during either. A hold, not a request, is what this histogram divides.
+
+Chunking also changes what the `drop` row *reads like*, which is worth saying
+because it looks at first like an argument for folding it into `bulk`. Before
+ADR-158 a `drop` hold was one transaction proportional to the collection: rare,
+and enormous. After it the holds are bounded like a bulk's and there are many
+of them, so what names a large drop is no longer one long hold but a count
+climbing in thousands beside a flat `ddl`, with `_sum` growing behind it. It
+stays its own holder regardless: `bulk` is client traffic and a purge is not —
+a purge can be running with no request in flight at all, which is exactly the
+member an operator is trying to explain.
+
+**The buckets**, in seconds: `0.001`, `0.01`, `0.1`, `1`, `5`, `30`, `300`,
+`+Inf`. They are not the wait histogram's, because a hold is not a wait. One
+millisecond is a transaction that wrote nothing and aborted, which costs no
+fsync at all — a declined expiry, a snapshot page a member already held. Ten
+is an ordinary durable commit, measured at ~3.4 ms. A hundred milliseconds and
+a second are where a batch sits. **Five seconds is `WRITER_HOLD_WARN`**, so
+the bucket the operations guide tells an operator to alert on and the line the
+log writes are the same threshold, and a test holds the two constants
+together; every hold counted above that bound has a `WARN` naming the same
+holder. Thirty seconds is the request timeout's *default*, and that one is
+weaker than it looks: nothing holds the two together the way a test holds the
+five-second pair, and an operator who sets `server.request_timeout_secs` to
+anything else leaves the bound meaning "thirty seconds" rather than "past the
+point a client write is refused". It is kept because thirty seconds is where
+the deployed default sits and a bucket boundary that moves with configuration
+is a histogram whose rates cannot be compared across members. Five minutes
+separates a bad hold from a write outage — the retention passes ADR-151
+measured ran ten to twelve.
+
+**On the bridge**, one observable counter pair per holder:
+`kimmy.write_lock.held_seconds.<holder>` and `kimmy.write_lock.holds.<holder>`,
+which is the one-instrument-per-label-value convention every other labelled
+series on that bridge already uses. The bucket boundaries stay on `/metrics`
+alone, for the reason recorded against the other two histograms — every
+instrument on this bridge is observable, and OpenTelemetry has no observable
+histogram — but the attribution does not, because the attribution is the part
+an operator acts on and a collector is where the alerting lives.
+
+**Why.** A sustained-load round on the test cluster ended with roughly 11,900
+writes having waited more than five seconds for the writer and eighteen
+transactions having held it for more than five seconds, and **nothing in the
+system could say what those eighteen were**. `kimmy_write_lock_wait_seconds`
+counts the effect on every write that queued; `kimmy_write_lock_held_seconds_max`
+gives one number about one moment and names nothing. A retention pass, a
+replicated batch, a collection drop and an ordinary client write were one
+undifferentiated fact, and the next decision — what to bound, and to what —
+cannot be taken from it. This is the measurement that has to come first.
+
+The attribution had to be **declared rather than inferred**, and that is the
+half of this worth arguing. ADR-151 read the holder from
+`tracing::Span::current()`, and that worked for the two paths it was checked
+against: `cluster.sync` is applied around an anti-entropy round, and
+`storage.retention` is entered in the collector on the same synchronous stack
+as all four of its writer sites, so both reached the line under the name
+ADR-151 promised. It was everything else that it could not name. The span
+every client operation runs under is called `db.operation`, with `find`,
+`insert` and the rest carried in an `otel.name` field for a collector to
+rename by — so a collection drop, an index build and a single insert all
+arrived at the log line as that one word, which is exactly the distinction the
+round needed, and it is the half that mattered, because a client's traffic is
+most of what a member serves. TTL, the embedding worker and a snapshot repair
+enter no span at all and reached it as `none`. And the barrier's flush takes
+the gate directly, outside any transaction, so it recorded no hold at all —
+the one holder that was not merely mislabelled but invisible. The mechanism
+was not wrong everywhere: it was right where somebody had looked and silent
+everywhere else, which is the one property a measurement must not have.
+
+**Two mechanisms, proving opposite things.** The parameter is what makes the
+set *exhaustive*: a new write path does not compile until it says what it is,
+so nothing can reach the histogram unlabelled or under a default. The compiler
+proves that and nothing else needs to.
+`every_holder_is_named_by_a_path_that_takes_the_writer` proves the converse,
+which the compiler cannot: that no holder is *dead* — a word on `/metrics` and
+in the operations guide that no path in the crate fills. A label like that
+splits to nothing for ever, and nobody can tell it from a path that simply
+never ran. Neither check subsumes the other, and neither is claimed to.
+
+**Alternatives.** *Keep reading the span and map its name onto a closed set*
+was rejected as the whole answer for the reason above: the mapping would be
+`db.operation` → one label for every client operation there is, and the
+divisions the round needed are inside it. *A task-local the entry points set,
+read by `begin_write`* was rejected for the failure it shares with the span: a
+path that sets nothing lands in a default bucket silently, and "silently" is
+what this ADR exists to end. *Naming the holder by origin — local or
+replicated — rather than by work* was rejected because it answers the wrong
+question: an operator with a stalled member wants to know what to go and look
+at, and "replicated" does not distinguish a batch of documents from a drop
+that removed forty thousand of them. *One label per storage entry point* was
+rejected as a metric label made of function names, which is neither bounded in
+practice nor readable by anyone who has not read the crate. *A database or
+collection label* is refused outright and permanently: an operator can create
+collections, so it is unbounded cardinality by construction, and it is the
+thing [ADR-068](#adr-068--telemetry-attribute-privacy-names-are-off-by-default)
+keeps off telemetry anyway. *Bridging the buckets to OTLP* is deferred with
+the latency and wait histograms, for the reason recorded against those two.
+*Bounding a hold* — chunking an index build or a drop the way the retention
+pass and a multi-document update are already chunked — is deliberately not
+here: that is the change this measurement exists to inform, and choosing which
+holder to bound before knowing which one spends the writer's time is choosing
+blind. That is the whole argument for shipping a histogram on its own.
+
+**Residuals.** `write` folds an insert, a replace, a delete and a
+find-and-modify into one row: they are one document each and their holds are
+the same shape, and splitting them would be four labels answering a question
+`kimmy_requests_total` already answers. A multi-document update that stops
+after one document is attributed as `write` and not as `bulk`, decided from
+the request's budget rather than from what it matched, because the hold is
+bought before the match is known — so a filtered update that turns out to
+match one document still reads as `bulk`. `rewind` reads 0 on any node that
+serves: it runs only under `kimmyd restore --until`, in a process that exits
+before anything can scrape it. It is in the set anyway, because the set is
+meant to be the whole of what takes the writer and not the part of it a scrape
+happens to see. **That claim has one live exception**, and it is worth naming
+rather than rounding off: at the end of a rewind, `rewind_to` calls
+`Engine::reset_version_vector_to_oplog`, which opens a transaction on the raw
+database — no gate, no commit count, no holder — one of the routes engine.rs
+is exempted from at
+`commits_are_counted_at_one_chokepoint`. It is harmless where it is, because
+that process is single-threaded and serves nothing, and it is not changed
+here; but the set is the whole set of what takes *the gate*, and that call
+does not take it.
+
+**A hold can be recorded before the node serves anything**, and that is
+intended rather than tolerated. The sweep ADR-158 puts in `Engine::open` takes
+the gate through `Engine::begin_write` like every other purge, so its chunks
+land in the `drop` row of the engine that is about to be returned — a member
+restarted part-way through a large drop therefore answers its first scrape with
+`drop` holds already counted and nothing served. That is the reading an
+operator wants: it is the only series that says why the start took a minute.
+It also draws the line through `open` in the right place. The rest of what
+`open` does — the migrations, the two index rebuilds — writes on the raw
+database and stays outside this accounting, because there is no engine to
+count against yet; the sweep runs on a fully constructed engine and is inside
+it. `commits_are_counted_at_one_chokepoint` already draws that same line, and
+the histogram now follows it. And a hold is measured from the moment the gate is taken to
+the moment it is released, which for a commit includes its fsync but not the
+wait at the coalescing barrier — a committer releases the gate before it waits
+there, as ADR-151 left it, so `durability` holds the writer for the flush and
+the waiter's own row does not carry it.

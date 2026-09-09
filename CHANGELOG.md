@@ -10,8 +10,39 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-
 ## Unreleased
+
+### Added
+
+- **The writer hold now says what held it.** `kimmy_write_lock_held_seconds{holder}`
+  is a histogram of how long each transaction held the single writer, split by
+  what it was doing: `write`, `bulk`, `ddl`, `index_build`, `drop`,
+  `replication`, `repair`, `retention`, `expiry`, `embedding`, `durability`,
+  `rewind`. `kimmy_write_lock_wait_seconds` has always counted the *effect* — a
+  hold shows there on every other write that queues behind it — and
+  `kimmy_write_lock_held_seconds_max` gives one number about one moment with no
+  name attached, so a retention pass, a replicated batch, a collection drop and
+  an ordinary client write were one undifferentiated fact. On a three-member
+  test cluster, a sustained-load round left roughly 11,900 writes having waited
+  more than five seconds and eighteen transactions having held the writer for
+  more than five seconds, and nothing on the page or in the log could say which
+  of the twelve those eighteen were. Each holder's total time and hold count are
+  on the OTLP bridge as `kimmy.write_lock.held_seconds.<holder>` and
+  `kimmy.write_lock.holds.<holder>`; the buckets stay on `/metrics` alone, with
+  the other two histograms and for the same reason. The `5`-second bucket is the
+  threshold the existing `WARN` fires at, so a hold counted above it has a log
+  line naming the same holder — and that line now names a holder the write path
+  declares rather than whatever tracing span happened to be current, which for
+  every client operation was the single word `db.operation` and for every
+  background pass was `none`. The since-start maximum and the `WARN` itself are
+  unchanged ([ADR-159](docs/decisions.md) has the holders, the buckets and why
+  a hold is attributed to the work rather than to who asked for it).
+
+  **Nothing to decide before upgrading.** One new `/metrics` series and no
+  removals, no HTTP shape changed, no protocol field added. A dashboard or scrape
+  config built on the three existing writer series is untouched.
+
+## 0.26.1 - 2026-09-09
 
 ### Changed
 
@@ -55,6 +86,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   data, cleared only by a collection created under the same name. Like every
   wait of that length, the `WARN` is a member whose writer is held for longer
   than a request is allowed to take.
+
 ## 0.26.1 - 2026-09-09
 
 ### Changed
