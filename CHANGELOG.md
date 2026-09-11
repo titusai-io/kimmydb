@@ -12,6 +12,26 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Documented
+
+- **A stored `Decimal128` is matched wrongly by a numeric filter, and `$ne` can
+  never exclude it.** Every path that puts a `Decimal128` *in a query* already
+  refuses it. The value *in a document* was never covered: a filter whose
+  operand is an ordinary number still compares against it, and that comparison
+  answers **equal — to every number**. So such a document matches `$eq`, `$gte`,
+  `$lte` and `$in` against any number, fails `$gt` and `$lt`, and — the one that
+  bites — **is never excluded by `$ne`**, so it cannot be filtered out the
+  ordinary way.
+
+  Nothing changes in this release except that the behaviour is now written down,
+  with the full matrix, in `query-language.md` and `key-encoding.md`. **It is
+  documented as a known defect, not as the contract**: the intended behaviour is
+  for a stored `Decimal128` to have a real position among the numbers, and
+  giving it one means exact decimal-to-binary comparison that deserves its own
+  release rather than riding this one. Until then, do not store a `Decimal128`
+  in a field you filter on numerically; `$type: "decimal"` and `$exists` still
+  find the ones you have.
+
 ### Fixed
 
 - **A collection you dropped no longer survives on a member that catches up

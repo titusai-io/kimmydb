@@ -291,7 +291,40 @@ A literal anywhere in a `$expr` expression is refused too, but by the
 expression parser, so that message is the one every expression gives — *a
 Decimal128 literal is not supported in an expression* ([HTTP API](http-api.md#the-json-boundary),
 [Aggregation](aggregation.md#not-supported)). `$type: "decimal"` and
-`$exists` compare nothing and find such documents as ever. The refusal is
+`$exists` compare nothing and find such documents as ever.
+
+> ### ⚠ A *stored* `Decimal128` is matched wrongly by a numeric filter, and this is a defect
+>
+> Everything above is about the **operand** — the value in the query — and that
+> side is closed: a `Decimal128` there is refused at parse.
+>
+> **The stored side is not.** A filter whose operand is an ordinary number still
+> reaches `canonical_cmp` against whatever the document holds, and against a
+> stored `Decimal128` that comparison answers *equal* — to every number. So a
+> document holding one behaves like this, measured:
+>
+> | filter, against a document holding `{"v": {"$numberDecimal": "1.5"}}` | result |
+> |---|---|
+> | `{"v": 1}`, `{"v": 999999}`, `{"v": {"$eq": <any number>}}` | **matches** |
+> | `{"v": {"$gte": 999999}}`, `{"v": {"$lte": -999999}}` | **matches** |
+> | `{"v": {"$in": [42]}}` | **matches** |
+> | `{"v": {"$gt": 999999}}`, `{"v": {"$lt": -999999}}` | does not match |
+> | `{"v": {"$ne": 999999}}` | **does not match** |
+> | `{"v": "a string"}` | does not match — type groups still hold |
+>
+> **The `$ne` row is the one that bites.** Because the stored value compares
+> equal to every number, `$ne` excludes it against every number — so **a document
+> holding a `Decimal128` cannot be filtered out the ordinary way.** A query
+> written to skip such documents keeps them, and one written to find them finds
+> everything.
+>
+> **This is a known defect and not the contract.** It is recorded here so that
+> the behaviour is discoverable, not so that it can be relied on or asserted
+> against: the intended behaviour is for a stored `Decimal128` to have a real
+> position among the numbers, and a fix is tracked as a finding in the project's
+> knowledge base. Until then, **do not store a `Decimal128` in a field you
+> filter on numerically.** Store a `double` or a `long`; `$type: "decimal"` and
+> `$exists` remain the reliable ways to find the ones you already have. The refusal is
 deliberate: through 0.24.0 the same filter was refused only by accident, as
 `unsupported operator "$numberDecimal"`, because the JSON edge did not read
 the wrapper.
