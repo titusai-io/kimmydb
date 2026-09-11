@@ -14,6 +14,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **The backup route's own documentation said it streams. It does not.**
+  `openapi.yaml` summarised `GET /v1/admin/backup` as *"Stream a consistent
+  backup"*, while the route builds the whole backup in a `Vec<u8>` before
+  sending any of it — and `operations.md` said so correctly all along. The two
+  contradicted each other on **exactly the property that decides the memory
+  cost**: peak resident memory on the member is the size of the finished backup
+  on top of everything else it is holding, and the request is what fails if that
+  does not fit. Round 0270 measured one taking 97% of a member's 2 GiB limit.
+
+  No behaviour changes. What changes is that both documents now say the same
+  thing, and both say what it costs and what to watch
+  (`kimmy_process_resident_peak_bytes`, which is latched — a five-second sampler
+  will miss the spike).
+
 - **A collection you dropped no longer survives on a member that catches up
   from far behind.** 0.26.1's release notes recorded one route as not closed:
   a whole-database snapshot — what a member below a peer's retention horizon
