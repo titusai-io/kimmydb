@@ -438,8 +438,9 @@ rather than as history**. See [ADR-036](decisions.md) and
 [ADR-160](decisions.md).
 
 **A snapshot is paged, one transaction a page, and resumes across rounds.**
-Documents arrive 512 to a page; the receiver applies a page in one write
-transaction — none when it already holds every document on the page — and
+Documents arrive 512 to a page; the receiver applies a page's documents in one
+write transaction — none when it already holds every document on the page, and
+none for a collection tombstone it already holds ([ADR-162](decisions.md)) — and
 records where the next page begins before it asks for it, so a round that runs
 out of budget leaves its pages applied and the next round with that peer
 continues from the cursor rather than page one. The coverage adopted when the

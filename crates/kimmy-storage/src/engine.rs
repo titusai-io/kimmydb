@@ -1071,11 +1071,42 @@ impl Engine {
         }
     }
 
+    /// Every collection tombstone this node holds.
+    ///
+    /// Bounded by `tombstone_retention_secs`: retention collects a tombstone
+    /// on the same window it collects the oplog, so this is the drops recent
+    /// enough that a peer might still be behind them, not every drop ever
+    /// made. That bound is what makes it affordable to put on a snapshot page.
+    pub fn collections_dropped(&self) -> Result<Vec<(CollectionId, Stamp)>> {
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let mut out = Vec::new();
+        for row in dropped.iter()? {
+            let (id, raw) = row?;
+            out.push((CollectionId(id.value()), codec::decode_oplog_key(raw.value())?));
+        }
+        Ok(out)
+    }
+
     /// Record that a collection was dropped at `stamp`, if that is newer.
     pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
-        let txn = self.begin_write(WriterHolder::Ddl)?;
+        // Read first, outside the writer. A tombstone this node already holds
+        // at or above `stamp` is the common case on the route ADR-162 added --
+        // a whole-database snapshot replays the sender's whole tombstone list
+        // on every page -- and taking the single writer to decide that nothing
+        // needs writing costs the receiver an fsync per tombstone per page.
+        // ADR-152's rule is that a page a member already holds must not cost
+        // one, and this is inside that promise.
+        if let Some(existing) = self.collection_dropped_at(id)?
+            && stamp <= existing
         {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        let wrote = {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            // Re-read under the writer: the check above is outside it, so
+            // another writer may have recorded a newer one since.
             let newer = match dropped.get(id.0)? {
                 Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
                 None => true,
@@ -1083,8 +1114,15 @@ impl Engine {
             if newer {
                 dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
             }
+            newer
+        };
+        // Nothing written, nothing committed -- the same rule the snapshot
+        // page itself follows.
+        if wrote {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
         }
-        txn.commit()?;
         Ok(())
     }
 

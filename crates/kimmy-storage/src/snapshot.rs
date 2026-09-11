@@ -9,8 +9,14 @@
 //! is to say, adding a node to a running cluster.
 //!
 //! So when a peer asks from below the horizon, it is sent **current state**
-//! instead of history: collection definitions first, then documents in pages,
-//! then the sender's coverage. The receiver is caught up when it has all three.
+//! instead of history: the sender's collection tombstones first, then the
+//! collection definitions, then documents in pages, then the sender's coverage.
+//! The receiver is caught up when it has all of them.
+//!
+//! The tombstones come first and that order is load-bearing — a page carrying
+//! both a drop and the definition of the life that replaced it must bury before
+//! it creates, or the definition is a no-op against the name still standing and
+//! the drop then takes it (ADR-162).
 //!
 //! # Why documents arrive as oplog entries
 //!
@@ -241,8 +247,9 @@ pub struct SnapshotPage {
     /// can land between two pages of a repair that runs for minutes, and a
     /// resumed page that could not carry it left the receiver holding a
     /// partial copy of the dropped incarnation and calling the pull complete.
-    /// Absent from a whole-database snapshot, which carries no drops at all —
-    /// a separate gap, tracked separately, and not one this field closes.
+    /// A whole-database snapshot carries its drops in `dropped_collections`
+    /// instead: this field names one collection, and that route has to deny
+    /// many.
     ///
     /// Optional on the wire, because a sender that predates the field never
     /// writes it (ADR-152). Nothing about the field changed to carry it on
@@ -252,6 +259,30 @@ pub struct SnapshotPage {
     /// never was on the page being the first.
     #[serde(default)]
     pub dropped: Option<Stamp>,
+    /// For a whole-database snapshot: every collection tombstone the sender
+    /// holds, so the page conveys **absence** and not only presence.
+    ///
+    /// `collections` says what the sender still has. Nothing on the page used
+    /// to say what it had and deleted, so a collection the receiver held and
+    /// the sender had dropped survived the snapshot — and, because completing
+    /// one grants the receiver coverage of the sender's history, the
+    /// `DropCollection` entry was never served to it afterwards either. The
+    /// collection stayed live, served and writable, on one member only, with
+    /// nothing reporting the disagreement. See ADR-162.
+    ///
+    /// On **every** page, not the first alone, for the reason ADR-152 found
+    /// for the scoped route: a drop can land between two pages of a snapshot
+    /// that runs for minutes, and a page that could not carry it would leave
+    /// the receiver holding a collection the sender deleted while the transfer
+    /// was in flight. The list is bounded by `tombstone_retention_secs`, which
+    /// is what makes re-sending it affordable.
+    ///
+    /// Defaulted on the wire, so a sender that predates the field writes
+    /// nothing and a receiver that predates it ignores what it cannot read —
+    /// no negotiation, and a mixed-version cluster simply keeps the old
+    /// behaviour until both ends have rolled.
+    #[serde(default)]
+    pub dropped_collections: Vec<(CollectionId, Stamp)>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -399,9 +430,15 @@ impl Engine {
             None if after.is_none() => (self.collection_states()?, None),
             None => (Vec::new(), None),
         };
+        // What the sender has DELETED, for the whole-database route only: the
+        // scoped route names its one collection in `dropped` above. On every
+        // page, so a drop that lands mid-transfer is carried (ADR-152's lesson,
+        // ADR-162's application of it).
+        let dropped_collections =
+            if scope.is_none() { self.collections_dropped()? } else { Vec::new() };
 
         let (documents, next) = self.snapshot_documents(after, scope)?;
-        Ok(SnapshotPage { collections, documents, next, versions, dropped })
+        Ok(SnapshotPage { collections, documents, next, versions, dropped, dropped_collections })
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
@@ -522,12 +559,43 @@ impl Engine {
         // Definitions first, through the DDL path with transactions of its
         // own — the reason a replicated run ends at a schema change
         // (ADR-119) — so every document below has a collection to land in.
+        // DENIALS FIRST, THEN DEFINITIONS. The order is load-bearing and the
+        // reverse loses data.
+        //
+        // A collection the sender dropped and recreated arrives on the page as
+        // a definition of the NEW life and a tombstone for the OLD one. If the
+        // receiver holds the old life and definitions are restored first,
+        // `restore_collection` sees the name already present and does nothing
+        // -- it does not compare incarnations, which is ADR-155's second
+        // residual -- and the tombstone then drops the life it found. The
+        // receiver ends with NO collection at all, and on a completed
+        // whole-database snapshot that is permanent, because the coverage
+        // grant means the `CreateCollection` entry is never served to it
+        // either.
+        //
+        // Applied first, the tombstone takes the old life, `restore_collection`
+        // then finds the name absent, checks the tombstone it has just written
+        // -- the new life's `created` is above it -- and creates the new life.
+        //
+        // The reverse order is safe in the other direction too: a receiver
+        // holding a life NEWER than the tombstone keeps it, because
+        // `aims_at_a_previous_incarnation` judges the tombstone against what
+        // stands here whenever it runs.
+        if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
+            self.restore_collection_drop(id, dropped)?;
+        }
+        // The whole-database route's own denials, through the same predicate
+        // the scoped one uses -- `restore_collection_drop` asks
+        // `aims_at_a_previous_incarnation`, so a tombstone below the
+        // incarnation standing here is ignored and one aimed at it takes it.
+        if progress.scope.is_none() {
+            for (id, dropped) in &page.dropped_collections {
+                self.restore_collection_drop(*id, *dropped)?;
+            }
+        }
         let mut ddl_refused = 0usize;
         for state in &page.collections {
             ddl_refused += self.restore_collection(state)?;
-        }
-        if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
-            self.restore_collection_drop(id, dropped)?;
         }
 
         // The coverage a whole-database snapshot grants is the first page's
@@ -709,8 +777,10 @@ impl Engine {
         }
     }
 
-    /// Record the sender's drop of the one collection a scoped snapshot is
-    /// of, so the entries this node was stopped at for it become history
+    /// Apply a drop the sender carried: the one collection a scoped snapshot
+    /// is of (`page.dropped`), or one of the tombstones a whole-database page
+    /// carries (`page.dropped_collections`, ADR-162). In both cases so that
+    /// the entries this node was stopped at for it become history
     /// (ADR-148's tombstone rule) rather than a stop that repeats for the
     /// life of the process — and, when this node still holds the very
     /// incarnation that was dropped, apply the drop here as well.
@@ -747,11 +817,16 @@ impl Engine {
             );
             self.drop_collection_inner(&current.db, &current.name, Some(dropped))?;
         } else {
-            warn!(
+            // `debug`, not `warn`. On the scoped route this is one line for the
+            // one collection the pull is about. On the whole-database route
+            // (ADR-162) it is the ORDINARY case for most of the sender's
+            // tombstones -- the receiver never held those collections -- and
+            // the list replays on every page, so at `warn` a single catch-up
+            // writes hundreds of thousands of lines saying nothing happened.
+            debug!(
                 collection = %id,
                 stamp = ?dropped,
-                "the peer has dropped the collection this snapshot was to repair; its tombstone is \
-                 recorded here so the entries addressed to it are history"
+                "recording a peer's collection tombstone; entries addressed to it are history"
             );
         }
         // Recorded on both paths that reach here, and after the drop rather
@@ -1399,9 +1474,16 @@ mod tests {
         assert_eq!(history.superseded, 1, "{history:?}");
         assert!(b.get_collection("shop", "orders").is_err(), "and nothing was resurrected");
 
-        // A whole-database snapshot never carries a drop: its receiver
-        // never had the collection.
-        assert_eq!(a.snapshot_page(None, None).unwrap().dropped, None);
+        // The whole-database route names no single collection in `dropped` --
+        // that field is the scoped route's -- but it does deny, in
+        // `dropped_collections`, and that is ADR-162.
+        let whole = a.snapshot_page(None, None).unwrap();
+        assert_eq!(whole.dropped, None);
+        assert!(
+            whole.dropped_collections.iter().any(|(id, _)| *id == ca.id),
+            "a whole-database page must carry the sender's tombstones: {:?}",
+            whole.dropped_collections
+        );
     }
 
     /// A moment, so an engine's clock separates what happens on either side
@@ -1748,12 +1830,21 @@ mod tests {
         );
         assert_eq!(b.version_vector().unwrap().get(b.node_id()), b_own, "no entry of its own");
 
-        // The whole-database route is untouched: it carries no drop on any
-        // page, which is a separate gap and not this one. Asked with the
-        // first page's cursor rather than `progress.after()`, which is `None`
-        // by now — the resumed arm is the one this could regress, and a first
-        // page is already pinned elsewhere in this file.
-        assert_eq!(a.snapshot_page(first.next.clone(), None).unwrap().dropped, None);
+        // The whole-database route names nothing in `dropped` on any page --
+        // that field is the scoped route's -- and carries its denials in
+        // `dropped_collections` on every page, resumed ones included
+        // (ADR-162). Asked with the first page's cursor rather than
+        // `progress.after()`, which is `None` by now: the resumed arm is the
+        // one this could regress, and a first page is pinned elsewhere in this
+        // file.
+        let resumed = a.snapshot_page(first.next.clone(), None).unwrap();
+        assert_eq!(resumed.dropped, None);
+        assert!(
+            resumed.dropped_collections.iter().any(|(id, _)| *id == ca.id),
+            "a resumed whole-database page must deny too, or a drop that lands \
+             mid-transfer is lost: {:?}",
+            resumed.dropped_collections
+        );
     }
 
     /// A tombstone alone cannot stand for "the collection is gone": a
@@ -1847,6 +1938,7 @@ mod tests {
             next: None,
             versions: VersionVector::new(),
             dropped: Some(dropped),
+            dropped_collections: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -1897,6 +1989,7 @@ mod tests {
             next: None,
             versions: VersionVector::new(),
             dropped: None,
+            dropped_collections: Vec::new(),
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -2365,6 +2458,7 @@ mod tests {
             next: None,
             versions: VersionVector::new(),
             dropped: None,
+            dropped_collections: Vec::new(),
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -2483,6 +2577,211 @@ mod tests {
             b.snapshots_to_resume().unwrap(),
             after_first,
             "a page that wrote nothing must leave the record where it was"
+        );
+    }
+
+    #[test]
+    fn a_whole_database_snapshot_takes_a_collection_the_sender_dropped() {
+        // The defect ADR-162 closes, and the only open High of the 0.28.0
+        // batch. A whole-database page said what the sender HAS and nothing
+        // about what it deleted, so a collection the receiver held and the
+        // sender had dropped survived the transfer -- and because completing
+        // one grants the receiver coverage of the sender's history, the
+        // `DropCollection` entry was never served to it afterwards either. The
+        // collection stayed live, served and writable, on one member only.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+
+        // The receiver takes the collection from the sender first, so it holds
+        // the same incarnation the sender is about to drop -- which is the
+        // state a real member is in, and the one a tombstone has to be judged
+        // against.
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "orders").is_ok(), "the fixture must start with it held");
+
+        // The sender drops it, then the receiver pulls again -- the case a
+        // member below a peer's retention horizon is in.
+        a.drop_collection("shop", "orders").unwrap();
+        transfer(&b, &a);
+
+        assert!(
+            b.get_collection("shop", "orders").is_err(),
+            "a whole-database snapshot must deny what the sender deleted, not only \
+             affirm what it kept"
+        );
+    }
+
+    #[test]
+    fn a_whole_database_snapshot_does_not_destroy_a_newer_incarnation() {
+        // The other half, and the reason the denials go through
+        // `restore_collection_drop` rather than being applied as they arrive:
+        // a tombstone alone cannot stand for "the collection is gone". A
+        // collection recreated after a drop keeps the tombstone that floored
+        // it, and a receiver holding the NEWER life must not be told to
+        // destroy it by a sender still carrying the older one's headstone.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        // Recreated on the sender: it now holds both a live incarnation and
+        // the tombstone of the life before it.
+        let again = a.create_collection("shop", "orders").unwrap();
+        a.insert(&again, doc! { "_id": 2 }).unwrap();
+        // And the RECEIVER already holds that same newer life, which is the
+        // state this test is named for. Taking it from the sender first is the
+        // only way to hold it: an empty receiver would gain the collection
+        // from the page under test, and `restore_collection` would take the
+        // create path -- which is a different case, and the one this fixture
+        // used to exercise while claiming to exercise this one.
+        transfer(&b, &a);
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().created,
+            again.created,
+            "the fixture must start with the receiver holding the newer life"
+        );
+        assert!(
+            a.collections_dropped().unwrap().iter().any(|(id, _)| *id == again.id),
+            "the fixture must leave the sender holding the older life's tombstone"
+        );
+
+        transfer(&b, &a);
+
+        assert!(
+            b.get_collection("shop", "orders").is_ok(),
+            "the drop is aimed at a life that has already ended and must be ignored"
+        );
+        assert!(
+            b.get(&b.get_collection("shop", "orders").unwrap(), &DocId::Int64(2))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_page_that_predates_the_field_denies_nothing_and_breaks_nothing() {
+        // Wire compatibility, asserted rather than assumed: the field is
+        // defaulted, so a page from a sender that predates it deserialises
+        // with an empty list and the receiver keeps what it holds -- the old
+        // behaviour, which is what a mixed-version cluster must see until both
+        // ends have rolled.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "orders").is_ok());
+        a.drop_collection("shop", "orders").unwrap();
+
+        let mut progress = SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let mut page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            // What an older sender puts on the wire.
+            page.dropped_collections.clear();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+
+        assert!(
+            b.get_collection("shop", "orders").is_ok(),
+            "an older sender denies nothing, so the receiver keeps what it has"
+        );
+    }
+
+    #[test]
+    fn a_receiver_holding_the_previous_life_gets_the_one_the_sender_recreated() {
+        // The case the order of denials and definitions decides, and the one
+        // that makes them inseparable.
+        //
+        // The sender dropped and recreated the collection, so its page carries
+        // a definition of the NEW life and a tombstone for the OLD one. The
+        // receiver holds the old life. Restore definitions first and
+        // `restore_collection` finds the name present and does nothing -- it
+        // does not compare incarnations, which is ADR-155's second residual --
+        // and the tombstone then takes the life it found: the receiver ends
+        // with NO collection, permanently, because a completed whole-database
+        // snapshot grants coverage and the `CreateCollection` entry is never
+        // served to it either.
+        //
+        // Denials first, and it converges: the old life goes, the name is then
+        // absent, and the new life is created above the tombstone just written.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        let life1 = b.get_collection("shop", "orders").unwrap().created;
+
+        a.drop_collection("shop", "orders").unwrap();
+        let life2 = a.create_collection("shop", "orders").unwrap();
+        a.insert(&life2, doc! { "_id": 2 }).unwrap();
+        assert_ne!(life1, life2.created, "the fixture must be two distinct lives");
+
+        transfer(&b, &a);
+
+        let held = b
+            .get_collection("shop", "orders")
+            .expect("the receiver must end holding the recreated collection, not nothing");
+        assert_eq!(held.created, life2.created, "and it must be the life the sender has");
+        assert!(
+            b.get(&held, &DocId::Int64(1)).unwrap().is_none(),
+            "the previous life's document stays buried"
+        );
+        assert!(
+            b.get(&held, &DocId::Int64(2)).unwrap().is_some(),
+            "and the new life's document lands"
+        );
+    }
+
+    #[test]
+    fn a_scoped_page_carries_no_whole_database_tombstone_list() {
+        // The sender-side gate. A scoped pull is about one collection and says
+        // so in `dropped`; carrying the sender's whole tombstone table would
+        // hand a repair authority over collections it was never asked about.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        a.insert(&other, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "other").unwrap();
+        assert!(!a.collections_dropped().unwrap().is_empty(), "the sender must hold one to leak");
+
+        let scoped = a.snapshot_page(None, Some(ca.id)).unwrap();
+        assert!(
+            scoped.dropped_collections.is_empty(),
+            "a scoped page must deny nothing beyond its own collection: {:?}",
+            scoped.dropped_collections
+        );
+    }
+
+    #[test]
+    fn a_scoped_pull_ignores_a_tombstone_list_it_is_handed() {
+        // The receiver-side gate, which is the half that matters: the sender
+        // is not the only thing that can put a list on a page. A hostile or
+        // buggy peer must not be able to make a repair drop collections the
+        // pull was never about.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+
+        let victim = b.get_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        // A denial of the very collection the receiver holds, at a stamp above
+        // its incarnation -- which on the whole-database route would take it.
+        page.dropped_collections =
+            vec![(victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()))];
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
+            .unwrap();
+
+        assert!(
+            b.get_collection("shop", "orders").is_ok(),
+            "a scoped pull must ignore a tombstone list, whoever put it on the page"
         );
     }
 
