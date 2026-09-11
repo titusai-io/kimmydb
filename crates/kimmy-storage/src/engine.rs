@@ -1291,49 +1291,107 @@ impl Engine {
     /// `peer` is a key and nothing else here: the bytes are written and read
     /// back and never interpreted, the same way `OPLOG_VERSIONS` is keyed by a
     /// node id. What a peer *is* stays in the cluster layer.
+    /// A scoped pull does not displace a whole-database one, and neither
+    /// displaces a row belonging to the other's scope on the way out — see
+    /// [`Self::stored_snapshot_scope`] for why the row is one per peer and
+    /// what decides which pull owns it.
     pub(crate) fn persist_snapshot_progress_in_txn(
         txn: &redb::WriteTransaction,
         peer: NodeId,
         progress: &crate::snapshot::SnapshotProgress,
     ) -> Result<()> {
+        let mut table = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
+        if progress.scope().is_some() && Self::stored_snapshot_scope(&table, peer)? == Some(None) {
+            // A repair of one collection does not cost a whole-database pull
+            // its place. Both are in flight against this peer, the row holds
+            // one, and the one worth thousands of pages outranks the one worth
+            // a few.
+            return Ok(());
+        }
         let encoded = serde_json::to_vec(progress)?;
-        txn.open_table(tables::SNAPSHOT_PROGRESS)?
-            .insert(peer.to_bytes().as_slice(), encoded.as_slice())?;
+        table.insert(peer.to_bytes().as_slice(), encoded.as_slice())?;
         Ok(())
     }
 
-    /// Forget the snapshot pull with `peer`. -> whether there was one.
+    /// The scope of the pull recorded for `peer`: `None` for no row at all,
+    /// `Some(None)` for a whole-database pull, `Some(Some(id))` for a repair
+    /// of one collection.
+    ///
+    /// # Why the row is one per peer
+    ///
+    /// Because the thing that reads it is: `PeerStalls` holds one
+    /// `SnapshotProgress` per peer and `resume_snapshots` inserts by peer, so
+    /// a second row for the same peer could only be resolved arbitrarily.
+    /// The persisted row mirrors that model rather than inventing a second
+    /// one.
+    ///
+    /// What it must not do is let either pull silently take the other's place.
+    /// The in-memory half already knew this — `PeerStalls::snapshot_forgotten`
+    /// removes a pull only when the scope matches — and the persisted half did
+    /// not, so a scoped repair completing against a peer cleared a
+    /// whole-database pull's cursor and the next start began again at page
+    /// one. ADR-165.
+    ///
+    /// An undecodable row reads as no row, so it is overwritten and removed
+    /// freely: it is a resume hint, the worst a lost one costs is a snapshot
+    /// that starts again, and `snapshots_to_resume` already drops what it
+    /// cannot read.
+    fn stored_snapshot_scope(
+        table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+        peer: NodeId,
+    ) -> Result<Option<Option<CollectionId>>> {
+        let Some(raw) = table.get(peer.to_bytes().as_slice())? else { return Ok(None) };
+        let stored: std::result::Result<crate::snapshot::SnapshotProgress, _> =
+            serde_json::from_slice(raw.value());
+        Ok(stored.ok().map(|progress| progress.scope()))
+    }
+
+    /// Forget the snapshot pull with `peer` **scoped to `scope`**. -> whether
+    /// there was one to forget.
     ///
     /// The answer is what tells the caller whether anything was written, which
     /// is what decides whether the transaction commits at all -- a completed
     /// snapshot that never persisted a cursor must not cost an fsync to clear
-    /// a row that is not there.
+    /// a row that is not there. A row belonging to a pull of a different scope
+    /// is not one to forget, and reads the same way: nothing written.
     pub(crate) fn forget_snapshot_progress_in_txn(
         txn: &redb::WriteTransaction,
         peer: NodeId,
+        scope: Option<CollectionId>,
     ) -> Result<bool> {
-        let existed = txn
-            .open_table(tables::SNAPSHOT_PROGRESS)?
-            .remove(peer.to_bytes().as_slice())?
-            .is_some();
-        Ok(existed)
+        let mut table = txn.open_table(tables::SNAPSHOT_PROGRESS)?;
+        match Self::stored_snapshot_scope(&table, peer)? {
+            // No row, or one this pull does not own.
+            None => return Ok(false),
+            Some(stored) if stored != scope => return Ok(false),
+            Some(_) => {}
+        }
+        Ok(table.remove(peer.to_bytes().as_slice())?.is_some())
     }
 
-    /// Whether a snapshot pull with `peer` is recorded, without opening a
-    /// write transaction. Used to decide whether clearing one is worth a
-    /// transaction of its own.
-    pub(crate) fn snapshot_progress_recorded(&self, peer: NodeId) -> Result<bool> {
+    /// Whether a snapshot pull with `peer` scoped to `scope` is recorded,
+    /// without opening a write transaction. Used to decide whether clearing
+    /// one is worth a transaction of its own.
+    pub(crate) fn snapshot_progress_recorded(
+        &self,
+        peer: NodeId,
+        scope: Option<CollectionId>,
+    ) -> Result<bool> {
         let txn = self.db.begin_read()?;
         let Ok(table) = txn.open_table(tables::SNAPSHOT_PROGRESS) else { return Ok(false) };
-        Ok(table.get(peer.to_bytes().as_slice())?.is_some())
+        Ok(Self::stored_snapshot_scope(&table, peer)? == Some(scope))
     }
 
-    /// Clear a recorded snapshot pull with `peer`, in a transaction of its
-    /// own. Only for the one case that has no page transaction to ride in: a
-    /// final page that wrote nothing.
-    pub(crate) fn forget_snapshot_progress(&self, peer: NodeId) -> Result<()> {
+    /// Clear a recorded snapshot pull with `peer` scoped to `scope`, in a
+    /// transaction of its own. Only for the one case that has no page
+    /// transaction to ride in: a final page that wrote nothing.
+    pub(crate) fn forget_snapshot_progress(
+        &self,
+        peer: NodeId,
+        scope: Option<CollectionId>,
+    ) -> Result<()> {
         let txn = self.begin_write(WriterHolder::Repair)?;
-        let existed = Self::forget_snapshot_progress_in_txn(&txn, peer)?;
+        let existed = Self::forget_snapshot_progress_in_txn(&txn, peer, scope)?;
         if existed {
             txn.commit()?;
         } else {

@@ -61,6 +61,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   The effect fell on the node least able to take it, since a node taking a
   whole-database snapshot is the one that had fallen behind.
 
+- **A repair of one collection threw away a whole-database snapshot's resume
+  point.** Where a snapshot pull stands is now persisted so a restart resumes
+  it, but the record was keyed by peer while the pull it belonged to was only
+  named inside it. A scoped repair finishing against the same peer cleared the
+  row, and a catch-up thousands of pages in began again at page one. The pairing
+  is the common one, not a corner: a node far enough behind to need a snapshot
+  is the node whose divergence check is firing repairs at that same peer. A pull
+  now clears only a record of its own, and a repair does not take a
+  whole-database pull's place (ADR-165). Bookkeeping only — the pages already
+  applied stayed applied.
+
 - **The backup route's own documentation said it streams. It does not.**
   `openapi.yaml` summarised `GET /v1/admin/backup` as *"Stream a consistent
   backup"*, while the route builds the whole backup in a `Vec<u8>` before
