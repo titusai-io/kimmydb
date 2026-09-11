@@ -34,6 +34,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A whole-database snapshot page could destroy a collection on the receiver
+  that its sender had never dropped — permanently.** A page carries the
+  sender's collection tombstones so it can convey absence, and the receiver
+  applied each one after a single check: is this stamp below the incarnation
+  standing here. A stamp far enough in the future is below nothing, so one
+  malformed entry took an arbitrary collection — including one the sender held
+  live on the same page, or one it had never heard of. Nothing reported it, no
+  stamp the cluster can mint recreated the name afterwards, the tombstone was
+  never collected, and the victim re-broadcast it on every page it served.
+
+  A receiver now honours a denial only where the sender's own advertised
+  coverage names its stamp — a legitimate tombstone always is, because the
+  sender absorbed the drop in position — and logs and ignores the rest
+  (ADR-163). **This needs no misbehaving peer:** the clock has no drift clamp,
+  so a node with a misconfigured wall clock mints such stamps through ordinary
+  code and pulls the peers it talks to up to them. The feature is new in this
+  release and unreleased, so no deployed cluster was exposed.
+
 - **The backup route's own documentation said it streams. It does not.**
   `openapi.yaml` summarised `GET /v1/admin/backup` as *"Stream a consistent
   backup"*, while the route builds the whole backup in a `Vec<u8>` before
