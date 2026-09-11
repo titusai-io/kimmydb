@@ -32,6 +32,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   in a field you filter on numerically; `$type: "decimal"` and `$exists` still
   find the ones you have.
 
+- **A snapshot does not carry document deletions, and that is now recorded as a
+  known defect.** A node caught up by snapshot keeps any document it held that
+  the sender had since deleted — the page carries live documents only, and
+  completing the snapshot grants coverage of the sender's history, so the
+  deletion is never replayed to it afterwards. Nothing changes in this release
+  except that it is written down, in ADR-162's residual, along with why the
+  divergence check can still see it: the document counts disagree. Two comments
+  in the source claimed the opposite — that deletions travel, and that skipping
+  them is safe — and have been corrected (ADR-166).
+
 ### Fixed
 
 - **A whole-database snapshot page could destroy a collection on the receiver
