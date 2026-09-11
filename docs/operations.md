@@ -1209,6 +1209,19 @@ and writers are neither blocked nor affected. The response is buffered before
 sending rather than streamed as it is produced, so a slow client cannot pin
 redb's pages by reading slowly.
 
+**That buffering is what decides the memory cost, so size for it.** Peak
+resident memory on the member is the size of the finished backup on top of
+everything else it is holding, and the request is what fails if that does not
+fit. Round 0270 measured a backup taking **97% of a member's 2 GiB limit**.
+Take one against a member you can afford to lose for the duration, watch
+`kimmy_process_resident_peak_bytes` on it rather than the sampled resident
+figure — the peak is latched and a five-second sampler will miss the spike — and
+give the container headroom above the backup you expect.
+
+`docs/openapi.yaml` summarised this route as *"Stream a consistent backup"*
+until 0.28.0, which said the opposite of what it does on precisely the property
+that determines whether the memory cost is bounded.
+
 > **Still do not copy `kimmy.redb` from a running node.** redb is rewriting
 > pages underneath the copy, and the result is not a state the database was ever
 > in. The endpoint above exists so you do not have to.
