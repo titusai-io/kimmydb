@@ -281,6 +281,11 @@ pub struct SnapshotPage {
     /// nothing and a receiver that predates it ignores what it cannot read —
     /// no negotiation, and a mixed-version cluster simply keeps the old
     /// behaviour until both ends have rolled.
+    ///
+    /// **A receiver honours an entry only where `versions` covers its stamp**
+    /// — a peer may only deny what its own coverage names (ADR-163). Both
+    /// halves of a pair come off the wire here, so without that gate one
+    /// malformed entry destroys an arbitrary collection unrecoverably.
     #[serde(default)]
     pub dropped_collections: Vec<(CollectionId, Stamp)>,
 }
@@ -588,8 +593,24 @@ impl Engine {
         // the scoped one uses -- `restore_collection_drop` asks
         // `aims_at_a_previous_incarnation`, so a tombstone below the
         // incarnation standing here is ignored and one aimed at it takes it.
+        //
+        // Each is first held to what the sender's own coverage names (ADR-163).
+        // The scoped route above cannot deny anything the pull was not about,
+        // because it takes the id from `progress.scope` and never from the
+        // page; this route takes both the id and the stamp from the wire, so
+        // without a gate an arbitrary pair destroys an arbitrary collection.
         if progress.scope.is_none() {
             for (id, dropped) in &page.dropped_collections {
+                if dropped.hlc > page.versions.get(dropped.node) {
+                    warn!(
+                        collection = %id,
+                        stamp = ?dropped,
+                        covered_to = ?page.versions.get(dropped.node),
+                        "a whole-database page denied a collection with a stamp its sender's own \
+                         coverage does not name; ignored"
+                    );
+                    continue;
+                }
                 self.restore_collection_drop(*id, *dropped)?;
             }
         }
@@ -2782,6 +2803,153 @@ mod tests {
         assert!(
             b.get_collection("shop", "orders").is_ok(),
             "a scoped pull must ignore a tombstone list, whoever put it on the page"
+        );
+    }
+
+    #[test]
+    fn a_whole_database_page_ignores_a_denial_its_senders_coverage_does_not_name() {
+        // The same gate as the scoped route above, on the route that has
+        // something far worse to lose. `a_scoped_pull_ignores_a_tombstone_list`
+        // states the reason -- the sender is not the only thing that can put a
+        // list on a page -- and the scoped route earns it structurally, by
+        // taking the id from `progress.scope`. This route takes the id AND the
+        // stamp from the wire, so the only thing standing between an arbitrary
+        // pair and a purge is what the sender's own coverage vouches for.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        // A collection the sender has never heard of, so the page cannot be
+        // read as a legitimate denial of anything it knows.
+        let local = b.create_collection("shop", "local-only").unwrap();
+        b.insert(&local, doc! { "_id": 1 }).unwrap();
+
+        let victim = b.get_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        assert!(
+            page.collections
+                .iter()
+                .any(|state| CollectionId::derive(&state.db, &state.name) == victim.id),
+            "the fixture must deny a collection the same page defines, which is the case that \
+             shows the denial is not a stale echo of something the sender dropped"
+        );
+        page.dropped_collections = vec![
+            (victim.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
+            (local.id, Stamp::new(Hlc::new(u64::MAX, 0), a.node_id())),
+        ];
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        assert!(
+            b.get_collection("shop", "orders").is_ok(),
+            "a denial above the sender's own coverage must not take a collection"
+        );
+        assert!(
+            b.get_collection("shop", "local-only").is_ok(),
+            "least of all one the sender has never held"
+        );
+        // The half that makes it unrecoverable rather than merely wrong: at
+        // `Hlc::MAX` no stamp the cluster can ever mint clears the tombstone,
+        // and `gc` expires on `stamp.hlc < cutoff`, so it is never collected
+        // either. Recording one would be permanent.
+        assert!(
+            b.collections_dropped().unwrap().is_empty(),
+            "and it must not be recorded, or it outlives every recovery and rides every page \
+             this node serves afterwards: {:?}",
+            b.collections_dropped().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_denial_the_senders_coverage_names_is_still_honoured() {
+        // The gate must discriminate. A test that only proves denials are
+        // refused is equally passed by refusing all of them -- which would
+        // reinstate the defect ADR-162 exists to close, quietly.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let doomed = a.create_collection("shop", "doomed").unwrap();
+        a.insert(&doomed, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "doomed").is_ok(), "the receiver must hold it to lose it");
+
+        a.drop_collection("shop", "doomed").unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let (_, stamp) = page.dropped_collections[0];
+        assert!(
+            stamp.hlc <= page.versions.get(stamp.node),
+            "a sender's own drop is absorbed in position, so its coverage names it: {stamp:?} vs \
+             {:?}",
+            page.versions.get(stamp.node)
+        );
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        assert!(
+            b.get_collection("shop", "doomed").is_err(),
+            "a denial within the sender's coverage still takes the collection"
+        );
+    }
+
+    #[test]
+    fn a_denial_the_gate_refuses_is_still_delivered_by_the_entries_path() {
+        // Why the gate can be this strict without reopening ADR-162's hole.
+        //
+        // A node relaying a snapshot mid-pull holds tombstones it has not yet
+        // absorbed coverage for, so its own page carries denials its `versions`
+        // does not name and the gate refuses them. That is not a lost drop:
+        // what made ADR-162's defect permanent was the COVERAGE GRANT, and a
+        // sender that does not cover the drop does not grant coverage of it
+        // either. The receiver stays behind on that stamp, so the
+        // `DropCollection` entry is still owed to it -- and arrives the
+        // ordinary way.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+
+        let doomed = a.create_collection("shop", "doomed").unwrap();
+        a.insert(&doomed, doc! { "_id": 1 }).unwrap();
+        transfer(&c, &a);
+        assert!(c.get_collection("shop", "doomed").is_ok(), "the victim must hold it to lose it");
+        a.drop_collection("shop", "doomed").unwrap();
+
+        // B takes a snapshot from A and stops part-way, so it holds A's
+        // tombstone with none of A's coverage. More than one page is what
+        // makes the stop real: a single-page snapshot completes and grants.
+        let keep = a.create_collection("shop", "keep").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 5) as i64 {
+            a.insert(&keep, doc! { "_id": i }).unwrap();
+        }
+        let mut partial = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut partial, &first).unwrap();
+        assert!(!partial.is_complete(), "the relay must be mid-pull, or it has absorbed the grant");
+
+        let relayed = b.snapshot_page(None, None).unwrap();
+        let (_, stamp) = relayed.dropped_collections[0];
+        assert!(
+            stamp.hlc > relayed.versions.get(stamp.node),
+            "the fixture must produce the refused case, or it proves nothing"
+        );
+
+        c.apply_snapshot_page(b.node_id(), &mut SnapshotProgress::whole_database(), &relayed)
+            .unwrap();
+        assert!(
+            c.get_collection("shop", "doomed").is_ok(),
+            "the gate refused the denial, as the fixture arranged"
+        );
+
+        // And now the entries path, which is what the gate is leaning on.
+        let mine = c.version_vector().unwrap();
+        let theirs = a.version_vector().unwrap();
+        let start = mine.behind(&theirs).expect("the refused drop must still be owed to C");
+        let entries = a.entries_for_peer(start, usize::MAX).unwrap().entries;
+        c.apply_batch(&entries).unwrap();
+
+        assert!(
+            c.get_collection("shop", "doomed").is_err(),
+            "a drop the gate refused is still delivered, because refusing it left the receiver \
+             behind on the stamp that carries it"
         );
     }
 

@@ -13781,6 +13781,8 @@ rather than described.
 
 ## ADR-162 — A whole-database snapshot page carries the sender's drops, so it can convey absence
 
+> **Amended by [ADR-163](#adr-163--a-peer-may-only-deny-what-its-own-coverage-names).**
+
 **Decision.** Every page of a whole-database snapshot carries
 `dropped_collections` — every collection tombstone the sender holds — and the
 receiver applies each through `restore_collection_drop`, the same predicate the
@@ -13941,3 +13943,95 @@ it — and `a_scoped_page_carries_no_whole_database_tombstone_list` with
 gates from both ends. The second of those is the one that matters: the sender is
 not the only thing that can put a list on a page, and a repair must not be made
 to drop collections it was never asked about.
+
+---
+
+## ADR-163 — A peer may only deny what its own coverage names
+
+**Decision.** A receiver honours a collection tombstone on a whole-database
+snapshot page only where the page's `versions` — the sender's own advertised
+coverage — names its stamp. A denial above that coverage is logged at `warn`
+and ignored.
+
+**Why.** ADR-162 gave a whole-database page the power to convey absence, which
+is the power to destroy a collection. It did not say what entitles a sender to
+use it.
+
+The scoped route never needed to say, because it cannot misuse the power: it
+takes the collection id from `progress.scope`, the receiver's own pull, and
+never from the page, so a repair structurally cannot drop a collection it was
+not about. ADR-162 reused that route's predicate —
+`aims_at_a_previous_incarnation` — and inherited the *appearance* of its
+safety without the structure underneath it. On the whole-database route both
+halves of the pair come off the wire, and the predicate asks only one question:
+is this stamp below the incarnation standing here. A stamp far enough in the
+future is below nothing.
+
+So one `(CollectionId, Stamp)` on a page destroyed an arbitrary collection on
+the receiver — including one the sender holds live **in `collections` on that
+very page**, and one the sender has never heard of. That is worse than a wrong
+answer in three compounding ways:
+
+- **It is silent.** No count diverges, so the divergence check cannot see it.
+- **It is unrecoverable.** Both creation paths refuse a create with
+  `created <= dropped.hlc`, so at `Hlc::MAX` no stamp the cluster can ever mint
+  brings the name back — and `gc` expires tombstones on `stamp.hlc < cutoff`,
+  so it is never collected either. ADR-162's "bounded by
+  `tombstone_retention_secs`" is a bound only for well-formed stamps.
+- **It spreads.** The tombstone lands in the victim's `COLLECTIONS_DROPPED`,
+  and `collections_dropped()` re-broadcasts it on every whole-database page
+  that node serves afterwards.
+
+**And it does not need a hostile peer**, which is what settles the priority.
+`HlcClock::tick` and `observe` have no drift clamp, so a node with a
+misconfigured wall clock mints far-future stamps through entirely ordinary
+code, and `observe` pulls every peer it talks to up to them. A drop taken on
+such a node is indistinguishable from an attack.
+
+**Why coverage is the right bound, and an exact one.** A sender absorbed the
+`DropCollection` entry in position before it held the tombstone, so a
+legitimate tombstone is at or below what the sender's vector names. The
+invariant is free — `versions` is already on the page for the grant — and it
+is the sender's own claim, not a guess about it.
+
+**Why it is safe to be this strict.** The gate does refuse some legitimate
+tombstones: a node relaying a snapshot while itself mid-pull holds tombstones
+it has not yet absorbed coverage for, and its pages carry denials its
+`versions` does not name. Refusing them does not reopen ADR-162's hole, and
+the reason is the same fact that made that hole permanent. What made a
+surviving collection permanent there was the **coverage grant** — completing a
+whole-database snapshot gave the receiver coverage of the sender's history, so
+the `DropCollection` entry was never served to it afterwards. A sender that
+does not cover the drop does not grant coverage of it either. The receiver
+stays behind on that stamp, the entry is still owed to it, and it arrives the
+ordinary way. The strict gate costs a round of anti-entropy; the loose one
+costs a collection.
+
+This is stated as a principle rather than as a clause of ADR-162 because it is
+not about tombstones. Anything a peer asserts that destroys state on the
+receiver is bounded by what that peer's own coverage vouches for, and the next
+thing we take off the wire should inherit the rule rather than rediscover it.
+
+**Cost.** One `VersionVector::get` per tombstone per page, against a map
+already deserialised for the grant.
+
+**Residual.** The gate bounds *when* a peer may deny, not *what*: a sender may
+still deny a collection within its coverage that it never held, which
+`restore_collection_drop` treats as the ordinary "receiver never held this"
+case and ignores. Bounding that would need the tombstone's origin, which the
+page does not carry.
+
+**Held by** `a_whole_database_page_ignores_a_denial_its_senders_coverage_does_not_name`,
+which is the defect — it denies both a collection the same page defines and one
+the sender has never held, and asserts the tombstone is not *recorded*, since
+recording it is what outlives every recovery. Its control is
+`a_denial_the_senders_coverage_names_is_still_honoured`: a test that only
+proves denials are refused is equally passed by refusing all of them, which
+would reinstate ADR-162's defect quietly. Both were confirmed to discriminate
+by disabling the gate and watching exactly the intended ones fail.
+`a_denial_the_gate_refuses_is_still_delivered_by_the_entries_path` holds the
+paragraph above: it builds the mid-pull relay, asserts the fixture really
+produces the refused case, and then shows the drop arriving through the oplog.
+That argument was reasoned first and the reasoning was checked against a probe
+before it was written down — the mid-pull relay was found by building it, not
+by reading for it.
