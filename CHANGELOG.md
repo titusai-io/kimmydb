@@ -66,6 +66,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `kimmy login` has no `--oidc` flag — it federates by default — so the
   suggested command fails to parse. It now prints `kimmy login --url ...`.
 
+- **`kimmy_sync_ddl_declined_total` rose on a healthy cluster, and its own
+  diagnostic then sent you looking for a problem that was not there.** The
+  counter is read as *"this member is holding an index its peers have dropped"*,
+  and `operations.md` told whoever saw it rise to look for a member whose clock
+  ran ahead. But two different things reached that branch, and only one of them
+  is news: a drop re-served past the recreation it preceded is the rule working
+  correctly, and it was being counted alongside the case worth investigating.
+  Round 0270 reproduced the rise deterministically over three iterations.
+
+  A member that applied a drop when the drop was current holds a tombstone
+  proving it, so the replay is now recognised and **not** counted — it is logged
+  at `debug` instead. What is still counted is a drop the member has never seen,
+  which is the case the diagnostic was written for. **No data outcome changes**:
+  the drop was declined before and is declined now, and the index standing under
+  the name is untouched either way.
+
 - **A collection you dropped no longer survives on a member that catches up
   from far behind.** 0.26.1's release notes recorded one route as not closed:
   a whole-database snapshot — what a member below a peer's retention horizon
