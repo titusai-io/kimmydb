@@ -713,7 +713,7 @@ impl Engine {
             // record goes; whether one was there decides whether that is a
             // write at all.
             if complete {
-                wrote |= Engine::forget_snapshot_progress_in_txn(&txn, peer)?;
+                wrote |= Engine::forget_snapshot_progress_in_txn(&txn, peer, progress.scope)?;
             } else if wrote {
                 Engine::persist_snapshot_progress_in_txn(
                     &txn,
@@ -761,9 +761,9 @@ impl Engine {
         if complete
             && page.documents.is_empty()
             && grant.is_none()
-            && self.snapshot_progress_recorded(peer)?
+            && self.snapshot_progress_recorded(peer, progress.scope)?
         {
-            self.forget_snapshot_progress(peer)?;
+            self.forget_snapshot_progress(peer, progress.scope)?;
         }
         if complete {
             match progress.scope {
@@ -2658,6 +2658,107 @@ mod tests {
         assert!(
             b.snapshots_to_resume().unwrap().is_empty(),
             "a finished snapshot has nothing to resume, and a record of one would restart it"
+        );
+    }
+
+    /// A whole-database pull, one page in and not complete, plus a scoped
+    /// repair against the same peer run to completion. The pairing is not
+    /// contrived: a node below a peer's retention horizon is exactly the node
+    /// whose divergence check is firing repairs at that same peer.
+    fn a_whole_database_pull_and_a_scoped_repair_at_one_peer()
+    -> (Engine, tempfile::TempDir, Engine, tempfile::TempDir, SnapshotProgress) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let big = a.create_collection("shop", "big").unwrap();
+        for i in 0..(SNAPSHOT_PAGE * 2) as i64 {
+            a.insert(&big, doc! { "_id": i }).unwrap();
+        }
+        let mut whole = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut whole, &first).unwrap();
+        assert!(!whole.is_complete(), "the whole-database pull must still be under way");
+        assert_eq!(
+            b.snapshots_to_resume().unwrap().len(),
+            1,
+            "and must have recorded a cursor, or there is nothing for the repair to take"
+        );
+        (a, da, b, db, whole)
+    }
+
+    #[test]
+    fn a_scoped_repair_completing_leaves_a_whole_database_cursor_alone() {
+        // The row is one per peer, because `PeerStalls` holds one pull per
+        // peer and `resume_snapshots` inserts by peer. What it must not do is
+        // let either pull silently take the other's place: the in-memory half
+        // already guarded this -- `snapshot_forgotten` removes a pull only
+        // when the scope matches -- and the persisted half did not.
+        let (a, _da, b, _db, _whole) = a_whole_database_pull_and_a_scoped_repair_at_one_peer();
+
+        let small = a.create_collection("shop", "small").unwrap();
+        a.insert(&small, doc! { "_id": 1 }).unwrap();
+        let mut scoped = SnapshotProgress::of_collection(small.id);
+        while !scoped.is_complete() {
+            let page = a.snapshot_page(scoped.after().cloned(), scoped.scope()).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut scoped, &page).unwrap();
+        }
+
+        let recorded = b.snapshots_to_resume().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "a repair of one collection must not clear a whole-database pull's cursor; the next \
+             start would begin again at page one, which is what ADR-161 exists to prevent"
+        );
+        assert_eq!(
+            recorded[0].1.scope(),
+            None,
+            "and the surviving cursor is the whole-database one"
+        );
+        assert_eq!(recorded[0].1.pages(), 1, "standing where the page left it");
+    }
+
+    #[test]
+    fn a_scoped_repair_does_not_displace_a_whole_database_cursor_by_persisting_over_it() {
+        // The other half. Forgetting is not the only way to take the row: a
+        // scoped repair that does not complete in one page persists a cursor
+        // of its own, and the row holds one.
+        let (a, _da, b, _db, _whole) = a_whole_database_pull_and_a_scoped_repair_at_one_peer();
+
+        let small = a.create_collection("shop", "small").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 5) as i64 {
+            a.insert(&small, doc! { "_id": i }).unwrap();
+        }
+        let mut scoped = SnapshotProgress::of_collection(small.id);
+        let page = a.snapshot_page(None, Some(small.id)).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut scoped, &page).unwrap();
+        assert!(!scoped.is_complete(), "the repair must be mid-pull, or it persists nothing");
+
+        let recorded = b.snapshots_to_resume().unwrap();
+        assert_eq!(recorded.len(), 1, "still one row");
+        assert_eq!(
+            recorded[0].1.scope(),
+            None,
+            "and it is still the whole-database pull's: the one worth thousands of pages \
+             outranks the one worth a few"
+        );
+    }
+
+    #[test]
+    fn a_whole_database_pull_still_clears_its_own_cursor() {
+        // The control. Guarding the row by scope must not stop a pull
+        // clearing what it owns -- a version that never forgot anything would
+        // pass both tests above and leave every completed snapshot behind as a
+        // cursor that resumes forever.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let big = a.create_collection("shop", "big").unwrap();
+        for i in 0..(SNAPSHOT_PAGE * 2) as i64 {
+            a.insert(&big, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(
+            b.snapshots_to_resume().unwrap().is_empty(),
+            "a completed whole-database pull leaves nothing to resume"
         );
     }
 

@@ -13698,6 +13698,9 @@ unaffected: the change is invisible outside this node.
 
 ## ADR-161 — A snapshot pull is recorded where it stands, so a restart resumes it
 
+> **Amended by [ADR-165](#adr-165--a-resume-point-belongs-to-the-pull-that-made-it).**
+
+
 **Decision.** After a snapshot page that wrote something, the receiver records
 where the pull stands in a node-local table keyed by the peer serving it, **in
 that page's own transaction**. A completed pull's record is removed. At startup
@@ -14136,3 +14139,65 @@ constant would have been satisfied by a version that took one writer too many
 for an unrelated reason, and would break whenever something incidental changed.
 Confirmed to discriminate by restoring the per-tombstone call: 6 transactions
 for 4 tombstones against 42 for 40, which is the growth this record removes.
+
+---
+
+## ADR-165 — A resume point belongs to the pull that made it
+
+**Decision.** The persisted snapshot cursor stays one row per peer, and the
+row belongs to a pull: a pull forgets only a row of its own scope, and a
+repair of one collection does not persist over a whole-database pull's row.
+
+**Why.** ADR-161 persists where a snapshot pull stands so a restart resumes
+rather than restarting. It keyed the row by peer — deliberately, and that part
+is right, because the thing that reads it is keyed by peer too: `PeerStalls`
+holds one `SnapshotProgress` per peer, and `resume_snapshots` inserts by peer,
+so a second row for the same peer could only be resolved arbitrarily.
+
+What it did not do is say **which pull owns the row**. The value carries a
+scope; the key does not; and nothing compared them. So
+`forget_snapshot_progress_in_txn(peer)` removed whatever was under that key
+and `persist_snapshot_progress_in_txn(peer, …)` overwrote it, whoever had put
+it there.
+
+The in-memory half already knew this mattered. `PeerStalls::snapshot_forgotten`
+takes a scope and removes a pull **only when it matches**, and
+`PeerStalls::snapshot_progress` resets in-memory progress when the scope
+differs. The persisted half was the same idea without the guard — the second
+time in this area that one of two parallel routes carried a check the other
+did not (ADR-163 was the first, and far more expensive).
+
+Reproduced: a whole-database pull one page in, with its cursor recorded, is
+cleared outright by **an unrelated scoped repair against the same peer**
+completing. The next start begins again at page one — the exact behaviour
+ADR-161 exists to remove.
+
+**And the pairing is not contrived.** A node below a peer's retention horizon
+is precisely the node whose divergence check is firing scoped repairs at that
+same peer. The two pulls that collide here are the two a catching-up node runs
+at once.
+
+**Why a whole-database pull outranks a scoped repair.** The row holds one, so
+something has to. A whole-database pull is worth thousands of pages and is
+served to the member least able to redo them; a scoped repair is one
+collection, and ADR-152 already restarts those freely. Losing the cheap
+cursor costs a repair; losing the expensive one costs a catch-up.
+
+**This is a bookkeeping loss, not a data loss.** The pages a pull applied stay
+applied, and `PeerStalls::snapshot_progress` checks the scope before adopting
+a record, so a row of the wrong scope could never have been *used* as the
+wrong pull's cursor. What was lost was the saving.
+
+**Not a migration.** ADR-161 is unreleased, so no node holds a row, and the
+table is node-local and absent from the backup format in any case.
+
+**Held by** `a_scoped_repair_completing_leaves_a_whole_database_cursor_alone`
+(the defect as reproduced) and
+`a_scoped_repair_does_not_displace_a_whole_database_cursor_by_persisting_over_it`
+(the other way to take the row, which forgetting is not the only one). Each was
+confirmed to fail when its own guard alone is disabled, so they discriminate
+the two halves separately rather than together. Their control is
+`a_whole_database_pull_still_clears_its_own_cursor`: a version that simply
+never forgot anything would pass both of the first two and leave every
+completed snapshot behind as a cursor that resumes forever — it fails, as it
+must, when the guard is widened to refuse every removal.
