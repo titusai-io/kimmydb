@@ -13913,6 +13913,12 @@ they have. A member-at-a-time roll therefore needs no stop and no ordering.
 **Cost, and one thing that had to change to keep it honest.** One read of the
 tombstone table per page and the list on the wire per page.
 
+> **Amended by [ADR-164](#adr-164--a-carried-tombstone-list-is-one-read-and-one-write-not-one-of-each-per-tombstone).**
+> That is the cost on the **sender**. The receiver's was stated here as
+> though it were the same and it was not: applying the list cost a full
+> `COLLECTIONS` walk per tombstone, so a page cost
+> `O(tombstones × collections)`.
+
 Applying a tombstone the receiver already holds must cost **nothing**, and it
 did not before this record: `record_collection_drop` took the single writer and
 committed unconditionally, so replaying the sender's list on every page would
@@ -14035,3 +14041,75 @@ produces the refused case, and then shows the drop arriving through the oplog.
 That argument was reasoned first and the reasoning was checked against a probe
 before it was written down — the mid-pull relay was found by building it, not
 by reading for it.
+
+---
+
+## ADR-164 — A carried tombstone list is one read and one write, not one of each per tombstone
+
+**Decision.** A whole-database snapshot page's `dropped_collections` is applied
+from one walk of `COLLECTIONS` and one read of `COLLECTIONS_DROPPED` taken for
+the whole list, and the tombstones it has to record are written in a single
+transaction. The per-tombstone `restore_collection_drop` remains what the
+scoped route and the replicated `DropCollection` arm use, and is still what a
+carried tombstone falls through to when the receiver holds the collection.
+
+**Why.** ADR-162 stated its cost as *"one read of the tombstone table per page
+and the list on the wire per page."* That is the **sender's** cost. The
+receiver's was never measured, and it was not the same.
+
+`restore_collection_drop` asks `collection_by_id`, which is a full walk of
+`COLLECTIONS` with a `serde_json` deserialise per row — there is no index on
+the id — and `record_collection_drop` opens a second read transaction after it.
+Per tombstone, on every page. So the receiver paid
+`O(tombstones × collections)` per page, plus a write transaction per tombstone
+on the page that first recorded them.
+
+`sync::Memo` looks like the answer and is not: it caches by collection id, and
+a page's tombstones are hundreds of thousands of *distinct* ids, so every
+lookup missed and paid the walk. The memo works for the document loop because
+a page is usually one collection's worth of documents; it cannot work here.
+
+Measured, release build, 600 tombstones against 600 local collections, the same
+page applied twice:
+
+| | Per tombstone | Hoisted |
+|---|---|---|
+| First page, all new | 1.55 s | 27 ms |
+| Replay, nothing to do | 161 ms | 0.5 ms |
+
+161 ms of pure CPU to conclude that a page has nothing to do, and it is
+superlinear: the same replay at 300 tombstones cost 52 ms, so trebling at
+double the size. Extrapolated to a real catch-up — a few thousand tombstones,
+a thousand collections, a couple of thousand pages — it is tens of minutes of
+added single-threaded receiver CPU per snapshot, blocking the sync round.
+
+**On the node least able to absorb it.** A node taking a whole-database
+snapshot is by definition the one that fell below a peer's retention horizon.
+This is also inside a promise already made twice: ADR-152's rule that a page a
+member already holds must not cost an fsync, which ADR-161 restates. We caught
+the **fsync** half of that in review of ADR-162 and fixed it; the CPU half was
+in the same function and nobody measured it.
+
+**Why the prefetched map is safe.** It is used **only to skip**. An id it
+reports live falls through to `restore_collection_drop`, which re-reads
+authoritatively — so a collection created concurrently is raced exactly as
+before, and the expensive branch is unchanged. What the fast path decides is
+that there is *nothing to do*, and that answer cannot go stale underneath the
+loop: nothing in it creates a collection or lowers a tombstone. The batched
+write re-establishes under the writer that each stamp is newer, because the
+map was read outside it — the same thing `record_collection_drop` does for the
+same reason.
+
+**Cost.** One walk and one read per page instead of per tombstone, and one
+commit instead of one per tombstone. The map is a `HashSet` of ids rather than
+of metadata, so it holds a `u64` per collection and not a deserialised
+`CollectionMeta`.
+
+**Held by** `a_carried_tombstone_list_costs_one_writer_and_a_replay_costs_none`,
+which asserts the **shape** rather than a number: it applies the same page at
+four tombstones and at forty and requires the write-transaction count to be
+equal, and requires a replay to add nothing whatever its length. A fixed
+constant would have been satisfied by a version that took one writer too many
+for an unrelated reason, and would break whenever something incidental changed.
+Confirmed to discriminate by restoring the per-tombstone call: 6 transactions
+for 4 tombstones against 42 for 40, which is the growth this record removes.

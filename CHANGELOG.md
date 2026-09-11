@@ -52,6 +52,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   code and pulls the peers it talks to up to them. The feature is new in this
   release and unreleased, so no deployed cluster was exposed.
 
+- **A node catching up by snapshot burned minutes of CPU deciding that pages
+  had nothing to do.** Every page of a whole-database snapshot carries the
+  sender's collection tombstones, and the receiver looked each one up with a
+  full scan of its collection table — once per tombstone, per page. At 600
+  tombstones against 600 collections a page with **nothing to do** cost 161 ms;
+  it is now 0.5 ms, and no longer grows with the product of the two (ADR-164).
+  The effect fell on the node least able to take it, since a node taking a
+  whole-database snapshot is the one that had fallen behind.
+
 - **The backup route's own documentation said it streams. It does not.**
   `openapi.yaml` summarised `GET /v1/admin/backup` as *"Stream a consistent
   backup"*, while the route builds the whole backup in a `Vec<u8>` before
