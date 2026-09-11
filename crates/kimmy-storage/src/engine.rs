@@ -1126,6 +1126,48 @@ impl Engine {
         Ok(())
     }
 
+    /// Record a batch of peers' collection tombstones in one transaction.
+    ///
+    /// The per-tombstone [`Self::record_collection_drop`] is right for the one
+    /// drop a scoped page or a replicated entry carries. A whole-database
+    /// snapshot page carries the sender's whole list (ADR-162), and the first
+    /// page of a catch-up has every one of them to record: taking the writer
+    /// and fsyncing per tombstone makes that hundreds of thousands of commits,
+    /// each one taking the writer away from live traffic.
+    ///
+    /// Callers pass only tombstones they have already established are newer
+    /// than what is held; this re-establishes it under the writer, as the
+    /// single version does, because that check was made outside it.
+    pub(crate) fn record_collection_drops(&self, stamps: &[(CollectionId, Stamp)]) -> Result<()> {
+        if stamps.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        let wrote = {
+            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let mut wrote = false;
+            for (id, stamp) in stamps {
+                let newer = match dropped.get(id.0)? {
+                    Some(existing) => *stamp > codec::decode_oplog_key(existing.value())?,
+                    None => true,
+                };
+                if newer {
+                    dropped.insert(id.0, codec::oplog_key(stamp).as_slice())?;
+                    wrote = true;
+                }
+            }
+            wrote
+        };
+        // Nothing written, nothing committed -- the rule ADR-152 sets and
+        // `record_collection_drop` follows one tombstone at a time.
+        if wrote {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(())
+    }
+
     /// When an index on this collection was dropped, if a tombstone still
     /// records it.
     ///
