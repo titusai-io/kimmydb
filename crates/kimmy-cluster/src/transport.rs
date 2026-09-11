@@ -1337,6 +1337,32 @@ impl PeerStalls {
         Self::default()
     }
 
+    /// Take up the snapshot pulls the engine recorded before this process
+    /// started (ADR-161), so one interrupted by a restart resumes at its last
+    /// recorded page rather than at page one.
+    ///
+    /// Only pulls that are unfinished and have applied a page are taken: a
+    /// completed one has nothing to resume, and one that recorded no page is
+    /// the same as no record at all. `snapshot_progress` already drops a
+    /// resumed pull whose scope is not the one a round wants, so a stale
+    /// record cannot redirect a round -- the worst it costs is being
+    /// discarded.
+    pub fn resume_snapshots(&mut self, recorded: Vec<(NodeId, SnapshotProgress)>) {
+        for (peer, progress) in recorded {
+            if progress.is_complete() || progress.pages() == 0 {
+                continue;
+            }
+            info!(
+                %peer,
+                pages = progress.pages(),
+                documents = progress.documents(),
+                cursor = ?progress.after().map(ToString::to_string),
+                "resuming a snapshot pull this node was part-way through"
+            );
+            self.snapshots.insert(peer, progress);
+        }
+    }
+
     /// A sync tick has begun, so the next pull at each peer opens that
     /// peer's contact for this tick (ADR-157).
     ///
@@ -1764,7 +1790,7 @@ where
         // this is the point a cancelled round resumes from.
         let progress = stalls.snapshot_progress(node, scope);
         let before = progress.pages();
-        let applied = engine.apply_snapshot_page(progress, &page);
+        let applied = engine.apply_snapshot_page(node, progress, &page);
         let advanced = progress.pages() > before;
         let complete = progress.is_complete();
         let (total_pages, total_documents) = (progress.pages(), progress.documents());

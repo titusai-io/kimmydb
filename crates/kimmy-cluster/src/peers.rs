@@ -258,6 +258,17 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
+    // A snapshot this node was part-way through when it stopped resumes where
+    // it left off rather than transferring everything again (ADR-161). Never
+    // fatal: the record is an optimisation, and a node that will not start
+    // because it cannot read one is a worse failure than the transfer it
+    // avoids.
+    match engine.snapshots_to_resume() {
+        Ok(recorded) => stalls.resume_snapshots(recorded),
+        Err(e) => {
+            warn!(error = %e, "could not read the recorded snapshot pulls; any that were in flight start again")
+        }
+    }
     // When the check last ran against anyone, so the report can say how old
     // the tracker's reading is (ADR-145). A tick in which every round fails
     // moves nothing else about the check. The report carries the instant,

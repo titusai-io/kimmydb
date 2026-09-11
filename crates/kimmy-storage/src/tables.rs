@@ -185,6 +185,22 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// exactly the path that matters when the stored vector has been lost.
 pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
 
+/// `peer node id (16 bytes) -> the snapshot pull left to resume with it`.
+///
+/// A snapshot that does not fit one round already resumes across rounds
+/// (ADR-152), but only while the process lives: the progress is held in a map
+/// on the cluster transport and dies with it. A member restarted part-way
+/// through a large snapshot began again at page one, re-transferring
+/// everything it had already applied.
+///
+/// Keyed by the peer serving the snapshot, and **the key is opaque here**:
+/// this module stores the bytes and never asks what they mean. It is the same
+/// shape `OPLOG_VERSIONS` and `OPLOG_WITNESSED` already use -- a node id as a
+/// table key -- so nothing about a peer crosses into storage that was not
+/// already here. See ADR-161.
+pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("snapshot_progress");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";
