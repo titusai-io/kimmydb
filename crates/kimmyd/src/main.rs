@@ -78,7 +78,7 @@ fn main() -> Result<()> {
                 }) {
                     Some((resource, _)) => eprintln!(
                         "this node publishes protected resource metadata for {resource} at \
-                         {path}, so `kimmy login --oidc --url ...` needs no other configuration",
+                         {path}, so `kimmy login --url ...` needs no other configuration",
                         path = kimmy_auth::PROTECTED_RESOURCE_METADATA_PATH
                     ),
                     None => eprintln!(

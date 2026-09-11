@@ -48,6 +48,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   (`kimmy_process_resident_peak_bytes`, which is latched — a five-second sampler
   will miss the spike).
 
+- **`check-config` printed `cluster.cluster_secret` in clear.** Every other
+  secret — `auth.root_password`, `auth.jwt_secret`, `auth.jwt_previous_secret` —
+  was redacted; this one was not, and `check-config` output is meant to be read
+  by a person: in a terminal, in CI output, pasted into a bug report. Anyone who
+  read it could join the cluster as a peer and be served every document in it.
+
+  It is redacted now, **and `<redacted>` is refused as a secret** wherever a
+  placeholder is. That second half is what makes the first safe: pasting
+  `check-config` output back into a config file must fail at startup rather than
+  run the node with the placeholder, and `cluster_secret` has no minimum length
+  to catch it the way `jwt_secret` incidentally did.
+
+- **A node with OIDC configured told operators to run a flag that does not
+  exist.** Starting with protected resource metadata published, `kimmyd`
+  printed that `kimmy login --oidc --url ...` needs no other configuration.
+  `kimmy login` has no `--oidc` flag — it federates by default — so the
+  suggested command fails to parse. It now prints `kimmy login --url ...`.
+
 - **A collection you dropped no longer survives on a member that catches up
   from far behind.** 0.26.1's release notes recorded one route as not closed:
   a whole-database snapshot — what a member below a peer's retention horizon
