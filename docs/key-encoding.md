@@ -160,6 +160,14 @@ numbers ([Query language](query-language.md#3-comparisons-do-not-cross-type-grou
 Storing one, reading it back and finding it by `$type` all work; it is
 comparing that is refused.
 
+**The refusals cover the operand, not the stored value**, and that gap is a
+known defect rather than the contract: a filter whose operand is an ordinary
+number still compares against whatever a document holds, and a stored
+`Decimal128` answers *equal* to all of them — so `$ne` can never exclude such a
+document. See [Query language](query-language.md#3-comparisons-do-not-cross-type-groups)
+for what matches and what does not, measured, and for why not to store one in a
+field you filter on numerically.
+
 Refusing is the honest outcome. An approximate index key is a wrong answer
 waiting to happen.
 
