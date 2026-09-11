@@ -12177,6 +12177,15 @@ reports, as a scrape does.
 > and ADR-158's tests assert each of those under a drop stopped mid-purge
 > rather than after one that finished.
 
+> **First residual closed by [ADR-162](#adr-162--a-whole-database-snapshot-page-carries-the-senders-drops-so-it-can-convey-absence).**
+> The route this record states as unclosed — a whole-database snapshot page
+> setting `dropped` on the scoped arm only, so that "an absence is not a drop"
+> and, on that route, the drop does not arrive at all — now carries every
+> tombstone the sender holds, on every page, applied through this record's own
+> `aims_at_a_previous_incarnation`. **The second residual stands**: a snapshot
+> still does not reconcile a differing incarnation on a collection the receiver
+> already holds.
+
 **Decision.** A collection this node holds a tombstone for is not a divergence
 while the peer's copy is the incarnation that was dropped, and a snapshot never
 recreates, or writes into, an incarnation older than a tombstone this node
@@ -13816,6 +13825,15 @@ flight. The cost of repeating the list is bounded by
 `tombstone_retention_secs`, which collects a tombstone on the same window it
 collects the oplog — so the list is the drops recent enough that a peer might
 still be behind them, not every drop ever made.
+
+**That bound is a time, not a count**, and worth saying so rather than implying
+otherwise: a workload that drops collections faster than retention collects them
+grows the list. The ceiling above it is `MAX_FRAME` at 64 MiB, which a
+`(CollectionId, Stamp)` pair reaches at something over a million tombstones
+inside one retention window — far outside anything this engine is built for, and
+a cluster in that state has a larger problem than a repeated list. It is
+recorded because "bounded" and "small" are different claims and only the first
+is true by construction.
 
 **What this knowingly does not cover.** A collection the sender **never held at
 all** is not denied, because there is nothing to deny it with: no tombstone, no
