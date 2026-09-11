@@ -10,6 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A sync round that ran out of time no longer reports itself as a malformed
+  frame.** Four bounded waits — the handshake (twice), a push, and a whole sync
+  round — mapped a timeout onto `malformed frame: … timed out`, so round 0270
+  logged `malformed frame: sync round timed out`. The two conditions send an
+  operator to opposite places: a malformed frame is a wire problem, meaning
+  peer builds, version skew and capability negotiation, while a timeout means
+  load, a stalled disk, a saturated link or a wedged peer — none of which is
+  visible in a frame. They are now a distinct error, and a timeout says only
+  that it timed out.
+
+  `kimmy_sync_failures_total` counts a failed round whatever the cause, as
+  before; what changes is the line beside it.
+
 ## 0.27.0 - 2026-09-09
 
 ### Added

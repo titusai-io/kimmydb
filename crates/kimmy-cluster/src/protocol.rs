@@ -286,6 +286,19 @@ pub enum ProtocolError {
     Io(#[from] io::Error),
     #[error("malformed frame: {0}")]
     Malformed(String),
+    /// A bounded wait ran out: the handshake, a push, or a whole sync round.
+    ///
+    /// Separate from [`Self::Malformed`] because the two send an operator to
+    /// opposite places. A malformed frame is a WIRE problem — a version skew,
+    /// a capability neither side negotiated, a corrupted or truncated frame —
+    /// and the things to look at are peer builds and the negotiation. A
+    /// timeout says the peer did not answer in time, which is load, a stalled
+    /// disk, a saturated link or a peer that is wedged, and none of that is
+    /// visible in a frame. Reporting one as the other sends whoever is
+    /// holding the pager to read protocol code for a problem that is not
+    /// there.
+    #[error("{0} timed out")]
+    TimedOut(String),
     #[error("frame of {size} bytes exceeds the {MAX_FRAME} byte limit")]
     TooLarge { size: usize },
     #[error("peer failed authentication")]
@@ -890,5 +903,25 @@ mod tests {
         let a = nonce(node);
         std::thread::sleep(std::time::Duration::from_millis(1));
         assert_ne!(a, nonce(node), "a repeated nonce makes a captured proof replayable");
+    }
+
+    #[test]
+    fn a_timeout_does_not_render_as_a_malformed_frame() {
+        // Round 0270 logged `malformed frame: sync round timed out`. The two
+        // send an operator to opposite places -- a wire problem is peer builds
+        // and capability negotiation, a timeout is load, a stalled disk or a
+        // wedged peer -- so a round that ran out of time must not name the
+        // wire at all.
+        let timed_out = ProtocolError::TimedOut("sync round".into()).to_string();
+        assert_eq!(timed_out, "sync round timed out");
+        assert!(
+            !timed_out.contains("malformed"),
+            "a timeout that says `malformed` sends the pager to read protocol code: {timed_out}"
+        );
+        assert!(!timed_out.contains("frame"), "nothing about a frame is known to be wrong");
+
+        // And a genuine wire problem still says so.
+        let malformed = ProtocolError::Malformed("expected Pushed, got Fault".into()).to_string();
+        assert_eq!(malformed, "malformed frame: expected Pushed, got Fault");
     }
 }

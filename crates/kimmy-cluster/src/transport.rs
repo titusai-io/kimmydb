@@ -215,7 +215,7 @@ where
         accept_handshake(engine, &mut stream, secret, binding),
     )
     .await
-    .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
+    .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
     debug!(?peer, "peer authenticated");
 
     loop {
@@ -616,7 +616,7 @@ pub async fn push_entry(
     };
     tokio::time::timeout(REQUEST_TIMEOUT, exchange)
         .await
-        .map_err(|_| ProtocolError::Malformed("push timed out".into()))?
+        .map_err(|_| ProtocolError::TimedOut("push".into()))?
 }
 
 /// Dial `peer`, complete TLS and the handshake, and hand back the stream and
@@ -666,7 +666,7 @@ async fn dial(
         open_handshake(engine, &mut stream, secret, &binding),
     )
     .await
-    .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
+    .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
     Ok((stream, their_node))
 }
 
@@ -692,7 +692,7 @@ where
         sync_round(engine, &mut stream, peer, their_node, probe, stalls, snapshot_deadline),
     )
     .await
-    .map_err(|_| ProtocolError::Malformed("sync round timed out".into()))?
+    .map_err(|_| ProtocolError::TimedOut("sync round".into()))?
 }
 
 /// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
