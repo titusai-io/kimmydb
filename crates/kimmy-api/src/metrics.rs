@@ -990,7 +990,7 @@ impl Metrics {
              # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.\n\
              # TYPE kimmy_sync_ddl_refused_total counter\n\
              kimmy_sync_ddl_refused_total {sync_ddl_refused}\n\
-             # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined because the index standing under the name here was created after the drop. A re-served window does this once and rarely; a count that keeps rising while nothing is being recreated under that name is a member whose clock ran ahead when it created the index, which is now the only member still holding it - drop it directly on that member.\n\
+             # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
@@ -1616,7 +1616,7 @@ kimmy_sync_peers_backing_off 24
 # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.
 # TYPE kimmy_sync_ddl_refused_total counter
 kimmy_sync_ddl_refused_total 25
-# HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined because the index standing under the name here was created after the drop. A re-served window does this once and rarely; a count that keeps rising while nothing is being recreated under that name is a member whose clock ran ahead when it created the index, which is now the only member still holding it - drop it directly on that member.
+# HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.

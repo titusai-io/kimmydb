@@ -77,12 +77,22 @@ pub struct SyncOutcome {
     /// visible here, in the log, and on `/metrics`.
     pub ddl_refused: usize,
     /// Replicated index drops this node declined because the index standing
-    /// under the name here was created *after* the drop (ADR-132): a drop
-    /// re-served past the recreation it preceded, which is the rule doing
-    /// its job, or a drop from a member whose clock trailed the creator's,
-    /// which leaves this member holding an index its peers have dropped.
-    /// The witnessed vector keeps the first rare, so a count that keeps
-    /// rising is the second (ADR-141).
+    /// under the name here was created *after* the drop (ADR-132), **and
+    /// which it had not already recorded**.
+    ///
+    /// Two things reach that branch and only one of them is news. A drop
+    /// re-served past the recreation it preceded is the rule doing its job,
+    /// and this node has a tombstone proving it applied that drop when it was
+    /// current -- so it is recognised and NOT counted. A drop from a member
+    /// whose clock trailed the creator's is one this node has never seen, and
+    /// it leaves this member holding an index its peers have dropped, which
+    /// nothing else reports (ADR-141). That is what this counts.
+    ///
+    /// The witnessed vector was supposed to keep the first rare enough that a
+    /// rising count meant the second. It did not: round 0270 saw the series
+    /// rise on a healthy cluster, deterministically, over three iterations --
+    /// so the counter said "look for a clock problem" when there was none.
+    /// Telling them apart is cheaper than keeping the first rare.
     pub ddl_declined: usize,
     /// Entries this round left for a later window rather than witnessing
     /// (ADR-148): above the vector the peer introduced the window with, so
@@ -935,10 +945,23 @@ enum DdlOutcome {
     /// entry carried it, for the log line and the outcome.
     UnknownCollection(String),
     Refused,
-    /// A drop older than the index standing under its name: recorded as a
-    /// tombstone and not applied (ADR-132), counted so a member whose peers
-    /// have all dropped an index it keeps is visible (ADR-141).
+    /// A drop older than the index standing under its name, and one this node
+    /// has NOT already recorded: recorded as a tombstone and not applied
+    /// (ADR-132), counted so a member whose peers have all dropped an index it
+    /// keeps is visible (ADR-141).
     Declined,
+    /// The same, for a drop this node has already seen — a re-served window
+    /// carrying a drop past the recreation it preceded.
+    ///
+    /// Not counted, because it is not news. `kimmy_sync_ddl_declined_total` is
+    /// read as "this member is holding an index its peers have dropped", and
+    /// `operations.md` sends whoever reads a rise to look for a member whose
+    /// clock ran ahead. A replay is neither: the drop was applied here when it
+    /// was current, the tombstone proves it, and the index standing now is a
+    /// later one of the same name. Counting it made the series rise on a
+    /// healthy cluster and the diagnostic fire on correct behaviour — round
+    /// 0270's one product finding, deterministic over three iterations.
+    DeclinedReplay,
 }
 
 /// Sort a schema change's result into applied, gone, or refused, leaving
@@ -1063,6 +1086,8 @@ impl Engine {
                 }
                 DdlOutcome::Refused => outcome.ddl_refused += 1,
                 DdlOutcome::Declined => outcome.ddl_declined += 1,
+                // Deliberately uncounted: see `DdlOutcome::DeclinedReplay`.
+                DdlOutcome::DeclinedReplay => {}
             }
             return Ok(Step::Taken);
         }
@@ -1281,14 +1306,46 @@ impl Engine {
                     // dropped, and nothing else reports that (ADR-141). The
                     // escape hatch is a local drop on this member, which
                     // mints a stamp ahead of the creation.
+                    // Which of the two it is, and this node can tell. A drop
+                    // it applied when the drop was current left a tombstone at
+                    // that stamp, so a tombstone at or above this entry's
+                    // stamp means the drop is one this node has ALREADY
+                    // recorded -- a re-served window carrying it past the
+                    // recreation it preceded. That is the rule doing its job
+                    // and it is not news.
+                    //
+                    // Without a tombstone that covers it, the drop is
+                    // information this node has never had: a member whose
+                    // clock trailed the creator's, leaving this member holding
+                    // an index its peers have all dropped, which nothing else
+                    // reports (ADR-141). That is what the counter is read as
+                    // meaning, and counting the replay as well made it rise on
+                    // a healthy cluster and sent whoever read the rise looking
+                    // for a clock problem that was not there.
+                    let index_id = kimmy_core::IndexMeta::derive_id(&target.index);
+                    let already_recorded = self
+                        .index_dropped_at(entry.collection, index_id)?
+                        .is_some_and(|seen| seen >= entry.stamp);
+                    if already_recorded {
+                        debug!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            index = %target.index,
+                            drop = ?entry.stamp,
+                            created = ?index.created,
+                            "a re-served window carried a drop past the recreation it \
+                             preceded; already recorded here, so not counted"
+                        );
+                        return Ok(DdlOutcome::DeclinedReplay);
+                    }
                     info!(
                         db = %target.db,
                         collection = %target.collection,
                         index = %target.index,
                         drop = ?entry.stamp,
                         created = ?index.created,
-                        "declined a drop older than the index it names; counted in \
-                         kimmy_sync_ddl_declined_total"
+                        "declined a drop older than the index it names, and had not seen it \
+                         before; counted in kimmy_sync_ddl_declined_total"
                     );
                     // Still remembered, exactly as the `DropCollection` arm
                     // remembers a superseded drop: a tombstone never moves
@@ -1299,11 +1356,7 @@ impl Engine {
                     // name — the comparison above turns that replay away too,
                     // so removing this would not by itself let the earlier
                     // index back.
-                    self.record_index_drop(
-                        entry.collection,
-                        kimmy_core::IndexMeta::derive_id(&target.index),
-                        entry.stamp,
-                    )?;
+                    self.record_index_drop(entry.collection, index_id, entry.stamp)?;
                     return Ok(DdlOutcome::Declined);
                 }
 
@@ -3279,6 +3332,62 @@ mod tests {
         assert!(
             a.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
             "the index it names is newer than the drop, and stands"
+        );
+    }
+
+    #[test]
+    fn a_re_served_drop_past_a_recreation_is_declined_but_not_counted() {
+        // Round 0270's one product finding, and the control for the test
+        // above: the SAME branch, the opposite count.
+        //
+        // Here the node applied the drop when it was current, so it holds a
+        // tombstone at that stamp. A re-served window carrying the drop again,
+        // after the name has been recreated, is the rule doing its job and is
+        // not news -- `kimmy_sync_ddl_declined_total` is read as "this member
+        // is holding an index its peers have dropped", and `operations.md`
+        // sends whoever sees a rise looking for a member whose clock ran
+        // ahead. Counting the replay made the series rise on a healthy cluster
+        // and the diagnostic fire on correct behaviour.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+
+        // A creates and drops the index; B applies both, so B holds the
+        // tombstone at the drop's own stamp.
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let dropped = a.drop_index_stamped("shop", "orders", "by_email").unwrap();
+        pull(&b, &a);
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_email").is_none(),
+            "the fixture must leave B having applied the drop"
+        );
+
+        // The name is then recreated, and B takes that too.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
+            .unwrap();
+        pull(&b, &a);
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
+            "the fixture must leave B holding the recreation"
+        );
+
+        // Now the window is served again, as overlapping ranges are as a
+        // matter of course.
+        let drop = a.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
+        let outcome = b.apply_batch(&[drop]).unwrap();
+
+        assert_eq!(
+            outcome.ddl_declined, 0,
+            "a drop this node already recorded is a replay, not a member holding an index its \
+             peers dropped: {outcome:?}"
+        );
+        assert_eq!(outcome.ddl_refused, 0, "and not a refusal either: {outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_email").is_some_and(|i| i.unique),
+            "and the recreation still stands, which is the half that was never wrong"
         );
     }
 

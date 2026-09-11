@@ -501,7 +501,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.ddl_declined",
             "{change}",
-            "Replicated index drops this node declined as older than the index standing under the name here.",
+            "Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded; a re-served replay is not counted.",
             sync_ddl_declined
         );
         observe!(
