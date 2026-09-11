@@ -12,6 +12,34 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **A collection you dropped no longer survives on a member that catches up
+  from far behind.** 0.26.1's release notes recorded one route as not closed:
+  a whole-database snapshot — what a member below a peer's retention horizon
+  pulls — carried no collection drops, so a member that took one kept a
+  collection the sender had deleted, live and writable, with nothing reporting
+  the disagreement. Completing the snapshot also granted that member coverage
+  of the sender's history, so the drop it never applied was not served to it
+  afterwards either: the collection stayed, indefinitely, on one member alone.
+
+  **That route is now closed.** Every page of a whole-database snapshot carries
+  the sender's collection tombstones, and the receiver applies each through the
+  same incarnation check the rest of the drop machinery uses — so a collection
+  recreated after a drop is not destroyed by the headstone of the life before
+  it.
+
+  **Nothing to decide before upgrading, and no stop in the roll.** The field is
+  defaulted: a member that has not rolled yet sends no denials and ignores the
+  ones it receives, so a pair keeps the previous behaviour until both ends have
+  rolled and gains the fix the moment they have.
+
+  **Two limits, unchanged and worth knowing.** A collection the sender never
+  held at all is not denied — there is nothing to deny it with — and a tombstone
+  that has aged past `tombstone_retention_secs` on the sender is gone and cannot
+  be carried. As ever, that setting must exceed the longest partition you intend
+  to survive. See ADR-162.
+
 ### Changed
 
 - **A snapshot interrupted by a restart now resumes where it left off.** A

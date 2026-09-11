@@ -13767,3 +13767,85 @@ transaction that was going to commit anyway, so no extra fsync on any path — o
 `a_completed_snapshot_leaves_no_record_to_resume`, and
 `a_page_that_wrote_nothing_records_no_cursor`, which is the bound above asserted
 rather than described.
+
+---
+
+## ADR-162 — A whole-database snapshot page carries the sender's drops, so it can convey absence
+
+**Decision.** Every page of a whole-database snapshot carries
+`dropped_collections` — every collection tombstone the sender holds — and the
+receiver applies each through `restore_collection_drop`, the same predicate the
+scoped route already uses. Defaulted on the wire, so a sender that predates the
+field writes nothing and a receiver that predates it ignores what it cannot
+read.
+
+**Why.** A whole-database page said what the sender **has** and nothing about
+what it has **deleted**. `collections` is a walk of the sender's live
+collections; nothing denied anything. So a collection the receiver held and the
+sender had dropped survived the transfer.
+
+That alone would be a window. What made it permanent is the coverage grant:
+completing a whole-database snapshot absorbs the sender's first-page vector,
+which sits at or above the sender's `DropCollection` entry, so **no peer will
+ever serve that entry to the receiver afterwards either**. The receiver keeps
+the collection live, served and writable, on one member alone — and nothing
+reports it, because a member's own divergence check subtracts the ids it holds
+a tombstone for (ADR-155) and the receiver holds none. It is not "the drop
+arrives later"; on this route it does not arrive.
+
+ADR-155 recorded this as the first of its two stated residuals, and it is the
+only open **High** of this batch.
+
+**The denials go through the same predicate as everything else that destroys.**
+`restore_collection_drop` asks `aims_at_a_previous_incarnation` (ADR-155), so a
+tombstone below the incarnation standing here is ignored and one aimed at it
+takes it. That matters because **a tombstone alone cannot stand for "the
+collection is gone"**: a collection recreated after a drop keeps the tombstone
+that floored it, so a sender holding a live incarnation *and* the headstone of
+the life before it must not tell a receiver holding the newer life to destroy
+it. Applying the drops **after** `restore_collection` is part of the same rule —
+a recreated collection arrives as a definition on the page and as a tombstone
+for its predecessor, and restoring first means the drop is judged against the
+incarnation it belongs beside.
+
+**On every page, not the first alone.** ADR-152 found this for the scoped route
+and it applies unchanged here: a drop can land between two pages of a snapshot
+that runs for minutes, and a page that could not carry it would leave the
+receiver holding a collection the sender deleted while the transfer was in
+flight. The cost of repeating the list is bounded by
+`tombstone_retention_secs`, which collects a tombstone on the same window it
+collects the oplog — so the list is the drops recent enough that a peer might
+still be behind them, not every drop ever made.
+
+**What this knowingly does not cover.** A collection the sender **never held at
+all** is not denied, because there is nothing to deny it with: no tombstone, no
+entry, no trace. A receiver holding a collection the sender has never heard of
+keeps it. That is a different problem from this one — it is not a drop that
+failed to travel, it is state with no counterpart — and closing it would mean a
+whole-database page asserting that its `collections` list is exhaustive, which
+is a much stronger claim than "here is what I have" and one a paged snapshot
+read over minutes cannot honestly make.
+
+Likewise a tombstone that has aged past `tombstone_retention_secs` on the
+sender is gone and cannot be carried. That bound is ADR-123's and unchanged:
+`tombstone_retention_secs` must exceed the longest partition you intend to
+survive.
+
+**No negotiation, and no new field on the wire that an older peer must
+understand.** `#[serde(default)]` means an older sender omits the list and an
+older receiver ignores it, so a mixed-version cluster keeps the previous
+behaviour on that pair until both ends have rolled and gains the fix the moment
+they have. A member-at-a-time roll therefore needs no stop and no ordering.
+
+**Cost.** One read of the tombstone table per page, and the list on the wire
+per page. Nothing else moves: the scoped route is untouched, `dropped` still
+names the one collection a scoped snapshot is of, and the receiver's existing
+gate on that field is unchanged.
+
+**Held by** `a_whole_database_snapshot_takes_a_collection_the_sender_dropped`
+(the defect), `a_whole_database_snapshot_does_not_destroy_a_newer_incarnation`
+(the recreated-collection case the predicate exists for), and
+`a_page_that_predates_the_field_denies_nothing_and_breaks_nothing` — which is
+also the control for the first: the same fixture with the list cleared keeps the
+collection, so the pair discriminates the change rather than merely exercising
+it.

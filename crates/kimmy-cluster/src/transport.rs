@@ -2404,7 +2404,14 @@ mod tests {
                 body: Some(bson::serialize_to_vec(&bson::doc! { "_id": wall as i64 }).unwrap()),
             })
             .collect();
-        SnapshotPage { collections, documents, next, versions, dropped: None }
+        SnapshotPage {
+            collections,
+            documents,
+            next,
+            versions,
+            dropped: None,
+            dropped_collections: Vec::new(),
+        }
     }
 
     fn cursor(after: u64) -> kimmy_storage::SnapshotCursor {

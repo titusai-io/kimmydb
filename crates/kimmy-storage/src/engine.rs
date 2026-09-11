@@ -1071,6 +1071,23 @@ impl Engine {
         }
     }
 
+    /// Every collection tombstone this node holds.
+    ///
+    /// Bounded by `tombstone_retention_secs`: retention collects a tombstone
+    /// on the same window it collects the oplog, so this is the drops recent
+    /// enough that a peer might still be behind them, not every drop ever
+    /// made. That bound is what makes it affordable to put on a snapshot page.
+    pub fn collections_dropped(&self) -> Result<Vec<(CollectionId, Stamp)>> {
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let mut out = Vec::new();
+        for row in dropped.iter()? {
+            let (id, raw) = row?;
+            out.push((CollectionId(id.value()), codec::decode_oplog_key(raw.value())?));
+        }
+        Ok(out)
+    }
+
     /// Record that a collection was dropped at `stamp`, if that is newer.
     pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
         let txn = self.begin_write(WriterHolder::Ddl)?;
