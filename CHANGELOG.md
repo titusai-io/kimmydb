@@ -40,23 +40,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   be carried. As ever, that setting must exceed the longest partition you intend
   to survive. See ADR-162.
 
-### Changed
-
-- **A snapshot interrupted by a restart now resumes where it left off.** A
-  snapshot that does not fit one round already resumed across rounds, but the
-  progress lived only in memory — so a member restarted part-way through a large
-  transfer began again at page one and re-sent everything it had already applied.
-  It is now recorded, in the page's own transaction, so a snapshot still costs no
-  commit of bookkeeping.
-
-  The bound, exactly: a restart resumes at **the last page that wrote
-  something**. Pages that were no-ops are re-pulled, and they are cheap to redo
-  precisely because they wrote nothing. A node **restored from a backup** starts
-  any in-flight snapshot again rather than resuming it — a restore is already a
-  full rebuild, and this is a cost of the same kind. See ADR-161.
-
-### Fixed
-
 - **A restart part-way through a snapshot no longer claims coverage the node
   does not have.** A snapshot document is applied as *state*, out of stamp
   order, and deliberately looks like an ordinary replicated write once it is in
@@ -90,6 +73,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
   `kimmy_sync_failures_total` counts a failed round whatever the cause, as
   before; what changes is the line beside it.
+
+### Changed
+
+- **A snapshot interrupted by a restart now resumes where it left off.** A
+  snapshot that does not fit one round already resumed across rounds, but the
+  progress lived only in memory — so a member restarted part-way through a large
+  transfer began again at page one and re-sent everything it had already applied.
+  It is now recorded, in the page's own transaction, so a snapshot still costs no
+  commit of bookkeeping.
+
+  The bound, exactly: a restart resumes at **the last page that wrote
+  something**. Pages that were no-ops are re-pulled, and they are cheap to redo
+  precisely because they wrote nothing. A node **restored from a backup** starts
+  any in-flight snapshot again rather than resuming it — a restore is already a
+  full rebuild, and this is a cost of the same kind. See ADR-161.
 
 ## 0.27.0 - 2026-09-09
 

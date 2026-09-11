@@ -644,10 +644,17 @@ and the count half has nothing to compare when the peer holds no such
 collection — so a member holding a collection every other member has dropped
 sees a clean gauge, and the members that dropped it now subtract it rather
 than reporting it ([ADR-155](decisions.md)). Both ways in are the
-**whole-database** snapshot, which carries no collection drops and, on
-completing, grants the member coverage of the sender's history — so the drop
-entry it never applied is below that coverage and no peer will serve it. The
-member keeps the collection, live and writable, until the dropping member's
+**whole-database** snapshot, which **since ADR-162 carries the sender's
+collection tombstones on every page** and applies them through the same
+incarnation check the rest of the drop machinery uses. On a cluster where every
+member has rolled past that, this route is closed.
+
+Before it — and on any pair where one end has not rolled, since the field is
+defaulted and an older sender sends nothing — the whole-database snapshot
+carried no collection drops and, on completing, granted the member coverage of
+the sender's history, so the drop entry it never applied was below that coverage
+and no peer would serve it. The member keeps the collection, live and writable,
+until the dropping member's
 tombstone expires, at which point that member's check reports it and repairs it
 back onto the cluster.
 

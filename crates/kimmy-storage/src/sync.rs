@@ -836,8 +836,14 @@ impl Engine {
 /// that has to know *which* incarnation it was aimed at, and a copy of the rule
 /// that implemented one of its two clauses would delete a collection the other
 /// copy defends. It has two callers — the replicated `DropCollection` arm of
-/// [`Engine::apply_ddl`], and the drop a scoped snapshot carries in place of a
-/// collection its sender no longer holds (`Engine::restore_collection_drop`).
+/// [`Engine::apply_ddl`], and `Engine::restore_collection_drop`, which serves
+/// both snapshot routes: the drop a SCOPED page carries in place of a
+/// collection its sender no longer holds, and each of the tombstones a
+/// WHOLE-DATABASE page carries so that it can convey absence at all
+/// (ADR-162). The second is why this predicate has to judge against what
+/// stands on the receiver rather than against what the sender sent: a
+/// whole-database page carries every tombstone its sender holds, including
+/// ones for collections it has since recreated.
 ///
 /// Two clauses, and both are needed:
 ///
