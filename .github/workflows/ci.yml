@@ -245,6 +245,20 @@ jobs:
       # backtrace symbol table.
       CARGO_PROFILE_TEST_DEBUG: 0
       RUSTFLAGS: -D warnings
+      # The harness waits 90 s for a node to answer /healthz, which is generous
+      # on a developer's machine and has now timed out three times here on a
+      # two-core runner booting three daemons. The tests below already run one
+      # at a time, so this is one cluster's startup exceeding the budget rather
+      # than jobs contending: the runner is simply slower than the ratio the
+      # default was chosen against.
+      #
+      # Raised rather than removed, and raised only here. A budget that cannot
+      # expire would turn a genuine hang into a job that runs until GitHub kills
+      # it, which says less than a timeout does. And the failure now prints the
+      # node's stderr, so an expiry can be read as a flake or a regression
+      # instead of being guessed at -- which is what makes a bigger number
+      # headroom rather than a blindfold.
+      KIMMY_TEST_PATIENCE_SECS: "240"
     steps:
       - uses: actions/checkout@v7
 

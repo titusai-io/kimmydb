@@ -47,7 +47,22 @@ const CLUSTER_SECRET: &str = "a-shared-harness-cluster-secret";
 /// that flakes teaches people to rerun failures instead of reading them. The
 /// happy path resolves in a few seconds; the budget only matters when
 /// something is genuinely wrong.
-const PATIENCE: Duration = Duration::from_secs(90);
+///
+/// From `KIMMY_TEST_PATIENCE_SECS` when set, so CI can raise it without moving
+/// the default a developer runs against. A local run resolves in a few seconds
+/// and a longer budget would only make a genuine hang slower to report; a
+/// two-core CI runner starting three daemons is a different machine and gets a
+/// different number.
+const DEFAULT_PATIENCE_SECS: u64 = 90;
+
+fn patience() -> Duration {
+    Duration::from_secs(
+        std::env::var("KIMMY_TEST_PATIENCE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PATIENCE_SECS),
+    )
+}
 const POLL: Duration = Duration::from_millis(250);
 
 /// A free localhost port.
@@ -147,21 +162,47 @@ allowed_hosts = ["127.0.0.1"]
     }
 
     async fn wait_ready(&self, client: &reqwest::Client) {
-        let deadline = std::time::Instant::now() + PATIENCE;
+        let budget = patience();
+        let deadline = std::time::Instant::now() + budget;
         loop {
             if let Ok(res) = client.get(self.url("/healthz")).send().await
                 && res.status().is_success()
             {
                 return;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{}: never became healthy; its stderr is in {:?}",
-                self.name,
-                self.dir.path().join("stderr.log"),
-            );
+            if std::time::Instant::now() >= deadline {
+                panic!("{}", self.never_became_healthy(budget));
+            }
             tokio::time::sleep(POLL).await;
         }
+    }
+
+    /// Why the node never answered, with its own stderr in the message.
+    ///
+    /// The failure used to name the path to `stderr.log` and stop there. On CI
+    /// nothing ever reads that file -- the runner is gone by the time anyone
+    /// looks -- so "never became healthy" was indistinguishable between a node
+    /// still booting on a loaded two-core machine and one that died with a real
+    /// startup error. That ambiguity has cost a human the question "is `main`
+    /// broken?" three times.
+    ///
+    /// **A red that cannot tell a flake from a regression is the same defect as
+    /// a green that cannot fail**: the signal does not discriminate, so it
+    /// cannot be acted on. The log goes in the panic message, where the CI
+    /// output already is.
+    fn never_became_healthy(&self, budget: Duration) -> String {
+        let path = self.dir.path().join("stderr.log");
+        let log = stderr_tail(&path);
+        format!(
+            "{}: never became healthy within {budget:?}.\n\
+             Read the log below before rerunning: empty or ending mid-startup means the \
+             runner was slower than the budget, and naming an error means a regression. \
+             Raise KIMMY_TEST_PATIENCE_SECS for the former; do not rerun for the latter.\n\
+             --- {} stderr ({}) ---\n{log}\n--- end ---",
+            self.name,
+            self.name,
+            path.display(),
+        )
     }
 
     async fn login(&self, client: &reqwest::Client) -> String {
@@ -212,18 +253,74 @@ impl Drop for Node {
     }
 }
 
-/// Wait until `condition` holds, or fail with `what` after [`PATIENCE`].
+/// The tail of a node's `stderr.log`, as a reader needs it in a panic message.
+///
+/// A node that failed says so at the END, so an early boot line is not what is
+/// wanted; and the three states have to be distinguishable, because that is the
+/// whole point of printing it — an empty log means the process had not reached a
+/// startup error, a log naming one means a regression, and an unreadable file
+/// means neither and should say so rather than looking like the first.
+fn stderr_tail(path: &std::path::Path) -> String {
+    const TAIL: usize = 40;
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => {
+            "<empty: the process wrote nothing, so it had not reached a startup error>".to_string()
+        }
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let from = lines.len().saturating_sub(TAIL);
+            format!("last {} line(s):\n{}", lines.len() - from, lines[from..].join("\n"))
+        }
+        Err(e) => format!("<could not be read: {e}>"),
+    }
+}
+
+/// The three states `stderr_tail` has to tell apart.
+///
+/// Not `#[ignore]`d with the cluster tests: it needs no daemon, and the whole
+/// value of the dump is that it discriminates — a message that said the same
+/// thing in all three cases would be the ambiguity it was written to remove.
+#[test]
+fn the_stderr_tail_distinguishes_empty_failing_and_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let missing = dir.path().join("nothing-here.log");
+    let answer = stderr_tail(&missing);
+    assert!(answer.contains("could not be read"), "{answer}");
+
+    let empty = dir.path().join("empty.log");
+    std::fs::write(&empty, "   \n\n").unwrap();
+    let answer = stderr_tail(&empty);
+    assert!(answer.contains("had not reached a startup error"), "{answer}");
+
+    // A real startup failure: the reason is the LAST thing written, which is
+    // why the tail is what is kept.
+    let failed = dir.path().join("failed.log");
+    let mut text: String = (0..100).map(|i| format!("boot line {i}\n")).collect();
+    text.push_str("Error: address already in use\n");
+    std::fs::write(&failed, &text).unwrap();
+    let answer = stderr_tail(&failed);
+    assert!(answer.contains("address already in use"), "the reason must survive: {answer}");
+    assert!(!answer.contains("boot line 0\n"), "and the early noise must not: {answer}");
+    assert!(answer.contains("last 40 line(s)"), "{answer}");
+}
+
+/// Wait until `condition` holds, or fail with `what` after [`patience`].
 async fn eventually<F, Fut>(what: &str, mut condition: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = std::time::Instant::now() + PATIENCE;
+    let budget = patience();
+    let deadline = std::time::Instant::now() + budget;
     loop {
         if condition().await {
             return;
         }
-        assert!(std::time::Instant::now() < deadline, "gave up waiting for: {what}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for: {what} (after {budget:?})"
+        );
         tokio::time::sleep(POLL).await;
     }
 }
@@ -1076,7 +1173,7 @@ async fn a_replicated_drop_ends_a_stream_on_another_node() {
     assert_eq!(dropped.status(), 200);
 
     // B's stream must end, and say why.
-    let event = tokio::time::timeout(PATIENCE, async {
+    let event = tokio::time::timeout(patience(), async {
         while let Some(Ok(message)) = socket.next().await {
             if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
