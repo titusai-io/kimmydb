@@ -13540,6 +13540,8 @@ the waiter's own row does not carry it.
 
 ## ADR-160 — The open-time raise is confined to the entries this node appended in position
 
+> **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
+
 **Decision.** A node records, in a node-local table, every oplog entry it
 appended as **state** rather than as history — a snapshot document, ADR-152's
 `Position::Hold`. `Engine::open`'s rebuild of the version vector skips those
@@ -13641,10 +13643,22 @@ unknown tag is a hard restore error, so a new tag makes every backup written by
 this build unrestorable by an older one — and, because `FORMAT` stays 1, it
 arrives as a confusing "table 12" mid-stream rather than as a clean refusal.
 
-The consequence of leaving it out is exactly the pre-ADR-160 behaviour, and
-only for a backup taken **mid-snapshot**: a restored node counts every entry
-and raises over the held ones. A backup of a settled node has no held entries
-to lose.
+The consequence of leaving it out is exactly the pre-ADR-160 behaviour: a
+restored node counts every entry and raises over the held ones.
+
+> **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
+> This paragraph used to add *"and only for a backup taken mid-snapshot — a
+> backup of a settled node has no held entries to lose"*, which contradicts
+> what this same record says four paragraphs above, and it is the wider
+> statement that is true. A node that completed a whole-database snapshot
+> against a busy sender **normally retains marks**, because the grant is the
+> first page's vector and anything written after it keeps its mark through a
+> snapshot that completed perfectly. Measured on a settled receiver after a
+> three-page pull: two marks held, zero orphans. So the residual reaches any
+> node that has ever taken a snapshot from a busy peer, not only one backed up
+> mid-transfer. The trade is unchanged and still accepted — the argument for it
+> is the restore-is-operator-initiated one below, which does not depend on the
+> window being narrow — but the window is not narrow.
 
 **It is not that a too-high vector is the safe direction.** A too-high vector is
 the defect this record opens by describing, and an earlier draft of this
@@ -13726,6 +13740,16 @@ something**, which preserves that rule exactly rather than trading it away. So:
 > no-ops are re-pulled, and they are cheap to redo precisely because they wrote
 > nothing.**
 
+> **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
+> The second sentence stopped being true when ADR-162 gave a page tombstones
+> to apply. `wrote` is computed from the **document** transaction alone, and a
+> page's drops commit in their own transactions before it opens — so a page
+> that purges a collection is a "page that wrote nothing" by this rule, and is
+> neither cheap to redo nor a no-op. The resume is still correct, because
+> re-applying a tombstone is idempotent and the re-sent documents of a dropped
+> collection are turned away by `is_history`; what is wrong is the claim about
+> cost.
+
 The alternative — persisting on every page — pays an fsync on the **normal**
 path to buy a tighter resume on the **rare** one, which is the wrong way round.
 
@@ -13784,7 +13808,8 @@ rather than described.
 
 ## ADR-162 — A whole-database snapshot page carries the sender's drops, so it can convey absence
 
-> **Amended by [ADR-163](#adr-163--a-peer-may-only-deny-what-its-own-coverage-names).**
+> **Amended by [ADR-163](#adr-163--a-peer-may-only-deny-what-its-own-coverage-names)** and
+> **[ADR-166](#adr-166--three-claims-the-code-does-not-support).**
 
 **Decision.** Every page of a whole-database snapshot carries
 `dropped_collections` — every collection tombstone the sender holds — and the
@@ -13938,6 +13963,24 @@ The scoped route is otherwise untouched: `dropped` still names the one
 collection a scoped snapshot is of, the receiver's gate on that field is
 unchanged, and a scoped page carries no list — both halves of which are now
 pinned by tests rather than merely true.
+
+**Residual: a document delete still does not travel.** This record closes the
+hole at the level of collections and leaves the identical one open a level
+down. The walk that builds a page skips document tombstones — a tombstone has
+no `_id` to recover, and `keyenc` is one-way — so a receiver that held a
+document the sender has since deleted keeps it. Every word of the **Why**
+above applies with *collection* replaced by *document*, including *what made
+it permanent is the coverage grant*: completing the snapshot puts the `Delete`
+inside the window the receiver claims to hold, and no peer sends it again.
+
+It is left open deliberately and on narrower ground than "it has not bitten".
+It is **pre-existing**, from the original snapshot commit rather than this
+record; it is one document rather than a whole collection; and, unlike the
+collection-level case, it is **not silent** — the counts disagree, so the
+divergence check can see it. That last difference is the one doing the work.
+Filed as its own plan, with the reproduction and three costed options for
+recovering the id. Note also that no scoped repair heals it: the scoped route
+skips tombstones on the same line.
 
 **Held by** `a_receiver_holding_the_previous_life_gets_the_one_the_sender_recreated`
 (the ordering, which is the one that loses data if it is wrong),
@@ -14201,3 +14244,106 @@ the two halves separately rather than together. Their control is
 never forgot anything would pass both of the first two and leave every
 completed snapshot behind as a cursor that resumes forever — it fails, as it
 must, when the guard is widened to refuse every removal.
+
+---
+
+## ADR-166 — Three claims the code does not support
+
+**Decision.** Three statements in ADR-160, ADR-161 and ADR-162, and two
+comments in `snapshot.rs`, are corrected against what the code does. No
+behaviour changes. One test is added, for the case whose absence let one of
+them go false unnoticed.
+
+**Why a record rather than a quiet edit.** Each of the three was *load-bearing*
+— a reader deciding what is safe would have relied on it — and two of them were
+true when written and falsified by a later record in the same batch. That is
+worth a pointer from the record that is now wrong, not a silent rewrite, and it
+is the same reason the file carries forward banners at all.
+
+They were found by the whole-of-Part-A review, not by any of the three
+individual reviews, and each was confirmed by running the case rather than by
+reading.
+
+### 1. ADR-160 contradicted itself about the backup residual
+
+`OPLOG_HELD` is node-local and deliberately outside the backup format, and
+ADR-160 bounded the cost of that as *"only for a backup taken mid-snapshot — a
+backup of a settled node has no held entries to lose."*
+
+Four paragraphs earlier the same record says the opposite, and derives it: the
+grant is the **first** page's vector, so a document written on the sender after
+that vector was read but still ahead of the cursor arrives above it and *"keeps
+its mark through a snapshot that completed perfectly"* — therefore *"a healthy,
+caught-up node can hold marks, and against a busy sender it normally will."*
+
+The wider statement is the true one. Measured on a settled receiver after a
+three-page pull from a sender written to between pages: **two marks held, zero
+orphans**. The code already said so too — `held_len`'s own comment reads *"Not
+zero on a settled node in general."*
+
+So the residual reaches any node that has ever taken a snapshot from a busy
+peer, restored from a backup, not only one backed up mid-transfer. **The trade
+is unchanged and still accepted**, because the argument for it never rested on
+the window being narrow — it is that a restore is operator-initiated, already
+behind, and already being checked. But a reader should not have been able to
+come away thinking the window was small.
+
+### 2. ADR-161's bound stopped being true when ADR-162 landed
+
+> *"Pages that were no-ops are re-pulled, and they are cheap to redo precisely
+> because they wrote nothing."*
+
+`wrote` is computed from the **document** transaction alone. ADR-162 gave a
+page tombstones to apply, and they commit in their own transactions *before*
+that one opens. So a page that purges a fifty-document collection is a "page
+that wrote nothing" by this rule: it records no cursor, and it is neither a
+no-op nor cheap to redo.
+
+**The resume is still correct** — re-applying a tombstone is idempotent, and
+the dropped collection's re-sent documents are turned away by `is_history`.
+What is wrong is only the claim about cost, and a first application of a
+carried drop must be durable in any case, so the fix is to the sentence rather
+than to the code.
+
+**The reason it went false unnoticed is the one worth keeping.** The bound was
+guarded by `a_page_that_wrote_nothing_records_no_cursor`, whose fixture carries
+no tombstones — so the test could not reach the case that falsified it and went
+on passing. Editing the sentence alone would leave that intact, so
+`a_page_that_only_applies_a_drop_records_no_cursor_either` now holds the case
+the first fixture cannot produce.
+
+### 3. ADR-162 was silent about the same defect one level down
+
+A document **delete** does not travel in a snapshot: the walk that builds a
+page skips document tombstones, because a tombstone has no `_id` to recover and
+`keyenc` is one-way. A receiver that held a document the sender has since
+deleted therefore keeps it — and ADR-162's own **Why** explains why that is
+permanent, word for word, with *collection* replaced by *document*, including
+*what made it permanent is the coverage grant*.
+
+ADR-162 now states this as a residual. It is left open on narrow and stated
+grounds: it is pre-existing, from the original snapshot commit; it is one
+document rather than a whole collection; and unlike the collection-level case
+it is **not silent**, because the counts disagree and the divergence check can
+see it. It is filed as its own plan with the reproduction and three costed
+options.
+
+### 4. Two comments in `snapshot.rs` asserted the opposite of the code
+
+- `SnapshotDoc::document` said a tombstone *"travels so a delete is not undone
+  by a peer that still holds the document."* It does not travel; the walk skips
+  it.
+- The skip itself said *"that is safe, because the receiver never had the
+  document."* A receiver taking a whole-database snapshot is a node that fell
+  below a peer's retention horizon, not a fresh one, and may very well have had
+  it.
+
+The second is worse than a stale comment, and is why this is a numbered record
+rather than a tidy-up: **it describes a safety property the code does not
+provide**, at the exact line where someone deciding whether to fix the skip
+would look. Both are replaced with what is true and a pointer to the residual.
+
+**Held by** `a_page_that_only_applies_a_drop_records_no_cursor_either` for the
+second claim. The first and third are corrections to prose and are held by the
+measurements quoted in them; the first is additionally pinned by `held_len`'s
+own doc comment, which was right all along.

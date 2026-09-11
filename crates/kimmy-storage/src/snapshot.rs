@@ -188,8 +188,12 @@ pub struct SnapshotDoc {
     pub collection: CollectionId,
     pub id: DocId,
     pub stamp: Stamp,
-    /// `None` for a tombstone, which travels so a delete is not undone by a
-    /// peer that still holds the document.
+    /// `None` for a tombstone.
+    ///
+    /// A tombstone does **not** in fact travel: the walk that builds a page
+    /// skips it, for the reason given there. This field is `Option` because
+    /// the record it is built from is, not because a snapshot carries
+    /// deletions. See ADR-162's residual for what that costs.
     ///
     /// Binary rather than serde's default array-of-int32s, for the reason on
     /// [`kimmy_core::OplogEntry::body`]. It matters at least as much here: a
@@ -514,10 +518,25 @@ impl Engine {
             let (collection, doc_key) = key.value();
             let record = codec::decode_doc_record(value.value())?;
 
-            // A tombstone has no `_id` to recover from a body, so its id comes
-            // from decoding the key is impossible — keyenc is one-way. Skipping
-            // tombstones here means a delete does not travel in a snapshot;
-            // that is safe, because the receiver never had the document.
+            // A tombstone has no `_id` to recover: the body is gone and the
+            // key cannot be decoded back into one, because keyenc is one-way.
+            // So a delete does not travel in a snapshot.
+            //
+            // That is a known defect, NOT a safe skip, and the comment here
+            // used to claim otherwise — "the receiver never had the document".
+            // A receiver taking a whole-database snapshot is a node that fell
+            // below a peer's retention horizon, not a fresh one, and it may
+            // very well have had it. It then keeps a deleted document, live
+            // and writable, on one member alone: completing the snapshot
+            // grants it coverage of the sender's history, so the `Delete` is
+            // inside the window it claims to hold and no peer sends it again.
+            //
+            // This is ADR-162's defect one level down — that record's "Why"
+            // applies verbatim with "collection" replaced by "document",
+            // including "what made it permanent is the coverage grant". Unlike
+            // the collection-level case it is visible as a count mismatch to
+            // the divergence check, which is why it is filed rather than fixed
+            // here. See ADR-162's residual.
             let Some(document) = record.document()? else {
                 continue;
             };
@@ -2767,9 +2786,13 @@ mod tests {
         // The bound, asserted: the cursor is persisted in the page's own
         // transaction and only when the page wrote something, so a page this
         // node already holds still costs no fsync (ADR-152's rule). A restart
-        // therefore resumes at the last page that WROTE something, and the
-        // no-op pages after it are re-pulled -- cheap to redo precisely
-        // because they wrote nothing.
+        // therefore resumes at the last page that WROTE something.
+        //
+        // This fixture carries no tombstones, and that is a limit of it rather
+        // than of the rule -- see
+        // `a_page_that_only_applies_a_drop_records_no_cursor_either` for the
+        // case it cannot reach, which is why ADR-161's claim that such pages
+        // are "cheap to redo" no longer holds.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let (a, _da) = sender_of_two_pages();
@@ -2789,6 +2812,57 @@ mod tests {
             b.snapshots_to_resume().unwrap(),
             after_first,
             "a page that wrote nothing must leave the record where it was"
+        );
+    }
+
+    #[test]
+    fn a_page_that_only_applies_a_drop_records_no_cursor_either() {
+        // The case the fixture above cannot produce, and the one that
+        // falsified ADR-161's stated bound. `wrote` is computed from the
+        // DOCUMENT transaction alone; a page's drops commit in their own
+        // transactions before it opens. So a page that purges a whole
+        // collection is a "page that wrote nothing" by that rule.
+        //
+        // The resume stays correct -- re-applying the tombstone is idempotent
+        // and the dropped collection's re-sent documents are turned away by
+        // `is_history` -- so what this pins is the cost claim, not the
+        // behaviour. Asserting it here rather than editing the sentence in the
+        // record: the sentence was guarded by a test whose fixture carried no
+        // drops, which is why it could go false unnoticed.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let doomed = a.create_collection("shop", "doomed").unwrap();
+        for i in 0..50i64 {
+            a.insert(&doomed, doc! { "_id": i }).unwrap();
+        }
+        // Enough to span two pages, so the first page does NOT complete the
+        // snapshot. A single-page fixture proves nothing here: it completes,
+        // takes the `forget` path, and records no cursor whatever the drops
+        // did.
+        let keep = a.create_collection("shop", "keep").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 5) as i64 {
+            a.insert(&keep, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "doomed").is_ok(), "the receiver must hold it to lose it");
+        a.drop_collection("shop", "doomed").unwrap();
+
+        // A fresh pull: the page now carries the tombstone, and every document
+        // on it is one the receiver already holds.
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(None, None).unwrap();
+        assert!(page.next.is_some(), "the fixture must be a page that does not complete the pull");
+        let applied = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert_eq!(applied.applied, 0, "the fixture must be a page that writes no documents");
+        assert!(
+            b.get_collection("shop", "doomed").is_err(),
+            "and yet it must have purged a fifty-document collection, or it is not the case"
+        );
+        assert!(
+            b.snapshots_to_resume().unwrap().is_empty(),
+            "a page that did that much work still records no cursor -- which is the bound being \
+             true to the letter and false about the cost"
         );
     }
 
