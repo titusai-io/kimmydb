@@ -850,6 +850,11 @@ pub struct ClusterConfig {
     /// headless service picks up new pods without a restart.
     pub seeds: Vec<SeedSource>,
     /// Shared secret authenticating node-to-node traffic.
+    ///
+    /// Redacted by `check-config` like every other secret: anyone who reads it
+    /// can join the cluster as a peer and be served every document in it, which
+    /// is the same bar as `jwt_secret` and was the only one printing in clear.
+    #[serde(serialize_with = "redact")]
     pub cluster_secret: Option<String>,
     /// How often to contact each known peer for an anti-entropy round.
     ///
@@ -1782,6 +1787,18 @@ pub const PLACEHOLDER_SECRETS: &[&str] = &[
     "kimmydb",
     "test",
     "example",
+    // `check-config`'s own redaction marker. Its output is meant to be read by
+    // a person and is routinely pasted back into a config file, so the
+    // placeholder it writes has to be refused at startup or the paste silently
+    // runs the node with `<redacted>` as the secret.
+    //
+    // `auth.jwt_secret` was already refused, but only by ACCIDENT: the marker
+    // is ten bytes and `MIN_SECRET_LEN` is thirty-two, so the length floor
+    // caught it. `cluster.cluster_secret` has no length floor, so redacting it
+    // without this would have created exactly the failure the redaction exists
+    // to prevent. Naming it here makes the refusal explicit for every secret
+    // rather than resting on a coincidence between two unrelated constants.
+    REDACTED,
 ];
 
 /// Whether `value` is one of [`PLACEHOLDER_SECRETS`].
@@ -1918,6 +1935,50 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
 
         assert!(err.contains("jwt_secret"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn the_cluster_secret_is_redacted_like_every_other_secret() {
+        // It was the only one printing in clear, and anyone who reads it can
+        // join the cluster as a peer and be served every document in it.
+        let mut cfg = valid();
+        cfg.cluster.enabled = true;
+        cfg.cluster.cluster_secret = Some("a-cluster-secret-of-my-own".into());
+
+        let printed = toml::to_string(&cfg).unwrap();
+
+        assert!(!printed.contains("a-cluster-secret-of-my-own"), "printed in clear:\n{printed}");
+        assert!(printed.contains(REDACTED), "and it must say that it is set:\n{printed}");
+    }
+
+    #[test]
+    fn a_redacted_cluster_secret_is_refused_rather_than_used() {
+        // The half that makes redacting it safe, and the one the length floor
+        // does NOT provide here: `auth.jwt_secret` refuses the marker only
+        // because it is ten bytes against a thirty-two byte minimum, and
+        // `cluster.cluster_secret` has no minimum at all. Without the marker in
+        // PLACEHOLDER_SECRETS, `check-config` output pasted back into a config
+        // file would start a node whose peers authenticate on `<redacted>` --
+        // exactly what redacting it is supposed to prevent.
+        let mut cfg = valid();
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.bind = "127.0.0.1:7900".parse().unwrap();
+        cfg.cluster.cluster_secret = Some(REDACTED.into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+
+        assert!(err.contains("cluster.cluster_secret"), "must name the setting: {err}");
+    }
+
+    #[test]
+    fn every_redacted_secret_round_trips_into_a_refusal() {
+        // The general property, so a secret added later inherits it: whatever
+        // `check-config` prints for a secret must not be accepted as one.
+        assert!(
+            is_placeholder_secret(REDACTED),
+            "the redaction marker must be refused wherever a placeholder is"
+        );
     }
 
     #[test]
