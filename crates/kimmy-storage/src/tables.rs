@@ -116,8 +116,12 @@ pub const INDEXES_DROPPED: TableDefinition<(u64, u32), &[u8]> =
 /// it on demand would mean scanning the whole oplog for a max-per-node, which
 /// is O(n) for a value read on every gossip round.
 ///
-/// **Derived state**, like the arrival index: `Engine::open` rebuilds it if it
-/// does not agree with the oplog, so it can be discarded without loss.
+/// **Rebuilt, but not purely derived.** `Engine::open` raises it to cover the
+/// oplog if it does not already, so a lost or stale vector is repaired -- but
+/// the rebuild only ever RAISES (ADR-036), and it skips the entries this node
+/// holds as state (`OPLOG_HELD`, ADR-160). So the oplog is a lower bound on
+/// coverage and not the whole of it: a completed snapshot's grant is not
+/// recoverable from the oplog, and discarding this table loses it.
 pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_versions");
 
 /// Newest stamp this node has **processed** per origin, appended or not.
@@ -135,6 +139,51 @@ pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("
 /// Always greater than or equal to [`OPLOG_VERSIONS`], because appending an
 /// entry raises both.
 pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_witnessed");
+
+/// `oplog key -> ()`, for every entry this node appended as state rather than
+/// as history: a snapshot document (ADR-152's `Position::Hold`).
+///
+/// **The one thing the oplog itself cannot say.** An entry records what the
+/// change was, never how this node came by it, and a snapshot document is
+/// deliberately reconstructed as an ordinary replicated write so that
+/// last-writer-wins, the indexes and the unique check all treat it as one. So
+/// `Engine::open`, rebuilding the version vector from the oplog, could not
+/// tell a document it holds as *state* from one it holds as *history*, and
+/// raised its position over both — claiming to be able to serve a contiguous
+/// window it cannot serve. See ADR-160.
+///
+/// A node-local table and **not a flag on the entry**, because Hold-versus-Raise
+/// is a property of how THIS node applied the entry and not of the entry: the
+/// same entry is Raise at its origin and Hold at a snapshot receiver. A flag
+/// would also be a wire and format change needing capability negotiation; this
+/// needs neither. `OPLOG_WITNESSED` and `OPLOG_COLLECTED` are the same shape --
+/// node-local, absent from the backup, re-derived at open -- so this follows
+/// the house pattern rather than introducing one.
+///
+/// **What removes a mark, and what does not.** A mark goes when the entry stops
+/// being state: a completed snapshot's grant releases every stamp it covers, in
+/// the transaction that adopts it; an append in position clears the key;
+/// retention collects the mark with the entry it names; and a rewind removes it
+/// with the row it discards.
+///
+/// **The table is not self-emptying, and it is worth being exact about when it
+/// is not**, because the ADR-054 repair case turns a lingering mark into a node
+/// that under-claims what it can serve:
+///
+/// * a **scoped** repair (ADR-148) grants no coverage at all, so none of its
+///   marks is released by a grant. They go on retention, or when the entries
+///   path appends the same key in position.
+/// * a **completed whole-database** snapshot releases only what its grant
+///   covers, and the grant is the FIRST page's vector. A document written on
+///   the sender after that vector was read, but still ahead of the cursor, is
+///   carried at a stamp above it -- so its mark survives a snapshot that
+///   completed perfectly.
+///
+/// So a healthy, caught-up node can hold marks, and on a busy sender it
+/// normally will. That is safe -- `Engine::open` merges and never lowers, so a
+/// mark can only withhold a raise -- but it is not nothing, and the rebuild is
+/// exactly the path that matters when the stored vector has been lost.
+pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
 
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";

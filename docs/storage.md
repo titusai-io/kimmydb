@@ -81,6 +81,14 @@ erDiagram
 | `oplog_versions` | node id (16 bytes) | highest `Hlc` covered from that node — **not** purely oplog-derived; a snapshot grants coverage too |
 | `collections_dropped` | collection id | `Stamp` of the drop |
 | `indexes_dropped` | `(u64, u32)` — (collection id, index id) | `Stamp` of the drop |
+| `oplog_witnessed` | node id (16 bytes) | newest `Hlc` **processed** from that node, appended or not (ADR-054) |
+| `oplog_collected` | node id (16 bytes) | highest `Hlc` retention has removed for that origin |
+| `oplog_held` | oplog key | `()` — the entry was appended as **state**, not history (ADR-160) |
+
+The last three are **node-local and absent from a backup**: each is re-derived
+when the database is opened, so a restored node rebuilds them rather than
+carrying them across. See [operations.md](operations.md) for what that means when
+restoring during a snapshot.
 
 ### Why the keys are shaped this way
 

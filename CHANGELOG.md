@@ -14,6 +14,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A restart part-way through a snapshot no longer claims coverage the node
+  does not have.** A snapshot document is applied as *state*, out of stamp
+  order, and deliberately looks like an ordinary replicated write once it is in
+  the oplog — so `Engine::open`, rebuilding the version vector from the oplog,
+  could not tell it from history and raised the node's position over it. A
+  member restarted mid-repair came back up advertising that it could serve a
+  contiguous window it had never seen, and a peer catching up from it would
+  have been served a silent gap.
+
+  Such entries are now recorded in a node-local table and skipped by the
+  open-time rebuild. Nothing on the wire changes and no negotiation is needed;
+  a peer running an older build is unaffected.
+
+  Two consequences worth knowing. A member that took documents from a snapshot
+  that **never completed** will not offer that range to a peer until the
+  snapshot finishes — the peer is sent state instead of history, which is the
+  designed fallback, and the member does not re-request anything in a loop. And
+  a backup taken **while a snapshot was running** does not carry the table, so
+  a node restored from one behaves as it did before this fix; a backup of a
+  settled member has nothing to carry. See ADR-160.
+
 - **A sync round that ran out of time no longer reports itself as a malformed
   frame.** Four bounded waits — the handshake (twice), a push, and a whole sync
   round — mapped a timeout onto `malformed frame: … timed out`, so round 0270

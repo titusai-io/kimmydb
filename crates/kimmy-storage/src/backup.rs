@@ -14,7 +14,13 @@
 //!
 //! # What a backup contains
 //!
-//! Every table, including secondary index entries. Index entries are derivable
+//! Every table a restored node cannot rebuild for itself, including secondary
+//! index entries. Three are deliberately omitted because opening re-derives
+//! them: `OPLOG_WITNESSED`, `OPLOG_COLLECTED`, and `OPLOG_HELD` (ADR-160) --
+//! and the tag list below is hand-written in both directions, so a table added
+//! to it makes every backup this build writes unrestorable by an older one.
+//!
+//! Index entries are derivable
 //! from documents, so omitting them would make backups smaller — and would make
 //! a restore's correctness depend on replaying index maintenance exactly, which
 //! is the part most likely to change between versions. Copying them keeps a

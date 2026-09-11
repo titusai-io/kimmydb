@@ -432,8 +432,10 @@ never learn what it missed.
 The peer then asks for a **snapshot** — current state rather than history — and
 adopts the sender's coverage once it is complete. That is why the version vector
 is no longer derived from the oplog: coverage can be granted by a snapshot for
-entries this node will never hold, so opening only ever *raises* the vector to
-cover the log. See [ADR-036](decisions.md).
+entries this node will never hold, so opening only ever *raises* the vector, and
+it raises it to cover **the log minus the entries this node appended as state
+rather than as history**. See [ADR-036](decisions.md) and
+[ADR-160](decisions.md).
 
 **A snapshot is paged, one transaction a page, and resumes across rounds.**
 Documents arrive 512 to a page; the receiver applies a page in one write
@@ -453,15 +455,20 @@ position the member already holds carries the rest — and, when the sender has
 since dropped the collection, carries the drop instead so the entries the
 member was stopped at become history ([ADR-152](decisions.md)).
 
-Where a pull stands is process memory. A member restarted *during* a
-multi-round snapshot forgets the cursor, and opening re-derives its vectors
-from the oplog — over the snapshot documents it already holds, which sit in
-key order, not stamp order — so its position can jump past the un-walked
-remainder of the snapshot and, on a repair, past the window it was stopped
-at; unless some origin it trails is still below the peer's horizon, that
-remainder is never asked for. Narrower than before ADR-152, when a timed-out
-snapshot left the same state on every round, and recorded there as an open
-decision rather than closed.
+A member restarted *during* a multi-round snapshot used to come back wrong in
+two ways, and both are now closed. Opening re-derived its vectors from the
+oplog — over the snapshot documents it already held, which sit in key order,
+not stamp order — so its position could jump past the un-walked remainder of
+the snapshot and, on a repair, past the window it was stopped at; unless some
+origin it trailed was still below the peer's horizon, that remainder was never
+asked for. **A node now records the entries it appended as state and the
+open-time rebuild skips them** ([ADR-160](decisions.md)), so a restart claims
+only what it can serve.
+
+**Where a pull stands is recorded too** ([ADR-161](decisions.md)), in the page's
+own transaction and only for a page that wrote something — so a restart resumes
+at the last page that wrote, and the no-op pages after it are re-pulled, which
+is cheap precisely because they wrote nothing.
 
 **The horizon is judged per origin.** `oplog_collected_through` is one stamp
 across every origin, and the threshold a peer asks from is its own coverage of

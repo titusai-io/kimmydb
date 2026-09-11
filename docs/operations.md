@@ -1273,10 +1273,19 @@ one keystroke between recovering and corrupting a cluster's identity space.
 
 ### What a backup contains
 
-Everything the node holds: documents, collection and index metadata, secondary
-index entries, the oplog and its arrival index, tombstones for deleted documents,
-dropped collections and dropped indexes, version vectors, the user store, and
-the node id.
+Documents, collection and index metadata, secondary index entries, the oplog and
+its arrival index, tombstones for deleted documents, dropped collections and
+dropped indexes, the **servable** version vector, the user store, and the node
+id.
+
+**Not everything the node holds.** Three tables are deliberately left out
+because each is node-local and re-derived when the database is opened: the
+witnessed vector, the per-origin retention record, and the record of which oplog
+entries this node appended as state rather than as history
+([ADR-160](decisions.md)). The consequence of the last one is worth knowing when
+restoring: **a node restored from a backup taken while a snapshot was running
+begins that snapshot again** rather than resuming it, and until it completes the
+restored node may advertise coverage of snapshot documents it holds as state.
 
 Restoring an older backup onto a newer build is supported while the format
 version matches; a backup from a *newer* build is refused by name rather than

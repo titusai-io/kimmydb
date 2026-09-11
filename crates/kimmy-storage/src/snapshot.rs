@@ -1927,6 +1927,406 @@ mod tests {
         );
     }
 
+    /// A sender with more documents than one snapshot page carries, so a
+    /// single `apply_snapshot_page` leaves the transfer genuinely unfinished.
+    fn sender_of_two_pages() -> (Engine, tempfile::TempDir) {
+        let (a, da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE + 4) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        (a, da)
+    }
+
+    #[test]
+    fn a_restart_part_way_through_a_snapshot_does_not_claim_the_coverage() {
+        // The defect ADR-160 closes, and the case ADR-152 recorded as untested.
+        //
+        // A snapshot document is appended under `Position::Hold` precisely
+        // because the receiver holds it as STATE and cannot serve a contiguous
+        // window containing it. `Engine::open` then rebuilt the vector from the
+        // oplog and raised the position over it anyway -- it could not tell a
+        // document held as state from one held as history. The node came back
+        // up claiming to be able to serve entries it had never seen, and the
+        // hole ADR-148 forbids was opened by a restart rather than by a page.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+
+        let (a, _da) = sender_of_two_pages();
+
+        // One page only: the snapshot is left in flight, which is what a
+        // restart mid-repair leaves behind.
+        let mut progress = SnapshotProgress::whole_database();
+        let stopped = {
+            let b = Engine::open(&path).unwrap();
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(&mut progress, &page).unwrap();
+            assert!(!progress.is_complete(), "the fixture must leave the snapshot unfinished");
+            assert!(b.held_len().unwrap() > 0, "an unfinished snapshot holds entries as state");
+            b.version_vector().unwrap()
+        };
+
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(
+            reopened.version_vector().unwrap(),
+            stopped,
+            "a restart must not raise the position over documents held as state"
+        );
+        assert!(
+            reopened.version_vector().unwrap().get(a.node_id())
+                < a.version_vector().unwrap().get(a.node_id()),
+            "the receiver must still be behind the sender it has not finished copying"
+        );
+    }
+
+    #[test]
+    fn a_completed_snapshot_releases_the_marks_its_grant_covers() {
+        // NOT "every mark it made". The grant is the FIRST page's vector, so a
+        // document written on the sender after that vector was read and still
+        // ahead of the cursor arrives at a stamp above it and keeps its mark
+        // through a snapshot that completed perfectly --
+        // `a_document_written_during_a_snapshot_keeps_its_mark` below is that
+        // case. This fixture has no writer running against the sender, so
+        // every stamp is at or below the grant and the table does empty; the
+        // name used to claim the general guarantee and the fixture could not
+        // have contradicted it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let granted = {
+            let b = Engine::open(&path).unwrap();
+            transfer(&b, &a);
+            assert_eq!(b.held_len().unwrap(), 0, "a completed snapshot leaves nothing held");
+            b.version_vector().unwrap()
+        };
+
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(
+            reopened.version_vector().unwrap(),
+            granted,
+            "a restart must not undo coverage a snapshot granted"
+        );
+    }
+
+    #[test]
+    fn a_document_written_during_a_snapshot_keeps_its_mark() {
+        // The limit of what a grant releases, and the case the fixture above
+        // cannot produce. The coverage a whole-database snapshot grants is the
+        // vector served with its FIRST page; `snapshot_page` re-reads live
+        // state per page, so a document written after that vector was read and
+        // still ahead of the cursor is carried at a stamp ABOVE the grant.
+        //
+        // Its mark is correctly NOT released: the receiver holds that document
+        // as state and the grant says nothing about it. What was wrong was the
+        // claim that a completed snapshot empties the table.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+        let ca = a.get_collection("shop", "orders").unwrap();
+
+        let b = Engine::open(&path).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+
+        // Page one fixes the grant.
+        let first = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(&mut progress, &first).unwrap();
+
+        // The sender writes while the snapshot is still running, at a stamp
+        // above the grant, and beyond the cursor so the next page carries it.
+        a.insert(&ca, doc! { "_id": 99_999 }).unwrap();
+
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(&mut progress, &page).unwrap();
+        }
+
+        assert!(
+            b.held_len().unwrap() > 0,
+            "a document written above the grant keeps its mark through a completed snapshot"
+        );
+        // And the node is honest about it rather than broken by it: it holds
+        // the document, and does not claim a position it cannot serve from.
+        assert!(b.get(&ca, &DocId::Int64(99_999)).unwrap().is_some());
+        assert!(
+            b.version_vector().unwrap().get(a.node_id())
+                < a.version_vector().unwrap().get(a.node_id()),
+            "the grant does not reach the write that came after it"
+        );
+    }
+
+    #[test]
+    fn finishing_an_interrupted_snapshot_releases_what_the_restart_kept() {
+        // The two halves together: the marks survive the restart, and the
+        // completion that follows clears them. Without this the confinement
+        // would be a one-way door.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let mut progress = SnapshotProgress::whole_database();
+        {
+            let b = Engine::open(&path).unwrap();
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(&mut progress, &page).unwrap();
+            assert!(b.held_len().unwrap() > 0);
+        }
+
+        // The resume carries the same progress, which is what persisting it
+        // buys a real node; here it is simply still in hand.
+        let b = Engine::open(&path).unwrap();
+        transfer_under(&b, &a, &mut progress);
+        assert_eq!(b.held_len().unwrap(), 0, "completion must release what the restart kept");
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            a.version_vector().unwrap().get(a.node_id()),
+            "and the receiver is caught up once it is"
+        );
+    }
+
+    #[test]
+    fn re_delivering_documents_a_snapshot_already_applied_does_not_claim_them() {
+        // The honest consequence of the confinement, asserted rather than
+        // wished away.
+        //
+        // An unfinished snapshot's documents are held as state. If the entries
+        // path then re-delivers the same stamps, last-writer-wins supersedes
+        // every one of them -- the document is already at that stamp -- so
+        // nothing is appended, the servable vector does not move, and the
+        // marks stay. That is correct: this node still cannot serve a
+        // contiguous window containing them. Before ADR-160 a restart raised
+        // the position over them anyway and the node claimed a window it could
+        // not serve.
+        //
+        // What must NOT happen is the ADR-054 failure: re-requesting forever.
+        // The witnessed vector is what "am I behind" is judged on, and the
+        // sync path absorbs the window's coverage into it whether or not
+        // anything was appended -- so the node goes quiet while staying
+        // honest about what it can serve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let mut progress = SnapshotProgress::whole_database();
+        let b = Engine::open(&path).unwrap();
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held > 0, "the fixture must leave something held");
+
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
+
+        assert_eq!(
+            b.held_len().unwrap(),
+            held,
+            "supersession releases no mark: nothing was appended, so nothing arrived in position"
+        );
+        // And yet the node is caught up, because the window was contiguous
+        // from ZERO and its later entries WERE appended in position. A version
+        // vector is a per-origin high-water mark, so raising it to the last
+        // entry covers every earlier stamp from that origin -- the marks left
+        // behind are stale rather than wrong, which is safe for the reason
+        // `a_stale_mark_can_never_lower_a_vector_that_already_covers_it`
+        // asserts, and retention collects them with their entries.
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            a.version_vector().unwrap().get(a.node_id()),
+            "a contiguous window from the beginning does catch the node up"
+        );
+    }
+
+    #[test]
+    fn a_stale_mark_can_never_lower_a_vector_that_already_covers_it() {
+        // The bound on how much damage a mark can do: the open-time rebuild
+        // MERGES into the stored vector and never lowers it, so a mark can only
+        // withhold a raise. A stamp the stored vector already covers stays
+        // covered however it got there.
+        //
+        // That is a bound, not a licence. Withholding a raise is exactly what
+        // bites in the case the rebuild exists for -- a stored vector lost or
+        // disagreeing with the oplog -- which is why `release_held_under` runs
+        // on every grant rather than leaving marks to be tidied later.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let covered = {
+            let b = Engine::open(&path).unwrap();
+            transfer(&b, &a);
+            b.version_vector().unwrap()
+        };
+
+        // Mark every entry as state after the fact -- a state no release path
+        // can produce, which is the point: even then the vector must hold.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let oplog = txn.open_table(crate::tables::OPLOG).unwrap();
+                let mut held = txn.open_table(crate::tables::OPLOG_HELD).unwrap();
+                for row in oplog.iter().unwrap() {
+                    let (key, _) = row.unwrap();
+                    held.insert(key.value(), ()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.version_vector().unwrap(), covered);
+    }
+
+    #[test]
+    fn a_database_with_no_held_table_opens_as_it_always_did() {
+        // An older build, or a restore: the backup does not carry this table,
+        // and neither does a database written before it existed. Opening must
+        // fall back to counting every entry -- the behaviour ADR-160 narrows,
+        // and the safe direction of the two.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let expected = {
+            let e = Engine::open(&path).unwrap();
+            let c = e.create_collection("db", "c").unwrap();
+            e.insert(&c, doc! { "_id": 1 }).unwrap();
+            e.version_vector().unwrap()
+        };
+
+        // Remove the table entirely, as a database that never had one.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.delete_table(crate::tables::OPLOG_HELD).unwrap();
+            {
+                let mut versions = txn.open_table(crate::tables::OPLOG_VERSIONS).unwrap();
+                versions.retain(|_, _| false).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.version_vector().unwrap(), expected);
+    }
+
+    #[test]
+    fn retention_collects_a_mark_with_the_entry_it_names() {
+        // The third release path, untested until now. A mark on an entry the
+        // oplog no longer holds could never be collected afterwards -- the
+        // removal is gated on the oplog row being there -- so it would be a
+        // permanent orphan.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let b = Engine::open(&path).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert!(b.held_len().unwrap() > 0, "the fixture must leave marks to collect");
+
+        let before = b.held_len().unwrap();
+        b.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+        assert!(b.held_len().unwrap() < before, "retention must take marks with the entries");
+        assert_eq!(
+            b.held_orphans().unwrap(),
+            0,
+            "and must never leave one naming an entry it removed: nothing could collect it after"
+        );
+    }
+
+    #[test]
+    fn a_rewind_discards_marks_with_the_entries_and_does_not_raise_over_the_rest() {
+        // Rewind is the only remover of oplog rows outside retention, and it
+        // is wrong in two directions at once if it ignores the marks: the ones
+        // it strands can never be collected, and
+        // `reset_version_vector_to_oplog` REPLACES the vectors rather than
+        // merging, so counting a held entry there does not merely fail to
+        // withhold a raise -- it writes the claim. ADR-160, entered by another
+        // door.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let b = Engine::open(&path).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held > 0);
+
+        // A snapshot document is a document whose earlier value was never in
+        // this node's oplog, so a rewind below it is REFUSED outright rather
+        // than discarding it -- which narrows how a held entry can be
+        // discarded at all, and is worth knowing.
+        let refused = b.rewind_to(Hlc::ZERO);
+        assert!(
+            refused.is_err(),
+            "a rewind below a document that exists only as snapshot state cannot be honoured"
+        );
+
+        // What CAN discard one: a document this node already held at an
+        // earlier stamp, replaced by a snapshot document, rewound to between
+        // the two. The earlier value is in the oplog, so the rewind is
+        // allowed, and the mark on the discarded entry must go with it.
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let own = b.insert(&cb, doc! { "_id": 424_242 }).unwrap();
+        let mid = b.version_vector().unwrap().get(b.node_id());
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            documents: vec![SnapshotDoc {
+                collection: cb.id,
+                id: DocId::Int64(424_242),
+                stamp: Stamp::new(a.version_vector().unwrap().get(a.node_id()), a.node_id()),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": 424_242, "v": 2 }).unwrap()),
+            }],
+            next: None,
+            versions: VersionVector::new(),
+            dropped: None,
+        };
+        let _ = own;
+        b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        b.rewind_to(mid).unwrap();
+        assert_eq!(
+            b.held_orphans().unwrap(),
+            0,
+            "a mark on a discarded entry can never be collected, so it must go with it"
+        );
+    }
+
+    #[test]
+    fn a_rewind_that_keeps_a_held_entry_does_not_claim_it() {
+        // The half the test above cannot show, because it discards everything:
+        // a rewind whose cut-off leaves held entries standing must still not
+        // raise the position over them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let b = Engine::open(&path).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        assert!(b.held_len().unwrap() > 0);
+
+        // Far in the future: nothing is discarded, so every mark stands.
+        let far = a.version_vector().unwrap().get(a.node_id());
+        b.rewind_to(far).unwrap();
+
+        assert!(b.held_len().unwrap() > 0, "nothing was discarded, so nothing was collected");
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            Hlc::ZERO,
+            "the reset must skip held entries exactly as the open-time rebuild does"
+        );
+    }
+
     #[test]
     fn a_peer_within_the_window_is_still_served_incrementally() {
         // Snapshots are the fallback, not the default: they transfer everything.

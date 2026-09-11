@@ -983,6 +983,11 @@ away and sent the node straight back to asking for history it cannot be given.
 The oplog is now a *lower bound* on coverage: opening raises the vector to cover
 it and never lowers it.
 
+> **Narrowed by [ADR-160](#adr-160--the-open-time-raise-is-confined-to-the-entries-this-node-appended-in-position).**
+> Opening raises the vector over the oplog *minus the entries this node
+> appended as state rather than as history*. The never-lowers half stands
+> unchanged, and is what bounds a mark's effect.
+
 ---
 
 ## ADR-037 — Local peer health, and SWIM membership above it
@@ -11628,6 +11633,16 @@ defaults do not fit is a knob that is wrong for that case.
 
 ## ADR-152 — A snapshot repair pulls one collection, a page per commit, and resumes where it stopped
 
+> **Amended by [ADR-160](#adr-160--the-open-time-raise-is-confined-to-the-entries-this-node-appended-in-position).**
+> The residual this record states as open — that the oplog holds stamps the
+> vectors do not name, and `Engine::open` re-derives both vectors from it
+> "without telling a snapshot document from a window's" — is closed. A node
+> records the entries it appended as state and the open-time rebuild skips
+> them, so a restart part-way through a snapshot no longer claims coverage it
+> does not have. Of the two closures this record names, that is the second one;
+> the first, persisting `SnapshotProgress`, is ADR-161.
+
+
 > **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
 > Two clauses below no longer hold. **"Records as a tombstone when it holds no
 > collection under the id"** becomes an incarnation comparison, with three
@@ -13511,3 +13526,161 @@ the moment it is released, which for a commit includes its fsync but not the
 wait at the coalescing barrier — a committer releases the gate before it waits
 there, as ADR-151 left it, so `durability` holds the writer for the flush and
 the waiter's own row does not carry it.
+
+---
+
+## ADR-160 — The open-time raise is confined to the entries this node appended in position
+
+**Decision.** A node records, in a node-local table, every oplog entry it
+appended as **state** rather than as history — a snapshot document, ADR-152's
+`Position::Hold`. `Engine::open`'s rebuild of the version vector skips those
+entries, so opening raises this node's position only over entries it took in
+position. Four things release a mark, each in the same transaction as the thing that
+releases it: a completed snapshot's grant, over every stamp the granted vector
+covers; an append of that key under `Position::Raise`, which is the statement
+that the entry arrived in position after all; retention, which collects the mark
+with the entry it names; and a rewind, which discards it with the row.
+
+**The clock resume is untouched, and the confinement is by construction.**
+`Engine::open` resumes the hybrid logical clock from the true oplog maximum,
+Hold-applied entries included, or a restart could mint a stamp below one
+already written and a document updated afterwards could lose to its own older
+version under last-writer-wins. That needed no work: the clock resume is
+`last_oplog_hlc`, a separate read transaction doing `oplog.last()` for a single
+global maximum, while the vector merge is `rebuild_version_vector_if_stale`,
+its own read transaction doing a full `oplog.iter()` for a maximum per origin.
+They share no transaction, no iterator and no value. This change is confined to
+the second, so the first is untouched by construction rather than by care.
+
+**Why.** An oplog entry records what the change was, never how this node came
+by it, and that is deliberate: a snapshot document is reconstructed as an
+ordinary replicated write so that last-writer-wins decides it, the indexes
+maintain it, and a unique violation is reported rather than smuggled past the
+check. `Position::Hold` — the fact that this node holds the document as state,
+out of stamp order, from a snapshot that may still be running — was a call
+argument, consumed and forgotten inside `append_oplog_at`.
+
+So `Engine::open` could not tell the two apart. Rebuilding the vector from the
+oplog, it took the newest stamp per origin over every entry it held and raised
+both vectors to it. A node restarted part-way through a snapshot came back up
+claiming it could serve a contiguous window it had never seen — the hole
+ADR-148 forbids, opened by a restart rather than by a page. ADR-152 recorded
+this as a known residual when it introduced `Position::Hold`, and named this
+change and the persisted `SnapshotProgress` as the two candidate closures.
+
+**Why a table and not a flag on the entry.** Hold-versus-Raise is a property of
+**how this node applied the entry**, not of the entry: the same entry is Raise
+at its origin and Hold at a snapshot receiver. Putting it in the entry record
+would therefore be wrong in the ordinary sense of recording one node's
+circumstance as a fact about a change every node holds — and it would be a wire
+and stored-format change, needing capability negotiation so that an older peer
+never receives a field it cannot read. A node-local table needs neither.
+
+It is also the house pattern in this exact module rather than a new one:
+`OPLOG_WITNESSED` and `OPLOG_COLLECTED` are both node-local, absent from the
+backup, and re-derived at open.
+
+**The table does not empty itself, and that has to be said plainly** — an
+earlier draft of this record claimed it did, and the claim was wrong in two
+reachable ways that matter:
+
+* a **scoped** repair (ADR-148) grants no coverage at all, so none of its marks
+  is released by a grant. They go on retention, or when the entries path appends
+  the same key in position.
+* a **completed whole-database** snapshot releases only what its grant covers,
+  and the grant is the **first** page's vector. A document written on the sender
+  after that vector was read but still ahead of the cursor arrives at a stamp
+  above it, and keeps its mark through a snapshot that completed perfectly.
+
+So a healthy, caught-up node can hold marks, and against a busy sender it
+normally will.
+
+**Over-marking is bounded rather than harmless.** The rebuild **merges** into the
+stored vector and never lowers it, so a mark can only withhold a raise, never
+cause a lowering — a stamp the vector already covers stays covered however it got
+there. But withholding a raise is exactly what bites in the case the rebuild
+exists for, a stored vector lost or disagreeing with the oplog (ADR-054): such a
+node comes back **under-claiming** what it can serve, and asks peers for history
+they may no longer retain, forcing the snapshot this record's fix was meant to
+make unnecessary. That is the residual, it is accepted, and it is the reason a
+grant releases marks in bulk rather than leaving them to retention.
+
+**What this costs, stated plainly.** A node that took documents from a snapshot
+that never completed does not claim them, and cannot serve a peer a contiguous
+window containing them. That is the truth about such a node, and the point of
+the change — but it is a real behavioural difference from a build where a
+restart papered over it. A **scoped** repair grants no coverage at all
+(ADR-152), so its marks are released only by a later append in position or by
+retention. Such a node stays honest about what it can serve; a peer asking to
+catch up from that range is sent state instead of history, which is ADR-036's
+designed fallback. It does **not** re-request forever: "am I behind" is judged
+on the witnessed vector, which the sync path absorbs from the window's coverage
+whether or not anything was appended (ADR-054).
+
+**Both vectors are narrowed, and that is deliberate.** The rebuild merges the
+witnessed vector from the servable one it has just computed, so skipping a held
+entry withholds it from both. Witnessing a snapshot document would be the
+ADR-054 failure pointed the other way — the node would believe it had already
+seen the entries around it and stop asking — so the two move together here, and
+the argument above rests on the sync path absorbing the window's coverage rather
+than on anything the open-time raise does.
+
+**The backup format.** `OPLOG_HELD` is deliberately **not** in it, which costs
+nothing to add and is the reason the question is answered here rather than
+deferred: tables are enumerated by a hand-written tag in both directions and an
+unknown tag is a hard restore error, so a new tag makes every backup written by
+this build unrestorable by an older one — and, because `FORMAT` stays 1, it
+arrives as a confusing "table 12" mid-stream rather than as a clean refusal.
+
+The consequence of leaving it out is exactly the pre-ADR-160 behaviour, and
+only for a backup taken **mid-snapshot**: a restored node counts every entry
+and raises over the held ones. A backup of a settled node has no held entries
+to lose.
+
+**It is not that a too-high vector is the safe direction.** A too-high vector is
+the defect this record opens by describing, and an earlier draft of this
+paragraph reached for the requester-side argument — *a vector that is too high
+asks for no history it cannot be given* — to excuse a server-side risk. Both
+cannot be the safe direction and that one is wrong here.
+
+The honest argument is narrower. **A restore is an operator-initiated event with
+a repair story of its own**: a node restored from a backup is already being
+brought back by hand, is already behind, and will be checked. Buying safety for
+that case costs a backup-format tag, which makes every backup this build writes
+unrestorable by an older one — permanently, for every backup, to narrow a window
+that exists only when a backup was taken during a snapshot. That trade is what
+decides it, not a claim that the residual is harmless.
+
+**Alternatives.** *Skip the open-time raise entirely while an incomplete
+snapshot is recorded.* ADR-152's other candidate. It needs the persisted
+`SnapshotProgress` to know, and it is coarser: it withholds the raise over
+every entry rather than over the ones actually held as state. *Keep a per-origin
+high-water mark of Raise-applied stamps.* Smaller than a mark per entry, but it
+is state the oplog does not hold and so cannot be rebuilt if lost. ADR-153
+considered the same shape for a different purpose and declined it as **a format
+change**, which is the more exact objection and applies here too. *Mark in memory.* Dies with
+the process, which is the case this exists for.
+
+**Cost.** One table; one `insert` on the Hold path and one `remove` on the Raise
+path, both inside a transaction that was already committing; one `remove` each
+on the retention and rewind paths, likewise; and a **full scan of the table on
+every grant**, which is once per completed snapshot and removes in place rather
+than collecting keys first, because the table is not bounded the way an earlier
+draft assumed.
+
+At open, a lookup per oplog entry in a walk that already decodes every key —
+ADR-153 measured that walk as the dominant cost of opening a large database.
+**The lookup is skipped entirely when the table is empty**, checked once outside
+the loop, which matters because retention opens the table for write and so
+creates it on every node, including ones that have never taken a snapshot.
+
+Nothing on the wire moves, no negotiation is needed, and an older peer is
+unaffected: the change is invisible outside this node.
+
+**Held by** `a_restart_part_way_through_a_snapshot_does_not_claim_the_coverage`
+(the case ADR-152 recorded as untested),
+`a_completed_snapshot_releases_every_mark_it_made`,
+`finishing_an_interrupted_snapshot_releases_what_the_restart_kept`,
+`re_delivering_documents_a_snapshot_already_applied_does_not_claim_them`,
+`a_stale_mark_can_never_lower_a_vector_that_already_covers_it`, and
+`a_database_with_no_held_table_opens_as_it_always_did`.

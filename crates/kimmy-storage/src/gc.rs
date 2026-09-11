@@ -194,6 +194,10 @@ impl Engine {
             let mut oplog = txn.open_table(tables::OPLOG)?;
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            // The state mark goes with the entry, for the same reason and in
+            // the same transaction as the arrival index: a mark on an entry
+            // that is gone is a row nothing will ever remove. ADR-160.
+            let mut held = txn.open_table(tables::OPLOG_HELD)?;
 
             let mut highest = None;
             // The same high-water mark per origin: the coarse horizon says a
@@ -216,6 +220,7 @@ impl Engine {
                 if let Some(seq) = by_stamp.remove(key.as_slice())? {
                     arrival.remove(seq.value())?;
                 }
+                held.remove(key.as_slice())?;
             }
 
             // Recording the horizon is what lets a peer be told it needs a

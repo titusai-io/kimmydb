@@ -302,8 +302,15 @@ impl Engine {
                     doomed.push(key.value().to_vec());
                 }
             }
+            // The state mark goes with the entry, and this is the only
+            // remover outside retention. A mark left on a key the oplog no
+            // longer holds can never be collected -- retention only removes
+            // one alongside the entry it names -- so it would be a permanent
+            // orphan, and the one growth path nothing else bounds. ADR-160.
+            let mut held = txn.open_table(tables::OPLOG_HELD)?;
             for key in doomed {
                 oplog.remove(key.as_slice())?;
+                held.remove(key.as_slice())?;
                 outcome.oplog_discarded += 1;
             }
         }

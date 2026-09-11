@@ -571,6 +571,7 @@ impl Engine {
             let _ = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let _ = txn.open_table(tables::INDEXES_DROPPED)?;
             let _ = txn.open_table(tables::OPLOG_COLLECTED)?;
+            let _ = txn.open_table(tables::OPLOG_HELD)?;
         }
         txn.commit()?;
 
@@ -893,7 +894,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Raise the version vector to cover everything in the oplog.
+    /// Raise the version vector to cover every oplog entry this node appended
+    /// in position — everything in the oplog except the entries it holds as
+    /// state (ADR-160).
     ///
     /// **Only ever raises.** The vector was derived state when the oplog was
     /// the sole way to gain coverage; a snapshot transfer grants coverage of
@@ -909,8 +912,32 @@ impl Engine {
         {
             let txn = db.begin_read()?;
             let oplog = txn.open_table(tables::OPLOG)?;
+            // The entries this node appended as STATE rather than as history,
+            // which it must not raise its position over: it holds the document
+            // but cannot serve a contiguous window containing it. ADR-160.
+            //
+            // `?`, not `.ok()`. `redb::TableError` has seven variants and only
+            // one of them is "no such table": the rest include `Storage(Io)`
+            // and `Storage(Corrupted)`, and swallowing those would turn a
+            // database reporting damage into "nothing is held" -- silently
+            // restoring the pre-ADR-160 behaviour on precisely the node least
+            // entitled to it. The table is created eagerly in `open_with_cache`
+            // above, before this runs, so a database from an older build or a
+            // restored backup finds it here EMPTY rather than missing, which
+            // produces the same "count every entry" answer without hiding
+            // anything.
+            let held = txn.open_table(tables::OPLOG_HELD)?;
+            // Hoisted: after one retention pass the table exists on every
+            // node, including ones that have never taken a snapshot, so
+            // without this every open would pay a lookup per oplog row on the
+            // walk ADR-153 measured as the dominant cost of opening a large
+            // database. Empty is the overwhelmingly common case.
+            let any_held = !held.is_empty()?;
             for row in oplog.iter()? {
                 let (key, _) = row?;
+                if any_held && held.get(key.value())?.is_some() {
+                    continue;
+                }
                 actual.observe(codec::decode_oplog_key(key.value())?);
             }
         }
@@ -944,7 +971,10 @@ impl Engine {
         }
         txn.commit()?;
 
-        info!(nodes = stored.len(), "raised the version vector to cover the oplog");
+        info!(
+            nodes = stored.len(),
+            "raised the version vector to cover the oplog entries appended in position"
+        );
         Ok(())
     }
 
@@ -965,8 +995,21 @@ impl Engine {
         {
             let txn = db.begin_read()?;
             let oplog = txn.open_table(tables::OPLOG)?;
+            // The same exclusion the open-time rebuild makes, for the same
+            // reason and more sharply: this REPLACES the vectors rather than
+            // merging into them, so counting a held entry here does not merely
+            // fail to withhold a raise -- it writes the claim. A rewind taken
+            // while a snapshot is in flight, or one that was interrupted and
+            // not resumed, would otherwise leave the node asserting it can
+            // serve a contiguous window containing documents it took out of
+            // stamp order: the defect ADR-160 closes, entered by another door.
+            let held = txn.open_table(tables::OPLOG_HELD)?;
+            let any_held = !held.is_empty()?;
             for row in oplog.iter()? {
                 let (key, _) = row?;
+                if any_held && held.get(key.value())?.is_some() {
+                    continue;
+                }
                 actual.observe(codec::decode_oplog_key(key.value())?);
             }
         }
@@ -1138,7 +1181,84 @@ impl Engine {
             raised |= raise_version(txn, tables::OPLOG_VERSIONS, &stamp)?;
             raised |= raise_version(txn, tables::OPLOG_WITNESSED, &stamp)?;
         }
+        raised |= Self::release_held_under(txn, granted)?;
         Ok(raised)
+    }
+
+    /// Marks naming an oplog entry this node no longer holds (ADR-160).
+    ///
+    /// The invariant every remover of an oplog row has to keep: retention only
+    /// removes a mark alongside the entry it names, so a mark left behind by
+    /// any OTHER remover can never be collected afterwards. Zero, always --
+    /// an orphan here is the one growth path nothing bounds.
+    pub(crate) fn held_orphans(&self) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        let held = txn.open_table(tables::OPLOG_HELD)?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        let mut orphans = 0;
+        for row in held.iter()? {
+            let (key, _) = row?;
+            if oplog.get(key.value())?.is_none() {
+                orphans += 1;
+            }
+        }
+        Ok(orphans)
+    }
+
+    /// How many entries this node holds as state rather than as history
+    /// (ADR-160). Not zero on a settled node in general -- see the note on
+    /// `OPLOG_HELD` for the two cases that leave marks behind a completed
+    /// transfer.
+    pub(crate) fn held_len(&self) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(tables::OPLOG_HELD)?.iter()?.count())
+    }
+
+    /// Drop the state marks (ADR-160) on every entry `granted` now covers.
+    /// -> whether anything was released.
+    ///
+    /// A snapshot document is held out of the position because the node cannot
+    /// serve a contiguous window containing it. The grant is precisely the
+    /// statement that it now can: the sender served this node a vector it
+    /// stands behind, and every stamp at or below it is covered however the
+    /// document arrived. So the mark has done its job and must go, in the same
+    /// transaction that adopts the coverage.
+    ///
+    /// It matters more than it looks, and not for the obvious reason: a stale
+    /// mark cannot lower a vector that already covers the stamp, because the
+    /// open-time rebuild merges and never lowers. What it can do is withhold a
+    /// raise in the one case the rebuild exists for — a stored vector lost or
+    /// disagreeing with the oplog (ADR-054's repair). A node repaired in that
+    /// state with marks still on covered entries would come back under-claiming
+    /// what it can serve, permanently. Releasing them here is what keeps the
+    /// rebuild able to re-derive the coverage it is there to re-derive.
+    ///
+    /// The table is NOT bounded by "a snapshot in flight" -- see the note on
+    /// `OPLOG_HELD` -- so this removes in place rather than collecting the
+    /// covered keys first. Materialising them would put an allocation
+    /// proportional to a repaired collection inside the final page's write
+    /// transaction, holding the single writer while it built.
+    fn release_held_under(
+        txn: &redb::WriteTransaction,
+        granted: &kimmy_core::VersionVector,
+    ) -> Result<bool> {
+        let mut released = false;
+        txn.open_table(tables::OPLOG_HELD)?.retain(|key, ()| {
+            let Ok(stamp) = codec::decode_oplog_key(key) else {
+                // A key this build cannot read is kept. Dropping it would
+                // silently raise the position over whatever it named.
+                return true;
+            };
+            // `get` answers `Hlc::ZERO` for an origin the grant does not
+            // mention, so such an entry is covered only if its own stamp is
+            // ZERO — which no real entry's is, since `HlcClock::tick` never
+            // mints one. An unmentioned origin therefore keeps its marks,
+            // which is the conservative half.
+            let covered = stamp.hlc <= granted.get(stamp.node);
+            released |= covered;
+            !covered
+        })?;
+        Ok(released)
     }
 
     /// The highest `Hlc` retention has removed from the oplog.
@@ -2392,6 +2512,21 @@ pub(crate) fn append_oplog_at(
     if position == Position::Raise {
         raise_version(txn, tables::OPLOG_VERSIONS, &entry.stamp)?;
         raise_version(txn, tables::OPLOG_WITNESSED, &entry.stamp)?;
+        // An entry appended in POSITION is not state, so any mark on its key
+        // goes -- whoever left it. A key can carry a stale mark without the
+        // entry: `rewind` removes oplog rows directly, and a mark it left
+        // behind would otherwise make the re-delivered entry invisible to
+        // every later `Engine::open` while the vectors it just raised said
+        // otherwise. Symmetric with the `Hold` arm below rather than a special
+        // case, which is what stops the two drifting. ADR-160.
+        txn.open_table(tables::OPLOG_HELD)?.remove(key.as_slice())?;
+    } else {
+        // Marked in the entry's own transaction, for the same reason the raise
+        // is: a mark that outlived a rolled-back entry would hold the position
+        // down over something this node does not hold, and one that was lost
+        // while the entry committed would let `Engine::open` raise over it.
+        // ADR-160.
+        txn.open_table(tables::OPLOG_HELD)?.insert(key.as_slice(), ())?;
     }
 
     let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
