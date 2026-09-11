@@ -1205,6 +1205,93 @@ impl Engine {
         Ok(orphans)
     }
 
+    /// Record where a snapshot pull with `peer` stands, in the transaction the
+    /// page is already writing. ADR-161.
+    ///
+    /// `peer` is a key and nothing else here: the bytes are written and read
+    /// back and never interpreted, the same way `OPLOG_VERSIONS` is keyed by a
+    /// node id. What a peer *is* stays in the cluster layer.
+    pub(crate) fn persist_snapshot_progress_in_txn(
+        txn: &redb::WriteTransaction,
+        peer: NodeId,
+        progress: &crate::snapshot::SnapshotProgress,
+    ) -> Result<()> {
+        let encoded = serde_json::to_vec(progress)?;
+        txn.open_table(tables::SNAPSHOT_PROGRESS)?
+            .insert(peer.to_bytes().as_slice(), encoded.as_slice())?;
+        Ok(())
+    }
+
+    /// Forget the snapshot pull with `peer`. -> whether there was one.
+    ///
+    /// The answer is what tells the caller whether anything was written, which
+    /// is what decides whether the transaction commits at all -- a completed
+    /// snapshot that never persisted a cursor must not cost an fsync to clear
+    /// a row that is not there.
+    pub(crate) fn forget_snapshot_progress_in_txn(
+        txn: &redb::WriteTransaction,
+        peer: NodeId,
+    ) -> Result<bool> {
+        let existed = txn
+            .open_table(tables::SNAPSHOT_PROGRESS)?
+            .remove(peer.to_bytes().as_slice())?
+            .is_some();
+        Ok(existed)
+    }
+
+    /// Whether a snapshot pull with `peer` is recorded, without opening a
+    /// write transaction. Used to decide whether clearing one is worth a
+    /// transaction of its own.
+    pub(crate) fn snapshot_progress_recorded(&self, peer: NodeId) -> Result<bool> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(tables::SNAPSHOT_PROGRESS) else { return Ok(false) };
+        Ok(table.get(peer.to_bytes().as_slice())?.is_some())
+    }
+
+    /// Clear a recorded snapshot pull with `peer`, in a transaction of its
+    /// own. Only for the one case that has no page transaction to ride in: a
+    /// final page that wrote nothing.
+    pub(crate) fn forget_snapshot_progress(&self, peer: NodeId) -> Result<()> {
+        let txn = self.begin_write(WriterHolder::Repair)?;
+        let existed = Self::forget_snapshot_progress_in_txn(&txn, peer)?;
+        if existed {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(())
+    }
+
+    /// Every snapshot pull this node was part-way through when it stopped, by
+    /// peer. Read once at startup; the cluster layer decides what to do with
+    /// them.
+    ///
+    /// A record that cannot be decoded is dropped with a warning rather than
+    /// failing the open. It is an optimisation -- the worst a lost record
+    /// costs is a snapshot that starts again -- and a node that will not start
+    /// because it cannot read a resume hint is a worse failure than the one
+    /// the hint avoids.
+    pub fn snapshots_to_resume(&self) -> Result<Vec<(NodeId, crate::snapshot::SnapshotProgress)>> {
+        let txn = self.db.begin_read()?;
+        let Ok(table) = txn.open_table(tables::SNAPSHOT_PROGRESS) else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let Ok(bytes) = <[u8; 16]>::try_from(key.value()) else {
+                warn!("a recorded snapshot pull has an unreadable peer key; ignored");
+                continue;
+            };
+            let peer = NodeId::from_bytes(bytes);
+            match serde_json::from_slice(value.value()) {
+                Ok(progress) => out.push((peer, progress)),
+                Err(e) => {
+                    warn!(%peer, error = %e, "a recorded snapshot pull could not be read; it will start again")
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// How many entries this node holds as state rather than as history
     /// (ADR-160). Not zero on a settled node in general -- see the note on
     /// `OPLOG_HELD` for the two cases that leave marks behind a completed

@@ -13684,3 +13684,86 @@ unaffected: the change is invisible outside this node.
 `re_delivering_documents_a_snapshot_already_applied_does_not_claim_them`,
 `a_stale_mark_can_never_lower_a_vector_that_already_covers_it`, and
 `a_database_with_no_held_table_opens_as_it_always_did`.
+
+---
+
+## ADR-161 — A snapshot pull is recorded where it stands, so a restart resumes it
+
+**Decision.** After a snapshot page that wrote something, the receiver records
+where the pull stands in a node-local table keyed by the peer serving it, **in
+that page's own transaction**. A completed pull's record is removed. At startup
+the replication loop takes up every recorded pull that is unfinished and has
+applied at least one page, so a snapshot interrupted by a restart resumes rather
+than beginning again at page one.
+
+**Why.** A snapshot that does not fit one round already resumes across rounds
+(ADR-152) — but only while the process lives. The progress is a
+`HashMap<NodeId, SnapshotProgress>` on the cluster transport and dies with it, so
+a member restarted part-way through a large snapshot transferred everything it
+had already applied a second time. ADR-152 named persisting it as one of two
+candidate closures for the same family of problems ADR-160 closed the other half
+of.
+
+**The bound, and it is the whole design.** `apply_snapshot_page` opens a
+transaction only when the page has something to write, and aborts it otherwise,
+because *a page this node already holds must not cost an fsync* (ADR-152). The
+cursor rides in that transaction and is written **only when the page wrote
+something**, which preserves that rule exactly rather than trading it away. So:
+
+> **A restart resumes at the last page that wrote something. Pages that were
+> no-ops are re-pulled, and they are cheap to redo precisely because they wrote
+> nothing.**
+
+The alternative — persisting on every page — pays an fsync on the **normal**
+path to buy a tighter resume on the **rare** one, which is the wrong way round.
+
+One case has no page transaction to ride in: a final page that writes nothing
+and grants nothing, which still has to clear a record an earlier page left.
+That is the only place a transaction is opened for bookkeeping alone, it happens
+at most once per snapshot, and it is guarded by a read so a pull that never
+recorded a cursor costs nothing.
+
+**The peer is a parameter, not a field.** `apply_snapshot_page` takes the peer;
+`SnapshotProgress` does not carry it. **`SnapshotProgress` describes the
+snapshot; the peer describes the exchange.** Where a pull has got to, what it
+will grant and how many pages it has applied are not facts about which peer is
+serving it, and putting the peer on the struct would record a property of the
+conversation inside a record of the work — **the mirror image of the category
+error ADR-160 rejects for Hold-versus-Raise**, made one ADR later. Anyone
+tempted to simplify the parameter onto the struct should read that ADR first.
+
+It is also the cheaper shape: both public constructors keep their signatures, so
+only `apply_snapshot_page`'s call sites move, and the transport already holds the
+peer — it is the map key it looks the progress up by.
+
+**The key is opaque to storage.** `SNAPSHOT_PROGRESS` is keyed by the peer's
+bytes, which this module stores and never interprets. That is not a new thing
+for storage to know: `OPLOG_VERSIONS` and `OPLOG_WITNESSED` are already keyed by
+a node id the same way, so this is the third instance of a pattern rather than a
+concept crossing a layer.
+
+**The backup format**, in the same form as ADR-160's answer, so that a reader who
+has understood one table's absence understands this one immediately.
+`SNAPSHOT_PROGRESS` is **not** in it. Tables are enumerated by a hand-written tag
+in both directions and an unknown tag is a hard restore error, so adding one
+makes every backup this build writes unrestorable by an older one.
+
+The consequence, decided rather than left to be inferred: **a node restored from
+a backup restarts any snapshot it was part-way through rather than resuming it —
+degraded, correct, and bounded by the same sentence as above.** A restore is
+already a full rebuild of a node's state; beginning a snapshot again is a cost
+of the same kind, and it is paid once.
+
+**A record that cannot be read is dropped, not fatal.** An unreadable row is
+logged and ignored, and a table that cannot be read at all leaves every pull to
+start again. The record is an optimisation; a node that will not start because it
+cannot read a resume hint is a worse failure than the transfer the hint avoids.
+
+**Cost.** One table. One `insert` per page that wrote something — inside a
+transaction that was going to commit anyway, so no extra fsync on any path — one
+`remove` at completion, and one read of the table at startup.
+
+**Held by** `an_interrupted_snapshot_is_recorded_and_resumes_at_its_last_page`,
+`a_completed_snapshot_leaves_no_record_to_resume`, and
+`a_page_that_wrote_nothing_records_no_cursor`, which is the bound above asserted
+rather than described.

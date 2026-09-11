@@ -978,7 +978,11 @@ async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
     b.engine
-        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .apply_snapshot_page(
+            a.engine.node_id(),
+            &mut kimmy_storage::SnapshotProgress::whole_database(),
+            &page,
+        )
         .unwrap();
 
     a.engine.create_collection("shop", "orders").unwrap();
@@ -2616,7 +2620,11 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
     // about the stored shape of the definition, nothing else.
     page.versions = kimmy_core::VersionVector::default();
     b.engine
-        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .apply_snapshot_page(
+            a.engine.node_id(),
+            &mut kimmy_storage::SnapshotProgress::whole_database(),
+            &page,
+        )
         .unwrap();
     assert!(
         b.engine
@@ -2695,7 +2703,11 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
     b.engine
-        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .apply_snapshot_page(
+            a.engine.node_id(),
+            &mut kimmy_storage::SnapshotProgress::whole_database(),
+            &page,
+        )
         .unwrap();
     assert_eq!(
         b.engine.get_collection("shop", "orders").unwrap().index("probe").unwrap().created,
@@ -2968,7 +2980,11 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
     page.documents.clear();
     page.versions = kimmy_core::VersionVector::default();
     engine
-        .apply_snapshot_page(&mut kimmy_storage::SnapshotProgress::whole_database(), &page)
+        .apply_snapshot_page(
+            a.engine.node_id(),
+            &mut kimmy_storage::SnapshotProgress::whole_database(),
+            &page,
+        )
         .unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
     a.engine

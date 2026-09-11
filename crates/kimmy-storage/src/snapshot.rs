@@ -91,7 +91,8 @@
 use std::fmt;
 
 use kimmy_core::{
-    CollectionId, DocId, Hlc, IndexMeta, OpKind, OplogEntry, Stamp, VectorConfig, VersionVector,
+    CollectionId, DocId, Hlc, IndexMeta, NodeId, OpKind, OplogEntry, Stamp, VectorConfig,
+    VersionVector,
 };
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
@@ -261,7 +262,7 @@ pub struct SnapshotPage {
 /// the sender's vector as served with the first page — so that a snapshot
 /// resumed rounds later still adopts the one vector every document it carried
 /// is at or below.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotProgress {
     /// The one collection the snapshot is of, or `None` for the whole
     /// database.
@@ -303,6 +304,23 @@ impl SnapshotProgress {
             documents: 0,
             complete: false,
         }
+    }
+
+    /// This progress as it stands after `page` has been applied, `applied`
+    /// documents of it having been written here.
+    ///
+    /// Split out because the record persisted in the page's own transaction
+    /// has to be the state the page LEAVES, and that transaction commits
+    /// before the caller's `progress` is advanced. One function so the two
+    /// cannot drift: a persisted cursor that disagreed with the in-memory one
+    /// would resume somewhere neither had been.
+    fn advanced(&self, page: &SnapshotPage, applied: usize) -> Self {
+        let mut next = self.clone();
+        next.after = page.next.clone();
+        next.pages += 1;
+        next.documents += applied;
+        next.complete = page.next.is_none();
+        next
     }
 
     /// The collection the snapshot is scoped to, if any.
@@ -497,6 +515,7 @@ impl Engine {
     /// page applied under it is never asked for again.
     pub fn apply_snapshot_page(
         &self,
+        peer: NodeId,
         progress: &mut SnapshotProgress,
         page: &SnapshotPage,
     ) -> Result<SnapshotApplied> {
@@ -517,7 +536,10 @@ impl Engine {
             progress.granted = Some(page.versions.clone());
         }
         let complete = page.next.is_none();
-        let grant = if complete { progress.granted.as_ref() } else { None };
+        // Cloned rather than borrowed: the borrow would outlive the page's
+        // transaction and keep `progress` frozen past the point it is
+        // advanced. It is one vector, on the last page only.
+        let grant = if complete { progress.granted.clone() } else { None };
 
         let mut applied = 0usize;
         let mut superseded = 0usize;
@@ -596,8 +618,31 @@ impl Engine {
             // snapshot costs no commit of bookkeeping (ADR-119's rule for a
             // batch's vector).
             let mut wrote = !pending.is_empty();
-            if let Some(granted) = grant {
+            if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
+            }
+            // Where the pull has got to, in the page's own transaction so a
+            // snapshot still costs no commit of bookkeeping (ADR-152's rule,
+            // which ADR-161 preserves rather than trades away).
+            //
+            // Only on a page that wrote something. A page this node already
+            // holds must not cost an fsync, so the cursor is not persisted for
+            // one -- which bounds the resume: a restart resumes at the last
+            // page that WROTE something, and the no-op pages after it are
+            // re-pulled. They are cheap to redo precisely because they wrote
+            // nothing.
+            //
+            // A completed snapshot has no cursor to leave behind, so the
+            // record goes; whether one was there decides whether that is a
+            // write at all.
+            if complete {
+                wrote |= Engine::forget_snapshot_progress_in_txn(&txn, peer)?;
+            } else if wrote {
+                Engine::persist_snapshot_progress_in_txn(
+                    &txn,
+                    peer,
+                    &progress.advanced(page, pending.len()),
+                )?;
             }
             if wrote {
                 txn.commit()?;
@@ -631,10 +676,18 @@ impl Engine {
             self.publish(published);
         }
 
-        progress.after = page.next.clone();
-        progress.pages += 1;
-        progress.documents += applied;
-        progress.complete = complete;
+        *progress = progress.advanced(page, applied);
+        // The one completion with no page transaction to ride in: a final page
+        // that wrote nothing, which cannot clear a record an earlier page
+        // left. Checked before it is opened, so a snapshot that never
+        // persisted a cursor costs nothing here. ADR-161.
+        if complete
+            && page.documents.is_empty()
+            && grant.is_none()
+            && self.snapshot_progress_recorded(peer)?
+        {
+            self.forget_snapshot_progress(peer)?;
+        }
         if complete {
             match progress.scope {
                 None => info!(
@@ -875,9 +928,18 @@ mod tests {
         let mut applied = 0;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            applied += into.apply_snapshot_page(progress, &page).unwrap().applied;
+            applied += into.apply_snapshot_page(from.node_id(), progress, &page).unwrap().applied;
         }
         applied
+    }
+
+    /// A peer id for a fixture that hand-builds a page and has no sender
+    /// engine to take one from. The peer is only a key to
+    /// `apply_snapshot_page` -- it is stored and never interpreted -- so any
+    /// stable value does, and a named one says that rather than leaving a
+    /// reader to wonder whose node it is.
+    fn no_sender() -> NodeId {
+        NodeId::from_bytes([7; 16])
     }
 
     /// Transfer a full snapshot from `from` into `into`.
@@ -958,7 +1020,7 @@ mod tests {
 
         let page = a.snapshot_page(None, None).unwrap();
         let outcome = b
-            .apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page)
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
             .expect("the page applies");
         assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
         assert_eq!(outcome.applied, 2, "the documents restore: {outcome:?}");
@@ -992,7 +1054,7 @@ mod tests {
             }
         }
         let outcome = b
-            .apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page)
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
             .expect("a refused index must not fail the page");
         assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
         assert_eq!(outcome.applied, 1, "the documents restore: {outcome:?}");
@@ -1049,14 +1111,18 @@ mod tests {
         );
 
         let page = a.snapshot_page(None, None).unwrap();
-        let into_b = b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+        let into_b = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .unwrap();
         assert_eq!(into_b.ddl_refused, 0, "the later definition is not a refusal: {into_b:?}");
         assert!(
             b.get_collection("shop", "orders").unwrap().index("by_item").unwrap().unique,
             "the snapshot's definition is the later one and replaces B's"
         );
 
-        let into_c = c.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+        let into_c = c
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .unwrap();
         assert_eq!(
             into_c.ddl_refused, 0,
             "an older definition is history, not a refusal: {into_c:?}"
@@ -1105,7 +1171,7 @@ mod tests {
 
         let before = b.commits();
         let mut progress = SnapshotProgress::whole_database();
-        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert_eq!(outcome.applied, SNAPSHOT_PAGE);
         assert_eq!(b.commits() - before, 1, "one page, one commit, coverage included");
         assert!(progress.is_complete());
@@ -1139,11 +1205,11 @@ mod tests {
         let before = b.commits();
         let first = a.snapshot_page(None, Some(ca.id)).unwrap();
         assert!(first.next.is_some());
-        let outcome = b.apply_snapshot_page(&mut progress, &first).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
         assert_eq!(outcome.applied, 0, "every document already here: {outcome:?}");
         let last = a.snapshot_page(progress.after().cloned(), Some(ca.id)).unwrap();
         assert!(last.next.is_none());
-        let outcome = b.apply_snapshot_page(&mut progress, &last).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &last).unwrap();
         assert_eq!(outcome.applied, 0, "{outcome:?}");
         assert_eq!(b.commits() - before, 0, "a superseded page must not cost a commit");
         assert!(progress.is_complete());
@@ -1191,8 +1257,11 @@ mod tests {
         assert!(last.next.is_none(), "ends at the collection's end");
 
         let mut progress = SnapshotProgress::of_collection(orders.id);
-        assert_eq!(b.apply_snapshot_page(&mut progress, &first).unwrap().applied, SNAPSHOT_PAGE);
-        assert_eq!(b.apply_snapshot_page(&mut progress, &last).unwrap().applied, 5);
+        assert_eq!(
+            b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap().applied,
+            SNAPSHOT_PAGE
+        );
+        assert_eq!(b.apply_snapshot_page(a.node_id(), &mut progress, &last).unwrap().applied, 5);
         assert!(progress.is_complete());
         assert_eq!(progress.documents(), SNAPSHOT_PAGE + 5);
 
@@ -1266,7 +1335,7 @@ mod tests {
         let mut progress = SnapshotProgress::whole_database();
         let first = a.snapshot_page(None, None).unwrap();
         let first_vector = first.versions.clone();
-        b.apply_snapshot_page(&mut progress, &first).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
         assert!(!progress.is_complete());
 
         // Between pages: one document behind the cursor, one ahead of it.
@@ -1276,7 +1345,7 @@ mod tests {
         let last = a.snapshot_page(progress.after().cloned(), None).unwrap();
         assert!(last.next.is_none());
         assert!(last.versions != first_vector, "the final page's vector names the new writes");
-        b.apply_snapshot_page(&mut progress, &last).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &last).unwrap();
         assert!(progress.is_complete());
 
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -1321,7 +1390,7 @@ mod tests {
         assert_eq!(page.dropped, Some(dropped_at), "the drop travels in its place");
         assert!(page.next.is_none());
         let mut progress = SnapshotProgress::of_collection(ca.id);
-        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert!(progress.is_complete());
         assert_eq!(b.collection_dropped_at(ca.id).unwrap(), Some(dropped_at));
 
@@ -1369,6 +1438,7 @@ mod tests {
 
         let outcome = b
             .apply_snapshot_page(
+                a.node_id(),
                 &mut SnapshotProgress::whole_database(),
                 &a.snapshot_page(None, None).unwrap(),
             )
@@ -1408,6 +1478,7 @@ mod tests {
 
         let outcome = b
             .apply_snapshot_page(
+                a.node_id(),
                 &mut SnapshotProgress::whole_database(),
                 &a.snapshot_page(None, None).unwrap(),
             )
@@ -1438,6 +1509,7 @@ mod tests {
 
         let outcome = b
             .apply_snapshot_page(
+                a.node_id(),
                 &mut SnapshotProgress::whole_database(),
                 &a.snapshot_page(None, None).unwrap(),
             )
@@ -1468,8 +1540,9 @@ mod tests {
         for state in &mut page.collections {
             state.created = None;
         }
-        let outcome =
-            b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .unwrap();
         assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         assert_eq!((outcome.applied, outcome.superseded), (0, 1), "{outcome:?}");
     }
@@ -1532,7 +1605,7 @@ mod tests {
 
         let mut progress = SnapshotProgress::of_collection(ca.id);
         let page = a.snapshot_page(None, Some(ca.id)).unwrap();
-        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert_eq!(outcome.applied, 0, "{outcome:?}");
         assert_eq!(outcome.superseded, 1, "{outcome:?}");
         assert_eq!(b.count(&cb).unwrap(), 0, "the previous life must not enter the replacement");
@@ -1543,7 +1616,7 @@ mod tests {
         a.insert(&ca, doc! { "_id": 2, "life": "after the drop" }).unwrap();
         let mut progress = SnapshotProgress::of_collection(ca.id);
         let page = a.snapshot_page(None, Some(ca.id)).unwrap();
-        let outcome = b.apply_snapshot_page(&mut progress, &page).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert_eq!((outcome.applied, outcome.superseded), (1, 1), "{outcome:?}");
         assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some());
         assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none());
@@ -1578,7 +1651,8 @@ mod tests {
 
         let page = a.snapshot_page(None, Some(ca.id)).unwrap();
         assert_eq!(page.dropped, Some(dropped), "the drop travels in the collection's place");
-        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(ca.id), &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
+            .unwrap();
 
         assert!(b.get_collection("shop", "orders").is_err(), "the copy held here went with it");
         assert_eq!(b.count_by_id(ca.id).unwrap(), None);
@@ -1613,7 +1687,8 @@ mod tests {
 
         let page = a.snapshot_page(None, Some(ca.id)).unwrap();
         assert_eq!(page.dropped, Some(dropped));
-        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(ca.id), &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
+            .unwrap();
 
         assert_eq!(b.get_collection("shop", "orders").unwrap().created, cb.created);
         assert_eq!(b.count(&cb).unwrap(), 1, "the newer incarnation and its documents stand");
@@ -1641,7 +1716,7 @@ mod tests {
         let mut progress = SnapshotProgress::of_collection(ca.id);
         let first = a.snapshot_page(None, Some(ca.id)).unwrap();
         assert!(first.next.is_some(), "the fixture needs a page left to resume");
-        let outcome = b.apply_snapshot_page(&mut progress, &first).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
         assert_eq!(outcome.applied, SNAPSHOT_PAGE, "{outcome:?}");
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE, "the partial copy is here");
@@ -1658,7 +1733,7 @@ mod tests {
         assert_eq!(resumed.dropped, Some(dropped), "a resumed page carries the drop too");
         assert!(resumed.collections.is_empty(), "definitions still ride the first page alone");
         assert!(resumed.documents.is_empty() && resumed.next.is_none(), "{resumed:?}");
-        b.apply_snapshot_page(&mut progress, &resumed).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &resumed).unwrap();
         assert!(progress.is_complete());
 
         assert!(
@@ -1773,7 +1848,8 @@ mod tests {
             versions: VersionVector::new(),
             dropped: Some(dropped),
         };
-        b.apply_snapshot_page(&mut SnapshotProgress::of_collection(current.id), &page).unwrap();
+        b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
+            .unwrap();
 
         assert_eq!(
             b.get_collection("shop", "orders").unwrap().created,
@@ -1822,8 +1898,9 @@ mod tests {
             versions: VersionVector::new(),
             dropped: None,
         };
-        let outcome =
-            b.apply_snapshot_page(&mut SnapshotProgress::of_collection(id), &page).unwrap();
+        let outcome = b
+            .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
         assert_eq!((outcome.applied, outcome.superseded), (1, 1), "{outcome:?}");
         assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none(), "the previous life stays buried");
         assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_some(), "the one above the floor lands");
@@ -1960,7 +2037,7 @@ mod tests {
         let stopped = {
             let b = Engine::open(&path).unwrap();
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            b.apply_snapshot_page(&mut progress, &page).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
             assert!(!progress.is_complete(), "the fixture must leave the snapshot unfinished");
             assert!(b.held_len().unwrap() > 0, "an unfinished snapshot holds entries as state");
             b.version_vector().unwrap()
@@ -2030,7 +2107,7 @@ mod tests {
 
         // Page one fixes the grant.
         let first = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        b.apply_snapshot_page(&mut progress, &first).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
 
         // The sender writes while the snapshot is still running, at a stamp
         // above the grant, and beyond the cursor so the next page carries it.
@@ -2038,7 +2115,7 @@ mod tests {
 
         while !progress.is_complete() {
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            b.apply_snapshot_page(&mut progress, &page).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         }
 
         assert!(
@@ -2068,7 +2145,7 @@ mod tests {
         {
             let b = Engine::open(&path).unwrap();
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            b.apply_snapshot_page(&mut progress, &page).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
             assert!(b.held_len().unwrap() > 0);
         }
 
@@ -2110,7 +2187,7 @@ mod tests {
         let mut progress = SnapshotProgress::whole_database();
         let b = Engine::open(&path).unwrap();
         let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         let held = b.held_len().unwrap();
         assert!(held > 0, "the fixture must leave something held");
 
@@ -2222,7 +2299,7 @@ mod tests {
         let b = Engine::open(&path).unwrap();
         let mut progress = SnapshotProgress::whole_database();
         let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert!(b.held_len().unwrap() > 0, "the fixture must leave marks to collect");
 
         let before = b.held_len().unwrap();
@@ -2256,7 +2333,7 @@ mod tests {
         let b = Engine::open(&path).unwrap();
         let mut progress = SnapshotProgress::whole_database();
         let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         let held = b.held_len().unwrap();
         assert!(held > 0);
 
@@ -2290,7 +2367,7 @@ mod tests {
             dropped: None,
         };
         let _ = own;
-        b.apply_snapshot_page(&mut SnapshotProgress::whole_database(), &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
 
         b.rewind_to(mid).unwrap();
         assert_eq!(
@@ -2312,7 +2389,7 @@ mod tests {
         let b = Engine::open(&path).unwrap();
         let mut progress = SnapshotProgress::whole_database();
         let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-        b.apply_snapshot_page(&mut progress, &page).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         assert!(b.held_len().unwrap() > 0);
 
         // Far in the future: nothing is discarded, so every mark stands.
@@ -2324,6 +2401,88 @@ mod tests {
             b.version_vector().unwrap().get(a.node_id()),
             Hlc::ZERO,
             "the reset must skip held entries exactly as the open-time rebuild does"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_snapshot_is_recorded_and_resumes_at_its_last_page() {
+        // Before ADR-161 the progress lived only in a map on the cluster
+        // transport, so a member restarted part-way through a large snapshot
+        // began again at page one and re-transferred everything it had
+        // already applied.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let stopped = {
+            let b = Engine::open(&path).unwrap();
+            let mut progress = SnapshotProgress::whole_database();
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            assert!(!progress.is_complete());
+            progress
+        };
+
+        // The process is gone; only what was written survives.
+        let b = Engine::open(&path).unwrap();
+        let recorded = b.snapshots_to_resume().unwrap();
+        assert_eq!(recorded.len(), 1, "the pull must be recorded against its peer");
+        let (peer, mut resumed) = recorded.into_iter().next().unwrap();
+        assert_eq!(peer, a.node_id());
+        assert_eq!(resumed, stopped, "and it must be exactly where the page left it");
+
+        // And it finishes from there rather than from page one.
+        let more = transfer_under(&b, &a, &mut resumed);
+        assert!(resumed.is_complete());
+        assert_eq!(
+            resumed.documents(),
+            (SNAPSHOT_PAGE + 4),
+            "the resumed pull accounts for every document, counted once"
+        );
+        assert!(more < SNAPSHOT_PAGE, "a resume that re-sent page one would have carried it again");
+    }
+
+    #[test]
+    fn a_completed_snapshot_leaves_no_record_to_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let b = Engine::open(&path).unwrap();
+        transfer(&b, &a);
+        assert!(
+            b.snapshots_to_resume().unwrap().is_empty(),
+            "a finished snapshot has nothing to resume, and a record of one would restart it"
+        );
+    }
+
+    #[test]
+    fn a_page_that_wrote_nothing_records_no_cursor() {
+        // The bound, asserted: the cursor is persisted in the page's own
+        // transaction and only when the page wrote something, so a page this
+        // node already holds still costs no fsync (ADR-152's rule). A restart
+        // therefore resumes at the last page that WROTE something, and the
+        // no-op pages after it are re-pulled -- cheap to redo precisely
+        // because they wrote nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = sender_of_two_pages();
+
+        let b = Engine::open(&path).unwrap();
+        let mut progress = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
+        let after_first = b.snapshots_to_resume().unwrap();
+        assert_eq!(after_first.len(), 1);
+
+        // The same page again: every document supersedes, nothing is written.
+        let mut replay = SnapshotProgress::whole_database();
+        let applied = b.apply_snapshot_page(a.node_id(), &mut replay, &first).unwrap();
+        assert_eq!(applied.applied, 0, "the fixture must be a page that writes nothing");
+        assert_eq!(
+            b.snapshots_to_resume().unwrap(),
+            after_first,
+            "a page that wrote nothing must leave the record where it was"
         );
     }
 
