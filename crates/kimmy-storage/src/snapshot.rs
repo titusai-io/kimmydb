@@ -810,10 +810,35 @@ impl Engine {
     /// per tombstone, and the tombstones to record are written in one
     /// transaction rather than one each. The map is used **only to skip**: an
     /// id it reports live falls through to `restore_collection_drop`, which
-    /// re-reads authoritatively, so a collection created concurrently is raced
-    /// no differently than before. What the fast path decides is that there is
-    /// nothing to do, and that answer cannot go stale underneath this loop —
-    /// nothing here creates a collection or lowers a tombstone.
+    /// re-reads authoritatively, so the expensive branch is unchanged.
+    ///
+    /// # Why a stale `live` set cannot skip a drop that mattered
+    ///
+    /// Not because nothing in this loop creates a collection — that is true
+    /// but it is the weak reason, and it would stop being true the moment
+    /// someone added one. **The skip is equivalent to doing the work, and the
+    /// tombstone comparison is what makes it so**, which holds against a
+    /// concurrent writer this loop does not control.
+    ///
+    /// Take the bad case: a collection is created between the prefetch and the
+    /// lookup, so `live` wrongly says absent and the re-read is skipped.
+    /// Reaching the skip at all requires `dropped <= held[id]`, and:
+    ///
+    /// - a collection standing under that id must have `created` **above**
+    ///   `held[id].hlc`, because `restore_collection` and `sync::apply_ddl`
+    ///   both refuse a create with `created <= dropped.hlc`;
+    /// - so `dropped.hlc <= held[id].hlc < current.created`, which is exactly
+    ///   `aims_at_a_previous_incarnation`'s `predates_create` — the drop would
+    ///   have been **ignored** by the branch that was skipped;
+    /// - and `record_collection_drop` would have left the higher tombstone
+    ///   standing, since `dropped <= existing` writes nothing.
+    ///
+    /// Both halves are no-ops, so the skip loses nothing.
+    ///
+    /// A stale `held` goes the harmless way in both directions too: a
+    /// tombstone recorded concurrently costs at worst a redundant batch write,
+    /// which is idempotent, and one collected by GC costs at worst
+    /// re-recording something already past retention.
     fn apply_carried_drops(&self, page: &SnapshotPage) -> Result<()> {
         if page.dropped_collections.is_empty() {
             return Ok(());

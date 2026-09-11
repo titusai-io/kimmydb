@@ -14092,13 +14092,36 @@ in the same function and nobody measured it.
 
 **Why the prefetched map is safe.** It is used **only to skip**. An id it
 reports live falls through to `restore_collection_drop`, which re-reads
-authoritatively — so a collection created concurrently is raced exactly as
-before, and the expensive branch is unchanged. What the fast path decides is
-that there is *nothing to do*, and that answer cannot go stale underneath the
-loop: nothing in it creates a collection or lowers a tombstone. The batched
-write re-establishes under the writer that each stamp is newer, because the
-map was read outside it — the same thing `record_collection_drop` does for the
-same reason.
+authoritatively, so the expensive branch is unchanged.
+
+The guarantee is not "nothing in this loop creates a collection". That is true,
+but it is a precondition about the loop's own body, and it stops being true the
+moment someone adds a creation to it. **The skip is *equivalent* to doing the
+work**, and the tombstone comparison is what makes it so — which holds even
+against a concurrent writer the loop does not control.
+
+Work the bad case. A collection is created between the prefetch and the lookup,
+so `live` wrongly reports it absent and the authoritative re-read is skipped —
+the exact failure a prefetch invites. Reaching the skip requires
+`dropped <= held[id]`, and then:
+
+- a collection standing under that id must have `created` **above**
+  `held[id].hlc`, because `restore_collection` and `sync::apply_ddl` both
+  refuse a create with `created <= dropped.hlc`;
+- so `dropped.hlc <= held[id].hlc < current.created`, which is precisely
+  `aims_at_a_previous_incarnation`'s `predates_create` clause — the drop would
+  have been **ignored** by the branch that was skipped;
+- and `record_collection_drop` would have left the higher tombstone standing,
+  since `dropped <= existing` writes nothing.
+
+Both halves are no-ops. A stale `held` is harmless in both directions as well:
+a tombstone recorded concurrently costs at worst a redundant batch write, which
+is idempotent, and one collected by GC costs at worst re-recording something
+already past retention.
+
+The batched write re-establishes under the writer that each stamp is newer,
+because the map was read outside it — the same thing `record_collection_drop`
+does for the same reason.
 
 **Cost.** One walk and one read per page instead of per tombstone, and one
 commit instead of one per tombstone. The map is a `HashSet` of ids rather than
