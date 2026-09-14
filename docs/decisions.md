@@ -14581,3 +14581,146 @@ walk per tombstone, so this one is costed explicitly.
 
 `a_carried_delete_does_not_take_a_newer_write` guards behaviour the fix must not
 break and passes without it.
+
+## ADR-168 — The count half defers while either member trails the other and moves
+
+**Decision.** The guard on the count half of the cross-member divergence check
+is made symmetric. ADR-146 drops the document-count probe while the **peer**'s
+witnessed vector trails this node's on some origin and is still moving there.
+It is now also dropped while **this node**, as of the moment its own count was
+read, trailed what the **peer can serve** on some origin other than its own and
+was still moving there. ADR-145's standing-still rule applies to this side
+unchanged: this node's position coming back the same on `FROZEN_CONTACTS`
+consecutive checked contacts is compared. The two sides are folded by one rule:
+either side behind and moving defers; otherwise either side standing still
+compares; neither behind compares.
+
+To judge this node's side at the right moment, `DivergenceProbe` carries
+`mine_at`, this node's witnessed vector read immediately **before** its count —
+in process only; nothing on the wire changes, and a peer on the previous release
+is judged exactly as before.
+
+**Why.** A member's count is read once per tick, before the tick's pulls
+(`kimmy-cluster::peers`), and the peer's count is read when `AskDivergence`
+reaches it, after them. So a member taking in a peer's steady writes compared a
+count that predated entries the peer's count included, found its own lag, and
+after two contacts confirmed a divergence and planned a repair. ADR-146's gate
+could not see it: it asks whether the *peer* has processed everything this node
+has, and the peer had. Measured on a healthy three-member cluster under ordinary
+bulk ingest on one member (0.27.1): replicas confirmed within seconds of the load
+starting, ran `Replay` repairs of 20.0, 28.0, 34.4 and 32.8 s, raised
+`kimmy_sync_repair_rounds_total` 299 → 404 and 23 → 159, and held
+`kimmy_sync_divergent_collections` at 1–2 for about three minutes. Walks of
+`(_id, stamp)` taken while the gauge read above 0 found **no id held at two
+stamps, only missing ids**, and all three members ended identical. The operations
+guide already says what that is: a gauge that fires on ordinary catch-up is worse
+than no gauge. The rule's purpose held in one direction only.
+
+**Why this node's side is judged against what the peer can serve, not what it
+has processed.** The peer's side is witnessed against witnessed (ADR-146) because
+it asks whether the peer has *processed* everything this node has. This side asks
+whether this node's count had seen everything the peer's can have, and the answer
+that can ever become yes is whether this node had processed everything the peer
+can *send*: this node's witnessed vector against the peer's servable one, the
+pull's own question (`mine.behind(&theirs)`). A peer that processed an entry
+without appending it — a last-writer-wins loser, a refused or declined schema
+change — has a witnessed position this node cannot reach through that peer,
+because that entry is never sent; it reaches it only by pulling from the entry's
+origin. Judged on it, this node would trail that peer until it did, and an idle
+cluster would defer the count against it for `FROZEN_CONTACTS` contacts after
+every such entry: the trickle ADR-146 removed, reintroduced in reverse. The naive
+symmetric rule is exactly that, which is why this record states the pairing.
+
+The peer's local writes enter this node's trailing map — they are precisely what a
+member trails a writing peer on. This node's own origin does too, in one case: its
+vector is read at the top of the tick, so a local write made after that and pulled
+by the peer before the contact reads as a position this node trailed on. That
+defers, which is right — the count was read before that write as well — and it
+removes a false comparison the gate before this record also made.
+
+**Why the vector read before the count.** Read after, it could name an entry the
+count missed and read this node as level with a peer it still trailed, which is
+the false comparison this record removes. Read before, it can only understate
+what the count saw — the witnessed vector is raised in a batch's last commit,
+after its documents — which errs towards deferring. The order is in
+`kimmy-cluster::peers` and **no test holds it**: the tests build their probes
+themselves, so swapping the two reads there passes them.
+
+**The standing-still rule on this side is defensive, and the sync loop does not
+reach it.** A checked contact happens only when a pull found nothing or reached the
+peer's tail, and either leaves this node covering what the peer could serve; the
+next tick re-reads its vector, so on its next checked contact with that peer it has
+moved on every origin it trailed and the count of still sightings starts again. A
+member whose inbound replication has stopped makes no checked contacts at all, and
+what catches it is its **peers'** side — ADR-145's rule, unchanged. The rule is kept
+so that a self side reading the same position on consecutive contacts compares
+rather than defers indefinitely, and it can only compare where the gate before
+this record compared too; its test holds a probe still across contacts, which the
+loop never builds, and says so.
+
+**Consequence, named: the count half does not compare against a member that keeps
+writing.** It takes no bulk load: one document a round on one member keeps every
+contact against that member deferred, because this node trails it on its origin
+and moves. Contacts between two members that are level with each other still
+compare. On a cluster where members keep writing, no count is compared for as long
+as the writes continue. That is structural, not incidental, and it is the trade taken: a
+count cannot be compared honestly while counts are legitimately in motion, and a
+gauge that is loud and wrong on ordinary catch-up is worse than one that is quiet.
+**The existence half is unaffected** and still reports a collection one member
+holds and another lacks under load. What goes undetected while writes continue is
+a run of missing documents inside a collection every member holds, against a
+member that keeps writing, until its writes pause long enough for a comparison.
+`operations.md` says this beside the gauge, and a test pins it on a single writer
+taking one document a round — the case the gate before this record compared. What detects divergence under sustained write is filed as its
+own question — an `(id, stamp)` comparison, which is what distinguished the false
+confirmations above from a real divergence while the load ran.
+
+**Alternatives.**
+- *Document the behaviour instead.* It would record the gauge as doing, on a
+  member draining a backlog, the thing the guide calls worse than no gauge — and
+  the lag gauge an operator would be told to read beside it read 0 against a
+  28,866-document backlog in the same measurement.
+- *Compare counts at a common processed vector.* Exact, but it needs a vector per
+  collection the probe frame does not carry, on a check whose cost under load has
+  already been a round's work to recover (ADR-157).
+- *Carry the peer's vector on the `Divergence` answer, read with its count.* It
+  would close the residual below, at the price of a wire field and a mixed-version
+  answer; not needed for the measured defect.
+- *Judge this node's side on the peer's witnessed vector.* Rejected above.
+
+**Limitation, named: a difference between count and servable vector is invisible
+to this gate, and state applied under `Position::Hold` creates exactly that.** The
+gate asks "are the two members level?" of vectors and then "do they differ?" of
+counts. Anything that moves a member's count without moving its servable vector
+breaks the pairing, and two routes do it today. A member that has applied a carried
+delete under `Hold` (ADR-167) and not since appended from that origin in position —
+during a pull, and after one completes too — holds a count **lower** than its
+servable vector implies; a member holding snapshot documents under `Hold` above its
+advertised vector (ADR-160) holds a count **higher**. A member judged level against
+such a member, and lacking the same held entries itself, compares, and two
+consecutive probes of that collection against it confirm. Where the comparing
+member can still take those entries from another member, the confirmation is
+held state; where no member can serve them, the difference is real. This record neither
+creates nor removes that — the comparison ran before it too — but a false
+confirmation seen after it ships should be checked against these two routes before
+it is read as this fix failing. Making an equal-stamp delete append in position
+would close the first once the entry arrives, not while it is held; the second is
+ADR-160's own residual.
+
+**Residual, stated.** The peer can advance between the contact's opening and its
+count read — a window that holds this node's pull and its apply, including any
+wait for the writer, so it is not bounded by a fixed time — which this record does
+not judge. It confirms only when two consecutive probes of the same collection
+against that peer both fall in it; a contact that finds this node level clears its
+memo, and the next tick's count, read before that tick's pulls, trails the peer's
+new writes and defers.
+
+**Held by** `this_node_behind_and_moving_defers_and_standing_still_compares`,
+`this_node_is_judged_on_what_the_peer_can_serve_not_on_what_it_processed` and
+`either_side_moving_defers_and_otherwise_a_still_side_compares` in the transport
+tests; and in `kimmy-cluster`'s replication tests,
+`a_member_draining_its_peers_writes_does_not_compare_a_count_it_read_before_its_pull`
+(the defect), `a_self_side_held_still_is_compared_and_its_real_difference_found`
+(the defensive standing-still rule, on a probe held still by the test), and
+`while_one_member_keeps_writing_the_count_half_against_it_stays_quiet` (the
+consequence, pinned: it compares, and mismatches, without this record).

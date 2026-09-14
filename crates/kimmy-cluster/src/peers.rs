@@ -354,6 +354,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                           collections; skipping this tick's probe rotation");
                 }
                 let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
+                    // What the count below can have seen, read first so it can
+                    // only understate it (ADR-168): a vector read after the
+                    // count could name an entry the count missed, and read this
+                    // node as level with a peer it still trailed.
+                    let mine_at = match engine.witnessed_vector() {
+                        Ok(vector) => Some(vector),
+                        Err(e) => {
+                            warn!(error = %e, "divergence check: could not read this node's \
+                                  witnessed vector; judging only the peer's side this tick");
+                            None
+                        }
+                    };
                     let mine_count = match engine.count_by_id(id) {
                         Ok(count) => count,
                         Err(e) => {
@@ -362,7 +374,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             None
                         }
                     };
-                    DivergenceProbe { id, mine_count }
+                    DivergenceProbe { id, mine_count, mine_at }
                 });
                 // The tick's wall-clock budget for draining (ADR-157). A
                 // peer whose pull the batch cap truncated is pulled from
@@ -399,7 +411,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     let span = contact.span();
                     let started = Instant::now();
                     let pulled =
-                        sync_once_with(&engine, peer, &config.secret, probe, &mut stalls)
+                        sync_once_with(&engine, peer, &config.secret, probe.clone(), &mut stalls)
                             .instrument(span)
                             .await;
                     let took = started.elapsed();

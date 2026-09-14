@@ -1295,7 +1295,7 @@ async fn the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_c
     assert!(b.engine.witnessed_vector().unwrap().behind(&theirs).is_none(), "the false belief");
     assert!(b.engine.get_collection("shop", "stranded").is_err(), "and yet B does not have it");
 
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None, mine_at: None });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
 
     assert_eq!(
@@ -1321,7 +1321,7 @@ async fn a_converged_cluster_has_no_divergence() {
     sync(&a, &b).await; // both directions witness the other's tail
 
     let mine_count = b.engine.count_by_id(ca.id).unwrap();
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count, mine_at: None });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
     assert_eq!(outcome.divergent, Some(BTreeSet::new()), "{outcome:?}");
 }
@@ -1344,7 +1344,7 @@ async fn a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely() {
         a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
     }
 
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None, mine_at: None });
     let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
     assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
     assert!(!first.exhausted, "the batch cap truncated this round's window: {first:?}");
@@ -1367,7 +1367,7 @@ async fn a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wr
         a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
     }
 
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None, mine_at: None });
     let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
     assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
     assert!(first.exhausted, "40 entries fit comfortably under the batch cap: {first:?}");
@@ -1408,7 +1408,7 @@ async fn only_the_probed_collection_is_ever_counted() {
     b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
 
     let mine_count = b.engine.count_by_id(ca.id).unwrap();
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count, mine_at: None });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
     assert_eq!(
         outcome.divergent,
@@ -1442,7 +1442,7 @@ async fn a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_diverge
     }
 
     let mine_count = a.engine.count_by_id(ca.id).unwrap();
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count, mine_at: None });
     let outcome = sync_once(&a.engine, b.addr, SECRET, probe).await.unwrap();
     assert_eq!(
         outcome.divergent,
@@ -3744,4 +3744,110 @@ async fn a_delete_does_not_yet_reach_a_member_through_one_that_never_held_the_do
         c.engine.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
         "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
     );
+}
+
+// -----------------------------------------------------------------------
+// The count half on both sides (ADR-168)
+// -----------------------------------------------------------------------
+
+/// A probe built the way `kimmy-cluster::peers` builds one: this node's
+/// witnessed vector first, then its count.
+fn probe_of(engine: &Engine, id: kimmy_core::CollectionId) -> Option<DivergenceProbe> {
+    let mine_at = Some(engine.witnessed_vector().unwrap());
+    let mine_count = engine.count_by_id(id).unwrap();
+    Some(DivergenceProbe { id, mine_count, mine_at })
+}
+
+#[tokio::test]
+async fn a_member_draining_its_peers_writes_does_not_compare_a_count_it_read_before_its_pull() {
+    // The defect: a member's count is read once per tick, before its pulls,
+    // and the peer's when the probe reaches it, after them. A replica taking
+    // in an origin's steady writes compared the two, found its own lag, and
+    // after two such contacts confirmed a divergence and ran a repair for
+    // it. The gate deferred only when the PEER trailed.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 0 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    for round in 1..=6i64 {
+        for i in 0..20 {
+            a.engine.insert(&ca, doc! { "_id": round * 100 + i }).unwrap();
+        }
+        let probe = probe_of(&b.engine, ca.id);
+        let outcome = sync_once_with(&b.engine, a.addr, SECRET, probe, &mut stalls).await.unwrap();
+        assert!(outcome.divergent.is_some(), "round {round}: the check must have run: {outcome:?}");
+        assert_eq!(outcome.count_probe, None, "round {round}: nothing compared: {outcome:?}");
+        assert!(outcome.count_probe_deferred, "round {round}: deferred, and counted as such");
+    }
+
+    // The writes stop and the replica catches up: its next count is compared,
+    // and agrees.
+    let probe = probe_of(&b.engine, ca.id);
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, probe, &mut stalls).await.unwrap();
+    assert_eq!(outcome.count_probe, Some((ca.id, false)), "compared, and equal: {outcome:?}");
+}
+
+#[tokio::test]
+async fn a_self_side_held_still_is_compared_and_its_real_difference_found() {
+    // The self side's standing-still rule, which is defensive: the sync loop
+    // re-reads this node's vector every tick and a checked contact leaves it
+    // covering the peer, so the loop never presents the same trailing position
+    // twice -- a wedged member is caught by its PEERS' side (ADR-145). This
+    // test holds the probe's vector and count still across contacts itself,
+    // the one way to reach the rule, and asserts it compares rather than
+    // defers for ever: after FROZEN_CONTACTS deferred contacts the count is
+    // compared and the difference found.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    let stuck = probe_of(&b.engine, ca.id);
+    a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    for contact in 1..=kimmy_cluster::FROZEN_CONTACTS {
+        let outcome =
+            sync_once_with(&b.engine, a.addr, SECRET, stuck.clone(), &mut stalls).await.unwrap();
+        assert!(outcome.count_probe_deferred, "contact {contact}: not yet still: {outcome:?}");
+    }
+    for contact in 0..2 {
+        let outcome =
+            sync_once_with(&b.engine, a.addr, SECRET, stuck.clone(), &mut stalls).await.unwrap();
+        assert_eq!(
+            outcome.count_probe,
+            Some((ca.id, true)),
+            "still for FROZEN_CONTACTS: compared, and the difference found ({contact}): {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn while_one_member_keeps_writing_the_count_half_against_it_stays_quiet() {
+    // Pinned, because it is deliberate and must not be discovered: it takes no
+    // bulk load. One document a round on one member keeps every contact against
+    // it deferred -- this node trails it on its origin and moves -- so no count
+    // is compared against that member while it writes. The gate before ADR-168
+    // compared here, and found a mismatch, on the first round: this is the
+    // consequence of the change, not behaviour it inherited.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    for round in 0..12i64 {
+        a.engine.insert(&ca, doc! { "_id": round }).unwrap();
+        let probe = probe_of(&b.engine, ca.id);
+        let outcome = sync_once_with(&b.engine, a.addr, SECRET, probe, &mut stalls).await.unwrap();
+        assert_eq!(outcome.count_probe, None, "round {round}: {outcome:?}");
+        assert!(outcome.count_probe_deferred, "round {round}: deferred, not skipped");
+    }
 }
