@@ -13287,7 +13287,8 @@ removal inside a pass ADR-151 has just finished bounding, and because the
 retention pass is what *collects* the tombstone the residue is identified by,
 so the two would have to agree about an order they currently do not need to.
 
-**Residuals, stated.** **A purge deferred on a long-running process is not
+**Residuals, stated.** *(The first is closed by the addendum at the end of
+this ADR.)* **A purge deferred on a long-running process is not
 retried until that process restarts or the name is created again, and past one
 tombstone-retention window neither ending is guaranteed.** The only way to
 reach the deferral at all is a chunk giving up on the writer, which is the
@@ -13337,6 +13338,49 @@ Each of those seven has been checked by reverting the production line it names
 — the purge loop, the tombstone's insert in the burial's transaction, the
 chunk bound, the sweep at `open`, the catalogue guard, the creation-side purge,
 and the tolerated `WriterBusy` — and watching it fail.
+
+**Addendum, 2026-09-14: an owed purge is finished while the node runs.** The
+first residual above is closed. Before it collects anything, the retention pass
+runs `Engine::finish_owed_drops`, which finds an owed purge the way `open` does
+— a collection tombstone with no collection over it and rows beneath — and
+removes it with the same chunked purge. It logs each collection and the rows
+it owes before it starts, and one line when it is done.
+
+The ordering this ADR declined to make the two agree on now holds by
+construction:
+
+- **The pass purges before it collects.** What is owed is removed first, and
+  the collection tombstones are collected after.
+- **A tombstone with rows under it is not collected, however old.**
+  `collect_dropped_collections` keeps it, so the marker outlasts the residue it
+  marks. A chunk that gives up inside the pass leaves the rest for the next
+  pass, which finds it by the same kept tombstone.
+
+The purge is the same one-chunk-at-a-time removal, so no transaction of the
+pass holds the writer longer than before (ADR-151). What it adds is length to
+the pass that does the work, reported as `dropped_rows` on that pass's log
+line. A pass with nothing owed reads the dropped-collections table, which
+`collect_dropped_collections` already walks whole, plus two seeks per dropped
+id, and takes no writer.
+
+A tombstone kept past `storage.tombstone_retention_secs` lives at most until
+the pass that finishes its purge, which on a node whose writer is free is the
+next one. While it lives it answers a replayed creation as it did inside the
+window, which is what it is for. With `storage.gc_interval_secs = 0` no pass
+runs, and the rows wait for the next start as before.
+
+Unchanged: the sweep at `open` still finishes an interrupted drop before the
+member binds. Making it chunked and off the open path is a separate change. The
+`WARN` a giving-up chunk logs now names the retention pass rather than the next
+start.
+
+Tested by `a_drop_left_owed_by_a_busy_writer_is_finished_by_the_next_retention_pass`
+(more than a chunk owed under a collection and its vector shadow after a chunk
+gave up, gone after one pass without reopening, tombstones kept) and
+`a_collection_tombstone_is_kept_while_its_drop_still_owes_rows`. Each was
+checked by reverting its production line and watching it fail.
+`a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing` still pins the
+start.
 
 ---
 

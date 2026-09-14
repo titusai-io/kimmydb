@@ -1421,6 +1421,7 @@ fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
+                    dropped_rows = outcome.dropped_rows_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),
