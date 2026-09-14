@@ -224,7 +224,7 @@ jobs:
       # Pinned to a release of the installer rather than its floating tag.
       - name: Install nextest
         if: needs.changes.outputs.docs_only != 'true'
-        uses: taiki-e/install-action@v2.87.2
+        uses: taiki-e/install-action@v2.87.8
         with:
           tool: nextest
 
