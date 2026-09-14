@@ -971,6 +971,15 @@ impl Engine {
             };
 
             if !wins {
+                // Superseded, but in a window contiguous from this node's
+                // position: an entry this node holds as state (ADR-160) has
+                // now arrived as history, so its mark goes and the vectors
+                // cover it (ADR-169). Nothing is appended and nothing
+                // published; the entry already has both.
+                if position == Position::InWindow {
+                    drop(docs);
+                    crate::engine::release_held_in_position(txn, &entry.stamp)?;
+                }
                 self.witness(&entry.stamp);
                 return Ok(RemoteApplied::Superseded);
             }

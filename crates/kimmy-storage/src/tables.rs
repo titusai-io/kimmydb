@@ -162,17 +162,18 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 ///
 /// **What removes a mark, and what does not.** A mark goes when the entry stops
 /// being state: a completed snapshot's grant releases every stamp it covers, in
-/// the transaction that adopts it; an append in position clears the key;
-/// retention collects the mark with the entry it names; and a rewind removes it
-/// with the row it discards.
+/// the transaction that adopts it; the entry arriving in a window contiguous
+/// from this node's position releases it, whether that arrival appends the key
+/// or is superseded at it (ADR-169); retention collects the mark with the entry
+/// it names; and a rewind removes it with the row it discards.
 ///
 /// **The table is not self-emptying, and it is worth being exact about when it
 /// is not**, because the ADR-054 repair case turns a lingering mark into a node
 /// that under-claims what it can serve:
 ///
 /// * a **scoped** repair (ADR-148) grants no coverage at all, so none of its
-///   marks is released by a grant. They go on retention, or when the entries
-///   path appends the same key in position.
+///   marks is released by a grant. They go on retention, or when their entries
+///   arrive in a window contiguous from this node's position (ADR-169).
 /// * a **completed whole-database** snapshot releases only what its grant
 ///   covers, and the grant is the FIRST page's vector. A document written on
 ///   the sender after that vector was read, but still ahead of the cursor, is

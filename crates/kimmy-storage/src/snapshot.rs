@@ -2565,24 +2565,22 @@ mod tests {
     }
 
     #[test]
-    fn re_delivering_documents_a_snapshot_already_applied_does_not_claim_them() {
-        // The honest consequence of the confinement, asserted rather than
-        // wished away.
+    fn re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window() {
+        // OVERTURNED BY ADR-169. This test used to assert the opposite, with
+        // this justification: "If the entries path then re-delivers the same
+        // stamps, last-writer-wins supersedes every one of them -- the document
+        // is already at that stamp -- so nothing is appended, the servable
+        // vector does not move, and the marks stay. That is correct: this node
+        // still cannot serve a contiguous window containing them." Its own
+        // next assertion contradicted it: the same contiguous window from the
+        // beginning caught the node up, and the marks it kept were "stale
+        // rather than wrong". Servable means "can serve a contiguous window
+        // containing this"; an entry already in the oplog that arrived in a
+        // window contiguous from this node's position has that property, and
+        // the append event was only ever the proof of it. So the marks go.
         //
-        // An unfinished snapshot's documents are held as state. If the entries
-        // path then re-delivers the same stamps, last-writer-wins supersedes
-        // every one of them -- the document is already at that stamp -- so
-        // nothing is appended, the servable vector does not move, and the
-        // marks stay. That is correct: this node still cannot serve a
-        // contiguous window containing them. Before ADR-160 a restart raised
-        // the position over them anyway and the node claimed a window it could
-        // not serve.
-        //
-        // What must NOT happen is the ADR-054 failure: re-requesting forever.
-        // The witnessed vector is what "am I behind" is judged on, and the
-        // sync path absorbs the window's coverage into it whether or not
-        // anything was appended -- so the node goes quiet while staying
-        // honest about what it can serve.
+        // What must still not happen is the ADR-054 failure, re-requesting for
+        // ever, and the caught-up half below is kept as the evidence.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let (a, _da) = sender_of_two_pages();
@@ -2591,8 +2589,7 @@ mod tests {
         let b = Engine::open(&path).unwrap();
         let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
         b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        let held = b.held_len().unwrap();
-        assert!(held > 0, "the fixture must leave something held");
+        assert!(b.held_len().unwrap() > 0, "the fixture must leave something held");
 
         let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
         b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
@@ -2600,16 +2597,9 @@ mod tests {
 
         assert_eq!(
             b.held_len().unwrap(),
-            held,
-            "supersession releases no mark: nothing was appended, so nothing arrived in position"
+            0,
+            "arrived in a window contiguous from this node's position: released (ADR-169)"
         );
-        // And yet the node is caught up, because the window was contiguous
-        // from ZERO and its later entries WERE appended in position. A version
-        // vector is a per-origin high-water mark, so raising it to the last
-        // entry covers every earlier stamp from that origin -- the marks left
-        // behind are stale rather than wrong, which is safe for the reason
-        // `a_stale_mark_can_never_lower_a_vector_that_already_covers_it`
-        // asserts, and retention collects them with their entries.
         assert_eq!(
             b.version_vector().unwrap().get(a.node_id()),
             a.version_vector().unwrap().get(a.node_id()),
@@ -3795,15 +3785,14 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_applied_mid_pull_is_held_above_the_vector_the_receiver_advertises() {
-        // A KNOWN RESIDUAL, pinned. A carried delete is appended under
-        // `Position::Hold` and marked held. When the same `Delete` then reaches
-        // B by entries, the equal stamp reads as already applied, nothing is
-        // appended in position, and only B's witnessed vector moves -- so B
-        // holds the entry above the vector it advertises, and a member pulling
-        // entries from B defers it until B appends a later entry from that
-        // origin in position (ADR-160's accepted residual, reaching deletes).
-        // Closed by the same equal-stamp append the relay plan proposes.
+    fn a_delete_applied_mid_pull_is_released_when_its_entry_arrives_in_position() {
+        // ADR-167's held-delete residual, closed (ADR-169). A carried delete is
+        // appended under `Position::Hold` and marked held. When the same
+        // `Delete` then reaches B by entries its stamp equals the tombstone's,
+        // so it is superseded -- and until ADR-169 that left the mark, and B
+        // held the entry above the vector it advertises, withheld from every
+        // member pulling entries from B. Arriving in position now releases the
+        // mark and raises the vectors over it.
         let (a, _da) = engine();
         let (b, _db) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
@@ -3817,7 +3806,10 @@ mod tests {
         assert!(first.next.is_some() && !first.deleted_documents.is_empty());
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
             .unwrap();
-        b.apply_batch(&a.read_oplog_from(Hlc::ZERO, 10_000).unwrap()).unwrap();
+        assert!(b.held_len().unwrap() > 0, "the fixture must hold the delete as state first");
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
 
         let cb = b.get_collection("shop", "orders").unwrap();
         assert!(b.get(&cb, &DocId::Int64(0)).unwrap().is_none());
@@ -3828,9 +3820,274 @@ mod tests {
             .find(|e| e.kind == OpKind::Delete && e.doc_id == Some(DocId::Int64(0)))
             .expect("B holds the Delete");
         assert!(
-            delete.stamp.hlc > b.version_vector().unwrap().get(a.node_id()),
-            "the known residual: held above what B advertises -- if this now fails, it closed"
+            delete.stamp.hlc <= b.version_vector().unwrap().get(a.node_id()),
+            "arrived in position: B now advertises it"
         );
+        assert_eq!(b.held_len().unwrap(), 0, "and holds nothing as state");
+        let deletes = b
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == OpKind::Delete)
+            .count();
+        assert_eq!(deletes, 1, "released, not appended a second time");
+    }
+
+    #[test]
+    fn a_held_snapshot_document_is_released_when_its_entry_arrives_in_position() {
+        // ADR-160's own direction. Snapshot documents are appended under
+        // `Hold`; a pull interrupted after its first page leaves them held,
+        // above the servable vector, and ADR-160 says the entries path
+        // releases them when it appends the same key in position. It did not:
+        // the equal stamp superseded the entry first. It does now, and a
+        // reopen -- the rebuild that skips held entries -- agrees.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let b = Engine::open(&path).unwrap();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some());
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held >= SNAPSHOT_PAGE, "the fixture must hold a page as state: {held}");
+        let before_events = b.read_arrival_from(0, 100_000).unwrap().len();
+
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
+
+        assert_eq!(b.held_len().unwrap(), 0, "every held document arrived in position");
+        let theirs = a.version_vector().unwrap().get(a.node_id());
+        assert_eq!(b.version_vector().unwrap().get(a.node_id()), theirs);
+        // Released, not re-appended: no document the page carried gains a second
+        // arrival, so a resumed change stream replays nothing twice. What does
+        // arrive is what the page did not carry -- the last document, and the
+        // collection's creation, which a snapshot restores without logging.
+        let carried: std::collections::BTreeSet<_> =
+            first.documents.iter().map(|d| d.id.clone()).collect();
+        let arrived = b.read_arrival_from(before_events as u64, 100_000).unwrap();
+        assert!(
+            arrived.iter().all(|e| e.doc_id.as_ref().is_none_or(|id| !carried.contains(id))),
+            "a held document gained a second arrival: {arrived:?}"
+        );
+        assert!(!arrived.is_empty(), "the documents the page did not carry still arrive");
+
+        drop(b);
+        let b = Engine::open(&path).unwrap();
+        assert_eq!(b.version_vector().unwrap().get(a.node_id()), theirs, "a reopen agrees");
+    }
+
+    #[test]
+    fn an_entry_re_delivered_out_of_position_keeps_its_mark() {
+        // The release is for an entry arriving as HISTORY. The same page pulled
+        // again is still state, in key order, and must leave the marks and the
+        // vectors where they were.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        let servable = b.version_vector().unwrap();
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+
+        assert_eq!(b.held_len().unwrap(), held, "re-pulled as state, still held");
+        assert_eq!(b.version_vector().unwrap(), servable, "and no vector moved");
+    }
+
+    #[test]
+    fn a_mark_whose_entry_is_gone_releases_nothing_over_it() {
+        // `release_held_in_position` raises the vectors only over an entry the
+        // oplog still holds. A mark can outlive its entry -- a rewind removes
+        // oplog rows directly -- and raising over an entry this node does not
+        // hold would claim a window it cannot serve. The window here ends at
+        // the held entry, and is not exhausted, so no later append and no
+        // coverage merge can raise the vector past it on the test's behalf.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        // The newest held document's entry: remove its oplog row, keep the mark.
+        let held = first.documents.iter().map(|d| d.stamp).max().unwrap();
+        {
+            let db = b.db();
+            let txn = db.begin_write().unwrap();
+            let key = codec::oplog_key(&held);
+            txn.open_table(tables::OPLOG).unwrap().remove(key.as_slice()).unwrap();
+            txn.commit().unwrap();
+        }
+        let before = b.version_vector().unwrap().get(a.node_id());
+        assert!(before < held.hlc, "the fixture must not already cover the held entry");
+
+        // Everything up to and including the held entry, in a window, not
+        // exhausted, introduced at exactly that stamp.
+        let entries: Vec<_> = a
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.stamp.hlc <= held.hlc)
+            .collect();
+        let mut theirs = VersionVector::new();
+        theirs.observe(held);
+        b.apply_peer_batch(&theirs, &entries, held.hlc, false).unwrap();
+
+        let below_held: Hlc = entries
+            .iter()
+            .filter(|e| e.stamp != held && e.stamp.node == held.node)
+            .map(|e| e.stamp.hlc)
+            .max()
+            .unwrap_or(Hlc::ZERO);
+        let after = b.version_vector().unwrap().get(a.node_id());
+        assert!(
+            after < held.hlc,
+            "no vector raised over an entry the oplog does not hold: {after:?} vs {held:?} \
+             (entries below it reach {below_held:?})"
+        );
+    }
+
+    #[test]
+    fn a_held_delete_whose_tombstone_retention_collected_is_released_through_the_append() {
+        // The existing-key branch, reached (found by review). Retention at equal
+        // ages, which the config allows, collects the held delete's tombstone
+        // but keeps its entry as the oplog's newest; the re-delivered `Delete`
+        // then WINS at its key rather than being superseded, meets its own
+        // entry in the oplog, and must release it there. The first form of this
+        // release reopened the oplog table already open on the transaction, and
+        // redb's refusal failed the whole batch -- every later round too.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(0)).unwrap());
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        assert!(b.held_len().unwrap() > 0);
+        let delete = a
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == OpKind::Delete)
+            .unwrap();
+        let later = crate::engine::physical_now_ms() + 10 * 86_400_000;
+        let gc = b.collect_garbage_at(later, crate::gc::RetentionPolicy::new(1, 1)).unwrap();
+        assert!(gc.tombstones_removed >= 1, "{gc:?}");
+        assert!(
+            b.read_oplog_from(Hlc::ZERO, 10_000).unwrap().iter().any(|e| e.stamp == delete.stamp),
+            "the held Delete is the newest entry and is kept"
+        );
+        assert_eq!(b.held_len().unwrap(), 1, "only the Delete's mark is left");
+        assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc);
+
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .expect("the batch must not fail on the release");
+        assert_eq!(b.held_len().unwrap(), 0, "released through append_oplog_at's existing key");
+        assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+    }
+
+    #[test]
+    fn a_window_releases_nothing_above_the_vector_that_introduced_it() {
+        // The contiguity premise against deferral (found by review to hold). An
+        // entry above the vector a peer introduced its window with is deferred,
+        // not taken, so no held entry above that vector is released and no
+        // vector rises past it -- and that holds per stamp, whatever order the
+        // window arrives in.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        let mut stamps: Vec<_> = first.documents.iter().map(|d| d.stamp.hlc).collect();
+        stamps.sort();
+        let mid = stamps[stamps.len() / 2];
+        let above = stamps.iter().filter(|h| **h > mid).count();
+        let mut theirs = kimmy_core::VersionVector::new();
+        theirs.insert(a.node_id(), mid);
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let outcome = b
+            .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        assert!(outcome.deferred > 0);
+        assert!(b.version_vector().unwrap().get(a.node_id()) <= mid, "raised past a deferral");
+        assert!(b.witnessed_vector().unwrap().get(a.node_id()) <= mid);
+        assert_eq!(b.held_len().unwrap(), above, "held {held}, released at or below mid only");
+
+        let mut reversed = window.entries.clone();
+        reversed.reverse();
+        let (c, _dc) = engine();
+        c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        c.apply_peer_batch(&theirs, &reversed, window.scanned_to, false).unwrap();
+        assert!(c.version_vector().unwrap().get(a.node_id()) <= mid, "and in reverse order too");
+    }
+
+    #[test]
+    fn an_entry_re_delivered_outside_a_window_keeps_its_mark() {
+        // The contiguity premise, pinned (ADR-169). Only a window a peer served
+        // from this node's own position vouches that an entry arrived as
+        // history. The same entries applied with no window behind them -- a
+        // bare `apply_batch`, a hand-applied `apply_remote` -- could be a gap
+        // in stamp order, so they release nothing and raise no vector over a
+        // held entry.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held > 0);
+        let held_stamp = first.documents[0].stamp;
+        // Exactly the entries the page holds, and nothing that would append.
+        let carried: Vec<_> = a
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.doc_id.is_some() && first.documents.iter().any(|d| d.stamp == e.stamp))
+            .collect();
+        let before = b.version_vector().unwrap().get(a.node_id());
+        assert!(before < held_stamp.hlc, "the fixture must not already cover the held entries");
+
+        b.apply_batch(&carried).unwrap();
+        assert_eq!(b.held_len().unwrap(), held, "no window, no release");
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            before,
+            "and no vector raised over a held entry"
+        );
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let one = carried.iter().find(|e| e.stamp == held_stamp).expect("the held entry");
+        b.apply_remote(&cb, one).unwrap();
+        assert_eq!(b.held_len().unwrap(), held, "nor from a hand-applied entry");
     }
 
     #[test]

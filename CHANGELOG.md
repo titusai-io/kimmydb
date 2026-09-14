@@ -53,6 +53,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   one document at a time is enough — until its writes pause; contacts between
   level members still compare, and the existence half still runs. See ADR-168.
 
+- **An entry a member holds from a snapshot is released when it arrives by
+  ordinary replication.** A snapshot document or a carried delete is held out of
+  the vector a member advertises until it is known to be history. The release
+  that should have happened when the same entry then arrived by replication never
+  did, so the member went on withholding it from peers pulling from it and, until
+  some unrelated write from the same origin, held a document count that did not
+  match what it advertised — enough for the divergence check to confirm a
+  difference that was only held state. Arriving in a replication window now
+  releases it, with no second change-stream event. See ADR-169.
+
 ### Documented
 
 - **A single write behind a bulk load waits for the bulk's fsync.** Under

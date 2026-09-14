@@ -2703,6 +2703,17 @@ pub(crate) enum Position {
     /// the cursor and the snapshot never carried — the hole ADR-148 forbids,
     /// which the first form of the restore opened on every page.
     Hold,
+    /// [`Self::Raise`], and the caller vouches that the entry arrived in a
+    /// window served **contiguously from this node's own position** — a pulled
+    /// sync window or a push, both through `Engine::apply_peer_batch` (ADR-143,
+    /// ADR-148). Only this variant releases a held mark on an entry this node
+    /// already holds (ADR-169): servable means "can serve a contiguous window
+    /// containing this", and an entry physically in the oplog that arrived in
+    /// such a window has that property whether or not it was appended now. A
+    /// plain `Raise` — a local write, a hand-applied `apply_remote`, a batch
+    /// with no window behind it — says nothing about contiguity and releases
+    /// nothing.
+    InWindow,
 }
 
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
@@ -2723,7 +2734,18 @@ pub(crate) fn append_oplog_at(
     // Re-appending an entry we already hold must not give it a second arrival
     // position. Peers resend overlapping ranges routinely, and a duplicate
     // arrival entry would deliver the same change twice to every stream.
+    //
+    // It must still release a held mark when it arrives in position: that is
+    // the entry reaching this node as history after all (ADR-160, ADR-169).
     if existed {
+        if position == Position::InWindow {
+            // The oplog table is still open on `txn`, and redb refuses a second
+            // open of it; the release reads the same table. Without this the
+            // release failed the whole batch, and every later round with that
+            // peer failed the same way.
+            drop(oplog);
+            release_held_in_position(txn, &entry.stamp)?;
+        }
         return Ok(());
     }
 
@@ -2734,7 +2756,7 @@ pub(crate) fn append_oplog_at(
     // witnessed stays at or above servable by construction (ADR-054). Not for
     // a snapshot document, whose coverage is granted once at the end — see
     // [`Position::Hold`].
-    if position == Position::Raise {
+    if matches!(position, Position::Raise | Position::InWindow) {
         raise_version(txn, tables::OPLOG_VERSIONS, &entry.stamp)?;
         raise_version(txn, tables::OPLOG_WITNESSED, &entry.stamp)?;
         // An entry appended in POSITION is not state, so any mark on its key
@@ -2764,6 +2786,45 @@ pub(crate) fn append_oplog_at(
     arrival.insert(next, key.as_slice())?;
     by_stamp.insert(key.as_slice(), next)?;
     Ok(())
+}
+
+/// Release the held mark (ADR-160) on the entry stored under `stamp`, because
+/// that entry has just arrived in position, and raise both vectors to it.
+/// -> whether a mark was released.
+///
+/// Called only for [`Position::InWindow`]: the caller vouches the entry
+/// arrived in a window contiguous from this node's position. Reached two
+/// ways: from `apply_remote_in_txn` when the entry is superseded at its key --
+/// the ordinary case, since a held entry's record is usually at its stamp -- and
+/// from [`append_oplog_at`]'s existing-key branch when it wins instead, which
+/// happens once retention has collected a held delete's tombstone but kept the
+/// entry as the oplog's newest. ADR-160 named "an append of that key under
+/// `Position::Raise`" as a release, which the existing-key return never
+/// performed, and a test asserted supersession must not release; ADR-169
+/// overturns that. So a snapshot document or a carried delete stayed held, above the
+/// servable vector, however it later reached this node — the mechanism behind
+/// ADR-167's held-delete residual and both routes of ADR-168's limitation.
+///
+/// Only an entry this node actually holds is raised over: a mark can outlive
+/// its entry (`rewind` removes oplog rows directly), and raising a vector over
+/// an entry the oplog does not hold would claim a window this node cannot
+/// serve. Such a mark is removed and nothing is raised. No arrival is added and
+/// nothing is published: the entry already has its arrival position and its
+/// change-stream event, both from when it was applied under `Hold`.
+pub(crate) fn release_held_in_position(
+    txn: &redb::WriteTransaction,
+    stamp: &Stamp,
+) -> Result<bool> {
+    let key = codec::oplog_key(stamp);
+    if txn.open_table(tables::OPLOG_HELD)?.remove(key.as_slice())?.is_none() {
+        return Ok(false);
+    }
+    if txn.open_table(tables::OPLOG)?.get(key.as_slice())?.is_none() {
+        return Ok(false);
+    }
+    raise_version(txn, tables::OPLOG_VERSIONS, stamp)?;
+    raise_version(txn, tables::OPLOG_WITNESSED, stamp)?;
+    Ok(true)
 }
 
 /// Whether a live collection stands under `id`.
