@@ -40,6 +40,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `storage.tombstone_retention_secs` on the sending member has no record left to
   carry and does not travel by either route.
 
+### Documented
+
+- **A single write behind a bulk load waits for the bulk's fsync.** Under
+  `storage.durability = durable` a commit fsyncs inside its hold on the single
+  writer, and a bulk insert is one commit, so a concurrent single write queues
+  behind the whole bulk's flush; measured, single-write p50 roughly tripled
+  under back-to-back bulks of 100 on one member. `operations.md#capacity` now
+  says so, and what `coalesced` does and does not change: the same no-loss
+  promise and a shared fsync for concurrent writers, but up to one coalescing
+  window added per write, a slower lone writer, and a shared flush that still
+  holds the writer.
+
 ## 0.27.1 - 2026-09-12
 
 ### Documented
