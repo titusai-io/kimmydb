@@ -13032,17 +13032,43 @@ argued against are not improved for a member that fell below a peer's
 retention horizon and is catching up by snapshot: that member still takes a
 round's worth of pages per tick, and the operations guide says so.
 
-**A residual, stated rather than left to be found.** The drain has no ceiling
-but the budget. A peer that answers a pull with a full window the sender
-reports as unexhausted but whose entries are all at or below where this node
-already stands moves nothing and still reads as truncated, so the loop would
-pull from it for the whole budget, every tick, for as long as it did that.
-That is a broken or hostile peer rather than a state a correct one can reach
-— a correct sender serves contiguously from the stamp it was asked for — and
-before this change it cost one wasted pull per tick rather than a budget's
-worth. It is recorded here because the change is what widens it, and a
-ceiling on the pulls one contact may make would close it in a line if it ever
-appears.
+**A residual, closed (addendum, 2026-09-14).** As first recorded, the drain had
+no ceiling but the budget. A peer that answers a pull with a window it reports
+as unexhausted, but whose entries all sit at or below where this node already
+stands, moves nothing and still reads as truncated. The loop would pull from it
+for the whole budget, every tick, for as long as it kept doing that. That is a
+broken or hostile peer rather than a state a correct one can reach — a correct
+sender serves contiguously from the stamp it was asked for — and before this
+change it cost one wasted pull per tick rather than a budget's worth.
+
+It is now closed by a ceiling on pulls per contact: `MAX_PULLS_PER_CONTACT`,
+128. A contact still truncated with budget left after that many pulls ends as
+though the budget had run out, and the next tick resumes from where this one
+stood. The line it logs names the peer with the pulls and entries applied: at
+`INFO` when the contact applied anything, since a real drain deeper than the
+ceiling reaches it too, and at `WARN` only when no pull applied anything, which
+is the shape of a peer serving windows that cannot advance.
+
+**Why a count, and why 128.** A count, not "stop on a pull that applied
+nothing", because a legitimate drain is made of exactly those pulls. Round 0310
+measured a re-serve drain of 306 applied-0 pulls per peer, each a full window of
+entries the member already held, and an applied-0 stop would have spread every
+such drain one pull per tick.
+
+The count cannot be set so that it catches only a bad peer, because a bad peer
+is not much cheaper per pull than a good one. What a pull costs is mostly its
+connection: a fresh TCP and TLS handshake and the HMAC exchange. Against a fake
+peer doing no work, a pull took about 14 ms on localhost, which is 145 pulls in a
+two-second tick and 326 in a five-second one. Round 0310's real drain fitted
+22–23 full windows into each five-second tick.
+
+So the ceiling bounds the waste rather than detecting the peer. 128 is above
+every tick of real draining measured, with room to spare, and at the default
+interval it holds a peer like that to under two seconds of a five-second tick.
+What it costs is a spill: a tick that could have pulled more than 128 full
+windows from one peer, about 131,000 entries, leaves the rest to the next tick,
+at most one tick later per 131,000 entries. It is a constant, not a
+configuration setting, for ADR-151's reason.
 
 **Why the divergence counters stay per contact.** ADR-135's series is a
 partition of the contacts a node made, and ADR-145 added the failed round to

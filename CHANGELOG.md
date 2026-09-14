@@ -45,6 +45,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   name would have cleared the rows. The retention pass now finishes such a
   purge, logging each collection and its row count before and a line after,
   and keeps the collection tombstone that marks the rows until they are gone.
+- **A peer answering windows that move nothing could spend a sync tick's whole
+  budget on one contact.** A tick keeps pulling from a peer while each pull
+  comes back truncated and budget remains (ADR-157). A broken or hostile peer
+  answering with an unexhausted window at or below this member's position was
+  pulled from back to back until the interval ran out, every tick. Measured
+  against a fake peer on localhost, that was about 14 ms per pull, 145 pulls in
+  a two-second tick. A contact now makes at most 128 pulls a tick and resumes
+  on the next. Reaching the ceiling is logged at `INFO` with the pulls and
+  entries applied, and at `WARN` only when no pull applied anything, which is
+  the shape of a peer serving windows that cannot advance.
+  Round 0310's real drains fitted 22–23 full windows per five-second tick, so
+  ordinary catch-up is unaffected. The cost: a tick that could have pulled more
+  than 128 full windows from one peer, about 131,000 entries, leaves the rest to
+  the next tick, at most one extra tick per 131,000 entries.
 
 ### Documented
 

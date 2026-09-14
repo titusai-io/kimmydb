@@ -218,6 +218,27 @@ pub struct ReplicationConfig {
     pub on_round: Option<RoundHook>,
 }
 
+/// The most pulls one contact makes in a tick, however much of the tick's
+/// budget is left (ADR-157's addendum). A constant, not a setting.
+///
+/// The budget ends an ordinary drain, and it cannot end a bad one early: a
+/// peer that answers every pull with a window that moves nothing and says it
+/// is not exhausted is pulled from again until the tick's deadline. What such
+/// a pull costs is its connection: a fresh TCP and TLS handshake and the HMAC
+/// exchange, about 14 ms on localhost even from a peer doing no work, which
+/// is 145 pulls in a two-second tick and 326 in a five-second one. A pull a
+/// real drain makes costs more — round 0310's re-serve drain fitted 22–23
+/// full windows into each five-second tick — so the two cannot be told apart
+/// by rate, only bounded.
+///
+/// 128 is above every tick of real draining measured, with room to spare, and
+/// at the default interval it holds a peer like that to under two seconds of
+/// a five-second tick. What it costs a real drain is a spill: a tick that
+/// could have pulled more than 128 full windows (about 131,000 entries) from
+/// one peer leaves the rest to the next tick, one tick later per 131,000
+/// entries at most.
+pub const MAX_PULLS_PER_CONTACT: usize = 128;
+
 impl ReplicationConfig {
     pub fn new(seeds: Vec<SeedSource>, secret: String, local: SocketAddr) -> Self {
         Self {
@@ -431,8 +452,37 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // counted as a skip on a tick that goes on to
                             // check.
                             if outcome.truncated && contact.fits_before(deadline) {
-                                draining.push_back(contact);
-                                continue;
+                                if contact.pulls < MAX_PULLS_PER_CONTACT {
+                                    draining.push_back(contact);
+                                    continue;
+                                }
+                                // Budget left and still truncated at the
+                                // ceiling (ADR-157's addendum). The contact
+                                // ends here as though the budget had run out,
+                                // and the next tick resumes from wherever
+                                // this one stood. A real drain deeper than the
+                                // ceiling reaches it too, and says so at info
+                                // with what it applied; only a contact that
+                                // applied nothing in all of its pulls is the
+                                // shape of a peer serving windows that cannot
+                                // advance, and that is the one worth a warning.
+                                if contact.applied > 0 {
+                                    info!(
+                                        peer = %peer,
+                                        pulls = contact.pulls,
+                                        applied = contact.applied,
+                                        "pull ceiling reached for this peer this tick; the next \
+                                         tick resumes"
+                                    );
+                                } else {
+                                    warn!(
+                                        peer = %peer,
+                                        pulls = contact.pulls,
+                                        applied = 0,
+                                        "pull ceiling reached for this peer this tick with nothing \
+                                         applied in any pull; the next tick resumes"
+                                    );
+                                }
                             }
                             // `i64` throughout: `tracing-opentelemetry` has
                             // no `record_u64`, so an unsigned value is
