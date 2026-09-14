@@ -2273,6 +2273,225 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     );
 }
 
+/// A tick's contact with a peer at the pull ceiling, run against a fake peer,
+/// and what the tick said about it.
+///
+/// The peer gets the handshake right and advertises an origin far ahead of
+/// this member. Every pull is answered unexhausted with one entry of that
+/// origin, below the advertised vector so it is never deferred. `fresh` picks
+/// the entry: a new document each pull, which a real drain deeper than the
+/// ceiling looks like, or the one document this member already applied, which
+/// moves nothing — ADR-157's residual.
+///
+/// **The interval is priced, not chosen**, for the reason the drain-budget
+/// test above gives: a pull's cost belongs to the machine. One pull against
+/// the fake is timed, and the interval set to three ceilings' worth of them.
+struct CeilingTick {
+    pulls: usize,
+    failed: usize,
+    ceiling_infos: usize,
+    ceiling_warns: usize,
+}
+
+async fn a_tick_at_the_pull_ceiling(fresh: bool) -> CeilingTick {
+    use kimmy_cluster::protocol::prove;
+    use kimmy_cluster::{
+        MAX_PULLS_PER_CONTACT, ReplicationConfig, RoundReport, SeedSource, replicate,
+    };
+
+    let b = node().await;
+    let coll = b.engine.create_collection("shop", "orders").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = move |n: u64| kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String(format!("d{n}"))),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+    };
+    if !fresh {
+        b.engine.apply_remote(&coll, &entry(0)).unwrap();
+    }
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let pulls = Arc::clone(&pulls);
+        async move {
+            let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = tls.acceptor();
+                let (theirs, pulls) = (theirs.clone(), Arc::clone(&pulls));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                    let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                    let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    let welcome = Message::Welcome {
+                        node: origin,
+                        nonce: vec![7; 32],
+                        proof: prove(SECRET, &nonce, &binding),
+                    };
+                    if write_frame(&mut stream, &welcome).await.is_err() {
+                        return;
+                    }
+                    let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    while let Ok(message) = read_frame(&mut stream).await {
+                        let answer = match message {
+                            Message::AskVersions { .. } => Message::Vectors {
+                                servable: theirs.clone(),
+                                witnessed: theirs.clone(),
+                            },
+                            Message::AskEntries { .. } => {
+                                let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
+                                let served = entry(if fresh { n } else { 0 });
+                                let scanned_to = served.stamp.hlc;
+                                Message::Entries {
+                                    entries: vec![served],
+                                    scanned_to,
+                                    exhausted: false,
+                                }
+                            }
+                            _ => return,
+                        };
+                        if write_frame(&mut stream, &answer).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let priced = std::time::Instant::now();
+    let one = sync_once(&b.engine, fake, SECRET, None).await.expect("one pull to price");
+    let interval = priced.elapsed() * (3 * MAX_PULLS_PER_CONTACT as u32);
+    assert!(one.truncated, "the fake must read as truncated, or this tests nothing: {one:?}");
+    let priced_pulls = pulls.load(Ordering::SeqCst);
+
+    let lines = CeilingLines::default();
+    let (infos, warns) = (Arc::clone(&lines.info), Arc::clone(&lines.warn));
+    let _recording = tracing::subscriber::set_default(lines);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![fake])], SECRET.into(), b.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(10);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    // The first tick that reached the peer. Nothing else pulls until the next
+    // tick, a whole interval later, so what is read at its report is that
+    // tick's alone.
+    let deadline = tokio::time::Instant::now() + interval * 4 + Duration::from_secs(10);
+    let tick = loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no tick reached the peer"))
+            .expect("the loop must keep reporting");
+        let seen = pulls.load(Ordering::SeqCst) - priced_pulls;
+        if seen > 0 {
+            break CeilingTick {
+                pulls: seen,
+                failed: report.failed,
+                ceiling_infos: infos.load(Ordering::SeqCst),
+                ceiling_warns: warns.load(Ordering::SeqCst),
+            };
+        }
+    };
+    looping.abort();
+    tick
+}
+
+/// The ceiling lines, by level, counted on this test's thread only.
+#[derive(Clone, Default)]
+struct CeilingLines {
+    info: Arc<AtomicUsize>,
+    warn: Arc<AtomicUsize>,
+}
+
+impl tracing::Subscriber for CeilingLines {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = CeilingLine(false);
+        event.record(&mut line);
+        if line.0 {
+            match *event.metadata().level() {
+                tracing::Level::WARN => self.warn.fetch_add(1, Ordering::SeqCst),
+                tracing::Level::INFO => self.info.fetch_add(1, Ordering::SeqCst),
+                _ => 0,
+            };
+        }
+    }
+
+    fn enter(&self, _: &tracing::Id) {}
+
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+/// Whether an event is the pull-ceiling line, by its message.
+struct CeilingLine(bool);
+
+impl tracing::field::Visit for CeilingLine {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" && format!("{value:?}").contains("pull ceiling reached") {
+            self.0 = true;
+        }
+    }
+}
+
+/// ADR-157's residual, closed by its addendum. A peer answering every pull
+/// with a window this member already holds, unexhausted, moves nothing and
+/// still reads as truncated, so the drain would pull again until the tick's
+/// deadline. The ceiling ends the contact at `MAX_PULLS_PER_CONTACT`, and
+/// because nothing was applied in any of those pulls the line is a warning.
+/// Reverting the ceiling in `peers.rs` lets the tick pull until its deadline:
+/// about three times the ceiling.
+#[tokio::test]
+async fn a_peer_serving_windows_that_move_nothing_is_held_to_the_pull_ceiling() {
+    let tick = a_tick_at_the_pull_ceiling(false).await;
+    assert_eq!(tick.failed, 0, "a ceiling is not a failure");
+    assert_eq!(
+        tick.pulls,
+        kimmy_cluster::MAX_PULLS_PER_CONTACT,
+        "one contact, held to the ceiling, with budget left for about twice as many more"
+    );
+    assert_eq!((tick.ceiling_warns, tick.ceiling_infos), (1, 0), "nothing applied: one warning");
+}
+
+/// The same ceiling reached by a real drain: every pull applied a new
+/// document. The contact still ends at the ceiling — the spill ADR-157's
+/// addendum prices — but a drain that is making progress is not a peer to
+/// suspect, so the line is at info, not a warning.
+#[tokio::test]
+async fn a_drain_deeper_than_the_ceiling_spills_to_the_next_tick_without_a_warning() {
+    let tick = a_tick_at_the_pull_ceiling(true).await;
+    assert_eq!(tick.failed, 0, "a ceiling is not a failure");
+    assert_eq!(tick.pulls, kimmy_cluster::MAX_PULLS_PER_CONTACT, "held to the ceiling as well");
+    assert_eq!((tick.ceiling_warns, tick.ceiling_infos), (0, 1), "entries applied: one info line");
+}
+
 /// A pull that fails ends the tick's contact with that peer. The round goes
 /// through the health backoff it always did, and the tick does not spend the
 /// rest of its budget dialling a member that has just refused it — a
