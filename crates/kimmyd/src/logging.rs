@@ -583,7 +583,7 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.divergence_count_probes.deferred",
             "{contact}",
-            "Checked peer contacts in which the count half was deferred because the peer was behind this node and still catching up.",
+            "Checked peer contacts in which the count half was deferred because one member was behind the other and still catching up.",
             sync_divergence_count_deferred
         );
         observe!(

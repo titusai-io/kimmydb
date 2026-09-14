@@ -1000,7 +1000,7 @@ impl Metrics {
              # TYPE kimmy_sync_divergence_checks_total counter\n\
              kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {sync_div_ran}\n\
              kimmy_sync_divergence_checks_total{{outcome=\"skipped\"}} {sync_div_skipped}\n\
-             # HELP kimmy_sync_divergence_count_probes_total Checked contacts in which the document-count half of the check compared the probed collection's count against the peer's, and checked contacts in which it was deferred because the peer was behind this node and still catching up. compared flat while ran rises means no document count has been compared against any peer, whatever the gauge reads. A peer that is behind but whose position has not moved for {frozen} consecutive checked contacts is compared regardless, so a peer whose replication has stopped is not deferred for as long as it stays stopped.\n\
+             # HELP kimmy_sync_divergence_count_probes_total Checked contacts in which the document-count half of the check compared the probed collection's count against the peer's, and checked contacts in which it was deferred because one member was behind the other and still catching up. compared flat while ran rises means no document count has been compared against any peer, whatever the gauge reads. A member that is behind but whose position has not moved for {frozen} consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped.\n\
              # TYPE kimmy_sync_divergence_count_probes_total counter\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"compared\"}} {sync_div_compared}\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"deferred\"}} {sync_div_deferred}\n\
@@ -1626,7 +1626,7 @@ kimmy_sync_divergent_collections 5
 # TYPE kimmy_sync_divergence_checks_total counter
 kimmy_sync_divergence_checks_total{outcome=\"ran\"} 32
 kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 34
-# HELP kimmy_sync_divergence_count_probes_total Checked contacts in which the document-count half of the check compared the probed collection's count against the peer's, and checked contacts in which it was deferred because the peer was behind this node and still catching up. compared flat while ran rises means no document count has been compared against any peer, whatever the gauge reads. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a peer whose replication has stopped is not deferred for as long as it stays stopped.
+# HELP kimmy_sync_divergence_count_probes_total Checked contacts in which the document-count half of the check compared the probed collection's count against the peer's, and checked contacts in which it was deferred because one member was behind the other and still catching up. compared flat while ran rises means no document count has been compared against any peer, whatever the gauge reads. A member that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped.
 # TYPE kimmy_sync_divergence_count_probes_total counter
 kimmy_sync_divergence_count_probes_total{outcome=\"compared\"} 63
 kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67

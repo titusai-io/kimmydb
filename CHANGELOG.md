@@ -40,6 +40,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `storage.tombstone_retention_secs` on the sending member has no record left to
   carry and does not travel by either route.
 
+- **A member catching up no longer confirms a divergence that is only its own
+  lag.** A member taking in a peer's steady writes compared a document count it
+  read before pulling them against the peer's count read after, confirmed a
+  divergence, and ran a repair that found nothing — on a healthy cluster under an
+  ordinary bulk load, holding `kimmy_sync_divergent_collections` above 0 for
+  minutes and pushing `kimmy_sync_repair_rounds_total` into the hundreds. The
+  count comparison is now deferred while either member trails the other and is
+  still catching up; a member whose replication has stopped is still compared by
+  its peers once it has stood still for three checked contacts. **The count half
+  of the check therefore does not compare against a member that keeps writing** —
+  one document at a time is enough — until its writes pause; contacts between
+  level members still compare, and the existence half still runs. See ADR-168.
+
 ### Documented
 
 - **A single write behind a bulk load waits for the bulk's fsync.** Under
