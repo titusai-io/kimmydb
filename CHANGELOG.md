@@ -10,6 +10,15 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Documented
+
+- **The OTLP description of `kimmy.write_lock.held_seconds.drop` no longer says
+  a collection drop removes everything in one transaction.** A collection drop
+  has purged in chunks since ADR-158, each chunk its own hold; the description
+  now matches `operations.md`.
+
 ## 0.28.0 - 2026-09-14
 
 **A minor, and upgrading to it requires reading one entry.** ADR-168 changes
