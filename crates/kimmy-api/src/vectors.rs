@@ -983,7 +983,14 @@ fn prepare(
     // the difference between a caller refining its query forever and a caller
     // learning that ingestion never happened — which is the whole failure mode
     // of `byo` being the default provider.
-    if state.engine.count(&shadow)? == 0 {
+    // One live vector is enough to know ingestion happened. Counting them
+    // decoded every vector of the collection on every search.
+    let mut any = false;
+    state.engine.for_each_doc(&shadow, |_, _| {
+        any = true;
+        Ok(false)
+    })?;
+    if !any {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             ErrorCode::NoVectors,

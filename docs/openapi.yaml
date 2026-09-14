@@ -1977,6 +1977,15 @@ paths:
 
         Without `index`, a count per index. With `index`, the colliding groups
         on that index with their documents, at most 10,000 groups.
+
+        **Cost.** The report is derived from the retained oplog, so a call is
+        one pass over it: every retained entry's header, whatever collection
+        wrote it. It grows with `storage.oplog_retention_secs` and the node's
+        write rate, not with this collection, and a collision older than the
+        retention window is no longer reported. A collection with no unique
+        index, or an `index` that is not one of its unique indexes, is answered
+        without the pass. Call it to resolve what a `uniqueViolation` event
+        announced rather than on a timer.
       x-kimmy-action: read
       parameters:
         - name: index

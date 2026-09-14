@@ -14,6 +14,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Five walks still ran on tokio's workers, and `/metrics` stalled behind
+  them.** ADR-153 moved read scans off the async workers but missed
+  `GET …/violations`, both forms of `$lookup`, `describe_collection`'s document
+  total (over REST and MCP), and `GET /v1/admin/backup`. Each now runs under the same
+  `block_in_place`. The violations route also answers without reading the
+  oplog when the collection has no unique index or `?index=` names none of
+  them, and otherwise decodes only that collection's violation records rather
+  than every retained entry. Before this, a call was measured at about 800 ms
+  and several hundred MiB of resident memory on a member retaining a day of
+  writes, with `/metrics` stalled for up to 1.3 s under eight concurrent calls.
+- **A vector search no longer decodes every vector of the collection before
+  searching.** Its check that the collection holds any vectors (the
+  `no_vectors` answer) counted all of them on every search; it now stops at
+  the first live one, so a search over a large collection gets cheaper by
+  that walk. What the check answers is unchanged: a collection whose vectors
+  have all been deleted still reads as having none.
 - **A collection drop that gave up on a busy writer left its rows on disk
   until the next restart.** When a chunk of a drop's purge could not take the
   single writer inside the request's budget, it logged a `WARN` and left the

@@ -236,6 +236,21 @@ pub fn encode_oplog_entry(entry: &OplogEntry) -> Vec<u8> {
     out
 }
 
+/// The kind and collection of an encoded oplog entry, read from its fixed-width
+/// header without touching the document id or the body.
+///
+/// For a walk that wants one kind of entry for one collection: every other
+/// entry is judged on these nine bytes, and only a match pays for
+/// [`decode_oplog_entry`] and the copy of its body.
+pub fn decode_oplog_kind_and_collection(mut input: &[u8]) -> Result<(OpKind, CollectionId)> {
+    check_version(&mut input)?;
+    take(&mut input, STAMP_LEN)?;
+    let kind = op_kind_from_tag(take(&mut input, 1)?[0])?;
+    let collection =
+        CollectionId(u64::from_be_bytes(take(&mut input, 8)?.try_into().expect("8 bytes")));
+    Ok((kind, collection))
+}
+
 pub fn decode_oplog_entry(mut input: &[u8]) -> Result<OplogEntry> {
     check_version(&mut input)?;
     let stamp = take_stamp(&mut input)?;

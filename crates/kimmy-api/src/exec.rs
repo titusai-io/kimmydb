@@ -1650,7 +1650,10 @@ pub fn violations(
 ) -> Result<Value, ApiError> {
     let _span = op_span("violations", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
-    let live = state.engine.live_unique_violations(&meta)?;
+    // A pass over the retained oplog, as long as retention makes it, and so a
+    // walk like any other (ADR-153). Skipped by the engine when no unique index
+    // could answer, which includes an `index` this collection does not have.
+    let live = kimmy_storage::blocking(|| state.engine.live_unique_violations(&meta, index))?;
 
     let Some(name) = index else {
         let mut per_index: std::collections::BTreeMap<&str, u64> = Default::default();
@@ -1948,21 +1951,25 @@ fn lookup(
     let mut matches: std::collections::HashMap<Vec<u8>, Vec<bson::Bson>> =
         std::collections::HashMap::new();
     let mut held = 0usize;
-    state.engine.for_each_doc(&foreign, |_id, doc| {
-        // `foreignField` and `localField` are field paths, not expressions:
-        // they name the key on each side, read the same way here and in
-        // `aggregate::lookup_keys`, and neither fans out across an array.
-        let Some(value) = kimmy_core::path::resolve(&doc, foreign_field).into_iter().next() else {
-            return Ok(true);
-        };
-        let Some(key) = encode_key(value) else {
-            return Ok(true);
-        };
-        if wanted.contains(&key) {
-            matches.entry(key).or_default().push(bson::Bson::Document(doc));
-            held += 1;
-        }
-        Ok(true)
+    // The whole foreign collection, so a walk (ADR-153).
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(&foreign, |_id, doc| {
+            // `foreignField` and `localField` are field paths, not expressions:
+            // they name the key on each side, read the same way here and in
+            // `aggregate::lookup_keys`, and neither fans out across an array.
+            let Some(value) = kimmy_core::path::resolve(&doc, foreign_field).into_iter().next()
+            else {
+                return Ok(true);
+            };
+            let Some(key) = encode_key(value) else {
+                return Ok(true);
+            };
+            if wanted.contains(&key) {
+                matches.entry(key).or_default().push(bson::Bson::Document(doc));
+                held += 1;
+            }
+            Ok(true)
+        })
     })?;
     // The joined documents are held in memory alongside the input, so they are
     // subject to the same ceiling.
@@ -2016,9 +2023,12 @@ fn lookup_pipeline(
     let foreign_meta = authorize(state, auth, Action::Read, db, from)?;
 
     let mut foreign: Vec<bson::Document> = Vec::new();
-    state.engine.for_each_doc(&foreign_meta, |_id, doc| {
-        foreign.push(doc);
-        Ok(true)
+    // The whole foreign collection, so a walk (ADR-153).
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(&foreign_meta, |_id, doc| {
+            foreign.push(doc);
+            Ok(true)
+        })
     })?;
     aggregate::check_limit("$lookup", foreign.len(), limits)?;
 
