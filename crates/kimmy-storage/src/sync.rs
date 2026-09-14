@@ -3768,7 +3768,7 @@ mod tests {
 
         // Recorded the way a merged write's collision is.
         assert_eq!(b.unique_violations(), 1, "counted once per shared key");
-        let live = b.live_unique_violations(&cb).unwrap();
+        let live = b.live_unique_violations(&cb, None).unwrap();
         assert_eq!(live.len(), 1, "the violations route reports it: {live:?}");
         assert_eq!(live[0].index, "email_1");
         let mut ids: Vec<String> = live[0].ids.iter().map(|id| id.to_string()).collect();

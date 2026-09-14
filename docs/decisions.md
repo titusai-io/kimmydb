@@ -12006,6 +12006,70 @@ one-worker runtime, a task spawned while a `count` over 30,000 documents is
 running is polled before the count finishes; before this change it was polled
 19 µs after.
 
+**Addendum, 2026-09-14: the walks this decision missed.** The decision says
+every read verb that walks goes through `visit_matching`. Five did not, and ran
+on the async worker as before:
+
+- `GET …/violations`: one pass over the whole retained oplog per call
+  (`Engine::live_unique_violations`), decoding every entry of every collection
+  in pages of 1,024. On a three-member test cluster retaining a day of writes
+  it cost about 790 ms per call on a collection with no unique index, as much
+  as on one with, and eight concurrent calls stalled `/metrics` for up to
+  1.26 s.
+- `$lookup`, both forms: the whole foreign collection per stage.
+- `describe_collection`, over REST and as the MCP tool and resource: the sample
+  stops at its limit, but the total is `Engine::count`, every document decoded.
+- `GET /v1/admin/backup`: the whole store.
+
+A sixth was found while fixing these: a vector search checked that the
+collection had any vectors by counting all of them, on every search. Two more
+are on the replication side, which the request-path review did not reach: the
+divergence check's count probe, read by the sync tick on the async runtime, and
+a member's count when it answers a peer's probe (`AskDivergence`). Each counts
+one collection by walking it. Both now run under `blocking`, the tick's side as
+one read transaction (ADR-168's limitation on the shared reading).
+
+Each of the five now runs under `blocking` inside the `exec` or `schema`
+function, so the MCP tools that call those functions are covered with the
+routes. The vector check stops at the first live vector and stays on the
+worker, as a primary-key probe does. What it answers is unchanged: the walk
+skips tombstones, so a collection whose every vector was deleted still answers
+`no_vectors`, and a test fails if a deleted row is ever taken for a vector. The
+same skipping means that on a collection holding only tombstones, the check
+still walks every one of them on the worker before it answers; that walk is
+bounded by `storage.tombstone_retention_secs`, not by the vectors ever stored. The violations pass also stops paying for
+what it does not report:
+
+- **It is skipped when nothing could stand.** A record is reported only while
+  the index it names exists and is unique, so a collection with no unique
+  index, or `?index=` naming something that is not one of its unique indexes,
+  is answered from metadata, inside `live_unique_violations` itself. The answer
+  is the one the pass would have given.
+- **It judges each entry on its header.** The kind and collection sit in an
+  entry's fixed-width header, so every other collection's writes, and this
+  collection's document writes, are passed over without decoding the document
+  id or copying the body. Only `UniqueViolation` entries of the collection are
+  decoded. A read transaction examines up to 16,384 rows rather than decoding
+  1,024 entries.
+
+The pass is still one walk over the retained oplog's keys and headers, so its
+cost still grows with `storage.oplog_retention_secs` and the write rate, and
+`openapi.yaml` and `indexes.md` now say so. Keeping a per-collection record of
+violation entries would make the cost proportional to violations rather than to
+the oplog. It is a format decision, and is not taken here.
+
+**The guard.** `crates/kimmy-api/tests/walks_leave_the_worker.rs` reads the
+`kimmy-api` and `kimmy-mcp` sources and fails on a call to a storage walk that
+is not inside the parentheses of a `blocking(` call, followed by bracket depth
+so a closure of any length is seen through. Walks bounded by
+something other than client data are counted per file, each with its reason:
+the webhook registry and delivery bookkeeping, the node registry,
+`sample_documents` at its limit, and the vector emptiness check. The check is
+textual, and it reads the request crates only: a walk reached through a
+helper whose name is not on its list is not seen, and neither is a walk in
+`kimmy-cluster`, whose two are listed above. That is the limit of what it
+proves.
+
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
 **Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a
@@ -13313,7 +13377,8 @@ removal inside a pass ADR-151 has just finished bounding, and because the
 retention pass is what *collects* the tombstone the residue is identified by,
 so the two would have to agree about an order they currently do not need to.
 
-**Residuals, stated.** **A purge deferred on a long-running process is not
+**Residuals, stated.** *(The first is closed by the addendum at the end of
+this ADR.)* **A purge deferred on a long-running process is not
 retried until that process restarts or the name is created again, and past one
 tombstone-retention window neither ending is guaranteed.** The only way to
 reach the deferral at all is a chunk giving up on the writer, which is the
@@ -13363,6 +13428,49 @@ Each of those seven has been checked by reverting the production line it names
 — the purge loop, the tombstone's insert in the burial's transaction, the
 chunk bound, the sweep at `open`, the catalogue guard, the creation-side purge,
 and the tolerated `WriterBusy` — and watching it fail.
+
+**Addendum, 2026-09-14: an owed purge is finished while the node runs.** The
+first residual above is closed. Before it collects anything, the retention pass
+runs `Engine::finish_owed_drops`, which finds an owed purge the way `open` does
+— a collection tombstone with no collection over it and rows beneath — and
+removes it with the same chunked purge. It logs each collection and the rows
+it owes before it starts, and one line when it is done.
+
+The ordering this ADR declined to make the two agree on now holds by
+construction:
+
+- **The pass purges before it collects.** What is owed is removed first, and
+  the collection tombstones are collected after.
+- **A tombstone with rows under it is not collected, however old.**
+  `collect_dropped_collections` keeps it, so the marker outlasts the residue it
+  marks. A chunk that gives up inside the pass leaves the rest for the next
+  pass, which finds it by the same kept tombstone.
+
+The purge is the same one-chunk-at-a-time removal, so no transaction of the
+pass holds the writer longer than before (ADR-151). What it adds is length to
+the pass that does the work, reported as `dropped_rows` on that pass's log
+line. A pass with nothing owed reads the dropped-collections table, which
+`collect_dropped_collections` already walks whole, plus two seeks per dropped
+id, and takes no writer.
+
+A tombstone kept past `storage.tombstone_retention_secs` lives at most until
+the pass that finishes its purge, which on a node whose writer is free is the
+next one. While it lives it answers a replayed creation as it did inside the
+window, which is what it is for. With `storage.gc_interval_secs = 0` no pass
+runs, and the rows wait for the next start as before.
+
+Unchanged: the sweep at `open` still finishes an interrupted drop before the
+member binds. Making it chunked and off the open path is a separate change. The
+`WARN` a giving-up chunk logs now names the retention pass rather than the next
+start.
+
+Tested by `a_drop_left_owed_by_a_busy_writer_is_finished_by_the_next_retention_pass`
+(more than a chunk owed under a collection and its vector shadow after a chunk
+gave up, gone after one pass without reopening, tombstones kept) and
+`a_collection_tombstone_is_kept_while_its_drop_still_owes_rows`. Each was
+checked by reverting its production line and watching it fail.
+`a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing` still pins the
+start.
 
 ---
 
@@ -14756,6 +14864,23 @@ confirmation seen after it ships should be checked against these two routes befo
 it is read as this fix failing. Making an equal-stamp delete append in position
 would close the first once the entry arrives, not while it is held; the second is
 ADR-160's own residual.
+
+**Limitation, named: this node's reading is shared by every peer of a tick.** The
+witnessed vector and the count are read once per tick and handed to each peer in
+turn, so against the second and later peers they predate the pulls from the peers
+before them as well as the tick's own. The direction is safe — a reading that
+predates entries this node has since taken in makes it look behind and still
+moving, which defers; it cannot make it look level with a peer it trails — but on
+a cluster of three or more members taking writes the count half defers more often
+than the two-member account above implies. Re-reading the vector alone per peer
+would undo this record: the vector would then name entries the tick's count
+missed. Re-reading both per peer is a count of the collection per peer, and the
+deferral it would recover is not a defect. Both reads are taken in one read
+transaction (`Engine::count_probe_reading`), so the count and the vector it is
+judged against come from the same snapshot and there is no order between them to
+get wrong. A storage error reading that side now leaves the tick with neither, so
+the count half is not compared that tick, where a failed vector read alone used
+to leave the count compared and only the peer's side judged.
 
 **Residual, stated.** The peer can advance between the contact's opening and its
 count read — a window that holds this node's pull and its apply, including any

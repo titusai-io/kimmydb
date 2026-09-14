@@ -32,7 +32,7 @@
 //! streams already handle that (`ResumeTokenExpired`, surfaced as HTTP 410), so
 //! it is a contract, not a surprise.
 
-use kimmy_core::Hlc;
+use kimmy_core::{CollectionId, Hlc};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
 
@@ -86,11 +86,14 @@ struct ExpiredTombstone {
 pub struct GcOutcome {
     pub oplog_removed: usize,
     pub tombstones_removed: usize,
+    /// Rows a collection drop had left owed, removed by this pass
+    /// ([`Engine::finish_owed_drops`]).
+    pub dropped_rows_removed: usize,
 }
 
 impl GcOutcome {
     pub fn is_empty(&self) -> bool {
-        self.oplog_removed == 0 && self.tombstones_removed == 0
+        self.oplog_removed == 0 && self.tombstones_removed == 0 && self.dropped_rows_removed == 0
     }
 }
 
@@ -110,11 +113,15 @@ impl Engine {
         let _span = tracing::info_span!("storage.retention").entered();
         let started = std::time::Instant::now();
         let tombstone_cutoff = cutoff(now_ms, policy.tombstone_secs);
+        // What a drop left owed goes first: it is found by the collection
+        // tombstone this same pass collects further down (ADR-158's addendum).
+        let dropped_rows_removed = self.finish_owed_drops()?;
         let outcome = GcOutcome {
             oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
+            dropped_rows_removed,
         };
 
         // Always, not only when something was removed: a pass that collects
@@ -123,6 +130,7 @@ impl Engine {
         debug!(
             oplog = outcome.oplog_removed,
             tombstones = outcome.tombstones_removed,
+            dropped_rows = outcome.dropped_rows_removed,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "retention pass"
         );
@@ -389,6 +397,15 @@ impl Engine {
             }
             expired
         };
+        // A tombstone with rows still under it is the only marker of a purge
+        // that is still owed; collecting it would leave those rows reachable
+        // by nothing but a creation under the same name. Kept until the purge
+        // is done, which `finish_owed_drops` retries on every pass.
+        // Unsure is kept too: a tombstone left one more pass costs nothing.
+        let mut expired = expired;
+        expired.retain(|(id, _)| {
+            matches!(self.collection_range_is_empty(CollectionId(*id)), Ok(true))
+        });
         if expired.is_empty() {
             return Ok(0);
         }
@@ -507,6 +524,27 @@ mod tests {
         let txn = engine.db().begin_read().unwrap();
         let oplog = txn.open_table(tables::OPLOG).unwrap();
         oplog.iter().unwrap().count()
+    }
+
+    /// A collection tombstone is how an owed purge is found, by the start and
+    /// by the retention pass (ADR-158's addendum), so it is not collected
+    /// while rows remain under it, however old it is.
+    #[test]
+    fn a_collection_tombstone_is_kept_while_its_drop_still_owes_rows() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+        }
+        engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+        let cutoff = Hlc::new(much_later(), 0);
+
+        assert_eq!(engine.collect_dropped_collections(cutoff).unwrap(), 0, "rows still owed");
+        assert!(engine.collection_dropped_at(coll.id).unwrap().is_some());
+
+        engine.purge_dropped_collection(coll.id).unwrap();
+        assert_eq!(engine.collect_dropped_collections(cutoff).unwrap(), 1, "nothing owed now");
+        assert!(engine.collection_dropped_at(coll.id).unwrap().is_none());
     }
 
     #[test]

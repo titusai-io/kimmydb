@@ -1047,6 +1047,14 @@ impl Engine {
         table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     ) -> Result<kimmy_core::VersionVector> {
         let txn = db.begin_read()?;
+        Self::read_versions_in(&txn, table)
+    }
+
+    /// [`Self::read_versions`] inside a read transaction the caller holds.
+    fn read_versions_in(
+        txn: &redb::ReadTransaction,
+        table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    ) -> Result<kimmy_core::VersionVector> {
         let versions = txn.open_table(table)?;
         let mut out = kimmy_core::VersionVector::new();
         for row in versions.iter()? {
@@ -1599,6 +1607,49 @@ impl Engine {
     /// made every cluster re-request the same entries forever (ADR-054).
     pub fn witnessed_vector(&self) -> Result<kimmy_core::VersionVector> {
         Self::read_versions(&self.db, tables::OPLOG_WITNESSED)
+    }
+
+    /// This node's side of a divergence count probe (ADR-168): the witnessed
+    /// vector, and the live count of collection `id`, read in **one** read
+    /// transaction.
+    ///
+    /// The gate judges the count against the vector, and it is sound only
+    /// while the vector cannot name an entry the count missed. Read as two
+    /// calls, that held because the caller read the vector first, an order
+    /// kept by a comment. Read from one snapshot, the two describe the same
+    /// state and there is no order to keep. The count is `None` when this node
+    /// holds no collection under `id`, as [`Self::count_by_id`] answers.
+    ///
+    /// A walk of the collection's records, so a caller on the async runtime
+    /// runs it under [`blocking`] (ADR-153).
+    pub fn count_probe_reading(
+        &self,
+        id: CollectionId,
+    ) -> Result<(kimmy_core::VersionVector, Option<u64>)> {
+        let txn = self.db.begin_read()?;
+        let witnessed = Self::read_versions_in(&txn, tables::OPLOG_WITNESSED)?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        let mut held = false;
+        for row in collections.iter()? {
+            let (_, value) = row?;
+            let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+            if meta.id == id {
+                held = true;
+                break;
+            }
+        }
+        if !held {
+            return Ok((witnessed, None));
+        }
+        let docs = txn.open_table(tables::DOCS)?;
+        let mut count = 0u64;
+        for row in docs.range(doc_range(id))? {
+            let (_, value) = row?;
+            if !codec::decode_doc_record(value.value())?.deleted {
+                count += 1;
+            }
+        }
+        Ok((witnessed, Some(count)))
     }
 
     /// Raise the witnessed vector to cover a whole batch, in one transaction.
@@ -2220,14 +2271,10 @@ impl Engine {
     /// caller's budget (ADR-151) must not be reported as a failed drop — it is
     /// not one, and a client told to retry would be answered `dropped: false`
     /// by the retry while the rows stayed exactly where they are. The next
-    /// start finishes it, as it finishes a drop a restart interrupted; a
-    /// collection created under the name before then finishes it first.
-    ///
-    /// Both of those endings need the tombstone, and on a process that stays
-    /// up past `storage.tombstone_retention_secs` the collector takes it: the
-    /// rows are then reachable only by a creation under the same name. A disk
-    /// leak of unreachable pages rather than a correctness hole, stated as a
-    /// residual in ADR-158 rather than defended against here.
+    /// retention pass finishes it ([`Self::finish_owed_drops`]), as the next
+    /// start would; a collection created under the name before then finishes
+    /// it first. The tombstone that identifies the residue is not collected
+    /// while rows remain under it, so the pass that finds it is never late.
     fn purge_what_the_drop_left(&self, id: CollectionId, db: &str, name: &str) -> Result<()> {
         match self.purge_dropped_collection(id) {
             Ok(_) => Ok(()),
@@ -2237,7 +2284,7 @@ impl Engine {
                     collection = name,
                     waited_ms = waited.as_millis() as u64,
                     "a chunk of this drop gave up waiting for the single writer; the collection \
-                     is dropped and what it held is removed at the next start"
+                     is dropped and what it held is removed by the next retention pass"
                 );
                 Ok(())
             }
@@ -2408,7 +2455,7 @@ impl Engine {
     }
 
     /// Whether anything is filed under a collection id at all.
-    fn collection_range_is_empty(&self, id: CollectionId) -> Result<bool> {
+    pub(crate) fn collection_range_is_empty(&self, id: CollectionId) -> Result<bool> {
         let txn = self.db.begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         if docs.range(doc_range(id))?.next().is_some() {
@@ -2552,6 +2599,56 @@ impl Engine {
             rows, "finished the collection drops that a restart interrupted"
         );
         Ok(())
+    }
+
+    /// Finish, while the node runs, a drop whose purge was left owed (ADR-158's
+    /// addendum): the retention pass's half of [`Self::resume_interrupted_drops`].
+    ///
+    /// A purge is left owed when one of its chunks gives up waiting for the
+    /// writer inside a caller's budget ([`Self::purge_what_the_drop_left`]),
+    /// which happens under exactly the sustained load a member can then stay
+    /// up through for days. Found the way `open` finds it — a tombstone with no
+    /// collection over it and rows beneath — and removed with the same chunked
+    /// purge, so the pass holds the writer one chunk at a time as every other
+    /// part of it does (ADR-151). Run before the pass collects collection
+    /// tombstones, and those are not collected while rows remain under them,
+    /// so the marker this reads outlasts the residue it marks.
+    ///
+    /// A chunk that gives up here too leaves the rest for the next pass, which
+    /// finds it by the same marker. A pass with nothing owed reads the dropped
+    /// table and says nothing.
+    pub(crate) fn finish_owed_drops(&self) -> Result<usize> {
+        let owed = self.drops_left_unfinished()?;
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        for (id, rows) in &owed {
+            info!(
+                collection = %id,
+                rows,
+                "a collection drop left rows behind; the retention pass is removing them"
+            );
+        }
+
+        let mut rows = 0usize;
+        for (id, _) in &owed {
+            match self.purge_dropped_collection(*id) {
+                Ok(removed) => rows += removed,
+                Err(StorageError::WriterBusy { waited }) => {
+                    warn!(
+                        collection = %id,
+                        rows,
+                        waited_ms = waited.as_millis() as u64,
+                        "removing what a collection drop left gave up waiting for the single \
+                         writer; the next retention pass carries on"
+                    );
+                    return Ok(rows);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        info!(collections = owed.len(), rows, "removed what the collection drops had left behind");
+        Ok(rows)
     }
 
     /// Every collection id a drop left rows under, with how many: a tombstone
@@ -3925,8 +4022,9 @@ mod tests {
     /// A drop is done when it is buried, and the purge behind it is a
     /// removal this node owes itself: a chunk that gives up waiting for the
     /// writer inside the caller's budget (ADR-151) leaves the drop standing
-    /// and the rows for the next start, rather than reporting a failed drop
-    /// whose retry would answer `dropped: false` over rows still on disk.
+    /// and the rows for the next retention pass or the next start, rather than
+    /// reporting a failed drop whose retry would answer `dropped: false` over
+    /// rows still on disk. This one pins the start.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3960,6 +4058,75 @@ mod tests {
         };
 
         assert_eq!(rows_under(&Engine::open(&path).unwrap(), coll.id), (0, 0), "the next start");
+    }
+
+    /// The probe reading counts what `count_by_id` counts — live documents, a
+    /// tombstone not among them — and hands back the witnessed vector beside
+    /// it, both from one snapshot (ADR-168's limitation). An id this node does
+    /// not hold is `None`, not zero.
+    #[test]
+    fn the_count_probe_reading_counts_what_count_by_id_counts() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("app", "c").unwrap();
+        for i in 0..5 {
+            engine.insert(&coll, bson::doc! { "_id": format!("d{i}") }).unwrap();
+        }
+        assert!(engine.delete(&coll, &kimmy_core::DocId::String("d1".into())).unwrap());
+
+        let (vector, count) = engine.count_probe_reading(coll.id).unwrap();
+        assert_eq!(count, Some(4), "a tombstone is not a document");
+        assert_eq!(count, engine.count_by_id(coll.id).unwrap());
+        assert_eq!(vector, engine.witnessed_vector().unwrap());
+        assert_eq!(engine.count_probe_reading(CollectionId(0x5eed)).unwrap().1, None);
+    }
+
+    /// The same owed purge on a node that stays up: the next retention pass
+    /// finishes it, without a restart (ADR-158's addendum). More than a chunk
+    /// is owed, under the collection and its vector shadow both, and the
+    /// tombstones stay — they are not due, and they mark the drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_left_owed_by_a_busy_writer_is_finished_by_the_next_retention_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (coll, shadow) = a_collection_of_more_than_one_chunk(&engine);
+        engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+
+        let hold = engine.hold_writer(WriterHolder::Bulk);
+        let budget = std::time::Duration::from_millis(100);
+        let owed = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(with_write_wait_budget(budget, async move {
+                engine.purge_what_the_drop_left(coll.id, "shop", "orders")
+            }))
+            .await
+            .unwrap()
+        };
+        drop(hold);
+        assert!(owed.is_ok(), "the drop must not be reported as failed: {owed:?}");
+        assert_eq!(engine.writer_wait_timeouts(), 1, "a chunk did give up");
+        let rows: usize = [coll.id, shadow.id]
+            .into_iter()
+            .map(|id| {
+                let (docs, indexes) = rows_under(&engine, id);
+                docs + indexes
+            })
+            .sum();
+        assert!(rows > DROP_PURGE_CHUNK, "more than a chunk owed: {rows}");
+
+        let policy = crate::RetentionPolicy::new(24 * 60 * 60, 24 * 60 * 60);
+        let outcome = engine.collect_garbage(policy).unwrap();
+
+        assert_eq!(outcome.dropped_rows_removed, rows, "{outcome:?}");
+        for id in [coll.id, shadow.id] {
+            assert_eq!(rows_under(&engine, id), (0, 0), "rows left under {id} after the pass");
+            assert!(engine.collection_dropped_at(id).unwrap().is_some(), "the tombstone stays");
+        }
+        assert!(engine.get_collection("shop", "orders").is_err(), "the drop still stands");
+        assert_eq!(
+            engine.collect_garbage(policy).unwrap().dropped_rows_removed,
+            0,
+            "and the pass after owes nothing"
+        );
     }
 
     /// The holder set is a metric label, so its shape is load-bearing: a

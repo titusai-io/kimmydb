@@ -4957,6 +4957,53 @@ async fn searching_a_collection_with_no_vectors_says_so() {
     assert!(message.contains("/vectors"), "the message must say how to fix it: {message}");
 }
 
+/// The check behind `no_vectors` stops at the first vector it finds rather
+/// than counting them (ADR-153's addendum), and a deleted vector is not one:
+/// a collection whose every vector row is a tombstone answers exactly as one
+/// that never had any.
+#[tokio::test]
+async fn a_collection_whose_vectors_were_all_deleted_still_has_no_vectors() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    for (id, vector) in [("a", [1.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0])] {
+        server
+            .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": id }))
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": id }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+
+    let engine = &server.state.engine;
+    let shadow = engine.vector_collection("shop", "docs").unwrap().unwrap();
+    let mut rows = Vec::new();
+    engine
+        .for_each_doc(&shadow, |id, _| {
+            rows.push(id);
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 2, "one vector row per document");
+    for id in &rows {
+        assert!(engine.delete(&shadow, id).unwrap());
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0] }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "tombstones are not vectors: {:?}", res.body);
+    assert_eq!(res.body["error"], "no_vectors");
+}
+
 #[tokio::test]
 async fn a_deleted_document_does_not_surface_from_search() {
     // The shadow collection is cleaned up by the embedding worker *after* the
