@@ -193,7 +193,7 @@ arbitrary = "1"
 # JSON for the spec itself because the document is written and reviewed by
 # hand, and a hand-written JSON document of that size stops being read.
 serde_norway = "0.9"
-jsonschema = { version = "0.52", default-features = false }
+jsonschema = { version = "0.55", default-features = false }
 # Benchmarks. `html_reports` off: the numbers get recorded in docs/benchmarks.md
 # by hand, and an untracked report directory is noise in a repo.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
