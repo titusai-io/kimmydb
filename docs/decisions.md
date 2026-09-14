@@ -13542,6 +13542,17 @@ the waiter's own row does not carry it.
 
 > **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
 
+> **Overturned in part by [ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window).** "An append of that key
+> under `Position::Raise`" could not release a mark: a re-delivery of a held
+> entry is usually superseded before it is appended, and when it wins instead —
+> its tombstone collected, its entry kept as the oplog's newest — an append of an
+> existing key returned before the arm that releases. A test then asserted
+> that supersession must not release, on a justification its own fixture
+> contradicted. Since ADR-169 a held entry is released when it arrives in a
+> window contiguous from this node's position, appended or superseded. The
+> paragraphs below that say marks go "only by a later append in position or by
+> retention" describe the state before it.
+
 **Decision.** A node records, in a node-local table, every oplog entry it
 appended as **state** rather than as history — a snapshot document, ADR-152's
 `Position::Hold`. `Engine::open`'s rebuild of the version vector skips those
@@ -13704,7 +13715,8 @@ unaffected: the change is invisible outside this node.
 (the case ADR-152 recorded as untested),
 `a_completed_snapshot_releases_every_mark_it_made`,
 `finishing_an_interrupted_snapshot_releases_what_the_restart_kept`,
-`re_delivering_documents_a_snapshot_already_applied_does_not_claim_them`,
+`re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window`
+(renamed and reversed by ADR-169),
 `a_stale_mark_can_never_lower_a_vector_that_already_covers_it`, and
 `a_database_with_no_held_table_opens_as_it_always_did`.
 
@@ -14497,7 +14509,11 @@ walk per tombstone, so this one is costed explicitly.
 
 **Residuals, stated.**
 
-- **A delete applied part-way through a pull is held above the vector the
+- **Closed by [ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window).** A delete applied part-way through a
+  pull is held above the vector the receiver advertises, and a member pulling
+  entries from it defers it — until the same entry arrives in a window, which now
+  releases it. The paragraph below is the state before ADR-169.
+  **A delete applied part-way through a pull is held above the vector the
   receiver advertises, and a member pulling entries from it defers it.** The
   carried delete is appended under `Position::Hold` and marked held. When the same
   `Delete` later reaches the receiver by entries, the equal stamp reads as already
@@ -14572,8 +14588,9 @@ walk per tombstone, so this one is costed explicitly.
   `is_history`, where only it decides.
 - `a_carried_delete_whose_id_does_not_re_encode_to_its_key_is_not_applied`: the
   key check never lands a delete on another document.
-- **The held-delete residual, pinned:**
-  `a_delete_applied_mid_pull_is_held_above_the_vector_the_receiver_advertises`.
+- **The held-delete residual:**
+  `a_delete_applied_mid_pull_is_released_when_its_entry_arrives_in_position`
+  (renamed and flipped when ADR-169 closed it).
 - `a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_document` in
   `kimmy-cluster`.
 - **The relay gap, pinned:** `a_receiver_that_never_held_the_document_does_not_yet_carry_the_delete_on`
@@ -14688,6 +14705,13 @@ confirmations above from a real divergence while the load ran.
   answer; not needed for the measured defect.
 - *Judge this node's side on the peer's witnessed vector.* Rejected above.
 
+> **Closed on both routes by [ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window)** once the held entry
+> arrives in a window contiguous from the member's position: both routes below
+> were one mechanism, a mark that arrival could not release. Until that arrival
+> the member still holds the entry as state, and this paragraph still applies —
+> and it never arrives in a window if every peer serves that range by snapshot
+> instead, for instance after their retention collected it.
+
 **Limitation, named: a difference between count and servable vector is invisible
 to this gate, and state applied under `Position::Hold` creates exactly that.** The
 gate asks "are the two members level?" of vectors and then "do they differ?" of
@@ -14724,3 +14748,113 @@ tests; and in `kimmy-cluster`'s replication tests,
 (the defensive standing-still rule, on a probe held still by the test), and
 `while_one_member_keeps_writing_the_count_half_against_it_stays_quiet` (the
 consequence, pinned: it compares, and mismatches, without this record).
+
+## ADR-169 — An entry held as state is released when it arrives in a contiguous window
+
+**Decision.** An oplog entry this node holds under an `OPLOG_HELD` mark (ADR-160)
+is released — the mark removed, both vectors raised to its stamp — when the same
+entry arrives in a window a peer served **contiguously from this node's own
+position**, whether that arrival appends it or is superseded because the record
+at its key is already at that stamp. The window's contiguity is **passed in, not
+assumed**: `Position` gains `InWindow`, which `apply_batch_absorbing` passes only
+when a peer introduced the window (`apply_peer_batch`, the sync pull and the push
+of ADR-143), and only `InWindow` releases. A plain `Raise` — a local write, a
+hand-applied `apply_remote`, a bare `apply_batch` — releases nothing. No arrival
+position is added and nothing is published: the entry already has both, from
+when it was applied under `Hold`.
+
+**This overturns a deliberate assertion, and says so.** The test
+`re_delivering_documents_a_snapshot_already_applied_does_not_claim_them` asserted
+that supersession releases no mark, on this justification:
+
+> *"An unfinished snapshot's documents are held as state. If the entries path
+> then re-delivers the same stamps, last-writer-wins supersedes every one of them
+> -- the document is already at that stamp -- so nothing is appended, the
+> servable vector does not move, and the marks stay. That is correct: this node
+> still cannot serve a contiguous window containing them."*
+
+Its own next assertion contradicted it: the same contiguous window from the
+beginning **caught the node up** — the later entries were appended in position and
+a per-origin high-water mark then covered the held stamps — and the test called
+the marks it kept *"stale rather than wrong"*. The justification was a claim
+about a property (can this node serve a contiguous window containing the entry?)
+drawn from a mechanism (was it appended just now?). **The servable vector means
+"this node can serve a contiguous window containing this".** An entry physically
+in the oplog that arrived in a window contiguous from this node's position has
+that property; the append was only ever the proof of contiguity, and the window
+proves it instead. ADR-160's sentence — a mark goes on *"an append of that key
+under `Position::Raise`, which is the statement that the entry arrived in position
+after all"* — was ambiguous between the two readings, the test chose the wrong
+one, and the release it named was not performed anyway: a re-delivery of a held
+entry is usually superseded before it is appended, and when it wins instead — once
+retention has collected a held delete's tombstone and kept its entry as the oplog's
+newest — `append_oplog_at` returned before its `Raise` arm for a key it already
+held. The
+test is rewritten to assert the release, and **keeps its caught-up half**, which
+is the evidence for this record.
+
+**Why it matters: one release that never happened is the mechanism behind three
+findings recorded separately.**
+- ADR-167's held-delete residual: a carried delete applied under `Hold` stayed
+  held when the same `Delete` then arrived by entries, above the vector the member
+  advertises, so a member pulling entries from it deferred the delete
+  (`beyond_advertised`) until an unrelated in-position append.
+- ADR-168's limitation, both routes: a held carried delete left a member's count
+  **lower** than its servable vector implied, and held snapshot documents left it
+  **higher**, so a peer judged level against it could confirm a divergence that
+  was only held state.
+- ADR-160's own residual: a healthy caught-up node holding marks against a busy
+  sender, under-claiming on a rebuild.
+All three are the same mechanism — a mark that the arrival which should have
+released it did not release.
+
+**Why contiguity is a passed-in fact.** The release rests on "this window was
+contiguous from my position". That is true of every window a peer introduces
+(ADR-148: the window is served from this node's position, entries above the
+advertised vector are left, and an unknown collection stops the batch), but it is
+a caller-side invariant. If a `Raise` path ever applied entries out of stamp order
+and released on them, the node would advertise that it can serve entries it
+cannot — the class of failure hardest to see. So the batch path says so
+explicitly, and every other path is `Raise` and releases nothing.
+`apply_peer_batch`'s caller still vouches for the window it passes; a caller that
+hands it a window with a gap in it would be believed, which is the contract
+`apply_peer_batch` already has for coverage.
+
+**Publishing, settled here so it is not re-opened.** A released entry was applied
+under `Hold` through the ordinary replicated path, which published its change
+event after that commit. Releasing it later adds no arrival and publishes
+nothing, so a live stream saw it once and a resumed stream replays it once.
+
+**Consequences.**
+- ADR-167's held-delete residual is **closed** once the delete arrives in a
+  window; ADR-168's limitation is **closed on both routes** under the same
+  condition — until the entry arrives, a member still holds it as state.
+- A scoped repair's marks, and a whole-database snapshot's marks above its grant,
+  now go when their entries arrive in position, not only on retention.
+
+**Alternatives.**
+- *Append a second copy in position.* A second arrival position replays the
+  change twice to every resumed stream.
+- *Release on any `Raise`.* Trusts contiguity from paths that do not vouch for it.
+- *Leave the test and correct ADR-160's sentence to match it.* Keeps a
+  justification its own fixture refutes, and all three findings above open.
+
+**Held by**
+- `a_delete_applied_mid_pull_is_released_when_its_entry_arrives_in_position`
+  (ADR-167's residual, formerly pinned open);
+- `a_held_snapshot_document_is_released_when_its_entry_arrives_in_position`
+  (ADR-160's direction, with a reopen agreeing and no held entry gaining a second
+  arrival);
+- `an_entry_re_delivered_out_of_position_keeps_its_mark` (a `Hold` re-pull
+  releases nothing);
+- `an_entry_re_delivered_outside_a_window_keeps_its_mark` (the contiguity
+  premise: a bare batch and `apply_remote` release nothing);
+- `a_mark_whose_entry_is_gone_releases_nothing_over_it` (the release raises no
+  vector over an entry the oplog no longer holds — a construction no current path
+  produces, since rewind and retention remove a mark with its row);
+- `a_held_delete_whose_tombstone_retention_collected_is_released_through_the_append`
+  (the existing-key branch, whose first form failed the batch — found by review);
+- `a_window_releases_nothing_above_the_vector_that_introduced_it` (deferral cannot
+  sit below a release of the same origin, in either window order);
+- `re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window`
+  (the overturned test, rewritten, its caught-up half kept).

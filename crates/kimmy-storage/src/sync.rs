@@ -609,6 +609,14 @@ impl Engine {
         let mut run = Run::default();
         let mut memo = Memo::default();
         let mut stopped_at: Option<Stamp> = None;
+        // A window a peer introduced is served from this node's own position,
+        // so it is contiguous for every origin it carries (ADR-148); only then
+        // may an entry already held as state be released (ADR-169). A batch
+        // with no window behind it vouches for nothing.
+        let position = match introduced {
+            Some(_) => crate::engine::Position::InWindow,
+            None => crate::engine::Position::Raise,
+        };
 
         for entry in entries {
             if let Some(introduced) = introduced
@@ -627,7 +635,7 @@ impl Engine {
             // stamp is recorded for an entry that was not applied. See
             // ADR-054. The one entry not taken — a collection this node
             // lacks — is not observed, and the batch ends at it.
-            match self.apply_one(entry, &mut run, &mut memo, &mut outcome)? {
+            match self.apply_one(entry, position, &mut run, &mut memo, &mut outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
@@ -1049,6 +1057,7 @@ impl Engine {
     fn apply_one<'e>(
         &'e self,
         entry: &OplogEntry,
+        position: crate::engine::Position,
         run: &mut Run<'e>,
         memo: &mut Memo,
         outcome: &mut SyncOutcome,
@@ -1120,7 +1129,7 @@ impl Engine {
         };
 
         let txn = self.run_txn(run)?;
-        match self.apply_remote_in_txn(txn, &collection, entry, crate::engine::Position::Raise)? {
+        match self.apply_remote_in_txn(txn, &collection, entry, position)? {
             RemoteApplied::Applied { id, violations } => {
                 outcome.applied += 1;
                 run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
