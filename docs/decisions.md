@@ -13964,6 +13964,13 @@ collection a scoped snapshot is of, the receiver's gate on that field is
 unchanged, and a scoped page carries no list — both halves of which are now
 pinned by tests rather than merely true.
 
+> **Residual closed by [ADR-167](#adr-167--a-document-delete-travels-in-a-snapshot-by-key-to-a-receiver-that-holds-the-document).**
+> A page now carries the document tombstones its walk passes, by key, and a
+> receiver that holds the document applies them through the same
+> last-writer-wins check a replicated delete goes through. A receiver that
+> never held it records nothing, so it carries nothing on; ADR-167 states that
+> gap. The paragraph below is the state before it.
+
 **Residual: a document delete still does not travel.** This record closes the
 hole at the level of collections and leaves the identical one open a level
 down. The walk that builds a page skips document tombstones — a tombstone has
@@ -14314,6 +14321,11 @@ the first fixture cannot produce.
 
 ### 3. ADR-162 was silent about the same defect one level down
 
+> **Closed by [ADR-167](#adr-167--a-document-delete-travels-in-a-snapshot-by-key-to-a-receiver-that-holds-the-document)** for a receiver that holds the
+> document. The residual this item names, and the two comments item 4 rewrote,
+> now describe code that has been fixed there; both comments were rewritten
+> again. A receiver that never held the document still carries nothing on.
+
 A document **delete** does not travel in a snapshot: the walk that builds a
 page skips document tombstones, because a tombstone has no `_id` to recover and
 `keyenc` is one-way. A receiver that held a document the sender has since
@@ -14347,3 +14359,225 @@ would look. Both are replaced with what is true and a pointer to the residual.
 second claim. The first and third are corrections to prose and are held by the
 measurements quoted in them; the first is additionally pinned by `held_len`'s
 own doc comment, which was right all along.
+
+## ADR-167 — A document delete travels in a snapshot, by key, to a receiver that holds the document
+
+**What this closes, exactly.** A document the sender deleted no longer survives a
+**snapshot** — whole-database or scoped — **on a receiver that holds it**. It does
+**not** close two things, both stated below: a delete relayed through a member
+that **never held** the document (that member carries nothing on, by snapshot or
+by entries), and survival by the entries route from a snapshot-caught-up member,
+which is not specific to documents.
+
+**Decision.** A snapshot page carries the document tombstones its walk passes,
+in a new list, `SnapshotPage::deleted_documents`, each one a collection, the
+**encoded document key** and the delete's stamp. The walk that builds a page no
+longer skips a tombstone; tombstones share the page with documents, count toward
+`SNAPSHOT_PAGE` and can end a page, so the cursor is still one walk in key order.
+Both routes take the same walk, so the whole-database snapshot and the scoped
+repair are fixed together.
+
+A receiver applies each carried tombstone inside the page's own transaction,
+after three questions:
+
+1. **Does the sender's own coverage name the stamp?** If not, it is ignored with
+   a warning. A peer may only deny what its own coverage names (ADR-163); the
+   key and the stamp both come off the wire, so without this an arbitrary pair
+   deletes an arbitrary document.
+2. **Is it history here?** The same `is_history` the page's documents answer —
+   and **not** redundant with question 3, which an earlier draft of this record
+   claimed. A restored collection's floor is the *sender's* stamp, and nothing
+   on the snapshot route moves the receiver's clock up to it, so under clock
+   skew a document written on the receiver into the standing life can carry a
+   stamp below its own floor, and so can a delete of it from a peer behind the
+   same way. That delete out-stamps the document; only the floor turns it away,
+   as the entries route does. **Question 3's own strict out-stamp check is
+   untested on its own**: `apply_remote_in_txn` checks last-writer-wins again
+   behind it, and removing it changes no stored state, only an advance of the
+   local clock to the tombstone's stamp.
+3. **Does this node hold a live document the tombstone strictly out-stamps?**
+   Then it is deleted through the ordinary replicated-delete path,
+   `apply_remote_in_txn` under `Position::Hold`: its index entries go, a
+   `Delete` entry is appended **with the document's `_id`** and served onward
+   like any entry, and it is published after the commit. **Otherwise nothing is
+   written** — not over a newer write, not over a tombstone, and not where
+   nothing is held.
+
+**Why.** The walk skipped tombstones because a tombstone keeps no body and
+`keyenc` is one-way, so there was no `_id` to put in a `SnapshotDoc`. A receiver
+that held a document the sender had since deleted therefore kept it, and on a
+whole-database snapshot that was permanent for the reason ADR-162 gives one level
+up, word for word with *collection* replaced by *document*: **what made it
+permanent is the coverage grant.** A scoped repair walked the same line, so no
+route healed it. The comment on the skip called it safe *"because the receiver
+never had the document"*; a whole-database snapshot is served to a node that fell
+below a peer's retention horizon, not a fresh one, and it very often had.
+
+**"A tombstone has no `_id`" was never a constraint on the fix, only on the
+sender.** The plan that filed this treated recovering the id as the blocking
+problem, with storing `_id` beside every tombstone as the costed fallback — a
+migration, and a cost on every delete. It dissolves once you ask where an id is
+needed: **only where the receiver holds the document, and there the receiver's
+own copy carries it.** The receiver checks that the `_id` it reads back encodes
+to the carried key before deleting, so a mismatch never lands the delete on
+another document. A mismatch can be constructed — `Engine` keys a
+`DocId::Uuid` under binary subtype 4 and `DocId::try_from_bson` reads any binary
+as the generic subtype — though not over HTTP or MCP, where ids come through
+`try_from_bson`, and no non-test code builds a `DocId::Uuid`. Such a document
+keeps living on the receiver rather than cost it another.
+
+**The rule for changing the wire, stated as a rule and not as this record's
+choice: add a list old peers ignore; never overload a field old peers already
+interpret.** The obvious alternative was to put the key on `SnapshotDoc` and send
+a tombstone as a `SnapshotDoc` with `body: None`. That changes the meaning of an
+existing field: an older receiver already reads `body: None` as a tombstone *for
+the `id` on the same struct* — a required `DocId` a tombstone does not have — and
+given a placeholder it deletes **the wrong document**, which is the worst failure
+available, not a no-op. A new `#[serde(default)]` field is ignored by an older
+receiver, which keeps its previous behaviour, and omitted by an older sender,
+whose pages decode with an empty list. That is how ADR-162's
+`dropped_collections` rolled: a mixed-version pair keeps the old behaviour until
+both ends have rolled, with no negotiation and no ordering.
+
+**Why a receiver that holds nothing records nothing — a tombstone by key was
+built, and cut.** The first form of this record also wrote a bare
+`DocRecord::tombstone(stamp)` by key where the receiver held nothing, so that a
+member that never held the document would carry the delete on to the next member
+that caught up from it. Two independent reviews each found a way it lost a
+delete that v0.27.1 did not lose, and both have one root cause:
+**`apply_remote_in_txn` supersedes an incoming entry whose stamp equals the
+record standing at its key, before it appends — even when this node's oplog does
+not hold that entry.** A bare record has no `_id` and so no entry; wherever the
+`Delete` entry was still owed, it met the bare record at its own stamp when it
+came, was superseded, and never reached this node's oplog, while this node's
+position moved past it — so a member pulling entries from here kept the document.
+That happened:
+
+- on **every scoped repair** of a collection the receiver lacked, which grants no
+  coverage, so every delete in it was still owed;
+- on a whole-database pull for deletes a **later page** carried above the first
+  page's vector;
+- when a written-under-grant record's pull was **interrupted before its final
+  page** — forgotten as soon as another peer lifted the node, replaced on a scope
+  change, abandoned, or restarted against another peer — so the grant it was
+  written under was never absorbed;
+- when the pull was later completed **from a lagging peer** whose grant was below
+  the record's stamp.
+
+Gating the record on the pull's grant closed the first two and not the last two,
+because the record is written before the grant is absorbed, on the last page. The
+two remaining fixes each cost more than this record should carry: writing the
+records in the final page's transaction buffers every tombstone of the database
+in the persisted progress record, rewritten every page, and lengthens the final
+writer hold; teaching `apply_remote_in_txn` to append an equal-stamp delete whose
+entry the oplog lacks changes shared replication on its hottest path, and needs a
+gate against re-appending an entry retention has collected (a re-append mints a
+new arrival sequence, and a resumed change stream would replay the delete). So the
+relay is left to its own record, and **this one writes nothing where nothing is
+held.** Two tests stop the bare record coming back: one asserts nothing is
+recorded where nothing is held and the `Delete` entry lands when entries bring it,
+on a scoped repair and on a whole-database pull interrupted after its first page;
+one pins the relay gap itself, over the wire and in storage, and fails the day the
+gap closes.
+
+**Cost, stated because ADR-164 exists.** A carried tombstone list once cost a full
+walk per tombstone, so this one is costed explicitly.
+- **Sender:** no read beyond what it already did. The tombstones come out of the
+  same `docs` range walk that builds the page's documents, over the page's own
+  key range, and they count toward the same 512. There is no whole-database
+  tombstone list and no second table.
+- **Receiver:** one point read of `docs` per carried tombstone, inside the
+  transaction the page already opens, with collection lookups memoised per page.
+  **O(page), never O(tombstones × collections).**
+- **Wire:** a key and a stamp per tombstone, a few tens of bytes, inside a frame
+  bounded by the page size.
+- **Commits:** a delete that lands is an applied write of the page and rides its
+  transaction; a page whose tombstones this node already holds commits nothing,
+  as a page of superseded documents does not.
+
+**Residuals, stated.**
+
+- **A delete applied part-way through a pull is held above the vector the
+  receiver advertises, and a member pulling entries from it defers it.** The
+  carried delete is appended under `Position::Hold` and marked held. When the same
+  `Delete` later reaches the receiver by entries, the equal stamp reads as already
+  applied, nothing is appended in position, and only the witnessed vector moves —
+  so a puller's window stops short of it (`beyond_advertised`) and that member
+  keeps the document for now. It clears when the receiver next appends an entry
+  from that origin in position; the puller still owes itself the entry and takes
+  it from any member that holds it in position, the origin included; it is
+  permanent only if the origin never writes again and the receiver is the
+  puller's only source. This is ADR-160's accepted residual — a held entry cannot
+  be served in a contiguous window — now reaching deletes, where at v0.27.1 the
+  receiver kept the document and minted nothing, and the delete reached it, and
+  then that member, in position. The same equal-stamp append the relay residual
+  names would close it. Held entries do not pile up: retention removes an oplog
+  entry by age whatever the vector, and its held mark with it.
+
+- **A delete older than the sender's `storage.tombstone_retention_secs` does not
+  travel.** Its tombstone has been collected, so there is nothing to carry. This
+  is the bound ADR-162's carried drops rest on and the one `operations.md` already
+  requires operators to set above the longest partition they intend to survive.
+- **A delete relayed through a member that never held the document does not
+  travel, by either route — unchanged from v0.27.1, not widened.** This record
+  closes the direct route and leaves the relay exactly as it found it. B catches up from A, never having held the document,
+  and records nothing; C, which held it, then catches up from B — by snapshot, and
+  B's walk carries no tombstone; or by entries, and B's oplog holds no `Delete`
+  while the coverage B advertises covers it. C keeps the document. Its candidate
+  fix is the equal-stamp append above, as its own record with its own review.
+  It is not silent: C reports a count the others disagree with.
+- **A node serves coverage onward that it holds only as state.** Even where the
+  receiver held the document — so the `Delete` entry is in its oplog — the
+  general shape stands: a member caught up by snapshot advertises coverage of the
+  sender's history, and its horizon check (`can_serve_peer_holding`, which asks
+  only whether a peer lacks an entry retention *collected*) approves an entries
+  round that omits everything it holds only as state. An enumeration of that
+  state puts collection drops (ADR-162), index definitions, rival and refused
+  definitions, and vector configuration in the same hole, with consequences a
+  surviving document does not have: a dropped collection that stays, a unique
+  constraint missing on one member, a TTL that never fires anywhere while that
+  member owns the collection's expiry, and vector search refused. The divergence
+  check compares documents only and sees none of them. The same sweep found two
+  defects of this record's shape on the snapshot route itself: an index drop, and
+  a disabled vector configuration, do not reach the member taking the snapshot.
+  Each is filed as its own plan.
+
+**Alternatives.**
+- *Store the `_id` beside the tombstone at delete time.* A migration and a cost
+  on every delete, to recover an id that is only needed where the receiver
+  already holds one.
+- *Do not grant coverage over deletes.* Narrowing the grant so the `Delete` stays
+  owed defeats the snapshot, which exists because the entries are gone, and
+  ADR-163 leans on the grant being honest in the other direction.
+- *Put the key on `SnapshotDoc` and send a bodiless one.* Rejected above: it
+  overloads a field an older receiver already interprets, and the misreading
+  deletes the wrong document.
+- *Record a tombstone by key where nothing is held.* Built, reviewed twice, and
+  cut above.
+
+**Held by**
+- `a_whole_database_snapshot_deletes_a_document_the_receiver_held`: the defect;
+  the unique index lets go of the value, and the `Delete` entry carries its `_id`.
+- `a_scoped_repair_deletes_a_document_the_receiver_held`.
+- `a_carried_delete_its_senders_coverage_does_not_name_is_ignored`: ADR-163.
+- `deletes_share_the_page_and_its_cursor_with_documents`: documents and deletes
+  interleaved across pages, each row exactly once.
+- `a_tombstone_is_never_sent_as_a_bodiless_document`: the mixed-version rule; an
+  older sender's page still decodes.
+- `a_pull_that_holds_nothing_records_nothing_and_the_delete_entry_still_lands`:
+  what keeps the cut mechanism cut.
+- `a_page_of_tombstones_this_node_already_holds_commits_nothing`: also passes at
+  v0.27.1; it guards the no-fsync rule against this change.
+- `a_carried_delete_below_a_restored_floor_is_history_under_clock_skew`:
+  `is_history`, where only it decides.
+- `a_carried_delete_whose_id_does_not_re_encode_to_its_key_is_not_applied`: the
+  key check never lands a delete on another document.
+- **The held-delete residual, pinned:**
+  `a_delete_applied_mid_pull_is_held_above_the_vector_the_receiver_advertises`.
+- `a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_document` in
+  `kimmy-cluster`.
+- **The relay gap, pinned:** `a_receiver_that_never_held_the_document_does_not_yet_carry_the_delete_on`
+  and, over the wire, `a_delete_does_not_yet_reach_a_member_through_one_that_never_held_the_document`.
+
+`a_carried_delete_does_not_take_a_newer_write` guards behaviour the fix must not
+break and passes without it.

@@ -2411,6 +2411,7 @@ mod tests {
             versions,
             dropped: None,
             dropped_collections: Vec::new(),
+            deleted_documents: Vec::new(),
         }
     }
 

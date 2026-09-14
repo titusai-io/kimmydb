@@ -3646,3 +3646,102 @@ async fn a_collection_recreated_on_the_peer_after_the_drop_is_still_pulled() {
         assert!(a.engine.get(&restored, &buried).unwrap().is_none(), "and none of the old one's");
     }
 }
+
+#[tokio::test]
+async fn a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_document() {
+    // ADR-167 over the real protocol: a page's deletes must survive BSON and
+    // the transport. C holds the document, A deletes it and collects its
+    // oplog, so C -- below A's horizon -- is served a snapshot, and the delete
+    // must reach it there.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+    let c = node().await;
+    sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(c.engine.count(&cc).unwrap(), 2, "C must hold the document first");
+
+    assert!(a.engine.delete(&ca, &DocId::Int64(2)).unwrap());
+    // Retention keeps an origin's newest entry, so a later write stands in
+    // front of the delete before A collects a day behind it.
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
+    a.engine
+        .collect_garbage_at(
+            later + HOUR_MS,
+            kimmy_storage::RetentionPolicy::new(DAY_SECS, u64::MAX),
+        )
+        .unwrap();
+    assert!(
+        !a.engine.can_serve_peer_holding(&c.engine.version_vector().unwrap()).unwrap(),
+        "the fixture must put C below A's horizon, or this is the entries route"
+    );
+
+    sync_once(&c.engine, a.addr, SECRET, None).await.expect("C catches up from A by snapshot");
+    assert!(c.engine.get(&cc, &DocId::Int64(2)).unwrap().is_none(), "the delete must travel");
+    assert!(c.engine.get(&cc, &DocId::Int64(1)).unwrap().is_some());
+    assert!(
+        c.engine.get(&cc, &DocId::String("clock".into())).unwrap().is_some(),
+        "the snapshot served"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_does_not_yet_reach_a_member_through_one_that_never_held_the_document() {
+    // A KNOWN GAP, pinned over the wire so a change to it is noticed. C holds
+    // the document; A deletes it; B, which never held it, catches up from A by
+    // snapshot and records nothing; C then catches up from B by snapshot, and
+    // B's walk has no tombstone to carry, so C keeps the document. Tracked by
+    // the plan "a delete relayed through a member that never held the document
+    // does not travel", whose first step is to flip the final assertion.
+    //
+    // Both catch-ups are snapshots, which takes arranging: a member is served
+    // one only when its peer has collected an entry it lacks.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
+
+    let c = node().await;
+    sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+
+    assert!(a.engine.delete(&ca, &DocId::Int64(2)).unwrap());
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("B catches up from A by snapshot");
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert!(b.engine.get(&cb, &DocId::Int64(2)).unwrap().is_none());
+
+    b.engine.insert(&cb, doc! { "_id": 3 }).unwrap();
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    b.engine.apply_batch(&[entry_stamped(cb.id, later)]).unwrap();
+    b.engine
+        .collect_garbage_at(
+            later + HOUR_MS,
+            kimmy_storage::RetentionPolicy::new(DAY_SECS, u64::MAX),
+        )
+        .unwrap();
+    assert!(
+        !b.engine.can_serve_peer_holding(&c.engine.version_vector().unwrap()).unwrap(),
+        "the fixture must put C below B's horizon, or this is the entries route"
+    );
+
+    sync_once(&c.engine, b.addr, SECRET, None).await.expect("C catches up from B by snapshot");
+    assert!(
+        c.engine.get(&cc, &DocId::Int64(3)).unwrap().is_some(),
+        "the snapshot must have served"
+    );
+    assert!(
+        c.engine.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
+        "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
+    );
+}
