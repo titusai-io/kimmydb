@@ -12,6 +12,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **A collection drop that gave up on a busy writer left its rows on disk
+  until the next restart.** When a chunk of a drop's purge could not take the
+  single writer inside the request's budget, it logged a `WARN` and left the
+  rest for the next start, and nothing retried it while the node ran. Past
+  `storage.tombstone_retention_secs`, only a collection created under the same
+  name would have cleared the rows. The retention pass now finishes such a
+  purge, logging each collection and its row count before and a line after,
+  and keeps the collection tombstone that marks the rows until they are gone.
+
 ### Documented
 
 - **`docs/mcp.md` states what `initialize` negotiates.** A client naming
