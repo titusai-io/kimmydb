@@ -1334,6 +1334,32 @@ documents grow the log quickly: 10 KB documents updated once a second is roughly
 860 MB/day. Retention caps that at one window's worth, so provision for the data
 plus roughly `oplog_retention_secs` of log.
 
+**A single write behind a bulk load waits for the bulk's fsync, by design.**
+Under `storage.durability = durable` a commit fsyncs before it releases the
+single writer, so the fsync is inside the hold, and a bulk insert is one
+transaction: a bulk of 100 is one commit and one fsync carrying all hundred
+documents, their index entries and their hundred oplog entries. A single write
+that arrives behind it waits for all of that. Measured on a three-member
+cluster with a single-document write stream and back-to-back bulks of 100
+pinned to one member: single-write p50 went from 61 to 184 ms, the writer was
+busy 99.9% of the time, and a bulk's hold averaged 74 ms — against 7.66 ms in
+the in-process benchmark, which uses ~200-byte documents and no indexes, so
+that benchmark is the wrong baseline for this, and the daemon's own figures
+already show the tail: bulk of 100 at p99 114–325 ms from 32 to 64 clients
+([Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc)). Nothing is
+failing; `kimmy_write_lock_held_seconds{holder="bulk"}` and
+`kimmy_write_lock_wait_seconds` say it is this. There is no group commit under
+`durable` — redb's single writer cannot merge two open transactions
+([ADR-088](decisions.md)) — so the knob is `storage.durability = coalesced`,
+and it gives less than its name suggests: the promise is the same (nothing
+acknowledged is lost), each commit releases the writer before it waits and
+concurrent commits share one fsync, but every write can wait up to
+`storage.commit_coalesce_ms` (5 ms) longer, a lone writer gets slower (79
+against 170 documents a second), and the shared fsync runs in a `durability`
+hold once per window that **still blocks the writer** while it flushes
+everything the window collected. It helps a member with many concurrent
+writers; it does not make a bulk load free for the writes queued behind it.
+
 **Resident memory and the container limit.** `kimmy_process_resident_bytes`
 is the number a cgroup limit is enforced against and the only series that
 measures it. Alert on it at 80% of the limit, and on it climbing while
