@@ -81,13 +81,16 @@ pub fn describe_collection(
     let mut fields: BTreeMap<String, FieldStats> = BTreeMap::new();
     let mut sampled = 0usize;
 
-    state.engine.for_each_doc(&meta, |_, doc| {
-        observe_document(&doc, &mut fields);
-        sampled += 1;
-        Ok(sampled < limit)
+    // The sample stops at `limit`, but the total is every document decoded,
+    // so the two run as one walk off the worker (ADR-153).
+    let total = kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(&meta, |_, doc| {
+            observe_document(&doc, &mut fields);
+            sampled += 1;
+            Ok(sampled < limit)
+        })?;
+        state.engine.count(&meta)
     })?;
-
-    let total = state.engine.count(&meta)?;
 
     let described: Vec<Value> = fields
         .iter()

@@ -1196,29 +1196,65 @@ impl Engine {
     pub fn live_unique_violations(
         &self,
         coll: &CollectionMeta,
+        index: Option<&str>,
     ) -> Result<Vec<kimmy_core::UniqueViolationDetail>> {
-        const PAGE: usize = 1024;
+        // A record is reported only while the index it names exists and is
+        // unique (`standing_members`), so with no such index — none on the
+        // collection, or not the one asked about — nothing can be standing, and
+        // the pass would read the whole oplog to say so.
+        let asked = |name: &str| index.is_none_or(|wanted| wanted == name);
+        if !coll.indexes.iter().any(|i| i.unique && asked(&i.name)) {
+            return Ok(Vec::new());
+        }
+        // Rows examined per read transaction. Only the entries this pass wants
+        // are decoded, so a page costs its matches, not its rows.
+        const PAGE: usize = 16_384;
         let mut out = Vec::new();
         let mut seen: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
         let mut reported: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
         let mut from = kimmy_core::Hlc::ZERO;
         let mut last_seen: Option<Stamp> = None;
         loop {
-            let page = self.read_oplog_from(from, PAGE)?;
-            let Some(last) = page.last() else { break };
-            let last_stamp = last.stamp;
-            for entry in &page {
-                // `read_oplog_from` is inclusive at `from`, so the first
-                // entries of a page can repeat the previous page's tail.
-                if last_seen.is_some_and(|s| entry.stamp <= s) {
-                    continue;
+            let mut details = Vec::new();
+            let mut examined = 0usize;
+            let mut last = None;
+            {
+                let txn = self.db().begin_read()?;
+                let oplog = txn.open_table(tables::OPLOG)?;
+                let lower = codec::oplog_key_lower_bound(from);
+                for row in oplog.range(lower.as_slice()..)? {
+                    let (key, value) = row?;
+                    let stamp = codec::decode_oplog_key(key.value())?;
+                    examined += 1;
+                    last = Some(stamp);
+                    // The range is inclusive at `from`, so the first rows of a
+                    // page can repeat the previous page's tail.
+                    if last_seen.is_none_or(|s| stamp > s) {
+                        // The kind and collection sit in the entry's fixed
+                        // header: every other collection's writes, and every
+                        // document write of this one, are judged on it without
+                        // decoding the body — which is what the pass reads
+                        // almost all of the time.
+                        let (kind, collection) =
+                            codec::decode_oplog_kind_and_collection(value.value())?;
+                        if kind == OpKind::UniqueViolation && collection == coll.id {
+                            let entry = codec::decode_oplog_entry(value.value())?;
+                            if let Some(body) = &entry.body {
+                                let detail: kimmy_core::UniqueViolationDetail =
+                                    bson::deserialize_from_slice(body)?;
+                                details.push(detail);
+                            }
+                        }
+                    }
+                    if examined >= PAGE {
+                        break;
+                    }
                 }
-                if entry.kind != OpKind::UniqueViolation || entry.collection != coll.id {
-                    continue;
-                }
-                let Some(body) = &entry.body else { continue };
-                let detail: kimmy_core::UniqueViolationDetail = bson::deserialize_from_slice(body)?;
-                if detail.ids.is_empty() {
+            }
+            // Outside the read transaction: re-evaluating a record reads the
+            // documents it names, each in a transaction of its own.
+            for detail in details {
+                if detail.ids.is_empty() || !asked(&detail.index) {
                     continue;
                 }
                 if !seen.insert((detail.index.clone(), id_set(&detail.ids))) {
@@ -1230,11 +1266,12 @@ impl Engine {
                     out.push(standing);
                 }
             }
-            if page.len() < PAGE {
+            let Some(last) = last else { break };
+            if examined < PAGE {
                 break;
             }
-            from = last_stamp.hlc;
-            last_seen = Some(last_stamp);
+            from = last.hlc;
+            last_seen = Some(last);
         }
         Ok(out)
     }
@@ -2322,7 +2359,7 @@ mod tests {
             remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
         engine.apply_remote(&coll, &entry).unwrap();
 
-        let live = engine.live_unique_violations(&coll).unwrap();
+        let live = engine.live_unique_violations(&coll, None).unwrap();
         assert_eq!(live.len(), 1, "{live:?}");
         assert_eq!(live[0].ids.len(), 2);
 
@@ -2334,7 +2371,7 @@ mod tests {
             9_500,
         );
         engine.apply_remote(&coll, &later).unwrap();
-        let live = engine.live_unique_violations(&coll).unwrap();
+        let live = engine.live_unique_violations(&coll, None).unwrap();
         assert_eq!(live.len(), 1, "a rewrite that keeps the value keeps the collision");
         assert_eq!(live[0].ids.len(), 2);
 
@@ -2352,7 +2389,7 @@ mod tests {
         assert!(engine.get(&coll, &DocId::String("local".into())).unwrap().is_some());
         assert!(engine.get(&coll, &DocId::String("remote".into())).unwrap().is_some());
         assert!(
-            engine.live_unique_violations(&coll).unwrap().is_empty(),
+            engine.live_unique_violations(&coll, None).unwrap().is_empty(),
             "a rewrite of the colliding value resolves the violation"
         );
         // The metric counts detections, not standing violations: the peer's
@@ -2498,5 +2535,78 @@ mod tests {
         // unconditional delete of a missing document is an ordinary `None`.
         assert_eq!(stale_of(engine.delete_if(&coll, &id, Some(second)).unwrap_err()), None);
         assert!(engine.delete_if(&coll, &id, None).unwrap().is_none());
+    }
+
+    /// Write `bytes` into the oplog at `stamp`, as nothing but storage itself
+    /// would: for the tests that need a row no writer can produce.
+    fn put_raw_oplog_row(engine: &Engine, stamp: &Stamp, bytes: &[u8]) {
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut oplog = txn.open_table(tables::OPLOG).unwrap();
+            oplog.insert(codec::oplog_key(stamp).as_slice(), bytes).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// An entry whose header reads but whose body is cut short: decoding the
+    /// whole of it fails, and reading its kind and collection does not.
+    fn truncated_insert(stamp: Stamp, collection: CollectionId) -> Vec<u8> {
+        let entry = OplogEntry {
+            stamp,
+            kind: OpKind::Insert,
+            collection,
+            doc_id: Some(DocId::String("x".into())),
+            body: Some(
+                bson::serialize_to_vec(&doc! { "_id": "x", "pad": "y".repeat(64) }).unwrap(),
+            ),
+        };
+        let mut bytes = codec::encode_oplog_entry(&entry);
+        bytes.truncate(bytes.len() - 8);
+        assert!(codec::decode_oplog_entry(&bytes).is_err(), "the fixture must be undecodable");
+        bytes
+    }
+
+    /// The violations pass reads every retained entry, and almost none of them
+    /// are what it wants. It judges them on their header: a body it does not
+    /// want is never decoded, which this proves with a body that cannot be.
+    #[test]
+    fn the_violations_pass_decodes_only_the_entries_it_reports_on() {
+        let (engine, _coll, _dir) = engine();
+        engine.create_index("app", "docs", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let elsewhere = engine.create_collection("app", "other").unwrap();
+        engine.insert(&coll, doc! { "_id": "a", "email": "a@x" }).unwrap();
+
+        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
+        put_raw_oplog_row(&engine, &stamp, &truncated_insert(stamp, elsewhere.id));
+
+        let live = engine.live_unique_violations(&coll, None).unwrap();
+        assert!(live.is_empty(), "{live:?}");
+    }
+
+    /// With no unique index to stand on — none on the collection, or not the
+    /// one asked about — the pass is not run. Proven with a row no pass can
+    /// read: asking about a unique index fails on it, the others answer.
+    #[test]
+    fn a_question_no_unique_index_can_answer_is_answered_without_reading_the_oplog() {
+        let (engine, plain, _dir) = engine();
+        engine.create_collection("app", "unique").unwrap();
+        engine.create_index("app", "unique", vec![field("email")], true, None).unwrap();
+        let unique = engine.get_collection("app", "unique").unwrap();
+        engine.create_index("app", "docs", vec![field("email")], false, None).unwrap();
+        let plain = engine.get_collection("app", plain.name.as_str()).unwrap();
+
+        let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
+        put_raw_oplog_row(&engine, &stamp, &[0xFF; 64]);
+
+        assert!(engine.live_unique_violations(&unique, None).is_err(), "the pass reads the row");
+        assert!(
+            engine.live_unique_violations(&unique, Some("email_1")).is_err(),
+            "and does for the unique index by name"
+        );
+        assert!(engine.live_unique_violations(&unique, Some("no_such_index")).unwrap().is_empty());
+        assert!(engine.live_unique_violations(&plain, None).unwrap().is_empty());
+        assert!(engine.live_unique_violations(&plain, Some("email_1")).unwrap().is_empty());
     }
 }

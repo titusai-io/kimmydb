@@ -791,7 +791,8 @@ async fn backup(
     auth.require(kimmy_auth::Action::Admin, "*", None)?;
 
     let mut buf = Vec::new();
-    let info = state.engine.backup_to(&mut buf)?;
+    // The whole store, so a walk (ADR-153).
+    let info = kimmy_storage::blocking(|| state.engine.backup_to(&mut buf))?;
     state.metrics.record_backup();
     warn!(
         records = info.records,

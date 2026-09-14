@@ -12006,6 +12006,60 @@ one-worker runtime, a task spawned while a `count` over 30,000 documents is
 running is polled before the count finishes; before this change it was polled
 19 µs after.
 
+**Addendum, 2026-09-14: the walks this decision missed.** The decision says
+every read verb that walks goes through `visit_matching`. Five did not, and ran
+on the async worker as before:
+
+- `GET …/violations`: one pass over the whole retained oplog per call
+  (`Engine::live_unique_violations`), decoding every entry of every collection
+  in pages of 1,024. On a three-member test cluster retaining a day of writes
+  it cost about 790 ms per call on a collection with no unique index, as much
+  as on one with, and eight concurrent calls stalled `/metrics` for up to
+  1.26 s.
+- `$lookup`, both forms: the whole foreign collection per stage.
+- `describe_collection`, over REST and as the MCP tool and resource: the sample
+  stops at its limit, but the total is `Engine::count`, every document decoded.
+- `GET /v1/admin/backup`: the whole store.
+
+A sixth was found while fixing these: a vector search checked that the
+collection had any vectors by counting all of them, on every search.
+
+Each of the five now runs under `blocking` inside the `exec` or `schema`
+function, so the MCP tools that call those functions are covered with the
+routes. The vector check stops at the first live vector and stays on the
+worker, as a primary-key probe does. What it answers is unchanged: the walk
+skips tombstones, so a collection whose every vector was deleted still answers
+`no_vectors`, and a test fails if a deleted row is ever taken for a vector. The violations pass also stops paying for
+what it does not report:
+
+- **It is skipped when nothing could stand.** A record is reported only while
+  the index it names exists and is unique, so a collection with no unique
+  index, or `?index=` naming something that is not one of its unique indexes,
+  is answered from metadata, inside `live_unique_violations` itself. The answer
+  is the one the pass would have given.
+- **It judges each entry on its header.** The kind and collection sit in an
+  entry's fixed-width header, so every other collection's writes, and this
+  collection's document writes, are passed over without decoding the document
+  id or copying the body. Only `UniqueViolation` entries of the collection are
+  decoded. A read transaction examines up to 16,384 rows rather than decoding
+  1,024 entries.
+
+The pass is still one walk over the retained oplog's keys and headers, so its
+cost still grows with `storage.oplog_retention_secs` and the write rate, and
+`openapi.yaml` and `indexes.md` now say so. Keeping a per-collection record of
+violation entries would make the cost proportional to violations rather than to
+the oplog. It is a format decision, and is not taken here.
+
+**The guard.** `crates/kimmy-api/tests/walks_leave_the_worker.rs` reads the
+`kimmy-api` and `kimmy-mcp` sources and fails on a call to a storage walk that
+is not inside the parentheses of a `blocking(` call, followed by bracket depth
+so a closure of any length is seen through. Walks bounded by
+something other than client data are counted per file, each with its reason:
+the webhook registry and delivery bookkeeping, the node registry,
+`sample_documents` at its limit, and the vector emptiness check. The check is
+textual. A walk reached through a helper whose name is not on its list is not
+seen, and that is the limit of what it proves.
+
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
 **Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a

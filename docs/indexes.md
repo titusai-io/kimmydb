@@ -623,6 +623,14 @@ collision older than `storage.oplog_retention_secs` is no longer listed even
 if both documents still exist — the change-stream event is the durable
 record, and an application that needs longer memory keeps it.
 
+**What a call costs.** Being derived from the retained oplog, the report is
+one pass over it — the header of every retained entry, whatever collection
+wrote it — so a call takes longer as `storage.oplog_retention_secs` and the
+node's write rate grow, not as this collection does. A collection with no
+unique index, or `?index=` naming something that is not one of its unique
+indexes, is answered without the pass. Call the route to resolve what a
+`uniqueViolation` event announced, not on a timer ([ADR-153](decisions.md)).
+
 ---
 
 ## TTL indexes — expiring documents
