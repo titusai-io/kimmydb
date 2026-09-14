@@ -1047,6 +1047,14 @@ impl Engine {
         table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     ) -> Result<kimmy_core::VersionVector> {
         let txn = db.begin_read()?;
+        Self::read_versions_in(&txn, table)
+    }
+
+    /// [`Self::read_versions`] inside a read transaction the caller holds.
+    fn read_versions_in(
+        txn: &redb::ReadTransaction,
+        table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    ) -> Result<kimmy_core::VersionVector> {
         let versions = txn.open_table(table)?;
         let mut out = kimmy_core::VersionVector::new();
         for row in versions.iter()? {
@@ -1599,6 +1607,49 @@ impl Engine {
     /// made every cluster re-request the same entries forever (ADR-054).
     pub fn witnessed_vector(&self) -> Result<kimmy_core::VersionVector> {
         Self::read_versions(&self.db, tables::OPLOG_WITNESSED)
+    }
+
+    /// This node's side of a divergence count probe (ADR-168): the witnessed
+    /// vector, and the live count of collection `id`, read in **one** read
+    /// transaction.
+    ///
+    /// The gate judges the count against the vector, and it is sound only
+    /// while the vector cannot name an entry the count missed. Read as two
+    /// calls, that held because the caller read the vector first, an order
+    /// kept by a comment. Read from one snapshot, the two describe the same
+    /// state and there is no order to keep. The count is `None` when this node
+    /// holds no collection under `id`, as [`Self::count_by_id`] answers.
+    ///
+    /// A walk of the collection's records, so a caller on the async runtime
+    /// runs it under [`blocking`] (ADR-153).
+    pub fn count_probe_reading(
+        &self,
+        id: CollectionId,
+    ) -> Result<(kimmy_core::VersionVector, Option<u64>)> {
+        let txn = self.db.begin_read()?;
+        let witnessed = Self::read_versions_in(&txn, tables::OPLOG_WITNESSED)?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        let mut held = false;
+        for row in collections.iter()? {
+            let (_, value) = row?;
+            let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+            if meta.id == id {
+                held = true;
+                break;
+            }
+        }
+        if !held {
+            return Ok((witnessed, None));
+        }
+        let docs = txn.open_table(tables::DOCS)?;
+        let mut count = 0u64;
+        for row in docs.range(doc_range(id))? {
+            let (_, value) = row?;
+            if !codec::decode_doc_record(value.value())?.deleted {
+                count += 1;
+            }
+        }
+        Ok((witnessed, Some(count)))
     }
 
     /// Raise the witnessed vector to cover a whole batch, in one transaction.
@@ -4007,6 +4058,26 @@ mod tests {
         };
 
         assert_eq!(rows_under(&Engine::open(&path).unwrap(), coll.id), (0, 0), "the next start");
+    }
+
+    /// The probe reading counts what `count_by_id` counts — live documents, a
+    /// tombstone not among them — and hands back the witnessed vector beside
+    /// it, both from one snapshot (ADR-168's limitation). An id this node does
+    /// not hold is `None`, not zero.
+    #[test]
+    fn the_count_probe_reading_counts_what_count_by_id_counts() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("app", "c").unwrap();
+        for i in 0..5 {
+            engine.insert(&coll, bson::doc! { "_id": format!("d{i}") }).unwrap();
+        }
+        assert!(engine.delete(&coll, &kimmy_core::DocId::String("d1".into())).unwrap());
+
+        let (vector, count) = engine.count_probe_reading(coll.id).unwrap();
+        assert_eq!(count, Some(4), "a tombstone is not a document");
+        assert_eq!(count, engine.count_by_id(coll.id).unwrap());
+        assert_eq!(vector, engine.witnessed_vector().unwrap());
+        assert_eq!(engine.count_probe_reading(CollectionId(0x5eed)).unwrap().1, None);
     }
 
     /// The same owed purge on a node that stays up: the next retention pass

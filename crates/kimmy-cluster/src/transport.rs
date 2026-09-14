@@ -316,8 +316,8 @@ where
                 // The one document read in this exchange, bounded to the
                 // single collection the requester named (ADR-133).
                 let probe_count = match probe {
-                    Some(id) => engine
-                        .count_by_id(id)
+                    // A walk of that collection, so off the worker (ADR-153).
+                    Some(id) => kimmy_storage::blocking(|| engine.count_by_id(id))
                         .map_err(|e| ProtocolError::Malformed(e.to_string()))?,
                     None => None,
                 };
@@ -425,8 +425,8 @@ where
 pub struct DivergenceProbe {
     pub id: kimmy_core::CollectionId,
     pub mine_count: Option<u64>,
-    /// This node's witnessed vector, read immediately before `mine_count` —
-    /// what that count can have seen (ADR-168).
+    /// This node's witnessed vector, read in the same snapshot as
+    /// `mine_count` — what that count can have seen (ADR-168).
     ///
     /// The count is read once per tick, before the tick's pulls, and the
     /// peer's count is read when the probe reaches it, after them. So this

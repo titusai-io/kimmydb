@@ -9,8 +9,9 @@
 //! one, so this reads the source the handlers run.
 //!
 //! A call counts as covered when it sits inside the parentheses of a
-//! `blocking(` call, which the scan follows by bracket depth, so a closure of
-//! any length is seen through. The walks that are allowed inline are counted
+//! `blocking(` call — the name on its own, so `nonblocking(` is not cover —
+//! which the scan follows by bracket depth, so a closure of any length is seen
+//! through. The walks that are allowed inline are counted
 //! per file with the reason they are bounded, so a new walk in one of those
 //! files still fails here.
 
@@ -109,7 +110,12 @@ fn uncovered(dir: &Path) -> Vec<(String, usize, String)> {
             let mut at = 0;
             while at < code.len() {
                 let rest = &code[at..];
-                if rest.starts_with("blocking(") {
+                // `blocking(` as a name of its own: `nonblocking(` is not it.
+                let named = code[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if named && rest.starts_with("blocking(") {
                     at += "blocking(".len();
                     depth += 1;
                     open.push(depth);
