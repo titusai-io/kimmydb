@@ -378,6 +378,8 @@ async fn initialize(server: &Server, version: &str) -> Value {
     body["result"].clone()
 }
 
+/// What `initialize` negotiates, as `mcp.md#protocol-version` states it.
+///
 /// The version the server answers `initialize` with is decided by rmcp, not by
 /// anything here, and a minor bump of it (3.1.4 → 3.2.0) changed that answer
 /// for a client naming `2026-07-28` without a test going red. The revisions
@@ -395,7 +397,7 @@ async fn initialize_naming_a_version_without_a_handshake_is_answered_with_the_ne
 }
 
 /// A client naming a version the server speaks gets that version back — the
-/// case every client connecting today is in.
+/// case every client connecting today is in (`mcp.md#protocol-version`).
 #[tokio::test]
 async fn initialize_naming_a_supported_version_is_answered_with_that_version() {
     let server = Server::start().await;
@@ -410,7 +412,7 @@ async fn initialize_naming_a_supported_version_is_answered_with_that_version() {
 /// A `2026-07-28` client sends no `initialize`: every request carries its
 /// version and capabilities in `_meta`, and over HTTP repeats the version and
 /// the method in headers (SEP-2243). That is the path a client takes once it moves, so it
-/// has to be served, not just parsed.
+/// has to be served, not just parsed (`mcp.md#protocol-version`).
 #[tokio::test]
 async fn a_request_carrying_its_protocol_version_in_meta_is_served_without_initialize() {
     let server = Server::start().await;

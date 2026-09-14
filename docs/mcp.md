@@ -73,6 +73,15 @@ An unauthenticated request is rejected with `401` by middleware, before the MCP
 transport runs — so a missing token fails at the door rather than inside twelve
 separate tools.
 
+### Protocol version
+
+A client naming `2025-11-25` or earlier on `initialize` has its version echoed.
+A client naming a later version is answered `2025-11-25`, the newest version
+that has an `initialize` handshake; a client that cannot accept the answered
+version fails at connect time. A client on `2026-07-28` or later that sends no
+`initialize`, and instead carries its version in each request's `_meta` and
+the `MCP-Protocol-Version` header, is served request by request.
+
 ### Discovering where to authenticate
 
 The `401` above carries a `WWW-Authenticate` challenge, and when the node
