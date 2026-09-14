@@ -10,7 +10,21 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.28.0 - 2026-09-14
+
+**A minor, and upgrading to it requires reading one entry.** ADR-168 changes
+what the divergence check's count half reports, and therefore what
+`kimmy_sync_divergent_collections` and the repair counters mean on a cluster
+taking writes. The count comparison is now deferred against any member that is
+still moving, so on a cluster with continuous writes, a quiet count half no
+longer means the counts were compared and matched. It means they were not
+compared. The existence half is unaffected. Read the second entry under
+*Fixed* before relying on either metric after the upgrade. Nothing on the
+wire or on disk is removed or tightened: a snapshot page gains a field that
+older members ignore, so a member-at-a-time roll needs no ordering.
+
+The release also carries dependency updates, two of them minor bumps, listed
+under *Dependencies*.
 
 ### Fixed
 
@@ -74,6 +88,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   promise and a shared fsync for concurrent writers, but up to one coalescing
   window added per write, a slower lone writer, and a shared flush that still
   holds the writer.
+
+### Dependencies
+
+Versions are as `Cargo.lock` resolves them.
+
+- **`rmcp` 3.1.4 → 3.2.0, a minor bump (MCP server).** One observable change
+  on the MCP endpoint: an `initialize` request naming `protocolVersion`
+  `2026-07-28` or later used to have that version echoed back, and is now
+  answered with `2025-11-25`, the newest version that still has an
+  `initialize` handshake. A client naming `2025-11-25` or earlier sees no
+  difference. A client that cannot accept the answered version fails visibly
+  at connect time, not quietly later. The rmcp release also allows concurrent
+  streamable HTTP requests; no difference is expected for KimmyDB's stateless,
+  JSON-response endpoint. Both statements come from reading the dependency's
+  source, not from testing, and no KimmyDB test pins the negotiated version
+  yet.
+- **`jsonschema` 0.52.1 → 0.55.1, a minor bump.** Test-only: it validates
+  KimmyDB's own responses against its OpenAPI document in the test suite and
+  is not part of the shipped build, so request validation and error messages
+  are unaffected.
+- Patch updates: `rmcp-macros` 3.1.4 → 3.3.0 (compile-time only),
+  `hickory-resolver`, `hickory-proto` and `hickory-net` 0.26.1 → 0.26.3,
+  `tokio-rustls` 0.26.4 → 0.26.5, `toml` 1.1.4 → 1.1.6.
+- CI only: `taiki-e/install-action` updated in the GitHub Actions workflows.
 
 ## 0.27.1 - 2026-09-12
 
