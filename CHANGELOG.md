@@ -14,6 +14,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Documented
 
+- **`docs/mcp.md` states what `initialize` negotiates.** A client naming
+  `2025-11-25` or earlier has its version echoed; a later version is answered
+  `2025-11-25`, and a client that cannot accept that fails at connect time.
 - **The OTLP description of `kimmy.write_lock.held_seconds.drop` no longer says
   a collection drop removes everything in one transaction.** A collection drop
   has purged in chunks since ADR-158, each chunk its own hold; the description
