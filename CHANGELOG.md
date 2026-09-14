@@ -23,6 +23,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   purge, logging each collection and its row count before and a line after,
   and keeps the collection tombstone that marks the rows until they are gone.
 
+### Documented
+
+- **`docs/mcp.md` states what `initialize` negotiates.** A client naming
+  `2025-11-25` or earlier has its version echoed; a later version is answered
+  `2025-11-25`, and a client that cannot accept that fails at connect time.
+- **The OTLP description of `kimmy.write_lock.held_seconds.drop` no longer says
+  a collection drop removes everything in one transaction.** A collection drop
+  has purged in chunks since ADR-158, each chunk its own hold; the description
+  now matches `operations.md`.
+
 ## 0.28.0 - 2026-09-14
 
 **A minor, and upgrading to it requires reading one entry.** ADR-168 changes
