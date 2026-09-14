@@ -259,7 +259,7 @@ impl TelemetryGuard {
             "kimmy.write_lock.held_seconds.drop",
             "kimmy.write_lock.holds.drop",
             WriterHolder::Drop,
-            "a collection or index drop, which removes everything it holds in one transaction"
+            "the destructive half of a drop: one chunk of a collection's purge, or an index drop, which is still one transaction"
         );
         held_by!(
             "kimmy.write_lock.held_seconds.replication",
