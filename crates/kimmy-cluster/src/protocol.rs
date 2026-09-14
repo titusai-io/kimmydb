@@ -760,6 +760,75 @@ mod tests {
         );
     }
 
+    /// The older-receiver half for `SnapshotPage`'s later fields, beside the
+    /// two boundaries above and below. A page carrying `dropped_collections`
+    /// (ADR-162) and `deleted_documents` (ADR-167) must decode through the page
+    /// as a receiver predating both declares it, ignoring what it cannot read;
+    /// and a page carrying a field newer than this build must still decode
+    /// here. The older-sender half is `kimmy-storage`'s
+    /// `a_page_that_predates_the_field_denies_nothing_and_breaks_nothing`.
+    #[tokio::test]
+    async fn snapshot_page_crosses_a_version_boundary_to_an_older_receiver() {
+        /// `SnapshotPage` as a receiver before ADR-162 and ADR-167 declares it.
+        #[derive(Debug, Deserialize)]
+        struct PageBeforeDropsAndDeletes {
+            collections: Vec<kimmy_storage::CollectionState>,
+            documents: Vec<kimmy_storage::SnapshotDoc>,
+            next: Option<SnapshotCursor>,
+            versions: VersionVector,
+            #[serde(default)]
+            dropped: Option<kimmy_core::Stamp>,
+        }
+
+        let node = NodeId::from_bytes([3; 16]);
+        let stamp = |ms| kimmy_core::Stamp::new(Hlc::new(ms, 0), node);
+        let mut versions = VersionVector::new();
+        versions.insert(node, Hlc::new(900, 0));
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            documents: Vec::new(),
+            next: Some(SnapshotCursor { collection: CollectionId(7), after_key: vec![1, 2, 3] }),
+            versions: versions.clone(),
+            dropped: None,
+            dropped_collections: vec![(CollectionId(9), stamp(500))],
+            deleted_documents: vec![kimmy_storage::SnapshotTombstone {
+                collection: CollectionId(7),
+                key: vec![4, 5],
+                stamp: stamp(600),
+            }],
+        };
+
+        let mut written = Vec::new();
+        write_frame(&mut written, &Message::Snapshot(Box::new(page.clone()))).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let sent = body.get_document("Snapshot").unwrap().clone();
+        assert!(
+            sent.contains_key("dropped_collections") && sent.contains_key("deleted_documents"),
+            "the frame must carry both fields for this to test anything: {sent}"
+        );
+
+        let older: PageBeforeDropsAndDeletes = bson::deserialize_from_document(sent.clone())
+            .expect("a receiver that predates the fields must still read the page");
+        assert!(older.collections.is_empty() && older.documents.is_empty());
+        assert_eq!(older.next, page.next);
+        assert_eq!(older.versions, versions);
+        assert_eq!(older.dropped, None);
+
+        let mut future = sent;
+        future.insert("somethingNewer", true);
+        let frame = {
+            let bytes = bson::serialize_to_vec(&bson::doc! { "Snapshot": future }).unwrap();
+            let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        assert_eq!(
+            read_frame(&mut frame.as_slice()).await.unwrap(),
+            Message::Snapshot(Box::new(page)),
+            "a field this build does not know must not fail the page"
+        );
+    }
+
     /// The same boundary for `Divergence::incarnations`. The answer is what
     /// crosses the version line here rather than the request: a requester
     /// that predates the field ignores it and compares names alone; an

@@ -30,6 +30,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the first live one, so a search over a large collection gets cheaper by
   that walk. What the check answers is unchanged: a collection whose vectors
   have all been deleted still reads as having none.
+- **The divergence check's count walks ran inline on the async runtime.** The
+  sync tick's count of the probed collection, and the count a member takes to
+  answer a peer's probe, each walked that collection on a tokio worker. Both
+  now run under the same `block_in_place` as other walks. On a loaded member
+  that is a candidate for the `/metrics` scrape stalls seen under load. The
+  tick's count and the version vector it is judged against are now read in one
+  read transaction; which collections are compared, and when, is unchanged.
 
 ## 0.28.0 - 2026-09-14
 

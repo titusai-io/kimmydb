@@ -354,27 +354,21 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                           collections; skipping this tick's probe rotation");
                 }
                 let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
-                    // What the count below can have seen, read first so it can
-                    // only understate it (ADR-168): a vector read after the
-                    // count could name an entry the count missed, and read this
-                    // node as level with a peer it still trailed.
-                    let mine_at = match engine.witnessed_vector() {
-                        Ok(vector) => Some(vector),
-                        Err(e) => {
-                            warn!(error = %e, "divergence check: could not read this node's \
-                                  witnessed vector; judging only the peer's side this tick");
-                            None
+                    // This node's count and the vector it is judged against,
+                    // from one snapshot so the vector cannot name an entry the
+                    // count missed (ADR-168), and off the worker because the
+                    // count walks the collection (ADR-153).
+                    match kimmy_storage::blocking(|| engine.count_probe_reading(id)) {
+                        Ok((vector, mine_count)) => {
+                            DivergenceProbe { id, mine_count, mine_at: Some(vector) }
                         }
-                    };
-                    let mine_count = match engine.count_by_id(id) {
-                        Ok(count) => count,
                         Err(e) => {
                             warn!(error = %e, collection = %id, "divergence check: could not \
-                                  count the probed collection; comparing existence only this tick");
-                            None
+                                  read this node's side of the count probe; comparing existence \
+                                  only this tick");
+                            DivergenceProbe { id, mine_count: None, mine_at: None }
                         }
-                    };
-                    DivergenceProbe { id, mine_count, mine_at }
+                    }
                 });
                 // The tick's wall-clock budget for draining (ADR-157). A
                 // peer whose pull the batch cap truncated is pulled from

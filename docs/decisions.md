@@ -12022,14 +12022,22 @@ on the async worker as before:
 - `GET /v1/admin/backup`: the whole store.
 
 A sixth was found while fixing these: a vector search checked that the
-collection had any vectors by counting all of them, on every search.
+collection had any vectors by counting all of them, on every search. Two more
+are on the replication side, which the request-path review did not reach: the
+divergence check's count probe, read by the sync tick on the async runtime, and
+a member's count when it answers a peer's probe (`AskDivergence`). Each counts
+one collection by walking it. Both now run under `blocking`, the tick's side as
+one read transaction (ADR-168's limitation on the shared reading).
 
 Each of the five now runs under `blocking` inside the `exec` or `schema`
 function, so the MCP tools that call those functions are covered with the
 routes. The vector check stops at the first live vector and stays on the
 worker, as a primary-key probe does. What it answers is unchanged: the walk
 skips tombstones, so a collection whose every vector was deleted still answers
-`no_vectors`, and a test fails if a deleted row is ever taken for a vector. The violations pass also stops paying for
+`no_vectors`, and a test fails if a deleted row is ever taken for a vector. The
+same skipping means that on a collection holding only tombstones, the check
+still walks every one of them on the worker before it answers; that walk is
+bounded by `storage.tombstone_retention_secs`, not by the vectors ever stored. The violations pass also stops paying for
 what it does not report:
 
 - **It is skipped when nothing could stand.** A record is reported only while
@@ -12057,8 +12065,10 @@ so a closure of any length is seen through. Walks bounded by
 something other than client data are counted per file, each with its reason:
 the webhook registry and delivery bookkeeping, the node registry,
 `sample_documents` at its limit, and the vector emptiness check. The check is
-textual. A walk reached through a helper whose name is not on its list is not
-seen, and that is the limit of what it proves.
+textual, and it reads the request crates only: a walk reached through a
+helper whose name is not on its list is not seen, and neither is a walk in
+`kimmy-cluster`, whose two are listed above. That is the limit of what it
+proves.
 
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
@@ -14784,6 +14794,23 @@ confirmation seen after it ships should be checked against these two routes befo
 it is read as this fix failing. Making an equal-stamp delete append in position
 would close the first once the entry arrives, not while it is held; the second is
 ADR-160's own residual.
+
+**Limitation, named: this node's reading is shared by every peer of a tick.** The
+witnessed vector and the count are read once per tick and handed to each peer in
+turn, so against the second and later peers they predate the pulls from the peers
+before them as well as the tick's own. The direction is safe — a reading that
+predates entries this node has since taken in makes it look behind and still
+moving, which defers; it cannot make it look level with a peer it trails — but on
+a cluster of three or more members taking writes the count half defers more often
+than the two-member account above implies. Re-reading the vector alone per peer
+would undo this record: the vector would then name entries the tick's count
+missed. Re-reading both per peer is a count of the collection per peer, and the
+deferral it would recover is not a defect. Both reads are taken in one read
+transaction (`Engine::count_probe_reading`), so the count and the vector it is
+judged against come from the same snapshot and there is no order between them to
+get wrong. A storage error reading that side now leaves the tick with neither, so
+the count half is not compared that tick, where a failed vector read alone used
+to leave the count compared and only the peer's side judged.
 
 **Residual, stated.** The peer can advance between the contact's opening and its
 count read — a window that holds this node's pull and its apply, including any
