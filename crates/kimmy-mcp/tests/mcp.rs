@@ -81,12 +81,19 @@ impl Server {
 
     /// POST one JSON-RPC message to `/mcp`.
     async fn rpc(&self, token: Option<&str>, body: Value) -> (u16, Value) {
-        self.rpc_at("/mcp", token, body).await
+        self.rpc_at("/mcp", token, &[], body).await
     }
 
-    /// The same, at a request target of the test's choosing — for the one
-    /// test whose subject is the target rather than the message.
-    async fn rpc_at(&self, target: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+    /// The same, at a request target and with headers of the test's choosing —
+    /// for the tests whose subject is the request line or a header rather than
+    /// the message.
+    async fn rpc_at(
+        &self,
+        target: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Value,
+    ) -> (u16, Value) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let host = self.base.strip_prefix("http://").unwrap();
@@ -101,6 +108,9 @@ impl Server {
         );
         if let Some(token) = token {
             request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
         }
         request.push_str("\r\n");
         request.push_str(&payload);
@@ -334,10 +344,119 @@ async fn a_query_string_on_mcp_is_not_refused_by_the_rest_tables_guard() {
     let server = Server::start().await;
     let root = server.root();
     let (status, body) = server
-        .rpc_at("/mcp?zz=1", Some(&root), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .rpc_at(
+            "/mcp?zz=1",
+            Some(&root),
+            &[],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["result"]["tools"].is_array(), "{body}");
+}
+
+/// `initialize` naming `version`, returning the JSON-RPC result.
+async fn initialize(server: &Server, version: &str) -> Value {
+    let root = server.root();
+    let (status, body) = server
+        .rpc(
+            Some(&root),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {},
+                    "clientInfo": { "name": "kimmy-mcp-tests", "version": "0" },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "initialize naming {version} returned HTTP {status}: {body}");
+    assert!(body["error"].is_null(), "initialize naming {version} failed: {body}");
+    body["result"].clone()
+}
+
+/// The version the server answers `initialize` with is decided by rmcp, not by
+/// anything here, and a minor bump of it (3.1.4 → 3.2.0) changed that answer
+/// for a client naming `2026-07-28` without a test going red. The revisions
+/// from `2026-07-28` have no handshake, so a client that still sends one is
+/// answered with the newest version that does. Pinned, so the next change to
+/// it is a decision someone reads rather than a dependency bump nobody does.
+#[tokio::test]
+async fn initialize_naming_a_version_without_a_handshake_is_answered_with_the_newest_that_has_one()
+{
+    let server = Server::start().await;
+    let result = initialize(&server, "2026-07-28").await;
+    assert_eq!(result["protocolVersion"], "2025-11-25", "{result}");
+    assert_eq!(result["serverInfo"]["name"], "kimmydb", "{result}");
+    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"), "{result}");
+}
+
+/// A client naming a version the server speaks gets that version back — the
+/// case every client connecting today is in.
+#[tokio::test]
+async fn initialize_naming_a_supported_version_is_answered_with_that_version() {
+    let server = Server::start().await;
+    for version in ["2025-11-25", "2025-03-26"] {
+        let result = initialize(&server, version).await;
+        assert_eq!(result["protocolVersion"], version, "{result}");
+        assert_eq!(result["serverInfo"]["name"], "kimmydb", "{result}");
+        assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"), "{result}");
+    }
+}
+
+/// A `2026-07-28` client sends no `initialize`: every request carries its
+/// version and capabilities in `_meta`, and over HTTP repeats the version and
+/// the method in headers (SEP-2243). That is the path a client takes once it moves, so it
+/// has to be served, not just parsed.
+#[tokio::test]
+async fn a_request_carrying_its_protocol_version_in_meta_is_served_without_initialize() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+
+    let (status, body) = server
+        .rpc_at(
+            "/mcp",
+            Some(&root),
+            &[("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/list")],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta": meta}}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert!(body["result"]["tools"].as_array().is_some_and(|t| !t.is_empty()), "{body}");
+
+    let (status, body) = server
+        .rpc_at(
+            "/mcp",
+            Some(&root),
+            &[
+                ("MCP-Protocol-Version", "2026-07-28"),
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "count"),
+            ],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "_meta": meta,
+                    "name": "count",
+                    "arguments": { "database": "sales", "collection": "orders" },
+                },
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(body["result"]["structuredContent"]["count"], 3, "{body}");
 }
 
 #[tokio::test]
