@@ -10,6 +10,14 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Documented
+
+- **`docs/mcp.md` states what `initialize` negotiates.** A client naming
+  `2025-11-25` or earlier has its version echoed; a later version is answered
+  `2025-11-25`, and a client that cannot accept that fails at connect time.
+
 ## 0.28.0 - 2026-09-14
 
 **A minor, and upgrading to it requires reading one entry.** ADR-168 changes
