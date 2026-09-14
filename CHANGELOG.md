@@ -10,6 +10,36 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A snapshot now carries document deletions to a member that holds the
+  document.** A member caught up from a peer by snapshot — one that fell behind
+  the peer's oplog retention, or one repairing a collection — used to keep any
+  document it held that the peer had since deleted, live and writable, on that
+  member alone. Completing the snapshot grants coverage of the peer's history, so
+  the delete was never replayed to it afterwards. A page now carries the deletes
+  in the range it walks, and the receiving member removes the document through
+  the same last-writer-wins check a replicated delete goes through: a write newer
+  than the delete survives. Mixed-version clusters need no ordering: an older
+  member ignores the new field and keeps the previous behaviour until both ends
+  of a pair have rolled. See ADR-167.
+
+  **What this does not close.** A member that never held the document records
+  nothing, so it carries nothing on: a member that later catches up from it —
+  by snapshot or by ordinary replication — can still keep a document the original
+  member deleted. More generally, a member caught up by snapshot can serve
+  ordinary replication that omits deletes and collection drops it holds only as
+  state. When a document survives this way, the divergence check reports that
+  collection's document count on the member keeping it. And where a member
+  applies such a delete part-way through a catch-up, a member pulling ordinary
+  replication from it can be held back from that delete until the member next
+  records a write from the delete's origin, or until it takes the delete from
+  another member. A delete older than
+  `storage.tombstone_retention_secs` on the sending member has no record left to
+  carry and does not travel by either route.
+
 ## 0.27.1 - 2026-09-12
 
 ### Documented

@@ -10,7 +10,8 @@
 //!
 //! So when a peer asks from below the horizon, it is sent **current state**
 //! instead of history: the sender's collection tombstones first, then the
-//! collection definitions, then documents in pages, then the sender's coverage.
+//! collection definitions, then documents in pages — live ones and, by key, the
+//! tombstones of deleted ones (ADR-167) — then the sender's coverage.
 //! The receiver is caught up when it has all of them.
 //!
 //! The tombstones come first and that order is load-bearing — a page carrying
@@ -188,12 +189,14 @@ pub struct SnapshotDoc {
     pub collection: CollectionId,
     pub id: DocId,
     pub stamp: Stamp,
-    /// `None` for a tombstone.
+    /// Always `Some` on a page a sender builds.
     ///
-    /// A tombstone does **not** in fact travel: the walk that builds a page
-    /// skips it, for the reason given there. This field is `Option` because
-    /// the record it is built from is, not because a snapshot carries
-    /// deletions. See ADR-162's residual for what that costs.
+    /// A deleted document does **not** travel as a `SnapshotDoc`: a tombstone
+    /// has no `_id` to put in `id`, so it travels by key in
+    /// [`SnapshotPage::deleted_documents`] instead (ADR-167). This field is
+    /// `Option` because the record it is built from is, and an older receiver
+    /// reads `None` here as a tombstone for `id` — which is why a tombstone
+    /// must never be sent in this shape with a placeholder id.
     ///
     /// Binary rather than serde's default array-of-int32s, for the reason on
     /// [`kimmy_core::OplogEntry::body`]. It matters at least as much here: a
@@ -203,17 +206,32 @@ pub struct SnapshotDoc {
     pub body: Option<Vec<u8>>,
 }
 
+/// One deleted document, as the sender's walk found it: by **key**, because a
+/// tombstone keeps no body and `keyenc` is one-way, so there is no `_id` to
+/// send. See [`SnapshotPage::deleted_documents`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotTombstone {
+    /// See [`SnapshotCursor::collection`] for why this is not a `u64`.
+    pub collection: CollectionId,
+    /// The encoded document key the tombstone is stored under.
+    #[serde(with = "serde_bytes")]
+    pub key: Vec<u8>,
+    /// The stamp of the delete.
+    pub stamp: Stamp,
+}
+
 /// What applying one snapshot page did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotApplied {
-    /// Documents the page wrote — those that won last-writer-wins here.
+    /// Documents the page wrote — those that won last-writer-wins here —
+    /// deletes it applied included (ADR-167).
     pub applied: usize,
     /// Index definitions on the page this node's documents refused and it
     /// skipped (ADR-123). Folded into `SyncOutcome::ddl_refused` by the
     /// transport, so a refusal reached through a snapshot is counted where
     /// one reached through the oplog is.
     pub ddl_refused: usize,
-    /// Documents on the page that address a life of their collection this
+    /// Documents and deletes on the page that address a life of their collection this
     /// node has buried — `Engine::is_history`, the predicate the entries
     /// path applies — plus those whose collection the page tried and failed
     /// to recreate over a tombstone held here.
@@ -292,6 +310,30 @@ pub struct SnapshotPage {
     /// malformed entry destroys an arbitrary collection unrecoverably.
     #[serde(default)]
     pub dropped_collections: Vec<(CollectionId, Stamp)>,
+    /// The document tombstones the page's walk passed, so a page conveys a
+    /// document's **absence** as well as a collection's (ADR-167).
+    ///
+    /// The walk used to skip them. A receiver that held a document the sender
+    /// has since deleted kept it, and on a whole-database snapshot that is
+    /// permanent for the reason ADR-162 gives one level up: completing the
+    /// snapshot grants coverage of the sender's history, the `Delete` is inside
+    /// it, and no peer serves it again. A scoped repair walked the same way and
+    /// healed nothing either.
+    ///
+    /// By key, in a list of its own, and never as a `SnapshotDoc` with no body:
+    /// that type needs a `DocId`, which a tombstone does not have, and an older
+    /// receiver would apply a bodiless `SnapshotDoc` as a delete of whatever id
+    /// it carried. Defaulted on the wire as `dropped_collections` is, so an
+    /// older sender writes nothing and an older receiver ignores the list, and
+    /// a mixed-version pair keeps the previous behaviour until both have rolled.
+    ///
+    /// Tombstones share the page with documents — they count toward
+    /// [`SNAPSHOT_PAGE`] and can end a page — so the cursor stays one walk in
+    /// key order. A receiver honours one only where `versions` covers its stamp
+    /// (ADR-163), and only against a live document it out-stamps: see
+    /// `Engine::apply_carried_document_deletes`.
+    #[serde(default)]
+    pub deleted_documents: Vec<SnapshotTombstone>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -446,8 +488,16 @@ impl Engine {
         let dropped_collections =
             if scope.is_none() { self.collections_dropped()? } else { Vec::new() };
 
-        let (documents, next) = self.snapshot_documents(after, scope)?;
-        Ok(SnapshotPage { collections, documents, next, versions, dropped, dropped_collections })
+        let (documents, deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        Ok(SnapshotPage {
+            collections,
+            documents,
+            next,
+            versions,
+            dropped,
+            dropped_collections,
+            deleted_documents,
+        })
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
@@ -463,23 +513,26 @@ impl Engine {
         Ok(out)
     }
 
-    /// Read up to [`SNAPSHOT_PAGE`] documents, resuming after `cursor`.
+    /// Read up to [`SNAPSHOT_PAGE`] records — live documents and tombstones
+    /// together — resuming after `cursor`.
     ///
     /// Walks the `docs` table in key order, which is `(collection, id)` — so a
     /// single cursor covers every collection without needing to track which one
     /// is in progress, and a scoped snapshot is the same walk bounded to one
     /// collection's key range.
+    #[allow(clippy::type_complexity)]
     fn snapshot_documents(
         &self,
         after: Option<SnapshotCursor>,
         scope: Option<CollectionId>,
-    ) -> Result<(Vec<SnapshotDoc>, Option<SnapshotCursor>)> {
+    ) -> Result<(Vec<SnapshotDoc>, Vec<SnapshotTombstone>, Option<SnapshotCursor>)> {
         use std::ops::Bound;
 
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
 
         let mut out = Vec::new();
+        let mut deleted = Vec::new();
         let mut cursor = None;
         let empty: &[u8] = &[];
 
@@ -502,9 +555,10 @@ impl Engine {
         // The key that ended a full page, kept only once the page is full.
         let mut last_sent: Option<(u64, Vec<u8>)> = None;
         for row in docs.range::<(u64, &[u8])>((start, end))? {
-            if out.len() >= SNAPSHOT_PAGE {
+            if out.len() + deleted.len() >= SNAPSHOT_PAGE {
                 // Another row exists past a full page, so there is a next
-                // page; the cursor names the last document sent. Looking
+                // page; the cursor names the last row sent, a document or a
+                // tombstone. Looking
                 // one row ahead is what lets a snapshot of exactly a page's
                 // worth end here rather than with an empty page after it.
                 cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
@@ -518,45 +572,42 @@ impl Engine {
             let (collection, doc_key) = key.value();
             let record = codec::decode_doc_record(value.value())?;
 
-            // A tombstone has no `_id` to recover: the body is gone and the
-            // key cannot be decoded back into one, because keyenc is one-way.
-            // So a delete does not travel in a snapshot.
-            //
-            // That is a known defect, NOT a safe skip, and the comment here
-            // used to claim otherwise — "the receiver never had the document".
-            // A receiver taking a whole-database snapshot is a node that fell
-            // below a peer's retention horizon, not a fresh one, and it may
-            // very well have had it. It then keeps a deleted document, live
-            // and writable, on one member alone: completing the snapshot
-            // grants it coverage of the sender's history, so the `Delete` is
-            // inside the window it claims to hold and no peer sends it again.
-            //
-            // This is ADR-162's defect one level down — that record's "Why"
-            // applies verbatim with "collection" replaced by "document",
-            // including "what made it permanent is the coverage grant". Unlike
-            // the collection-level case it is visible as a count mismatch to
-            // the divergence check, which is why it is filed rather than fixed
-            // here. See ADR-162's residual.
-            let Some(document) = record.document()? else {
-                continue;
-            };
-            let id = match document.get(crate::ID_FIELD) {
-                Some(value) => DocId::try_from_bson(value)?,
-                None => continue,
-            };
+            // A tombstone travels by KEY. It has no `_id` to recover -- the
+            // body is gone and keyenc is one-way -- so it cannot be a
+            // `SnapshotDoc`, and it used to be skipped here. That skip was the
+            // defect ADR-167 closes: a receiver below this node's retention
+            // horizon may well hold the document, and completing a
+            // whole-database snapshot grants it coverage of the `Delete`, so
+            // no peer would ever send it. A receiver does not need the `_id`
+            // from us: where it holds the document, its own body carries one.
+            if !record.is_live() {
+                deleted.push(SnapshotTombstone {
+                    collection: CollectionId(collection),
+                    key: doc_key.to_vec(),
+                    stamp: record.stamp,
+                });
+            } else {
+                let Some(document) = record.document()? else {
+                    continue;
+                };
+                let id = match document.get(crate::ID_FIELD) {
+                    Some(value) => DocId::try_from_bson(value)?,
+                    None => continue,
+                };
 
-            out.push(SnapshotDoc {
-                collection: CollectionId(collection),
-                id,
-                stamp: record.stamp,
-                body: Some(record.body),
-            });
-            if out.len() == SNAPSHOT_PAGE {
+                out.push(SnapshotDoc {
+                    collection: CollectionId(collection),
+                    id,
+                    stamp: record.stamp,
+                    body: Some(record.body),
+                });
+            }
+            if out.len() + deleted.len() == SNAPSHOT_PAGE {
                 last_sent = Some((collection, doc_key.to_vec()));
             }
         }
 
-        Ok((out, cursor))
+        Ok((out, deleted, cursor))
     }
 
     /// Apply one page of a peer's snapshot, and move `progress` past it.
@@ -640,7 +691,7 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
-        if !page.documents.is_empty() || grant.is_some() {
+        if !page.documents.is_empty() || !page.deleted_documents.is_empty() || grant.is_some() {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
             // outside the writer, from the state the definitions above left.
@@ -707,6 +758,16 @@ impl Engine {
                     pending.push(Pending { collection, entry, id, violations });
                 }
             }
+
+            // The page's deletes, in the same transaction as its documents, so
+            // they share its cursor and, on the last page, its grant (ADR-167).
+            self.apply_carried_document_deletes(
+                &txn,
+                &mut memo,
+                page,
+                &mut pending,
+                &mut superseded,
+            )?;
 
             // Only a *completed* snapshot grants coverage: adopting it
             // earlier would stop the receiver asking for pages it has not
@@ -779,6 +840,7 @@ impl Engine {
         // persisted a cursor costs nothing here. ADR-161.
         if complete
             && page.documents.is_empty()
+            && page.deleted_documents.is_empty()
             && grant.is_none()
             && self.snapshot_progress_recorded(peer, progress.scope)?
         {
@@ -803,6 +865,122 @@ impl Engine {
             Some(e) => Err(e),
             None => Ok(SnapshotApplied { applied, ddl_refused, superseded }),
         }
+    }
+
+    /// Apply the document tombstones a page carries (ADR-167), inside the
+    /// page's transaction. A delete that lands goes into `pending` like any
+    /// applied document.
+    ///
+    /// Each tombstone is held to three questions, in order:
+    ///
+    /// 1. **Does the sender's own coverage name it?** A peer may only deny what
+    ///    its coverage names (ADR-163). The key and the stamp both come off the
+    ///    wire, so without this an arbitrary pair deletes an arbitrary document.
+    /// 2. **Is it history here?** The predicate the page's documents answer, so
+    ///    a delete aimed at a buried life of the collection is not applied to
+    ///    the life standing here. Not redundant with the next question: a
+    ///    restored collection's floor is the sender's stamp, and nothing on the
+    ///    snapshot route moves this node's clock up to it, so under clock skew
+    ///    a document written here into the standing life can carry a stamp
+    ///    below its own floor -- and so can a delete of it from a peer that is
+    ///    behind the same way. The delete out-stamps the document; only this
+    ///    turns it away, as the entries route does.
+    /// 3. **Does this node hold a live document the tombstone strictly
+    ///    out-stamps?** Then it is deleted through the ordinary replicated-delete
+    ///    path — `apply_remote_in_txn` under `Position::Hold` — which maintains
+    ///    the indexes and appends a `Delete` entry carrying the document's
+    ///    `_id`, read from this node's own copy, the only place one is needed.
+    ///    That entry is served onward like any other. **Otherwise nothing is
+    ///    written**: not over a newer write, not over a tombstone, and not where
+    ///    nothing is held.
+    ///
+    /// Recording a tombstone by key where nothing is held was built and cut
+    /// (ADR-167 says why). With no `_id` it can mint no entry, and a record at a
+    /// stamp whose `Delete` entry is still owed makes that entry look already
+    /// applied when it comes — `apply_remote_in_txn` supersedes an equal stamp
+    /// before it appends — so this node's oplog never held the delete and a
+    /// member pulling entries from here kept the document.
+    fn apply_carried_document_deletes(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        memo: &mut Memo,
+        page: &SnapshotPage,
+        pending: &mut Vec<Pending>,
+        superseded: &mut usize,
+    ) -> Result<()> {
+        for tombstone in &page.deleted_documents {
+            if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
+                warn!(
+                    collection = %tombstone.collection,
+                    stamp = ?tombstone.stamp,
+                    covered_to = ?page.versions.get(tombstone.stamp.node),
+                    "a snapshot page deleted a document with a stamp its sender's own coverage \
+                     does not name; ignored"
+                );
+                continue;
+            }
+            let collection = self.memo_collection(memo, tombstone.collection)?;
+            if self.is_history(
+                memo,
+                collection.as_deref(),
+                tombstone.collection,
+                tombstone.stamp,
+            )? {
+                *superseded += 1;
+                continue;
+            }
+            let Some(collection) = collection else {
+                continue;
+            };
+
+            let existing = {
+                let docs = txn.open_table(tables::DOCS)?;
+                match docs.get((collection.id.0, tombstone.key.as_slice()))? {
+                    Some(raw) => Some(codec::decode_doc_record(raw.value())?),
+                    None => None,
+                }
+            };
+            let Some(current) = existing else {
+                continue;
+            };
+            if !tombstone.stamp.wins_over(&current.stamp) {
+                continue;
+            }
+            let Some(document) = current.document()? else {
+                continue;
+            };
+            let id = match document.get(crate::ID_FIELD) {
+                Some(value) => DocId::try_from_bson(value)?,
+                None => continue,
+            };
+            // The id read back from the body must encode to the key the
+            // tombstone names, or the delete would land on another document. A
+            // stored id can disagree with it: `DocId::try_from_bson` reads any
+            // binary as the generic subtype, while a document written through
+            // `Engine` under a `DocId::Uuid` is keyed under subtype 4. Such a
+            // document keeps its delete here rather than lose another's.
+            if crate::docs::doc_key(&id)? != tombstone.key {
+                warn!(
+                    collection = %tombstone.collection,
+                    "a document's _id does not encode to the key it is stored under; the carried \
+                     delete is not applied"
+                );
+                continue;
+            }
+            let entry = OplogEntry {
+                stamp: tombstone.stamp,
+                kind: OpKind::Delete,
+                collection: collection.id,
+                doc_id: Some(id),
+                body: None,
+            };
+            if let RemoteApplied::Applied { id, violations } =
+                self.apply_remote_in_txn(txn, &collection, &entry, Position::Hold)?
+            {
+                pending.push(Pending { collection, entry, id, violations });
+            }
+        }
+        Ok(())
     }
 
     /// Apply the tombstones a whole-database page carries (ADR-162), held to
@@ -2069,6 +2247,7 @@ mod tests {
             versions: VersionVector::new(),
             dropped: Some(dropped),
             dropped_collections: Vec::new(),
+            deleted_documents: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -2120,6 +2299,7 @@ mod tests {
             versions: VersionVector::new(),
             dropped: None,
             dropped_collections: Vec::new(),
+            deleted_documents: Vec::new(),
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -2589,6 +2769,7 @@ mod tests {
             versions: VersionVector::new(),
             dropped: None,
             dropped_collections: Vec::new(),
+            deleted_documents: Vec::new(),
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -3291,5 +3472,395 @@ mod tests {
         a.insert(&ca, doc! { "_id": 1 }).unwrap();
 
         assert!(a.can_serve_from_oplog(Hlc::ZERO).unwrap(), "nothing has been collected yet");
+    }
+
+    // -- ADR-167: a document delete travels in a snapshot -------------------
+
+    /// Whether `engine` stores a tombstone for `id` in `coll`, read straight
+    /// off `docs` -- `get` answers `None` for a tombstone and for nothing at
+    /// all alike.
+    fn holds_tombstone(engine: &Engine, coll: &CollectionMeta, id: &DocId) -> bool {
+        let txn = engine.db().begin_read().unwrap();
+        let docs = txn.open_table(tables::DOCS).unwrap();
+        let key = crate::docs::doc_key(id).unwrap();
+        docs.get((coll.id.0, key.as_slice()))
+            .unwrap()
+            .is_some_and(|raw| !codec::decode_doc_record(raw.value()).unwrap().is_live())
+    }
+
+    /// The `OpKind::Delete` entries `engine` holds for `id`.
+    fn deletes_in_oplog(engine: &Engine, id: &DocId) -> usize {
+        engine
+            .read_oplog_from(Hlc::ZERO, 100_000)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == OpKind::Delete && e.doc_id.as_ref() == Some(id))
+            .count()
+    }
+
+    #[test]
+    fn a_whole_database_snapshot_deletes_a_document_the_receiver_held() {
+        // The defect, as filed: B held a document, fell below A's horizon,
+        // and A deleted it meanwhile. The walk skipped A's tombstone, so B
+        // kept the document live -- and, the snapshot granting B coverage of
+        // A's history, no peer would ever send the `Delete` again.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("item")], true, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "item": "kept" }).unwrap();
+        a.insert(&ca, doc! { "_id": 2, "item": "gone" }).unwrap();
+        transfer(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap(), 2, "the fixture must hold the document first");
+
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        transfer(&b, &a);
+
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none(), "the delete must travel");
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some(), "and take nothing else");
+        assert_eq!(b.count(&cb).unwrap(), 1);
+        // Through the ordinary delete path, so the unique index let go of the
+        // value: a stale index entry would refuse this insert.
+        b.insert(&cb, doc! { "_id": 3, "item": "gone" })
+            .expect("the deleted document's index entry must be gone too");
+        // And with its `_id`, recovered from B's own copy, in an entry B serves
+        // onward like any other.
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1);
+    }
+
+    #[test]
+    fn a_scoped_repair_deletes_a_document_the_receiver_held() {
+        // The same line served the scoped route, so a repair healed nothing
+        // either.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+
+        transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none(), "the repair must carry it");
+        assert_eq!(b.count(&cb).unwrap(), 1);
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1);
+    }
+
+    #[test]
+    fn a_carried_delete_does_not_take_a_newer_write() {
+        // Last-writer-wins decides, exactly as for a document: B rewrote the
+        // document after A deleted it, so B's write stands.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(1)).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.replace(&cb, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+
+        transfer(&b, &a);
+
+        let held = b.get(&cb, &DocId::Int64(1)).unwrap().expect("the newer write must survive");
+        assert_eq!(held.get_i32("v").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_carried_delete_its_senders_coverage_does_not_name_is_ignored() {
+        // ADR-163's gate, for documents. The key and the stamp both come off
+        // the wire, so without it an arbitrary pair deletes an arbitrary
+        // document.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+
+        let mut page = a.snapshot_page(None, None).unwrap();
+        page.deleted_documents = vec![SnapshotTombstone {
+            collection: ca.id,
+            key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+            stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
+        }];
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some(), "an uncovered delete is ignored");
+    }
+
+    #[test]
+    fn deletes_share_the_page_and_its_cursor_with_documents() {
+        // Tombstones count toward SNAPSHOT_PAGE and end a page like documents,
+        // so a collection with deletes interleaved among its documents still
+        // crosses in bounded pages, and every row -- live or deleted -- arrives
+        // exactly once.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let total = 2 * SNAPSHOT_PAGE as i64 + 10;
+        for i in 0..total {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        for i in (0..total).step_by(2) {
+            assert!(a.delete(&ca, &DocId::Int64(i)).unwrap());
+        }
+
+        let first = a.snapshot_page(None, None).unwrap();
+        assert_eq!(first.documents.len() + first.deleted_documents.len(), SNAPSHOT_PAGE);
+        assert!(!first.documents.is_empty() && !first.deleted_documents.is_empty(), "interleaved");
+        assert!(first.next.is_some());
+
+        let mut progress = SnapshotProgress::whole_database();
+        let (mut live, mut deleted) = (Vec::new(), Vec::new());
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), None).unwrap();
+            live.extend(page.documents.iter().map(|d| d.id.clone()));
+            deleted.extend(page.deleted_documents.iter().map(|t| t.key.clone()));
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        let half = total as usize / 2;
+        let live_unique = live.iter().collect::<std::collections::BTreeSet<_>>().len();
+        let deleted_unique = deleted.iter().collect::<std::collections::BTreeSet<_>>().len();
+        assert_eq!((live.len(), live_unique), (half, half), "each live row exactly once");
+        assert_eq!((deleted.len(), deleted_unique), (half, half), "each delete exactly once");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap(), total as u64 / 2, "every delete must arrive once");
+    }
+
+    #[test]
+    fn a_tombstone_is_never_sent_as_a_bodiless_document() {
+        // The mixed-version rule. An older receiver reads a `SnapshotDoc` with
+        // no body as a delete of the id it carries, and a tombstone has no id,
+        // so one sent in that shape deletes whatever placeholder it names.
+        // Deletes go in a list an older receiver ignores, and an older
+        // sender's page, which has no such list, still decodes.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+
+        let page = a.snapshot_page(None, None).unwrap();
+        assert!(page.documents.iter().all(|d| d.body.is_some()), "{:?}", page.documents);
+        assert_eq!(page.deleted_documents.len(), 1);
+
+        let mut older = bson::serialize_to_document(&page).unwrap();
+        assert!(older.remove("deleted_documents").is_some(), "the field must be on the wire");
+        let read: SnapshotPage = bson::deserialize_from_document(older).unwrap();
+        assert!(read.deleted_documents.is_empty(), "an older sender's page must still decode");
+    }
+
+    #[test]
+    fn a_pull_that_holds_nothing_records_nothing_and_the_delete_entry_still_lands() {
+        // What stops a tombstone recorded by key from coming back. Such a
+        // record was built and cut: where the `Delete` entry was still owed it
+        // met a tombstone at its own stamp when it came, was superseded before
+        // it was appended, and never reached this node's oplog -- so a member
+        // pulling entries from here kept the document. Both routes, and the
+        // shape the review reproduced: entries arriving part-way through a
+        // multi-page pull.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let gone = DocId::Int64(0);
+        assert!(a.delete(&ca, &gone).unwrap());
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000).unwrap();
+
+        // A scoped repair of a collection this node lacks.
+        let (b, _db) = engine();
+        transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(!holds_tombstone(&b, &cb, &gone), "nothing held, nothing recorded");
+        b.apply_batch(&entries).unwrap();
+        assert_eq!(deletes_in_oplog(&b, &gone), 1, "the entry lands when it comes");
+
+        // A whole-database pull interrupted after its first page.
+        let (c, _dc) = engine();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some() && !first.deleted_documents.is_empty());
+        c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let cc = c.get_collection("shop", "orders").unwrap();
+        assert!(!holds_tombstone(&c, &cc, &gone));
+        c.apply_batch(&entries).unwrap();
+        assert_eq!(deletes_in_oplog(&c, &gone), 1, "and on this route too");
+    }
+
+    #[test]
+    fn a_page_of_tombstones_this_node_already_holds_commits_nothing() {
+        // A page this node already holds must not cost an fsync -- deletes
+        // included, not only superseded documents.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            assert!(a.delete(&ca, &DocId::Int64(i)).unwrap());
+        }
+        transfer(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(0)), "the fixture must hold them");
+
+        let before = b.commits();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some() && first.deleted_documents.len() == SNAPSHOT_PAGE);
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        assert_eq!(b.commits() - before, 0, "a re-pulled page of held tombstones must not commit");
+    }
+
+    #[test]
+    fn a_carried_delete_below_a_restored_floor_is_history_under_clock_skew() {
+        // `is_history` for a delete, and why it is not redundant with the
+        // out-stamp check. A runs an hour ahead and drops and recreates the
+        // collection, so the floor B and C restore is A's stamp -- and nothing
+        // on the snapshot route moves their clocks up to it. B then writes a
+        // document into the standing life below that floor, and C, behind the
+        // same way, writes and deletes one at the same id a moment later. C's
+        // delete out-stamps B's document; only the floor turns it away, which
+        // is what the entries route does with it too.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let ahead = Stamp::new(
+            Hlc::new(crate::physical_now_ms() + 3_600_000, 0),
+            NodeId::from_bytes([9; 16]),
+        );
+        a.witness_processed(&ahead).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        transfer(&b, &a);
+        transfer(&c, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let cc = c.get_collection("shop", "orders").unwrap();
+        let floor = cb.incarnation_floor.expect("the fixture must restore a floor");
+
+        b.insert(&cb, doc! { "_id": 1 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.insert(&cc, doc! { "_id": 1 }).unwrap();
+        assert!(c.delete(&cc, &DocId::Int64(1)).unwrap());
+        let page = c.snapshot_page(None, None).unwrap();
+        let carried = page.deleted_documents.first().expect("C's page carries the delete").stamp;
+        assert!(carried.hlc < floor, "the delete must sit below the floor: {carried:?} {floor:?}");
+
+        b.apply_snapshot_page(c.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+        assert!(
+            b.get(&cb, &DocId::Int64(1)).unwrap().is_some(),
+            "a delete below the standing life's floor is history, though it out-stamps"
+        );
+    }
+
+    #[test]
+    fn a_carried_delete_whose_id_does_not_re_encode_to_its_key_is_not_applied() {
+        // The key check, reachable through `Engine` though not over HTTP: a
+        // document written under `DocId::Uuid` is keyed as binary subtype 4,
+        // and `DocId::try_from_bson` reads its `_id` back as generic binary,
+        // which keys differently. Without the check the delete would land on
+        // whatever B holds under that generic key -- another document.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let uuid = uuid::Uuid::from_bytes([7; 16]);
+        a.replace(&ca, &DocId::Uuid(uuid), doc! { "v": 1 }, true).unwrap();
+        b.apply_batch(&a.read_oplog_from(Hlc::ZERO, 10_000).unwrap()).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let generic = bson::Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: uuid.as_bytes().to_vec(),
+        });
+        b.insert(&cb, doc! { "_id": generic, "other": true }).unwrap();
+        assert_eq!(b.count(&cb).unwrap(), 2, "the fixture must hold both documents");
+
+        assert!(a.delete(&ca, &DocId::Uuid(uuid)).unwrap());
+        let page = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        assert!(
+            b.get(&cb, &DocId::Binary(uuid.as_bytes().to_vec())).unwrap().is_some(),
+            "the delete must never land on another document"
+        );
+        assert_eq!(b.count(&cb).unwrap(), 2, "and the mismatched one keeps its delete");
+    }
+
+    #[test]
+    fn a_delete_applied_mid_pull_is_held_above_the_vector_the_receiver_advertises() {
+        // A KNOWN RESIDUAL, pinned. A carried delete is appended under
+        // `Position::Hold` and marked held. When the same `Delete` then reaches
+        // B by entries, the equal stamp reads as already applied, nothing is
+        // appended in position, and only B's witnessed vector moves -- so B
+        // holds the entry above the vector it advertises, and a member pulling
+        // entries from B defers it until B appends a later entry from that
+        // origin in position (ADR-160's accepted residual, reaching deletes).
+        // Closed by the same equal-stamp append the relay plan proposes.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(0)).unwrap());
+
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some() && !first.deleted_documents.is_empty());
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        b.apply_batch(&a.read_oplog_from(Hlc::ZERO, 10_000).unwrap()).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::Int64(0)).unwrap().is_none());
+        let delete = b
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == OpKind::Delete && e.doc_id == Some(DocId::Int64(0)))
+            .expect("B holds the Delete");
+        assert!(
+            delete.stamp.hlc > b.version_vector().unwrap().get(a.node_id()),
+            "the known residual: held above what B advertises -- if this now fails, it closed"
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_never_held_the_document_does_not_yet_carry_the_delete_on() {
+        // A KNOWN GAP, pinned so a change to it is noticed rather than silent.
+        // B never held the document, so there is nothing for B to delete and
+        // nothing is recorded (see the test above for why). C, which did hold
+        // it, then catches up from B, and B's walk has no tombstone to carry:
+        // C keeps the document. Tracked by the plan "a delete relayed through a
+        // member that never held the document does not travel"; its fix makes
+        // an equal-stamp delete append the entry it is missing, and its first
+        // step is to flip this assertion.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        transfer(&c, &a);
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+
+        transfer(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(!holds_tombstone(&b, &cb, &DocId::Int64(2)));
+
+        transfer(&c, &b);
+        let cc = c.get_collection("shop", "orders").unwrap();
+        assert!(
+            c.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
+            "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
+        );
     }
 }

@@ -45,7 +45,7 @@ pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta,
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
-    SnapshotProgress,
+    SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to, lacks_collected, lag_behind_ms,
