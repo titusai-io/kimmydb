@@ -204,6 +204,15 @@ Two consequences, both fixed rather than documented:
   otherwise never learn about, and hiding a gap is what the invalidate
   machinery exists to prevent.
 
+**Only a resume token is refused.** The drop's tombstone can outlive its oplog
+entry — collected under an `oplog_retention_secs` shorter than
+`tombstone_retention_secs`, or never held where a snapshot recorded a peer's
+tombstone. An open without a token still succeeds then: the tail opens at the
+tail, and `from_start` begins at the first retained entry stamped after the
+drop. A token is compared with the tombstone's stamp instead, and one from at or
+before it is still `410`. Until 0.29.0 both kinds of open were refused with
+`410 resume_token_expired` until the tombstone was collected.
+
 Found by driving a real node and asking what actually happened, after a written
 claim about it turned out to describe something else entirely.
 
