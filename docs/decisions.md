@@ -15347,10 +15347,21 @@ spans, each `MarkedRange { origin, from, through }`.
     unchanged. Only a snapshot or a repair adds a mark, each once, so this
     costs one walk per peer per such event.
   - **Record expiry.** `MARKS_REASK_AFTER` (300 s) has passed since the resume
-    point last moved. This is the bound on how long a release waits when the
-    peer takes the missing entry below the resume point, whether by restore, a
-    replay, or its own release on an origin gone quiet. That move is invisible
-    to the requester.
+    point last moved. A peer can take the missing entry below the resume point,
+    whether by restore, a replay, or its own release on an origin gone quiet.
+    That move is invisible to the requester, and the expiry is the bound on how
+    long the release waits.
+    - **That bound holds only once the span is dropped.** The record is
+      refreshed by every window that serves the span. While the peer's
+      advertised position on the origin is below the span's top and still
+      rising, every pull names the span and the record never expires. A peer
+      that fills a hole below the resume point is therefore re-asked only after
+      its position passes the span's top and the span is dropped, and then
+      within 300 s.
+    - **A mark released and re-added at the same stamp** between two asks is not
+      new to the record, and waits for the expiry.
+    - **A peer that rewinds below some marks** causes one extra walk from the
+      bottom when its position recovers, by the same rule.
 - **Nothing resets the resume point in the middle of a walk, and the peer moving
   on the span's origin does not re-ask from the bottom.** The entries below the
   resume point were walked and did not carry the marked entry. Entries above it
@@ -15598,6 +15609,9 @@ entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
   ⌈2,890 / 1,024⌉ + 1 pulls.
 - `a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stamp`: the
   tie at a window's end, over TCP.
+- `a_mark_added_below_a_spans_resume_point_reopens_the_span_from_its_new_bottom`:
+  a second scoped repair adds a mark below a partly walked span's resume point,
+  and the next round releases it, over TCP.
 - `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`:
   what an older sender is asked.
 - `a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it`:

@@ -1366,10 +1366,11 @@ struct SpanAsked {
 }
 
 /// How long a span's resume point stands before the span is asked from its
-/// bottom again (ADR-172): the bound on how long a release waits when the
-/// peer takes a missing entry below the resume point, by restore, a replay,
-/// or its own release on an origin gone quiet, which moves nothing this node
-/// can see. Entries below the resume point were walked and did not carry the
+/// bottom again (ADR-172): once the span is dropped, the bound on how long a
+/// release waits when the peer takes a missing entry below the resume point,
+/// by restore, a replay, or its own release on an origin gone quiet, which
+/// moves nothing this node can see. Every window that serves the span
+/// refreshes the record, so it does not run while the span is still named. Entries below the resume point were walked and did not carry the
 /// entry, so no other signal reopens them. Five minutes is the repair
 /// cooldown's length at the default interval.
 pub const MARKS_REASK_AFTER: Duration = Duration::from_secs(300);

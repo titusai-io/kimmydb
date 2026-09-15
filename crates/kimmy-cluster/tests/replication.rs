@@ -1600,6 +1600,81 @@ async fn a_peer_moving_on_the_origin_in_the_middle_of_a_walk_does_not_restart_it
 }
 
 #[tokio::test]
+async fn a_mark_added_below_a_spans_resume_point_reopens_the_span_from_its_new_bottom() {
+    // R's span on O runs from d100 to d2900, and A lacks d100. One pull walks
+    // the span partway and the resume point moves past d1124. A second scoped
+    // repair then brings e50, an earlier entry of the same origin in another
+    // collection, under a mark below that resume point. No window from A has
+    // walked e50, so the next round names the span from e50 and A releases it.
+    let o = node().await;
+    let a = node().await;
+    let r = node().await;
+    let ce = o.engine.create_collection("shop", "early").unwrap();
+    o.engine.insert_many(&ce, (0..100).map(|i| doc! { "_id": format!("e{i}") }).collect()).unwrap();
+    let cd = o.engine.create_collection("shop", "orders").unwrap();
+    o.engine
+        .insert_many(&cd, (0..3_000).map(|i| doc! { "_id": format!("d{i}") }).collect())
+        .unwrap();
+    let history = o.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let theirs = o.engine.version_vector().unwrap();
+    let stamp_of = |id: &str| {
+        history
+            .entries
+            .iter()
+            .find(|e| e.doc_id == Some(DocId::String(id.into())))
+            .unwrap()
+            .stamp
+            .hlc
+    };
+    let e50 = stamp_of("e50");
+    assert!(e50 < stamp_of("d100"), "e50 must sort below the span's bottom");
+    for (member, holes) in [(&a, vec!["d100"]), (&r, vec!["d100", "d2900", "e50"])] {
+        let missing: BTreeSet<DocId> = holes.iter().map(|h| DocId::String((*h).into())).collect();
+        let window: Vec<kimmy_core::OplogEntry> = history
+            .entries
+            .iter()
+            .filter(|e| e.doc_id.as_ref().is_none_or(|id| !missing.contains(id)))
+            .cloned()
+            .collect();
+        member.engine.apply_peer_batch(&theirs, &window, history.scanned_to, true).unwrap();
+    }
+    let repair = |collection: kimmy_core::CollectionId| {
+        let mut progress = kimmy_storage::SnapshotProgress::of_collection(collection);
+        while !progress.is_complete() {
+            let page = o.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            r.engine.apply_snapshot_page(o.engine.node_id(), &mut progress, &page).unwrap();
+        }
+    };
+    let lowest = |r: &Node| {
+        r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap()[0].from
+    };
+    repair(cd.id);
+    assert_eq!(lowest(&r), stamp_of("d100"));
+
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(first.truncated && first.superseded == 1024, "walked partway: {first:?}");
+
+    repair(ce.id);
+    assert_eq!(lowest(&r), e50, "e50 held as state, below the resume point");
+
+    let mut pulls = Vec::new();
+    loop {
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated || pulls.len() >= 6 {
+            break;
+        }
+    }
+    assert_eq!(
+        lowest(&r),
+        stamp_of("d100"),
+        "e50 was named from the span's new bottom and released; d100, which A lacks, stays: {pulls:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stamp() {
     // The tie at a window's end. L sorts before O, and L's entry and R's marked
     // O entry share one timestamp, H. The first window is truncated on L's
