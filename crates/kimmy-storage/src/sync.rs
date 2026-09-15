@@ -527,14 +527,26 @@ impl Engine {
     ///
     /// **Why it is safe.** `held` is the requester's witnessed vector, the
     /// one `from` was derived from, so every skipped entry is one it has
-    /// processed; its vector only rises while the window is in flight. What
+    /// processed, or holds coverage of that a snapshot granted (ADR-082,
+    /// ADR-167); its vector only rises while the window is in flight. What
     /// the window carries for each origin therefore begins exactly where the
     /// requester's history of that origin ends, which is the contiguity the
     /// coverage rule and ADR-143's invariant rest on, and a skipped entry
     /// still moves `scanned_to` the way a withheld violation does, so the
     /// window reports the end it really reached (ADR-127). `limit` counts only
     /// what is sent, so a window truncated at the cap still ends at its last
-    /// entry (ADR-126). `None` serves the whole range, as a requester that
+    /// entry (ADR-126).
+    ///
+    /// **What it gives up.** An entry the vector covers but that the requester
+    /// does not hold in position is no longer re-served when another origin
+    /// holds the threshold low: a held entry at or below the position, and DDL
+    /// processed without applying. See ADR-171 for the residual that leaves.
+    ///
+    /// **Cost.** The range is still walked from `from`, by key, until the first
+    /// entry the requester lacks, which can be most of the retained oplog: a
+    /// caller on the async runtime runs it under `blocking` (ADR-153).
+    ///
+    /// `None` serves the whole range, as a requester that
     /// sent no vector — or a repair re-serving below its position (ADR-148) —
     /// asked for.
     pub fn entries_for_peer_holding(

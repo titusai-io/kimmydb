@@ -1177,6 +1177,53 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
     }
 }
 
+/// What the requester logs when a peer answers `BeyondHorizon` and the round
+/// falls back to a snapshot.
+const SNAPSHOT_FALLBACK: &str = "falling back to a snapshot";
+
+/// `round`'s result, and every event message logged while it ran, from its
+/// own task.
+///
+/// The cluster wire is TLS under the cluster secret, so a test cannot watch
+/// which messages a round sent. The requester's own log line is what says it
+/// asked for a snapshot.
+async fn logged_during<T>(round: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+    use tracing::instrument::WithSubscriber;
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = round.with_subscriber(Recorder(Arc::clone(&lines))).await;
+    let lines = lines.lock().unwrap().clone();
+    (out, lines)
+}
+
+/// A subscriber that keeps each event's message and nothing else.
+struct Recorder(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[tokio::test]
 async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
     // The second finding. The first peer to pull from a restarted member was
@@ -1198,16 +1245,17 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
         "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
     );
 
-    // Per origin, nothing B lacks is gone, which is the answer the served
-    // `AskEntries` arm gives on the vector B sends with its request. This used
-    // to be read off the round instead, as a re-served tail reported
-    // superseded; since ADR-171 a window passes over what B has processed, so
-    // an oplog round and a snapshot both report nothing superseded here.
+    // The round itself says which way it was served. This used to be read off
+    // a re-served tail reported superseded; since ADR-171 an oplog round and a
+    // snapshot of this store both apply one document and supersede nothing.
+    // What differs is that the requester logs its fallback when the peer
+    // answers `BeyondHorizon`, and asks for a snapshot next.
+    let (outcome, logged) = logged_during(sync_once(&b.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
     assert!(
-        a.engine.can_serve_peer_holding(&held).unwrap(),
-        "per origin, A can serve B from the oplog"
+        !logged.iter().any(|line| line.contains(SNAPSHOT_FALLBACK)),
+        "the round must be served from the oplog, not a snapshot: {logged:?}"
     );
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(outcome.applied, 1, "{outcome:?}");
     assert_eq!(outcome.superseded, 0, "and nothing B holds is served again: {outcome:?}");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
@@ -1339,6 +1387,28 @@ async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() 
 }
 
 #[tokio::test]
+async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds() {
+    // The push of ADR-143 serves the window a pull from the member's position
+    // would. Before ADR-171 that window, read from C's position on B, was a
+    // full batch of A's writes C already held and stopped short of B's schema
+    // change, so the push named C unreached and left the change to
+    // anti-entropy.
+    let (_a, b, c) = a_quiet_member_among_caught_up_peers().await;
+    b.engine.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
+    // B's newest write of its own, read by its stamp: `newest` scans the first
+    // two batches of the oplog, and A's writes sit between them and this.
+    let b_id = b.engine.node_id();
+    let stamp = kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id);
+    let entry = b.engine.oplog_entry(&stamp).unwrap().expect("B's schema change");
+    assert_eq!(entry.kind, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&b.engine, c.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(pushed.outcome.ddl, 1, "the change is applied at once: {pushed:?}");
+    assert_eq!(pushed.outcome.superseded, 0, "and nothing C holds is sent: {pushed:?}");
+}
+
+#[tokio::test]
 async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots() {
     // The control for both. B holds A's first write but never received the
     // second, and A has since collected it. B lacks something gone: A names
@@ -1371,7 +1441,12 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
         "B lacks a collected write of A's, 36 hours behind: it is stale: {outcome:?}"
     );
 
-    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let (pulled, logged) = logged_during(sync_once(&b.engine, a.addr, SECRET, None)).await;
+    let pulled = pulled.unwrap();
+    assert!(
+        logged.iter().any(|line| line.contains(SNAPSHOT_FALLBACK)),
+        "served as a snapshot, and the recorder sees the line that says so: {logged:?}"
+    );
     assert_eq!(pulled.superseded, 0, "served as a snapshot, not from the oplog: {pulled:?}");
     for id in ["a-missed", "a-after"] {
         assert!(

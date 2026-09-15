@@ -21,14 +21,26 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   which the puller already held. So one document written on a member whose
   previous local write was an hour old cost each peer a run of back-to-back
   pulls that applied nothing. It was measured on a three-member cluster at 306
-  pulls and about 313,000 entries per peer in 67 s, and on 0.28.1 at 282 pulls
-  in 56 s. Every version roll triggered it once per member, because a member
+  pulls and up to about 313,000 entries per peer in 67 s, and on 0.28.1 at 282
+  pulls in 56 s. Every version roll triggered it once per member, because a member
   rewrites its topology record when its build changes. A window now passes over
-  every entry the puller has already processed of that entry's origin, judged on
-  the vector the puller already sends with its request, so the same write is one
-  pull. The skipped entries are judged on their keys and never decoded.
+  every entry the puller's witnessed vector already covers for that entry's
+  origin, judged on the vector the puller already sends with its request. In the
+  harness test (a debug build, one run; not yet re-measured on a cluster), the
+  same write is one pull. The skipped entries are judged on their keys and never
+  decoded, and the walk runs off the async worker.
   [ADR-171](docs/decisions.md) has the reasoning and why nothing a puller lacks
   can be skipped.
+
+  **One residual this leaves.** It applies to a member with a hole on an origin
+  (its witnessed vector covers an entry its oplog does not hold in position)
+  that a scoped repair then fills, so the member holds that entry as state.
+  That entry used to be re-served and released whenever another origin held the
+  member's threshold low, which every roll does. It now stays held until the
+  origin writes again or retention collects the entry. Until then the member
+  advertises the origin below the entry, and peers pulling from it count the
+  entry under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`.
+  ADR-171 says why re-serving it by lowering the vector was not done.
 
   **Nothing to decide before upgrading, and no ordering in the roll.** Nothing on
   the wire changes: the vector was already sent. A member serves the shorter
