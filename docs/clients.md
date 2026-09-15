@@ -132,8 +132,9 @@ token loops forever.
 `Client::download_to` streams `GET /v1/admin/backup` into anything that
 implements `AsyncWrite` — a file, or stdout — without holding it in memory.
 The node sends nothing until it has walked its whole store, which can take many
-minutes, so the wait for the response head has no timeout (TCP keepalive still
-ends a dead connection). The body is bounded by the builder's `timeout` as a
+minutes, so the wait for the response head has no timeout. TCP keepalive ends a
+dead connection, but a server that accepts the connection and never answers
+holds the download open, since keepalive ends only a dead peer. The body is bounded by the builder's `timeout` as a
 read-idle timeout: the download fails with `Error::Stalled` after that long
 without a byte, however long the whole transfer takes. `Client::download` is
 the same, collected into a `Vec`.
