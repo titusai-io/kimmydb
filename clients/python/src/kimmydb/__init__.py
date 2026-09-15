@@ -24,8 +24,9 @@ What it does, and each is a promise the server makes:
   token;
 * raises typed errors carrying the retry class, so an unfamiliar code is still
   actionable;
-* resumes change streams from the last token seen, which is safe only because
-  those tokens are portable between nodes.
+* resumes change streams from the last token seen, which is safe because any
+  node resumes from one without a gap (a node other than the one that issued
+  it may repeat a few events).
 
 And one thing it deliberately does not do: **retry a write**. ``elsewhere``
 means *this node* did not answer, not that the work did not happen.

@@ -1075,7 +1075,7 @@ impl Engine {
     }
 
     /// [`Self::read_versions`] inside a read transaction the caller holds.
-    fn read_versions_in(
+    pub(crate) fn read_versions_in(
         txn: &redb::ReadTransaction,
         table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     ) -> Result<kimmy_core::VersionVector> {

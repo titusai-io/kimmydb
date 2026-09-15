@@ -241,6 +241,17 @@ pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
 /// that origin was collected. [`OPLOG_COLLECTED`] is the same fact per origin.
 pub const META_OPLOG_COLLECTED_THROUGH: &str = "oplog_collected_through";
 
+/// Every point-in-time rewind this database has taken: its target, and per
+/// origin the newest stamp it discarded (`Engine::rewinds`).
+///
+/// A rewind removes oplog entries a change stream may already have delivered,
+/// so a resume token naming one of them describes history that no longer
+/// exists and is refused (ADR-173). The record is what tells such a token from
+/// one that names an entry this member simply never held. Appended to, never
+/// collected: a rewind is a rare, deliberate operator action, and a record per
+/// rewind is a few dozen bytes.
+pub const META_REWOUND: &str = "rewound";
+
 /// `node id (16 bytes) -> highest Hlc retention has removed from that origin`.
 ///
 /// [`META_OPLOG_COLLECTED_THROUGH`] split by origin. It answers the question

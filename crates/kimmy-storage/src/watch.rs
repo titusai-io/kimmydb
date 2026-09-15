@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kimmy_core::{CollectionId, Hlc, OpKind, OplogEntry, ResumeToken, Stamp};
+use kimmy_core::{
+    CollectionId, Hlc, NodeId, OpKind, OplogEntry, ResumeToken, Stamp, VersionVector,
+};
 use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
@@ -53,6 +55,20 @@ pub struct WatchOptions {
     pub start_at: Option<Hlc>,
 }
 
+/// Where a stream opens, and what it starts out able to claim.
+struct Opened {
+    /// The arrival position of the first entry the stream reads.
+    start: u64,
+    /// The delivered vector its tokens carry until it first reaches the tail.
+    delivered: VersionVector,
+    /// Entries at or below this, per origin, are passed over for the life of
+    /// the stream: the client was already sent them (ADR-173).
+    skip: Option<VersionVector>,
+}
+
+fn expired() -> StorageError {
+    StorageError::Core(kimmy_core::Error::ResumeTokenExpired)
+}
 /// One item from a change stream.
 #[derive(Clone, Debug)]
 pub enum ChangeEvent {
@@ -132,14 +148,21 @@ impl Engine {
         // keeps its origin stamp and so lands behind the local tail; following
         // stamp order would mean a subscriber already past that point never
         // saw it. See `tables::OPLOG_ARRIVAL`.
-        let start = match (&options.resume_after, options.start_at) {
+        let opened = match (&options.resume_after, options.start_at) {
             // Resuming is exclusive of the token itself, so a client never sees
             // the last event it already acknowledged twice.
-            (Some(token), _) => self.arrival_after(token)?,
-            (None, Some(at)) => self.first_arrival_at_or_after(at)?,
+            (Some(token), _) => self.resume_point(token)?,
+            // Nothing delivered yet, so nothing is claimed: a token issued
+            // before this stream first reaches the tail says so.
+            (None, Some(at)) => Opened {
+                start: self.first_arrival_at_or_after(at)?,
+                delivered: VersionVector::new(),
+                skip: None,
+            },
             // No resume point: start live, skipping all history.
-            (None, None) => self.next_arrival_seq()?,
+            (None, None) => self.tail_open()?,
         };
+        let start = opened.start;
 
         // Step 3: never read across a drop.
         //
@@ -154,9 +177,9 @@ impl Engine {
         // quietly moved forward: there is a real gap between where the client
         // was and where this collection begins, and hiding a gap is the thing
         // `Invalidate` exists to avoid.
-        let start = match scope {
+        let (start, incarnation_floor) = match scope {
             WatchScope::Collection(id) => self.clamp_to_incarnation(id, start, &options)?,
-            _ => start,
+            _ => (start, None),
         };
 
         Ok(ChangeStream {
@@ -166,6 +189,11 @@ impl Engine {
             resume_floor: start,
             replay: Vec::new().into_iter(),
             last_delivered: None,
+            issuer: self.node_id(),
+            delivered: opened.delivered,
+            pending: None,
+            skip: opened.skip,
+            incarnation_floor,
             db_of_collection: HashMap::new(),
             finished: false,
         })
@@ -186,15 +214,38 @@ impl Engine {
     /// token is resolved answered `ResumeTokenExpired` for opens that carried
     /// no token, so every recreated collection under the name was unwatchable
     /// until the tombstone went. Found in round 0330.
+    ///
+    /// Also returns a floor by stamp, set only for a token another member
+    /// issued: that stream passes over every entry of this collection stamped
+    /// at or before the drop.
     fn clamp_to_incarnation(
         &self,
         id: CollectionId,
         start: u64,
         options: &WatchOptions,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<(CollectionId, Stamp)>)> {
         let Some(dropped_at) = self.collection_dropped_at(id)? else {
-            return Ok(start);
+            return Ok((start, None));
         };
+        // A token another member issued starts from its vector, and this
+        // member's positions are not the issuer's: an entry of another
+        // collection that arrived here before the drop can put the start below
+        // it. So the incarnation is bounded by the drop's stamp, as it is for a
+        // drop this member never held, and the stream is floored at that stamp
+        // instead of at a position (ADR-173). The token is from this
+        // incarnation when its entry is stamped after the drop or its vector
+        // covers the drop.
+        if let Some(token) = &options.resume_after
+            && let Some(issued) = &token.issued
+            && issued.by != self.node_id()
+        {
+            let after_the_drop = token.to_stamp() > dropped_at
+                || issued.delivered.get(dropped_at.node) >= dropped_at.hlc;
+            return match after_the_drop {
+                true => Ok((start, Some((id, dropped_at)))),
+                false => Err(expired()),
+            };
+        }
         let Some(drop_seq) = self.arrival_of(&dropped_at)? else {
             // The drop is not in the log, so its position is not known. The
             // tombstone's stamp still bounds the incarnation: a token at or
@@ -204,19 +255,19 @@ impl Engine {
                 Some(token) if token.to_stamp() <= dropped_at => {
                     Err(kimmy_core::Error::ResumeTokenExpired.into())
                 }
-                Some(_) => Ok(start),
-                None => self.first_arrival_stamped_after(start, dropped_at),
+                Some(_) => Ok((start, None)),
+                None => Ok((self.first_arrival_stamped_after(start, dropped_at)?, None)),
             };
         };
         // The incarnation begins just after the drop entry.
         let after_drop = drop_seq + 1;
         if start >= after_drop {
-            return Ok(start);
+            return Ok((start, None));
         }
         if options.resume_after.is_some() {
             return Err(kimmy_core::Error::ResumeTokenExpired.into());
         }
-        Ok(after_drop)
+        Ok((after_drop, None))
     }
 
     /// The arrival position of the entry stamped `stamp`, if this node holds it.
@@ -245,38 +296,122 @@ impl Engine {
         Ok(arrival.last()?.map_or(from, |(seq, _)| from.max(seq.value() + 1)))
     }
 
-    /// The arrival position just after the entry a token names.
+    /// Where a stream resumed after `token` starts, and what it may take as
+    /// already delivered (ADR-173).
     ///
-    /// The token is a stamp, which is a public contract older than the arrival
-    /// index, so it is translated here rather than changing what clients hold.
-    fn arrival_after(&self, token: &ResumeToken) -> Result<u64> {
-        let txn = self.db().begin_read()?;
-        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
-        let key = codec::oplog_key(&token.to_stamp());
-
-        if let Some(seq) = by_stamp.get(key.as_slice())? {
-            return Ok(seq.value() + 1);
+    /// Three cases, by who issued the token:
+    ///
+    /// - **This member.** The stamp names a position in this member's own
+    ///   arrival order, which is exact: the stream starts just after it.
+    /// - **Another member.** That member ordered the same writes differently,
+    ///   so the stamp's position here means nothing. The token's delivered
+    ///   vector says instead what the client has: every entry at or below it,
+    ///   per origin. The stream delivers every entry above it, in this member's
+    ///   arrival order, from the first one, and passes over everything at or
+    ///   below it — here and on every later arrival.
+    /// - **Nobody**: a single-stamp token issued before 0.30.0. As before when
+    ///   this member holds the entry; when it does not and the stamp is inside
+    ///   the retained range, from the first entry stamped after it rather than
+    ///   at the tail.
+    ///
+    /// A token naming an entry a rewind discarded, and that this member does not
+    /// hold again, is refused in every case: the client saw history this member
+    /// no longer has.
+    fn resume_point(&self, token: &ResumeToken) -> Result<Opened> {
+        let stamp = token.to_stamp();
+        let held = self.arrival_of(&stamp)?;
+        if held.is_none() && self.rewinds()?.iter().any(|rewind| rewind.discarded(&stamp)) {
+            return Err(expired());
         }
-
-        // The entry is not in the log. Either it was collected — in which case
-        // resuming would silently skip everything between — or it is newer than
-        // anything we hold, which is fine and simply means nothing has happened
-        // since. The oldest retained stamp distinguishes the two.
-        drop(by_stamp);
-        let collected = {
-            let oplog = txn.open_table(tables::OPLOG)?;
-            match oplog.first()? {
-                Some((oldest, _)) => token.to_stamp() < codec::decode_oplog_key(oldest.value())?,
-                // An empty log cannot have collected anything.
-                None => false,
+        match &token.issued {
+            Some(issued) if issued.by == self.node_id() => match held {
+                Some(seq) => Ok(Opened {
+                    start: seq + 1,
+                    delivered: issued.delivered.clone(),
+                    skip: Some(issued.delivered.clone()),
+                }),
+                // This member held every entry its streams delivered, until
+                // retention collected it. Whatever came between is gone.
+                None => Err(expired()),
+            },
+            Some(issued) => {
+                // An origin collected past what the client has: entries above
+                // the token's vector may be gone from here, and nothing can
+                // say whether the client was sent them.
+                //
+                // Capped at what this member witnessed of the origin. The
+                // record is seeded from the coarse horizon on a database an
+                // earlier build collected from, which can put a quiet origin's
+                // entry above anything it ever wrote; nothing of it above what
+                // was witnessed can have been collected.
+                let collected = self.oplog_collected()?;
+                let witnessed = self.witnessed_vector()?;
+                if collected.iter().any(|(origin, hlc)| {
+                    hlc.min(witnessed.get(origin)) > issued.delivered.get(origin)
+                }) {
+                    return Err(expired());
+                }
+                Ok(Opened {
+                    start: self.first_arrival_beyond(&issued.delivered)?,
+                    delivered: issued.delivered.clone(),
+                    skip: Some(issued.delivered.clone()),
+                })
             }
-        };
-
-        if collected {
-            return Err(StorageError::Core(kimmy_core::Error::ResumeTokenExpired));
+            None => {
+                let start = match held {
+                    Some(seq) => seq + 1,
+                    None if self.stamp_collected(&stamp)? => return Err(expired()),
+                    None => self.first_arrival_stamped_after(0, stamp)?,
+                };
+                Ok(Opened { start, delivered: VersionVector::new(), skip: None })
+            }
         }
-        drop(txn);
-        self.next_arrival_seq()
+    }
+
+    /// A stream opened at the tail: the next arrival position, and this
+    /// member's witnessed vector read in the same transaction.
+    ///
+    /// Everything the vector covers has either been appended below that
+    /// position or was superseded without being appended, so a stream that
+    /// starts there can claim it from its first token.
+    fn tail_open(&self) -> Result<Opened> {
+        let txn = self.db().begin_read()?;
+        let start = {
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1)
+        };
+        let delivered = Engine::read_versions_in(&txn, tables::OPLOG_WITNESSED)?;
+        Ok(Opened { start, delivered, skip: None })
+    }
+
+    /// The first arrival position holding an entry above `delivered` for its
+    /// origin, or the position the next appended entry will take.
+    ///
+    /// A walk of the arrival index's keys, once per stream opened from a
+    /// token another member issued.
+    fn first_arrival_beyond(&self, delivered: &VersionVector) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        for row in arrival.iter()? {
+            let (seq, key) = row?;
+            let stamp = codec::decode_oplog_key(key.value())?;
+            if stamp.hlc > delivered.get(stamp.node) {
+                return Ok(seq.value());
+            }
+        }
+        Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
+    }
+
+    /// Whether retention has collected past `stamp`: it is older than the
+    /// oldest entry the oplog retains.
+    fn stamp_collected(&self, stamp: &Stamp) -> Result<bool> {
+        let txn = self.db().begin_read()?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        Ok(match oplog.first()? {
+            Some((oldest, _)) => *stamp < codec::decode_oplog_key(oldest.value())?,
+            // An empty log cannot have collected anything.
+            None => false,
+        })
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -337,6 +472,52 @@ impl Engine {
             }
         }
         Ok(out)
+    }
+
+    /// [`Self::read_arrival_from`], and — when the read reached the end of the
+    /// arrival index — this member's witnessed vector, from the same
+    /// transaction.
+    ///
+    /// The vector is what a stream's tokens may claim once it has taken every
+    /// entry the read returned (ADR-173). Read in the same transaction, it
+    /// covers only entries at arrival positions the read has already passed,
+    /// or entries that were superseded here without being appended.
+    ///
+    /// Also returns the last arrival position the read passed, which is where
+    /// the next read starts after. Positions are not contiguous: a rewind and
+    /// retention both remove rows from the middle of the index, so the count of
+    /// entries read says nothing about how far the read went.
+    fn read_arrival_batch(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> Result<(Vec<OplogEntry>, Option<VersionVector>, Option<u64>)> {
+        let txn = self.db().begin_read()?;
+        let mut out = Vec::new();
+        let mut last = None;
+        let mut reached_tail = true;
+        {
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            for row in arrival.range(from..)? {
+                let (seq, key) = row?;
+                last = Some(seq.value());
+                let Some(raw) = oplog.get(key.value())? else {
+                    warn!("arrival index points at a missing oplog entry");
+                    continue;
+                };
+                out.push(codec::decode_oplog_entry(raw.value())?);
+                if out.len() >= limit {
+                    reached_tail = arrival.range(seq.value() + 1..)?.next().is_none();
+                    break;
+                }
+            }
+        }
+        let witnessed = match reached_tail {
+            true => Some(Engine::read_versions_in(&txn, tables::OPLOG_WITNESSED)?),
+            false => None,
+        };
+        Ok((out, witnessed, last))
     }
 
     /// Reject a resume token whose position has already been collected.
@@ -478,6 +659,27 @@ pub struct ChangeStream {
     replay: std::vec::IntoIter<OplogEntry>,
     /// The last stamp handed to the caller, which is what a resume token names.
     last_delivered: Option<Stamp>,
+    /// This member, which issues every token the stream hands out.
+    issuer: NodeId,
+    /// Per origin, a stamp at or below which this stream has taken every entry
+    /// this member holds: delivered it, or passed over it. Every token carries
+    /// it (ADR-173).
+    ///
+    /// It moves only when the stream has taken everything up to the end of the
+    /// arrival index as some read found it, and then to the witnessed vector
+    /// that read saw. Until then it holds what the stream opened with, which
+    /// is lower than it could be and never higher.
+    delivered: VersionVector,
+    /// The witnessed vector of the last read that reached the tail, waiting
+    /// for the stream to take every entry that read returned.
+    pending: Option<VersionVector>,
+    /// Entries at or below this are never delivered: the token the stream
+    /// resumed from says the client already has them.
+    skip: Option<VersionVector>,
+    /// For a collection stream resumed from another member's token, the drop
+    /// its incarnation began after: entries of the collection stamped at or
+    /// before it belong to the previous one.
+    incarnation_floor: Option<(CollectionId, Stamp)>,
     /// Cache for database-scoped filtering.
     db_of_collection: HashMap<CollectionId, String>,
     finished: bool,
@@ -521,6 +723,12 @@ impl ChangeStream {
                 continue;
             }
 
+            // Every entry the last read returned has been taken, so what that
+            // read's vector covers is behind the stream now.
+            if let Some(witnessed) = self.pending.take() {
+                self.delivered.merge(&witnessed);
+            }
+
             let from = self.next_replay_from.unwrap_or(self.resume_floor);
 
             // Phase 2: has retention collected the range we were about to read?
@@ -542,13 +750,26 @@ impl ChangeStream {
             }
 
             // Phase 3: read whatever has arrived since we last looked.
-            match engine.read_arrival_from(from, REPLAY_BATCH) {
-                Ok(batch) if !batch.is_empty() => {
-                    self.next_replay_from = Some(from + batch.len() as u64);
-                    self.replay = batch.into_iter();
-                    continue;
+            match engine.read_arrival_batch(from, REPLAY_BATCH) {
+                Ok((batch, witnessed, last)) => {
+                    // Past the last position the read reached, not past as
+                    // many positions as it returned entries: a hole left by a
+                    // rewind or by retention would otherwise put the next read
+                    // back inside this one, and deliver its tail again.
+                    if let Some(last) = last {
+                        self.next_replay_from = Some(last + 1);
+                    }
+                    if !batch.is_empty() {
+                        self.replay = batch.into_iter();
+                        self.pending = witnessed;
+                        continue;
+                    }
+                    // Nothing past the stream's position: it has taken
+                    // everything the vector covers already.
+                    if let Some(witnessed) = witnessed {
+                        self.delivered.merge(&witnessed);
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     debug!(error = %e, "oplog replay failed; ending stream");
                     self.finished = true;
@@ -557,7 +778,7 @@ impl ChangeStream {
             }
 
             // Phase 4: nothing new on disk. Wait to be told to look again.
-            self.next_replay_from = Some(from);
+            self.next_replay_from.get_or_insert(from);
             match self.rx.recv().await {
                 // The payload is deliberately ignored; see the note above.
                 Ok(_) => {}
@@ -581,6 +802,30 @@ impl ChangeStream {
             return None;
         }
 
+        // The previous incarnation's history, older drops included.
+        if let Some((collection, floor)) = self.incarnation_floor
+            && entry.collection == collection
+            && entry.stamp <= floor
+        {
+            return None;
+        }
+
+        // The client already has it: the token this stream resumed from was
+        // issued by a stream that had taken it. Before the drop check, so a
+        // drop the issuing stream had already taken does not end this one.
+        //
+        // A violation is never passed over. Each member reports a merge's
+        // violation under its own stamp and peers never serve one another's,
+        // so the vector can cover this member's report without the issuing
+        // member ever having held it (ADR-173). Delivering it can only repeat
+        // a report of the same merge.
+        if let Some(skip) = &self.skip
+            && entry.kind != OpKind::UniqueViolation
+            && entry.stamp.hlc <= skip.get(entry.stamp.node)
+        {
+            return None;
+        }
+
         // The collection this stream is watching has gone. Ending here rather
         // than at the edge that renders events, because *this* is where
         // `finished` lives: a consumer of `Engine::watch` that is not the HTTP
@@ -597,7 +842,7 @@ impl ChangeStream {
         }
 
         self.last_delivered = Some(entry.stamp);
-        let token = entry.resume_token();
+        let token = ResumeToken::issued(entry.stamp, self.issuer, self.delivered.clone());
         Some(ChangeEvent::Change { entry, token })
     }
 
@@ -627,7 +872,8 @@ impl ChangeStream {
 
     /// The token to resume from, reflecting everything delivered so far.
     pub fn resume_token(&self) -> Option<ResumeToken> {
-        self.last_delivered.map(ResumeToken::from_stamp)
+        self.last_delivered
+            .map(|stamp| ResumeToken::issued(stamp, self.issuer, self.delivered.clone()))
     }
 }
 
@@ -1511,5 +1757,519 @@ mod tests {
             )
             .expect("a token from this incarnation resumes");
         assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![3]);
+    }
+
+    // -- A token resumed on a member other than the one that issued it ------
+    //
+    // Each member orders its own arrivals, and a token issued by one names a
+    // position in that member's order. These are the ways another member's
+    // order leaves that position out (ADR-173).
+
+    /// The next document change on `stream`, with the token it carried.
+    async fn next_change(
+        engine: &Engine,
+        stream: &mut ChangeStream,
+    ) -> (Arc<OplogEntry>, ResumeToken) {
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(engine))
+                    .await
+                    .expect("timed out waiting for a change")
+                    .expect("stream ended early");
+            if let ChangeEvent::Change { entry, token } = event
+                && entry.kind.is_document()
+            {
+                return (entry, token);
+            }
+        }
+    }
+
+    /// Document changes from `stream`, in delivery order, until every id in
+    /// `wanted` has been delivered.
+    async fn changes_until(
+        engine: &Engine,
+        stream: &mut ChangeStream,
+        wanted: &[&str],
+    ) -> Vec<Arc<OplogEntry>> {
+        let mut delivered: Vec<Arc<OplogEntry>> = Vec::new();
+        let id_of = |entry: &OplogEntry| match &entry.doc_id {
+            Some(kimmy_core::DocId::String(s)) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        while !wanted.iter().all(|w| delivered.iter().any(|e| id_of(e) == *w)) {
+            let seen: Vec<String> = delivered.iter().map(|e| id_of(e)).collect();
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(engine))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("timed out waiting for {wanted:?}; delivered {seen:?}")
+                    })
+                    .expect("stream ended early");
+            if let ChangeEvent::Change { entry, .. } = event
+                && entry.kind.is_document()
+            {
+                delivered.push(entry);
+            }
+        }
+        delivered
+    }
+
+    fn ids(entries: &[Arc<OplogEntry>]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match &e.doc_id {
+                Some(kimmy_core::DocId::String(s)) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_token_for_a_write_the_resuming_member_superseded_resumes_without_a_gap() {
+        let (a, coll_a, _da) = setup();
+        let (b, coll_b, _db) = setup();
+
+        let mut on_a = a.watch(WatchScope::Collection(coll_a.id), WatchOptions::default()).unwrap();
+        a.insert(&coll_a, doc! { "_id": "x", "v": 1 }).unwrap();
+        let (written_on_a, token) = next_change(&a, &mut on_a).await;
+
+        // B writes the same document later, so A's write loses there and B
+        // never appends it: the token names an entry B will never hold.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.insert(&coll_b, doc! { "_id": "x", "v": 2 }).unwrap();
+        b.insert(&coll_b, doc! { "_id": "y" }).unwrap();
+        assert!(!b.apply_remote(&coll_b, &written_on_a).unwrap(), "A's write must lose on B");
+
+        let mut on_b = b
+            .watch(
+                WatchScope::Collection(coll_b.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token resumes on B");
+        let delivered = changes_until(&b, &mut on_b, &["x", "y"]).await;
+        assert_eq!(
+            ids(&delivered),
+            vec!["x", "y"],
+            "B's own write to x and its insert of y never reached the client through A"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap() {
+        let (a, coll, _da) = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+
+        let mut on_a = a.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        a.insert(&coll, doc! { "_id": "x", "v": 1 }).unwrap();
+        let (_, token) = next_change(&a, &mut on_a).await;
+        drop(on_a);
+
+        // Written while the client is away. B is built from A's snapshot, which
+        // carries x as it is now and never the version the token names.
+        a.replace(
+            &coll,
+            &kimmy_core::DocId::String("x".into()),
+            doc! { "_id": "x", "v": 2 },
+            false,
+        )
+        .unwrap();
+        a.insert(&coll, doc! { "_id": "z" }).unwrap();
+        let mut progress = crate::SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+
+        let mut on_b = b
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token resumes on B");
+        let delivered = changes_until(&b, &mut on_b, &["x", "z"]).await;
+        assert_eq!(ids(&delivered), vec!["x", "z"]);
+        let x = delivered[0].document().unwrap().unwrap();
+        assert_eq!(x.get_i32("v").unwrap(), 2, "the version the client missed");
+    }
+
+    #[tokio::test]
+    async fn a_token_for_a_write_the_resuming_member_has_not_yet_received_resumes_without_a_gap() {
+        let (a, coll_a, _da) = setup();
+        let (b, coll_b, _db) = setup();
+        b.insert(&coll_b, doc! { "_id": "b0" }).unwrap();
+
+        let mut on_a = a.watch(WatchScope::Collection(coll_a.id), WatchOptions::default()).unwrap();
+        a.insert(&coll_a, doc! { "_id": "a1" }).unwrap();
+        let (first, _) = next_change(&a, &mut on_a).await;
+        a.insert(&coll_a, doc! { "_id": "a2" }).unwrap();
+        let (second, token) = next_change(&a, &mut on_a).await;
+
+        // The client fails over to B before replication has carried A's writes
+        // there, and B has taken a write of its own that never reached A.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.insert(&coll_b, doc! { "_id": "b1" }).unwrap();
+
+        let mut on_b = b
+            .watch(
+                WatchScope::Collection(coll_b.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token resumes on B");
+        let delivered = changes_until(&b, &mut on_b, &["b0", "b1"]).await;
+        assert_eq!(ids(&delivered), vec!["b0", "b1"], "neither of B's writes ever reached A");
+
+        // Replication catches up. a1 was delivered before the token's own event
+        // and is not delivered again; a2 is the token's event, which a member
+        // other than the issuer may repeat.
+        assert!(b.apply_remote(&coll_b, &first).unwrap());
+        assert!(b.apply_remote(&coll_b, &second).unwrap());
+        b.insert(&coll_b, doc! { "_id": "b2" }).unwrap();
+        let after = ids(&changes_until(&b, &mut on_b, &["b2"]).await);
+        assert!(!after.contains(&"a1".to_string()), "a1 was delivered before the token: {after:?}");
+        assert!(after.iter().all(|id| id == "a2" || id == "b2"), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_single_stamp_token_naming_an_entry_this_member_lacks_resumes_after_its_stamp() {
+        // What every member issued before 0.30.0, still accepted for one
+        // release. It names an entry this member does not hold, inside the
+        // retained range, and resumes at the first entry stamped after it
+        // rather than at the tail.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": "before" }).unwrap();
+        let unheld = later_by(newest_stamp(&engine), 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions {
+                    resume_after: Some(ResumeToken::from_stamp(unheld)),
+                    ..Default::default()
+                },
+            )
+            .expect("the token resumes");
+        let delivered = changes_until(&engine, &mut stream, &["after"]).await;
+        assert_eq!(ids(&delivered), vec!["after"]);
+    }
+
+    #[tokio::test]
+    async fn a_token_naming_an_entry_a_rewind_discarded_is_refused() {
+        let (engine, coll, _dir) = setup();
+        let mut stream = engine.watch(WatchScope::Cluster, WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+        next_change(&engine, &mut stream).await;
+        let until = newest_stamp(&engine).hlc;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+        let (_, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+
+        engine.rewind_to(until).unwrap();
+
+        // The client saw an event the database no longer holds. Nothing after
+        // it can be delivered as a continuation of what the client saw.
+        let refused = engine.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(
+            matches!(
+                refused.err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "a token naming a rewound entry must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_claims_nothing_its_stream_had_read_but_not_yet_handed_over() {
+        // One read returns both writes and reaches the tail. The token for the
+        // first cannot claim the second: the client may never get it.
+        let (a, coll_a, _da) = setup();
+        let (b, coll_b, _db) = setup();
+        let mut on_a = a.watch(WatchScope::Collection(coll_a.id), WatchOptions::default()).unwrap();
+        a.insert(&coll_a, doc! { "_id": "a1" }).unwrap();
+        a.insert(&coll_a, doc! { "_id": "a2" }).unwrap();
+        let (first, token) = next_change(&a, &mut on_a).await;
+        let (second, _) = next_change(&a, &mut on_a).await;
+        assert_eq!(ids(&[first.clone(), second.clone()]), vec!["a1", "a2"]);
+        drop(on_a);
+
+        let mut on_b = b
+            .watch(
+                WatchScope::Collection(coll_b.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .unwrap();
+        assert!(b.apply_remote(&coll_b, &first).unwrap());
+        assert!(b.apply_remote(&coll_b, &second).unwrap());
+        changes_until(&b, &mut on_b, &["a2"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_from_another_member_is_refused_where_this_member_collected_past_it() {
+        let collect = |engine: &Engine| {
+            engine
+                .collect_garbage_at(
+                    crate::physical_now_ms() + 1_000_000_000,
+                    crate::RetentionPolicy::new(0, 24 * 60 * 60),
+                )
+                .unwrap();
+        };
+        let (a, coll_a, _da) = setup();
+        let (b, coll_b, _db) = setup();
+
+        // A has taken B's first write, so a stream opened on A claims it.
+        b.insert(&coll_b, doc! { "_id": "b1" }).unwrap();
+        let b1 = b.read_arrival_from(0, 100).unwrap().pop().unwrap();
+        a.apply_remote(&coll_a, &b1).unwrap();
+        let mut on_a = a.watch(WatchScope::Collection(coll_a.id), WatchOptions::default()).unwrap();
+        a.insert(&coll_a, doc! { "_id": "a1" }).unwrap();
+        let (_, token) = next_change(&a, &mut on_a).await;
+
+        // B collects exactly what the token claims of it: b1, and its
+        // collection's creation below it. The client has all of that.
+        b.insert(&coll_b, doc! { "_id": "b2" }).unwrap();
+        collect(&b);
+        let mut on_b = b
+            .watch(
+                WatchScope::Collection(coll_b.id),
+                WatchOptions { resume_after: Some(token.clone()), ..Default::default() },
+            )
+            .expect("nothing the client lacks has been collected");
+        assert_eq!(ids(&changes_until(&b, &mut on_b, &["b2"]).await), vec!["b2"]);
+        drop(on_b);
+
+        // One more write, and B collects b2, which the client was never sent.
+        b.insert(&coll_b, doc! { "_id": "b3" }).unwrap();
+        collect(&b);
+        let refused = b.watch(
+            WatchScope::Collection(coll_b.id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(
+            matches!(
+                refused.err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "b2 is gone from B, and the client was never sent it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewind_leaves_the_issuing_members_order_as_its_streams_saw_it() {
+        // A replicated write stamped below the token's entry but taken in after
+        // it. A rewind that keeps both must not reorder them, or the issuing
+        // member resumes past it after its next start.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let token = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            let mut stream =
+                engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+            engine.insert(&coll, doc! { "_id": "t" }).unwrap();
+            let (t, token) = next_change(&engine, &mut stream).await;
+            drop(stream);
+            engine
+                .apply_remote(&coll, &remote_entry(&coll, "late", t.stamp.hlc.wall_ms - 1))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+            engine.rewind_to(t.stamp.hlc).unwrap();
+            token
+        };
+
+        let engine = Engine::open(&path).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token's entry survived the rewind");
+        assert_eq!(ids(&changes_until(&engine, &mut stream, &["late"]).await), vec!["late"]);
+    }
+
+    #[tokio::test]
+    async fn a_hole_a_rewind_leaves_in_the_arrival_index_is_read_across_once() {
+        // The mirror order of the rebuild test above: after the token's entry,
+        // a local write stamped after it, then a replicated one stamped before
+        // it. The rewind discards the first and keeps the second, leaving a
+        // hole in the arrival positions between the token's entry and the
+        // replicated one.
+        let (engine, coll, _dir) = setup();
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "t" }).unwrap();
+        let (t, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+        engine.apply_remote(&coll, &remote_entry(&coll, "late", t.stamp.hlc.wall_ms - 1)).unwrap();
+        engine.rewind_to(t.stamp.hlc).unwrap();
+        engine.insert(&coll, doc! { "_id": "marker" }).unwrap();
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token's entry survived the rewind");
+        let mut delivered = ids(&changes_until(&engine, &mut stream, &["after"]).await);
+        // One write more, taken only once everything above is delivered: a read
+        // put back inside the last one delivers its tail again before this.
+        engine.insert(&coll, doc! { "_id": "final" }).unwrap();
+        delivered.extend(ids(&changes_until(&engine, &mut stream, &["final"]).await));
+        assert_eq!(
+            delivered,
+            vec!["late", "marker", "after", "final"],
+            "each entry after the token once, across the hole"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewound_entry_a_peer_sends_back_stays_refused() {
+        let (engine, coll, _dir) = setup();
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+        next_change(&engine, &mut stream).await;
+        let until = newest_stamp(&engine).hlc;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+        let (undone, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+        engine.rewind_to(until).unwrap();
+
+        // A peer that still holds it sends it back. The rewind left a tombstone
+        // stamped after it, so it loses and is never held here again: the token
+        // naming it still describes history this member does not have.
+        assert!(!engine.apply_remote(&coll, &undone).unwrap(), "the rewind's tombstone wins");
+        let refused = engine.watch(
+            WatchScope::Collection(coll.id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(matches!(
+            refused.err(),
+            Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_token_from_another_member_resumes_on_a_recreated_collection_by_the_drops_stamp() {
+        let (engine, coll, _dir) = setup();
+        let elsewhere = engine.create_collection("app", "elsewhere").unwrap();
+        let before_the_drop = newest_stamp(&engine).hlc.wall_ms;
+        // Arrived before the drop, above anything the issuing member had sent:
+        // a write to another collection, which puts this member's start below
+        // the drop, and a third member's write to the old incarnation.
+        engine.apply_remote(&elsewhere, &remote_entry(&elsewhere, "y", before_the_drop)).unwrap();
+        engine.apply_remote(&coll, &remote_entry(&coll, "old", before_the_drop)).unwrap();
+        engine.drop_collection("app", "docs").unwrap();
+        let dropped_at = newest_stamp(&engine);
+        let coll = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&coll, doc! { "_id": "n1" }).unwrap();
+
+        // The issuing member had sent everything of this member's through the
+        // drop.
+        let mut delivered = VersionVector::new();
+        delivered.insert(dropped_at.node, dropped_at.hlc);
+        let token = ResumeToken::issued(dropped_at, NodeId::generate(), delivered);
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("a token from this incarnation resumes");
+        assert_eq!(
+            ids(&changes_until(&engine, &mut stream, &["n1"]).await),
+            vec!["n1"],
+            "nothing from the dropped incarnation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seeded_retention_record_does_not_refuse_a_token_covering_a_quiet_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (quiet, newest) = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            // An origin that wrote once and went quiet.
+            let quiet = remote_entry(&coll, "quiet", newest_stamp(&engine).hlc.wall_ms);
+            engine.apply_remote(&coll, &quiet).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            engine.insert(&coll, doc! { "_id": "b1" }).unwrap();
+            engine.insert(&coll, doc! { "_id": "b2" }).unwrap();
+            engine
+                .collect_garbage_at(
+                    crate::physical_now_ms() + 1_000_000_000,
+                    crate::RetentionPolicy::new(0, 24 * 60 * 60),
+                )
+                .unwrap();
+            let newest = newest_stamp(&engine);
+            // What an earlier build left behind: the horizon, no record. The
+            // next start seeds every origin, the quiet one included, with it.
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::OPLOG_COLLECTED).unwrap().retain(|_, _| false).unwrap();
+            txn.commit().unwrap();
+            (quiet, newest)
+        };
+        let engine = Engine::open(&path).unwrap();
+        assert!(
+            engine.oplog_collected().unwrap().get(quiet.stamp.node) > quiet.stamp.hlc,
+            "the fixture must seed the quiet origin above its only write"
+        );
+
+        // A token whose vector holds everything the quiet origin ever wrote,
+        // and everything of this member's.
+        let mut delivered = VersionVector::new();
+        delivered.insert(quiet.stamp.node, quiet.stamp.hlc);
+        delivered.insert(newest.node, newest.hlc);
+        let token = ResumeToken::issued(newest, NodeId::generate(), delivered);
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("nothing the client lacks was collected");
+    }
+
+    #[tokio::test]
+    async fn a_token_this_member_issued_is_refused_once_its_entry_is_collected() {
+        let (engine, coll, _dir) = setup();
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "e1" }).unwrap();
+        let (_, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+        engine.insert(&coll, doc! { "_id": "e2" }).unwrap();
+        engine.insert(&coll, doc! { "_id": "e3" }).unwrap();
+        engine
+            .collect_garbage_at(
+                crate::physical_now_ms() + 1_000_000_000,
+                crate::RetentionPolicy::new(0, 24 * 60 * 60),
+            )
+            .unwrap();
+
+        let refused = engine.watch(
+            WatchScope::Collection(coll.id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(
+            matches!(
+                refused.err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "e2 was collected before the client was sent it"
+        );
     }
 }

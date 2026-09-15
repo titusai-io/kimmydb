@@ -262,7 +262,9 @@ last event the client already acknowledged.
 
 ### Expired tokens
 
-A token older than the oldest retained oplog entry gets **410 Gone**:
+A token older than the oldest retained oplog entry gets **410 Gone** — as does a
+token from another member whose delivered vector is below what this member's
+retention has collected, and one naming an entry a rewind discarded:
 
 ```json
 { "error": "resume_token_expired",
@@ -276,6 +278,54 @@ since — and is accepted.
 The check happens **before** the WebSocket upgrade, so the client gets a real
 HTTP status rather than an unexplained socket close after a successful
 handshake. Authorization happens before the upgrade for the same reason.
+
+---
+
+## Resuming on another member
+
+A stream follows its member's **arrival order**, and every member orders the
+same writes differently: a write reaches each member at its own moment, a write
+that loses to a newer one is never appended where it lost, and a member built
+from a snapshot holds each document as it is now rather than the writes that
+made it. So a position in one member's order means nothing on another.
+
+A token therefore carries two things ([ADR-173](decisions.md)):
+
+- the **last delivered entry**, a position in the issuing member's own order;
+  and
+- that member's **delivered vector**: per origin, a stamp at or below which its
+  stream had taken every entry the member holds.
+
+| Resumed on | Starts | Guarantee |
+|---|---|---|
+| The member that issued the token | Just after the token's entry | **Exact**: every event the stream had not sent, once each |
+| Any other member | At its first entry above the vector | **At-least-once**: every event the stream had not sent, and possibly some it had |
+
+**What can repeat, precisely.** The vector moves only once the stream has
+handed over everything up to the end of the arrival index as one read found it.
+The events it sent after that read — at most one read, up to 1,024 events, or
+one live wake-up's worth — are above the vector, so another member may deliver
+them again, the token's own event included. A stream that has not caught up
+since it opened claims only what it opened with (nothing, for `from_start`), so
+its repeats reach back to there. Everything at or below the vector is passed
+over for the life of the resumed stream, including writes that reach the member
+later.
+
+**The one case it cannot see.** A divergence repair appends entries the member's
+witnessed vector already claimed ([ADR-148](decisions.md)), and a token issued
+after that claim passes over them wherever it resumes. A repair follows a
+divergence the check has already reported (`kimmy_sync_divergent_collections`).
+
+**Tokens from before 0.30.0** name only an entry. They are accepted through
+0.30.x: as before where the member holds the entry, and where it does not, from
+the first entry stamped after it rather than at the tail. A 0.29 member refuses
+a 0.30 token as malformed (`400`), so a client that fails over during a roll to
+a member not yet upgraded is refused until the roll is done.
+
+Verified by the cluster harness: a stream cut mid-flow on one member under
+concurrent writers, with the members paused in turn so their arrival orders
+differ, delivers every missed id when resumed on another member and exactly the
+missed ids when resumed on the one that issued the token.
 
 ---
 
@@ -305,8 +355,10 @@ remote entry keeps its *originating* stamp, so it lands in the oplog behind the
 local tail, and a subscriber past that point would never have seen it. Streams
 now follow a second ordering over local arrival sequence (`oplog_arrival`) while
 the oplog stays keyed by origin stamp for conflict resolution and anti-entropy.
-Resume tokens are unchanged — they are translated to an arrival position at
-watch time. [ADR-030](decisions.md), and [Oplog](oplog.md) for the mechanism.
+A resume token is translated to an arrival position at watch time on the member
+that issued it, and resumed from its delivered vector on any other — see
+[Resuming on another member](#resuming-on-another-member).
+[ADR-030](decisions.md), and [Oplog](oplog.md) for the mechanism.
 
 **Collection DDL is filtered out.** Create and drop append `kind = Collection`
 entries with no document. The WebSocket layer drops them rather than emitting

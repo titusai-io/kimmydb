@@ -2474,6 +2474,55 @@ mod tests {
         assert!(detail.ids.contains(&DocId::String("remote".into())));
     }
 
+    #[tokio::test]
+    async fn a_violation_is_delivered_to_a_stream_resumed_from_another_members_token() {
+        // Each member reports a merge's violation under its own stamp, and
+        // peers never serve one another's. So a token's vector can cover this
+        // member's report without the issuing member having held it, and
+        // passing over what the vector covers must not pass over it (ADR-173).
+        use crate::watch::{ChangeEvent, WatchOptions, WatchScope};
+
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+        // Something the issuing member had not sent, so the stream starts
+        // before the merge.
+        let unsent =
+            remote_insert(&coll, "unsent", doc! { "_id": "unsent", "email": "u@x" }, 8_000);
+        engine.apply_remote(&coll, &unsent).unwrap();
+        let merged =
+            remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
+        engine.apply_remote(&coll, &merged).unwrap();
+
+        let mut delivered = engine.witnessed_vector().unwrap();
+        delivered.insert(unsent.stamp.node, kimmy_core::Hlc::ZERO);
+        let token = kimmy_core::ResumeToken::issued(
+            merged.stamp,
+            kimmy_core::NodeId::generate(),
+            delivered,
+        );
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .unwrap();
+
+        let mut kinds = Vec::new();
+        while !kinds.contains(&OpKind::UniqueViolation) {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+                    .await
+                    .unwrap_or_else(|_| panic!("no violation delivered; delivered {kinds:?}"))
+                    .expect("stream ended early");
+            if let ChangeEvent::Change { entry, .. } = event {
+                kinds.push(entry.kind);
+            }
+        }
+        assert!(!kinds.is_empty());
+    }
+
     #[test]
     fn a_clean_merge_logs_no_violation_entry() {
         let (engine, _dir) = indexed_engine();

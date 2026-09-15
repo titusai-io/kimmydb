@@ -2628,9 +2628,12 @@ paths:
         A WebSocket upgrade. Once open, the server sends one JSON text frame
         per change; the client sends nothing but may close.
 
-        **Resume tokens are portable across nodes.** A token taken from one
-        node resumes correctly on any other, which is what lets a client fail
-        over mid-stream.
+        **A resume token resumes on any node.** On the node that issued it the
+        resume is exact. On any other node it delivers every event the stream
+        had not sent and may repeat events sent before the token
+        (at-least-once): up to one read once the stream had caught up, and
+        everything since it opened before then. That is what lets a client
+        fail over mid-stream. See ADR-173.
 
         Authorization happens *before* the upgrade, and so does opening the
         stream — an expired resume token is a `410` rather than an

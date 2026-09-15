@@ -183,6 +183,16 @@ The `/v1` promise holds *through* every one of these: "breaking" here means
 things the protocol contract does not cover — operator surface, packaging,
 the cluster wire.
 
+**A resume token's format is a client contract, and changes only in a
+`0.MINOR`.** A token is opaque, but clients store it across restarts and hand
+it to whichever node answers, so a new format breaks anything holding the old
+one. It ships in a `0.MINOR` release, and the previous format stays accepted
+for that whole minor release line; a later minor may refuse it, with a release
+note. An older node does not understand a newer token and refuses it as
+`400 bad_request`, so resuming on a node not yet upgraded fails until a roll
+completes. The single-stamp token 0.30.0 replaced is the first case
+([ADR-173](decisions.md)).
+
 **One version, two binaries.** `[workspace.package] version` in the root
 `Cargo.toml` is the single source of truth. `kimmyd` and `kimmy` are always
 released together, carry the same number, and a test pins that neither can
