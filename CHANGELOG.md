@@ -12,6 +12,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **A recreated collection can be watched after its drop's oplog entry is
+  collected.** A collection watch — the tail as well as `from_start` — on a
+  collection recreated under a dropped name answered `410
+  resume_token_expired` whenever the drop's tombstone outlived the drop's oplog
+  entry, and kept doing so until the tombstone was collected. Latent since the
+  incarnation clamp shipped; exposed by a retention deviation, and hit by any
+  operator running `tombstone_retention_secs` above `oplog_retention_secs`, and
+  by a member holding a peer's tombstone from a snapshot. An open without a
+  token now always succeeds, `from_start` beginning at the first retained entry
+  stamped after the drop; a resume token from before the drop is still `410`.
+  Found in round 0330.
+
 ### Documented
 
 - **`docs/operations.md` states what a backup costs in memory.** The walk reads
