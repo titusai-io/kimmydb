@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.28.1 - 2026-09-15
 
 ### Fixed
 
@@ -69,6 +69,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   a collection drop removes everything in one transaction.** A collection drop
   has purged in chunks since ADR-158, each chunk its own hold; the description
   now matches `operations.md`.
+- **`docs/compatibility.md` says a member-at-a-time roll is not evidence that
+  mixed versions work together.** The 0.28.0 roll took about 10 s with the
+  cluster mixed for 6.8 s, and no sync round crossed versions in that window. A
+  release that changes the cluster wire names a deliberate mixed-version test in
+  its plan; otherwise the evidence is the version-boundary tests beside the
+  protocol, not the roll.
+
+### Dependencies
+
+Versions are as `Cargo.lock` resolves them.
+
+- **`rustls` 0.23.43 → 0.23.45, for RUSTSEC-2026-0285.** The advisory says
+  rustls accepted TLS 1.3 handshake messages sent at the wrong encryption
+  level. rustls carries both the server's TLS listener and every outbound TLS
+  connection (peer sync, embedding providers, the client and CLI), so every
+  member should take this release. Nothing about configuration or behaviour on
+  a correct handshake changes.
+- Patch updates: `rustls-webpki` 0.103.13 → 0.103.15 (with rustls), `chacha20`
+  0.10.1 → 0.10.2 (replaces a yanked version, via `foca`).
 
 ## 0.28.0 - 2026-09-14
 
@@ -294,7 +313,7 @@ Versions are as `Cargo.lock` resolves them.
   the name is untouched either way.
 
 - **A collection you dropped no longer survives on a member that catches up
-  from far behind.** 0.26.1's release notes recorded one route as not closed:
+  from far behind.** 0.27.0's release notes recorded one route as not closed:
   a whole-database snapshot — what a member below a peer's retention horizon
   pulls — carried no collection drops, so a member that took one kept a
   collection the sender had deleted, live and writable, with nothing reporting
@@ -369,6 +388,8 @@ Versions are as `Cargo.lock` resolves them.
   full rebuild, and this is a cost of the same kind. See ADR-161.
 
 ## 0.27.0 - 2026-09-09
+
+0.26.1 was never tagged; 0.27.0 shipped its content the same day, folded in below.
 
 ### Added
 
@@ -478,10 +499,6 @@ Versions are as `Cargo.lock` resolves them.
   contact rather than per pull, so "sixty rounds" is still the five minutes
   its constant is argued in. No new `/metrics` series, nothing on the wire,
   and nothing to decide before upgrading.
-
-## 0.26.1 - 2026-09-09
-
-### Changed
 
 - **A release ships Linux archives only, and the Homebrew tap stops
   updating.** `aarch64-apple-darwin` is paused, so a tag attaches no macOS

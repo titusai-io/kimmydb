@@ -151,6 +151,16 @@ property being bought, and it is why this one does not join the
 stop-the-cluster list. Finish inside `storage.oplog_retention_secs` — see
 [Operations](operations.md).
 
+**A member-at-a-time roll is not evidence that mixed versions work together.**
+The 0.28.0 roll took about 10 s from first member to last, the cluster was
+mixed for 6.8 s of it, and no sync round crossed versions in that window, so a
+roll that goes cleanly has exercised nothing across the boundary. A release
+that changes the cluster wire therefore names a deliberate mixed-version test
+in its plan, one that keeps members on both builds long enough for rounds,
+snapshots and probes to cross. Otherwise the evidence is the version-boundary
+tests beside the protocol, which decode each added field as an older receiver
+and as an older sender would, and not the roll.
+
 ---
 
 ## Release versioning — what the build number promises
