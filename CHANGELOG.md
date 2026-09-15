@@ -66,6 +66,46 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     renames it into place only once it is complete and synced. A failed download
     leaves an existing file exactly as it was.
 
+### Fixed
+
+- **One write on a quiet member no longer makes every peer re-read the oplog
+  above that member's previous write.** A pull asks from one position for every
+  origin, the peer's own position on whichever origin it trails most, and the
+  window read from it carried every other origin's entries above that position,
+  which the puller already held. So one document written on a member whose
+  previous local write was an hour old cost each peer a run of back-to-back
+  pulls that applied nothing. It was measured on a three-member cluster at 306
+  pulls and up to about 313,000 entries per peer in 67 s, and on 0.28.1 at 282
+  pulls in 56 s. Every version roll triggered it once per member, because a member
+  rewrites its topology record when its build changes. A window now passes over
+  every entry the puller's witnessed vector already covers for that entry's
+  origin, judged on the vector the puller already sends with its request. In the
+  harness test (a debug build, one run; not yet re-measured on a cluster), the
+  same write is one pull. The skipped entries are judged on their keys and never
+  decoded, and the walk runs off the async worker.
+  [ADR-171](docs/decisions.md) has the reasoning and why nothing a puller lacks
+  can be skipped.
+
+  **One residual this leaves.** It applies to a member with a hole on an origin
+  (its witnessed vector covers an entry its oplog does not hold in position)
+  that a scoped repair then fills, so the member holds that entry as state.
+  That entry used to be re-served and released whenever another origin held the
+  member's threshold low, which every roll does. It now stays held until the
+  origin writes again or retention collects the entry. Until then the member's
+  advertised position may not cover the entry. A peer that already holds it sees
+  nothing. A peer that also lacks it and pulls it from that member counts it
+  under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`, and takes
+  it from another member instead.
+  ADR-171 says why re-serving it by lowering the vector was not done.
+
+  **Nothing to decide before upgrading, and no ordering in the roll.** Nothing on
+  the wire changes: the vector was already sent. A member serves the shorter
+  window from the moment it runs this release, whatever build pulls from it. A
+  member still on the previous build serves the old window, so the roll itself
+  can still show the drain against members not yet rolled. No new `/metrics`
+  series. The `merged from peer` line reads the same, with fewer `pulls` and no
+  run of `applied 0`.
+
 ## 0.28.1 - 2026-09-15
 
 ### Fixed

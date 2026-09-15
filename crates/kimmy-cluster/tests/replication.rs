@@ -1177,6 +1177,53 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
     }
 }
 
+/// What the requester logs when a peer answers `BeyondHorizon` and the round
+/// falls back to a snapshot.
+const SNAPSHOT_FALLBACK: &str = "falling back to a snapshot";
+
+/// `round`'s result, and every event message logged while it ran, from its
+/// own task.
+///
+/// The cluster wire is TLS under the cluster secret, so a test cannot watch
+/// which messages a round sent. The requester's own log line is what says it
+/// asked for a snapshot.
+async fn logged_during<T>(round: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+    use tracing::instrument::WithSubscriber;
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = round.with_subscriber(Recorder(Arc::clone(&lines))).await;
+    let lines = lines.lock().unwrap().clone();
+    (out, lines)
+}
+
+/// A subscriber that keeps each event's message and nothing else.
+struct Recorder(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[tokio::test]
 async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
     // The second finding. The first peer to pull from a restarted member was
@@ -1198,19 +1245,167 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
         "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
     );
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
-    // An incremental round re-serves the tail B already holds and reports it
-    // superseded; a snapshot reports only what it applied. That is the tell.
+    // The round itself says which way it was served. This used to be read off
+    // a re-served tail reported superseded; since ADR-171 an oplog round and a
+    // snapshot of this store both apply one document and supersede nothing.
+    // What differs is that the requester logs its fallback when the peer
+    // answers `BeyondHorizon`, and asks for a snapshot next.
+    let (outcome, logged) = logged_during(sync_once(&b.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
     assert!(
-        outcome.superseded > 0,
-        "the round must be served from the oplog, not a snapshot: {outcome:?}"
+        !logged.iter().any(|line| line.contains(SNAPSHOT_FALLBACK)),
+        "the round must be served from the oplog, not a snapshot: {logged:?}"
     );
     assert_eq!(outcome.applied, 1, "{outcome:?}");
+    assert_eq!(outcome.superseded, 0, "and nothing B holds is served again: {outcome:?}");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(b.engine.get(&cb, &DocId::String("a-after-restart".into())).unwrap().is_some());
 
     let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "and B is then caught up: {second:?}");
+}
+
+// -----------------------------------------------------------------------
+// A caught-up member is not re-served what it holds (ADR-171)
+
+/// Pull into `into` from `from` until a pull reaches the peer's tail, the way
+/// one tick's contact drains a peer (ADR-157). Each pull's outcome, in order.
+async fn drain(into: &Node, from: &Node) -> Vec<kimmy_storage::SyncOutcome> {
+    let mut pulls = Vec::new();
+    loop {
+        let outcome = sync_once(&into.engine, from.addr, SECRET, None).await.expect("pull");
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated {
+            return pulls;
+        }
+        assert!(pulls.len() < 1_000, "a drain that does not end");
+    }
+}
+
+/// Entries a busy member writes after a quiet member's last write: more than
+/// four full windows, so a peer re-served them needs at least five pulls.
+const BUSY: usize = 4 * kimmy_cluster::protocol::MAX_BATCH + 100;
+
+fn busy_documents(prefix: &str) -> Vec<bson::Document> {
+    (0..BUSY).map(|i| doc! { "_id": format!("{prefix}-{i}") }).collect()
+}
+
+/// Three converged members: B wrote once and then went quiet, and A then wrote
+/// [`BUSY`] entries that B and C both hold. C's position on B is B's quiet
+/// write, below every one of A's.
+async fn a_quiet_member_among_caught_up_peers() -> (Node, Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-first" }).unwrap();
+    converge(&a, &b, &c).await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-quiet" }).unwrap();
+    converge(&a, &b, &c).await;
+
+    a.engine.insert_many(&ca, busy_documents("busy")).unwrap();
+    drain(&b, &a).await;
+    drain(&c, &a).await;
+    (a, b, c)
+}
+
+#[tokio::test]
+async fn one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer() {
+    // The finding: one document written on a member whose previous local write
+    // was forty minutes old made each peer re-read the oplog above that write,
+    // about 300 back-to-back pulls applying nothing. The threshold is the
+    // peer's position on the quiet member, and the range read from it carried
+    // every other origin's entries above it, which the peer already held.
+    let (a, b, c) = a_quiet_member_among_caught_up_peers().await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-after-quiet" }).unwrap();
+
+    let held = c.engine.witnessed_vector().unwrap();
+    let from = held.behind(&b.engine.version_vector().unwrap()).expect("C trails B by one write");
+    let above = b.engine.read_oplog_from(from, usize::MAX).unwrap().len();
+    assert!(above > BUSY, "the fixture must put A's writes above C's position on B: {above}");
+    assert!(held.get(a.engine.node_id()) > from, "and C must already hold them");
+
+    let started = std::time::Instant::now();
+    let pulls = drain(&c, &b).await;
+    let superseded: usize = pulls.iter().map(|p| p.superseded).sum();
+    eprintln!(
+        "one write after {above} entries: {} pulls, {} superseded, {:?}",
+        pulls.len(),
+        superseded,
+        started.elapsed()
+    );
+    assert_eq!(
+        pulls.len(),
+        1,
+        "one write is one pull, not a pass over the {above} entries C holds: {pulls:?}"
+    );
+    assert_eq!(pulls[0].applied, 1, "{:?}", pulls[0]);
+    assert_eq!(superseded, 0, "nothing C had processed is served to it again");
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert!(c.engine.get(&cc, &DocId::String("b-after-quiet".into())).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() {
+    // The guard on the other side: passing over what a peer has processed must
+    // be judged per origin. C has pulled one window of A's writes and has then
+    // written past all of them itself, so its vector's newest stamp is above
+    // everything of A's it still lacks. B serves C, and C must end holding all
+    // of A's writes.
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    converge(&a, &b, &c).await;
+    a.engine.insert_many(&ca, busy_documents("busy")).unwrap();
+    drain(&b, &a).await;
+    let first = sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(first.truncated, "C must stop partway through A: {first:?}");
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    c.engine.insert(&cc, doc! { "_id": "c-later" }).unwrap();
+    let held = c.engine.witnessed_vector().unwrap();
+    let c_own = held.get(c.engine.node_id());
+    let a_part = held.get(a.engine.node_id());
+    assert!(
+        c_own > a.engine.version_vector().unwrap().get(a.engine.node_id()) && a_part < c_own,
+        "the fixture must put C's newest stamp above everything of A's it lacks"
+    );
+
+    drain(&c, &b).await;
+    assert_eq!(
+        c.engine.count(&cc).unwrap(),
+        BUSY as u64 + 1,
+        "every write of A's C lacked arrives from B"
+    );
+    assert_eq!(
+        c.engine.witnessed_vector().unwrap().get(a.engine.node_id()),
+        b.engine.version_vector().unwrap().get(a.engine.node_id())
+    );
+}
+
+#[tokio::test]
+async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds() {
+    // The push of ADR-143 serves the window a pull from the member's position
+    // would. Before ADR-171 that window, read from C's position on B, was a
+    // full batch of A's writes C already held and stopped short of B's schema
+    // change, so the push named C unreached and left the change to
+    // anti-entropy.
+    let (_a, b, c) = a_quiet_member_among_caught_up_peers().await;
+    b.engine.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
+    // B's newest write of its own, read by its stamp: `newest` scans the first
+    // two batches of the oplog, and A's writes sit between them and this.
+    let b_id = b.engine.node_id();
+    let stamp = kimmy_core::Stamp::new(b.engine.version_vector().unwrap().get(b_id), b_id);
+    let entry = b.engine.oplog_entry(&stamp).unwrap().expect("B's schema change");
+    assert_eq!(entry.kind, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&b.engine, c.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(pushed.outcome.ddl, 1, "the change is applied at once: {pushed:?}");
+    assert_eq!(pushed.outcome.superseded, 0, "and nothing C holds is sent: {pushed:?}");
 }
 
 #[tokio::test]
@@ -1246,7 +1441,12 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
         "B lacks a collected write of A's, 36 hours behind: it is stale: {outcome:?}"
     );
 
-    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let (pulled, logged) = logged_during(sync_once(&b.engine, a.addr, SECRET, None)).await;
+    let pulled = pulled.unwrap();
+    assert!(
+        logged.iter().any(|line| line.contains(SNAPSHOT_FALLBACK)),
+        "served as a snapshot, and the recorder sees the line that says so: {logged:?}"
+    );
     assert_eq!(pulled.superseded, 0, "served as a snapshot, not from the oplog: {pulled:?}");
     for id in ["a-missed", "a-after"] {
         assert!(

@@ -812,6 +812,42 @@ The four readings:
   applied, and a peer draining a backlog emits it every tick with a large
   `pulls` and a large `applied`.
 
+**A caught-up member can be re-served entries it already holds, and the log
+shows it as pulls that apply nothing.** A pull asks from one position for every
+origin: this node's position on whichever origin it trails the peer on most.
+When a member writes after a long quiet spell, that position is its previous
+write, and the peer's oplog above it holds everything every *other* member wrote
+since. Before [ADR-171](decisions.md), all of it was served again. The shape on
+each peer of the member that wrote is a `merged from peer` line naming that
+member every tick, with `pulls` near the tick's budget and `applied 0`, for as
+long as the re-read takes. It ends with one line applying the write. Measured on
+a three-member cluster: 306 pulls and up to about 313,000 entries per peer (the
+pulls times the 1,024-entry cap), over 67 s, for one document. A version roll produced it once per member, because a member
+rewrites its topology record when its build changes, and a plain restart did
+not. Nothing was applied twice, nothing reached a change stream twice, and
+repair and failure counters stayed at 0; the cost was reading and decoding.
+
+Since ADR-171 a window passes over every entry the puller's witnessed vector
+already covers for that entry's origin. In the project's harness test the same
+write is one pull applying one entry; that is a debug build and one run, not yet
+re-measured on a cluster. What you can still see is a member serving from a
+build before ADR-171, during a roll.
+
+On this release, a run of `applied 0` pulls against a peer is not the re-serve.
+It is one of three other things:
+- **A repair replay** ([ADR-148](decisions.md)). It sends no vector and is
+  re-served its whole range on purpose; `kimmy_sync_repair_rounds_total` rises
+  with it.
+- **A backlog** this member trails the peer on.
+- **Entries above the vector the peer advertised**
+  (`kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`).
+
+That last includes an entry a member holds as state after a scoped repair
+filled a hole. Only a peer that also lacks the entry and pulls it from that
+member sees it. ADR-171 describes the residual: the entry is deferred there
+until its origin writes again, retention collects it, or the peer takes it from
+another member.
+
 **Why the check does not simply run anyway on a truncated round.** Because a
 truncated pull manufactures the finding. The existence half reports only "the
 peer holds it and I do not", and on a round that did not reach the peer's

@@ -3557,6 +3557,98 @@ fn oplog_len(state: &kimmy_api::SharedState) -> usize {
     state.engine.read_oplog_from(kimmy_core::Hlc::ZERO, 10_000).expect("reading the oplog").len()
 }
 
+/// One contact's drain of `from` into `to`, in the shape the sync transport
+/// gives it: asked from `to`'s witnessed position with that vector sent along,
+/// window after window until one reaches the peer's tail (ADR-157, ADR-171).
+/// Each pull's outcome, in order.
+fn drain_between(from: &Server, to: &Server) -> Vec<kimmy_storage::SyncOutcome> {
+    let mut pulls = Vec::new();
+    loop {
+        let held = to.state.engine.witnessed_vector().unwrap();
+        let theirs = from.state.engine.version_vector().unwrap();
+        let Some(start) = held.behind(&theirs) else { return pulls };
+        let window = from.state.engine.entries_for_peer_holding(start, 1024, Some(&held)).unwrap();
+        let outcome = to
+            .state
+            .engine
+            .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        pulls.push(outcome);
+        if window.exhausted {
+            return pulls;
+        }
+        assert!(pulls.len() < 1_000, "a drain that does not end");
+    }
+}
+
+/// Every member drains every other, twice over.
+fn converge_members(members: &[Server]) {
+    for _ in 0..2 {
+        for from in members {
+            for to in members {
+                if !std::ptr::eq(from, to) {
+                    drain_between(from, to);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_version_roll_re_registers_every_member_without_re_serving_what_its_peers_hold() {
+    // The roll-shaped half of ADR-171. A member rewrites its topology record
+    // at start-up when its build version changed, so a roll makes every member
+    // write once — most of them for the first time since the previous roll.
+    // Each peer's position on such a member is that old record, and before
+    // ADR-171 a pull asked from it re-read everything every other member had
+    // written since: a run of pulls applying nothing, once per member per
+    // peer, on a cluster whose members had all just restarted.
+    let members = [Server::start().await, Server::start().await, Server::start().await];
+    for (i, member) in members.iter().enumerate() {
+        let state = &member.state;
+        kimmy_api::topology::register(state, &format!("http://10.1.1.{}:7878", i + 1)).unwrap();
+        // As the previous build registered it: the version is what differs.
+        let nodes = state
+            .engine
+            .get_collection(kimmy_api::topology::NODES_DB, kimmy_api::topology::NODES_COLLECTION)
+            .unwrap();
+        let id = kimmy_core::DocId::String(state.engine.node_id().to_string());
+        let mut record = state.engine.get(&nodes, &id).unwrap().expect("registered");
+        record.insert("version", "0.0.0-previous");
+        state.engine.replace(&nodes, &id, record, true).unwrap();
+    }
+    converge_members(&members);
+
+    // Clients write through one member between the rolls.
+    let busy = &members[0].state.engine;
+    let orders = busy.create_collection("shop", "orders").unwrap();
+    let documents: Vec<bson::Document> =
+        (0..4 * 1024 + 100).map(|i| bson::doc! { "_id": format!("order-{i}") }).collect();
+    busy.insert_many(&orders, documents).unwrap();
+    converge_members(&members);
+
+    for (i, member) in members.iter().enumerate() {
+        let before = oplog_len(&member.state);
+        kimmy_api::topology::register(&member.state, &format!("http://10.1.1.{}:7878", i + 1))
+            .unwrap();
+        assert!(oplog_len(&member.state) > before, "the roll must write the record again");
+    }
+
+    for from in &members {
+        for to in &members {
+            if std::ptr::eq(from, to) {
+                continue;
+            }
+            let pulls = drain_between(from, to);
+            assert!(
+                pulls.len() <= 1 && pulls.iter().all(|p| p.applied > 0 && p.superseded == 0),
+                "a re-registration is one pull that applies it, not a run applying nothing: \
+                 {pulls:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_registered_peer_is_reported_unknown_until_membership_sees_it() {
     // Address and liveness come from different places on purpose: the registry

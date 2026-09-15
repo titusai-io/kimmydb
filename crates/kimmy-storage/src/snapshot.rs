@@ -3883,6 +3883,128 @@ mod tests {
     }
 
     #[test]
+    fn a_held_document_above_the_requesters_position_is_still_served_and_released() {
+        // ADR-171 against ADR-169. A window served to a peer passes over what
+        // the peer's witnessed vector covers. A held snapshot document is not
+        // covered -- `Hold` raises neither vector -- so it sits above that
+        // vector, is served, and is released as ADR-169 says. The fixture is
+        // the busy sender: a whole-database grant is the first page's vector,
+        // so the sender's entry at the grant is passed over, and a document
+        // written behind the cursor sits above it, held.
+        let (a, _da) = sender_of_two_pages();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        let (b, _db) = engine();
+        let mut progress = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
+        a.insert(&ca, doc! { "_id": 99_999 }).unwrap();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert!(b.held_len().unwrap() > 0, "the fixture must hold a document above the grant");
+
+        let held = b.witnessed_vector().unwrap();
+        let from = held.behind(&a.version_vector().unwrap()).expect("B trails A by the late write");
+        let whole = a.entries_for_peer(from, usize::MAX).unwrap();
+        let window = a.entries_for_peer_holding(from, usize::MAX, Some(&held)).unwrap();
+        assert!(
+            window.entries.len() < whole.entries.len(),
+            "the fixture must make the skip pass over something: {} of {}",
+            window.entries.len(),
+            whole.entries.len()
+        );
+        assert!(window.exhausted);
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
+
+        assert_eq!(b.held_len().unwrap(), 0, "the held document was served and released");
+        assert!(b.get(&ca, &DocId::Int64(99_999)).unwrap().is_some());
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            a.version_vector().unwrap().get(a.node_id())
+        );
+    }
+
+    #[test]
+    fn a_held_entry_at_or_below_the_members_witnessed_position_is_not_re_served() {
+        // ADR-171's residual against ADR-169, pinned as it stands. R has a hole
+        // on A's origin: its witnessed vector covers S, A's last write, and S is
+        // not in R's oplog. A scoped repair brings S under `Hold`: a mark, and
+        // neither vector raised, so R advertises A's origin below S and a peer
+        // pulling from R defers S (ADR-167's residual). A second origin, B, then
+        // holds R's threshold below S: the quiet-origin shape a roll produces.
+        //
+        // Before ADR-171 that window re-served S and ADR-169 released the mark.
+        // Now S is covered by R's witnessed vector and is passed over, so the
+        // mark stays until A writes again or retention collects S. The last
+        // half shows the unskipped window still releasing it, so a fix for the
+        // residual flips the middle, not the fixture.
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(3));
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (r, _dr) = engine();
+
+        let cb = b.create_collection("shop", "bees").unwrap();
+        b.insert(&cb, doc! { "_id": "b1" }).unwrap();
+        let from_b = b.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        a.apply_batch(&from_b.entries).unwrap();
+        r.apply_peer_batch(&b.version_vector().unwrap(), &from_b.entries, from_b.scanned_to, true)
+            .unwrap();
+        pause();
+
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a0" }).unwrap();
+        pause();
+        a.insert(&ca, doc! { "_id": "s" }).unwrap();
+        let s = a.version_vector().unwrap().get(a.node_id());
+        let is_s = |e: &OplogEntry| e.stamp.node == a.node_id() && e.stamp.hlc == s;
+
+        // R takes A's history with S missing from the window, and the window's
+        // exhaustion covers it anyway: the hole.
+        let history = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let holed: Vec<OplogEntry> = history.entries.iter().filter(|e| !is_s(e)).cloned().collect();
+        assert_eq!(holed.len() + 1, history.entries.len());
+        r.apply_peer_batch(&a.version_vector().unwrap(), &holed, history.scanned_to, true).unwrap();
+        let cr = r.get_collection("shop", "orders").unwrap();
+        assert!(r.get(&cr, &DocId::String("s".into())).unwrap().is_none());
+        assert!(r.witnessed_vector().unwrap().get(a.node_id()) >= s, "the hole: S is covered");
+
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            r.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert!(r.get(&cr, &DocId::String("s".into())).unwrap().is_some(), "the repair brought S");
+        assert_eq!(r.held_len().unwrap(), 1, "and holds it as state");
+        assert!(r.version_vector().unwrap().get(a.node_id()) < s, "R advertises A below S");
+
+        pause();
+        b.insert(&cb, doc! { "_id": "b2" }).unwrap();
+        a.apply_batch(&b.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap().entries).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let held = r.witnessed_vector().unwrap();
+        let from = held.behind(&theirs).expect("R trails A on B's origin");
+        assert!(from < s, "B's origin holds R's threshold below S");
+
+        let window = a.entries_for_peer_holding(from, usize::MAX, Some(&held)).unwrap();
+        assert!(!window.entries.iter().any(is_s), "S is passed over");
+        r.apply_peer_batch(&theirs, &window.entries, window.scanned_to, true).unwrap();
+        assert_eq!(r.held_len().unwrap(), 1, "the residual: the mark stays");
+        assert!(
+            r.version_vector().unwrap().get(a.node_id()) < s,
+            "and R still advertises A below S"
+        );
+
+        // The same window unskipped, as it was served before ADR-171.
+        let whole = a.entries_for_peer(from, usize::MAX).unwrap();
+        assert!(whole.entries.iter().any(is_s));
+        r.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, true).unwrap();
+        assert_eq!(r.held_len().unwrap(), 0, "arriving in a window releases it");
+        assert_eq!(r.version_vector().unwrap().get(a.node_id()), s);
+    }
+
+    #[test]
     fn an_entry_re_delivered_out_of_position_keeps_its_mark() {
         // The release is for an entry arriving as HISTORY. The same page pulled
         // again is still state, in key order, and must leave the marks and the
