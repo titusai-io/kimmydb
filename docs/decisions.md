@@ -1292,6 +1292,13 @@ hold the read transaction open for as long as the client took to read, pinning
 MVCC pages to a slow socket. Memory is the cheaper cost and is bounded by the
 database rather than by the caller.
 
+**Amended by [ADR-170]: the buffer is a file, not the heap.** The rule above
+stands — the transaction closes before the first byte is sent — but "memory is
+the cheaper cost" did not survive measurement: the buffer was held until the
+client had read the last byte, and took members to 87–97% of a 2 GiB limit. The
+backup is now written to an unlinked file in the data directory and streamed
+from it.
+
 **Backups include index entries**, though they are derivable from documents.
 Recomputing them on restore would make a restore's correctness depend on
 replaying index maintenance exactly — the part most likely to differ between
@@ -1330,6 +1337,7 @@ database silently missing whatever it held.
 [ADR-006]: #adr-006--hlc-with-node-id-tiebreak-whole-document-lww
 [ADR-036]: #adr-036--a-peer-past-the-retention-horizon-gets-state-not-history
 [ADR-003]: #adr-003--hand-rolled-binary-codec-for-hot-records
+[ADR-170]: #adr-170--a-backup-is-spilled-to-a-file-and-streamed-not-held-in-the-heap
 
 ---
 
@@ -15009,3 +15017,129 @@ nothing, so a live stream saw it once and a resumed stream replays it once.
   sit below a release of the same origin, in either window order);
 - `re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window`
   (the overturned test, rewritten, its caught-up half kept).
+
+---
+
+## ADR-170 — A backup is spilled to a file and streamed, not held in the heap
+
+**Context.** ADR-041 buffers a backup before sending it, so its read transaction
+closes before a slow client can pin redb's MVCC pages. The route built the whole
+backup in a `Vec` and handed the `Vec` to the response. Three things were wrong
+with what that cost.
+
+- **The buffer lived until the client finished reading, not until the walk
+  ended.** ADR-041 shortened the transaction and nothing else. A `Vec` grown by
+  doubling also briefly holds old and new capacity together, and the allocator
+  keeps a freed segment on its own schedule (ADR-117, ADR-147). Measured on a
+  three-member test cluster with a 2 GiB container limit per member:
+  - a backup of 807,848,429 bytes, taken in 15.1 s, took the member to
+    **1,789 MiB (87%)**;
+  - one of the same store in the previous round took it to **1,838 MiB (90%)**;
+  - an earlier round measured **97%**;
+  - on 4.29 GB stores, resident memory rose by about a gigabyte for the length
+    of the backup.
+
+  `operations.md`'s capacity table listed no backup among the contributors to
+  resident memory, and told operators to size a container from that gauge.
+- **Nothing bounded or described the time.** Three members with stores identical
+  to the byte, 4.29 GB each, took **91.7 s, 329.6 s and 1,903.0 s**. The most
+  plausible cause is page-cache warmth, the dependence the retention pass already
+  documents (ADR-151). A client with any ordinary timeout gave up on a healthy
+  server.
+- **The request deadline did not apply, by accident.** `enforce_timeout` fires
+  only while a handler is pending, and a handler that never yields is polled to
+  completion. The walk has run under `block_in_place` since ADR-153's completion,
+  which still never yields, so a thirty-minute backup answered `200` past a
+  thirty-second deadline. The route comment said it needed no exemption *because*
+  it was buffered.
+
+**Decision.**
+
+1. **The walk writes to an unlinked temporary file in the data directory, and the
+   response streams that file.** The file is created beside `kimmy.redb` under
+   a name no other file holds, with mode `0600`, and unlinked at once, before the
+   walk begins. It is written through a 64 KiB buffer under the walk's one read
+   transaction. The `tempfile` crate would do the same, but its Linux build
+   brings `linux-raw-sys` into the default dependency graph (ADR-016's
+   correction), which is not worth one call. It is then rewound and sent in
+   64 KiB reads, with `Content-Length` set from its size. ADR-041's invariant
+   holds exactly: the transaction ends with the walk, before the first byte is
+   sent. What a slow client pins is one backup of disk. The format and the bytes
+   on the wire are unchanged.
+2. **The walk runs on a blocking thread (`spawn_blocking`), not under
+   `block_in_place`.**
+   - ADR-153 chose `block_in_place` for read walks that take milliseconds to
+     seconds, where a thread hop is a real cost and a borrowed closure is
+     convenient.
+   - A backup takes minutes. For that long `block_in_place` turns an async worker
+     into a blocking one, and the hop costs nothing against it.
+   - A handler that awaits a blocking task is pending, so the deadline applies
+     for real, and registering the route outside it is load-bearing and testable,
+     not a property of a future that happens never to yield.
+3. **The route is registered with the change stream in `streaming_routes`,
+   outside the request deadline.** Otherwise decision 2 answers every real
+   backup `503 timeout` at 30 s. ADR-099 exempted nothing individually because
+   storage work never yielded; this is the one route where it now does.
+4. **A failed spill is a `500` to the client and an `ERROR` to the operator.**
+   The response stays the generic internal error every storage failure gets,
+   because paths and storage detail do not go to clients. The log line is
+   `event` `backup failed`, in ADR-144's layout, and its `message` names the
+   directory and keeps the operating system's error, typically `No space left on
+   device`. The file is unlinked, so a failure leaves no partial backup behind.
+5. **One series.** `kimmy_backup_duration_seconds` is a histogram with buckets
+   from 1 s to 3,600 s, recorded when the backup exists and before it is sent,
+   beside `kimmy_backups_total`, which is its count.
+   - Its buckets stay off the OTLP bridge, for the reason the other histograms'
+     do.
+   - Its sum is on the bridge as `kimmy.backup.duration_seconds`, and
+     `kimmy.backups` is its count there.
+   - The `served a backup` line gains `spill_bytes` and `elapsed_ms`.
+
+**Why the data directory and not a setting.** It is the volume an operator has
+already sized for the store, and the one a restore writes into. A backup needing
+free space equal to one backup beside the store is a sentence in the
+documentation, not a knob, and a knob set before a deployment needs the spill
+elsewhere would be set without evidence.
+
+**Consequences.**
+- Resident memory no longer tracks a backup's size; the heap holds one read
+  chunk.
+- The data directory needs one backup's worth of free space for the duration.
+  Running out is a `500` with an `ERROR` line; the database is untouched.
+- A backup has no deadline. The response headers arrive when the walk ends, which
+  on a cold cache can be half an hour. A client should use a read-idle timeout,
+  not a total one.
+- **The Rust client and the CLI still download with a 30 s total timeout and
+  buffer the body in memory**, so `kimmy backup` fails on a store whose walk
+  outlasts it. That is a separate change. **The .NET client, a separate
+  repository, carries the same 30 s risk** if it uses a total timeout for the
+  download, and its owner should check.
+
+**Alternatives.**
+- *Keep the `Vec` (ADR-041 as written).* The measured cost is the reason for
+  this ADR.
+- *Stream as produced through a bounded channel.* Holds the read transaction for
+  the whole transfer, which is exactly what ADR-041 refuses.
+- *Document the heap cost and change nothing.* Leaves a member one backup away
+  from its container limit.
+- *`block_in_place`, as ADR-153's walks use.* Keeps an async worker blocked for
+  the whole walk, and leaves the deadline exemption a contract no test can see.
+
+**Held by**
+- `a_spilled_backup_is_the_backup_from_its_first_byte`: the file is rewound, its
+  length is what the walk wrote, and it restores.
+- `a_spill_leaves_no_file_in_the_directory`: the file is unlinked while open.
+- `a_full_disk_names_the_directory_and_the_os_error` and
+  `a_directory_that_cannot_hold_the_file_is_named`: what the `ERROR` line
+  carries.
+- `a_backup_declares_its_length_and_restores`: `Content-Length` equals the body
+  over a real socket, and the body restores.
+- `a_backup_that_outlasts_the_request_deadline_still_answers`: a 1 ms deadline
+  and a store whose walk outlasts it.
+- The metrics golden text, the ordered-series test, the operations.md metrics
+  table test, and `every_metrics_series_reaches_the_bridge`, for the histogram.
+- **Not held by a test:** that the handler's heap does not track the backup's
+  size. No in-process signal distinguishes it: `kimmy_process_resident_bytes`
+  reads `/proc` and is the whole test process. It rests on review, since the
+  handler holds no buffer larger than one chunk, and on the next round's
+  measurement on a real store.
