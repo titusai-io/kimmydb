@@ -44,6 +44,18 @@ pub enum Error {
 
     #[error("change stream: {0}")]
     Stream(String),
+
+    /// A download's body went longer than the client's timeout without a
+    /// byte. Only the body is bounded this way; see `Client::download_to`.
+    #[error("{endpoint} sent nothing for {idle:?} in the middle of a download")]
+    Stalled { endpoint: String, idle: std::time::Duration },
+
+    /// Writing a download out failed on this side: the file, or the pipe.
+    #[error("writing a download: {source}")]
+    Io {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Error {

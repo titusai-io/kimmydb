@@ -399,6 +399,17 @@ impl TelemetryGuard {
             rate_limited_principal
         );
         observe!(u64_observable_counter, "kimmy.backups", "{backup}", "Backups served.", backups);
+        // `kimmy_backup_duration_seconds` is a histogram and its buckets stay
+        // on `/metrics`, as the other histograms' do (see `NOT_BRIDGED`); its
+        // sum is observable and is carried here, and `kimmy.backups` above is
+        // its count, so a collector has the mean (ADR-170).
+        observe!(
+            f64_observable_counter,
+            "kimmy.backup.duration_seconds",
+            "s",
+            "Seconds spent producing backups: the walk of the whole store and its spill to disk. Divide by kimmy.backups for the mean.",
+            |s| s.backup_duration_sum_us as f64 / 1e6
+        );
         observe!(
             u64_observable_counter,
             "kimmy.ttl.expired",
@@ -957,6 +968,14 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          the same change: it is recorded synchronously where a transaction takes \
          the writer (ADR-151). Its two summaries — the writes that gave up waiting, \
          and the longest hold — are observable and are on the bridge.",
+    ),
+    (
+        "kimmy_backup_duration_seconds",
+        "A histogram, and OpenTelemetry has no observable histogram, so its buckets \
+         stay on /metrics for the same reason as the two above. Its sum is bridged \
+         as kimmy.backup.duration_seconds and its count is kimmy.backups, so a \
+         collector still has how many backups ran and how long they took in total \
+         (ADR-170).",
     ),
 ];
 

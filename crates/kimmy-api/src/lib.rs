@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod audit;
+mod backup;
 pub mod dispatch;
 /// The address policy for outbound requests, shared with the embedding
 /// providers in `kimmy-vector` (ADR-115). Re-exported under the name the

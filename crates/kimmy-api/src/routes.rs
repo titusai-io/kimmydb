@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use opentelemetry_semantic_conventions::attribute as semconv;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{Instrument, warn};
+use tracing::{Instrument, error, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::ApiError;
@@ -106,22 +106,28 @@ fn routes(state: SharedState, limits: RequestLimits) -> Router {
         .with_state(state)
 }
 
-/// Routes whose response is a connection rather than a document, and which
-/// therefore carry no request deadline.
+/// Routes whose response is a connection or a stream rather than a document,
+/// and which therefore carry no request deadline.
 ///
-/// Only the change-stream upgrade today. `/mcp` is the other streaming
+/// The change-stream upgrade and the backup. `/mcp` is the other streaming
 /// surface, and it is exempt by being merged after the deadline is applied —
-/// see [`router_with_limits`]. Nothing else on this server long-polls or
-/// streams: `/v1/admin/backup` is buffered before it is sent, and every
-/// document route answers in one piece.
+/// see [`router_with_limits`]. Every other route answers in one piece.
 ///
-/// The exemption is the contract rather than a mechanism the upgrade needs
-/// today: axum hands the upgraded socket to a task of its own once the `101`
-/// is written, so the handler future the deadline wraps has already finished
-/// when the stream begins. Registering the route here is what keeps that true
-/// if the upgrade ever moves into the handler, and what a test can hold.
+/// For the upgrade, the exemption is the contract rather than a mechanism it
+/// needs today: axum hands the upgraded socket to a task of its own once the
+/// `101` is written, so the handler future the deadline wraps has already
+/// finished when the stream begins. Registering the route here is what keeps
+/// that true if the upgrade ever moves into the handler, and what a test can
+/// hold.
+///
+/// For the backup it is the mechanism. The walk runs on a blocking thread and
+/// the handler awaits it, so the handler is pending for as long as the store
+/// takes to walk — minutes, on a store of a few gigabytes — and the deadline
+/// would answer every real backup `503 timeout` at 30 s (ADR-170).
 fn streaming_routes() -> Router<SharedState> {
-    Router::new().route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
+    Router::new()
+        .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
+        .route("/v1/admin/backup", get(backup))
 }
 
 /// Every route that answers with a document, public and authenticated alike.
@@ -157,7 +163,6 @@ fn timed_routes() -> Router<SharedState> {
         // Authenticated, unlike /v1/version: a version is a fact about
         // software, this is a map of where a deployment's data lives.
         .route("/v1/topology", get(crate::topology::topology))
-        .route("/v1/admin/backup", get(backup))
         .route("/v1/auth/whoami", get(crate::users::whoami))
         .route("/v1/users", get(crate::users::list_users).post(crate::users::create_user))
         .route("/v1/users/{name}", get(crate::users::get_user).delete(crate::users::delete_user))
@@ -779,29 +784,77 @@ async fn refresh(
 /// consulted per collection here; there is no filtered backup, because a partial
 /// backup that looks like a whole one is a restore that silently loses data.
 ///
-/// Buffered rather than streamed as it is produced: the backup runs inside a
-/// read transaction, and holding that open across a slow client's socket would
-/// pin redb's MVCC pages for as long as the client cared to dawdle. Memory is
-/// the cheaper cost, and it is bounded by the database rather than by the
-/// caller.
+/// The backup's blocking task ended without an answer: it panicked, or the
+/// runtime is shutting down. Logged in full and answered generically, because
+/// a panic's text can name paths and internals, and those do not go to a
+/// client (ADR-170).
+fn backup_task_failed(e: tokio::task::JoinError) -> ApiError {
+    error!(event = "backup failed", message = %e);
+    ApiError::internal("the backup did not finish")
+}
+
+/// Spilled, then streamed (ADR-170, amending ADR-041). The walk runs inside one
+/// read transaction and writes to an unlinked temporary file beside the
+/// database; the transaction closes when the walk ends, before the first byte
+/// is sent, so a slow client pins neither redb's MVCC pages nor a backup's
+/// worth of heap. It pins one file's worth of disk until it finishes reading.
+///
+/// The walk runs on a blocking thread rather than under `block_in_place`: it
+/// is the one request measured in minutes, and a blocking thread keeps it off
+/// the runtime's workers for the whole of that. It is also why the route is
+/// registered in [`streaming_routes`], outside the request deadline.
 async fn backup(
     State(state): State<SharedState>,
     auth: Auth,
 ) -> Result<axum::response::Response, ApiError> {
+    use tokio::io::AsyncReadExt;
+
     auth.require(kimmy_auth::Action::Admin, "*", None)?;
 
-    let mut buf = Vec::new();
-    // The whole store, so a walk (ADR-153).
-    let info = kimmy_storage::blocking(|| state.engine.backup_to(&mut buf))?;
-    state.metrics.record_backup();
+    let engine = std::sync::Arc::clone(&state.engine);
+    let dir = crate::backup::spill_dir(&engine);
+    let spilled = tokio::task::spawn_blocking(move || crate::backup::spill(&engine, &dir))
+        .await
+        .map_err(backup_task_failed)?;
+    let spilled = match spilled {
+        Ok(spilled) => spilled,
+        Err(failure) => {
+            // The client is told only that the server failed: the path and
+            // the storage detail stay out of the response, as for every
+            // storage error. The operator gets both, here.
+            error!(
+                event = "backup failed",
+                dir = %failure.dir.display(),
+                message = %failure,
+                user = %auth.principal().user,
+            );
+            return Err(failure.error.into());
+        }
+    };
+
+    // Counted and logged once the backup exists, before it is sent: a client
+    // that disconnects part-way through was still served one.
+    state.metrics.record_backup(spilled.elapsed);
     warn!(
-        records = info.records,
-        bytes = info.bytes,
+        records = spilled.info.records,
+        bytes = spilled.info.bytes,
+        spill_bytes = spilled.len,
+        elapsed_ms = spilled.elapsed.as_millis() as u64,
         user = %auth.principal().user,
         "served a backup"
     );
 
-    let filename = format!("kimmy-{}-{}.backup", state.engine.node_id(), info.created_ms);
+    let filename = format!("kimmy-{}-{}.backup", state.engine.node_id(), spilled.info.created_ms);
+    let file = tokio::fs::File::from_std(spilled.file);
+    let body = futures::stream::try_unfold(file, |mut file| async move {
+        let mut chunk = vec![0u8; 1 << 16];
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        chunk.truncate(read);
+        Ok::<_, std::io::Error>(Some((axum::body::Bytes::from(chunk), file)))
+    });
     Ok((
         [
             (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
@@ -809,8 +862,9 @@ async fn backup(
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
+            (axum::http::header::CONTENT_LENGTH, spilled.len.to_string()),
         ],
-        buf,
+        axum::body::Body::from_stream(body),
     )
         .into_response())
 }
@@ -1322,6 +1376,23 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// A panic in the spill is the generic `500`: the panic's own text, which
+    /// can name a path or an internal, is logged and not sent (ADR-170).
+    #[tokio::test]
+    async fn a_panicking_backup_task_does_not_send_its_panic_text() {
+        let joined = tokio::task::spawn_blocking(|| {
+            panic!("panic-text-for-the-log /var/lib/kimmy/kimmy.redb");
+        })
+        .await;
+        let response = backup_task_failed(joined.unwrap_err()).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("internal"), "still the documented envelope: {text}");
+        assert!(!text.contains("panic-text-for-the-log"), "{text}");
+        assert!(!text.contains("/var/lib"), "{text}");
+    }
 
     /// The REST table's shape in miniature: one route the table opens, one it
     /// does not, under the same layer `routes` applies.
