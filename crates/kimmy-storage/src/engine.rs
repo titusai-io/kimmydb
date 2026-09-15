@@ -1491,6 +1491,17 @@ impl Engine {
         Ok(txn.open_table(tables::OPLOG_HELD)?.iter()?.count())
     }
 
+    /// How many entries this node holds as state (ADR-160), for the
+    /// `kimmy_sync_held_marks` gauge.
+    ///
+    /// The count redb keeps in the table's root, read without visiting a row,
+    /// so a scrape costs the same however many marks a member holds. Not
+    /// split by origin: that would be a walk of the table on every scrape.
+    pub fn held_marks(&self) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(tables::OPLOG_HELD)?.len()?)
+    }
+
     /// Drop the state marks (ADR-160) on every entry `granted` now covers.
     /// -> whether anything was released.
     ///

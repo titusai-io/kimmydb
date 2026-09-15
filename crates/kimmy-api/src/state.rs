@@ -200,6 +200,10 @@ impl AppState {
             // addendum), counted by the engine on commit so a pulled and a
             // pushed window land on the same series.
             held_marks_released: self.engine.held_marks_released(),
+            // Whether this member holds anything as state now, which the
+            // release counter above cannot say: it moves only when a mark
+            // goes (ADR-160, ADR-172).
+            held_marks: self.engine.held_marks()?,
         })
     }
 
