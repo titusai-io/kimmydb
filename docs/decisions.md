@@ -16161,19 +16161,31 @@ collection:
   transaction that reads the witnessed vector, so ADR-168's gate still judges a
   count and a vector from one snapshot. `count_by_id` reads it after the
   existence check.
-- **A mark says the counts can be trusted.** Every oplog append writes
-  `LIVE_COUNTS_THROUGH` = the next arrival position, in the append's own
-  transaction (`append_oplog_at`).
+- **A mark says the counts can be trusted.** `LIVE_COUNTS_THROUGH` records
+  two values: the arrival index's next position, and the oplog's newest key
+  (`live_count::mark_of`).
+  - **Written** by every oplog append, in the append's own transaction
+    (`append_oplog_at`).
+  - **Carried** across a rewind and a retention pass (`live_count::carry_mark`),
+    which remove rows without appending. The mark moves to the state they leave
+    only if it matched the state before them, so a mark already stale stays
+    stale.
+  - **Two values, because either alone comes back to a value it held.** A
+    rewind or retention takes the arrival end down. An older build appending as
+    many entries brings it back up, and that append moves the newest key. A
+    0.29.x rewind moves the newest key back, and leaves the arrival index for
+    the next start to renumber.
 - **Rebuilt at open when they cannot.** `Engine::open` calls
   `live_count::rebuild_if_stale` after the arrival index and version vectors
-  are settled, and before it returns. Unless the mark equals the arrival index's
-  next position, it walks every record header of the store in one transaction,
-  rewrites every count, and writes the mark. That covers:
+  are settled, and before it returns. Unless the mark matches the store, it
+  walks every record header of the store in one transaction, rewrites every
+  count, and writes the mark. That covers:
   - **the first start of this build on a database**, where the mark is missing;
   - **a start after `kimmyd restore`.** A backup carries neither table: the
     backup format's table list is fixed and does not name them;
   - **a start after an older build wrote.** Every document write appends to the
-    oplog, and an older build moves the arrival index without the mark;
+    oplog, and an older build moves the arrival index and the oplog's newest
+    key without the mark;
   - **a start that rebuilt the arrival index**, which renumbers positions.
 - **The rebuild logs** `rebuilt the live document counts before serving` at
   `INFO`, with `collections`, `records` and `elapsed_ms`.
@@ -16184,8 +16196,9 @@ collection:
 **Why the count stays exact.** The count and the record move in one
 transaction, so a write that fails after its record is in takes the count back
 with it. The mark moves in the transaction of the append, and every document
-write appends in the transaction of its record. So there is no crash point
-between a record, its count and the mark.
+write appends in the transaction of its record; a rewind and retention carry it
+in the transaction of their removal. So there is no crash point between a
+record, its count and the mark.
 
 **Costs.**
 - **Startup, once.** The rebuild reads the header of every document record, a
@@ -16221,13 +16234,28 @@ between a record, its count and the mark.
 - **Read path.** None beyond the table's existence. Nothing reads the counts but
   the probe.
 
-**Residual.**
-- **A database written by an older build between two starts of this one** is
-  caught only through the arrival index. Every document write appends to the
-  oplog, so a build that does not keep the counts leaves the mark behind.
-- **A rewind by such a build appends nothing.** It is still caught: that build's
-  rewind leaves the arrival index covering less than the oplog, the next start
-  rebuilds the index, and the renumbered positions no longer match the mark.
+**The first form of the mark, and what is left.**
+- **The first form compared the arrival end alone, and only an append moved
+  it.** Found in review, and both effects are gone:
+  - **An unneeded rebuild.** A rewind removes arrival rows, and retention can
+    empty the index; neither appends. So every rewind forced a full rebuild of
+    the counts at the next start, which takes minutes on a large store, unless a
+    write came first.
+  - **A skipped rebuild.** An older build appending as many entries as a rewind
+    had removed brought the end back to exactly the mark, so a rebuild the
+    counts needed was skipped.
+- **A 0.29.x rewind** removes oplog rows and leaves the arrival index covering
+  more than the oplog. The next start rebuilds the index, renumbered, and the
+  renumbered end can equal the mark. The rewind moved the oplog's newest key,
+  so the mark does not match and the counts are rebuilt.
+- **What would still be missed.** An older build whose writes return both the
+  arrival end and the oplog's newest key to the mark's values. Its writes would
+  have to end on the entry the mark names as the newest, after something had
+  removed that entry. A rewind cannot bring it back: the rewind's own tombstone
+  is stamped after it, so a re-sent copy loses.
+- **Opening a 0.30 store with 0.29.x is safe.** 0.29.x ignores both tables and
+  never writes the mark, and a backup never carries them. A later 0.30 start
+  finds the mark stale and rebuilds.
 
 **Alternatives.**
 - **Keep the walk; header-only (ADR-133's addendum).** It removes CPU and heap
@@ -16246,7 +16274,10 @@ between a record, its count and the mark.
   - replace and upsert;
   - `find_and_modify` setting a value, and removing a document;
   - a replicated insert, a replicated delete, and a superseded replicated delete;
-  - a member built from a snapshot;
+  - a member built from a snapshot, and a second snapshot into it after the
+    sender replaced, deleted and inserted documents it already holds;
+  - a scoped repair, and a second one over the copy the first left held as
+    state;
   - a rewind that reverts one document and brings a deleted one back;
   - retention removing tombstones;
   - a drop, and a recreate.
@@ -16257,10 +16288,19 @@ between a record, its count and the mark.
   `a_write_by_a_build_that_does_not_keep_the_counts_is_caught_at_open`: the
   rebuild. The second writes a record, its oplog entry and both arrival rows
   without the count or the mark.
+- `a_rewind_leaves_the_counts_trusted_at_the_next_open`: the mark is carried
+  across a rewind. A count altered after the rewind survives the restart.
+- `a_build_that_writes_as_many_entries_as_a_rewind_removed_is_caught_at_open`:
+  the reviewer's sequence. A rewind removes one entry, then an older build
+  appends one.
+- `an_older_build_rewinding_then_writing_is_caught_at_open`: the oplog's newest
+  key. A 0.29.x-style rewind leaves the arrival index for the next start to
+  renumber back to the mark, and an older delete follows.
 - `a_clean_start_trusts_the_counts_and_does_not_walk`: the mark spares the walk.
   A count altered behind the mark's back survives the restart.
 - `every_document_write_moves_the_count`: the source guard. It fails on any
-  `docs.insert`, `docs.remove` or `docs.retain` outside this module, `migrate.rs`
+  `docs.insert`, `docs.remove`, `docs.retain` (which also covers `retain_in`),
+  `docs.pop_*`, `docs.drain` or `docs.extract*` outside this module, `migrate.rs`
   (run during open, before the rebuild) and `backup.rs` (a restore into a file
   the first open rebuilds).
 - `the_divergence_check_reads_a_kept_count_not_the_collection` (cluster harness,
@@ -16292,3 +16332,11 @@ for a raw write to `DOCS`:
   it.
 - **The mark never written:** the clean-start test.
 - **The rebuild disabled:** both rebuild tests.
+- **A rewind not carrying the mark:** the rewind-then-restart test.
+- **The first form of the mark** (arrival end alone, carried by nothing): the
+  rewind-then-restart test, the reviewer's sequence, and the 0.29.x-rewind test.
+- **The mark without the oplog's newest key:** the 0.29.x-rewind test.
+- **A snapshot's Hold apply removing the record first, so it counts every
+  record as new:** the verifier's second snapshot, and the guard. Before that
+  step was added, only the guard caught it, because the first snapshot lands in
+  an empty member.

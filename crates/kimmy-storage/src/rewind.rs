@@ -319,6 +319,7 @@ impl Engine {
             // resumed from the wrong place (ADR-173).
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
             let mut discarded = VersionVector::new();
             for key in doomed {
                 oplog.remove(key.as_slice())?;
@@ -335,6 +336,15 @@ impl Engine {
             if !discarded.is_empty() {
                 record_rewind(&txn, until, &discarded)?;
             }
+            // The live counts moved with every record the rewind rewrote, in
+            // this transaction; their mark moves with the rows it removed, or
+            // the next start would walk the whole store to rebuild counts that
+            // are exact (ADR-174).
+            crate::live_count::carry_mark(
+                &txn,
+                &mark_before,
+                &crate::live_count::mark_of(&arrival, &oplog)?,
+            )?;
         }
         txn.commit()?;
 

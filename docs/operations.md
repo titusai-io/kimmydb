@@ -480,6 +480,10 @@ cannot trust them:
 - a start after an older build wrote to the database;
 - a start that also rebuilt the arrival index.
 
+A rewind does not force it: the counts' mark moves with the rows a rewind
+removes. Opening the database with 0.29.x in between is safe, because 0.29.x
+ignores the counts, and the next start of 0.30.0 or later rebuilds them.
+
 The rebuild reads the header of every document record in the store, in one
 transaction, **before the node serves anything**, and logs at `INFO` when it is
 done:

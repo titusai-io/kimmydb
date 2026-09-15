@@ -2939,9 +2939,9 @@ pub(crate) fn append_oplog_at(
     arrival.insert(next, key.as_slice())?;
     by_stamp.insert(key.as_slice(), next)?;
     // Every document write appends, so this is where a build that keeps the
-    // live counts says so; a mark behind the index's end at open means one that
+    // live counts says so; a mark that no longer matches at open means one that
     // does not wrote since (ADR-174).
-    crate::live_count::mark_through(txn, next + 1)?;
+    crate::live_count::mark_through(txn, &crate::live_count::mark_of(&arrival, &oplog)?)?;
     Ok(false)
 }
 

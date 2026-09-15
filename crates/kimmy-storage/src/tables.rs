@@ -32,13 +32,17 @@ pub const DOCS: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("doc
 /// be stale.
 pub const LIVE_COUNTS: TableDefinition<u64, u64> = TableDefinition::new("live_counts");
 
-/// `"arrival" -> the arrival position the live counts are kept through`.
+/// `"arrival" -> where the live counts are kept through`: the arrival index's
+/// next position and the oplog's newest key, as they stood after the last
+/// write that kept [`LIVE_COUNTS`] (`live_count::mark_of`).
 ///
-/// Written with every oplog append by a build that keeps [`LIVE_COUNTS`]. Every
-/// document write appends, so a mark behind the arrival index's end means a
-/// build that does not keep the counts wrote since, and a missing one means no
-/// build that does has written here.
-pub const LIVE_COUNTS_THROUGH: TableDefinition<&str, u64> =
+/// Written with every oplog append by a build that keeps the counts, and
+/// carried forward by a rewind and by retention, which remove rows without
+/// appending. Every document write appends, so a mark that no longer matches
+/// means a build that does not keep the counts wrote since, and a missing one
+/// means no build that does has written here. Two values, because either alone
+/// can return to a value it held: see the mark's own note.
+pub const LIVE_COUNTS_THROUGH: TableDefinition<&str, &[u8]> =
     TableDefinition::new("live_counts_through");
 
 /// `(collection_id, index_id, encoded key, encoded _id)`.
