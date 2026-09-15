@@ -112,6 +112,9 @@ pub struct Engine {
     writer_wait_sum_us: std::sync::atomic::AtomicU64,
     /// Writes that gave up waiting for the writer inside their budget.
     writer_wait_timeouts: std::sync::atomic::AtomicU64,
+    /// Entries held as state that a window released, since start (ADR-169's
+    /// addendum). Added only after the run that released them commits.
+    held_marks_released: std::sync::atomic::AtomicU64,
     /// The longest any one transaction has held the writer, since start.
     writer_hold_max_us: std::sync::atomic::AtomicU64,
     /// How long the writer was held, as a histogram over
@@ -621,6 +624,7 @@ impl Engine {
             writer_wait_count: std::sync::atomic::AtomicU64::new(0),
             writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
+            held_marks_released: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
                 std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0))
@@ -654,6 +658,20 @@ impl Engine {
     /// start (ADR-151).
     pub fn writer_wait_timeouts(&self) -> u64 {
         self.writer_wait_timeouts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries this node held as state (ADR-160) that arrived in a window
+    /// contiguous from its position and were released, since start (ADR-169's
+    /// addendum). One per entry: a mark is released once, and a re-delivery
+    /// of an entry already released finds no mark. Counted when the run that
+    /// released them commits, so a rolled-back release is not counted.
+    pub fn held_marks_released(&self) -> u64 {
+        self.held_marks_released.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Add `n` committed releases to [`Self::held_marks_released`].
+    pub(crate) fn count_held_marks_released(&self, n: u64) {
+        self.held_marks_released.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The longest any one transaction has held the writer, since start.
@@ -2814,15 +2832,17 @@ pub(crate) enum Position {
 }
 
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
-    append_oplog_at(txn, entry, Position::Raise)
+    append_oplog_at(txn, entry, Position::Raise).map(|_| ())
 }
 
 /// [`append_oplog`], with the caller saying whether the vectors move.
+/// -> whether a held mark was released on an entry this node already held
+/// ([`release_held_in_position`]), for the caller to count once it commits.
 pub(crate) fn append_oplog_at(
     txn: &redb::WriteTransaction,
     entry: &OplogEntry,
     position: Position,
-) -> Result<()> {
+) -> Result<bool> {
     let key = codec::oplog_key(&entry.stamp);
     let mut oplog = txn.open_table(tables::OPLOG)?;
     let existed =
@@ -2841,9 +2861,9 @@ pub(crate) fn append_oplog_at(
             // release failed the whole batch, and every later round with that
             // peer failed the same way.
             drop(oplog);
-            release_held_in_position(txn, &entry.stamp)?;
+            return release_held_in_position(txn, &entry.stamp);
         }
-        return Ok(());
+        return Ok(false);
     }
 
     // Same transaction as the entry, so the vector can never claim coverage of
@@ -2882,7 +2902,7 @@ pub(crate) fn append_oplog_at(
     let next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
     arrival.insert(next, key.as_slice())?;
     by_stamp.insert(key.as_slice(), next)?;
-    Ok(())
+    Ok(false)
 }
 
 /// Release the held mark (ADR-160) on the entry stored under `stamp`, because
