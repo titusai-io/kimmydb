@@ -210,7 +210,10 @@ entry — collected under an `oplog_retention_secs` shorter than
 tombstone. An open without a token still succeeds then: the tail opens at the
 tail, and `from_start` begins at the first retained entry stamped after the
 drop. A token is compared with the tombstone's stamp instead, and one from at or
-before it is still `410`. Until 0.29.0 both kinds of open were refused with
+before it is still `410`. The bound is by stamp, so on a tombstone a snapshot
+installed, a local write stamped below it under clock skew is outside the
+incarnation and not replayed — the same side of the line the engine puts that
+write on everywhere else. Through 0.29.0 both kinds of open were refused with
 `410 resume_token_expired` until the tombstone was collected.
 
 Found by driving a real node and asking what actually happened, after a written
