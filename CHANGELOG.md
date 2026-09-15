@@ -76,6 +76,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   its plan; otherwise the evidence is the version-boundary tests beside the
   protocol, not the roll.
 
+### Dependencies
+
+Versions are as `Cargo.lock` resolves them.
+
+- **`rustls` 0.23.43 → 0.23.45, for RUSTSEC-2026-0285.** The advisory says
+  rustls accepted TLS 1.3 handshake messages sent at the wrong encryption
+  level. rustls carries both the server's TLS listener and every outbound TLS
+  connection (peer sync, embedding providers, the client and CLI), so every
+  member should take this release. Nothing about configuration or behaviour on
+  a correct handshake changes.
+- Patch updates: `rustls-webpki` 0.103.13 → 0.103.15 (with rustls), `chacha20`
+  0.10.1 → 0.10.2 (replaces a yanked version, via `foca`).
+
 ## 0.28.0 - 2026-09-14
 
 **A minor, and upgrading to it requires reading one entry.** ADR-168 changes
