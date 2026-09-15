@@ -1659,15 +1659,25 @@ impl Engine {
         if !held {
             return Ok((witnessed, None));
         }
+        Ok((witnessed, Some(Self::live_count_in(&txn, id)?)))
+    }
+
+    /// The live documents of collection `id`, counted in `txn` from each
+    /// record's header alone (`codec::doc_record_is_live`).
+    ///
+    /// A walk of the collection's records either way, but one that copies and
+    /// decodes nothing: the count half of the divergence check runs it on both
+    /// members of every contact (ADR-133's addendum).
+    pub(crate) fn live_count_in(txn: &redb::ReadTransaction, id: CollectionId) -> Result<u64> {
         let docs = txn.open_table(tables::DOCS)?;
         let mut count = 0u64;
         for row in docs.range(doc_range(id))? {
             let (_, value) = row?;
-            if !codec::decode_doc_record(value.value())?.deleted {
+            if codec::doc_record_is_live(value.value())? {
                 count += 1;
             }
         }
-        Ok((witnessed, Some(count)))
+        Ok(count)
     }
 
     /// Raise the witnessed vector to cover a whole batch, in one transaction.
