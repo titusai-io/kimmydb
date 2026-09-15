@@ -14911,8 +14911,9 @@ consequence, pinned: it compares, and mismatches, without this record).
 >   threshold low, which every roll produces.
 > - **Now.** Its mark stays until the origin writes again or retention collects
 >   the entry.
-> - **Until then.** The member advertises the origin below the entry, and peers
->   pulling from it defer the entry as `beyond_advertised`.
+> - **Until then.** The member's servable vector is not raised over the entry. A
+>   peer that already holds the entry sees nothing. A peer that also lacks it and
+>   pulls it from this member defers it as `beyond_advertised`.
 
 **Decision.** An oplog entry this node holds under an `OPLOG_HELD` mark (ADR-160)
 is released — the mark removed, both vectors raised to its stamp — when the same
@@ -15125,7 +15126,13 @@ covers but the requester does not hold in position. There are two kinds. One is
 a held entry (below). The other is DDL the member processed without applying:
 refused, declined or judged history (ADR-123). Both used to come round again
 whenever another origin held the threshold low. Now only a repair replay
-(ADR-148), which sends no vector, re-serves them. Every entry above
+(ADR-148), which sends no vector, re-serves them.
+
+The same goes for an ADR-148 hole, an entry witnessed and never applied, on an
+origin that is not the one holding the threshold low. The old drain re-served
+it by accident whenever another origin trailed. Now it is healed only by the
+replay the divergence check plans for its collection, which sends `held: None`
+(`sync_round`). That is the path ADR-148 designed for it. Every entry above
 `held[origin]` in the range is still
 served or deliberately withheld, as before (a `UniqueViolation`, ADR-029).
 That is the contiguity ADR-143 and ADR-148 require, met more exactly than
@@ -15154,8 +15161,10 @@ no longer re-served.** It is wider than "rare".
 - **How it arises.** A member R has a hole on origin O: its witnessed vector
   covers an entry S, and S is not in position in its oplog. A scoped repair
   (ADR-152) then brings S under `Hold`. The mark stays and neither vector moves,
-  so R advertises O below S. A peer pulling from R defers S as
-  `beyond_advertised`, which is ADR-167's residual for that entry.
+  so R's servable vector (`OPLOG_VERSIONS`, which `AskVersions` answers with) is
+  not raised to S. That shows only when S is above every entry of O that R holds
+  in position. Otherwise R's servable position on O is already past S, and the
+  mark matters to nothing but ADR-160's open-time rebuild.
 - **Before this record.** S was re-served, and the mark released, whenever
   another origin held R's threshold at or below S. That is the quiet-origin
   shape every roll produces, so it happened often.
@@ -15167,8 +15176,24 @@ no longer re-served.** It is wider than "rare".
     holds only once O has written after S.**
   - Retention on R collects S with its mark. Retention delivers S to no one; it
     ends the deferral by removing the entry.
-- **Until then.** Peers pulling from R count S under `beyond_advertised`, and
-  ADR-168's count-half limitation holds for R on O.
+  - A point-in-time rewind resets both vectors to what the oplog holds. It
+    excludes marked entries and replaces the vectors rather than merging
+    (`reset_version_vector_to_oplog`). If S is O's newest entry at R, the rewind
+    leaves R's witnessed position just below S. The next pull is then served S in
+    position and ADR-169 releases it, so that case corrects itself at the cost of
+    one entry on one pull.
+- **What peers observe, checked against the code.** Nothing on a serve, a
+  divergence probe or a deferral reads `OPLOG_HELD`. Its readers are the
+  open-time rebuild and the rewind reset, the grant's release, the release on
+  arrival, retention, and a diagnostic. The effect reaches a peer only through
+  R's servable vector, and only while S sits above it.
+  - A peer whose witnessed vector already covers S skips it when pulling from R
+    and sees nothing. That is every member that did not share R's hole.
+  - A peer that also lacks S and pulls it from R is served S above the vector R
+    advertised. It defers S (`beyond_advertised`, counted from the batch's
+    `deferred`), and takes it from any member that holds it in position.
+  - R serves the document itself as state through the ordinary read path
+    throughout.
 - **Beyond scoped repairs.** The same holds for any entry held at or below the
   witnessed position, such as a delete carried by a snapshot (ADR-167) at a
   stamp the member had already witnessed.

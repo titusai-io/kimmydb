@@ -37,9 +37,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   that a scoped repair then fills, so the member holds that entry as state.
   That entry used to be re-served and released whenever another origin held the
   member's threshold low, which every roll does. It now stays held until the
-  origin writes again or retention collects the entry. Until then the member
-  advertises the origin below the entry, and peers pulling from it count the
-  entry under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`.
+  origin writes again or retention collects the entry. Until then the member's
+  advertised position may not cover the entry. A peer that already holds it sees
+  nothing. A peer that also lacks it and pulls it from that member counts it
+  under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`, and takes
+  it from another member instead.
   ADR-171 says why re-serving it by lowering the vector was not done.
 
   **Nothing to decide before upgrading, and no ordering in the roll.** Nothing on
