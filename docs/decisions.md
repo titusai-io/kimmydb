@@ -15109,11 +15109,15 @@ elsewhere would be set without evidence.
 - A backup has no deadline. The response headers arrive when the walk ends, which
   on a cold cache can be half an hour. A client should use a read-idle timeout,
   not a total one.
-- **The Rust client and the CLI still download with a 30 s total timeout and
-  buffer the body in memory**, so `kimmy backup` fails on a store whose walk
-  outlasts it. That is a separate change. **The .NET client, a separate
-  repository, carries the same 30 s risk** if it uses a total timeout for the
-  download, and its owner should check.
+- **The Rust client and the CLI stream the download.** They used to apply a
+  30 s total timeout and buffer the body in memory, so `kimmy backup` failed on
+  any store whose walk outlasted it. `Client::download_to` now has no total
+  timeout: the wait for the head is unbounded, with TCP keepalive, and the body
+  is bounded by the client's timeout as a read-idle timeout, failing with
+  `Error::Stalled`. `kimmy backup` writes as it receives and removes a partial
+  file on failure. **The .NET client, a separate repository, carries the same
+  30 s risk** if it uses a total timeout for the download, and its owner should
+  check.
 
 **Alternatives.**
 - *Keep the `Vec` (ADR-041 as written).* The measured cost is the reason for
@@ -15136,6 +15140,9 @@ elsewhere would be set without evidence.
   over a real socket, and the body restores.
 - `a_backup_that_outlasts_the_request_deadline_still_answers`: a 1 ms deadline
   and a store whose walk outlasts it.
+- `a_download_longer_than_the_client_timeout_completes` and
+  `a_download_that_stops_sending_is_abandoned_after_the_idle_timeout`: the
+  client's two timeouts, against a stub that delays the head and then the body.
 - The metrics golden text, the ordered-series test, the operations.md metrics
   table test, and `every_metrics_series_reaches_the_bridge`, for the histogram.
 - **Not held by a test:** that the handler's heap does not track the backup's

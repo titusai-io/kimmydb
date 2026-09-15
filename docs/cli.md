@@ -94,7 +94,7 @@ grants any other client is.
 | `kimmy vector-search <db.coll> [query]` | Search by meaning. `--vector --k --filter --per-document` |
 | `kimmy hybrid-search <db.coll> [query]` | Dense and lexical, fused by rank. Same flags |
 | `kimmy watch <db.coll>` | Follow changes until interrupted, one event per line. `--full --resume-after` |
-| `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout |
+| `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout. Streamed to the file as it arrives; waits without a timeout for the node to walk its store, then gives up only if 30 s pass without a byte. A failed download leaves no file |
 
 Global: `--url` (`KIMMY_URL`), `--token` (`KIMMY_TOKEN`), `--pretty`.
 

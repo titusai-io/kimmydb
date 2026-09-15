@@ -742,14 +742,27 @@ async fn run() -> Result<()> {
             }
         }
         Command::Backup { out } => {
-            let bytes = client.download("/v1/admin/backup").await?;
+            // Streamed to its destination as it arrives, never held whole: a
+            // backup is the size of the store. The node sends nothing until it
+            // has walked the store, so the wait for it is not timed; the body
+            // is, as a read-idle timeout (ADR-170).
             if out == "-" {
-                use std::io::Write;
-                std::io::stdout().write_all(&bytes)?;
+                client.download_to("/v1/admin/backup", &mut tokio::io::stdout()).await?;
             } else {
-                std::fs::write(out, &bytes)
-                    .with_context(|| format!("writing the backup to {out}"))?;
-                eprintln!("wrote {} bytes to {out}", bytes.len());
+                let mut file = tokio::fs::File::create(&out)
+                    .await
+                    .with_context(|| format!("creating {out}"))?;
+                match client.download_to("/v1/admin/backup", &mut file).await {
+                    Ok(bytes) => eprintln!("wrote {bytes} bytes to {out}"),
+                    Err(e) => {
+                        // A partial backup under the name asked for is a
+                        // restore waiting to fail: nothing is left there.
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&out).await;
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("downloading the backup to {out}")));
+                    }
+                }
             }
         }
     }
