@@ -236,13 +236,15 @@ impl Engine {
                 let after = match &restore_to {
                     Some(entry) if entry.kind != OpKind::Delete => match &entry.body {
                         Some(body) => {
-                            docs.insert(
-                                (collection_id, key.as_slice()),
-                                codec::encode_doc_record(&kimmy_core::DocRecord::live(
+                            crate::live_count::put_record(
+                                &txn,
+                                &mut docs,
+                                collection_id,
+                                &key,
+                                &codec::encode_doc_record(&kimmy_core::DocRecord::live(
                                     entry.stamp,
                                     body.clone(),
-                                ))
-                                .as_slice(),
+                                )),
                             )?;
                             outcome.reverted += 1;
                             Some(bson::deserialize_from_slice::<bson::Document>(body).map_err(
@@ -270,10 +272,12 @@ impl Engine {
                             .as_ref()
                             .map(|e| e.stamp)
                             .unwrap_or_else(|| self.next_stamp());
-                        docs.insert(
-                            (collection_id, key.as_slice()),
-                            codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp))
-                                .as_slice(),
+                        crate::live_count::put_record(
+                            &txn,
+                            &mut docs,
+                            collection_id,
+                            &key,
+                            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp)),
                         )?;
                         outcome.removed += 1;
                         None

@@ -159,16 +159,15 @@ impl Engine {
     /// One collection's scan, no more — the cost [`next_probe`] rotates
     /// around the cluster's collections rather than paying every round.
     ///
-    /// Counted from each record's header, not through `Engine::count`, which
-    /// decodes every live document into BSON to count it. The answering peer
-    /// of every contact runs this, and paid that parse for every document of
-    /// the probed collection (ADR-133's addendum).
+    /// Read from the kept count (ADR-174), not walked: the answering peer of
+    /// every contact runs this, and a walk read every page of the probed
+    /// collection each time.
     pub fn count_by_id(&self, id: CollectionId) -> Result<Option<u64>> {
         if self.collection_by_id(id)?.is_none() {
             return Ok(None);
         }
         let txn = self.db().begin_read()?;
-        Ok(Some(Engine::live_count_in(&txn, id)?))
+        Ok(Some(crate::live_count::live_count(&txn, id)?))
     }
 }
 
@@ -578,11 +577,13 @@ mod tests {
         let key = crate::docs::doc_key(&kimmy_core::DocId::String("unreadable".into())).unwrap();
         let db = engine.db();
         let txn = db.begin_write().unwrap();
-        txn.open_table(crate::tables::DOCS)
-            .unwrap()
-            .insert((coll.id.0, key.as_slice()), unreadable.as_slice())
-            .unwrap();
+        {
+            // Through the kept count's own write, which reads the header only.
+            let mut docs = txn.open_table(crate::tables::DOCS).unwrap();
+            crate::live_count::put_record(&txn, &mut docs, coll.id.0, &key, &unreadable).unwrap();
+        }
         txn.commit().unwrap();
+        assert_eq!(Engine::live_count_in(&db.begin_read().unwrap(), coll.id).unwrap(), 2);
 
         assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(2));
         assert_eq!(engine.count_probe_reading(coll.id).unwrap().1, Some(2));

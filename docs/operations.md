@@ -469,6 +469,33 @@ disagree — a code given a level and left out here, or listed here as silent
 after it started logging, is a test failure rather than an operator finding out
 from a page.
 
+#### A start that rebuilds the live document counts
+
+Each collection's live document count is kept in the database, moved by every
+document write, so the divergence check reads a number instead of walking a
+collection ([ADR-174](decisions.md)). A start rebuilds those counts when it
+cannot trust them:
+- the first start of 0.30.0 or later on a database;
+- a start after `kimmyd restore`, since a backup does not carry the counts;
+- a start after an older build wrote to the database;
+- a start that also rebuilt the arrival index.
+
+The rebuild reads the header of every document record in the store, in one
+transaction, **before the node serves anything**, and logs at `INFO` when it is
+done:
+
+```text
+rebuilt the live document counts before serving  collections=12 records=4803112 elapsed_ms=38211
+```
+
+It is a walk of every page that holds documents. On a store larger than the
+page cache, or with a cold cache after a host restart, it runs at the disk's
+speed and takes minutes, the same dependence as the retention pass and a backup
+([Capacity](#capacity)). Plan the first start after upgrading, and the start
+after a restore, for that; a readiness probe that gives up sooner restarts the
+node into the same walk. A start that does not need the rebuild does not read
+the documents.
+
 #### What a shutdown logs, and what a start says about the last one
 
 Every way out of the process is named. A signal — `SIGTERM` from `docker
@@ -893,8 +920,9 @@ reconciliation would:
   a recreation on a member not yet rolled is left to the ordinary entries
   path rather than reported here.
 - **One collection's live document count**, chosen in turn from this node's
-  own collection list so a check pays for at most one collection's scan
-  rather than the whole database. Reaching every collection again after one
+  own collection list. Since 0.30.0 the count is kept in the database and read
+  as one value on each member ([ADR-174](decisions.md)); before, each member
+  walked the whole collection for it on every check, reading every page of it. Reaching every collection again after one
   has had its turn takes as many *checked* rounds as there are collections —
   not wall-clock rounds, if some rounds are skipped per the paragraph above.
 

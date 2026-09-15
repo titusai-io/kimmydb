@@ -449,7 +449,13 @@ impl Engine {
                 return Err(CoreError::DuplicateKey(id.to_string()).into());
             }
             let record = DocRecord::live(stamp, body.clone());
-            docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )?;
         }
 
         // Same transaction as the document write, so the index cannot describe
@@ -574,7 +580,13 @@ impl Engine {
             }
 
             let record = DocRecord::live(stamp, body.clone());
-            docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )?;
             (existed, previous)
         };
 
@@ -748,9 +760,12 @@ impl Engine {
             if !guard(current, image)? {
                 return Ok(None);
             }
-            docs.insert(
-                (coll.id.0, key.as_slice()),
-                codec::encode_doc_record(&DocRecord::tombstone(stamp)).as_slice(),
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&DocRecord::tombstone(stamp)),
             )?;
             previous
         };
@@ -997,7 +1012,13 @@ impl Engine {
             };
             debug_assert_eq!(winner.stamp, incoming.stamp, "merge disagreed with wins_over");
 
-            docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&winner).as_slice())?;
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&winner),
+            )?;
             drop(docs);
 
             // Secondary indexes are maintained here for the same reason they

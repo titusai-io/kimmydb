@@ -362,7 +362,7 @@ impl Engine {
                     },
                     None => false,
                 };
-                if unchanged && docs.remove(key)?.is_some() {
+                if unchanged && crate::live_count::remove_record(&txn, &mut docs, key.0, key.1)? {
                     removed += 1;
                 }
             }

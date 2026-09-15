@@ -94,6 +94,11 @@ impl Node {
     /// Sync and discovery intervals are shortened so the tests wait on
     /// gossip's own timing, not on configuration chosen for production.
     fn spawn(name: &'static str, cluster: u16, seeds: &[u16]) -> Node {
+        Self::spawn_with(name, cluster, seeds, "")
+    }
+
+    /// [`Node::spawn`], with `storage` added to the `[storage]` section.
+    fn spawn_with(name: &'static str, cluster: u16, seeds: &[u16], storage: &str) -> Node {
         let dir = tempfile::tempdir().unwrap();
         let http = free_port();
         let seed_list =
@@ -109,6 +114,7 @@ data_dir = "{data}"
 # Expiry runs every second rather than every sixty, so a TTL test waits on
 # ownership settling rather than on a production cadence.
 ttl_interval_secs = 1
+{storage}
 
 [auth]
 jwt_secret = "{JWT_SECRET}"
@@ -332,10 +338,15 @@ where
 /// seed list never names B to C — which makes membership convergence itself
 /// the "an unseeded member is learned" assertion.
 async fn three_nodes(client: &reqwest::Client) -> (Node, Node, Node) {
+    three_nodes_with(client, "").await
+}
+
+/// [`three_nodes`], with `storage` added to each node's `[storage]` section.
+async fn three_nodes_with(client: &reqwest::Client, storage: &str) -> (Node, Node, Node) {
     let (pa, pb, pc) = (free_port(), free_port(), free_port());
-    let a = Node::spawn("node-a", pa, &[pb]);
-    let b = Node::spawn("node-b", pb, &[pa]);
-    let c = Node::spawn("node-c", pc, &[pa]);
+    let a = Node::spawn_with("node-a", pa, &[pb], storage);
+    let b = Node::spawn_with("node-b", pb, &[pa], storage);
+    let c = Node::spawn_with("node-c", pc, &[pa], storage);
     a.wait_ready(client).await;
     b.wait_ready(client).await;
     c.wait_ready(client).await;
@@ -1315,4 +1326,122 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
         }
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// The divergence check reads a kept count, not the collection (ADR-174)
+// ---------------------------------------------------------------------------
+
+/// Bytes the node's process has read through `read(2)` and `pread(2)`, page
+/// cache hits included: `rchar` in `/proc/<pid>/io`.
+#[cfg(target_os = "linux")]
+fn rchar(node: &Node) -> u64 {
+    let io = std::fs::read_to_string(format!("/proc/{}/io", node.child.id())).unwrap();
+    io.lines()
+        .find_map(|line| line.strip_prefix("rchar: "))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("rchar in /proc/<pid>/io")
+}
+
+/// A labelled counter from `/metrics`.
+#[cfg(target_os = "linux")]
+async fn labelled(client: &reqwest::Client, node: &Node, series: &str) -> u64 {
+    let body = client.get(node.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    body.lines()
+        .find(|line| line.starts_with(series))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// An idle, converged member holding one collection of large documents reads
+/// far less than that collection while the divergence check runs.
+///
+/// The check rotates through every collection a member holds, one a contact,
+/// and before ADR-174 both members of a contact walked the probed collection,
+/// reading every page of it. Over a window long enough for the rotation to
+/// reach the large collection several times, that was several times its size;
+/// reading a kept count, it is sync traffic.
+///
+/// **redb's read cache is set below the collection's size.** A walk served from
+/// the cache makes no `read` call, so with the default 256 MiB cache a
+/// collection this size is walked invisibly: on 0.29.1 the same fixture read
+/// 8,192 bytes in the window while comparing 58 counts. The cost this guards
+/// was measured on a 400 MiB collection, larger than the cache, which is the
+/// shape reproduced here at the smallest cache a node accepts.
+///
+/// Linux only, because `rchar` is a Linux counter. CI's cluster harness runs on
+/// Linux.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn the_divergence_check_reads_a_kept_count_not_the_collection() {
+    const DOCS: usize = 160;
+    const PAYLOAD: usize = 64 * 1024;
+    const WINDOW: Duration = Duration::from_secs(30);
+
+    let client = reqwest::Client::new();
+    // 8 MiB, the smallest cache a node accepts, below the collection's 9.8 MiB.
+    let (a, b, c) = three_nodes_with(&client, "cache_bytes = 8388608").await;
+    let bearer = a.login(&client).await;
+
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&bearer)
+        .json(&serde_json::json!({ "name": "wide" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let payload = "x".repeat(PAYLOAD);
+    for chunk in (0..DOCS as i64).collect::<Vec<_>>().chunks(16) {
+        let batch: Vec<serde_json::Value> =
+            chunk.iter().map(|i| serde_json::json!({ "_id": i, "payload": payload })).collect();
+        let res = client
+            .post(a.url("/v1/db/shop/coll/wide/bulk"))
+            .bearer_auth(&bearer)
+            .json(&batch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "seeding: {:?}", res.text().await);
+    }
+    for node in [&a, &b, &c] {
+        eventually("every member to hold the whole collection", || {
+            let client = &client;
+            let bearer = bearer.clone();
+            async move {
+                let Ok(res) = client
+                    .post(node.url("/v1/db/shop/coll/wide/count"))
+                    .bearer_auth(&bearer)
+                    .json(&serde_json::json!({ "filter": {} }))
+                    .send()
+                    .await
+                else {
+                    return false;
+                };
+                let body: serde_json::Value = res.json().await.unwrap_or_default();
+                body["count"].as_i64() == Some(DOCS as i64)
+            }
+        })
+        .await;
+    }
+
+    let compared = r#"kimmy_sync_divergence_count_probes_total{outcome="compared"}"#;
+    let probes_before = labelled(&client, &b, compared).await;
+    let read_before = rchar(&b);
+    tokio::time::sleep(WINDOW).await;
+    let read = rchar(&b) - read_before;
+    let probes = labelled(&client, &b, compared).await - probes_before;
+
+    let collection = (DOCS * PAYLOAD) as u64;
+    eprintln!(
+        "B read {read} bytes over {WINDOW:?} and compared {probes} counts; the collection holds {collection}"
+    );
+    assert!(probes > 0, "the count half never compared, so the window measured nothing");
+    assert!(
+        read < collection,
+        "B read {read} bytes over {WINDOW:?} while idle, and the collection holds {collection}: \
+         the count is being walked"
+    );
 }

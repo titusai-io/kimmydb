@@ -15807,3 +15807,176 @@ phase.
   decodes.
 - `one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer`: still one pull
   with no marks.
+
+## ADR-174 — A collection keeps its live document count, and the divergence check reads it
+
+> **Extends [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it)**,
+> whose count half compared "one collection's scan". ADR-133 recorded no
+> rejection of a stored count; it chose the scan and bounded it to one
+> collection a contact. Its 0.30.0 addendum removed the scan's per-record copy
+> and decode, and said what it could not remove.
+
+**The cost this removes.** Both members of every contact walked the probed
+collection:
+- **What a walk reads.** redb keeps a value in the leaf page that holds its
+  key, so reading one byte of each record's header loads every page of the
+  collection.
+- **Measured.** On 0.29.1, a 400 MiB collection read about 438 MiB per contact
+  (`rchar`).
+- **What follows it.** Resident-memory steps of 70 to 276 MiB, released within
+  seconds, as redb's read cache replaced pages under the walk.
+- **How often.** The rotation reaches a collection once per as many contacts as
+  the member holds collections, and each contact is also answered for the peer.
+  An idle member holding one large collection read it several times a minute.
+
+**Decision.**
+- **A table of counts.** `LIVE_COUNTS` holds `collection id → live records under
+  that id in DOCS`. There is no row for a collection with none.
+- **One way in.** Every write to a document record goes through
+  `live_count::put_record` or `live_count::remove_record`. Each reads the
+  record's liveness before and after from its header
+  (`codec::doc_record_is_live`) and moves the count by the difference, in the
+  same transaction as the write. The writes routed through them:
+  - insert, including over a tombstone;
+  - replace and upsert;
+  - delete;
+  - `apply_remote_in_txn`, which is replication and a snapshot's documents alike;
+  - `find_and_modify`'s write;
+  - rewind's revert and its tombstone;
+  - the drop purge's chunk;
+  - retention's tombstone removal.
+- **The probe reads one value.** `count_probe_reading` reads the count in the
+  transaction that reads the witnessed vector, so ADR-168's gate still judges a
+  count and a vector from one snapshot. `count_by_id` reads it after the
+  existence check.
+- **A mark says the counts can be trusted.** Every oplog append writes
+  `LIVE_COUNTS_THROUGH` = the next arrival position, in the append's own
+  transaction (`append_oplog_at`).
+- **Rebuilt at open when they cannot.** `Engine::open` calls
+  `live_count::rebuild_if_stale` after the arrival index and version vectors
+  are settled, and before it returns. Unless the mark equals the arrival index's
+  next position, it walks every record header of the store in one transaction,
+  rewrites every count, and writes the mark. That covers:
+  - **the first start of this build on a database**, where the mark is missing;
+  - **a start after `kimmyd restore`.** A backup carries neither table: the
+    backup format's table list is fixed and does not name them;
+  - **a start after an older build wrote.** Every document write appends to the
+    oplog, and an older build moves the arrival index without the mark;
+  - **a start that rebuilt the arrival index**, which renumbers positions.
+- **The rebuild logs** `rebuilt the live document counts before serving` at
+  `INFO`, with `collections`, `records` and `elapsed_ms`.
+- **A count a write cannot move below zero** saturates instead of failing the
+  write. A count already wrong is repaired at the next open; refusing a delete
+  over it would turn a wrong number into an outage.
+
+**Why the count stays exact.** The count and the record move in one
+transaction, so a write that fails after its record is in takes the count back
+with it. The mark moves in the transaction of the append, and every document
+write appends in the transaction of its record. So there is no crash point
+between a record, its count and the mark.
+
+**Costs.**
+- **Startup, once.** The rebuild reads the header of every document record, a
+  walk of every page that holds documents. On a store larger than the page cache,
+  or with a cold cache after a host restart, it runs at the disk's speed and
+  takes minutes (ADR-151's dependence). It happens before the node serves, so a
+  readiness probe that gives up sooner restarts the node into the same walk.
+  `docs/operations.md` says so under the startup log.
+- **Write path.** Each oplog append writes one more small row, one key in a
+  one-row table. Each write that changes liveness opens `LIVE_COUNTS` and
+  updates one row. Measured with `benches/write_path.rs`, two back-to-back runs on one Mac, base (the header-only count, main at
+  #332) then this change, 30 samples each, mean with its 95% interval, in ms.
+  Every write here ends in a synchronous flush, which dominates the time and
+  moves between runs: a first pair taken minutes apart put this change 8–40%
+  *faster* on every benchmark, which is noise. Only the back-to-back pair is
+  quoted.
+
+  | Benchmark | Base | This change | Difference |
+  |---|---|---|---|
+  | `insert/secondary_indexes/0` | 5.72 [5.50, 5.98] | 5.46 [5.29, 5.69] | within noise |
+  | `mutation/replace` | 4.81 [4.66, 4.96] | 5.55 [5.31, 5.85] | +15%, intervals apart |
+  | `mutation/delete_then_insert` | 10.69 [10.46, 10.94] | 10.74 [10.54, 10.93] | within noise |
+  | `bulk/batch_size/1` | 5.42 [5.33, 5.51] | 5.29 [5.17, 5.41] | within noise |
+  | `bulk/batch_size/100` | 8.71 [8.50, 8.93] | 9.04 [8.72, 9.34] | +4%, intervals overlap |
+  | `bulk/batch_size/1000` | 26.41 [25.71, 27.10] | 27.88 [26.99, 28.72] | +6%, intervals barely overlap |
+  | `insert_with_consumer/consumers/1` | 14.38 [13.99, 14.83] | 14.13 [13.72, 14.53] | within noise |
+
+  A replace changes no live count, so its only added write is the mark. The
+  bulk insert moves the count row and the mark once per document inside one
+  transaction. That is the shape a per-transaction mark and count would remove,
+  left for a measurement on Linux under `durable` before it is worth the
+  bookkeeping.
+- **Read path.** None beyond the table's existence. Nothing reads the counts but
+  the probe.
+
+**Residual.**
+- **A database written by an older build between two starts of this one** is
+  caught only through the arrival index. Every document write appends to the
+  oplog, so a build that does not keep the counts leaves the mark behind.
+- **A rewind by such a build appends nothing.** It is still caught: that build's
+  rewind leaves the arrival index covering less than the oplog, the next start
+  rebuilds the index, and the renumbered positions no longer match the mark.
+
+**Alternatives.**
+- **Keep the walk; header-only (ADR-133's addendum).** It removes CPU and heap
+  but not the pages read, which are the cost.
+- **Count at the probe from a cheaper index**, such as a secondary index on
+  `_id`. That is still a walk, of fewer bytes per entry, proportional to the
+  collection.
+- **Rebuild at every start.** Simpler, and it makes every start pay the walk
+  that the mark exists to spare.
+
+**Held by**
+- `the_kept_counts_match_the_records_after_every_kind_of_write`: the verifier.
+  After each kind of write, every kept count equals a walk of the headers. The
+  kinds covered:
+  - insert, delete, a delete of nothing, and an insert over a tombstone;
+  - replace and upsert;
+  - `find_and_modify` setting a value, and removing a document;
+  - a replicated insert, a replicated delete, and a superseded replicated delete;
+  - a member built from a snapshot;
+  - a rewind that reverts one document and brings a deleted one back;
+  - retention removing tombstones;
+  - a drop, and a recreate.
+- `a_write_that_aborts_after_its_record_leaves_the_count_unchanged`: a unique
+  violation found after the record is written. A count kept in a transaction of
+  its own would stay moved.
+- `a_missing_or_wrong_count_is_rebuilt_at_open` and
+  `a_write_by_a_build_that_does_not_keep_the_counts_is_caught_at_open`: the
+  rebuild. The second writes a record, its oplog entry and both arrival rows
+  without the count or the mark.
+- `a_clean_start_trusts_the_counts_and_does_not_walk`: the mark spares the walk.
+  A count altered behind the mark's back survives the restart.
+- `every_document_write_moves_the_count`: the source guard. It fails on any
+  `docs.insert`, `docs.remove` or `docs.retain` outside this module, `migrate.rs`
+  (run during open, before the rebuild) and `backup.rs` (a restore into a file
+  the first open rebuilds).
+- `the_divergence_check_reads_a_kept_count_not_the_collection` (cluster harness,
+  Linux only, read with `rchar`). An idle, converged member holding 160
+  documents of 64 KiB (10,485,760 bytes) must read less than the collection
+  over 30 s while the count half compares.
+  - **The cache must be smaller than the collection.** The nodes run with
+    `storage.cache_bytes` at 8 MiB, the smallest a node accepts, below the
+    collection's size. The first form of the test ran with the default 256 MiB
+    cache and passed on 0.29.1: a walk served from redb's cache makes no `read`
+    call, and it read 8,192 bytes while comparing 58 counts. The cost was
+    measured on a 400 MiB collection, larger than the cache, and that is the
+    shape the fixture reproduces.
+  - **Measured in a `rust:1.98-bookworm` container.**
+    - 0.29.1 plus this test: **309,305,344 bytes** read in the window, 58 counts
+      compared. Red.
+    - This change: **20,480 bytes**, 60 counts compared. Green.
+  - CI's cluster harness runs on Linux, which holds it there.
+- The existing count tests (`a_probe_count_is_the_live_document_count` and the
+  header-only record test) now read the kept count.
+
+**Red by breaking one path at a time.** Each break swaps one site's routed write
+for a raw write to `DOCS`:
+- **Insert:** the verifier, the abort test and the guard.
+- **Replace, delete, `apply_remote_in_txn`, `find_and_modify`, rewind's revert,
+  rewind's tombstone, the drop purge:** the verifier and the guard.
+- **Retention's tombstone removal:** the guard alone. Removing a tombstone never
+  changes a live count, so no count can show the break; the guard is what holds
+  it.
+- **The mark never written:** the clean-start test.
+- **The rebuild disabled:** both rebuild tests.
