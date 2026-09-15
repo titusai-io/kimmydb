@@ -14902,6 +14902,13 @@ consequence, pinned: it compares, and mismatches, without this record).
 
 ## ADR-169 — An entry held as state is released when it arrives in a contiguous window
 
+> **Amended by [ADR-171](#adr-171--a-served-window-passes-over-what-the-puller-has-already-processed).**
+> A served window now passes over what the puller has already processed, so a
+> held entry is re-served only while it is above the member's witnessed position
+> for its origin. A scoped repair's mark at or below that position is released by
+> retention, not by arrival. It was released by arrival only when another origin
+> happened to pin the threshold below it.
+
 **Decision.** An oplog entry this node holds under an `OPLOG_HELD` mark (ADR-160)
 is released — the mark removed, both vectors raised to its stamp — when the same
 entry arrives in a window a peer served **contiguously from this node's own
@@ -15009,3 +15016,156 @@ nothing, so a live stream saw it once and a resumed stream replays it once.
   sit below a release of the same origin, in either window order);
 - `re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window`
   (the overturned test, rewritten, its caught-up half kept).
+
+---
+
+## ADR-171 — A served window passes over what the puller has already processed
+
+**Decision.** A window served to a peer skips every oplog entry whose stamp is
+at or below the requester's `held` vector for that entry's own origin
+(`Engine::entries_for_peer_holding`). `held` is the witnessed vector the
+requester already sends with `AskEntries` (ADR-097). A skipped entry is judged
+on its key, which is its stamp, and is never decoded. It moves `scanned_to` the
+way a withheld `UniqueViolation` does, and it does not count towards the limit.
+The push of ADR-143 serves the same window, skipping on the member's witnessed
+vector it already asked for. A request with no `held` is served the whole
+range, as before. That is a sender on an older build, and also a repair
+re-serving below its position (ADR-148), which sends none on purpose. Nothing
+on the wire changes.
+
+**The defect.** `VersionVector::behind` reduces "what am I missing" to one
+threshold: the requester's position on whichever origin it trails most. The
+oplog sorts by stamp across origins, so the range read from that threshold
+carries every other origin's entries above it too. A member that wrote nothing
+for a while and then wrote once put every peer's threshold at its previous
+write, and each peer was re-served everything every other member had written
+since. Every one of those entries came back `superseded`, one full window at a
+time, and ADR-157 kept pulling while each window was truncated. The property
+itself was already stated in the ConfigureVectors re-publish fix ("inclusive
+and origin-blind"). That fix judged the re-delivery harmless on correctness and
+never measured its cost.
+
+**Measured.** On a three-member cluster running 0.28.0, one document was written
+directly on the member whose previous local write was about forty minutes old.
+Its two peers made 306 and 308 pulls, 306 and 307 of them applying nothing, over
+66–67 s. That is up to about 313,000 entries each, re-read and decoded, for one
+document. The same write on the most recent writer cost one pull. On 0.28.1 the
+same probe gave 282 and 281 pulls, 278 and 280 applying nothing, over 56 s. A
+plain restart produced nothing, because `topology::register` writes only when
+the endpoint or build changed. **A version roll produced it once per member.**
+Nothing was applied twice, nothing reached a change stream twice (a re-served
+entry gets no second arrival row), repair stayed at 0 and no round failed.
+The cost is disk, CPU and a log that reads like a stuck sync, and it lands on
+the cluster least ready for it: every member has just restarted.
+
+The harness test, three members over real sockets, reproduces this: 4,198 entries
+of one origin sit above the quiet member's previous write, and both peers hold
+them. It was measured on a debug build, one run each. **Without the skip**, the
+peer's drain of the quiet member's one write took **5 pulls, 4,204 entries
+applied as superseded, 514 ms**. **With it**, the same drain took **1 pull, 0
+superseded, 29 ms**. The pull count is O(entries / 1,024) before and O(1) after,
+which is the whole of the field's 306 pulls.
+
+**Two ways to close it.**
+
+*A. Skip on the serve side, keyed on the requester's `held` vector (built).*
+The requester already sends the vector its threshold came from. The sender
+passes over what that vector covers per origin. **Not a wire change:** `held` has
+travelled in `AskEntries` since ADR-097. A sender on an older build ignores it
+for this purpose and serves the old window, and the requester applies either
+window the same way. The cost stays on the sender: the range from the
+threshold is still walked, but by key alone. That is a key decode per entry
+the requester holds, in one read transaction, against a body decode and a frame
+per 1,024 entries before.
+
+*B. A window per origin (not built).* The requester would ask, per origin it
+trails, from its own position on that origin. The sender would read each
+origin's run and merge them. **This is a wire change:** `AskEntries` would
+carry a position per origin, or the sender would need a per-origin index that
+the oplog does not have. The stamp-ordered key reads all origins together, so
+serving one origin's run from a position is the same range scan with a filter,
+which is option A with more on the wire. A per-origin index would be a new
+table, maintained on every append, and a stored-format change. Arithmetic, not
+a measurement: for the probe above both options send one entry. A reads about
+313,000 keys once, which is milliseconds on a warm page cache; B, with a new
+index, reads one row and pays an extra index write on every oplog append on
+every member, forever. Mixed-version, B needs the requester to fall back to one
+threshold against a sender that predates the field, so the drain stays for as
+long as any member is on an old build.
+
+A is recommended and built. It needs no wire change and no new table, and it is
+correct on the invariant below.
+
+**Why the skip cannot let a requester miss an entry it lacks (ADR-143).** ADR-143
+says nothing raises a node's witnessed vector for an origin except a window
+that starts at that node's own position for it, or a snapshot's wholesale grant.
+The skip raises nothing. The receiver's rule is unchanged: `apply_peer_batch`
+observes what the batch took and raises the vector by `coverage_up_to` to the
+window's end. What changes is where each origin's run in the window starts.
+Before, it started at the one threshold, at or below the requester's position
+for every origin. Now it starts exactly at the requester's position for that
+origin. Every entry passed over is at or below `held[origin]`, which the
+requester had already processed when it sent the request. Its witnessed vector
+only rises while the window is in flight, so nothing passed over becomes
+something it lacks. Every entry above `held[origin]` in the range is still
+served or deliberately withheld, as before (a `UniqueViolation`, ADR-029).
+That is the contiguity ADR-143 and ADR-148 require, met more exactly than
+before.
+
+The window's end is unchanged in meaning (ADR-126, ADR-127). The scan still
+stops only after keeping `limit` entries or reaching the end of the oplog. So a
+truncated window's last examined entry is its last served one, and a correct
+sender still cannot produce an empty window that is not a tail. Skipped entries
+after the last served one occur only in an exhausted window, whose end the
+receiver takes as the peer's advertised vector (ADR-082). The ADR-148 tie rule
+at the window's end reads the full stamp of the last served entry, which is
+untouched. An entry above the vector the peer advertised is still deferred by
+the receiver. An entry for a collection the receiver has no record of is never
+witnessed, so it sits above `held` and is still served.
+
+**ADR-169's release, which the skip narrows and does not break.** An entry held
+as state (ADR-160) is applied under `Position::Hold`, which raises neither
+vector. So a held entry above the requester's witnessed position is still
+served, and ADR-169 releases it when it arrives in the window. That is the
+whole-database snapshot's case: documents written behind the cursor above the
+grant, and the case the live round exercised. A held entry **at or below** the
+requester's witnessed position is no longer re-served. That arises when a
+scoped repair (ADR-152) brings a document whose origin the member had already
+witnessed past, which is the hole the repair exists for. Before this record,
+such an entry was released only when some *other* origin happened to pin the
+threshold below it, which on a converged cluster is never. After it, the entry
+is released only by retention (ADR-160). Its mark sits below the member's
+servable position for any origin that wrote after it, so what it withholds is
+confined to ADR-160's open-time rebuild. ADR-160 already bounds that: the rebuild
+merges and never lowers. ADR-169's consequence that "a scoped repair's marks
+now go when their entries arrive in position" held only in that incidental
+case, and is corrected here to entries above the member's witnessed position.
+
+**What this does not change.** The threshold (`behind`) and the horizon judgment
+(`can_serve_peer_holding`) are untouched. So is the webhook dispatcher's scan,
+which reads `entries_for_peer` for its own position and sends no vector.
+
+**Alternatives.**
+- *Raise the threshold on the requester to the highest position it trails
+  on.* That skips entries of the lower origins that it lacks, which is the hole.
+- *Stop the drain in the loop* when a pull applies nothing. An applied-0 pull is
+  also a window of last-writer-wins losers the member must witness, and giving up
+  on it pins the position. It treats the log line, not the read.
+- *Skip on the servable vector.* Entries the requester processed without
+  appending (losers, refused DDL) sit between servable and witnessed and would
+  be re-served forever (ADR-054).
+
+**Held by**
+- `one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer`: three
+  members over TCP; red without the skip.
+- `a_version_roll_re_registers_every_member_without_re_serving_what_its_peers_hold`:
+  the roll shape, through `topology::register` with a changed version; red
+  without the skip.
+- `a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it`: the
+  per-origin guard, where the requester's newest stamp is above what it lacks;
+  red when the skip is judged on the vector's maximum.
+- `a_held_document_above_the_requesters_position_is_still_served_and_released`:
+  ADR-169 still releases; red when the skip is judged on the sender's vector.
+- `a_restarted_member_serves_its_first_puller_from_the_oplog`: ADR-097's
+  finding, re-pinned on the per-origin horizon answer rather than on a
+  superseded count this record removes.

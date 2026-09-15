@@ -352,6 +352,24 @@ impl Engine {
         limit: usize,
         keep: impl Fn(&OplogEntry) -> bool,
     ) -> Result<OplogWindow> {
+        self.read_oplog_from_skipping(from, limit, |_| false, keep)
+    }
+
+    /// [`Self::read_oplog_from_where`], passing over every entry whose stamp
+    /// `skip` names without decoding it.
+    ///
+    /// A skipped entry is examined like one `keep` rejects: it moves
+    /// `scanned_to` and does not count towards `limit`. It is judged on its
+    /// key alone, which is its stamp, so passing over one costs a key decode
+    /// rather than a body. The caller that uses this is a window served to a
+    /// peer that has already processed part of what the range holds (ADR-171).
+    pub fn read_oplog_from_skipping(
+        &self,
+        from: Hlc,
+        limit: usize,
+        skip: impl Fn(&Stamp) -> bool,
+        keep: impl Fn(&OplogEntry) -> bool,
+    ) -> Result<OplogWindow> {
         let txn = self.db().begin_read()?;
         let oplog = txn.open_table(tables::OPLOG)?;
         let lower = codec::oplog_key_lower_bound(from);
@@ -360,7 +378,12 @@ impl Engine {
         // end of the oplog as much as a range that runs out is.
         let mut window = OplogWindow { exhausted: true, ..OplogWindow::default() };
         for entry in oplog.range(lower.as_slice()..)? {
-            let (_, value) = entry?;
+            let (key, value) = entry?;
+            let stamp = codec::decode_oplog_key(key.value())?;
+            if skip(&stamp) {
+                window.scanned_to = stamp.hlc;
+                continue;
+            }
             let entry = codec::decode_oplog_entry(value.value())?;
             // Every entry the scan *examines* moves the window's end, kept or
             // not: the peer has read past it either way, and a stamp it will

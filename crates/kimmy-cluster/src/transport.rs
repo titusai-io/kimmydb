@@ -268,8 +268,12 @@ where
                 // an arbitrary one would let it ask for the whole oplog in a
                 // single frame.
                 let limit = limit.min(MAX_BATCH);
+                // What the peer has already processed of each origin is not
+                // served again: the threshold is one stamp for every origin,
+                // and without this a caught-up peer is re-served the whole
+                // oplog above its oldest position (ADR-171).
                 let window = engine
-                    .entries_for_peer(from, limit)
+                    .entries_for_peer_holding(from, limit, held.as_ref())
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
                 // Large entries can put a full batch over the frame limit. Failing the
@@ -566,8 +570,10 @@ pub async fn push_entry(
                     .into(),
             )));
         }
+        // The window a pull from the member's position would be served, what
+        // it has processed passed over (ADR-171).
         let mut window = engine
-            .entries_for_peer(from, MAX_BATCH)
+            .entries_for_peer_holding(from, MAX_BATCH, Some(&held))
             .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         if let Fits::Only(fits) = how_many_fit(&window.entries) {
             if fits == 0 {
@@ -579,7 +585,7 @@ pub async fn push_entry(
             // Re-read at the smaller limit rather than trim: the end the
             // window reports must match the entries it carries (ADR-127).
             window = engine
-                .entries_for_peer(from, fits)
+                .entries_for_peer_holding(from, fits, Some(&held))
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         }
         if !window.entries.iter().any(|e| e.stamp == entry.stamp) {

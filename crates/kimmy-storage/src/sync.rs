@@ -509,7 +509,46 @@ impl Engine {
     /// filtering afterwards is what let a withheld violation disguise a
     /// truncated window as a tail (ADR-126).
     pub fn entries_for_peer(&self, from: Hlc, limit: usize) -> Result<OplogWindow> {
-        self.read_oplog_from_where(from, limit, |entry| entry.kind != OpKind::UniqueViolation)
+        self.entries_for_peer_holding(from, limit, None)
+    }
+
+    /// [`Self::entries_for_peer`] for a peer that said what it has processed:
+    /// every entry at or below `held` for its own origin is passed over, unread
+    /// and uncounted (ADR-171).
+    ///
+    /// **Why.** `from` is one threshold for every origin — the requester's own
+    /// position on whichever origin it trails most (`VersionVector::behind`) —
+    /// and the oplog sorts by stamp across origins, so a range read from it
+    /// re-serves every entry of every *other* origin above that threshold. One
+    /// write on a member quiet for an hour made each peer re-read the whole
+    /// oplog above that member's previous write: measured on a three-member
+    /// cluster at about 300 back-to-back pulls and 300,000 entries per peer,
+    /// every one of them applied as superseded, for one document.
+    ///
+    /// **Why it is safe.** `held` is the requester's witnessed vector, the
+    /// one `from` was derived from, so every skipped entry is one it has
+    /// processed; its vector only rises while the window is in flight. What
+    /// the window carries for each origin therefore begins exactly where the
+    /// requester's history of that origin ends, which is the contiguity the
+    /// coverage rule and ADR-143's invariant rest on, and a skipped entry
+    /// still moves `scanned_to` the way a withheld violation does, so the
+    /// window reports the end it really reached (ADR-127). `limit` counts only
+    /// what is sent, so a window truncated at the cap still ends at its last
+    /// entry (ADR-126). `None` serves the whole range, as a requester that
+    /// sent no vector — or a repair re-serving below its position (ADR-148) —
+    /// asked for.
+    pub fn entries_for_peer_holding(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+    ) -> Result<OplogWindow> {
+        self.read_oplog_from_skipping(
+            from,
+            limit,
+            |stamp| held.is_some_and(|held| stamp.hlc <= held.get(stamp.node)),
+            |entry| entry.kind != OpKind::UniqueViolation,
+        )
     }
 
     /// Merge a batch of entries received from a peer.

@@ -10,7 +10,33 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## 0.28.1 - 2026-09-15
+## Unreleased
+
+### Fixed
+
+- **One write on a quiet member no longer makes every peer re-read the oplog
+  above that member's previous write.** A pull asks from one position for every
+  origin, the peer's own position on whichever origin it trails most, and the
+  window read from it carried every other origin's entries above that position,
+  which the puller already held. So one document written on a member whose
+  previous local write was an hour old cost each peer a run of back-to-back
+  pulls that applied nothing. It was measured on a three-member cluster at 306
+  pulls and about 313,000 entries per peer in 67 s, and on 0.28.1 at 282 pulls
+  in 56 s. Every version roll triggered it once per member, because a member
+  rewrites its topology record when its build changes. A window now passes over
+  every entry the puller has already processed of that entry's origin, judged on
+  the vector the puller already sends with its request, so the same write is one
+  pull. The skipped entries are judged on their keys and never decoded.
+  [ADR-171](docs/decisions.md) has the reasoning and why nothing a puller lacks
+  can be skipped.
+
+  **Nothing to decide before upgrading, and no ordering in the roll.** Nothing on
+  the wire changes: the vector was already sent. A member serves the shorter
+  window from the moment it runs this release, whatever build pulls from it. A
+  member still on the previous build serves the old window, so the roll itself
+  can still show the drain against members not yet rolled. No new `/metrics`
+  series. The `merged from peer` line reads the same, with fewer `pulls` and no
+  run of `applied 0`.
 
 ### Fixed
 

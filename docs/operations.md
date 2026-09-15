@@ -810,6 +810,29 @@ The four readings:
   applied, and a peer draining a backlog emits it every tick with a large
   `pulls` and a large `applied`.
 
+**A caught-up member can be re-served entries it already holds, and the log
+shows it as pulls that apply nothing.** A pull asks from one position for every
+origin: this node's position on whichever origin it trails the peer on most.
+When a member writes after a long quiet spell, that position is its previous
+write, and the peer's oplog above it holds everything every *other* member wrote
+since. Before [ADR-171](decisions.md), all of it was served again. The shape on
+each peer of the member that wrote is a `merged from peer` line naming that
+member every tick, with `pulls` near the tick's budget and `applied 0`, for as
+long as the re-read takes. It ends with one line applying the write. Measured on
+a three-member cluster: 306 pulls and about 313,000 entries per peer, over 67 s,
+for one document. A version roll produced it once per member, because a member
+rewrites its topology record when its build changes, and a plain restart did
+not. Nothing was applied twice, nothing reached a change stream twice, and
+repair and failure counters stayed at 0; the cost was reading and decoding.
+
+Since ADR-171 a window passes over every entry the puller has already processed
+of that entry's origin, so the same write is one pull applying one entry. What
+you can still see is a member serving from a build before ADR-171, during a
+roll. A run of `applied 0` pulls against a peer on this release is not this: it
+is a peer re-serving entries this member has not processed, which is a backlog
+it trails on, or entries above the vector the peer advertised
+(`kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`).
+
 **Why the check does not simply run anyway on a truncated round.** Because a
 truncated pull manufactures the finding. The existence half reports only "the
 peer holds it and I do not", and on a round that did not reach the peer's

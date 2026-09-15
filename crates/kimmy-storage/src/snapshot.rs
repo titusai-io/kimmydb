@@ -3883,6 +3883,39 @@ mod tests {
     }
 
     #[test]
+    fn a_held_document_above_the_requesters_position_is_still_served_and_released() {
+        // ADR-171 against ADR-169. A window served to a peer passes over what
+        // the peer has processed, judged on the peer's witnessed vector. A held
+        // snapshot document is not processed -- `Hold` raises neither vector --
+        // so it sits above that vector, is served, and is released as ADR-169
+        // says. A skip judged on anything that covered it would leave the mark.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let (b, _db) = engine();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some());
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        assert!(b.held_len().unwrap() >= SNAPSHOT_PAGE, "the fixture must hold a page");
+
+        let held = b.witnessed_vector().unwrap();
+        let from = held.behind(&a.version_vector().unwrap()).expect("B trails A");
+        let window = a.entries_for_peer_holding(from, usize::MAX, Some(&held)).unwrap();
+        assert!(window.exhausted);
+        b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
+
+        assert_eq!(b.held_len().unwrap(), 0, "every held document was served and released");
+        assert_eq!(
+            b.version_vector().unwrap().get(a.node_id()),
+            a.version_vector().unwrap().get(a.node_id())
+        );
+    }
+
+    #[test]
     fn an_entry_re_delivered_out_of_position_keeps_its_mark() {
         // The release is for an entry arriving as HISTORY. The same page pulled
         // again is still state, in key order, and must leave the marks and the

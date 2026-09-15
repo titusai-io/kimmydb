@@ -1198,19 +1198,144 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
         "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
     );
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
-    // An incremental round re-serves the tail B already holds and reports it
-    // superseded; a snapshot reports only what it applied. That is the tell.
+    // Per origin, nothing B lacks is gone, which is the answer the served
+    // `AskEntries` arm gives on the vector B sends with its request. This used
+    // to be read off the round instead, as a re-served tail reported
+    // superseded; since ADR-171 a window passes over what B has processed, so
+    // an oplog round and a snapshot both report nothing superseded here.
     assert!(
-        outcome.superseded > 0,
-        "the round must be served from the oplog, not a snapshot: {outcome:?}"
+        a.engine.can_serve_peer_holding(&held).unwrap(),
+        "per origin, A can serve B from the oplog"
     );
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(outcome.applied, 1, "{outcome:?}");
+    assert_eq!(outcome.superseded, 0, "and nothing B holds is served again: {outcome:?}");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(b.engine.get(&cb, &DocId::String("a-after-restart".into())).unwrap().is_some());
 
     let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "and B is then caught up: {second:?}");
+}
+
+// -----------------------------------------------------------------------
+// A caught-up member is not re-served what it holds (ADR-171)
+
+/// Pull into `into` from `from` until a pull reaches the peer's tail, the way
+/// one tick's contact drains a peer (ADR-157). Each pull's outcome, in order.
+async fn drain(into: &Node, from: &Node) -> Vec<kimmy_storage::SyncOutcome> {
+    let mut pulls = Vec::new();
+    loop {
+        let outcome = sync_once(&into.engine, from.addr, SECRET, None).await.expect("pull");
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated {
+            return pulls;
+        }
+        assert!(pulls.len() < 1_000, "a drain that does not end");
+    }
+}
+
+/// Entries a busy member writes after a quiet member's last write: more than
+/// four full windows, so a peer re-served them needs at least five pulls.
+const BUSY: usize = 4 * kimmy_cluster::protocol::MAX_BATCH + 100;
+
+fn busy_documents(prefix: &str) -> Vec<bson::Document> {
+    (0..BUSY).map(|i| doc! { "_id": format!("{prefix}-{i}") }).collect()
+}
+
+/// Three converged members: B wrote once and then went quiet, and A then wrote
+/// [`BUSY`] entries that B and C both hold. C's position on B is B's quiet
+/// write, below every one of A's.
+async fn a_quiet_member_among_caught_up_peers() -> (Node, Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-first" }).unwrap();
+    converge(&a, &b, &c).await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-quiet" }).unwrap();
+    converge(&a, &b, &c).await;
+
+    a.engine.insert_many(&ca, busy_documents("busy")).unwrap();
+    drain(&b, &a).await;
+    drain(&c, &a).await;
+    (a, b, c)
+}
+
+#[tokio::test]
+async fn one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer() {
+    // The finding: one document written on a member whose previous local write
+    // was forty minutes old made each peer re-read the oplog above that write,
+    // about 300 back-to-back pulls applying nothing. The threshold is the
+    // peer's position on the quiet member, and the range read from it carried
+    // every other origin's entries above it, which the peer already held.
+    let (a, b, c) = a_quiet_member_among_caught_up_peers().await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-after-quiet" }).unwrap();
+
+    let held = c.engine.witnessed_vector().unwrap();
+    let from = held.behind(&b.engine.version_vector().unwrap()).expect("C trails B by one write");
+    let above = b.engine.read_oplog_from(from, usize::MAX).unwrap().len();
+    assert!(above > BUSY, "the fixture must put A's writes above C's position on B: {above}");
+    assert!(held.get(a.engine.node_id()) > from, "and C must already hold them");
+
+    let started = std::time::Instant::now();
+    let pulls = drain(&c, &b).await;
+    let superseded: usize = pulls.iter().map(|p| p.superseded).sum();
+    eprintln!(
+        "one write after {above} entries: {} pulls, {} superseded, {:?}",
+        pulls.len(),
+        superseded,
+        started.elapsed()
+    );
+    assert_eq!(
+        pulls.len(),
+        1,
+        "one write is one pull, not a pass over the {above} entries C holds: {pulls:?}"
+    );
+    assert_eq!(pulls[0].applied, 1, "{:?}", pulls[0]);
+    assert_eq!(superseded, 0, "nothing C had processed is served to it again");
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert!(c.engine.get(&cc, &DocId::String("b-after-quiet".into())).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() {
+    // The guard on the other side: passing over what a peer has processed must
+    // be judged per origin. C has pulled one window of A's writes and has then
+    // written past all of them itself, so its vector's newest stamp is above
+    // everything of A's it still lacks. B serves C, and C must end holding all
+    // of A's writes.
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    converge(&a, &b, &c).await;
+    a.engine.insert_many(&ca, busy_documents("busy")).unwrap();
+    drain(&b, &a).await;
+    let first = sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(first.truncated, "C must stop partway through A: {first:?}");
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    c.engine.insert(&cc, doc! { "_id": "c-later" }).unwrap();
+    let held = c.engine.witnessed_vector().unwrap();
+    let c_own = held.get(c.engine.node_id());
+    let a_part = held.get(a.engine.node_id());
+    assert!(
+        c_own > a.engine.version_vector().unwrap().get(a.engine.node_id()) && a_part < c_own,
+        "the fixture must put C's newest stamp above everything of A's it lacks"
+    );
+
+    drain(&c, &b).await;
+    assert_eq!(
+        c.engine.count(&cc).unwrap(),
+        BUSY as u64 + 1,
+        "every write of A's C lacked arrives from B"
+    );
+    assert_eq!(
+        c.engine.witnessed_vector().unwrap().get(a.engine.node_id()),
+        b.engine.version_vector().unwrap().get(a.engine.node_id())
+    );
 }
 
 #[tokio::test]
