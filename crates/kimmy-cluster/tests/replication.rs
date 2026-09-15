@@ -1654,11 +1654,14 @@ async fn a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_
 }
 
 #[tokio::test]
-async fn a_span_is_named_again_once_the_peer_has_moved_on_its_origin() {
-    // The re-ask. A answered R's span without d10 or d20, so the span is left
-    // out. A then takes d10 in position and moves on O's origin, and the next
-    // round names the span again from its bottom: d10 is released, and d20,
-    // which A still lacks, stays held.
+async fn a_peer_moving_on_the_origin_does_not_re_walk_an_answered_span() {
+    // A answered R's span without d10 or d20, so the span is left out. A then
+    // takes d10 below the resume point and moves on O's origin. Entries below
+    // the resume point were walked and did not carry d10, and a move re-walking
+    // from the bottom costs the whole span on every tick of a busy origin, so
+    // the round does not name the span again: it pulls d30 alone. d10 waits for
+    // the record's expiry (`MARKS_REASK_AFTER`), which the resume points' unit
+    // test pins.
     let (o, a, r) = holed_members(30, &[10, 20], &[10, 20]).await;
     let mut stalls = PeerStalls::new();
     let first = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
@@ -1679,12 +1682,70 @@ async fn a_span_is_named_again_once_the_peer_has_moved_on_its_origin() {
     o.engine.insert(&co, doc! { "_id": "d30" }).unwrap();
     sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
 
-    sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    let third = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!((third.applied, third.superseded), (1, 0), "d30 alone: {third:?}");
     let spans = r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap();
     assert!(
-        spans.len() == 1 && spans[0].from == spans[0].through,
-        "d10 released and d20 still held: {spans:?}"
+        spans.len() == 1 && spans[0].from < spans[0].through,
+        "d10 and d20 still held: {spans:?}"
     );
+}
+
+#[tokio::test]
+async fn continuous_writes_on_a_span_origin_do_not_re_walk_the_span_every_tick() {
+    // The livelock a re-ask from the bottom brings back under continuous
+    // writes. R's span, d10 to d4990, is wider than the scaled-down ceiling
+    // below: 4,979 entries A holds, five windows. A lacks d10, and O keeps
+    // writing. Once the span has been walked, each tick must bring R the new
+    // writes in one pull, never re-walking the span.
+    const CEILING: usize = 4; // a tick's pull ceiling, scaled down from MAX_PULLS_PER_CONTACT
+    const PER_TICK: usize = 10;
+    let (o, a, r) = holed_members(5_000, &[10], &[10, 4_990]).await;
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    let mut stalls = PeerStalls::new();
+
+    let mut walk = 0;
+    loop {
+        walk += 1;
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        if !outcome.truncated {
+            break;
+        }
+        assert!(walk < 20, "the first walk must end");
+    }
+    assert!(walk > CEILING, "the span must be wider than the ceiling: {walk} pulls");
+
+    for tick in 0..3 {
+        let docs = (0..PER_TICK).map(|i| doc! { "_id": format!("t{tick}-{i}") }).collect();
+        o.engine.insert_many(&co, docs).unwrap();
+        drain(&a, &o).await;
+
+        let mut pulls = Vec::new();
+        loop {
+            let outcome =
+                sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+            let truncated = outcome.truncated;
+            pulls.push(outcome);
+            if !truncated || pulls.len() >= CEILING {
+                break;
+            }
+        }
+        let superseded: Vec<usize> = pulls.iter().map(|p| p.superseded).collect();
+        assert!(
+            pulls.len() < CEILING && !pulls.last().unwrap().truncated,
+            "tick {tick} hit the ceiling: {superseded:?}"
+        );
+        assert!(
+            pulls.len() <= PER_TICK.div_ceil(1024) + 1,
+            "tick {tick}: {} pulls for {PER_TICK} new entries: {superseded:?}",
+            pulls.len()
+        );
+        for i in 0..PER_TICK {
+            let id = DocId::String(format!("t{tick}-{i}"));
+            assert!(r.engine.get(&cr, &id).unwrap().is_some(), "tick {tick}'s writes arrive");
+        }
+    }
 }
 
 #[tokio::test]

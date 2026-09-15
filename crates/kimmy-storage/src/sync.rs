@@ -632,9 +632,10 @@ impl Engine {
         Ok(self.held_marks_covered_by(witnessed)?.into_iter().map(|(span, _)| span).collect())
     }
 
-    /// [`Self::held_ranges_covered_by`], with how many marks each span covers:
-    /// what a pull's resume points are invalidated by, since more marks on an
-    /// origin can mean a held entry below where a span last resumed.
+    /// [`Self::held_ranges_covered_by`], with the stamps of the marks each span
+    /// covers, ascending: what a pull's resume points are checked against,
+    /// since a mark added below where a span last resumed is one no window has
+    /// walked.
     ///
     /// **Cost.** A range read of `OPLOG_HELD` up to the highest stamp the
     /// vector names, on every pull that is not a repair. The table is not
@@ -645,14 +646,14 @@ impl Engine {
     pub fn held_marks_covered_by(
         &self,
         witnessed: &VersionVector,
-    ) -> Result<Vec<(MarkedRange, usize)>> {
+    ) -> Result<Vec<(MarkedRange, Vec<Hlc>)>> {
         let Some(highest) = witnessed.iter().map(|(_, hlc)| hlc).max() else {
             return Ok(Vec::new());
         };
         let upper = crate::codec::oplog_key(&Stamp::new(highest, NodeId::from_bytes([0xFF; 16])));
         let txn = self.db().begin_read()?;
         let held = txn.open_table(crate::tables::OPLOG_HELD)?;
-        let mut spans: HashMap<NodeId, (Hlc, Hlc, usize)> = HashMap::new();
+        let mut marks: HashMap<NodeId, Vec<Hlc>> = HashMap::new();
         for row in held.range(..=upper.as_slice())? {
             let (key, _) = row?;
             let Ok(stamp) = crate::codec::decode_oplog_key(key.value()) else {
@@ -661,18 +662,15 @@ impl Engine {
             if stamp.hlc > witnessed.get(stamp.node) {
                 continue;
             }
-            spans
-                .entry(stamp.node)
-                .and_modify(|(lowest, highest, marks)| {
-                    *lowest = (*lowest).min(stamp.hlc);
-                    *highest = (*highest).max(stamp.hlc);
-                    *marks += 1;
-                })
-                .or_insert((stamp.hlc, stamp.hlc, 1));
+            marks.entry(stamp.node).or_default().push(stamp.hlc);
         }
-        let mut out: Vec<(MarkedRange, usize)> = spans
+        let mut out: Vec<(MarkedRange, Vec<Hlc>)> = marks
             .into_iter()
-            .map(|(origin, (from, through, marks))| (MarkedRange { origin, from, through }, marks))
+            .filter_map(|(origin, mut stamps)| {
+                stamps.sort_unstable();
+                let span = MarkedRange { origin, from: *stamps.first()?, through: *stamps.last()? };
+                Some((span, stamps))
+            })
             .collect();
         out.sort_by_key(|(span, _)| (span.from, span.origin));
         Ok(out)

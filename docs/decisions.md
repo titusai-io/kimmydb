@@ -15339,14 +15339,23 @@ spans, each `MarkedRange { origin, from, through }`.
     retention or another peer releases it.
   - A window stopped at a collection this node lacks moves nothing, and nor
     does an answer that is not a window.
-- **When a span is asked from its bottom again.** Any of:
-  - the member holds more marks on that origin than when the resume point was
-    recorded;
-  - the peer now advertises more of that origin than it did;
+- **When a span is asked from its bottom again.** Only in two cases:
+  - a mark has been added below the span's resume point for that peer. Only a
+    snapshot or a repair adds a mark, each once, so this costs one walk per peer
+    per such event;
   - `MARKS_REASK_AFTER` (300 s) has passed since the resume point last moved.
-    A peer can take the missing entry below its own position on an origin that
-    has gone quiet, which moves nothing the requester can see; the five minutes
-    bound how long that release waits.
+    That is the bound on how long a release waits when the peer takes the missing
+    entry below the resume point — by restore, a replay, or its own release on an
+    origin gone quiet. That moves nothing the requester can see.
+- **The peer moving on the span's origin does not re-ask from the bottom.** The
+  entries below the resume point were walked and did not carry the marked entry.
+  Entries above it are named from the resume point, as the span's top rises with
+  what the peer advertises. The first rebuild of this record re-asked from the
+  bottom on every such move. On a peer that keeps receiving writes on that
+  origin, that re-walked the whole span every tick. A span wider than the tick's
+  128-pull ceiling (a day of one origin, the shape ADR-171 measured, is hundreds
+  of thousands of entries) then never reached the backlog above it. That is the
+  livelock again, under continuous writes instead of a pinned mark.
 - **The log.** The requester logs `asking the peer to serve entries this node
   holds as state below its own position` at `INFO`. It is written when the
   spans named to a peer change by origin and upper bound, not on every pull.
@@ -15470,20 +15479,20 @@ lowers, so a span never turns a pull into `BeyondHorizon`.
     released. The span's bottom then rises to the next mark, so a span of
     servable marks costs about one window per run of marks lying within 1,024
     entries of each other.
-- **After a span is dropped.** Nothing, until one of the reopening conditions
-  above holds. The three conditions cost differently:
-  - **Marks grown** is rare: a repair or snapshot brought more.
-  - **Record expiry** re-walks a span no peer can serve once every five minutes
-    per peer, until retention collects the marks.
-  - **The peer moving on the origin** is the expensive one. A peer that keeps
-    writing to that origin, or keeps receiving its writes, moves on it every
-    tick. If that peer still lacks the entry, the span is walked again every
-    tick: ⌈W / 1,024⌉ extra pulls per tick per such peer, for as long as the
-    marks live. That is bounded per tick, and replication beneath it progresses.
-    It is the cost of reopening on the peer's movement, which is what covers a
-    peer gaining the entry by restore, replay or its own release. A cheaper
-    reopening, probing only the held entries' exact stamps, needs the marks
-    themselves on the wire, and is not built.
+- **After a span is dropped.** Nothing per tick. The peer moving on the origin
+  names only what lies above the resume point, which the ordinary ask walks
+  anyway. The two reopenings each re-walk the span from its bottom once:
+  - **A mark added below the resume point.** Once per peer per snapshot or
+    repair that added one.
+  - **Record expiry.** Once every five minutes per peer, until retention collects
+    the marks or a release empties the span.
+  - **Spans wider than the ceiling.** A re-walk wider than a tick's pull ceiling
+    carries its resume point across ticks. It delays the backlog above the span
+    on that contact by ⌈W / 1,024⌉ / 128 ticks, once per reopening, and never
+    stops it.
+  - **What is not detected.** A mark added below the resume point while another
+    below it is released in the same interval leaves the count unchanged. It
+    waits for the expiry.
 - **Memo entries.** Entries for a peer that leaves the cluster are not pruned.
   They are a few bytes per origin and go with the process, as the other per-peer
   memos in `PeerStalls` do.
@@ -15573,7 +15582,11 @@ entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
   reproduction two, the shared hole. Three pulls, ⌈2,890 / 1,024⌉.
 - `a_span_the_peer_answered_is_not_named_again_on_the_next_round`: the resume
   points' wiring across two rounds.
-- `a_span_is_named_again_once_the_peer_has_moved_on_its_origin`: the re-ask.
+- `a_peer_moving_on_the_origin_does_not_re_walk_an_answered_span`: the peer's
+  movement names only what is above the resume point.
+- `continuous_writes_on_a_span_origin_do_not_re_walk_the_span_every_tick`: a span
+  wider than a scaled-down pull ceiling of 4, under continuous writes. Every
+  tick's writes arrive in one pull, and no tick reaches the ceiling.
 - `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`:
   what an older sender is asked.
 - `a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it`:

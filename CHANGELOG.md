@@ -71,9 +71,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
   A span is walked once, a window at a time, from where the last window left
   it. Once a peer has been walked across a span, the span is dropped for that
-  peer. It is asked again when the member holds more marks on that origin, when
-  the peer moves on that origin, or after five minutes. So a peer that cannot
-  serve a span's lowest entry no longer pins the pull.
+  peer. It is asked from its bottom again only when a snapshot or repair adds a
+  mark below where it resumed, or after five minutes. So neither a peer that
+  cannot serve a span's lowest entry nor continuous writes on its origin pin the
+  pull.
 
   **Nothing to decide before upgrading, and no ordering in the roll.** The field
   is defaulted, and an older member sends none. A pull's `from` is never lowered
