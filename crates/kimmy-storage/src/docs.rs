@@ -896,7 +896,7 @@ impl Engine {
             return Ok(false);
         }
         let txn = self.begin_write(WriterHolder::Replication)?;
-        let RemoteApplied::Applied { id, violations } =
+        let RemoteApplied::Applied { id, violations, .. } =
             self.apply_remote_in_txn(&txn, coll, entry, Position::Raise)?
         else {
             // Nothing was written, so nothing is committed — a superseded
@@ -945,7 +945,7 @@ impl Engine {
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
             self.witness(&entry.stamp);
-            return Ok(RemoteApplied::Superseded);
+            return Ok(RemoteApplied::Superseded { released: false });
         };
 
         let key = doc_key(&id)?;
@@ -976,12 +976,12 @@ impl Engine {
                 // now arrived as history, so its mark goes and the vectors
                 // cover it (ADR-169). Nothing is appended and nothing
                 // published; the entry already has both.
-                if position == Position::InWindow {
+                let released = position == Position::InWindow && {
                     drop(docs);
-                    crate::engine::release_held_in_position(txn, &entry.stamp)?;
-                }
+                    crate::engine::release_held_in_position(txn, &entry.stamp)?
+                };
                 self.witness(&entry.stamp);
-                return Ok(RemoteApplied::Superseded);
+                return Ok(RemoteApplied::Superseded { released });
             }
 
             // The previous image is needed to remove the index entries it
@@ -1019,13 +1019,13 @@ impl Engine {
             violations
         };
 
-        crate::engine::append_oplog_at(txn, entry, position)?;
+        let released = crate::engine::append_oplog_at(txn, entry, position)?;
 
         // Advance the local clock past what we just accepted, so a subsequent
         // local write is ordered after it.
         self.witness(&entry.stamp);
 
-        Ok(RemoteApplied::Applied { id, violations })
+        Ok(RemoteApplied::Applied { id, violations, released })
     }
 
     /// The part of a replicated write that must follow its commit: count and
@@ -1164,10 +1164,14 @@ pub(crate) enum RemoteApplied {
         /// recorded yet: [`Engine::report_remote_write`] does both once the
         /// write is durable.
         violations: Vec<index::UniqueViolation>,
+        /// Whether its append met the entry already in the oplog and released
+        /// a held mark there (ADR-169), for the caller to count on commit.
+        released: bool,
     },
     /// The entry lost, or named no document. The transaction is exactly as
-    /// it was.
-    Superseded,
+    /// it was, save for a held mark released on arrival in a window
+    /// (ADR-169), which `released` reports for the caller to count on commit.
+    Superseded { released: bool },
 }
 
 /// A group's identity for deduplication: its ids, order-free.

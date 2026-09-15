@@ -733,9 +733,13 @@ impl Engine {
     fn commit_run(&self, run: &mut Run<'_>) -> Result<()> {
         let Some(txn) = run.txn.take() else {
             debug_assert!(run.pending.is_empty(), "applied entries without a transaction");
+            debug_assert_eq!(run.released, 0, "released marks without a transaction");
             return Ok(());
         };
         txn.commit()?;
+        // Counted only now: a release in a run that failed to commit did not
+        // happen, and the next window releases it again (ADR-169's addendum).
+        self.count_held_marks_released(std::mem::take(&mut run.released));
         let mut published = Vec::with_capacity(run.pending.len());
         let mut failed = None;
         for Pending { collection, entry, id, violations } in run.pending.drain(..) {
@@ -910,6 +914,8 @@ pub(crate) struct Memo {
 struct Run<'e> {
     txn: Option<WriteTxn<'e>>,
     pending: Vec<Pending>,
+    /// Held marks released into `txn` (ADR-169), counted when it commits.
+    released: u64,
 }
 
 /// An entry applied into the open run, with what its commit owes.
@@ -1130,13 +1136,18 @@ impl Engine {
 
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, position)? {
-            RemoteApplied::Applied { id, violations } => {
+            RemoteApplied::Applied { id, violations, released } => {
                 outcome.applied += 1;
+                run.released += u64::from(released);
                 run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
             }
             // Nothing was written, so the run's transaction is exactly as it
-            // was; the next entry carries on in it.
-            RemoteApplied::Superseded => outcome.superseded += 1,
+            // was — save a held mark released — and the next entry carries on
+            // in it.
+            RemoteApplied::Superseded { released } => {
+                outcome.superseded += 1;
+                run.released += u64::from(released);
+            }
         }
         Ok(Step::Taken)
     }
