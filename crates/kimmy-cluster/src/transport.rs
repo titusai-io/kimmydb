@@ -1349,16 +1349,18 @@ pub struct PeerStalls {
 }
 
 /// Where one origin's held span resumes against one peer (ADR-172).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SpanAsked {
     /// Where the next request for this origin's span starts: past every entry
     /// of it the peer has served, or past its top once a window reached the
     /// peer's tail.
     resume: Hlc,
-    /// The marks below `resume` when this was recorded. More of them since is
-    /// a mark added where no window from this peer has walked, so the record
-    /// is dropped and the span asked from its bottom.
-    below: usize,
+    /// The marks below `resume` when this was last asked, ascending. A mark
+    /// below `resume` that is not among them was added where no window from
+    /// this peer has walked, so the record is dropped and the span asked from
+    /// its bottom. Kept as the stamps rather than a count: a mark released and
+    /// a lower one added in the same interval leave a count unchanged.
+    below: Vec<Hlc>,
     /// When the record last moved.
     at: std::time::Instant,
 }
@@ -1506,9 +1508,11 @@ impl PeerStalls {
     /// it.
     ///
     /// The record is dropped, and the span asked from its bottom, only when a
-    /// mark has been added below the resume point, which only a snapshot or a
-    /// repair does and each once, or [`MARKS_REASK_AFTER`] after the record
-    /// last moved. Origins no longer held are forgotten.
+    /// mark below the resume point is one it did not hold when last asked,
+    /// which only a snapshot or a repair adds and each once, or
+    /// [`MARKS_REASK_AFTER`] after the record last moved. Nothing resets the
+    /// resume point in the middle of a walk. Origins no longer held are
+    /// forgotten.
     pub fn marks_to_ask(
         &mut self,
         peer: NodeId,
@@ -1523,16 +1527,17 @@ impl PeerStalls {
         for (span, marks) in current {
             let key = (peer, span.origin);
             if let Some(asked) = self.marks_asked.get(&key) {
-                let below = marks.partition_point(|mark| *mark < asked.resume);
-                if below > asked.below
-                    || now.saturating_duration_since(asked.at) >= MARKS_REASK_AFTER
-                {
+                let below_now = marks.partition_point(|mark| *mark < asked.resume);
+                let added =
+                    marks[..below_now].iter().any(|mark| asked.below.binary_search(mark).is_err());
+                if added || now.saturating_duration_since(asked.at) >= MARKS_REASK_AFTER {
                     self.marks_asked.remove(&key);
                 }
             }
             let from = match self.marks_asked.get_mut(&key) {
                 Some(asked) => {
-                    asked.below = marks.partition_point(|mark| *mark < asked.resume);
+                    let below_now = marks.partition_point(|mark| *mark < asked.resume);
+                    asked.below = marks[..below_now].to_vec();
                     asked.resume.max(span.from)
                 }
                 None => span.from,
@@ -1573,7 +1578,7 @@ impl PeerStalls {
                     None => span.from,
                 }
             };
-            let below = marks.partition_point(|mark| *mark < resume);
+            let below = marks[..marks.partition_point(|mark| *mark < resume)].to_vec();
             self.marks_asked.insert((peer, span.origin), SpanAsked { resume, below, at: now });
         }
     }
@@ -2324,6 +2329,12 @@ mod tests {
             stalls.marks_to_ask(peer, held(&[10, 150]), t0),
             vec![span(at(100).successor(), 150)],
             "a mark added above the resume point is named from the resume point"
+        );
+        stalls.marks_served(peer, None, true, t0);
+        assert_eq!(
+            stalls.marks_to_ask(peer, held(&[5, 150]), t0),
+            vec![span(at(5), 150)],
+            "one mark released and a lower one added, the count unchanged: from the bottom"
         );
         stalls.marks_served(peer, None, true, t0);
         assert_eq!(

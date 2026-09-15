@@ -637,8 +637,9 @@ impl Engine {
     /// since a mark added below where a span last resumed is one no window has
     /// walked.
     ///
-    /// **Cost.** A range read of `OPLOG_HELD` up to the highest stamp the
-    /// vector names, on every pull that is not a repair. The table is not
+    /// **Cost.** A read of `OPLOG_HELD` on every pull that is not a repair,
+    /// capped at the highest stamp the vector names. That stamp is about now,
+    /// so in practice the cap excludes nothing and the whole table is read. The table is not
     /// empty on every member: a member that completed a whole-database
     /// snapshot against a busy sender holds the marks above the grant, and one
     /// mid-snapshot holds each page it has applied (see the table's note).
