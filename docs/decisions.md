@@ -15058,7 +15058,8 @@ with what that cost.
 1. **The walk writes to an unlinked temporary file in the data directory, and the
    response streams that file.** The file is created beside `kimmy.redb` under
    a name no other file holds, with mode `0600`, and unlinked at once, before the
-   walk begins. It is written through a 64 KiB buffer under the walk's one read
+   walk begins. Unix is assumed: removing an open file's name and reading on
+   through its descriptor are Unix semantics, and only there is the mode set. It is written through a 64 KiB buffer under the walk's one read
    transaction. The `tempfile` crate would do the same, but its Linux build
    brings `linux-raw-sys` into the default dependency graph (ADR-016's
    correction), which is not worth one call. It is then rewound and sent in
@@ -15086,6 +15087,11 @@ with what that cost.
    `event` `backup failed`, in ADR-144's layout, and its `message` names the
    directory and keeps the operating system's error, typically `No space left on
    device`. The file is unlinked, so a failure leaves no partial backup behind.
+   A panic in the blocking task is answered the same way: logged at `ERROR`
+   and answered `500` without its text. One failed spill logs two `ERROR`
+   lines: the route's `backup failed`, and `storage failure` from the
+   conversion every storage error passes through. They are left as two, and the
+   route's line is the one that names the directory.
 5. **One series.** `kimmy_backup_duration_seconds` is a histogram with buckets
    from 1 s to 3,600 s, recorded when the backup exists and before it is sent,
    beside `kimmy_backups_total`, which is its count.
@@ -15145,6 +15151,11 @@ elsewhere would be set without evidence.
   client's two timeouts, against a stub that delays the head and then the body.
 - The metrics golden text, the ordered-series test, the operations.md metrics
   table test, and `every_metrics_series_reaches_the_bridge`, for the histogram.
+- **Not held by a test:** decision 2, a blocking thread rather than
+  `block_in_place`. `spill_with` wraps the walk in `blocking(`, which satisfies
+  ADR-153's source scan on its own, and the deadline test would also pass for a
+  handler that never yields, since the deadline cannot fire inside one. What
+  holds it is the code and this record.
 - **Not held by a test:** that the handler's heap does not track the backup's
   size. No in-process signal distinguishes it: `kimmy_process_resident_bytes`
   reads `/proc` and is the whole test process. It rests on review, since the

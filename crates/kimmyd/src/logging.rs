@@ -960,6 +960,14 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          the writer (ADR-151). Its two summaries — the writes that gave up waiting, \
          and the longest hold — are observable and are on the bridge.",
     ),
+    (
+        "kimmy_backup_duration_seconds",
+        "A histogram, and OpenTelemetry has no observable histogram, so its buckets \
+         stay on /metrics for the same reason as the two above. Its sum is bridged \
+         as kimmy.backup.duration_seconds and its count is kimmy.backups, so a \
+         collector still has how many backups ran and how long they took in total \
+         (ADR-170).",
+    ),
 ];
 
 #[cfg(test)]

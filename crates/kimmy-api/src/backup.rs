@@ -81,6 +81,8 @@ fn unlinked_file_in(dir: &Path) -> io::Result<std::fs::File> {
         options.read(true).write(true).create_new(true);
         // Every document on the node, users' password hashes included: no
         // other account reads it in the instant it has a name.
+        // Unix is assumed throughout: removing an open file's name, and
+        // reading it on through the descriptor, is Unix semantics (ADR-170).
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(&path) {
