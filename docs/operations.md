@@ -1309,10 +1309,17 @@ space comes back when the transfer ends ([ADR-170](decisions.md)).
   the transfer together. A backup that runs out of space answers `500`, and the
   `ERROR` line with `event` `backup failed` names the directory and the operating
   system's error.
-- **Memory**: one read chunk. Until 0.29.0 the finished backup was held in the heap
-  until the client had read the last byte, and that was the cost that mattered: an
-  808 MB backup took a member to 1,789 MiB of its 2 GiB container limit, and one
-  of the same size in an earlier round to 1,838 MiB.
+- **Memory**: redb's page cache, filled to its cap. The walk reads every page of
+  the store through redb's read cache, so on a store larger than
+  `storage.cache_bytes` the member's anonymous memory rises to the cache cap
+  (256 MiB by default) during the walk and stays there under the allocator
+  afterwards, as any full read does. The spilled backup itself is file-backed
+  and not resident; the handler adds one read chunk. Measured on 0.29.0: a
+  531 MB backup on a partly warm cache raised resident memory by 91 MiB. Until
+  0.29.0 the finished backup was also held in the heap until the client had read
+  the last byte, and that was the cost that mattered: an 808 MB backup took a
+  member to 1,789 MiB of its 2 GiB container limit, and one of the same size in
+  an earlier round to 1,838 MiB.
 
 **The request deadline does not apply to this route**, as it does not apply to a
 change stream: `server.request_timeout_secs` would otherwise cut every real
@@ -1428,7 +1435,7 @@ partially read.
 | Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
-| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. **`kimmy_process_resident_bytes` is the whole of it**, as the kernel counts it; size a container limit from that gauge, not from the two byte gauges, which each bound one part. It does not come down promptly by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and the allocator hands freed heap back to the kernel in whole segments on its own schedule — a 0.24.0 member sat at its limit for eleven minutes after the load on it ended, came down to a third, and went back up with nothing running (see below). A restart is the certain reset; `kimmy_process_resident_peak_bytes` says what the last run climbed to. A backup is not a contributor: it is spilled to disk rather than held in the heap ([ADR-170](decisions.md)) |
+| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. **`kimmy_process_resident_bytes` is the whole of it**, as the kernel counts it; size a container limit from that gauge, not from the two byte gauges, which each bound one part. It does not come down promptly by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and the allocator hands freed heap back to the kernel in whole segments on its own schedule — a 0.24.0 member sat at its limit for eleven minutes after the load on it ended, came down to a third, and went back up with nothing running (see below). A restart is the certain reset; `kimmy_process_resident_peak_bytes` says what the last run climbed to. A backup adds no more than a full read does: it walks every page through redb's read cache, so on a store larger than `storage.cache_bytes` it fills the cache to its cap (256 MiB by default), which then stays under the allocator — a 531 MB backup on a partly warm cache measured +91 MiB on 0.29.0. The backup image itself is spilled to a file and is not resident ([ADR-170](decisions.md)) |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly

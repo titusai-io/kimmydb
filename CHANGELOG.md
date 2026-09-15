@@ -26,6 +26,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   stamped after the drop; a resume token from before the drop is still `410`.
   Found in round 0330.
 
+### Documented
+
+- **`docs/operations.md` states what a backup costs in memory.** The walk reads
+  every page of the store through redb's read cache, so on a store larger than
+  `storage.cache_bytes` resident memory rises to the cache cap (256 MiB by
+  default) and stays there under the allocator, as any full read does; the
+  spilled image is file-backed and not resident. Round 0330 measured +91 MiB
+  for a 531 MB backup on a partly warm cache. ADR-170's statement that the heap
+  holds one read chunk carries a correction note.
+
 ## 0.29.0 - 2026-09-15
 
 **A minor. Read the two entries under *Changed* before upgrading.** The backup
