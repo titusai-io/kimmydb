@@ -2256,6 +2256,14 @@ nothing checked" and was quietly false for two milestones. The register framed
 this as "there is no wire protocol", which conceded a premise that was never
 true. There is one. It was undocumented.
 
+> *Correction (0.30.0):* a resume token was portable in that every node
+> accepted it, and not in that a stream resumed on another node continued
+> correctly. It named a position in the issuing node's arrival order, which a
+> node that ordered the same writes differently skipped past or never held.
+> [ADR-173](#adr-173--a-resume-token-carries-its-issuing-members-delivered-vector-and-resumes-on-any-member)
+> makes it resume on any node: exactly on the one that issued it, and without a
+> gap, repeats possible, on any other.
+
 **Rejected: the MongoDB wire protocol.** Three of its prerequisites — cursors,
 `findAndModify`, computed expressions — are M9 tasks that are needed either
 way, so they are not the argument. What is unique to it: an OP_MSG/OP_QUERY
@@ -15778,3 +15786,269 @@ phase.
   decodes.
 - `one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer`: still one pull
   with no marks.
+
+## ADR-173 — A resume token carries its issuing member's delivered vector, and resumes on any member
+
+> **Corrects [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud)'s**
+> "resume tokens that are portable across nodes", which `docs/clients.md`, the
+> Rust and Python clients and `openapi.yaml` repeated as "a reconnect may land
+> elsewhere and continue correctly".
+
+**The defect.** A resume token was the stamp of the last delivered entry, and
+the member a stream opened on translated it to the arrival position at which
+*it* held that entry. A stream follows its member's arrival order, and each
+member orders the same writes differently. Three shapes, each reachable with
+tokens a server issued, and each opening the stream at the tail with no error,
+because "neither held nor collected" read as "newer than anything held":
+- **The resuming member superseded the write.** A write that loses to a newer
+  one is never appended where it lost.
+- **The resuming member was built from a snapshot.** A snapshot carries each
+  document at its current stamp, never the version a token named.
+- **The resuming member had not yet received the write.** This is ordinary
+  failover under replication lag.
+
+Where the resuming member did hold the entry, its position was still its own:
+every entry it had taken in before that one and the issuing member had not yet
+sent was skipped.
+
+**Decision.**
+- **What a token carries.** The stamp of the last delivered entry, as before;
+  the member that issued it; and a **delivered vector** `D`: per origin, a stamp
+  at or below which the issuing stream had taken every entry that member holds,
+  whether by delivering it or by passing over it as out of scope.
+- **How a stream keeps `D`.**
+  - Opened at the tail: this member's witnessed vector, read in the same
+    transaction as the tail position.
+  - Opened `from_start`: empty.
+  - Resumed: the token's `D`.
+  - Raised to the witnessed vector read in the same transaction as a read of
+    the arrival index that reached its end, **once the stream has handed over
+    every entry that read returned**, and not at the read. A token never claims
+    an entry its stream had read but not yet handed over.
+- **Resumed on the member that issued the token.** From just after the token's
+  entry in that member's own arrival order, as before. An entry that member no
+  longer holds is `410`: retention collected it, or a rewind discarded it.
+- **Resumed on any other member.** From the first entry in this member's arrival
+  order that is above `D` for its origin. Every entry at or below `D` is passed
+  over for the life of the stream, including entries that arrive later. An
+  origin this member has collected past `D` (`OPLOG_COLLECTED`) is `410`:
+  entries above `D` may be gone, and nothing says whether the client was sent
+  them. The collected record is capped at what this member witnessed of the
+  origin. On a database an earlier build collected from, the record is seeded
+  from the coarse horizon (`seed_collected_if_untracked`). That can put a quiet
+  or departed origin above anything it ever wrote, and refuse every such token
+  on that member for good.
+- **On both, entries at or below `D` are passed over**, so a stream resumed
+  twice does not re-deliver what the first resume passed over. **Except a
+  `UniqueViolation` entry, which is never passed over.** Each member reports a
+  merge's violation under its own stamp, and peers never serve one another's
+  (they are withheld). So `D` can cover this member's report without the
+  issuing member ever having held it, and passing over it could lose the only
+  report of that merge the client would get. Delivering it can only repeat a
+  report of the same merge.
+- **A single-stamp token**, which every member issued before 0.30.0, resumes as
+  before when the member holds the entry, and is `410` below the oldest retained
+  entry. Otherwise it resumes from the first entry stamped after it, not at the
+  tail.
+- **A rewind is recorded, and keeps the arrival order.**
+  - `rewind_to` writes its target and, per origin, the newest stamp it
+    discarded (`META_REWOUND`), in the transaction that discards them.
+  - A token whose entry a recorded rewind discarded, and which the member does
+    not hold, is `410` there, whoever issued it: the client saw history the
+    member no longer has. A peer sending the entry back does not change that:
+    the rewind's tombstone is stamped after it, so it loses.
+  - The rewind also removes the discarded entries' arrival rows, as retention
+    does. Before this, it left them. The index then no longer covered the
+    oplog, and the next start rebuilt it in stamp order
+    (`rebuild_arrival_index_if_stale`). Every entry the member's streams had
+    delivered moved, so a token that member issued resumed past an entry taken
+    in after the token's but stamped below it.
+- **The incarnation bound.** A collection stream is floored at the collection's
+  last drop
+  ([ADR-081](#adr-081--a-recreated-collection-floors-its-previous-incarnations-at-the-drop),
+  and 0.29.1's bound by stamp).
+  - **Unchanged** for a token this member issued and for a single-stamp token.
+  - **By the drop's stamp** for another member's token. That stream starts from
+    `D`, which ignores scope, so an entry of another collection taken in before
+    the drop can put its start below the drop's position. The position rule
+    then refused a token from the live incarnation, at exactly the moment a
+    client fails over.
+  - Such a token is from the live incarnation when its entry is stamped after
+    the drop or `D` covers the drop. It is `410` otherwise.
+  - The stream passes over every entry of the collection stamped at or before
+    the drop, older drops included. So neither the previous incarnation's
+    history nor a late-arriving older drop reaches it.
+
+**Why `D` makes another member gap-free.** The premise is the one pulls already
+rest on (ADR-054):
+- **What the witnessed vector read in a transaction covers.** Only two kinds of
+  entry. Either it was appended at a position that transaction's arrival index
+  holds, or it was processed without being appended: superseded, refused or
+  declined DDL, or a peer's `UniqueViolation` entry, which is withheld (handled
+  by never passing over a violation, above).
+- **A covered entry is never appended afterwards.** The vector moves only by
+  appending an entry at that entry's own stamp, by a window's coverage rule
+  (ADR-126, ADR-127, ADR-143), or by a snapshot's grant (ADR-152). Each is a
+  claim to have processed everything it covers, and a member asks a peer only
+  for what is above it.
+- **So `D` in any token satisfies:** every entry of origin `o` at or below
+  `D[o]` that the issuing member ever appends was behind its stream when the
+  token was issued.
+
+Take an entry the client was not sent. Either it is above `D` for its origin, or
+the issuing member never appended it: that member superseded it with a newer
+write to the same document, which the client was sent or which is itself above
+`D`. The resuming member delivers every entry above `D`. So:
+- **On another member: no gap.** Every entry it holds that the issuing stream had
+  not sent is delivered, in this member's arrival order.
+- **What repeats, exactly.** The entries above `D` that the issuing stream had
+  already sent: those it handed over after its last read that reached the end of
+  the arrival index, up to and including the token's own entry.
+  - That is at most one read: up to 1,024 entries (`REPLAY_BATCH`), or one live
+    wake-up's worth.
+  - A stream that has not reached the tail since it opened claims only its
+    opening vector, so its repeats reach back to that, which is everything for
+    `from_start`.
+- **On the issuing member: exact.** Its own position separates what was sent
+  from what was not, and while the premise holds nothing after that position is
+  at or below `D`.
+- **Why not the vector alone, everywhere.** `D` trails by up to one read, so
+  resuming the issuing member from `D` would repeat that read. The stamp is exact
+  on its own member and meaningless elsewhere; the vector is the reverse. The
+  token carries both, and the member it lands on picks by who issued it.
+
+**The residual: where the premise does not hold.** A divergence repair
+(ADR-148) exists because a member's witnessed vector claimed history it lacked.
+Its replay, or a scoped snapshot's documents, is appended at stamps the vector
+already covers.
+- A stream on that member delivers those entries late.
+- A token issued after the vector covered them passes over them wherever it
+  resumes, the issuing member included.
+
+The stream is as right as the witnessed vector it reads. A repair follows a
+divergence the check has already reported (`kimmy_sync_divergent_collections`).
+
+**A second, narrower residual: a rebuilt arrival index.** `Engine::open` still
+rebuilds the index in stamp order when it does not cover the oplog. With the
+rewind fixed, that happens only on a database a build predating the arrival
+index appended to after this one created it. A token that member issued before
+the rebuild can resume past an entry the rebuild moved below the token's.
+
+**Cost.**
+- **Reads.** Each arrival read that reaches the end of the index also reads the
+  witnessed vector, one row per origin, in the same transaction.
+- **Token size.** A token grows from 26 bytes to 45 plus 26 per origin: 123
+  bytes, 164 characters, on a three-member cluster. `MAX_TOKEN_ORIGINS` caps
+  it at 1,024 origins.
+- **Opening on another member.** A stream resumed on a member other than the
+  issuing one walks the arrival index's keys once, at open, to find its start.
+- **Rewinds.** Each rewind adds a record of a few dozen bytes.
+
+**Compatibility and roll.**
+- **The token format is a client contract.** A token is opaque, but clients
+  store it across restarts, and the embedding worker stores its own in the
+  database. `docs/compatibility.md` now says so: the format changes only in a
+  `0.MINOR`, and the previous format is accepted for that whole minor release
+  line. This change is the first case.
+- **Single-stamp tokens** are accepted through 0.30.x, with the semantics above.
+  A release no earlier than 0.31.0 may refuse them, with a release note.
+- **A 0.29.x member refuses a 0.30.0 token** as `400 bad_request`
+  (`MalformedResumeToken`). During a member-at-a-time roll, a client that
+  resumes on a member not yet rolled is refused until the roll completes. The
+  Rust client reports that as an error after its reconnect attempts.
+- **Downgrading a member from 0.30.x to 0.29.x stops its embedding worker at
+  start.** 0.29.x cannot decode the recorded position, which 0.30 wrote in the
+  new format.
+- **No cluster wire change.** Tokens never cross between members, so a roll
+  needs no ordering and no mixed-version test for this.
+- **The clients.**
+  - The Rust client and `kimmy-cli` hold the token as a string and need no
+    change. Their portability comment is corrected.
+  - The Python client (`clients/python`) holds it the same way; its comments
+    are corrected here.
+  - The Go client is maintained in its own repository. Its package comment
+    (`kimmydb/client.go`, "safe only because those tokens are portable between
+    nodes") makes the same claim and is left for its owner.
+
+**Alternatives.**
+- **`410` when the token's entry is not held.**
+  - It refuses the third shape, which is ordinary failover under lag, and the
+    Rust client treats `410` as the end of a stream.
+  - It does nothing for a held entry, whose position is still the wrong one.
+- **Replay from the first entry stamped after the token.**
+  - It closes the first two shapes. It misses the third, because an entry
+    stamped below the token that the issuing member had not received is never
+    replayed.
+  - It repeats everything stamped above the token that had already been sent.
+  - Kept as the single-stamp token's fallback for the compatibility window.
+- **Record the witnessed vector with each arrival row.** Exact at every
+  position, at the cost of a vector per appended entry. The rule above costs one
+  vector read per read that reaches the tail, and trails by at most one read.
+
+**Held by**
+- `a_token_for_a_write_the_resuming_member_superseded_resumes_without_a_gap`: the
+  superseded write.
+- `a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap`: the
+  snapshot. The resuming member hands over the version the client missed.
+- `a_token_for_a_write_the_resuming_member_has_not_yet_received_resumes_without_a_gap`:
+  lag. It also checks that an entry sent before the token's own is passed over
+  when it reaches the resuming member later.
+- `a_change_stream_resumed_on_another_node_misses_nothing` (cluster harness):
+  - Three members. B and C are paused while the client reads from A, and the
+    client's stream is cut mid-flow.
+  - A and C are then paused while B takes writes of its own, so B holds those
+    writes ahead of the token's entry.
+  - Then writers run on A and B at once.
+  - Resumed on B, every missed id arrives, and the repeats are asserted to be
+    within one read: 176 events for 175 missed, the repeat being the token's
+    own. Resumed on A, exactly the 175 arrive.
+- `a_token_claims_nothing_its_stream_had_read_but_not_yet_handed_over`: the
+  vector moves after hand-over, not at the read.
+- `a_token_from_another_member_is_refused_where_this_member_collected_past_it`
+  and `a_token_this_member_issued_is_refused_once_its_entry_is_collected`: the
+  two retention refusals. The first is accepted while the member has collected
+  only what `D` covers, and refused once it collects one entry more.
+- `a_token_naming_an_entry_a_rewind_discarded_is_refused` and
+  `a_rewound_entry_a_peer_sends_back_stays_refused`: the rewind record.
+- `a_rewind_leaves_the_issuing_members_order_as_its_streams_saw_it`: a rewind,
+  a restart, and the issuing member resuming exactly. It delivers the replicated
+  entry taken in after the token's but stamped below it.
+- `a_token_from_another_member_resumes_on_a_recreated_collection_by_the_drops_stamp`:
+  the incarnation bound by stamp. It also checks the floor that keeps a third
+  member's write to the previous incarnation out.
+- `a_seeded_retention_record_does_not_refuse_a_token_covering_a_quiet_origin`:
+  the collected record capped at what was witnessed.
+- `a_violation_is_delivered_to_a_stream_resumed_from_another_members_token`
+  (`docs.rs`): a violation this member reported, which the token's vector
+  covers, is still delivered.
+- `a_single_stamp_token_naming_an_entry_this_member_lacks_resumes_after_its_stamp`
+  and `a_single_stamp_token_issued_before_0_30_still_decodes`: the compatibility
+  window, the second built from the 0.29 byte layout rather than through
+  `encode`.
+- `an_issued_token_round_trips_with_its_issuer_and_vector` and
+  `malformed_issued_tokens_are_rejected`: the format.
+- Every existing single-server resume test, unchanged.
+
+**Red on 0.29.1:**
+- the three shapes, the rewind and the single-stamp fallback;
+- the harness test, which resumed on B and never delivered the 60 writes B took
+  while A was paused.
+
+**Red by breaking one guard at a time:**
+- **Passing over `D` removed:** the lag test, whose earlier entry is delivered
+  again.
+- **The vector raised at the read instead of after hand-over:** the hand-over
+  test, and `resuming_is_exclusive_of_the_token`.
+- **Either retention refusal removed:** its own test.
+- **The issuing member resuming from `D` instead of its own position:**
+  `resuming_is_exclusive_of_the_token`,
+  `resuming_under_continuous_writes_has_no_gaps_and_no_duplicates` and
+  `a_replicated_entry_is_delivered_after_a_resume`.
+- **The rewind leaving its arrival rows:** the rebuild test, and both rewind
+  refusals. With the rows left, the discarded stamp still resolves to a
+  position.
+- **Violations passed over:** the violation test.
+- **Another member's token clamped by position**, or **the floor removed:** the
+  recreated-collection test.
+- **The collected record not capped by what was witnessed:** the seeded-record
+  test.

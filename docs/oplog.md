@@ -149,22 +149,34 @@ semantics did not change. Both index tables are **derived** from the oplog:
 `Engine::open` compares their size against it and rebuilds when they disagree,
 so a database written before they existed is repaired rather than refused.
 
-Resume tokens are unchanged — they still name an entry by stamp, and are
-translated to an arrival position by point lookup when a stream opens. Tokens
-live in *clients*, where no migration can reach them.
+A resume token names an entry by stamp, and the member that issued it translates
+it to an arrival position by point lookup when a stream opens. Any other member
+resumes from the delivered vector the token also carries, because its own
+arrival order is different ([ADR-173](decisions.md)). Tokens live in *clients*,
+where no migration can reach them, which is why the single-stamp form stays
+accepted for a release.
 
 ---
 
 ## Resume tokens
 
-A resume token is the opaque, URL-safe encoding of an entry's `(hlc, node)`:
+A resume token is opaque and URL-safe. Since 0.30.0 it names the last delivered
+entry, the member that issued it, and that member's delivered vector
+([ADR-173](decisions.md)):
+
+```
+base64url( 0x02 ‖ hlc(10) ‖ node(16) ‖ issued-by(16) ‖ origins(u16) ‖ (node(16) ‖ hlc(10))* )
+    →   164 characters on a three-member cluster
+```
+
+A token issued before 0.30.0 is the entry alone, and is accepted through 0.30.x:
 
 ```
 base64url( hlc(10 bytes) ‖ node(16 bytes) )   →   35 characters
 ```
 
 ```rust
-pub fn exclusive_start(self) -> Hlc {
+pub fn exclusive_start(&self) -> Hlc {
     self.hlc.successor()      // resuming is EXCLUSIVE of the token itself
 }
 ```

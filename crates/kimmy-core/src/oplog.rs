@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::hlc::{HLC_ENCODED_LEN, Hlc, Stamp};
 use crate::ids::{CollectionId, DocId, NodeId};
+use crate::version::VersionVector;
 
 /// What kind of mutation an oplog entry describes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -107,7 +108,7 @@ pub struct OplogEntry {
 
 impl OplogEntry {
     pub fn resume_token(&self) -> ResumeToken {
-        ResumeToken { hlc: self.stamp.hlc, node: self.stamp.node }
+        ResumeToken::from_stamp(self.stamp)
     }
 
     pub fn document(&self) -> Result<Option<bson::Document>> {
@@ -118,30 +119,74 @@ impl OplogEntry {
     }
 }
 
-/// An opaque cursor into the oplog.
+/// An opaque cursor into a change stream.
 ///
-/// Clients treat this as a blob. Internally it is just the `(hlc, node)` of the
-/// last delivered entry, encoded so that resuming means "scan from the
-/// successor of this position".
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+/// Clients treat this as a blob. It names the last delivered entry by stamp,
+/// and, on a token a 0.30.0 or later member issued, also carries
+/// [`Issued`]: which member delivered it, and how far that member's stream had
+/// delivered each origin (ADR-173).
+///
+/// Both are needed because a stream follows a member's *arrival* order, and
+/// every member orders the same writes differently. On the member that issued
+/// it, the stamp names a position in that order, which is exact. Anywhere else
+/// that position means nothing, so a member resumes from the vector instead.
+///
+/// A token without `issued` is the single stamp every member issued before
+/// 0.30.0, still accepted for one minor release.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ResumeToken {
     pub hlc: Hlc,
     pub node: NodeId,
+    pub issued: Option<Issued>,
 }
 
-const TOKEN_LEN: usize = HLC_ENCODED_LEN + 16;
+/// Who issued a resume token, and what their stream had delivered.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Issued {
+    /// The member whose stream delivered the token's entry.
+    pub by: NodeId,
+    /// Per origin, a stamp at or below which the issuing member's stream had
+    /// taken every entry that member holds — delivered it, or passed over it
+    /// as out of scope — when the token was issued (ADR-173).
+    pub delivered: VersionVector,
+}
+
+/// A single-stamp token: `hlc ‖ node`, as issued before 0.30.0.
+const SINGLE_STAMP_LEN: usize = HLC_ENCODED_LEN + 16;
+
+/// The first byte of an issued token. A single-stamp token has no version
+/// byte, and is told apart by its length, which no issued token can have.
+const ISSUED_VERSION: u8 = 2;
+
+/// `version ‖ hlc ‖ node ‖ issued-by ‖ origin count (u16, big-endian)`.
+const ISSUED_HEADER_LEN: usize = 1 + HLC_ENCODED_LEN + 16 + 16 + 2;
+
+/// One origin of the delivered vector: `node ‖ hlc`.
+const ORIGIN_LEN: usize = 16 + HLC_ENCODED_LEN;
+
+/// The most origins a token may name. A cluster's vector has one per member
+/// that ever wrote; the bound keeps a token a string a query parameter can
+/// carry and refuses a forged one that asks for an unbounded decode.
+pub const MAX_TOKEN_ORIGINS: usize = 1024;
 
 impl ResumeToken {
+    /// A single-stamp token, with no issuing member.
     pub fn new(hlc: Hlc, node: NodeId) -> Self {
-        Self { hlc, node }
+        Self { hlc, node, issued: None }
     }
 
+    /// A single-stamp token naming `stamp`, with no issuing member.
     pub fn from_stamp(stamp: Stamp) -> Self {
-        Self { hlc: stamp.hlc, node: stamp.node }
+        Self::new(stamp.hlc, stamp.node)
     }
 
-    pub fn to_stamp(self) -> Stamp {
+    /// The token a member's stream issues for the entry stamped `stamp`.
+    pub fn issued(stamp: Stamp, by: NodeId, delivered: VersionVector) -> Self {
+        Self { hlc: stamp.hlc, node: stamp.node, issued: Some(Issued { by, delivered }) }
+    }
+
+    pub fn to_stamp(&self) -> Stamp {
         Stamp::new(self.hlc, self.node)
     }
 
@@ -150,28 +195,76 @@ impl ResumeToken {
     /// Returning the *successor* rather than the token itself is what makes
     /// resumption deliver each event exactly once — resuming at the token would
     /// redeliver the last event the client already saw.
-    pub fn exclusive_start(self) -> Hlc {
+    pub fn exclusive_start(&self) -> Hlc {
         self.hlc.successor()
     }
 
-    pub fn encode(self) -> String {
-        let mut buf = [0u8; TOKEN_LEN];
-        buf[..HLC_ENCODED_LEN].copy_from_slice(&self.hlc.to_bytes());
-        buf[HLC_ENCODED_LEN..].copy_from_slice(&self.node.to_bytes());
+    pub fn encode(&self) -> String {
+        let Some(issued) = &self.issued else {
+            let mut buf = [0u8; SINGLE_STAMP_LEN];
+            buf[..HLC_ENCODED_LEN].copy_from_slice(&self.hlc.to_bytes());
+            buf[HLC_ENCODED_LEN..].copy_from_slice(&self.node.to_bytes());
+            return URL_SAFE_NO_PAD.encode(buf);
+        };
+        let origins = issued.delivered.len().min(MAX_TOKEN_ORIGINS);
+        let mut buf = Vec::with_capacity(ISSUED_HEADER_LEN + origins * ORIGIN_LEN);
+        buf.push(ISSUED_VERSION);
+        buf.extend_from_slice(&self.hlc.to_bytes());
+        buf.extend_from_slice(&self.node.to_bytes());
+        buf.extend_from_slice(&issued.by.to_bytes());
+        // `origins` fits: MAX_TOKEN_ORIGINS is below u16::MAX.
+        buf.extend_from_slice(&(origins as u16).to_be_bytes());
+        // A vector iterates in node order, which is what `decode` requires.
+        for (node, hlc) in issued.delivered.iter().take(origins) {
+            buf.extend_from_slice(&node.to_bytes());
+            buf.extend_from_slice(&hlc.to_bytes());
+        }
         URL_SAFE_NO_PAD.encode(buf)
     }
 
     pub fn decode(s: &str) -> Result<Self> {
         let raw = URL_SAFE_NO_PAD.decode(s).map_err(|_| Error::MalformedResumeToken)?;
-        if raw.len() != TOKEN_LEN {
+        if raw.len() == SINGLE_STAMP_LEN {
+            return Ok(Self::new(hlc_at(&raw, 0), node_at(&raw, HLC_ENCODED_LEN)));
+        }
+        if raw.len() < ISSUED_HEADER_LEN || raw[0] != ISSUED_VERSION {
             return Err(Error::MalformedResumeToken);
         }
-        let mut hlc_bytes = [0u8; HLC_ENCODED_LEN];
-        hlc_bytes.copy_from_slice(&raw[..HLC_ENCODED_LEN]);
-        let mut node_bytes = [0u8; 16];
-        node_bytes.copy_from_slice(&raw[HLC_ENCODED_LEN..]);
-        Ok(Self { hlc: Hlc::from_bytes(hlc_bytes), node: NodeId::from_bytes(node_bytes) })
+        let hlc = hlc_at(&raw, 1);
+        let node = node_at(&raw, 1 + HLC_ENCODED_LEN);
+        let by = node_at(&raw, 1 + HLC_ENCODED_LEN + 16);
+        let count_at = ISSUED_HEADER_LEN - 2;
+        let origins = u16::from_be_bytes([raw[count_at], raw[count_at + 1]]) as usize;
+        if origins > MAX_TOKEN_ORIGINS || raw.len() != ISSUED_HEADER_LEN + origins * ORIGIN_LEN {
+            return Err(Error::MalformedResumeToken);
+        }
+        let mut delivered = VersionVector::new();
+        let mut previous: Option<NodeId> = None;
+        for i in 0..origins {
+            let at = ISSUED_HEADER_LEN + i * ORIGIN_LEN;
+            let origin = node_at(&raw, at);
+            // Strictly ascending, as `encode` writes them: a repeated origin
+            // would be a token that says two things about one member.
+            if previous.is_some_and(|p| p >= origin) {
+                return Err(Error::MalformedResumeToken);
+            }
+            previous = Some(origin);
+            delivered.insert(origin, hlc_at(&raw, at + 16));
+        }
+        Ok(Self { hlc, node, issued: Some(Issued { by, delivered }) })
     }
+}
+
+fn hlc_at(raw: &[u8], at: usize) -> Hlc {
+    let mut bytes = [0u8; HLC_ENCODED_LEN];
+    bytes.copy_from_slice(&raw[at..at + HLC_ENCODED_LEN]);
+    Hlc::from_bytes(bytes)
+}
+
+fn node_at(raw: &[u8], at: usize) -> NodeId {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&raw[at..at + 16]);
+    NodeId::from_bytes(bytes)
 }
 
 impl std::fmt::Display for ResumeToken {
@@ -228,6 +321,73 @@ mod tests {
     fn resume_is_exclusive_of_the_token_itself() {
         let t = token();
         assert!(t.exclusive_start() > t.hlc, "resuming must not redeliver the last event");
+    }
+
+    fn issued_token() -> ResumeToken {
+        let mut delivered = VersionVector::new();
+        delivered.insert(NodeId::from_bytes([3; 16]), Hlc::new(1_700_000_000_500, 1));
+        delivered.insert(NodeId::from_bytes([9; 16]), Hlc::new(1_700_000_000_000, 42));
+        ResumeToken::issued(
+            Stamp::new(Hlc::new(1_700_000_000_000, 42), NodeId::from_bytes([9; 16])),
+            NodeId::from_bytes([5; 16]),
+            delivered,
+        )
+    }
+
+    #[test]
+    fn an_issued_token_round_trips_with_its_issuer_and_vector() {
+        let t = issued_token();
+        let back = ResumeToken::decode(&t.encode()).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.issued.unwrap().delivered.len(), 2);
+    }
+
+    /// What every member issued before 0.30.0: `hlc ‖ node`, 26 bytes, no
+    /// version byte. Built here from the layout rather than through `encode`,
+    /// so a change to how a single-stamp token is written cannot also change
+    /// what this test expects of one.
+    #[test]
+    fn a_single_stamp_token_issued_before_0_30_still_decodes() {
+        let hlc = Hlc::new(1_700_000_000_000, 42);
+        let node = NodeId::from_bytes([9; 16]);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&hlc.to_bytes());
+        raw.extend_from_slice(&node.to_bytes());
+        let old = URL_SAFE_NO_PAD.encode(&raw);
+
+        let token = ResumeToken::decode(&old).unwrap();
+        assert_eq!(token.to_stamp(), Stamp::new(hlc, node));
+        assert_eq!(token.issued, None, "a single-stamp token names no issuing member");
+        assert_eq!(token.encode(), old, "and is written back unchanged");
+    }
+
+    #[test]
+    fn malformed_issued_tokens_are_rejected() {
+        let raw = URL_SAFE_NO_PAD.decode(issued_token().encode()).unwrap();
+
+        let mut wrong_version = raw.clone();
+        wrong_version[0] = 3;
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(wrong_version)).is_err());
+
+        let mut truncated = raw.clone();
+        truncated.pop();
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(truncated)).is_err());
+
+        // The two origins swapped: a vector names each member once, in order.
+        let mut unsorted = raw.clone();
+        let first = ISSUED_HEADER_LEN..ISSUED_HEADER_LEN + ORIGIN_LEN;
+        let second = ISSUED_HEADER_LEN + ORIGIN_LEN..ISSUED_HEADER_LEN + 2 * ORIGIN_LEN;
+        let (a, b) = (raw[first.clone()].to_vec(), raw[second.clone()].to_vec());
+        unsorted[first].copy_from_slice(&b);
+        unsorted[second].copy_from_slice(&a);
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(unsorted)).is_err());
+
+        // A count past the bound, with the bytes to match it.
+        let mut oversized = raw[..ISSUED_HEADER_LEN].to_vec();
+        let count = (MAX_TOKEN_ORIGINS + 1) as u16;
+        oversized[ISSUED_HEADER_LEN - 2..].copy_from_slice(&count.to_be_bytes());
+        oversized.resize(ISSUED_HEADER_LEN + (MAX_TOKEN_ORIGINS + 1) * ORIGIN_LEN, 0);
+        assert!(ResumeToken::decode(&URL_SAFE_NO_PAD.encode(oversized)).is_err());
     }
 
     #[test]

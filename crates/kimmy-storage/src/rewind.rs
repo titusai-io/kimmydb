@@ -46,7 +46,7 @@
 
 use std::collections::HashMap;
 
-use kimmy_core::{DocId, Hlc, OpKind, OplogEntry};
+use kimmy_core::{DocId, Hlc, OpKind, OplogEntry, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::info;
 
@@ -308,10 +308,28 @@ impl Engine {
             // one alongside the entry it names -- so it would be a permanent
             // orphan, and the one growth path nothing else bounds. ADR-160.
             let mut held = txn.open_table(tables::OPLOG_HELD)?;
+            // The arrival index goes with the entry too, as retention removes
+            // it. Left behind, the index no longer covered the oplog, and the
+            // next start rebuilt it in stamp order — moving every entry this
+            // member's streams had delivered, so a token this member issued
+            // resumed from the wrong place (ADR-173).
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let mut discarded = VersionVector::new();
             for key in doomed {
                 oplog.remove(key.as_slice())?;
                 held.remove(key.as_slice())?;
+                if let Some(seq) = by_stamp.remove(key.as_slice())? {
+                    arrival.remove(seq.value())?;
+                }
+                discarded.observe(codec::decode_oplog_key(&key)?);
                 outcome.oplog_discarded += 1;
+            }
+            // In the same transaction as the removal: a change stream may have
+            // delivered what was just discarded, and a token naming it has to
+            // be told from one naming an entry this member never held (ADR-173).
+            if !discarded.is_empty() {
+                record_rewind(&txn, until, &discarded)?;
             }
         }
         txn.commit()?;
@@ -337,6 +355,84 @@ impl Engine {
         let _ = discardable;
         Ok(outcome)
     }
+
+    /// Every rewind this database has taken, oldest first.
+    pub(crate) fn rewinds(&self) -> Result<Vec<Rewound>> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(tables::META)?;
+        match meta.get(tables::META_REWOUND)? {
+            Some(raw) => decode_rewinds(raw.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// One rewind: its target, and per origin the newest stamp it discarded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Rewound {
+    pub until: Hlc,
+    pub through: VersionVector,
+}
+
+impl Rewound {
+    /// Whether this rewind discarded the entry stamped `stamp`, or would have
+    /// had this member held it.
+    pub fn discarded(&self, stamp: &Stamp) -> bool {
+        stamp.hlc > self.until && stamp.hlc <= self.through.get(stamp.node)
+    }
+}
+
+/// `until ‖ origin count (u16) ‖ (node ‖ hlc)*`, one after another per rewind.
+const REWIND_ORIGIN_LEN: usize = 16 + kimmy_core::HLC_ENCODED_LEN;
+
+fn record_rewind(
+    txn: &redb::WriteTransaction,
+    until: Hlc,
+    discarded: &VersionVector,
+) -> Result<()> {
+    let mut meta = txn.open_table(tables::META)?;
+    let mut record = match meta.get(tables::META_REWOUND)? {
+        Some(raw) => raw.value().to_vec(),
+        None => Vec::new(),
+    };
+    record.extend_from_slice(&until.to_bytes());
+    let origins = u16::try_from(discarded.len()).map_err(|_| {
+        StorageError::Database("a rewind discarded entries from too many origins".into())
+    })?;
+    record.extend_from_slice(&origins.to_be_bytes());
+    for (node, hlc) in discarded.iter() {
+        record.extend_from_slice(&node.to_bytes());
+        record.extend_from_slice(&hlc.to_bytes());
+    }
+    meta.insert(tables::META_REWOUND, record.as_slice())?;
+    Ok(())
+}
+
+fn decode_rewinds(mut raw: &[u8]) -> Result<Vec<Rewound>> {
+    let corrupt = || StorageError::Corrupt("the rewind record is truncated".into());
+    let mut out = Vec::new();
+    while !raw.is_empty() {
+        let header = kimmy_core::HLC_ENCODED_LEN + 2;
+        if raw.len() < header {
+            return Err(corrupt());
+        }
+        let until = Hlc::from_bytes(raw[..kimmy_core::HLC_ENCODED_LEN].try_into().unwrap());
+        let origins = u16::from_be_bytes([raw[header - 2], raw[header - 1]]) as usize;
+        let end = header + origins * REWIND_ORIGIN_LEN;
+        if raw.len() < end {
+            return Err(corrupt());
+        }
+        let mut through = VersionVector::new();
+        for i in 0..origins {
+            let at = header + i * REWIND_ORIGIN_LEN;
+            let node = kimmy_core::NodeId::from_bytes(raw[at..at + 16].try_into().unwrap());
+            let hlc = Hlc::from_bytes(raw[at + 16..at + REWIND_ORIGIN_LEN].try_into().unwrap());
+            through.insert(node, hlc);
+        }
+        out.push(Rewound { until, through });
+        raw = &raw[end..];
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

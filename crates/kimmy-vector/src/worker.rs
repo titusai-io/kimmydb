@@ -601,7 +601,7 @@ impl EmbeddingWorker {
         let mut recovering = false;
         loop {
             let options = WatchOptions {
-                resume_after: resume,
+                resume_after: resume.clone(),
                 // No recorded position means everything so far is unembedded.
                 start_at: resume.is_none().then_some(Hlc::ZERO),
             };
@@ -823,7 +823,7 @@ impl EmbeddingWorker {
             self.embed_batch(batch, &mut checkpoint).await;
         }
         if checkpoint.failed {
-            pending.token = pending.token.or(checkpoint.token);
+            pending.token = pending.token.take().or(checkpoint.token.take());
             return Ok(());
         }
         if let Some(token) = pending.token.take().or(checkpoint.token) {
@@ -1443,7 +1443,7 @@ impl EmbeddingWorker {
             writes.push((job.source, job.hlc, count, write));
         }
 
-        let position = checkpoint.token;
+        let position = checkpoint.token.clone();
         let written: Vec<usize> = self.engine.write_batch(WriterHolder::Embedding, |scope| {
             let mut written = Vec::new();
             for (source, hlc, count, write) in writes {
@@ -2249,7 +2249,7 @@ mod tests {
         // must point below it to be collected at all.
         let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
         let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
-        engine.put_consumer_position(CONSUMER, stale).unwrap();
+        engine.put_consumer_position(CONSUMER, stale.clone()).unwrap();
         let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
         engine
             .collect_garbage_at(
@@ -2257,8 +2257,10 @@ mod tests {
                 kimmy_storage::RetentionPolicy::new(0, u64::MAX),
             )
             .unwrap();
-        let refused = engine
-            .watch(WatchScope::Cluster, WatchOptions { resume_after: Some(stale), start_at: None });
+        let refused = engine.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(stale.clone()), start_at: None },
+        );
         assert!(
             matches!(&refused, Err(e) if is_lost_position(e)),
             "the fixture must reproduce the refused position: {:?}",
@@ -2308,7 +2310,7 @@ mod tests {
         assert!(engine.consumer_position(CONSUMER).unwrap().is_none());
 
         let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
-        engine.put_consumer_position(CONSUMER, token).unwrap();
+        engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
         assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
     }
 
@@ -2643,7 +2645,7 @@ mod tests {
         }
         let latest = last_entry(engine);
         let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
-        pending.hold(token, now);
+        pending.hold(token.clone(), now);
         (pending, token)
     }
 
@@ -2712,7 +2714,7 @@ mod tests {
         let before = engine.consumer_position(CONSUMER).unwrap();
 
         let (mut pending, token) = a_batch_of(&engine, &worker, &coll, &["alpha", "same", "beta"]);
-        assert_ne!(Some(token), before);
+        assert_ne!(Some(token.clone()), before);
         let held_since = pending.held_since;
         let documents = worker.counters.documents_embedded.load(Ordering::Relaxed);
         let calls = fake.calls();
@@ -2742,7 +2744,7 @@ mod tests {
         let (engine, _coll, mut worker, _dir) = setup().await;
         let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
         let mut pending = Pending::default();
-        pending.hold(token, Instant::now());
+        pending.hold(token.clone(), Instant::now());
 
         let commits = engine.commits();
         worker.flush(&mut pending).await.unwrap();
@@ -3027,7 +3029,7 @@ mod tests {
     fn position_at_latest(engine: &Engine) {
         let latest = last_entry(engine);
         let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
-        engine.put_consumer_position(CONSUMER, token).unwrap();
+        engine.put_consumer_position(CONSUMER, token.clone()).unwrap();
     }
 
     /// Wait until `count` documents have vectors, or give up.
