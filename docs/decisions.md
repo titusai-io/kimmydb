@@ -15009,3 +15009,33 @@ nothing, so a live stream saw it once and a resumed stream replays it once.
   sit below a release of the same origin, in either window order);
 - `re_delivering_documents_a_snapshot_already_applied_releases_them_in_a_window`
   (the overturned test, rewritten, its caught-up half kept).
+
+**Addendum — the release is counted.** A live whole-database snapshot showed
+`kimmy_sync_entries_skipped_total{reason="beyond_advertised"}` go 0 → 1 → 2 and
+stop. That is what this record predicts while held entries wait to be released,
+and it is also what the ordinary race ADR-148 counts on the same label produces,
+so the reading could not say which path ran.
+`kimmy_sync_held_marks_released_total` counts the release itself: one per held
+entry whose mark a window removed, through either branch — the superseded arrival
+in `apply_remote_in_txn` or the existing-key append in `append_oplog_at` — and
+only where `release_held_in_position` removed a mark over an entry the oplog
+still holds. A mark with no entry beneath it raises nothing and is not counted.
+Nor is ADR-160's removal of a stale mark on a fresh append, which releases no
+held state.
+
+*A counter, because it can be exact.* A run sums its releases, and the engine
+adds them only after that run's transaction commits. A release rolled back with
+a failed batch is not counted, and the re-delivery that then releases it is. A
+mark is removed once, so the same entry delivered again finds none and adds
+nothing. The counter is the engine's and is read at scrape, like
+`kimmy_write_lock_wait_timeouts_total`, so a pulled and a pushed window land on
+one series without either path reporting it. On the OTLP bridge as
+`kimmy.sync.held_marks_released`.
+
+**Held by**
+- `a_held_mark_released_by_a_window_is_counted_once_on_commit` (the superseded
+  branch, and a second delivery of the same window adding nothing);
+- `a_held_delete_whose_tombstone_retention_collected_is_released_through_the_append`
+  (the existing-key branch, now counted too);
+- `a_window_that_defers_every_entry_counts_no_release` (the race: every entry
+  left as `beyond_advertised`, and nothing counted).
