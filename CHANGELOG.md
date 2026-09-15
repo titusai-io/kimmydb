@@ -25,6 +25,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   OTLP bridge as `kimmy.sync.held_marks_released`. One new `/metrics` series,
   nothing removed, nothing on the wire.
 
+### Changed
+
+- **A backup no longer holds its image in the member's memory.** `GET
+  /v1/admin/backup` built the whole backup in the heap and kept it until the client
+  had read the last byte. On a three-member test cluster with a 2 GiB limit per
+  member, an 808 MB backup took a member to 1,789 MiB, and earlier rounds measured
+  90% and 97%. The walk now writes to an unlinked temporary file beside
+  `kimmy.redb`, closes its read transaction, and streams the file, so memory holds
+  one read chunk and a slow client pins neither the database's pages nor the heap.
+  See ADR-170, which amends ADR-041.
+
+  **What to plan for.**
+  - **Disk:** the data directory needs free space equal to one backup for the walk
+    and the transfer. A backup that runs out answers `500`, and an `ERROR` line
+    with `event` `backup failed` names the directory and the operating system's
+    error. Nothing is left behind.
+  - **No deadline:** `server.request_timeout_secs` no longer applies to this
+    route, which would otherwise cut every real backup at 30 s. Headers arrive
+    when the walk ends, which on a cold page cache can be many minutes. Use a
+    read-idle timeout, not a total one.
+  - **Additions:** the response now carries `Content-Length`, and
+    `kimmy_backup_duration_seconds` is a new histogram of how long each backup
+    took to produce, with its sum on the OTLP bridge as
+    `kimmy.backup.duration_seconds`. The `served a backup` line gains
+    `spill_bytes` and `elapsed_ms`.
+  - **Unchanged:** the bytes of a backup and the restore.
+
 ## 0.28.1 - 2026-09-15
 
 ### Fixed

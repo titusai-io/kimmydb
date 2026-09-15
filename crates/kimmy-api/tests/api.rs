@@ -7825,6 +7825,83 @@ async fn a_backup_downloads_and_looks_like_a_backup() {
     );
 }
 
+/// A backup on the wire, read as bytes: the head, and exactly the body.
+async fn fetch_backup(base: &str, token: Option<&str>) -> (String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = base.strip_prefix("http://").unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let mut req = format!("GET /v1/admin/backup HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("a response head");
+    (String::from_utf8_lossy(&raw[..split]).into_owned(), raw[split + 4..].to_vec())
+}
+
+/// The backup is spilled to a file and streamed with its length declared
+/// (ADR-170): a client can size a wait and show progress, and the bytes that
+/// arrive are a backup that restores.
+#[tokio::test]
+async fn a_backup_declares_its_length_and_restores() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":1,"v":"present"})).await;
+
+    let (head, body) = fetch_backup(&server.base, Some(&token)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let length = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("no Content-Length in:\n{head}"));
+    assert_eq!(length.parse::<usize>().unwrap(), body.len(), "{head}");
+    assert!(body.starts_with(b"KIMMYBK1"), "the body is the backup itself");
+
+    let restored = tempfile::tempdir().unwrap();
+    let path = restored.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut body.as_slice()).unwrap();
+    let engine = Engine::open(&path).unwrap();
+    let orders = engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(engine.count(&orders).unwrap(), 1);
+}
+
+/// A backup walks the whole store, which takes minutes on a real one, so the
+/// request deadline must not apply to it (ADR-170). The deadline here is a
+/// millisecond and the store is large enough that the walk cannot finish
+/// inside it: registered under the deadline, this answers `503 timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backup_that_outlasts_the_request_deadline_still_answers() {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(1),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let engine = &server.state.engine;
+    let orders = engine.create_collection("shop", "orders").unwrap();
+    for batch in 0..20 {
+        let docs = (0..1_000)
+            .map(|i| bson::doc! { "_id": batch * 1_000 + i, "pad": "x".repeat(200) })
+            .collect();
+        engine.insert_many(&orders, docs).unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let (head, body) = fetch_backup(&server.base, None).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{}", String::from_utf8_lossy(&body));
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(5),
+        "the fixture must outlast the deadline for this to test anything: {:?}",
+        started.elapsed()
+    );
+    assert!(body.starts_with(b"KIMMYBK1"));
+}
+
 #[tokio::test]
 async fn the_metrics_endpoint_exposes_the_process_counters() {
     // Fetched as raw text: the client parses JSON, and /metrics is Prometheus
@@ -8009,6 +8086,19 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_request_duration_seconds_bucket",
         "kimmy_request_duration_seconds_sum",
         "kimmy_request_duration_seconds_count",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_bucket",
+        "kimmy_backup_duration_seconds_sum",
+        "kimmy_backup_duration_seconds_count",
     ])
     .collect();
 
