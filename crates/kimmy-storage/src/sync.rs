@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
+use redb::{ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::docs::RemoteApplied;
@@ -431,6 +433,27 @@ pub fn coverage_up_to(theirs: &VersionVector, end: WindowEnd) -> VersionVector {
     }
 }
 
+/// A span of one origin's history a requester holds as state at or below its
+/// own position, which it asks a peer to serve anyway (ADR-172): every entry of
+/// `origin` from `from` through `through`, both inclusive.
+///
+/// Carried in `AskEntries::marked`. The bounds are the lowest and highest held
+/// mark on that origin, so what a span costs the peer is that origin's entries
+/// between them and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkedRange {
+    pub origin: NodeId,
+    pub from: Hlc,
+    pub through: Hlc,
+}
+
+impl MarkedRange {
+    /// Whether `stamp` lies inside this span.
+    pub fn contains(&self, stamp: &Stamp) -> bool {
+        stamp.node == self.origin && self.from <= stamp.hlc && stamp.hlc <= self.through
+    }
+}
+
 impl Engine {
     /// Merge a batch a peer served in answer to `AskEntries`, and record what
     /// the batch proved about coverage.
@@ -555,12 +578,84 @@ impl Engine {
         limit: usize,
         held: Option<&VersionVector>,
     ) -> Result<OplogWindow> {
+        self.entries_for_peer_marked(from, limit, held, &[])
+    }
+
+    /// [`Self::entries_for_peer_holding`], also serving the spans a requester
+    /// holds as state at or below its own position (ADR-172).
+    ///
+    /// The skip passes over everything `held` covers, and a held entry at or
+    /// below that position is covered without being in the requester's oplog
+    /// in position: it would never be served again, and its mark (ADR-160)
+    /// would outlive every arrival that could release it (ADR-169). A span
+    /// names, per origin, the lowest and highest such mark, and the entries of
+    /// that origin inside it are served rather than skipped. The scan starts at
+    /// the lowest span when that is below `from`. Every entry of any origin
+    /// below `from` is covered by `held`, so nothing outside a span is served
+    /// by starting lower.
+    ///
+    /// The extra range is bounded by the spans, not by the requester's
+    /// position: an origin's entries between its lowest and highest mark, and
+    /// no others. Spans are ignored without `held`, since such a request is
+    /// served the whole range anyway. What this node has collected inside a
+    /// span is simply not there to serve; the horizon is judged on `held`
+    /// alone, so a span never turns a pull into a snapshot.
+    pub fn entries_for_peer_marked(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        marked: &[MarkedRange],
+    ) -> Result<OplogWindow> {
+        let marked = if held.is_some() { marked } else { &[] };
+        let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
         self.read_oplog_from_skipping(
-            from,
+            start,
             limit,
-            |stamp| held.is_some_and(|held| stamp.hlc <= held.get(stamp.node)),
+            |stamp| {
+                held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
+                    && !marked.iter().any(|span| span.contains(stamp))
+            },
             |entry| entry.kind != OpKind::UniqueViolation,
         )
+    }
+
+    /// The spans of each origin's history this node holds as state at or below
+    /// `witnessed` (ADR-172): per origin, its lowest and highest held mark
+    /// that the vector covers. What a pull names in `AskEntries::marked` so
+    /// the peer serves those entries and ADR-169 can release them.
+    ///
+    /// A mark above `witnessed` is left out: the skip does not pass over it,
+    /// so an ordinary window serves it. A key this build cannot read is left
+    /// out too, as the grant's release keeps one (ADR-160). Reads the held
+    /// table, which is empty on almost every node and at most the documents a
+    /// snapshot or repair brought on the rest.
+    pub fn held_ranges_covered_by(&self, witnessed: &VersionVector) -> Result<Vec<MarkedRange>> {
+        let txn = self.db().begin_read()?;
+        let held = txn.open_table(crate::tables::OPLOG_HELD)?;
+        let mut spans: HashMap<NodeId, (Hlc, Hlc)> = HashMap::new();
+        for row in held.iter()? {
+            let (key, _) = row?;
+            let Ok(stamp) = crate::codec::decode_oplog_key(key.value()) else {
+                continue;
+            };
+            if stamp.hlc > witnessed.get(stamp.node) {
+                continue;
+            }
+            spans
+                .entry(stamp.node)
+                .and_modify(|(lowest, highest)| {
+                    *lowest = (*lowest).min(stamp.hlc);
+                    *highest = (*highest).max(stamp.hlc);
+                })
+                .or_insert((stamp.hlc, stamp.hlc));
+        }
+        let mut out: Vec<MarkedRange> = spans
+            .into_iter()
+            .map(|(origin, (from, through))| MarkedRange { origin, from, through })
+            .collect();
+        out.sort_by_key(|span| (span.from, span.origin));
+        Ok(out)
     }
 
     /// Merge a batch of entries received from a peer.

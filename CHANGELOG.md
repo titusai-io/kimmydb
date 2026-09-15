@@ -32,17 +32,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   [ADR-171](docs/decisions.md) has the reasoning and why nothing a puller lacks
   can be skipped.
 
-  **One residual this leaves.** It applies to a member with a hole on an origin
-  (its witnessed vector covers an entry its oplog does not hold in position)
-  that a scoped repair then fills, so the member holds that entry as state.
-  That entry used to be re-served and released whenever another origin held the
-  member's threshold low, which every roll does. It now stays held until the
-  origin writes again or retention collects the entry. Until then the member's
-  advertised position may not cover the entry. A peer that already holds it sees
-  nothing. A peer that also lacks it and pulls it from that member counts it
-  under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`, and takes
-  it from another member instead.
-  ADR-171 says why re-serving it by lowering the vector was not done.
+  A member holding an entry as state below its own position is no longer left
+  out by this: see the next entry ([ADR-172](docs/decisions.md)).
 
   **Nothing to decide before upgrading, and no ordering in the roll.** Nothing on
   the wire changes: the vector was already sent. A member serves the shorter
@@ -51,6 +42,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   can still show the drain against members not yet rolled. No new `/metrics`
   series. The `merged from peer` line reads the same, with fewer `pulls` and no
   run of `applied 0`.
+- **An entry a member holds as state below its own position is released on the
+  next pull.** A scoped repair that fills a hole leaves the document held as
+  state (ADR-160), below what the member has witnessed of its origin. The skip
+  above passed over it on every pull, so its mark stayed until the origin wrote
+  again or retention collected the entry. `AskEntries` gains an optional field,
+  `marked`: per origin, the span from the lowest to the highest such entry. The
+  peer serves that span's entries, and the member releases them on arrival
+  (ADR-169). The member asks even when it is behind on nothing.
+
+  A span never turns a pull into a snapshot, because the horizon is still judged
+  on the member's position. Entries the peer has already collected stay held
+  until the member's own retention collects them.
+  [ADR-172](docs/decisions.md).
+
+  **Nothing to decide before upgrading, and no ordering in the roll.** The field
+  is defaulted: a member on an older build ignores it and serves as before, and
+  an older member sends none. The member logs `asking the peer to serve entries
+  this node holds as state below its own position` at `INFO` when it names
+  spans. On a healthy cluster that line should not appear.
 
 ### Fixed
 

@@ -1408,6 +1408,110 @@ async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds()
     assert_eq!(pushed.outcome.superseded, 0, "and nothing C holds is sent: {pushed:?}");
 }
 
+// -----------------------------------------------------------------------
+// An entry held as state below the member's position is released (ADR-172)
+
+/// What the requester logs when it names spans it holds as state below its
+/// own position.
+const ASKING_MARKED: &str = "asking the peer to serve entries this node holds as state";
+
+/// Two members, where R holds A's last write S only as state below its own
+/// position: R's witnessed vector covered S through a window that never
+/// carried it, and a scoped repair then brought S under `Hold`. R is behind A
+/// on nothing. The nodes, the collection, and S's stamp.
+async fn a_member_holding_a_repaired_entry_below_its_position()
+-> (Node, Node, kimmy_storage::CollectionMeta, Hlc) {
+    let a = node().await;
+    let r = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a0" }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": "s" }).unwrap();
+    let a_id = a.engine.node_id();
+    let s = a.engine.version_vector().unwrap().get(a_id);
+
+    let history = a.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let holed: Vec<kimmy_core::OplogEntry> = history
+        .entries
+        .iter()
+        .filter(|e| !(e.stamp.node == a_id && e.stamp.hlc == s))
+        .cloned()
+        .collect();
+    assert_eq!(holed.len() + 1, history.entries.len());
+    r.engine
+        .apply_peer_batch(&a.engine.version_vector().unwrap(), &holed, history.scanned_to, true)
+        .unwrap();
+    let mut progress = kimmy_storage::SnapshotProgress::of_collection(ca.id);
+    while !progress.is_complete() {
+        let page = a.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        r.engine.apply_snapshot_page(a_id, &mut progress, &page).unwrap();
+    }
+
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    assert!(r.engine.get(&cr, &DocId::String("s".into())).unwrap().is_some(), "repaired");
+    assert!(r.engine.version_vector().unwrap().get(a_id) < s, "held: R does not advertise S");
+    assert!(
+        r.engine.witnessed_vector().unwrap().covers(&a.engine.version_vector().unwrap()),
+        "and R is behind A on nothing"
+    );
+    (a, r, ca, s)
+}
+
+#[tokio::test]
+async fn a_held_entry_below_the_members_position_is_released_by_its_next_pull() {
+    // ADR-171's residual, closed. R's witnessed vector covers S, so a window
+    // passes over it, and R is behind on nothing, so before ADR-172 no round
+    // would ever ask. R names its span and the next pull releases it, without
+    // a snapshot.
+    let (a, r, _ca, s) = a_member_holding_a_repaired_entry_below_its_position().await;
+
+    let (outcome, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
+    assert!(logged.iter().any(|l| l.contains(ASKING_MARKED)), "R names the span: {logged:?}");
+    assert!(!logged.iter().any(|l| l.contains(SNAPSHOT_FALLBACK)), "and no snapshot: {logged:?}");
+    assert!(outcome.exhausted && !outcome.truncated, "one pull: {outcome:?}");
+    assert_eq!(outcome.superseded, 1, "S alone is served: {outcome:?}");
+    assert_eq!(
+        r.engine.version_vector().unwrap().get(a.engine.node_id()),
+        s,
+        "released: R advertises S"
+    );
+
+    let (again, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    assert!(!logged.iter().any(|l| l.contains(ASKING_MARKED)), "nothing left: {logged:?}");
+    assert_eq!(again.unwrap().total(), 0);
+}
+
+#[tokio::test]
+async fn a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapshot() {
+    // The horizon is judged on `held`, never on a span (ADR-172). A has
+    // collected S; a span below A's horizon must not make the pull a
+    // snapshot. R takes what A still has, and S's mark waits for R's own
+    // retention.
+    let (a, r, ca, s) = a_member_holding_a_repaired_entry_below_its_position().await;
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
+    a.engine
+        .collect_garbage_at(
+            later + HOUR_MS,
+            kimmy_storage::RetentionPolicy::new(DAY_SECS, DAY_SECS),
+        )
+        .unwrap();
+    assert!(a.engine.oplog_collected_through().unwrap() >= s, "A collected S");
+
+    let (outcome, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
+    assert!(logged.iter().any(|l| l.contains(ASKING_MARKED)), "R names the span: {logged:?}");
+    assert!(
+        !logged.iter().any(|l| l.contains(SNAPSHOT_FALLBACK)),
+        "a span below the peer's horizon is never a snapshot: {logged:?}"
+    );
+    assert_eq!(outcome.applied, 1, "R takes the later write: {outcome:?}");
+    assert!(
+        r.engine.version_vector().unwrap().get(a.engine.node_id()) < s,
+        "S is gone from A, so R's mark stays for R's own retention"
+    );
+}
+
 #[tokio::test]
 async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots() {
     // The control for both. B holds A's first write but never received the

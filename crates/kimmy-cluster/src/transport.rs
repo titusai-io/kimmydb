@@ -246,7 +246,7 @@ where
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
-            Message::AskEntries { from, limit, held } => {
+            Message::AskEntries { from, limit, held, marked } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
                 // never learn what had been collected. Judged per origin when
@@ -276,7 +276,7 @@ where
                 // retained oplog to reach the first entry it lacks, in one read
                 // transaction (ADR-153).
                 let window = kimmy_storage::blocking(|| {
-                    engine.entries_for_peer_holding(from, limit, held.as_ref())
+                    engine.entries_for_peer_marked(from, limit, held.as_ref(), &marked)
                 })
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
@@ -772,13 +772,39 @@ where
         Some((_, Repair::Replay { from })) => Some(from),
         _ => None,
     };
+    // What this node holds as state at or below its own position (ADR-172).
+    // The peer passes over everything that position covers (ADR-171), so
+    // these entries would never be served again and their marks would stay
+    // until retention. Named as spans, so the peer serves them and ADR-169
+    // releases them on arrival. Only spans the peer advertises reaching, and
+    // not beside a repair, whose replay serves its range whole anyway. The memo
+    // leaves out spans a peer already answered in full, so a converged member
+    // does not make every tick walk a peer's oplog for marks it cannot release.
+    let marked = if repair.is_none() {
+        let spans = kimmy_storage::blocking(|| engine.held_ranges_covered_by(&mine))
+            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        let reachable: Vec<kimmy_storage::MarkedRange> =
+            spans.into_iter().filter(|span| theirs.get(span.origin) >= span.from).collect();
+        stalls.marks_to_ask(their_node, reachable)
+    } else {
+        Vec::new()
+    };
+    let lowest_marked = marked.iter().map(|span| span.from).min();
     let from = match (mine.behind(&theirs), repair) {
         (behind, Some((_, Repair::Replay { from: floor }))) => {
             Some(behind.map_or(floor, |behind| behind.min(floor)))
         }
         (behind, Some((_, Repair::Snapshot))) => Some(behind.unwrap_or(Hlc::ZERO)),
-        (behind, None) => behind,
+        (Some(behind), None) => Some(lowest_marked.map_or(behind, |lowest| behind.min(lowest))),
+        (None, None) => lowest_marked,
     };
+    if !marked.is_empty() {
+        info!(
+            %peer,
+            spans = marked.len(),
+            "asking the peer to serve entries this node holds as state below its own position"
+        );
+    }
     let Some(from) = from else {
         // Nothing to pull, but the peer's own position is still news:
         // how far *it* trails *us* is what says whether it has been
@@ -840,7 +866,11 @@ where
             Message::BeyondHorizon {}
         }
         _ => {
-            write_frame(stream, &Message::AskEntries { from, limit, held: held.clone() }).await?;
+            write_frame(
+                stream,
+                &Message::AskEntries { from, limit, held: held.clone(), marked: marked.clone() },
+            )
+            .await?;
             read_frame(stream).await?
         }
     };
@@ -856,7 +886,8 @@ where
         }
         limit = fits;
         warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
-        write_frame(stream, &Message::AskEntries { from, limit, held }).await?;
+        write_frame(stream, &Message::AskEntries { from, limit, held, marked: marked.clone() })
+            .await?;
         answer = read_frame(stream).await?;
     }
 
@@ -1043,6 +1074,9 @@ where
     let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;
+    if !marked.is_empty() {
+        stalls.marks_answered(their_node, window_exhausted);
+    }
     outcome.truncated = window_truncated;
     // Only when the pull reached the peer's tail: a round still working
     // through a backlog deeper than one batch has not earned the belief
@@ -1287,6 +1321,10 @@ pub struct PeerStalls {
     /// is with — and written after every page, before the next frame, so a
     /// round the timeout cancels leaves the pages it applied recorded.
     snapshots: HashMap<NodeId, SnapshotProgress>,
+    /// The held spans last asked of each peer (ADR-172), and whether that pull
+    /// reached the peer's tail, which is what lets a round leave out spans a
+    /// peer has already served everything it retains of.
+    marks_asked: HashMap<NodeId, (Vec<kimmy_storage::MarkedRange>, bool)>,
 }
 
 /// How a round repairs a hole against one peer (ADR-148).
@@ -1384,6 +1422,38 @@ struct Stall {
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The held spans worth asking `peer` for this round (ADR-172): `current`,
+    /// unless the last pull from this peer asked for exactly these spans and
+    /// reached its tail. That peer has served every entry it retains inside
+    /// them, and whatever is still held is what it has collected, which
+    /// asking again would re-walk its oplog to find absent on every tick until
+    /// this node's own retention collects the marks. A span that shrank, grew
+    /// or moved is asked again.
+    pub fn marks_to_ask(
+        &mut self,
+        peer: NodeId,
+        current: Vec<kimmy_storage::MarkedRange>,
+    ) -> Vec<kimmy_storage::MarkedRange> {
+        if current.is_empty() {
+            self.marks_asked.remove(&peer);
+            return current;
+        }
+        if self.marks_asked.get(&peer).is_some_and(|(asked, reached)| *reached && *asked == current)
+        {
+            return Vec::new();
+        }
+        self.marks_asked.insert(peer, (current.clone(), false));
+        current
+    }
+
+    /// Record whether the pull that asked `peer` for held spans reached its
+    /// tail (ADR-172).
+    pub fn marks_answered(&mut self, peer: NodeId, reached_tail: bool) {
+        if let Some((_, reached)) = self.marks_asked.get_mut(&peer) {
+            *reached = reached_tail;
+        }
     }
 
     /// Take up the snapshot pulls the engine recorded before this process
@@ -2061,6 +2131,54 @@ mod tests {
             mine_count: Some(10),
             mine_at: None,
         })
+    }
+
+    /// The memo `sync_round` asks for held spans through (ADR-172). Spans are
+    /// named on the first pull; left out once a pull asking exactly those
+    /// spans reached the peer's tail, because that peer has served every entry
+    /// it retains inside them; named again when the pull did not reach the
+    /// tail, when the spans change, or of a different peer; and forgotten when
+    /// nothing is held.
+    #[test]
+    fn peer_stalls_leave_out_spans_a_peer_answered_to_its_tail() {
+        let peer = node(1);
+        let other = node(2);
+        let span = |through: u64| kimmy_storage::MarkedRange {
+            origin: node(3),
+            from: Hlc::new(10, 0),
+            through: Hlc::new(through, 0),
+        };
+        let mut stalls = PeerStalls::new();
+
+        assert_eq!(stalls.marks_to_ask(peer, vec![span(20)]), vec![span(20)], "first ask");
+        stalls.marks_answered(peer, false);
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![span(20)]),
+            vec![span(20)],
+            "a pull short of the tail is asked again"
+        );
+        stalls.marks_answered(peer, true);
+        assert!(
+            stalls.marks_to_ask(peer, vec![span(20)]).is_empty(),
+            "the same spans, answered to the tail, are left out"
+        );
+        assert_eq!(
+            stalls.marks_to_ask(other, vec![span(20)]),
+            vec![span(20)],
+            "another peer is asked"
+        );
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![span(15)]),
+            vec![span(15)],
+            "a span that changed is asked"
+        );
+        stalls.marks_answered(peer, true);
+        assert!(stalls.marks_to_ask(peer, Vec::new()).is_empty(), "nothing held");
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![span(15)]),
+            vec![span(15)],
+            "and a mark held again after that is asked afresh"
+        );
     }
 
     /// The truth table `divergence_probe_for` decides over `PeerStalls`
