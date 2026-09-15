@@ -377,8 +377,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
                     // This node's count and the vector it is judged against,
                     // from one snapshot so the vector cannot name an entry the
-                    // count missed (ADR-168), and off the worker because the
-                    // count walks the collection (ADR-153).
+                    // count missed (ADR-168). A read of the kept count since
+                    // ADR-174, not a walk; still off the worker, as every
+                    // storage read from the loop is (ADR-153).
                     match kimmy_storage::blocking(|| engine.count_probe_reading(id)) {
                         Ok((vector, mine_count)) => {
                             DivergenceProbe { id, mine_count, mine_at: Some(vector) }

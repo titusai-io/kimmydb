@@ -236,13 +236,15 @@ impl Engine {
                 let after = match &restore_to {
                     Some(entry) if entry.kind != OpKind::Delete => match &entry.body {
                         Some(body) => {
-                            docs.insert(
-                                (collection_id, key.as_slice()),
-                                codec::encode_doc_record(&kimmy_core::DocRecord::live(
+                            crate::live_count::put_record(
+                                &txn,
+                                &mut docs,
+                                collection_id,
+                                &key,
+                                &codec::encode_doc_record(&kimmy_core::DocRecord::live(
                                     entry.stamp,
                                     body.clone(),
-                                ))
-                                .as_slice(),
+                                )),
                             )?;
                             outcome.reverted += 1;
                             Some(bson::deserialize_from_slice::<bson::Document>(body).map_err(
@@ -270,10 +272,12 @@ impl Engine {
                             .as_ref()
                             .map(|e| e.stamp)
                             .unwrap_or_else(|| self.next_stamp());
-                        docs.insert(
-                            (collection_id, key.as_slice()),
-                            codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp))
-                                .as_slice(),
+                        crate::live_count::put_record(
+                            &txn,
+                            &mut docs,
+                            collection_id,
+                            &key,
+                            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp)),
                         )?;
                         outcome.removed += 1;
                         None
@@ -315,6 +319,7 @@ impl Engine {
             // resumed from the wrong place (ADR-173).
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
             let mut discarded = VersionVector::new();
             for key in doomed {
                 oplog.remove(key.as_slice())?;
@@ -331,6 +336,15 @@ impl Engine {
             if !discarded.is_empty() {
                 record_rewind(&txn, until, &discarded)?;
             }
+            // The live counts moved with every record the rewind rewrote, in
+            // this transaction; their mark moves with the rows it removed, or
+            // the next start would walk the whole store to rebuild counts that
+            // are exact (ADR-174).
+            crate::live_count::carry_mark(
+                &txn,
+                &mark_before,
+                &crate::live_count::mark_of(&arrival, &oplog)?,
+            )?;
         }
         txn.commit()?;
 

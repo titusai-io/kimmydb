@@ -560,7 +560,13 @@ impl Engine {
 
         {
             let mut docs = txn.open_table(tables::DOCS)?;
-            docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
+            crate::live_count::put_record(
+                txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )?;
         }
 
         let newly_multikey = index::maintain(self, txn, coll, Some(before), next.as_ref(), &key)?;

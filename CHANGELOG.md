@@ -45,6 +45,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     cannot read (`embedding worker stopped` in the log). The same happens when
     a backup taken on 0.30.0 is restored onto 0.29.x.
 
+- **Each collection's live document count is kept, and the divergence check
+  reads it instead of walking the collection** ([ADR-174](docs/decisions.md)).
+  - **What it saves.** Both members of every contact walked the probed
+    collection, reading every page of it. On a 400 MiB collection that measured
+    about 438 MiB read per contact, with resident-memory steps as redb's cache
+    churned under it. The check now reads one value on each member.
+  - **Kept how.** The count moves in the same transaction as every document
+    write, and a source-guard test fails on any write that does not move it.
+  - **One-time startup cost.** The first start of 0.30.0 rebuilds every count
+    before the node serves, reading the header of every document record, and
+    logs `rebuilt the live document counts before serving` with `records` and
+    `elapsed_ms`. On a store larger than the page cache, or with a cold cache,
+    that takes minutes. The same rebuild runs after `kimmyd restore` and after
+    an older build wrote to the database.
+  - **Write path.** Every oplog append writes one more small row. The measured
+    cost is in ADR-174.
+
 ### Fixed
 
 - **The divergence check's count no longer copies or decodes the documents it

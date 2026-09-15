@@ -575,6 +575,8 @@ impl Engine {
             let _ = txn.open_table(tables::INDEXES_DROPPED)?;
             let _ = txn.open_table(tables::OPLOG_COLLECTED)?;
             let _ = txn.open_table(tables::OPLOG_HELD)?;
+            let _ = txn.open_table(tables::LIVE_COUNTS)?;
+            let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
         }
         txn.commit()?;
 
@@ -590,6 +592,30 @@ impl Engine {
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::rebuild_version_vector_if_stale(&db)?;
         Self::seed_collected_if_untracked(&db)?;
+        // After the arrival index, whose end the counts' mark is compared
+        // against: a rebuilt index renumbers positions, and the counts are
+        // rebuilt with it (ADR-174).
+        {
+            let started = std::time::Instant::now();
+            let txn = db.begin_write()?;
+            match crate::live_count::rebuild_if_stale(&txn)? {
+                Some(rebuilt) => {
+                    txn.commit()?;
+                    // Before the node serves anything: this function has not
+                    // returned. On a large store with a cold page cache the
+                    // walk runs at the disk's speed.
+                    info!(
+                        collections = rebuilt.collections,
+                        records = rebuilt.records,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        previous_mark = ?rebuilt.previous_mark,
+                        arrival = rebuilt.arrival,
+                        "rebuilt the live document counts before serving"
+                    );
+                }
+                None => txn.abort()?,
+            }
+        }
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;
@@ -1659,15 +1685,15 @@ impl Engine {
         if !held {
             return Ok((witnessed, None));
         }
-        Ok((witnessed, Some(Self::live_count_in(&txn, id)?)))
+        Ok((witnessed, Some(crate::live_count::live_count(&txn, id)?)))
     }
 
-    /// The live documents of collection `id`, counted in `txn` from each
-    /// record's header alone (`codec::doc_record_is_live`).
+    /// The live documents of collection `id`, counted in `txn` by walking each
+    /// record's header (`codec::doc_record_is_live`).
     ///
-    /// A walk of the collection's records either way, but one that copies and
-    /// decodes nothing: the count half of the divergence check runs it on both
-    /// members of every contact (ADR-133's addendum).
+    /// What the kept count (ADR-174) is checked against. The probe no longer
+    /// walks: it reads `live_count::live_count`.
+    #[cfg(test)]
     pub(crate) fn live_count_in(txn: &redb::ReadTransaction, id: CollectionId) -> Result<u64> {
         let docs = txn.open_table(tables::DOCS)?;
         let mut count = 0u64;
@@ -2543,7 +2569,7 @@ impl Engine {
                         keys
                     };
                     for key in &keys {
-                        docs.remove((id.0, key.as_slice()))?;
+                        crate::live_count::remove_record(&txn, &mut docs, id.0, key)?;
                     }
                     removed += keys.len();
                 }
@@ -2912,6 +2938,10 @@ pub(crate) fn append_oplog_at(
     let next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
     arrival.insert(next, key.as_slice())?;
     by_stamp.insert(key.as_slice(), next)?;
+    // Every document write appends, so this is where a build that keeps the
+    // live counts says so; a mark that no longer matches at open means one that
+    // does not wrote since (ADR-174).
+    crate::live_count::mark_through(txn, &crate::live_count::mark_of(&arrival, &oplog)?)?;
     Ok(false)
 }
 

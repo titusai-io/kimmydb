@@ -206,6 +206,10 @@ impl Engine {
             // the same transaction as the arrival index: a mark on an entry
             // that is gone is a row nothing will ever remove. ADR-160.
             let mut held = txn.open_table(tables::OPLOG_HELD)?;
+            // Removing entries appends nothing, so the live counts' mark is
+            // carried across the removal here (ADR-174). An emptied oplog or
+            // index would otherwise leave it behind, and force a rebuild.
+            let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
 
             let mut highest = None;
             // The same high-water mark per origin: the coarse horizon says a
@@ -230,6 +234,11 @@ impl Engine {
                 }
                 held.remove(key.as_slice())?;
             }
+            crate::live_count::carry_mark(
+                &txn,
+                &mark_before,
+                &crate::live_count::mark_of(&arrival, &oplog)?,
+            )?;
 
             // Recording the horizon is what lets a peer be told it needs a
             // snapshot rather than being served a silent gap. Both records in
@@ -362,7 +371,7 @@ impl Engine {
                     },
                     None => false,
                 };
-                if unchanged && docs.remove(key)?.is_some() {
+                if unchanged && crate::live_count::remove_record(&txn, &mut docs, key.0, key.1)? {
                     removed += 1;
                 }
             }

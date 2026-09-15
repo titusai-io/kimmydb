@@ -17,6 +17,7 @@ pub mod error;
 pub mod expiry;
 pub mod gc;
 pub mod index;
+mod live_count;
 pub mod meta;
 pub mod migrate;
 pub mod modify;

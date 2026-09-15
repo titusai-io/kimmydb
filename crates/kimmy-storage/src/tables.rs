@@ -22,6 +22,29 @@ pub const COLLECTIONS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::n
 /// contiguous range, making scans and drops a single range operation.
 pub const DOCS: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("docs");
 
+/// `collection id -> live records under that id in DOCS` (ADR-174).
+///
+/// Kept, not derived on read: moved in the transaction of every write to
+/// [`DOCS`], through `live_count::put_record` and `live_count::remove_record`,
+/// so the divergence check reads a count instead of walking a collection. A
+/// collection with no live records has no row. Node-local and absent from a
+/// backup; `Engine::open` rebuilds it when [`LIVE_COUNTS_THROUGH`] says it may
+/// be stale.
+pub const LIVE_COUNTS: TableDefinition<u64, u64> = TableDefinition::new("live_counts");
+
+/// `"arrival" -> where the live counts are kept through`: the arrival index's
+/// next position and the oplog's newest key, as they stood after the last
+/// write that kept [`LIVE_COUNTS`] (`live_count::mark_of`).
+///
+/// Written with every oplog append by a build that keeps the counts, and
+/// carried forward by a rewind and by retention, which remove rows without
+/// appending. Every document write appends, so a mark that no longer matches
+/// means a build that does not keep the counts wrote since, and a missing one
+/// means no build that does has written here. Two values, because either alone
+/// can return to a value it held: see the mark's own note.
+pub const LIVE_COUNTS_THROUGH: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("live_counts_through");
+
 /// `(collection_id, index_id, encoded key, encoded _id)`.
 pub type IndexKey<'a> = (u64, u32, &'a [u8], &'a [u8]);
 

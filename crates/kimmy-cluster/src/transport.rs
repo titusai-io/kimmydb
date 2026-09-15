@@ -324,7 +324,8 @@ where
                 // The one document read in this exchange, bounded to the
                 // single collection the requester named (ADR-133).
                 let probe_count = match probe {
-                    // A walk of that collection, so off the worker (ADR-153).
+                    // The kept count of that collection (ADR-174), not a walk;
+                    // off the worker as every storage read here is (ADR-153).
                     Some(id) => kimmy_storage::blocking(|| engine.count_by_id(id))
                         .map_err(|e| ProtocolError::Malformed(e.to_string()))?,
                     None => None,
