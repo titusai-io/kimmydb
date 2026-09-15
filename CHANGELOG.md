@@ -10,8 +10,6 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
-
 ## 0.29.1 - 2026-09-15
 
 **A patch: a change stream on a recreated collection no longer refuses to
