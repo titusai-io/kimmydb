@@ -742,18 +742,70 @@ async fn run() -> Result<()> {
             }
         }
         Command::Backup { out } => {
-            let bytes = client.download("/v1/admin/backup").await?;
+            // Streamed to its destination as it arrives, never held whole: a
+            // backup is the size of the store. The node sends nothing until it
+            // has walked the store, so the wait for it is not timed; the body
+            // is, as a read-idle timeout (ADR-170).
             if out == "-" {
-                use std::io::Write;
-                std::io::stdout().write_all(&bytes)?;
+                client.download_to("/v1/admin/backup", &mut tokio::io::stdout()).await?;
             } else {
-                std::fs::write(out, &bytes)
-                    .with_context(|| format!("writing the backup to {out}"))?;
-                eprintln!("wrote {} bytes to {out}", bytes.len());
+                let bytes = download_into_place(
+                    std::path::Path::new(&out),
+                    async |file: &mut tokio::fs::File| {
+                        client.download_to("/v1/admin/backup", file).await
+                    },
+                )
+                .await?;
+                eprintln!("wrote {bytes} bytes to {out}");
             }
         }
     }
     Ok(())
+}
+
+/// Run `download` into a file beside `out`, and put it at `out` only once it is
+/// complete and on disk.
+///
+/// `out` is often yesterday's good backup, so it is never opened: a download
+/// that fails leaves it byte for byte as it was, and one killed by a signal
+/// leaves at most the `.<name>.<pid>.partial` file beside it. The rename is
+/// within one directory, so `out` is either the old file or the whole new one.
+async fn download_into_place(
+    out: &std::path::Path,
+    download: impl AsyncFnOnce(&mut tokio::fs::File) -> kimmy_client::Result<u64>,
+) -> Result<u64> {
+    let dir = match out.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let name = out.file_name().context("the backup's destination names no file")?;
+    let partial = dir.join(format!(".{}.{}.partial", name.to_string_lossy(), std::process::id()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .await
+        .with_context(|| format!("creating {}", partial.display()))?;
+
+    let written: Result<u64> = async {
+        let bytes = download(&mut file).await?;
+        file.sync_all().await.context("syncing the backup to disk")?;
+        Ok(bytes)
+    }
+    .await;
+    drop(file);
+
+    let placed = match written {
+        Ok(bytes) => tokio::fs::rename(&partial, out)
+            .await
+            .map(|()| bytes)
+            .with_context(|| format!("moving the backup into place at {}", out.display())),
+        Err(e) => Err(e),
+    };
+    if placed.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    placed.with_context(|| format!("downloading the backup to {}", out.display()))
 }
 
 /// Build the request body both search commands send.
@@ -2418,6 +2470,45 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `kimmy backup --out last.backup` over yesterday's good backup: a download
+    /// that fails part-way leaves it byte for byte as it was and nothing beside
+    /// it, and one that completes replaces it whole.
+    #[tokio::test]
+    async fn a_failed_backup_download_leaves_the_existing_file_untouched() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("kimmy-cli-backup-in-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("last.backup");
+        std::fs::write(&target, b"yesterday's good backup").unwrap();
+
+        let failed = download_into_place(&target, async |file: &mut tokio::fs::File| {
+            file.write_all(b"half of today's").await.unwrap();
+            Err(kimmy_client::Error::Stalled {
+                endpoint: "http://node:7878".into(),
+                idle: std::time::Duration::from_secs(30),
+            })
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"yesterday's good backup");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing is left beside it");
+
+        let placed = download_into_place(&target, async |file: &mut tokio::fs::File| {
+            file.write_all(b"today's").await.unwrap();
+            Ok(7)
+        })
+        .await
+        .unwrap();
+        assert_eq!(placed, 7);
+        assert_eq!(std::fs::read(&target).unwrap(), b"today's");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "the partial file became it");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // -----------------------------------------------------------------------

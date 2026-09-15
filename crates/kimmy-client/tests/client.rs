@@ -871,3 +871,103 @@ async fn a_federated_token_cannot_be_refreshed_by_the_node_that_accepted_it() {
         .expect("a local user still refreshes");
     assert!(refreshed["token"].is_string());
 }
+
+/// A node serving a backup the way a real one does: nothing until the walk is
+/// done, then the body. `head` is how long the walk takes, and the body comes
+/// in `chunks` pieces `gap` apart; after `stall_after` pieces, if set, it
+/// stops sending and holds the connection open.
+async fn backup_stub(
+    head: std::time::Duration,
+    chunks: usize,
+    gap: std::time::Duration,
+    stall_after: Option<usize>,
+) -> String {
+    const CHUNK: usize = 1024;
+    let app = axum::Router::new().route(
+        "/v1/admin/backup",
+        axum::routing::get(move || async move {
+            tokio::time::sleep(head).await;
+            let body = futures::stream::unfold(0usize, move |sent| async move {
+                if sent == chunks {
+                    return None;
+                }
+                if stall_after == Some(sent) {
+                    std::future::pending::<()>().await;
+                }
+                if sent > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                let piece = axum::body::Bytes::from(vec![sent as u8; CHUNK]);
+                Some((Ok::<_, std::io::Error>(piece), sent + 1))
+            });
+            (
+                [(axum::http::header::CONTENT_LENGTH, (chunks * CHUNK).to_string())],
+                axum::body::Body::from_stream(body),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A backup whose walk and transfer together take longer than the client's
+/// timeout still downloads (ADR-170). With a total timeout — what this
+/// client used to apply — it fails at one second, part-way through.
+#[tokio::test]
+async fn a_download_longer_than_the_client_timeout_completes() {
+    let second = std::time::Duration::from_secs(1);
+    let base = backup_stub(
+        std::time::Duration::from_millis(1_500),
+        6,
+        std::time::Duration::from_millis(300),
+        None,
+    )
+    .await;
+    let client = Client::builder(&base)
+        .token("opaque-to-this-client")
+        .timeout(second)
+        .connect()
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let written = client.download_to("/v1/admin/backup", &mut out).await.expect("the download");
+    assert!(
+        started.elapsed() > 2 * second,
+        "the fixture must outlast the timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(written, 6 * 1024);
+    assert_eq!(out.len(), 6 * 1024);
+    assert!(out.chunks(1024).enumerate().all(|(i, piece)| piece.iter().all(|&b| b == i as u8)));
+}
+
+/// The body is bounded by the timeout as a read-idle timeout: a node that stops
+/// sending part-way through is abandoned after that long, not waited on for
+/// ever.
+#[tokio::test]
+async fn a_download_that_stops_sending_is_abandoned_after_the_idle_timeout() {
+    let idle = std::time::Duration::from_millis(400);
+    let base = backup_stub(std::time::Duration::ZERO, 6, std::time::Duration::ZERO, Some(2)).await;
+    let client = Client::builder(&base)
+        .token("opaque-to-this-client")
+        .timeout(idle)
+        .connect()
+        .await
+        .unwrap();
+
+    let mut out = Vec::new();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.download_to("/v1/admin/backup", &mut out),
+    )
+    .await
+    .expect("the idle timeout must end the download, not the test's own timeout");
+    assert!(matches!(outcome, Err(kimmy_client::Error::Stalled { .. })), "{outcome:?}");
+    assert_eq!(out.len(), 2 * 1024, "what arrived before the stall was written");
+}

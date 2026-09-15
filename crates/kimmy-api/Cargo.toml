@@ -46,7 +46,7 @@ tracing-opentelemetry.workspace = true
 # value` — so a specification rename is a compile error instead of an attribute
 # nothing queries. Constants only: this crate still gets no SDK and no exporter.
 opentelemetry-semantic-conventions.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "net", "macros", "fs", "io-util"] }
 
 [dev-dependencies]
 parking_lot.workspace = true

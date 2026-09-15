@@ -184,6 +184,13 @@ type TokenProvider = Arc<dyn Fn() -> TokenFuture + Send + Sync>;
 
 struct Inner {
     http: reqwest::Client,
+    /// For downloads: no total timeout, because a backup's headers arrive only
+    /// when the node has walked its whole store, which takes minutes. `idle`
+    /// bounds the body instead.
+    download_http: reqwest::Client,
+    /// The longest a download's body may go without a byte: the builder's
+    /// `timeout`.
+    idle: Duration,
     /// Node endpoints, this client's own first. Rotated on failover.
     endpoints: RwLock<Vec<String>>,
     credentials: Option<(String, String)>,
@@ -609,29 +616,69 @@ impl Client {
         self.send(method.into(), path, body, safety).await
     }
 
-    /// Raw bytes, for the routes that are not JSON — the backup.
+    /// Raw bytes, for the routes that are not JSON — the backup — held in
+    /// memory. [`Client::download_to`] writes them out as they arrive instead,
+    /// which is what a backup of any real size wants.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.download_to(path, &mut bytes).await?;
+        Ok(bytes)
+    }
+
+    /// Stream a route that is not JSON — the backup — into `out`, returning
+    /// the bytes written.
+    ///
+    /// **No total timeout.** A node answers `GET /v1/admin/backup` only once it
+    /// has walked its whole store, which takes minutes on a store of a few
+    /// gigabytes and longer on a cold page cache, and the server applies no
+    /// deadline to it either. So the wait for the response head is unbounded
+    /// (a dead connection still ends it, through TCP keepalive), and the body
+    /// is bounded by the builder's `timeout` as a *read-idle* timeout: the
+    /// download fails with [`Error::Stalled`] if that long passes without a
+    /// byte, however long the whole transfer takes. A body shorter than its
+    /// `Content-Length` is a [`Error::Protocol`].
+    pub async fn download_to<W>(&self, path: &str, out: &mut W) -> Result<u64>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
         self.authenticate().await?;
         let endpoint = self.primary().await;
         let token = self.token().await;
-        let mut builder = self.inner.http.get(format!("{endpoint}{path}"));
+        let mut builder = self.inner.download_http.get(format!("{endpoint}{path}"));
         if let Some(token) = token {
             builder = builder.bearer_auth(token);
         }
-        let response = builder
-            .send()
-            .await
-            .map_err(|source| Error::Transport { endpoint: endpoint.clone(), source })?;
+        let transport = |source| Error::Transport { endpoint: endpoint.clone(), source };
+        let mut response = builder.send().await.map_err(transport)?;
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|source| Error::Transport { endpoint: endpoint.clone(), source })?;
         if !status.is_success() {
+            let bytes = response.bytes().await.map_err(transport)?;
             let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             return Err(error::from_response(status.as_u16(), None, &body));
         }
-        Ok(bytes.to_vec())
+
+        let expected = response.content_length();
+        let idle = self.inner.idle;
+        let mut written = 0u64;
+        loop {
+            let chunk = tokio::time::timeout(idle, response.chunk())
+                .await
+                .map_err(|_| Error::Stalled { endpoint: endpoint.clone(), idle })?
+                .map_err(transport)?;
+            let Some(chunk) = chunk else { break };
+            out.write_all(&chunk).await.map_err(|source| Error::Io { source })?;
+            written += chunk.len() as u64;
+        }
+        out.flush().await.map_err(|source| Error::Io { source })?;
+        if let Some(expected) = expected.filter(|&expected| expected != written) {
+            return Err(Error::Protocol {
+                endpoint,
+                detail: format!("the body ended at {written} of {expected} bytes"),
+            });
+        }
+        Ok(written)
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -1075,6 +1122,9 @@ impl Builder {
         self
     }
 
+    /// The most a request may take, 30 s unless set. For a download
+    /// ([`Client::download_to`]) it is instead the most the body may go
+    /// without a byte, and the wait for the response head is not bounded.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -1094,6 +1144,12 @@ impl Builder {
             .danger_accept_invalid_certs(self.accept_invalid_certs)
             .build()
             .map_err(|source| Error::Transport { endpoint: self.endpoints[0].clone(), source })?;
+        let download_http = reqwest::Client::builder()
+            .connect_timeout(self.timeout)
+            .tcp_keepalive(Duration::from_secs(60))
+            .danger_accept_invalid_certs(self.accept_invalid_certs)
+            .build()
+            .map_err(|source| Error::Transport { endpoint: self.endpoints[0].clone(), source })?;
 
         let session = self.token.map(|token| Session {
             token,
@@ -1107,6 +1163,8 @@ impl Builder {
         let client = Client {
             inner: Arc::new(Inner {
                 http,
+                download_http,
+                idle: self.timeout,
                 endpoints: RwLock::new(self.endpoints),
                 credentials: self.credentials,
                 provider: self.provider,

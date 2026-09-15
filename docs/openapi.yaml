@@ -2720,16 +2720,14 @@ paths:
         There is no filtered backup, because a partial backup that looks like a
         whole one is a restore that silently loses data.
 
-        **The response is buffered whole in the member's memory before any of
-        it is sent — it is not streamed.** Peak memory on the member is
-        therefore the size of the finished backup, on top of everything else it
-        is holding, and the request is what fails if that does not fit. Round
-        0270 measured a backup taking 97% of a member's 2 GiB limit.
-
-        Take a backup against a member you can afford to lose for the duration,
-        watch `kimmy_process_resident_peak_bytes` on it, and size the container
-        accordingly — this summary said "stream" until 0.28.0, and streaming is
-        exactly the property that would have made the memory cost bounded.
+        The whole store is walked under one read transaction and written to an
+        unlinked temporary file in the data directory; the transaction closes
+        before the first byte is sent, and the file is streamed. The member needs
+        free space there equal to one backup for the duration, and holds one read
+        chunk of it in memory. The headers arrive when the walk has finished,
+        which on a store of a few gigabytes can take minutes: the request deadline
+        does not apply to this route, so give the client a read-idle timeout
+        rather than a total one. A data directory without room answers `500`.
       x-kimmy-action: admin over `*`
       responses:
         "200":
@@ -2738,6 +2736,9 @@ paths:
             Content-Disposition:
               schema: { type: string }
               description: '`attachment; filename="kimmy-{node}-{created}.backup"`'
+            Content-Length:
+              schema: { type: integer }
+              description: The size of the backup in bytes, known before it is sent.
           content:
             application/octet-stream:
               schema:

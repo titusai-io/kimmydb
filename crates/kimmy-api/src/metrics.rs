@@ -20,6 +20,27 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Upper bounds of `kimmy_backup_duration_seconds`, in microseconds (ADR-170).
+///
+/// A backup reads the whole store, so its duration follows the store's size and
+/// whether the file is in page cache, not the request: measured from 15 s for
+/// an 800 MB backup to 1,903 s for a 4.29 GB one on a cold cache. The bounds
+/// run from a second to the hour, which brackets both with room either side;
+/// anything longer lands in `+Inf`, which is what an operator should be looking
+/// at anyway.
+pub const BACKUP_BUCKETS_US: [u64; 10] = [
+    1_000_000,
+    5_000_000,
+    15_000_000,
+    30_000_000,
+    60_000_000,
+    120_000_000,
+    300_000_000,
+    600_000_000,
+    1_800_000_000,
+    3_600_000_000,
+];
+
 /// Histogram bucket upper bounds, in microseconds.
 ///
 /// Chosen from measurement, not preference (ADR-046): end-to-end against a
@@ -265,6 +286,9 @@ pub struct MetricsSnapshot {
     /// excluded, so this is smaller than `requests` on any real node.
     pub latency_count: u64,
     pub latency_sum_us: u64,
+    /// Microseconds spent producing backups (ADR-170); `backups` is the
+    /// matching count. The histogram's buckets are on `/metrics` alone.
+    pub backup_duration_sum_us: u64,
 }
 
 /// Counters for one running server.
@@ -273,6 +297,10 @@ pub struct Metrics {
     latency_buckets: [AtomicU64; LATENCY_BUCKETS_US.len()],
     latency_sum_us: AtomicU64,
     latency_count: AtomicU64,
+    /// `kimmy_backup_duration_seconds`, non-cumulative like the latency
+    /// buckets; its count is `backups`.
+    backup_buckets: [AtomicU64; BACKUP_BUCKETS_US.len()],
+    backup_sum_us: AtomicU64,
     replication_lag_secs: AtomicU64,
     /// Pushed by the replication loop after every sync tick (ADR-123): two
     /// counters and a level. What a wedged round looks like from outside,
@@ -369,6 +397,8 @@ impl Default for Metrics {
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
+            backup_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            backup_sum_us: AtomicU64::new(0),
             replication_lag_secs: AtomicU64::new(0),
             sync_failures: AtomicU64::new(0),
             sync_peers_backing_off: AtomicU64::new(0),
@@ -626,7 +656,14 @@ impl Metrics {
         self.cluster_members.store(n, Ordering::Relaxed);
     }
 
-    pub fn record_backup(&self) {
+    /// One backup produced, and how long the walk and the spill took
+    /// (ADR-170). Recorded when the backup exists, before it is sent.
+    pub fn record_backup(&self, elapsed: std::time::Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        if let Some(slot) = BACKUP_BUCKETS_US.iter().position(|&upper| micros <= upper) {
+            self.backup_buckets[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        self.backup_sum_us.fetch_add(micros, Ordering::Relaxed);
         self.backups.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -777,6 +814,7 @@ impl Metrics {
             rate_limited: self.get(&self.rate_limited),
             rate_limited_principal: self.get(&self.rate_limited_principal),
             backups: self.get(&self.backups),
+            backup_duration_sum_us: self.get(&self.backup_sum_us),
             ttl_expired: self.get(&self.ttl_expired),
             ttl_skipped: self.get(&self.ttl_skipped),
             index_unkeyed: readings.index_unkeyed,
@@ -1124,7 +1162,32 @@ impl Metrics {
             jwks_fail = self.get(&self.jwks_refresh_failed),
         );
         self.render_latency(&mut out);
+        self.render_backup_duration(&mut out);
         out
+    }
+
+    /// The backup-duration histogram (ADR-170), in the latency histogram's
+    /// shape. Its count is the backup counter, read once here so the two
+    /// cannot disagree within a scrape.
+    fn render_backup_duration(&self, out: &mut String) {
+        use std::fmt::Write;
+
+        out.push_str(
+            "# HELP kimmy_backup_duration_seconds How long a backup took to produce: the walk of the whole store and its spill to disk, before any of it was sent. Follows the store's size and whether the file is in page cache.\n\
+             # TYPE kimmy_backup_duration_seconds histogram\n",
+        );
+        let mut cumulative = 0u64;
+        for (slot, upper) in BACKUP_BUCKETS_US.iter().enumerate() {
+            cumulative += self.get(&self.backup_buckets[slot]);
+            let le = *upper as f64 / 1e6;
+            let _ =
+                writeln!(out, "kimmy_backup_duration_seconds_bucket{{le=\"{le}\"}} {cumulative}");
+        }
+        let count = self.get(&self.backups);
+        let sum = self.get(&self.backup_sum_us) as f64 / 1e6;
+        let _ = writeln!(out, "kimmy_backup_duration_seconds_bucket{{le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "kimmy_backup_duration_seconds_sum {sum}");
+        let _ = writeln!(out, "kimmy_backup_duration_seconds_count {count}");
     }
 
     /// The latency histogram, in Prometheus's cumulative-bucket form.
@@ -1254,7 +1317,7 @@ mod tests {
             m.record_principal_rate_limited();
         }
 
-        m.record_backup();
+        m.record_backup(Duration::from_secs(42));
         m.record_expiry(11, 12);
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
@@ -1708,6 +1771,21 @@ kimmy_request_duration_seconds_bucket{le=\"10\"} 3
 kimmy_request_duration_seconds_bucket{le=\"+Inf\"} 3
 kimmy_request_duration_seconds_sum 0.03049
 kimmy_request_duration_seconds_count 3
+# HELP kimmy_backup_duration_seconds How long a backup took to produce: the walk of the whole store and its spill to disk, before any of it was sent. Follows the store's size and whether the file is in page cache.
+# TYPE kimmy_backup_duration_seconds histogram
+kimmy_backup_duration_seconds_bucket{le=\"1\"} 0
+kimmy_backup_duration_seconds_bucket{le=\"5\"} 0
+kimmy_backup_duration_seconds_bucket{le=\"15\"} 0
+kimmy_backup_duration_seconds_bucket{le=\"30\"} 0
+kimmy_backup_duration_seconds_bucket{le=\"60\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"120\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"300\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"600\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"1800\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"3600\"} 1
+kimmy_backup_duration_seconds_bucket{le=\"+Inf\"} 1
+kimmy_backup_duration_seconds_sum 42
+kimmy_backup_duration_seconds_count 1
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -1831,6 +1909,10 @@ kimmy_request_duration_seconds_count 3
             expect(&format!("kimmy_embed_provider_errors_total{{kind=\"{kind}\"}} {n}\n"));
         }
         expect(&format!("kimmy_request_duration_seconds_count {}\n", s.latency_count));
+        expect(&format!(
+            "kimmy_backup_duration_seconds_sum {}\n",
+            s.backup_duration_sum_us as f64 / 1e6
+        ));
 
         // Not a rendered series of its own — the histogram prints it in seconds
         // — but the bridge reports microseconds, so the conversion is the thing
@@ -1883,10 +1965,11 @@ kimmy_request_duration_seconds_count 3
         // 56 scalar sample lines plus three histograms: the latency one's 12
         // buckets, +Inf, sum and count; the writer wait's 8 buckets, +Inf,
         // sum and count (ADR-151); and the writer hold's 7 buckets, +Inf,
-        // sum and count for each of the twelve holders (ADR-159).
+        // sum and count for each of the twelve holders (ADR-159); and the
+        // backup duration's 10 buckets, +Inf, sum and count (ADR-170).
         assert_eq!(
             samples,
-            90 + 10 * kimmy_storage::WriterHolder::COUNT,
+            103 + 10 * kimmy_storage::WriterHolder::COUNT,
             "expected one sample per series: {out}"
         );
     }

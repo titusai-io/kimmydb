@@ -58,7 +58,7 @@ fails fast on a bad volume mount.
 | `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiters' own memory; the key space is attacker-controlled |
 | `server.rate_limit.per_principal` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL` | `0` | Requests per authenticated principal per window, on every route that takes a token. `0` disables — the default. See [Security](security.md#limits-on-authenticated-requests) |
 | `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
-| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body or for an embedding provider; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams and `/mcp` are exempt |
+| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body or for an embedding provider; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams, `/mcp` and `GET /v1/admin/backup` are exempt |
 | `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
@@ -559,6 +559,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_write_lock_held_seconds_max` | The longest any one transaction has held the writer since start. Every other write on the node waited behind it. A value above a few seconds on a member with no bulk traffic is a background pass that walked more than it should have. One number about one moment, and it names nothing: the histogram below is what says which path to go and look at |
 | `kimmy_write_lock_held_seconds{holder}` | Histogram of how long each transaction *held* the single writer, by what held it. The cause `kimmy_write_lock_wait_seconds` is the effect of: every other write on the node queues behind the hold, and until this existed nothing on the page could say which of the twelve holders it was queueing behind. The holders are `write` (one document from a client), `bulk` (a bulk insert, a chunk of a multi-document update, a scoped batch), `ddl` (a schema change that writes metadata alone), `index_build` (an index creation, which files every document of the collection in the transaction that creates it), `drop` (the destructive half of a drop: one chunk of a collection's purge, or an index drop, which is still one transaction. The burial that precedes a collection's purge writes metadata alone and is `ddl`; the chunks a creation or a restart's sweep runs to finish an earlier drop are `drop`, because the label names the work and not who asked for it), `replication` (applying a peer's entries), `repair` (a page of a peer's snapshot), `retention` (the pass removing what its scans found, never the scans), `expiry` (a TTL index's delete), `embedding` (the worker writing vectors or checkpointing its position), `durability` (the shared fsync of the coalescing barrier), and `rewind` (a point-in-time rewind, which runs only under `kimmyd restore --until` in a process that serves no metrics, so it reads 0 here). A holder is what the transaction *does*, not who asked for it, so a collection drop is `drop` whether a client issued it or a peer's entry carried it. **Alert on the `5`-second bucket falling behind `+Inf` for any holder**: that is the same threshold as the `WARN` logged when the holder lets go, so every hold counted there has a log line naming the same holder. Read `_sum` by holder for the other question — which holder is spending the writer's time when no single hold is long enough to warn ([ADR-159](decisions.md)) |
 | `kimmy_backups_total` | Backups served |
+| `kimmy_backup_duration_seconds` | Histogram of how long each backup took to produce: the walk of the whole store and its spill to disk, before any of it was sent. Buckets run from 1 s to 3,600 s. It follows the store's size and whether the database file is in page cache, so a backup several times slower than the last one on the same store is usually a cold cache rather than a fault. Its count is `kimmy_backups_total`; on the OTLP bridge its sum is `kimmy.backup.duration_seconds` ([ADR-170](decisions.md)) |
 | `kimmy_ttl_expired_total` | Documents deleted by a TTL index |
 | `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
 | `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, more than 1,000 keys for one document, a `Decimal128` at an indexed path — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)) |
@@ -1289,22 +1290,37 @@ lesser grant would read past its own scope. There is no grant-filtered backup: a
 partial backup that looks whole is a restore that silently loses data.
 
 It runs inside a read transaction, so it is a consistent snapshot of one instant
-and writers are neither blocked nor affected. The response is buffered before
-sending rather than streamed as it is produced, so a slow client cannot pin
-redb's pages by reading slowly.
+and writers are neither blocked nor affected. The walk writes the backup to a
+temporary file in the data directory, beside `kimmy.redb`; the transaction closes
+when the walk ends, before the first byte is sent, and the file is then streamed
+to the client. A slow client therefore pins neither redb's pages nor the
+member's memory. The file is unlinked from the moment it is created, so a
+client that disconnects, a crash or a walk that fails leaves nothing behind: the
+space comes back when the transfer ends ([ADR-170](decisions.md)).
 
-**That buffering is what decides the memory cost, so size for it.** Peak
-resident memory on the member is the size of the finished backup on top of
-everything else it is holding, and the request is what fails if that does not
-fit. Round 0270 measured a backup taking **97% of a member's 2 GiB limit**.
-Take one against a member you can afford to lose for the duration, watch
-`kimmy_process_resident_peak_bytes` on it rather than the sampled resident
-figure — the peak is latched and a five-second sampler will miss the spike — and
-give the container headroom above the backup you expect.
+**What a backup costs, so size for it.**
 
-`docs/openapi.yaml` summarised this route as *"Stream a consistent backup"*
-until 0.28.0, which said the opposite of what it does on precisely the property
-that determines whether the memory cost is bounded.
+- **Time**, in proportion to the store and to whether the database file is in
+  page cache. Three members of a three-member test cluster with stores identical
+  to the byte, 4.29 GB each, took 92 s, 330 s and 1,903 s, the spread being how
+  warm each member's cache was; an 808 MB backup took 15 s. The response headers
+  arrive only when the walk has finished, so nothing is received for that long.
+- **Disk**: free space in the data directory equal to one backup, for the walk and
+  the transfer together. A backup that runs out of space answers `500`, and the
+  `ERROR` line with `event` `backup failed` names the directory and the operating
+  system's error.
+- **Memory**: one read chunk. Until 0.29.0 the finished backup was held in the heap
+  until the client had read the last byte, and that was the cost that mattered: an
+  808 MB backup took a member to 1,789 MiB of its 2 GiB container limit, and one
+  of the same size in an earlier round to 1,838 MiB.
+
+**The request deadline does not apply to this route**, as it does not apply to a
+change stream: `server.request_timeout_secs` would otherwise cut every real
+backup at 30 s. Give your client a read-idle timeout rather than a total one —
+`curl` has no total unless you set one — and expect it to wait for the walk before
+the headers arrive. The response carries `Content-Length`, so once they do, a
+client can show progress and size the rest of its wait.
+`kimmy_backup_duration_seconds` records how long each backup took to produce.
 
 > **Still do not copy `kimmy.redb` from a running node.** redb is rewriting
 > pages underneath the copy, and the result is not a state the database was ever
@@ -1406,12 +1422,13 @@ partially read.
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | Retention pass | Reads the expired oplog prefix by key range and up to 100,000 documents of the tombstone scan per pass, under read transactions; holds the single writer only to remove what it found, 1,000 records per commit. On a member whose container leaves no page cache for the database file, a scan of that size reads from disk — size a container limit for the file's working set as well as for `kimmy_process_resident_bytes`, or the pass, and every read that misses, runs at the disk's speed ([ADR-151](decisions.md)) |
+| Backup | Reads the whole store under one read transaction and writes it to an unlinked file in the data directory, so it needs free space there equal to one backup for as long as the walk and the transfer take; the heap holds one read chunk. Its time follows the store and the page cache — the same dependence as the retention pass above — and three identical 4.29 GB stores took 92 s to 1,903 s. No request deadline applies. See [Taking a backup](#taking-a-backup) and `kimmy_backup_duration_seconds` ([ADR-170](decisions.md)) |
 | TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
 | Collection drop | Two stages ([ADR-158](decisions.md)). One short transaction removes the definition, records the tombstone and mints the entry; everything the collection held is then removed 1,000 rows per commit, the vector shadow in the same chunks, with the single writer released between them. So a drop still takes as long as it takes — 62 s for 261,000 small documents, 238 s for a 12,829-row vector shadow, measured on a three-member cluster — but only its own caller waits for it, where before every client write on that member queued behind one transaction and, past `server.request_timeout_secs`, was refused. **From the drop's first commit the collection is gone**: it is not listed, not served, not reported by the divergence check, and not recreatable by a repair, so there is no window in which it reads as intact and short of documents. A drop interrupted by a restart leaves rows under an id nothing resolves — invisible, and finished at the next start **before that member binds**, so a restart part-way through a large drop adds up to what was left of it to the start; the start logs each collection it owes and its row count before it begins, so a long one is diagnosable rather than silent. A `WARN` naming a chunk that gave up waiting for the writer leaves the same state on a node that stayed up, and the next retention pass removes it, logging each collection and its row count when it starts and a line when it is done; the collection tombstone that marks those rows is kept past `storage.tombstone_retention_secs` until they are gone. With `storage.gc_interval_secs = 0` no pass runs, and the rows wait for the next start. Unreachable disk rather than data — and the database file does not shrink either way, since redb reuses freed pages rather than returning them |
 | Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
-| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. **`kimmy_process_resident_bytes` is the whole of it**, as the kernel counts it; size a container limit from that gauge, not from the two byte gauges, which each bound one part. It does not come down promptly by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and the allocator hands freed heap back to the kernel in whole segments on its own schedule — a 0.24.0 member sat at its limit for eleven minutes after the load on it ended, came down to a third, and went back up with nothing running (see below). A restart is the certain reset; `kimmy_process_resident_peak_bytes` says what the last run climbed to |
+| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. **`kimmy_process_resident_bytes` is the whole of it**, as the kernel counts it; size a container limit from that gauge, not from the two byte gauges, which each bound one part. It does not come down promptly by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and the allocator hands freed heap back to the kernel in whole segments on its own schedule — a 0.24.0 member sat at its limit for eleven minutes after the load on it ended, came down to a third, and went back up with nothing running (see below). A restart is the certain reset; `kimmy_process_resident_peak_bytes` says what the last run climbed to. A backup is not a contributor: it is spilled to disk rather than held in the heap ([ADR-170](decisions.md)) |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly

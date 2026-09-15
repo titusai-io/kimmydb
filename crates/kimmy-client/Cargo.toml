@@ -22,7 +22,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "io-util"] }
 futures.workspace = true
 # WebSocket framing only. TLS is supplied by this crate rather than selected by
 # a feature, so the connector is the ring-backed one the workspace already
