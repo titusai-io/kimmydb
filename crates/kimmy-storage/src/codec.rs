@@ -179,6 +179,20 @@ pub fn decode_doc_record(mut input: &[u8]) -> Result<DocRecord> {
     Ok(DocRecord { stamp, deleted, body: input.to_vec() })
 }
 
+/// Whether an encoded document record is live, read from its fixed-width header
+/// without touching the body.
+///
+/// For a walk that only counts: every record is judged on its first
+/// `1 + STAMP_LEN + 1` bytes, and nothing is copied or decoded. The bytes read
+/// from disk are the same — redb keeps a value in the leaf page that holds its
+/// key — but the copy [`decode_doc_record`] makes of every body, and the BSON
+/// parse a document read adds to it, are not (ADR-133's addendum).
+pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
+    check_version(&mut input)?;
+    take(&mut input, STAMP_LEN)?;
+    Ok(take(&mut input, 1)?[0] == 0)
+}
+
 // ---------------------------------------------------------------------------
 // OplogEntry
 // ---------------------------------------------------------------------------

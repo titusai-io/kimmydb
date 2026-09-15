@@ -45,6 +45,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     cannot read (`embedding worker stopped` in the log). The same happens when
     a backup taken on 0.30.0 is restored onto 0.29.x.
 
+### Fixed
+
+- **The divergence check's count no longer copies or decodes the documents it
+  counts** ([ADR-133](docs/decisions.md)'s addendum). Both members of every
+  contact count the probed collection. The requester copied every document's
+  body to read one byte of its header, and the answering peer parsed every
+  document into BSON. Both now read only each record's header.
+  - **Saved:** the CPU and the per-record heap on both sides of every contact.
+  - **Unchanged: the bytes read.** The walk still loads every page of the
+    collection, because redb keeps a value in the page that holds its key.
+
 ## 0.29.1 - 2026-09-15
 
 **A patch: a change stream on a recreated collection no longer refuses to

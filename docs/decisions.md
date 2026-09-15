@@ -9127,6 +9127,35 @@ Defended by `crates/kimmy-storage/src/divergence.rs`'s unit tests —
 `a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`
 (the exhausted boundary, both sides).
 
+**Addendum (0.30.0): the count reads each record's header, and nothing else.**
+The count half needs one fact per record: whether it is live, which is the
+tombstone flag in the record's fixed header (`version ‖ stamp ‖ deleted ‖ body`).
+Tombstones share `DOCS` with live documents, so a walk of keys alone would count
+them, and the flag has to be read.
+- **What the walk paid, measured on 0.29.1.** A 400 MiB collection read about
+  438 MiB per contact (`rchar`). Both sides of a contact also paid per record:
+  - the requester (`count_probe_reading`) copied every record's whole body to
+    read that one byte (`decode_doc_record`);
+  - the answering peer (`count_by_id`, through `Engine::count`) parsed every
+    live document into BSON.
+- **Now.** Both read the flag with `codec::doc_record_is_live` and copy and
+  decode nothing: `Engine::live_count_in`, shared by the two.
+- **What does not change: the bytes read.** redb keeps a value in the leaf page
+  that holds its key, so reaching a record's header loads its body's page either
+  way. The per-contact read, and the resident-memory steps that follow redb's
+  cache churning under it, stay. Removing those needs a count that is not a
+  walk.
+- **Held by:**
+  - `a_probe_count_is_the_live_document_count`: the header count equals
+    `Engine::count` over live documents, tombstones and a replaced document.
+  - `a_record_whose_body_does_not_decode_is_counted_from_its_header`: the body
+    is not read. Red on 0.29.1, where `count_by_id` failed decoding it.
+  - `counting_a_collection_of_large_documents_allocates_less_than_one_of_them`
+    (`kimmy-storage/tests/count_allocations.rs`, a counting allocator): 64
+    documents of 64 KiB, cache warm. Each count allocates less than one
+    document. On 0.29.1 `count_probe_reading` allocated 4,203,191 bytes and
+    `count_by_id` 8,428,874.
+
 ---
 
 ## ADR-134 — A tagged variant that takes no configuration carries an empty body, so an unknown key beside it is refused
