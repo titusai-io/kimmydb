@@ -15157,6 +15157,10 @@ elsewhere would be set without evidence.
 **Consequences.**
 - Resident memory no longer tracks a backup's size; the heap holds one read
   chunk.
+  *Correction (0.29.1):* the walk also fills redb's read cache to
+  `storage.cache_bytes` on a store larger than that, as any full read does, and
+  the allocator keeps it; round 0330 measured +91 MiB for a 531 MB backup on a
+  partly warm cache (see [Operations](operations.md#taking-a-backup)).
 - The data directory needs one backup's worth of free space for the duration.
   Running out is a `500` with an `ERROR` line; the database is untouched.
 - A backup has no deadline. The response headers arrive when the walk ends, which
