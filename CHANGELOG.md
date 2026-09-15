@@ -10,12 +10,33 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.29.0 - 2026-09-15
+
+**A minor. Read the two entries under *Changed* before upgrading.** The backup
+route now needs free disk beside the database and has no request deadline, and
+the Rust client's `Error` gains variants an exhaustive `match` must handle
+(ADR-170). The wire gains one defaulted field, `AskEntries.marked` (ADR-172),
+which an older member ignores and does not send, so a member-at-a-time roll
+needs no ordering.
+
+**The roll is not evidence of mixed-version compatibility**
+([docs/compatibility.md](docs/compatibility.md)). 0.29.0 rolls member at a time,
+with no held mixed-version phase, so its wire compatibility rests on the tests
+beside the protocol:
+- `ask_entries_marked_crosses_a_version_boundary_in_both_directions` and
+  `ask_entries_crosses_a_version_boundary_in_both_directions`, which decode the
+  new request as an older member reads it and an older request as this release
+  reads it;
+- `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`,
+  which answers a 0.29.0 requester the way a 0.28.1 sender and an ADR-171 sender
+  each serve.
+
+ADR-172's live mixed-version test was prepared and parked for this release.
 
 ### Added
 
 - **`kimmy_sync_held_marks_released_total` counts the entries a sync window
-  releases from being held as state** (ADR-169's addendum). A member caught up
+  releases from being held as state** ([ADR-169](docs/decisions.md)'s addendum). A member caught up
   by snapshot holds what the snapshot wrote above the vector it advertises until
   those entries arrive in position, and a member pulling from it leaves them
   meanwhile under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`.
@@ -34,7 +55,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   90% and 97%. The walk now writes to an unlinked temporary file beside
   `kimmy.redb`, closes its read transaction, and streams the file, so memory holds
   one read chunk and a slow client pins neither the database's pages nor the heap.
-  See ADR-170, which amends ADR-041.
+  See [ADR-170](docs/decisions.md), which amends ADR-041.
 
   **What to plan for.**
   - **Disk:** the data directory needs free space equal to one backup for the walk
@@ -56,7 +77,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   backup longer than 30 s.** `kimmy-client` downloaded with its 30 s total
   timeout and collected the body in memory. For a download, `Builder::timeout` now
   means a read-idle timeout on the body: there is no total, and the wait for the
-  response head is unbounded.
+  response head is unbounded. See [ADR-170](docs/decisions.md).
   - **New public API:** `Client::download_to`, which streams into any `AsyncWrite`;
     `Error::Stalled`, returned when the body goes that long without a byte; and
     `Error::Io`, for a local write failure.

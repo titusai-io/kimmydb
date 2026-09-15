@@ -15692,40 +15692,36 @@ boundary on every pull.
     itself sends.
 
 **The deliberate mixed-version test for the 0.29.0 release plan**
-(compatibility.md). A held mark at or below the witnessed position cannot be
-produced through the product's API on a correct build: it needs a hole, which is
-a defect. So the test places one with the harness fixture this record's tests
-use on the 0.29.0 member. That fixture applies a window with one entry missing,
-whose exhaustion covers it, then runs a scoped repair from a member holding the
-entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
-- **Setup.**
-  1. Write a few thousand documents through P.
-  2. Converge.
-  3. On M, drop one of those entries from the window it took and repair its
-     collection from P, so M holds that entry under a mark at or below its
-     position.
-  4. Stop writes. Record M's `merged from peer` lines and the `asking the peer
-     to serve entries…` line from here on.
-- **(a) M pulls from a 0.28.1 member.**
-  1. Write N documents through Q, after a quiet spell.
-  2. M's pulls from Q number about N / 1,024. There is no run of `applied 0`
-     pulls from the mark's position: M's request asks from its own threshold,
-     and Q serves nothing inside the span.
-  3. The mark is not released by Q, and M's
-     `kimmy_sync_held_marks_released_total` does not move.
-  4. M's asking line may appear, since it names the span to every peer, but Q
-     answers it with the ordinary window only.
-  5. Hold the cluster mixed for at least ten sync intervals. Across it:
-     `kimmy_sync_failures_total` is flat on every member,
-     `kimmy_sync_divergence_checks_total{outcome="ran"}` rises, and no decode or
-     malformed-frame `WARN` appears.
-- **(b) M pulls from a 0.29.0 member.**
-  1. Roll P to 0.29.0.
-  2. M's next pull from P releases the mark in one pull. M's advertised vector
-     for the origin reaches the entry, and M's
-     `kimmy_sync_held_marks_released_total` rises by one (ADR-169's addendum).
-  3. M's asking line is logged once for that span set, not per pull.
-- **Finish.** Roll Q, and repeat the checks in (a) step 5.
+(compatibility.md). **Prepared and parked.** 0.29.0 rolls member at a time with
+no held mixed-version phase, so this test is not run for it. The evidence for
+0.29.0's wire is the harness tests under *Wire and roll* and *Held by*, and the
+release notes say so. The test is kept here for a release that holds a mixed
+phase.
+- **The live half is the wire only.** A held mark at or below the witnessed
+  position needs a hole, which is a defect, and no supported operation places
+  one on a deployed member. `kimmyd restore` re-derives the witnessed vector and
+  the marks from the oplog. A restore with `--until` removes the marks with the
+  entries it discards and lowers the vectors to what the oplog holds. No route
+  or command starts a repair. A whole-database catch-up releases every mark its
+  grant covers. On a three-member cluster, M on 0.29.0 and P and Q on 0.28.1:
+  1. Hold the cluster mixed for at least ten sync intervals, with writes through
+     M and through Q. Across it, `kimmy_sync_failures_total` is flat on every
+     member, `kimmy_sync_divergence_checks_total{outcome="ran"}` rises, no decode
+     or malformed-frame `WARN` appears, and M's
+     `kimmy_sync_held_marks_released_total` is flat.
+  2. Leave Q quiet while M keeps writing, then write one document through Q.
+     M's pulls from Q show ADR-171's drain, a run of `applied 0` pulls, because
+     a 0.28.1 sender serves the origin-blind window.
+  3. Roll P to 0.29.0. Leave P quiet while M keeps writing, then write one
+     document through P. M takes it from P in one pull.
+  4. Roll Q, and repeat step 1.
+- **The mark half is harness-only**, held by
+  `a_held_entry_below_the_members_position_is_released_by_its_next_pull` (a
+  0.29.0 sender releases the mark in one pull, over TCP),
+  `a_held_entry_at_or_below_the_members_witnessed_position_is_released_by_its_span`
+  (without a span the mark stays), and
+  `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`
+  (a 0.28.1 sender is asked no more than before and releases nothing).
 
 **Alternatives.**
 - *A floor per origin* (above).
