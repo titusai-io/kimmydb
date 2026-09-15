@@ -3927,19 +3927,19 @@ mod tests {
     }
 
     #[test]
-    fn a_held_entry_at_or_below_the_members_witnessed_position_is_not_re_served() {
-        // ADR-171's residual against ADR-169, pinned as it stands. R has a hole
-        // on A's origin: its witnessed vector covers S, A's last write, and S is
-        // not in R's oplog. A scoped repair brings S under `Hold`: a mark, and
-        // neither vector raised, so R advertises A's origin below S and a peer
-        // pulling from R defers S (ADR-167's residual). A second origin, B, then
-        // holds R's threshold below S: the quiet-origin shape a roll produces.
+    fn a_held_entry_at_or_below_the_members_witnessed_position_is_released_by_its_span() {
+        // ADR-171's residual against ADR-169, and ADR-172's closure of it. R has
+        // a hole on A's origin: its witnessed vector covers S, A's last write,
+        // and S is not in R's oplog. A scoped repair brings S under `Hold`: a
+        // mark, and neither vector raised, so R's servable vector stops below S.
+        // A second origin, B, then holds R's threshold below S: the quiet-origin
+        // shape a roll produces.
         //
         // Before ADR-171 that window re-served S and ADR-169 released the mark.
-        // Now S is covered by R's witnessed vector and is passed over, so the
-        // mark stays until A writes again or retention collects S. The last
-        // half shows the unskipped window still releasing it, so a fix for the
-        // residual flips the middle, not the fixture.
+        // Under ADR-171 alone S is covered by R's witnessed vector and passed
+        // over, which is what a request naming no spans still gets, from a
+        // requester that predates ADR-172. The last half names R's span, and S
+        // is served and released.
         let pause = || std::thread::sleep(std::time::Duration::from_millis(3));
         let (a, _da) = engine();
         let (b, _db) = engine();
@@ -3990,18 +3990,88 @@ mod tests {
         let window = a.entries_for_peer_holding(from, usize::MAX, Some(&held)).unwrap();
         assert!(!window.entries.iter().any(is_s), "S is passed over");
         r.apply_peer_batch(&theirs, &window.entries, window.scanned_to, true).unwrap();
-        assert_eq!(r.held_len().unwrap(), 1, "the residual: the mark stays");
+        assert_eq!(r.held_len().unwrap(), 1, "without a span, the mark stays");
         assert!(
             r.version_vector().unwrap().get(a.node_id()) < s,
             "and R still advertises A below S"
         );
 
-        // The same window unskipped, as it was served before ADR-171.
-        let whole = a.entries_for_peer(from, usize::MAX).unwrap();
-        assert!(whole.entries.iter().any(is_s));
-        r.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, true).unwrap();
+        // R names what it holds as state below its position (ADR-172), and is
+        // no longer behind A on anything.
+        let held = r.witnessed_vector().unwrap();
+        assert!(held.behind(&theirs).is_none());
+        let spans = r.held_ranges_covered_by(&held).unwrap();
+        assert_eq!(
+            spans,
+            vec![crate::sync::MarkedRange { origin: a.node_id(), from: s, through: s }]
+        );
+        let marked = a.entries_for_peer_marked(s, usize::MAX, Some(&held), &spans).unwrap();
+        assert!(
+            marked.entries.len() == 1 && is_s(&marked.entries[0]),
+            "S alone is served: {:?}",
+            marked.entries
+        );
+        r.apply_peer_batch(&theirs, &marked.entries, marked.scanned_to, marked.exhausted).unwrap();
         assert_eq!(r.held_len().unwrap(), 0, "arriving in a window releases it");
         assert_eq!(r.version_vector().unwrap().get(a.node_id()), s);
+        assert!(r.held_ranges_covered_by(&r.witnessed_vector().unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it() {
+        // ADR-172's bound. R holds ten of A's writes as state, from the middle
+        // of four windows' worth of A's history, and is behind A on nothing.
+        // Serving from the lowest mark up to R's position would re-serve the
+        // drain ADR-171 removed; the span serves the ten.
+        let (a, _da) = engine();
+        let (r, _dr) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let busy = 4 * 1024 + 100;
+        a.insert_many(&ca, (0..busy).map(|i| doc! { "_id": i as i64 }).collect()).unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let hole: std::collections::BTreeSet<DocId> = (2_000..2_010).map(DocId::Int64).collect();
+        let holed: Vec<OplogEntry> = history
+            .entries
+            .iter()
+            .filter(|e| e.doc_id.as_ref().is_none_or(|id| !hole.contains(id)))
+            .cloned()
+            .collect();
+        assert_eq!(holed.len() + hole.len(), history.entries.len());
+        r.apply_peer_batch(&a.version_vector().unwrap(), &holed, history.scanned_to, true).unwrap();
+        let mut progress = SnapshotProgress::of_collection(ca.id);
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            r.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert_eq!(r.held_len().unwrap(), hole.len(), "the repair holds the ten as state");
+
+        let held = r.witnessed_vector().unwrap();
+        assert!(held.behind(&a.version_vector().unwrap()).is_none(), "R is behind A on nothing");
+        let spans = r.held_ranges_covered_by(&held).unwrap();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let from_floor = a.entries_for_peer(spans[0].from, usize::MAX).unwrap().entries.len();
+        let window = a.entries_for_peer_marked(spans[0].from, 1024, Some(&held), &spans).unwrap();
+        eprintln!(
+            "span of {} marks: {} entries served; from the floor to R's position: {from_floor}",
+            hole.len(),
+            window.entries.len()
+        );
+        assert!(from_floor > 2_000, "the fixture must put a long history above the floor");
+        assert_eq!(
+            window.entries.len(),
+            hole.len(),
+            "the span's entries, not the {from_floor} from its floor to R's position"
+        );
+        assert!(window.exhausted, "one pull");
+        r.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
+            .unwrap();
+        assert_eq!(r.held_len().unwrap(), 0, "every mark is released");
+
+        // A request naming no spans is served exactly as ADR-171 serves it.
+        assert_eq!(
+            a.entries_for_peer_marked(spans[0].from, 1024, Some(&held), &[]).unwrap(),
+            a.entries_for_peer_holding(spans[0].from, 1024, Some(&held)).unwrap()
+        );
     }
 
     #[test]

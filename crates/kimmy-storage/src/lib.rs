@@ -48,8 +48,8 @@ pub use snapshot::{
     SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
-    SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to, lacks_collected, lag_behind_ms,
-    lag_beyond_horizon_ms,
+    MarkedRange, SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to, lacks_collected,
+    lag_behind_ms, lag_beyond_horizon_ms,
 };
 pub use vectors::VectorWrite;
 pub use watch::{

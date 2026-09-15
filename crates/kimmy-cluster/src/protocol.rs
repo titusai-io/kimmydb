@@ -115,6 +115,16 @@ pub enum Message {
         limit: usize,
         #[serde(default)]
         held: Option<VersionVector>,
+        /// Spans of history the requester holds as state at or below `held`,
+        /// which the skip would otherwise never serve it again (ADR-172):
+        /// the sender serves the entries inside them as well. Written on
+        /// every request, empty when there are none, so a mixed-version
+        /// cluster exercises the boundary on every pull. Optional on the wire
+        /// for the reason `held` is: a sender that predates the field ignores
+        /// it and serves as ADR-171 does, and a requester that predates it
+        /// sends none, which reads as no spans.
+        #[serde(default)]
+        marked: Vec<kimmy_storage::MarkedRange>,
     },
     /// The answer, in stamp order, and where the window it came from ended.
     ///
@@ -558,8 +568,23 @@ mod tests {
         let messages = [
             Message::AskVersions { witnessed: false },
             Message::AskVersions { witnessed: true },
-            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None },
-            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: Some(populated_vector()) },
+            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None, marked: Vec::new() },
+            Message::AskEntries {
+                from: Hlc::new(7, 1),
+                limit: 10,
+                held: Some(populated_vector()),
+                marked: Vec::new(),
+            },
+            Message::AskEntries {
+                from: Hlc::new(7, 1),
+                limit: 10,
+                held: Some(populated_vector()),
+                marked: vec![kimmy_storage::MarkedRange {
+                    origin: NodeId::generate(),
+                    from: Hlc::new(3, 0),
+                    through: Hlc::new(5, 2),
+                }],
+            },
             Message::Versions(populated_vector()),
             Message::Vectors { servable: populated_vector(), witnessed: populated_vector() },
             Message::Entries { entries: Vec::new(), scanned_to: Hlc::new(11, 2), exhausted: false },
@@ -628,9 +653,12 @@ mod tests {
         // would consume the tail of the first message.
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Message::AskVersions { witnessed: false }).await.unwrap();
-        write_frame(&mut buffer, &Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None })
-            .await
-            .unwrap();
+        write_frame(
+            &mut buffer,
+            &Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None, marked: Vec::new() },
+        )
+        .await
+        .unwrap();
 
         let mut stream = buffer.as_slice();
         assert_eq!(
@@ -639,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None }
+            Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None, marked: Vec::new() }
         );
     }
 
@@ -659,7 +687,7 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new() },
             "a request without the field must read as one that did not send it"
         );
 
@@ -673,8 +701,69 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new() },
             "a field this build does not know must not fail the frame"
+        );
+    }
+
+    /// The same boundary for `AskEntries::marked` (ADR-172). A receiver
+    /// before the field reads a request carrying spans as the request it
+    /// knew; a requester before the field sends none, which reads as a
+    /// request naming no spans and is served as ADR-171 serves it.
+    #[tokio::test]
+    async fn ask_entries_marked_crosses_a_version_boundary_in_both_directions() {
+        /// `AskEntries` as a receiver before ADR-172 declares it.
+        #[derive(Debug, Deserialize)]
+        struct AskEntriesBeforeMarked {
+            from: Hlc,
+            limit: usize,
+            #[serde(default)]
+            held: Option<VersionVector>,
+        }
+
+        let held = populated_vector();
+        let request = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: Some(held.clone()),
+            marked: vec![kimmy_storage::MarkedRange {
+                origin: NodeId::generate(),
+                from: Hlc::new(3, 0),
+                through: Hlc::new(5, 2),
+            }],
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &request).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let sent = body.get_document("AskEntries").unwrap().clone();
+        assert!(
+            sent.contains_key("marked"),
+            "the frame must carry the field for this to test anything: {sent}"
+        );
+
+        let older: AskEntriesBeforeMarked = bson::deserialize_from_document(sent.clone())
+            .expect("a receiver that predates the field must still read the request");
+        assert_eq!(older.from, Hlc::new(7, 1));
+        assert_eq!(older.limit, 10);
+        assert_eq!(older.held, Some(held.clone()));
+
+        let mut before = sent;
+        before.remove("marked");
+        let frame = {
+            let bytes = bson::serialize_to_vec(&bson::doc! { "AskEntries": before }).unwrap();
+            let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        assert_eq!(
+            read_frame(&mut frame.as_slice()).await.unwrap(),
+            Message::AskEntries {
+                from: Hlc::new(7, 1),
+                limit: 10,
+                held: Some(held),
+                marked: Vec::new()
+            },
+            "a request without the field must read as one naming no spans"
         );
     }
 

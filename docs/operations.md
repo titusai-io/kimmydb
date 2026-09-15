@@ -842,11 +842,13 @@ It is one of three other things:
 - **Entries above the vector the peer advertised**
   (`kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`).
 
-That last includes an entry a member holds as state after a scoped repair
-filled a hole. Only a peer that also lacks the entry and pulls it from that
-member sees it. ADR-171 describes the residual: the entry is deferred there
-until its origin writes again, retention collects it, or the peer takes it from
-another member.
+A member holding an entry as state below its own position, such as one a
+scoped repair brought to fill a hole, is no longer among them since
+[ADR-172](decisions.md). It names the entry in its next pull, the peer serves
+it, and the member logs `asking the peer to serve entries this node holds as
+state below its own position` at `INFO`. On a healthy cluster that line should
+not appear. Entries the peer has already collected stay held until this
+member's own retention collects them.
 
 **Why the check does not simply run anyway on a truncated round.** Because a
 truncated pull manufactures the finding. The existence half reports only "the

@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
 use kimmy_cluster::transport::{
-    DivergenceProbe, push_entry, serve, serve_with, sync_once, sync_once_with,
+    DivergenceProbe, PeerStalls, entries_threshold, push_entry, serve, serve_with, sync_once,
+    sync_once_with,
 };
 use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
@@ -1406,6 +1407,617 @@ async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds()
     assert_eq!(pushed.unreached, None, "{pushed:?}");
     assert_eq!(pushed.outcome.ddl, 1, "the change is applied at once: {pushed:?}");
     assert_eq!(pushed.outcome.superseded, 0, "and nothing C holds is sent: {pushed:?}");
+}
+
+// -----------------------------------------------------------------------
+// An entry held as state below the member's position is released (ADR-172)
+
+/// What the requester logs when it names spans it holds as state below its
+/// own position.
+const ASKING_MARKED: &str = "asking the peer to serve entries this node holds as state";
+
+/// Two members, where R holds A's last write S only as state below its own
+/// position: R's witnessed vector covered S through a window that never
+/// carried it, and a scoped repair then brought S under `Hold`. R is behind A
+/// on nothing. The nodes, the collection, and S's stamp.
+async fn a_member_holding_a_repaired_entry_below_its_position()
+-> (Node, Node, kimmy_storage::CollectionMeta, Hlc) {
+    let a = node().await;
+    let r = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a0" }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": "s" }).unwrap();
+    let a_id = a.engine.node_id();
+    let s = a.engine.version_vector().unwrap().get(a_id);
+
+    let history = a.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let holed: Vec<kimmy_core::OplogEntry> = history
+        .entries
+        .iter()
+        .filter(|e| !(e.stamp.node == a_id && e.stamp.hlc == s))
+        .cloned()
+        .collect();
+    assert_eq!(holed.len() + 1, history.entries.len());
+    r.engine
+        .apply_peer_batch(&a.engine.version_vector().unwrap(), &holed, history.scanned_to, true)
+        .unwrap();
+    let mut progress = kimmy_storage::SnapshotProgress::of_collection(ca.id);
+    while !progress.is_complete() {
+        let page = a.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        r.engine.apply_snapshot_page(a_id, &mut progress, &page).unwrap();
+    }
+
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    assert!(r.engine.get(&cr, &DocId::String("s".into())).unwrap().is_some(), "repaired");
+    assert!(r.engine.version_vector().unwrap().get(a_id) < s, "held: R does not advertise S");
+    assert!(
+        r.engine.witnessed_vector().unwrap().covers(&a.engine.version_vector().unwrap()),
+        "and R is behind A on nothing"
+    );
+    (a, r, ca, s)
+}
+
+#[tokio::test]
+async fn a_held_entry_below_the_members_position_is_released_by_its_next_pull() {
+    // ADR-171's residual, closed. R's witnessed vector covers S, so a window
+    // passes over it, and R is behind on nothing, so before ADR-172 no round
+    // would ever ask. R names its span and the next pull releases it, without
+    // a snapshot.
+    let (a, r, _ca, s) = a_member_holding_a_repaired_entry_below_its_position().await;
+
+    let (outcome, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
+    assert!(logged.iter().any(|l| l.contains(ASKING_MARKED)), "R names the span: {logged:?}");
+    assert!(!logged.iter().any(|l| l.contains(SNAPSHOT_FALLBACK)), "and no snapshot: {logged:?}");
+    assert!(outcome.exhausted && !outcome.truncated, "one pull: {outcome:?}");
+    assert_eq!(outcome.superseded, 1, "S alone is served: {outcome:?}");
+    assert_eq!(
+        r.engine.version_vector().unwrap().get(a.engine.node_id()),
+        s,
+        "released: R advertises S"
+    );
+
+    let (again, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    assert!(!logged.iter().any(|l| l.contains(ASKING_MARKED)), "nothing left: {logged:?}");
+    assert_eq!(again.unwrap().total(), 0);
+}
+
+/// Three members for ADR-172's spans. O writes `writes` documents `d0..`. A
+/// takes them with the documents in `a_holes` missing from its window, and R
+/// with those in `r_holes` missing, and both windows' exhaustion covers the
+/// holes anyway. R then repairs from O by a scoped snapshot, which brings its
+/// holes under `Hold`: marks at or below R's position.
+async fn holed_members(writes: usize, a_holes: &[usize], r_holes: &[usize]) -> (Node, Node, Node) {
+    let o = node().await;
+    let a = node().await;
+    let r = node().await;
+    let co = o.engine.create_collection("shop", "orders").unwrap();
+    o.engine
+        .insert_many(&co, (0..writes).map(|i| doc! { "_id": format!("d{i}") }).collect())
+        .unwrap();
+    let history = o.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let theirs = o.engine.version_vector().unwrap();
+    for (member, holes) in [(&a, a_holes), (&r, r_holes)] {
+        let missing: BTreeSet<DocId> =
+            holes.iter().map(|i| DocId::String(format!("d{i}"))).collect();
+        let window: Vec<kimmy_core::OplogEntry> = history
+            .entries
+            .iter()
+            .filter(|e| e.doc_id.as_ref().is_none_or(|id| !missing.contains(id)))
+            .cloned()
+            .collect();
+        assert_eq!(window.len() + holes.len(), history.entries.len());
+        member.engine.apply_peer_batch(&theirs, &window, history.scanned_to, true).unwrap();
+    }
+    let mut progress = kimmy_storage::SnapshotProgress::of_collection(co.id);
+    while !progress.is_complete() {
+        let page = o.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        r.engine.apply_snapshot_page(o.engine.node_id(), &mut progress, &page).unwrap();
+    }
+    let spans = r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap();
+    assert_eq!(spans.len(), 1, "R holds one origin's span: {spans:?}");
+    (o, a, r)
+}
+
+#[tokio::test]
+async fn a_span_whose_bottom_the_peer_cannot_serve_does_not_stop_replication_from_it() {
+    // The second way a span's bottom is not served, the ADR-148 shape: A
+    // witnessed past d10 without applying it, and R was repaired from O.
+    // Found by review of ADR-172's first form. R's span runs from d10 to d2900.
+    // A lacks d10, the same hole, but holds 2,890 of the span's entries. The
+    // first form asked from the span's bottom on every pull and served the
+    // same 1,024 superseded entries every time, truncated, so nothing above
+    // the span ever arrived from A. Each span now resumes past what A served.
+    let (o, a, r) = holed_members(3_000, &[10], &[10, 2_900]).await;
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    o.engine.insert(&co, doc! { "_id": "late" }).unwrap();
+    sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    assert!(a.engine.get(&ca, &DocId::String("late".into())).unwrap().is_some());
+
+    let mut stalls = PeerStalls::new();
+    let mut pulls = Vec::new();
+    loop {
+        let outcome =
+            sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.expect("pull");
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated || pulls.len() >= 10 {
+            break;
+        }
+    }
+    let superseded: Vec<usize> = pulls.iter().map(|p| p.superseded).collect();
+    eprintln!("span walk: {} pulls, superseded per pull {superseded:?}", pulls.len());
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    assert!(
+        r.engine.get(&cr, &DocId::String("late".into())).unwrap().is_some(),
+        "the write above the span arrives from A: {pulls:?}"
+    );
+    assert_eq!(
+        pulls.len(),
+        3,
+        "the 2,890 entries A holds inside the span, a window at a time: {superseded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_moving_on_the_origin_in_the_middle_of_a_walk_does_not_restart_it() {
+    // Found on review: re-asking from the bottom whenever the peer moved on the
+    // span's origin reset the walk between two pulls of one contact. R's span
+    // is d10 to d2900 and A lacks d10; O writes one document before each of R's
+    // pulls and A takes it. Every pull then came back 1,024 superseded and
+    // truncated, and `late` never arrived, for a span of 2,890 entries. The
+    // resume point is not reset by the peer moving, so the walk finishes.
+    const CEILING: usize = 12;
+    let (o, a, r) = holed_members(3_000, &[10], &[10, 2_900]).await;
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    o.engine.insert(&co, doc! { "_id": "late" }).unwrap();
+    sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
+
+    let mut stalls = PeerStalls::new();
+    let mut superseded = Vec::new();
+    let mut arrived_after = None;
+    for pull in 0..CEILING {
+        o.engine.insert(&co, doc! { "_id": format!("w{pull}") }).unwrap();
+        sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        superseded.push(outcome.superseded);
+        if r.engine.get(&cr, &DocId::String("late".into())).unwrap().is_some() {
+            arrived_after = Some(pull + 1);
+            break;
+        }
+    }
+    let bound = 2_890usize.div_ceil(1024) + 1;
+    assert!(
+        arrived_after.is_some_and(|pulls| pulls <= bound),
+        "late arrives within {bound} pulls while A moves on the origin: {superseded:?}"
+    );
+    assert!(
+        !superseded.windows(2).any(|w| w[0] == 1024 && w[1] == 1024 && superseded.len() > bound),
+        "no run of full superseded windows: {superseded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mark_added_below_a_spans_resume_point_reopens_the_span_from_its_new_bottom() {
+    // R's span on O runs from d100 to d2900, and A lacks d100. One pull walks
+    // the span partway and the resume point moves past d1124. A second scoped
+    // repair then brings e50, an earlier entry of the same origin in another
+    // collection, under a mark below that resume point. No window from A has
+    // walked e50, so the next round names the span from e50 and A releases it.
+    let o = node().await;
+    let a = node().await;
+    let r = node().await;
+    let ce = o.engine.create_collection("shop", "early").unwrap();
+    o.engine.insert_many(&ce, (0..100).map(|i| doc! { "_id": format!("e{i}") }).collect()).unwrap();
+    let cd = o.engine.create_collection("shop", "orders").unwrap();
+    o.engine
+        .insert_many(&cd, (0..3_000).map(|i| doc! { "_id": format!("d{i}") }).collect())
+        .unwrap();
+    let history = o.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let theirs = o.engine.version_vector().unwrap();
+    let stamp_of = |id: &str| {
+        history
+            .entries
+            .iter()
+            .find(|e| e.doc_id == Some(DocId::String(id.into())))
+            .unwrap()
+            .stamp
+            .hlc
+    };
+    let e50 = stamp_of("e50");
+    assert!(e50 < stamp_of("d100"), "e50 must sort below the span's bottom");
+    for (member, holes) in [(&a, vec!["d100"]), (&r, vec!["d100", "d2900", "e50"])] {
+        let missing: BTreeSet<DocId> = holes.iter().map(|h| DocId::String((*h).into())).collect();
+        let window: Vec<kimmy_core::OplogEntry> = history
+            .entries
+            .iter()
+            .filter(|e| e.doc_id.as_ref().is_none_or(|id| !missing.contains(id)))
+            .cloned()
+            .collect();
+        member.engine.apply_peer_batch(&theirs, &window, history.scanned_to, true).unwrap();
+    }
+    let repair = |collection: kimmy_core::CollectionId| {
+        let mut progress = kimmy_storage::SnapshotProgress::of_collection(collection);
+        while !progress.is_complete() {
+            let page = o.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            r.engine.apply_snapshot_page(o.engine.node_id(), &mut progress, &page).unwrap();
+        }
+    };
+    let lowest = |r: &Node| {
+        r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap()[0].from
+    };
+    repair(cd.id);
+    assert_eq!(lowest(&r), stamp_of("d100"));
+
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(first.truncated && first.superseded == 1024, "walked partway: {first:?}");
+
+    repair(ce.id);
+    assert_eq!(lowest(&r), e50, "e50 held as state, below the resume point");
+
+    let mut pulls = Vec::new();
+    loop {
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated || pulls.len() >= 6 {
+            break;
+        }
+    }
+    assert_eq!(
+        lowest(&r),
+        stamp_of("d100"),
+        "e50 was named from the span's new bottom and released; d100, which A lacks, stays: {pulls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_window_ending_on_a_stamp_the_spans_origin_shares_resumes_at_that_stamp() {
+    // The tie at a window's end. L sorts before O, and L's entry and R's marked
+    // O entry share one timestamp, H. The first window is truncated on L's
+    // entry, so O's entry at H was not examined. The span must resume at H, not
+    // past it, or that entry is never served and its mark waits for the expiry.
+    let a = node().await;
+    let r = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    sync(&a, &r).await;
+    let l = kimmy_core::NodeId::from_bytes([1; 16]);
+    let o = kimmy_core::NodeId::from_bytes([2; 16]);
+    let base = kimmy_storage::physical_now_ms() + 1_000;
+    let entry = |origin: kimmy_core::NodeId, wall: u64, id: String| kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection: ca.id,
+        doc_id: Some(DocId::String(id.clone())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+    };
+    let h = base + 1_024;
+    let mut history: Vec<kimmy_core::OplogEntry> =
+        (1..=1_024u64).map(|i| entry(o, base + i, format!("o{i}"))).collect();
+    history.push(entry(l, h, "l".into()));
+    history.sort_by_key(|e| e.stamp);
+    let mut theirs = kimmy_core::VersionVector::new();
+    for e in &history {
+        theirs.observe(e.stamp);
+    }
+    a.engine.apply_peer_batch(&theirs, &history, Hlc::new(h, 0), true).unwrap();
+
+    let mut r_vector = kimmy_core::VersionVector::new();
+    r_vector.insert(o, Hlc::new(h, 0));
+    let holes = [DocId::String("o1".into()), DocId::String("o1024".into())];
+    let r_window: Vec<kimmy_core::OplogEntry> = history
+        .iter()
+        .filter(|e| e.stamp.node == o && !e.doc_id.as_ref().is_some_and(|id| holes.contains(id)))
+        .cloned()
+        .collect();
+    r.engine.apply_peer_batch(&r_vector, &r_window, Hlc::new(h, 0), true).unwrap();
+    let mut progress = kimmy_storage::SnapshotProgress::of_collection(ca.id);
+    while !progress.is_complete() {
+        let page = a.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        r.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, &page).unwrap();
+    }
+    let covered =
+        |r: &Node| r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap();
+    assert_eq!(
+        covered(&r),
+        vec![kimmy_storage::MarkedRange {
+            origin: o,
+            from: Hlc::new(base + 1, 0),
+            through: Hlc::new(h, 0)
+        }],
+        "R holds o1 and o1024 as state below its position"
+    );
+
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(first.truncated, "the first window is cut on L's entry at H: {first:?}");
+    for _ in 0..4 {
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        if !outcome.truncated {
+            break;
+        }
+    }
+    assert!(
+        covered(&r).is_empty(),
+        "o1024, at the tied stamp, is served and released: {:?}",
+        covered(&r)
+    );
+}
+
+#[tokio::test]
+async fn a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_from_it() {
+    // The first of the two ways a span's bottom is not served: the peer has
+    // collected it. R holds x10 and x2900 of origin X as state; A collected
+    // x0..x10 and holds the rest, then writes. The first form of ADR-172 asked
+    // from x10 on every pull and was served the same 1,024 superseded entries,
+    // truncated, until R's own retention collected the mark. The span now
+    // resumes past what A served, the write arrives in three pulls, and a
+    // later round names nothing: A provably lacks x10.
+    let a = node().await;
+    let r = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    sync(&a, &r).await;
+    let x = kimmy_core::NodeId::generate();
+    let now = kimmy_storage::physical_now_ms();
+    let entry = |i: u64| {
+        let wall = if i <= 10 { now - 2 * DAY_SECS * 1_000 + i } else { now + i };
+        kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), x),
+            kind: kimmy_core::OpKind::Insert,
+            collection: ca.id,
+            doc_id: Some(DocId::String(format!("x{i}"))),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": format!("x{i}") }).unwrap()),
+        }
+    };
+    let history: Vec<kimmy_core::OplogEntry> = (0..3_000).map(entry).collect();
+    let end = history.last().unwrap().stamp;
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.observe(end);
+    a.engine.apply_peer_batch(&theirs, &history, end.hlc, true).unwrap();
+    let holes = [DocId::String("x10".into()), DocId::String("x2900".into())];
+    let holed: Vec<kimmy_core::OplogEntry> = history
+        .iter()
+        .filter(|e| !e.doc_id.as_ref().is_some_and(|id| holes.contains(id)))
+        .cloned()
+        .collect();
+    r.engine.apply_peer_batch(&theirs, &holed, end.hlc, true).unwrap();
+    let mut progress = kimmy_storage::SnapshotProgress::of_collection(ca.id);
+    while !progress.is_complete() {
+        let page = a.engine.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        r.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(
+        r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap(),
+        vec![kimmy_storage::MarkedRange {
+            origin: x,
+            from: history[10].stamp.hlc,
+            through: history[2_900].stamp.hlc
+        }],
+        "R holds x10 and x2900 as state"
+    );
+
+    a.engine
+        .collect_garbage_at(now, kimmy_storage::RetentionPolicy::new(DAY_SECS, DAY_SECS))
+        .unwrap();
+    assert!(
+        a.engine.oplog_collected_through().unwrap() >= history[10].stamp.hlc,
+        "A collected x10"
+    );
+    a.engine.insert(&ca, doc! { "_id": "late" }).unwrap();
+
+    let mut stalls = PeerStalls::new();
+    let mut pulls = Vec::new();
+    loop {
+        let outcome =
+            sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.expect("pull");
+        let truncated = outcome.truncated;
+        pulls.push(outcome);
+        if !truncated || pulls.len() >= 10 {
+            break;
+        }
+    }
+    let superseded: Vec<usize> = pulls.iter().map(|p| p.superseded).collect();
+    eprintln!(
+        "collected-lowest span walk: {} pulls, superseded per pull {superseded:?}",
+        pulls.len()
+    );
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    assert!(
+        r.engine.get(&cr, &DocId::String("late".into())).unwrap().is_some(),
+        "the later write arrives from A: {superseded:?}"
+    );
+    assert_eq!(pulls.len(), 3, "the 2,890 entries A holds inside the span, a window at a time");
+    assert_eq!(
+        r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap().len(),
+        1,
+        "x2900 was released and x10 is still held"
+    );
+
+    let again = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(again.total(), 0, "A provably lacks x10, so the span is not named again: {again:?}");
+}
+
+#[tokio::test]
+async fn a_peer_moving_on_the_origin_does_not_re_walk_an_answered_span() {
+    // A answered R's span without d10 or d20, so the span is left out. A then
+    // takes d10 below the resume point and moves on O's origin. Entries below
+    // the resume point were walked and did not carry d10, and a move re-walking
+    // from the bottom costs the whole span on every tick of a busy origin, so
+    // the round does not name the span again: it pulls d30 alone. d10 waits for
+    // the record's expiry (`MARKS_REASK_AFTER`), which the resume points' unit
+    // test pins.
+    let (o, a, r) = holed_members(30, &[10, 20], &[10, 20]).await;
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(first.superseded, 9, "{first:?}");
+    let second = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(second.total(), 0, "{second:?}");
+
+    let d10 = o
+        .engine
+        .entries_for_peer(Hlc::ZERO, usize::MAX)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.doc_id == Some(DocId::String("d10".into())))
+        .unwrap();
+    a.engine.apply_batch(&[d10]).unwrap();
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    o.engine.insert(&co, doc! { "_id": "d30" }).unwrap();
+    sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
+
+    let third = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!((third.applied, third.superseded), (1, 0), "d30 alone: {third:?}");
+    let spans = r.engine.held_ranges_covered_by(&r.engine.witnessed_vector().unwrap()).unwrap();
+    assert!(
+        spans.len() == 1 && spans[0].from < spans[0].through,
+        "d10 and d20 still held: {spans:?}"
+    );
+}
+
+#[tokio::test]
+async fn continuous_writes_on_a_span_origin_do_not_re_walk_the_span_every_tick() {
+    // The livelock a re-ask from the bottom brings back under continuous
+    // writes. R's span, d10 to d4990, is wider than the scaled-down ceiling
+    // below: 4,979 entries A holds, five windows. A lacks both ends, so
+    // nothing in the span is ever released and it stays that wide, and O keeps
+    // writing. Once the span has been walked, each tick must bring R the new
+    // writes in one pull, never re-walking the span.
+    const CEILING: usize = 4; // a tick's pull ceiling, scaled down from MAX_PULLS_PER_CONTACT
+    const PER_TICK: usize = 10;
+    let (o, a, r) = holed_members(5_000, &[10, 4_990], &[10, 4_990]).await;
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    let cr = r.engine.get_collection("shop", "orders").unwrap();
+    let mut stalls = PeerStalls::new();
+
+    let mut walk = 0;
+    loop {
+        walk += 1;
+        let outcome = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        if !outcome.truncated {
+            break;
+        }
+        assert!(walk < 20, "the first walk must end");
+    }
+    assert!(walk > CEILING, "the span must be wider than the ceiling: {walk} pulls");
+
+    for tick in 0..3 {
+        let docs = (0..PER_TICK).map(|i| doc! { "_id": format!("t{tick}-{i}") }).collect();
+        o.engine.insert_many(&co, docs).unwrap();
+        drain(&a, &o).await;
+
+        let mut pulls = Vec::new();
+        loop {
+            let outcome =
+                sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+            let truncated = outcome.truncated;
+            pulls.push(outcome);
+            if !truncated || pulls.len() >= CEILING {
+                break;
+            }
+        }
+        let superseded: Vec<usize> = pulls.iter().map(|p| p.superseded).collect();
+        assert!(
+            pulls.len() < CEILING && !pulls.last().unwrap().truncated,
+            "tick {tick} hit the ceiling: {superseded:?}"
+        );
+        assert!(
+            pulls.len() <= PER_TICK.div_ceil(1024) + 1,
+            "tick {tick}: {} pulls for {PER_TICK} new entries: {superseded:?}",
+            pulls.len()
+        );
+        for i in 0..PER_TICK {
+            let id = DocId::String(format!("t{tick}-{i}"));
+            assert!(r.engine.get(&cr, &id).unwrap().is_some(), "tick {tick}'s writes arrive");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_span_the_peer_answered_is_not_named_again_on_the_next_round() {
+    // The resume points' wiring through the round. R and A share the holes at
+    // d10 and d20, so A serves the nine entries between and can release
+    // neither mark. With one `PeerStalls` across two rounds, the second names
+    // nothing and pulls nothing.
+    let (_o, a, r) = holed_members(30, &[10, 20], &[10, 20]).await;
+    let mut stalls = PeerStalls::new();
+
+    let (first, logged) =
+        logged_during(sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls)).await;
+    let first = first.unwrap();
+    assert!(logged.iter().any(|l| l.contains(ASKING_MARKED)), "R names the span: {logged:?}");
+    assert_eq!(first.superseded, 9, "A serves the span's entries it holds, d11..d19: {first:?}");
+
+    let second = sync_once_with(&r.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(second.total(), 0, "a span answered to the tail is not named again: {second:?}");
+}
+
+#[tokio::test]
+async fn a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before() {
+    // A sender that predates ADR-172 ignores `marked`, and one that predates
+    // ADR-171 does not skip either. Neither can be run here, so each is what
+    // it serves a request with: `entries_for_peer` for the release before
+    // ADR-171, `entries_for_peer_holding` for ADR-171's. What they are asked
+    // is what this build asks.
+    let (o, a, r) = holed_members(30, &[10, 20], &[10, 20]).await;
+    let held = r.engine.witnessed_vector().unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    let spans = r.engine.held_ranges_covered_by(&held).unwrap();
+    assert!(held.behind(&theirs).is_none(), "R is behind A on nothing");
+
+    // Behind on nothing, a requester before ADR-172 sends no request. This one
+    // asks from A's newest stamp, never from the span's bottom.
+    let from = entries_threshold(&held, &theirs, &spans).expect("a member holding spans asks");
+    let before_171 = a.engine.entries_for_peer(from, 1024).unwrap();
+    assert!(
+        before_171.exhausted && before_171.entries.len() <= 1,
+        "served from A's newest stamp, not the span's bottom: {:?}",
+        before_171.entries
+    );
+    let adr_171 = a.engine.entries_for_peer_holding(from, 1024, Some(&held)).unwrap();
+    assert!(adr_171.exhausted && adr_171.entries.is_empty(), "{:?}", adr_171.entries);
+
+    // Behind, the request is the one a requester before ADR-172 sends.
+    let co = o.engine.get_collection("shop", "orders").unwrap();
+    o.engine.insert_many(&co, (0..100).map(|i| doc! { "_id": format!("e{i}") }).collect()).unwrap();
+    sync_once(&a.engine, o.addr, SECRET, None).await.unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    assert!(held.behind(&theirs).is_some());
+    assert_eq!(entries_threshold(&held, &theirs, &spans), held.behind(&theirs));
+}
+
+#[tokio::test]
+async fn a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapshot() {
+    // The horizon is judged on `held`, never on a span (ADR-172). A has
+    // collected S; a span below A's horizon must not make the pull a
+    // snapshot. R takes what A still has, and S's mark waits for R's own
+    // retention.
+    let (a, r, ca, s) = a_member_holding_a_repaired_entry_below_its_position().await;
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
+    a.engine
+        .collect_garbage_at(
+            later + HOUR_MS,
+            kimmy_storage::RetentionPolicy::new(DAY_SECS, DAY_SECS),
+        )
+        .unwrap();
+    assert!(a.engine.oplog_collected_through().unwrap() >= s, "A collected S");
+
+    let (outcome, logged) = logged_during(sync_once(&r.engine, a.addr, SECRET, None)).await;
+    let outcome = outcome.unwrap();
+    assert!(logged.iter().any(|l| l.contains(ASKING_MARKED)), "R names the span: {logged:?}");
+    assert!(
+        !logged.iter().any(|l| l.contains(SNAPSHOT_FALLBACK)),
+        "a span below the peer's horizon is never a snapshot: {logged:?}"
+    );
+    assert_eq!(outcome.applied, 1, "R takes the later write: {outcome:?}");
+    assert!(
+        r.engine.version_vector().unwrap().get(a.engine.node_id()) < s,
+        "S is gone from A, so R's mark stays for R's own retention"
+    );
 }
 
 #[tokio::test]
