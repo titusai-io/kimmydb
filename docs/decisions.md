@@ -15534,7 +15534,8 @@ entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
   2. M's pulls from Q number about N / 1,024. There is no run of `applied 0`
      pulls from the mark's position: M's request asks from its own threshold,
      and Q serves nothing inside the span.
-  3. The mark is not released by Q.
+  3. The mark is not released by Q, and M's
+     `kimmy_sync_held_marks_released_total` does not move.
   4. M's asking line may appear, since it names the span to every peer, but Q
      answers it with the ordinary window only.
   5. Hold the cluster mixed for at least ten sync intervals. Across it:
@@ -15544,9 +15545,8 @@ entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
 - **(b) M pulls from a 0.29.0 member.**
   1. Roll P to 0.29.0.
   2. M's next pull from P releases the mark in one pull. M's advertised vector
-     for the origin reaches the entry. Once
-     `kimmy_sync_held_marks_released_total` is in the build, it moves by one.
-     That series lands separately and is not in this change.
+     for the origin reaches the entry, and M's
+     `kimmy_sync_held_marks_released_total` rises by one (ADR-169's addendum).
   3. M's asking line is logged once for that span set, not per pull.
 - **Finish.** Roll Q, and repeat the checks in (a) step 5.
 
