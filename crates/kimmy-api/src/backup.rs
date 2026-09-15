@@ -111,7 +111,10 @@ pub(crate) fn spill_with<F: Write + Seek>(
     // Buffered, because `backup_to` writes a record at a time and each would
     // otherwise be a system call.
     let mut out = BufWriter::with_capacity(1 << 16, file);
-    let info = engine.backup_to(&mut out).map_err(failed)?;
+    // The route already runs this on a blocking thread, where the wrapper
+    // simply runs the walk; it is here so that no other caller can put a walk
+    // of the whole store on an async worker (ADR-153).
+    let info = kimmy_storage::blocking(|| engine.backup_to(&mut out)).map_err(failed)?;
     let mut file = out
         .into_inner()
         .map_err(|e| failed(StorageError::Database(format!("writing a backup: {}", e.error()))))?;
