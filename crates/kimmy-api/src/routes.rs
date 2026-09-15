@@ -784,6 +784,15 @@ async fn refresh(
 /// consulted per collection here; there is no filtered backup, because a partial
 /// backup that looks like a whole one is a restore that silently loses data.
 ///
+/// The backup's blocking task ended without an answer: it panicked, or the
+/// runtime is shutting down. Logged in full and answered generically, because
+/// a panic's text can name paths and internals, and those do not go to a
+/// client (ADR-170).
+fn backup_task_failed(e: tokio::task::JoinError) -> ApiError {
+    error!(event = "backup failed", message = %e);
+    ApiError::internal("the backup did not finish")
+}
+
 /// Spilled, then streamed (ADR-170, amending ADR-041). The walk runs inside one
 /// read transaction and writes to an unlinked temporary file beside the
 /// database; the transaction closes when the walk ends, before the first byte
@@ -806,7 +815,7 @@ async fn backup(
     let dir = crate::backup::spill_dir(&engine);
     let spilled = tokio::task::spawn_blocking(move || crate::backup::spill(&engine, &dir))
         .await
-        .map_err(|e| ApiError::internal(format!("the backup did not finish: {e}")))?;
+        .map_err(backup_task_failed)?;
     let spilled = match spilled {
         Ok(spilled) => spilled,
         Err(failure) => {
@@ -1367,6 +1376,23 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// A panic in the spill is the generic `500`: the panic's own text, which
+    /// can name a path or an internal, is logged and not sent (ADR-170).
+    #[tokio::test]
+    async fn a_panicking_backup_task_does_not_send_its_panic_text() {
+        let joined = tokio::task::spawn_blocking(|| {
+            panic!("panic-text-for-the-log /var/lib/kimmy/kimmy.redb");
+        })
+        .await;
+        let response = backup_task_failed(joined.unwrap_err()).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("internal"), "still the documented envelope: {text}");
+        assert!(!text.contains("panic-text-for-the-log"), "{text}");
+        assert!(!text.contains("/var/lib"), "{text}");
+    }
 
     /// The REST table's shape in miniature: one route the table opens, one it
     /// does not, under the same layer `routes` applies.
