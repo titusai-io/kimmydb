@@ -196,6 +196,10 @@ impl AppState {
             // and says nothing about which path an operator should go and
             // look at.
             writer_hold: self.engine.writer_hold(),
+            // Entries held as state that a window released (ADR-169's
+            // addendum), counted by the engine on commit so a pulled and a
+            // pushed window land on the same series.
+            held_marks_released: self.engine.held_marks_released(),
         })
     }
 

@@ -12,6 +12,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmy_sync_held_marks_released_total` counts the entries a sync window
+  releases from being held as state** (ADR-169's addendum). A member caught up
+  by snapshot holds what the snapshot wrote above the vector it advertises until
+  those entries arrive in position, and a member pulling from it leaves them
+  meanwhile under `kimmy_sync_entries_skipped_total{reason="beyond_advertised"}`.
+  That is the same label the ordinary race has always counted, so a few there
+  and a stop could not say which had happened. The new series counts the release
+  itself, once per entry, when the batch that released it commits. It is on the
+  OTLP bridge as `kimmy.sync.held_marks_released`. One new `/metrics` series,
+  nothing removed, nothing on the wire.
+
 ### Fixed
 
 - **One write on a quiet member no longer makes every peer re-read the oplog
@@ -51,6 +64,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   can still show the drain against members not yet rolled. No new `/metrics`
   series. The `merged from peer` line reads the same, with fewer `pulls` and no
   run of `applied 0`.
+
+## 0.28.1 - 2026-09-15
 
 ### Fixed
 
