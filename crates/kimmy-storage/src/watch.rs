@@ -2165,7 +2165,8 @@ mod tests {
             let newest = newest_stamp(&engine);
             // What an earlier build left behind: the horizon, no record. The
             // next start seeds every origin, the quiet one included, with it.
-            let txn = engine.db().begin_write().unwrap();
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
             txn.open_table(tables::OPLOG_COLLECTED).unwrap().retain(|_, _| false).unwrap();
             txn.commit().unwrap();
             (quiet, newest)
