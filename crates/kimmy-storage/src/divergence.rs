@@ -158,11 +158,17 @@ impl Engine {
     ///
     /// One collection's scan, no more — the cost [`next_probe`] rotates
     /// around the cluster's collections rather than paying every round.
+    ///
+    /// Counted from each record's header, not through `Engine::count`, which
+    /// decodes every live document into BSON to count it. The answering peer
+    /// of every contact runs this, and paid that parse for every document of
+    /// the probed collection (ADR-133's addendum).
     pub fn count_by_id(&self, id: CollectionId) -> Result<Option<u64>> {
-        match self.collection_by_id(id)? {
-            Some(meta) => Ok(Some(self.count(&meta)?)),
-            None => Ok(None),
+        if self.collection_by_id(id)?.is_none() {
+            return Ok(None);
         }
+        let txn = self.db().begin_read()?;
+        Ok(Some(Engine::live_count_in(&txn, id)?))
     }
 }
 
@@ -530,6 +536,56 @@ mod tests {
                 .unwrap();
         }
         (engine, dir)
+    }
+
+    #[test]
+    fn a_probe_count_is_the_live_document_count() {
+        // Live documents, tombstones and a replaced document: what the header
+        // says must agree with what decoding every document says.
+        let (engine, _dir) = engine_with(true, false);
+        let coll = engine.get_collection("app", "docs").unwrap();
+        for i in 0..5i64 {
+            engine.insert(&coll, bson::doc! { "_id": i, "v": i }).unwrap();
+        }
+        engine.delete(&coll, &kimmy_core::DocId::Int64(1)).unwrap();
+        engine.delete(&coll, &kimmy_core::DocId::Int64(3)).unwrap();
+        engine
+            .replace(
+                &coll,
+                &kimmy_core::DocId::Int64(4),
+                bson::doc! { "_id": 4i64, "v": 40 },
+                false,
+            )
+            .unwrap();
+
+        let decoded = engine.count(&coll).unwrap();
+        assert_eq!(decoded, 3);
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(decoded));
+        assert_eq!(engine.count_probe_reading(coll.id).unwrap().1, Some(decoded));
+    }
+
+    #[test]
+    fn a_record_whose_body_does_not_decode_is_counted_from_its_header() {
+        // Proof the count reads the header and nothing else: a record whose
+        // header is sound and whose body is not BSON still counts. Decoding the
+        // body to count it refused the whole walk.
+        let (engine, _dir) = engine_with(true, false);
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": "sound" }).unwrap();
+        let stamp = engine.next_stamp();
+        let unreadable =
+            crate::codec::encode_doc_record(&kimmy_core::DocRecord::live(stamp, vec![0xFF; 64]));
+        let key = crate::docs::doc_key(&kimmy_core::DocId::String("unreadable".into())).unwrap();
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(crate::tables::DOCS)
+            .unwrap()
+            .insert((coll.id.0, key.as_slice()), unreadable.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(2));
+        assert_eq!(engine.count_probe_reading(coll.id).unwrap().1, Some(2));
     }
 
     #[test]
