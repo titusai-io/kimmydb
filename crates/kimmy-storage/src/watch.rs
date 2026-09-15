@@ -178,6 +178,14 @@ impl Engine {
     /// position otherwise. A resume token that predates it is an error: the
     /// client asked to continue from a point in a collection that no longer
     /// exists, and everything between that point and now is a gap.
+    ///
+    /// **Only a token is ever refused.** The tombstone can outlive the drop's
+    /// oplog entry — collected under an `oplog_retention_secs` shorter than
+    /// `tombstone_retention_secs`, or never held at all where a snapshot
+    /// recorded the sender's tombstone — and resolving that entry the way a
+    /// token is resolved answered `ResumeTokenExpired` for opens that carried
+    /// no token, so every recreated collection under the name was unwatchable
+    /// until the tombstone went. Found in round 0330.
     fn clamp_to_incarnation(
         &self,
         id: CollectionId,
@@ -187,9 +195,21 @@ impl Engine {
         let Some(dropped_at) = self.collection_dropped_at(id)? else {
             return Ok(start);
         };
-        // The arrival position of the drop entry itself; the incarnation
-        // begins after it.
-        let after_drop = self.arrival_after(&ResumeToken::from_stamp(dropped_at))?;
+        let Some(drop_seq) = self.arrival_of(&dropped_at)? else {
+            // The drop is not in the log, so its position is not known. The
+            // tombstone's stamp still bounds the incarnation: a token at or
+            // before it is from the previous one, and a start without a token
+            // begins at the first entry stamped after it.
+            return match &options.resume_after {
+                Some(token) if token.to_stamp() <= dropped_at => {
+                    Err(kimmy_core::Error::ResumeTokenExpired.into())
+                }
+                Some(_) => Ok(start),
+                None => self.first_arrival_stamped_after(start, dropped_at),
+            };
+        };
+        // The incarnation begins just after the drop entry.
+        let after_drop = drop_seq + 1;
         if start >= after_drop {
             return Ok(start);
         }
@@ -197,6 +217,32 @@ impl Engine {
             return Err(kimmy_core::Error::ResumeTokenExpired.into());
         }
         Ok(after_drop)
+    }
+
+    /// The arrival position of the entry stamped `stamp`, if this node holds it.
+    fn arrival_of(&self, stamp: &Stamp) -> Result<Option<u64>> {
+        let txn = self.db().begin_read()?;
+        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+        Ok(by_stamp.get(codec::oplog_key(stamp).as_slice())?.map(|seq| seq.value()))
+    }
+
+    /// The first arrival position at or after `from` whose entry is stamped
+    /// after `stamp`, or the position the next appended entry will take.
+    ///
+    /// Read in one transaction, so the fallback cannot land past an entry
+    /// appended after the walk. The walk starts at `from`, so a tail open reads
+    /// nothing; a replay from the start walks the prefix older than the drop,
+    /// which retention bounds, once per stream.
+    fn first_arrival_stamped_after(&self, from: u64, stamp: Stamp) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        for row in arrival.range(from..)? {
+            let (seq, key) = row?;
+            if codec::decode_oplog_key(key.value())? > stamp {
+                return Ok(seq.value());
+            }
+        }
+        Ok(arrival.last()?.map_or(from, |(seq, _)| from.max(seq.value() + 1)))
     }
 
     /// The arrival position just after the entry a token names.
@@ -1299,5 +1345,171 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The newest stamp in the oplog.
+    fn newest_stamp(engine: &Engine) -> Stamp {
+        let txn = engine.db().begin_read().unwrap();
+        let oplog = txn.open_table(tables::OPLOG).unwrap();
+        let (key, _) = oplog.last().unwrap().expect("a non-empty oplog");
+        codec::decode_oplog_key(key.value()).unwrap()
+    }
+
+    /// A stamp `ms` milliseconds past `stamp`, from the same node.
+    fn later_by(stamp: Stamp, ms: u64) -> Stamp {
+        Stamp::new(Hlc::new(stamp.hlc.wall_ms + ms, 0), stamp.node)
+    }
+
+    /// Drop `app.docs`, collect the drop's oplog entry while keeping its
+    /// tombstone, and recreate it: the shape of an oplog retention shorter than
+    /// the tombstone's, one retention pass after the drop.
+    fn recreate_after_the_drop_entry_is_collected(
+        engine: &Engine,
+        coll: &CollectionMeta,
+    ) -> CollectionMeta {
+        engine.insert(coll, doc! { "_id": 1i64 }).unwrap();
+        engine.drop_collection("app", "docs").unwrap();
+        // Something after the drop: retention never collects the newest entry,
+        // so a drop at the tail would survive and this would test nothing.
+        let other = engine.create_collection("app", "other").unwrap();
+        engine.insert(&other, doc! { "_id": 7i64 }).unwrap();
+
+        let an_hour_on = crate::engine::physical_now_ms() + 60 * 60 * 1000;
+        engine
+            .collect_garbage_at(an_hour_on, crate::gc::RetentionPolicy::new(300, 86_400))
+            .unwrap();
+        let dropped_at = engine.collection_dropped_at(coll.id).unwrap().expect("tombstone kept");
+        {
+            let txn = engine.db().begin_read().unwrap();
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+            assert!(
+                by_stamp.get(codec::oplog_key(&dropped_at).as_slice()).unwrap().is_none(),
+                "the drop's oplog entry is collected"
+            );
+        }
+
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        assert_eq!(recreated.id, coll.id, "the id is derived from the name");
+        recreated
+    }
+
+    #[tokio::test]
+    async fn from_start_after_a_collected_drop_entry_yields_the_recreate_s_events() {
+        // A drop tombstone outlives its oplog entry whenever
+        // `tombstone_retention_secs` exceeds `oplog_retention_secs`. Resolving
+        // the collected entry's position answered `ResumeTokenExpired` for an
+        // open that carried no token, and the route returned 410 — found in
+        // round 0330, on members running a shorter oplog retention.
+        let (engine, coll, _dir) = setup();
+        let recreated = recreate_after_the_drop_entry_is_collected(&engine, &coll);
+        engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(recreated.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .expect("an open without a token is never refused");
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn a_tail_open_after_a_collected_drop_entry_opens() {
+        let (engine, coll, _dir) = setup();
+        let recreated = recreate_after_the_drop_entry_is_collected(&engine, &coll);
+
+        let mut stream = engine
+            .watch(WatchScope::Collection(recreated.id), WatchOptions::default())
+            .expect("an open without a token is never refused");
+        engine.insert(&recreated, doc! { "_id": 5i64 }).unwrap();
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![5]);
+    }
+
+    #[tokio::test]
+    async fn from_start_after_a_tombstone_whose_entry_this_node_never_held() {
+        // A snapshot install records the sender's tombstones without their
+        // entries, so no retention setting is needed for this: a tombstone
+        // older than everything retained here refused the open outright.
+        let (engine, coll, _dir) = setup();
+        let first = newest_stamp(&engine);
+        let before = Stamp::new(Hlc::new(first.hlc.wall_ms - 1_000, 0), first.node);
+        engine.record_collection_drop(coll.id, before).unwrap();
+        engine.insert(&coll, doc! { "_id": 99i64 }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .expect("an open without a token is never refused");
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn from_start_after_an_unheld_tombstone_inside_the_oplog_starts_after_it() {
+        // The other half of the same lookup: a stamp newer than the oldest
+        // retained entry, but not held, resolved to the *tail*, so `from_start`
+        // silently skipped every retained event of the incarnation. It starts
+        // at the first entry stamped after the drop, and no earlier.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let before_drop = newest_stamp(&engine);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.insert(&coll, doc! { "_id": 99i64 }).unwrap();
+        engine.record_collection_drop(coll.id, later_by(before_drop, 1)).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .expect("an open without a token is never refused");
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn a_token_from_before_an_unheld_drop_is_still_refused() {
+        // With the drop's entry gone, the token is compared with the
+        // tombstone's stamp instead: one from the previous incarnation is still
+        // a gap, and still 410.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let token = ResumeToken::from_stamp(newest_stamp(&engine));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.insert(&coll, doc! { "_id": 99i64 }).unwrap();
+        engine.record_collection_drop(coll.id, later_by(token.to_stamp(), 1)).unwrap();
+
+        let refused = engine.watch(
+            WatchScope::Collection(coll.id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "a token from a previous incarnation must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_from_after_an_unheld_drop_resumes() {
+        // And not over-refused: a token from this incarnation resumes after it.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let before_drop = newest_stamp(&engine);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.insert(&coll, doc! { "_id": 2i64 }).unwrap();
+        let token = ResumeToken::from_stamp(newest_stamp(&engine));
+        engine.insert(&coll, doc! { "_id": 3i64 }).unwrap();
+        engine.record_collection_drop(coll.id, later_by(before_drop, 1)).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("a token from this incarnation resumes");
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![3]);
     }
 }
