@@ -752,7 +752,7 @@ impl Engine {
                 // `Hold`: a snapshot document must not move the vectors —
                 // the coverage is granted once, below, and the reason is on
                 // `Position::Hold`.
-                if let RemoteApplied::Applied { id, violations } =
+                if let RemoteApplied::Applied { id, violations, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
                 {
                     pending.push(Pending { collection, entry, id, violations });
@@ -974,7 +974,7 @@ impl Engine {
                 doc_id: Some(id),
                 body: None,
             };
-            if let RemoteApplied::Applied { id, violations } =
+            if let RemoteApplied::Applied { id, violations, .. } =
                 self.apply_remote_in_txn(txn, &collection, &entry, Position::Hold)?
             {
                 pending.push(Pending { collection, entry, id, violations });
@@ -3999,10 +3999,78 @@ mod tests {
         assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc);
 
         let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        assert_eq!(b.held_marks_released(), 0, "nothing released before the window");
         b.apply_peer_batch(&a.version_vector().unwrap(), &window.entries, window.scanned_to, true)
             .expect("the batch must not fail on the release");
         assert_eq!(b.held_len().unwrap(), 0, "released through append_oplog_at's existing key");
         assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+        assert_eq!(b.held_marks_released(), 1, "and counted, once, from that branch");
+    }
+
+    #[test]
+    fn a_held_mark_released_by_a_window_is_counted_once_on_commit() {
+        // ADR-169's addendum, the superseded branch: every held snapshot
+        // document arrives in a window contiguous from B's position, its record
+        // is already at that stamp, and its mark is released. One count per
+        // released entry -- and a second delivery of the same window finds no
+        // mark and adds nothing.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some(), "the fixture must leave the pull unfinished");
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held >= SNAPSHOT_PAGE, "the fixture must hold a page as state: {held}");
+        assert_eq!(b.held_marks_released(), 0);
+
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let outcome =
+            b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, true).unwrap();
+        assert_eq!(outcome.deferred, 0, "nothing in this window is the race");
+        assert_eq!(b.held_len().unwrap(), 0, "every held document was released");
+        assert_eq!(b.held_marks_released(), held as u64, "one count per released entry");
+
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, true).unwrap();
+        assert_eq!(b.held_marks_released(), held as u64, "a second delivery releases nothing");
+    }
+
+    #[test]
+    fn a_window_that_defers_every_entry_counts_no_release() {
+        // The race `beyond_advertised` has always counted (ADR-148), which the
+        // release must not be confused with: a window introduced by a vector
+        // below every entry it carries leaves them all, so nothing is taken,
+        // nothing held is released, and the release counter does not move.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        let held = b.held_len().unwrap();
+        assert!(held > 0, "the fixture must hold something a release could count");
+
+        let window = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let outcome = b
+            .apply_peer_batch(
+                &kimmy_core::VersionVector::new(),
+                &window.entries,
+                window.scanned_to,
+                false,
+            )
+            .unwrap();
+        assert!(!window.entries.is_empty());
+        assert_eq!(outcome.deferred, window.entries.len(), "every entry took the race path");
+        assert_eq!(b.held_len().unwrap(), held, "and nothing was released");
+        assert_eq!(b.held_marks_released(), 0, "so nothing is counted");
     }
 
     #[test]

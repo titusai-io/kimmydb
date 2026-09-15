@@ -621,6 +621,15 @@ impl TelemetryGuard {
             "Replicated entries left for a later window because they sat above the vector the peer advertised before serving it.",
             sync_entries_skipped_beyond_advertised
         );
+        // The release that beyond_advertised cannot tell from the race it has
+        // always counted (ADR-169's addendum).
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.held_marks_released",
+            "{entry}",
+            "Entries held as state that arrived in a sync window contiguous from this node's position and were released; the release path itself, which beyond_advertised cannot tell from the ordinary race.",
+            sync_held_marks_released
+        );
         observe!(
             u64_observable_counter,
             "kimmy.sync.repair_rounds",

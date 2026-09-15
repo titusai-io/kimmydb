@@ -562,6 +562,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         writer_wait_timeouts: 12,
         writer_hold_max_us: 13,
         writer_hold: kimmy_storage::WriterHoldSnapshot::default(),
+        held_marks_released: 14,
     };
     assert_eq!(
         exposed_series(&metrics.render()).keys().collect::<Vec<_>>(),
