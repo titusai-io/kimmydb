@@ -8147,6 +8147,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_held_marks_released_total",
+        "kimmy_sync_held_marks",
         "kimmy_sync_repair_rounds_total",
         "kimmy_tls_reloads_total",
         "kimmy_tls_reloads_total",

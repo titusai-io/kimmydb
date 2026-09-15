@@ -630,6 +630,15 @@ impl TelemetryGuard {
             "Entries held as state that arrived in a sync window contiguous from this node's position and were released; the release path itself, which beyond_advertised cannot tell from the ordinary race.",
             sync_held_marks_released
         );
+        // Whether marks are held at all, which the counter above moves only
+        // when one goes (ADR-160, ADR-172).
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.held_marks",
+            "{entry}",
+            "Entries this node holds as state rather than history, waiting to arrive in a sync window contiguous from its position; read at export.",
+            sync_held_marks
+        );
         observe!(
             u64_observable_counter,
             "kimmy.sync.repair_rounds",

@@ -100,6 +100,8 @@ pub struct StorageReadings {
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
+    /// Entries held as state right now (`Engine::held_marks`, ADR-160).
+    pub held_marks: u64,
 }
 
 /// The process's resident memory, read from the kernel.
@@ -259,6 +261,8 @@ pub struct MetricsSnapshot {
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
     pub sync_held_marks_released: u64,
+    /// Entries held as state right now (ADR-160): an engine reading.
+    pub sync_held_marks: u64,
     /// Rounds spent repairing against a peer (ADR-148): re-serving its
     /// oplog from below this node's position or pulling its snapshot, on
     /// the strength of a confirmed divergence or a stopped batch.
@@ -841,6 +845,7 @@ impl Metrics {
             sync_entries_skipped_beyond_advertised: self
                 .get(&self.sync_entries_skipped_beyond_advertised),
             sync_held_marks_released: readings.held_marks_released,
+            sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
@@ -1060,6 +1065,9 @@ impl Metrics {
              # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.\n\
              # TYPE kimmy_sync_held_marks_released_total counter\n\
              kimmy_sync_held_marks_released_total {sync_held_released}\n\
+             # HELP kimmy_sync_held_marks Entries this node holds as state rather than history - written by a snapshot page, a carried delete or a scoped repair above the vector it advertises - and still waiting to arrive in a sync window contiguous from its position, which releases them. A gauge, read at scrape. Non-zero is not a fault: a member caught up by snapshot holds entries until they arrive as history. Non-zero and not falling over many rounds is a member whose peers are not serving those entries, and each pull names them to its peers as spans until they are.\n\
+             # TYPE kimmy_sync_held_marks gauge\n\
+             kimmy_sync_held_marks {sync_held_marks}\n\
              # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.\n\
              # TYPE kimmy_sync_repair_rounds_total counter\n\
              kimmy_sync_repair_rounds_total {sync_repair_rounds}\n\
@@ -1149,6 +1157,7 @@ impl Metrics {
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
             sync_held_released = readings.held_marks_released,
+            sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
             frozen = kimmy_cluster::FROZEN_CONTACTS,
             tls_ok = self.get(&self.tls_reloads_ok),
@@ -1425,6 +1434,7 @@ mod tests {
             writer_wait_timeouts: 51,
             writer_hold_max_us: 52_500_000,
             held_marks_released: 53,
+            held_marks: 54,
             // One holder per row, none of them equal, so a row rendered
             // under another holder's label cannot match the golden. The
             // counts are the buckets' sum, as a real snapshot's are.
@@ -1716,6 +1726,9 @@ kimmy_sync_entries_skipped_total{reason=\"beyond_advertised\"} 75
 # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.
 # TYPE kimmy_sync_held_marks_released_total counter
 kimmy_sync_held_marks_released_total 53
+# HELP kimmy_sync_held_marks Entries this node holds as state rather than history - written by a snapshot page, a carried delete or a scoped repair above the vector it advertises - and still waiting to arrive in a sync window contiguous from its position, which releases them. A gauge, read at scrape. Non-zero is not a fault: a member caught up by snapshot holds entries until they arrive as history. Non-zero and not falling over many rounds is a member whose peers are not serving those entries, and each pull names them to its peers as spans until they are.
+# TYPE kimmy_sync_held_marks gauge
+kimmy_sync_held_marks 54
 # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.
 # TYPE kimmy_sync_repair_rounds_total counter
 kimmy_sync_repair_rounds_total 77
@@ -1887,6 +1900,7 @@ kimmy_backup_duration_seconds_count 1
             s.sync_entries_skipped_beyond_advertised
         ));
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
+        expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
@@ -1962,14 +1976,14 @@ kimmy_backup_duration_seconds_count 1
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 56 scalar sample lines plus three histograms: the latency one's 12
+        // 57 scalar sample lines plus three histograms: the latency one's 12
         // buckets, +Inf, sum and count; the writer wait's 8 buckets, +Inf,
         // sum and count (ADR-151); and the writer hold's 7 buckets, +Inf,
         // sum and count for each of the twelve holders (ADR-159); and the
         // backup duration's 10 buckets, +Inf, sum and count (ADR-170).
         assert_eq!(
             samples,
-            103 + 10 * kimmy_storage::WriterHolder::COUNT,
+            104 + 10 * kimmy_storage::WriterHolder::COUNT,
             "expected one sample per series: {out}"
         );
     }

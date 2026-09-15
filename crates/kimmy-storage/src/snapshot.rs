@@ -2490,6 +2490,26 @@ mod tests {
     }
 
     #[test]
+    fn the_held_marks_gauge_rises_with_a_snapshot_page_and_falls_with_its_release() {
+        // `Engine::held_marks` is what `kimmy_sync_held_marks` reads: the count
+        // redb keeps in the table's root, which has to agree with the rows it
+        // counts at every step for the gauge to mean anything.
+        let (a, _da) = sender_of_two_pages();
+        let (b, _db) = engine();
+        assert_eq!(b.held_marks().unwrap(), 0, "a fresh member holds nothing");
+
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        let held = b.held_marks().unwrap();
+        assert!(held > 0, "one page of an unfinished snapshot holds its entries as state");
+        assert_eq!(held, b.held_len().unwrap() as u64, "the gauge counts the marks, no more");
+
+        transfer_under(&b, &a, &mut progress);
+        assert_eq!(b.held_marks().unwrap(), 0, "completing the snapshot releases what it held");
+    }
+
+    #[test]
     fn a_document_written_during_a_snapshot_keeps_its_mark() {
         // The limit of what a grant releases, and the case the fixture above
         // cannot produce. The coverage a whole-database snapshot grants is the

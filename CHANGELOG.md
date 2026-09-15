@@ -12,6 +12,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmy_sync_held_marks`, a gauge of the entries a member holds as state**
+  ([ADR-169](docs/decisions.md), [ADR-172](docs/decisions.md)).
+  - **What it shows.** Entries a snapshot page, a carried delete or a scoped
+    repair wrote above the member's advertised vector, still waiting to arrive
+    as history.
+  - **Why it was needed.** Nothing showed whether a member held any:
+    `kimmy_sync_held_marks_released_total` moves only when a mark goes. While
+    the gauge is non-zero, the member's pulls name those entries to its peers
+    as spans, which the peers walk their oplog to serve.
+  - **Cost.** Read at scrape from the table's row count, so free at any size.
+  - **Where.** On the OTLP bridge as `kimmy.sync.held_marks`. Unlabelled.
+
 ### Changed
 
 - **A change stream resumed on another member misses nothing**
