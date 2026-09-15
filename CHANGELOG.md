@@ -10,7 +10,16 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.29.1 - 2026-09-15
+
+**A patch: a change stream on a recreated collection no longer refuses to
+open.** A collection recreated under a dropped name could not be watched —
+`410 resume_token_expired`, tail and `from_start` alike — for as long as the
+drop's tombstone outlived the drop's oplog entry. That is every recreated
+collection on a member running `tombstone_retention_secs` above
+`oplog_retention_secs`, and one on a member that took the drop's tombstone from
+a peer by snapshot. Nothing changes on the wire, on disk, in configuration or in
+packaging; the one other entry is documentation.
 
 ### Fixed
 
