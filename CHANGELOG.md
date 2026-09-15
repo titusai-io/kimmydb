@@ -56,11 +56,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   until the member's own retention collects them.
   [ADR-172](docs/decisions.md).
 
+  A span is walked once, a window at a time, from where the last window left
+  it. Once a peer has been walked across a span, the span is dropped for that
+  peer. It is asked again when the member holds more marks on that origin, when
+  the peer moves on that origin, or after five minutes. So a peer that cannot
+  serve a span's lowest entry no longer pins the pull.
+
   **Nothing to decide before upgrading, and no ordering in the roll.** The field
-  is defaulted: a member on an older build ignores it and serves as before, and
-  an older member sends none. The member logs `asking the peer to serve entries
-  this node holds as state below its own position` at `INFO` when it names
-  spans. On a healthy cluster that line should not appear.
+  is defaulted, and an older member sends none. A pull's `from` is never lowered
+  for a span. A member on the previous release therefore receives the ordinary
+  request and serves what it serves today. It serves nothing inside a span, and
+  those entries wait for a member on this release, or for retention. The member
+  logs `asking the peer to serve entries this node holds as state below its own
+  position` at `INFO` when the spans it names change. On a healthy cluster that
+  line should not appear.
 
 ### Fixed
 

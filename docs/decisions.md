@@ -15278,28 +15278,48 @@ which reads `entries_for_peer` for its own position and sends no vector.
 > and closes its residual. ADR-171's considered alternative is built here, in
 > the form that needs a field of its own.
 
-**Decision.** `AskEntries` gains `marked`: a list of spans, each
-`MarkedRange { origin, from, through }`, with `#[serde(default)]`.
-- **What the requester names.** For each origin, the lowest and highest entry it
+**Decision.** `AskEntries` gains `marked`, with `#[serde(default)]`: a list of
+spans, each `MarkedRange { origin, from, through }`.
+- **What the requester names.** Per origin, the lowest and highest entry it
   holds under an `OPLOG_HELD` mark (ADR-160) that its witnessed vector covers
-  (`Engine::held_ranges_covered_by`). It leaves out an origin the peer does not
-  advertise reaching that far (`servable[origin] < from`).
+  (`Engine::held_ranges_covered_by`). The upper bound is clamped to what the
+  peer advertises of that origin, and a span the peer advertises none of is
+  left out. None are named beside a repair, whose replay sends no `held` and is
+  served its range whole.
 - **What the sender serves.** Every entry of that origin inside the span, in
-  addition to what ADR-171's skip already serves
-  (`Engine::entries_for_peer_marked`). The scan starts at the lowest span when
-  that is below `from`. Every entry below `from` is covered by `held`, so
-  starting lower serves nothing outside a span.
+  addition to what ADR-171's skip serves (`Engine::entries_for_peer_marked`).
+  The sender starts its own scan at the lowest span when that is below `from`.
+  Every entry below `from` is covered by `held`, so starting lower serves nothing
+  outside a span.
 - **The release.** A served entry arrives in a window, and ADR-169 releases its
   mark.
-- **When the round asks.** The round names spans even when it is behind the peer
-  on nothing. That was the case ADR-171 left: no round would ever have asked.
-  It names none beside a repair, whose replay sends no `held` and is served its
-  range whole.
-- **The memo.** A per-peer memo in `PeerStalls` leaves out spans the last pull
-  from that peer asked for and answered to its tail. So a span whose entries the
-  peer has collected is not re-walked every tick.
+- **The request's `from` is never lowered for a span**
+  (`transport::entries_threshold`).
+  - When the requester is behind the peer, `from` is ADR-171's threshold.
+  - When it is behind on nothing and names spans, `from` is the highest stamp
+    the peer advertises. A sender that ignores `marked` then serves only the
+    entries at or above that stamp.
+- **A resume point per peer and origin** (`PeerStalls`). The span named on the
+  wire starts where the last window from that peer left it:
+  - after a window truncated at the cap, past that window's last entry, with
+    the entry's full stamp deciding a tie, as the coverage rule's does (ADR-148);
+  - after a window that reached the peer's tail, past the span's top. The span
+    is then dropped from the ask. That peer has been walked across the whole
+    span, so whatever is still held is an entry it provably lacks, and
+    retention or another peer releases it.
+  - A window stopped at a collection this node lacks moves nothing, and nor
+    does an answer that is not a window.
+- **When a span is asked from its bottom again.** Any of:
+  - the member holds more marks on that origin than when the resume point was
+    recorded;
+  - the peer now advertises more of that origin than it did;
+  - `MARKS_REASK_AFTER` (300 s) has passed since the resume point last moved.
+    A peer can take the missing entry below its own position on an origin that
+    has gone quiet, which moves nothing the requester can see; the five minutes
+    bound how long that release waits.
 - **The log.** The requester logs `asking the peer to serve entries this node
-  holds as state below its own position` at `INFO` whenever it names spans.
+  holds as state below its own position` at `INFO`. It is written when the
+  spans named to a peer change by origin and upper bound, not on every pull.
 
 **What the residual did to peers, read from source.** ADR-171 was reviewed
 twice. One reading was that peers pulling from the member defer the entry. The
@@ -15317,9 +15337,9 @@ other was that nothing observable follows. Each is half the answer.
   - retention, which removes a mark with its row;
   - a diagnostic.
 - **Who sees it.** A peer whose witnessed vector covers the entry skips it and
-  sees nothing. A peer that also lacks it, pulling from that member, is served
-  it above the advertised vector and defers it as `beyond_advertised`. That
-  peer takes the entry from any member that holds it in position.
+  sees nothing. A peer that also lacks it, pulling from that member, is served it
+  above the advertised vector and defers it as `beyond_advertised`. That peer
+  takes the entry from any member that holds it in position.
 - **Meanwhile,** the member serves the document as state through the ordinary
   read path.
 - **How long it lasted under ADR-171.** The mark stayed until one of three
@@ -15327,12 +15347,12 @@ other was that nothing observable follows. Each is half the answer.
   - the origin wrote again;
   - retention collected the entry;
   - a rewind reset the vectors below it, which self-corrects on the next pull.
-- **Where it comes from.** The shape this record found is a hole filled by a
-  scoped repair. A hole is an entry witnessed and never applied, the ADR-148
-  class. A whole-database snapshot's grant releases every mark it covers, and a
-  mark above the grant is above the witnessed vector, which ADR-171 still
-  serves. No path on a correct build that produces a mark at or below the
-  witnessed position without a hole was found.
+- **Where it comes from.** The shape found is a hole filled by a scoped repair.
+  A hole is an entry witnessed and never applied, the ADR-148 class. A
+  whole-database snapshot's grant releases every mark it covers, and a mark
+  above the grant is above the witnessed vector, which ADR-171 still serves. No
+  path on a correct build that produces a mark at or below the witnessed
+  position without a hole was found.
 
 **Why spans, and not a floor.** The starting shape was a floor: per origin, the
 lowest mark, with the sender serving that origin's entries from the floor up to
@@ -15341,109 +15361,199 @@ lowest mark, with the sender serving that origin's entries from the floor up to
   requester's position, not by the marks. One mark on a document written a day
   ago re-serves that origin's whole retained day, which is ADR-171's drain for
   one origin.
-- **Measured.** `a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it`
-  puts ten marks in the middle of 4,196 entries of one origin, on a member
-  that is behind on nothing. A floor at the lowest mark serves 2,196 entries,
-  three windows, all but ten of them superseded. The span serves the ten, in
-  one exhausted window. Debug build, one run.
+- **Measured.**
+  `a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it`
+  puts ten marks in the middle of 4,196 entries of one origin, on a member that
+  is behind on nothing. A floor at the lowest mark serves 2,196 entries, three
+  windows, all but ten of them superseded. The span serves the ten, in one
+  exhausted window. These are entry counts, fixed by the fixture.
 - **What a span costs.** One more stamp per origin on the wire.
 - **Why not every mark.** Sending every mark would be exact, but unbounded in
   size, since a snapshot can leave thousands. A span is two stamps per origin
   whatever the count.
-- **The slack.** Entries inside a span that the member already holds in
-  position are served and superseded. That slack is proportional to the
-  origin's writes across the span.
+
+**The failure the first form of this record had, found in review.** The first
+form lowered the request's `from` to the lowest span on every pull. It served
+every entry inside a span, held or not, counting towards the batch limit.
+- **The trigger.** A peer that does not serve a span's lowest entry, but holds
+  at least 1,024 of that origin's entries above it inside the span, pinned the
+  pull. A peer does not serve that entry when it has collected it, when it
+  shares the hole, when a rewind removed it, or when it is on an older build.
+  The ADR-148 shape meets the 1,024-entry condition routinely.
+- **What it did.** Every window was the same 1,024 superseded entries.
+  - Nothing was released, the window was truncated, and the witnessed vector
+    already covered all of it.
+  - The next pull asked the same thing, up to 128 pulls a tick.
+  - Nothing above the span was served from that peer, the divergence check never
+    ran on that contact, and no failure counter moved.
+  - It ended only when the requester's own retention collected the mark, or
+    when a third member holding the entry served it first. A two-member cluster
+    had no third member.
+- **The two reproductions, over TCP with one `PeerStalls` for every pull:**
+  - *The peer collected the span's lowest entry, then wrote* (x10 collected on
+    A, R holding x10 and x2900).
+  - *The peer shares the hole* (A witnessed past d10 without applying it, R was
+    repaired from the origin, R holding d10 and d2900).
+  - On the first form, both pulls repeated as applied 0, superseded 1,024 and
+    truncated, six times out of six. The later write never arrived.
+  - With the resume points, both finish in three pulls (1,024, 1,024 and 842
+    superseded), that is ⌈2,890 / 1,024⌉ for the entries A holds inside the
+    span, and the later write arrives on the third.
+- **The fix.** The resume points move each span's bottom past what the peer
+  served, so a span is walked once, a window at a time, and the window then
+  reaches whatever lies above it. The span is dropped once a window reached the
+  peer's tail across it. The request's `from` is no longer lowered, so an older
+  sender is never asked to serve from a span's bottom.
 
 **The horizon.** `can_serve_peer_holding` judges `held`, which a span never
 lowers, so a span never turns a pull into `BeyondHorizon`.
 - **A span below the sender's horizon.** It is served whatever the sender still
-  has inside it. Entries the sender has collected do not arrive, so their marks
-  stay, and the requester's own retention collects them with their entries, as
-  before.
+  has inside it. Entries the sender has collected do not arrive, and their marks
+  stay until the requester's own retention collects them, or another peer
+  serves them.
+- **A span-bearing request answered `BeyondHorizon`** records no resume point.
+  The whole-database snapshot that follows serves no span. Its grant releases
+  every mark at or below the grant, in the transaction that adopts it
+  (`release_held_under`). A covered mark above the grant is named again on the
+  next pull.
 - **Nothing is witnessed by a span.** The receiver's coverage rule is unchanged,
   and a span lies at or below `held`, so the window's end is where ADR-171 put
   it.
-- **Why not lower `held` instead.** Lowering `held`, ADR-171's first form of
-  this idea, would have the horizon judge the lowered vector. It would answer a
+- **Why not lower `held` instead.** Lowering `held`, ADR-171's first form of this
+  idea, would have the horizon judge the lowered vector. It would answer a
   snapshot for exactly these entries.
 
 **Cost.**
-- **Per pull.** One read of `OPLOG_HELD` before the request, off the async
-  worker. The table is empty on almost every member.
-- **When spans are named.** The sender walks from the lowest span by key, as in
-  ADR-171's walk, under `blocking`.
-- **How often.** The memo bounds it. A peer that answered the same spans to its
-  tail is not asked again until the spans change, which a release or this node's
-  retention does.
-- **During a drain.** A pull that did not reach the tail, such as one truncated
-  at the batch cap, names the spans again on the next pull and re-walks from the
-  lowest span. That is bounded by the spans, for as long as the drain lasts.
+- **Per pull, on the requester.** A range read of `OPLOG_HELD` up to the
+  member's highest witnessed stamp, off the async worker, on every pull that is
+  not a repair, drain pulls included.
+  - The table is not empty on every member. A member that completed a
+    whole-database snapshot against a busy sender holds the marks above the
+    grant, and a member part-way through a snapshot holds every page it has
+    applied (the table's own note).
+  - Marks above the witnessed position for their origin are read and left out.
+  - Not measured.
+- **Per span, on the sender.** A walk of that origin's entries inside the span
+  that the sender holds, a window at a time: ⌈W / 1,024⌉ pulls for W such
+  entries, once per resume point.
+  - When the span's lowest entry is servable, it is in the first window and is
+    released. The span's bottom then rises to the next mark, so a span of
+    servable marks costs about one window per run of marks lying within 1,024
+    entries of each other.
+- **After a span is dropped.** Nothing, until one of the reopening conditions
+  above holds. The three conditions cost differently:
+  - **Marks grown** is rare: a repair or snapshot brought more.
+  - **Record expiry** re-walks a span no peer can serve once every five minutes
+    per peer, until retention collects the marks.
+  - **The peer moving on the origin** is the expensive one. A peer that keeps
+    writing to that origin, or keeps receiving its writes, moves on it every
+    tick. If that peer still lacks the entry, the span is walked again every
+    tick: ⌈W / 1,024⌉ extra pulls per tick per such peer, for as long as the
+    marks live. That is bounded per tick, and replication beneath it progresses.
+    It is the cost of reopening on the peer's movement, which is what covers a
+    peer gaining the entry by restore, replay or its own release. A cheaper
+    reopening, probing only the held entries' exact stamps, needs the marks
+    themselves on the wire, and is not built.
+- **Memo entries.** Entries for a peer that leaves the cluster are not pruned.
+  They are a few bytes per origin and go with the process, as the other per-peer
+  memos in `PeerStalls` do.
 
 **Wire and roll.** An additive, defaulted field. It is written on every
-`AskEntries`, empty when there are no spans, so that a mixed-version pair
-crosses the boundary on every pull and not only when a mark exists.
-- **An older sender** ignores the field and serves as ADR-171 does, and the
-  marks stay as they did.
+`AskEntries`, empty when there are no spans, so a mixed-version pair crosses the
+boundary on every pull.
+- **A sender on 0.28.1** ignores `marked` and has no ADR-171 skip. It receives
+  the ordinary ask. When the requester is behind, that is exactly what a 0.28.1
+  requester sends, and it is served what 0.28.1 serves today, the ADR-171 drain
+  included. When the requester is behind on nothing, a 0.28.1 requester sends
+  nothing. A 0.29.0 requester holding spans asks from the peer's newest stamp,
+  and is served the entries at that stamp and whatever arrived since the vector
+  was read. Nothing inside a span is served, so those marks wait for a 0.29.0
+  sender or for retention. (The first form of this record lowered `from`, which
+  re-created the whole drain from the lowest mark on such a sender. That drain
+  released the marks as a side effect.)
+- **A sender on ADR-171 alone** skips and ignores `marked`. It serves what
+  ADR-171 serves, and the marks wait the same way.
 - **An older requester** sends none and is served as ADR-171 serves.
 - **No ordering in the roll.**
-- `ask_entries_marked_crosses_a_version_boundary_in_both_directions` in
-  `protocol.rs` pins both decodes. `frames_round_trip` carries a request with a
-  span.
+- **Held by** `ask_entries_marked_crosses_a_version_boundary_in_both_directions`,
+  which checks decoding only, and
+  `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`,
+  which checks what such a sender is asked.
+  - The older senders are simulated by the storage calls each build serves with:
+    `entries_for_peer` for 0.28.1 and `entries_for_peer_holding` for ADR-171.
+  - The threshold is computed by `entries_threshold`, which is what the round
+    itself sends.
 
 **The deliberate mixed-version test for the 0.29.0 release plan**
-(compatibility.md). It has two halves, because a mark at or below the witnessed
-position cannot be produced through the product's API on a correct build: it
-needs a hole, which is a defect.
-
-*The wire, live.* On a three-member cluster:
-1. **Roll one member to 0.29.0** and leave two on 0.28.1.
-2. **Hold the cluster mixed for at least ten sync intervals** (50 s at the
-   default), with a writer at a few documents a second through every member.
-3. **Every member, both builds, should show:**
-   - `kimmy_sync_failures_total` flat;
-   - `kimmy_sync_divergence_checks_total{outcome="ran"}` rising;
-   - no decode or malformed-frame `WARN`.
-4. **Run the one-write drain probe ADR-171 was measured with, in both directions:**
-   - **A write on a 0.28.1 member**, after a quiet spell. The 0.29.0 member
-     pulls it, served by the old build, which ignores `marked` and does not
-     skip: the drain is still there, with pulls about equal to the entries above
-     the writer's previous write divided by 1,024.
-   - **A write on the 0.29.0 member**, after a quiet spell. Each 0.28.1 member
-     pulls it, served by the new build, whose request carried no `marked`: one
-     pull.
-5. **The 0.29.0 member logs no `asking the peer to serve entries this node holds
-   as state` line.** No member of a correct cluster holds such an entry, so a
-   line there is itself a finding.
-6. **Roll the remaining two members, and repeat step 3.**
-
-*The release, in the harness.*
-`a_held_entry_below_the_members_position_is_released_by_its_next_pull` runs a
-0.29.0 requester against a 0.29.0 sender over TCP.
-`a_held_entry_at_or_below_the_members_witnessed_position_is_released_by_its_span`
-shows that a request without spans, which is what a 0.28.1 requester sends,
-leaves the mark as ADR-171 did. The decode test covers the older sender, which
-ignores the field.
+(compatibility.md). A held mark at or below the witnessed position cannot be
+produced through the product's API on a correct build: it needs a hole, which is
+a defect. So the test places one with the harness fixture this record's tests
+use on the 0.29.0 member. That fixture applies a window with one entry missing,
+whose exhaustion covers it, then runs a scoped repair from a member holding the
+entry. It runs on a three-member cluster: M on 0.29.0, and P and Q on 0.28.1.
+- **Setup.**
+  1. Write a few thousand documents through P.
+  2. Converge.
+  3. On M, drop one of those entries from the window it took and repair its
+     collection from P, so M holds that entry under a mark at or below its
+     position.
+  4. Stop writes. Record M's `merged from peer` lines and the `asking the peer
+     to serve entries…` line from here on.
+- **(a) M pulls from a 0.28.1 member.**
+  1. Write N documents through Q, after a quiet spell.
+  2. M's pulls from Q number about N / 1,024. There is no run of `applied 0`
+     pulls from the mark's position: M's request asks from its own threshold,
+     and Q serves nothing inside the span.
+  3. The mark is not released by Q.
+  4. M's asking line may appear, since it names the span to every peer, but Q
+     answers it with the ordinary window only.
+  5. Hold the cluster mixed for at least ten sync intervals. Across it:
+     `kimmy_sync_failures_total` is flat on every member,
+     `kimmy_sync_divergence_checks_total{outcome="ran"}` rises, and no decode or
+     malformed-frame `WARN` appears.
+- **(b) M pulls from a 0.29.0 member.**
+  1. Roll P to 0.29.0.
+  2. M's next pull from P releases the mark in one pull. M's advertised vector
+     for the origin reaches the entry. Once
+     `kimmy_sync_held_marks_released_total` is in the build, it moves by one.
+     That series lands separately and is not in this change.
+  3. M's asking line is logged once for that span set, not per pull.
+- **Finish.** Roll Q, and repeat the checks in (a) step 5.
 
 **Alternatives.**
 - *A floor per origin* (above).
 - *Every mark.* Unbounded on the wire.
 - *Lower `held`* (ADR-171). The horizon would answer a snapshot.
+- *Stop naming spans for the rest of a contact after a truncated pull that
+  released nothing.* It leaves a wasted pull per tick per peer for as long as
+  the marks live, and never finishes walking a span wider than a batch.
 - *A request per mark, by stamp.* A second message type and a round trip per
   span, for nothing a range scan does not already do.
 
 **Held by**
 - `a_held_entry_below_the_members_position_is_released_by_its_next_pull`: over
-  TCP, and read from the round's own log: spans named, no snapshot, one pull,
-  released. Red when the requester names no spans, and when the sender ignores
-  them.
-- `a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapshot`:
-  red when the served arm judges the horizon on `held` lowered by the spans.
+  TCP, read from the round's own log. Spans are named, there is no snapshot,
+  it takes one pull, and the entry is released.
+- `a_span_the_peer_has_collected_is_served_what_remains_and_never_a_snapshot`: a
+  span below the sender's horizon.
+- `a_span_whose_lowest_entry_the_peer_collected_does_not_stop_replication_from_it`:
+  reproduction one. The later write arrives in three pulls, and the next round
+  names nothing.
+- `a_span_whose_bottom_the_peer_cannot_serve_does_not_stop_replication_from_it`:
+  reproduction two, the shared hole. Three pulls, ⌈2,890 / 1,024⌉.
+- `a_span_the_peer_answered_is_not_named_again_on_the_next_round`: the resume
+  points' wiring across two rounds.
+- `a_span_is_named_again_once_the_peer_has_moved_on_its_origin`: the re-ask.
+- `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`:
+  what an older sender is asked.
 - `a_marked_span_serves_the_marked_range_and_not_the_origins_history_above_it`:
-  the bound. Red when a span ignores its upper bound.
+  the bound.
 - `a_held_entry_at_or_below_the_members_witnessed_position_is_released_by_its_span`:
   without a span the mark stays, and with it the entry is released.
-- `peer_stalls_leave_out_spans_a_peer_answered_to_its_tail`: the memo. Red when
-  it asks every time.
+- `peer_stalls_resume_each_span_past_what_the_peer_served`,
+  `the_spans_named_are_logged_when_they_change` and
+  `a_pull_asks_from_its_threshold_and_never_from_a_span`: the resume points, the
+  log and the threshold.
 - `ask_entries_marked_crosses_a_version_boundary_in_both_directions`: both
   decodes.
 - `one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer`: still one pull
