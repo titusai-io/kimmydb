@@ -52,6 +52,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     `spill_bytes` and `elapsed_ms`.
   - **Unchanged:** the bytes of a backup and the restore.
 
+- **The Rust client streams a download, and `kimmy backup` no longer fails on a
+  backup longer than 30 s.** `kimmy-client` downloaded with its 30 s total
+  timeout and collected the body in memory. For a download, `Builder::timeout` now
+  means a read-idle timeout on the body: there is no total, and the wait for the
+  response head is unbounded.
+  - **New public API:** `Client::download_to`, which streams into any `AsyncWrite`;
+    `Error::Stalled`, returned when the body goes that long without a byte; and
+    `Error::Io`, for a local write failure.
+  - **Breaking for exhaustive matches:** `Error` is not `#[non_exhaustive]`, so a
+    downstream exhaustive `match` on it stops compiling. Pre-1.0, no shim.
+  - **`kimmy backup`** downloads to a partial file beside the destination and
+    renames it into place only once it is complete and synced. A failed download
+    leaves an existing file exactly as it was.
+
 ## 0.28.1 - 2026-09-15
 
 ### Fixed

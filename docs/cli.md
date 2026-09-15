@@ -94,7 +94,7 @@ grants any other client is.
 | `kimmy vector-search <db.coll> [query]` | Search by meaning. `--vector --k --filter --per-document` |
 | `kimmy hybrid-search <db.coll> [query]` | Dense and lexical, fused by rank. Same flags |
 | `kimmy watch <db.coll>` | Follow changes until interrupted, one event per line. `--full --resume-after` |
-| `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout |
+| `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout. Streamed to `.<file>.<pid>.partial` beside `<file>`, synced, and renamed over `<file>` only when complete, so a failed download leaves an existing `<file>` exactly as it was and removes the partial file; a download killed by a signal can leave the partial file behind, never a damaged `<file>`. Waits without a timeout for the node to walk its store, then gives up only if 30 s pass without a byte; a server that accepts the connection and never answers holds it open, since keepalive ends only a dead peer |
 
 Global: `--url` (`KIMMY_URL`), `--token` (`KIMMY_TOKEN`), `--pretty`.
 
