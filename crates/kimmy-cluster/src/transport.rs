@@ -776,35 +776,40 @@ where
     // The peer passes over everything that position covers (ADR-171), so
     // these entries would never be served again and their marks would stay
     // until retention. Named as spans, so the peer serves them and ADR-169
-    // releases them on arrival. Only spans the peer advertises reaching, and
-    // not beside a repair, whose replay serves its range whole anyway. The memo
-    // leaves out spans a peer already answered in full, so a converged member
-    // does not make every tick walk a peer's oplog for marks it cannot release.
+    // releases them on arrival: only the part of a span the peer advertises
+    // reaching, and not beside a repair, whose replay serves its range whole.
+    // Each span resumes past what this peer already served of it, so a span
+    // whose bottom the peer cannot serve is walked once rather than re-served
+    // from the same place on every pull.
     let marked = if repair.is_none() {
-        let spans = kimmy_storage::blocking(|| engine.held_ranges_covered_by(&mine))
+        let spans = kimmy_storage::blocking(|| engine.held_marks_covered_by(&mine))
             .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        let reachable: Vec<kimmy_storage::MarkedRange> =
-            spans.into_iter().filter(|span| theirs.get(span.origin) >= span.from).collect();
-        stalls.marks_to_ask(their_node, reachable)
+        let reachable = spans
+            .into_iter()
+            .filter_map(|(span, marks)| {
+                let through = span.through.min(theirs.get(span.origin));
+                (through >= span.from)
+                    .then_some((kimmy_storage::MarkedRange { through, ..span }, marks))
+            })
+            .collect();
+        stalls.marks_to_ask(their_node, reachable, &theirs, std::time::Instant::now())
     } else {
         Vec::new()
     };
-    let lowest_marked = marked.iter().map(|span| span.from).min();
-    let from = match (mine.behind(&theirs), repair) {
-        (behind, Some((_, Repair::Replay { from: floor }))) => {
-            Some(behind.map_or(floor, |behind| behind.min(floor)))
-        }
-        (behind, Some((_, Repair::Snapshot))) => Some(behind.unwrap_or(Hlc::ZERO)),
-        (Some(behind), None) => Some(lowest_marked.map_or(behind, |lowest| behind.min(lowest))),
-        (None, None) => lowest_marked,
-    };
-    if !marked.is_empty() {
+    if stalls.marks_named_changed(their_node, &marked) && !marked.is_empty() {
         info!(
             %peer,
             spans = marked.len(),
             "asking the peer to serve entries this node holds as state below its own position"
         );
     }
+    let from = match (mine.behind(&theirs), repair) {
+        (behind, Some((_, Repair::Replay { from: floor }))) => {
+            Some(behind.map_or(floor, |behind| behind.min(floor)))
+        }
+        (behind, Some((_, Repair::Snapshot))) => Some(behind.unwrap_or(Hlc::ZERO)),
+        (_, None) => entries_threshold(&mine, &theirs, &marked),
+    };
     let Some(from) = from else {
         // Nothing to pull, but the peer's own position is still news:
         // how far *it* trails *us* is what says whether it has been
@@ -988,6 +993,17 @@ where
             // asking the same question.
             window_truncated =
                 !exhausted && outcome.unknown_collection == 0 && outcome.deferred < entries.len();
+            // Where each span this request named resumes against this peer
+            // (ADR-172). A batch stopped at a collection this node lacks did
+            // not take what it carried past the stop, so it moves nothing.
+            if !marked.is_empty() && outcome.unknown_collection == 0 {
+                stalls.marks_served(
+                    their_node,
+                    entries.last().map(|entry| entry.stamp),
+                    exhausted,
+                    std::time::Instant::now(),
+                );
+            }
             match (repair, &outcome.unknown) {
                 // A replay under way: done when it reached the tail,
                 // escalated to a snapshot if it stopped at a collection
@@ -1074,9 +1090,6 @@ where
     let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;
-    if !marked.is_empty() {
-        stalls.marks_answered(their_node, window_exhausted);
-    }
     outcome.truncated = window_truncated;
     // Only when the pull reached the peer's tail: a round still working
     // through a backlog deeper than one batch has not earned the belief
@@ -1321,10 +1334,63 @@ pub struct PeerStalls {
     /// is with — and written after every page, before the next frame, so a
     /// round the timeout cancels leaves the pages it applied recorded.
     snapshots: HashMap<NodeId, SnapshotProgress>,
-    /// The held spans last asked of each peer (ADR-172), and whether that pull
-    /// reached the peer's tail, which is what lets a round leave out spans a
-    /// peer has already served everything it retains of.
-    marks_asked: HashMap<NodeId, (Vec<kimmy_storage::MarkedRange>, bool)>,
+    /// Where each held span resumes against each peer (ADR-172), keyed by
+    /// peer and origin: see [`PeerStalls::marks_to_ask`].
+    marks_asked: HashMap<(NodeId, NodeId), SpanAsked>,
+    /// The spans the last request to each peer named, with how many marks
+    /// each covered, until [`PeerStalls::marks_served`] records the answer.
+    marks_pending: HashMap<NodeId, Vec<(kimmy_storage::MarkedRange, usize, Hlc)>>,
+    /// The spans each peer was last named in the log, by origin and upper
+    /// bound, so the line is written when they change and not on every pull.
+    marks_logged: HashMap<NodeId, Vec<(NodeId, Hlc)>>,
+}
+
+/// Where one origin's held span resumes against one peer (ADR-172).
+#[derive(Clone, Copy, Debug)]
+struct SpanAsked {
+    /// Where the next request for this origin's span starts: past every entry
+    /// of it the peer has served, or past its top once a window reached the
+    /// peer's tail.
+    resume: Hlc,
+    /// The marks the span covered when this was recorded. More marks since
+    /// can mean a held entry below `resume`, so the record is dropped.
+    marks: usize,
+    /// What the peer advertised of the span's origin when this was recorded.
+    /// A peer that has moved on that origin since may now hold what it
+    /// lacked, so the record is dropped.
+    theirs: Hlc,
+    /// When the record last moved.
+    at: std::time::Instant,
+}
+
+/// How long a span's resume point stands before the span is asked from its
+/// bottom again (ADR-172), when nothing else has reopened it. A peer that
+/// answered a span to its tail without holding one of its entries reopens it
+/// by moving on the span's origin, which is how most peers come to hold such
+/// an entry. One that takes the entry below its own position on an origin
+/// that has gone quiet moves nothing this node can see; five minutes, the
+/// repair cooldown's length at the default interval, bounds how long that
+/// release waits and how often a span no peer can serve is walked.
+pub const MARKS_REASK_AFTER: Duration = Duration::from_secs(300);
+
+/// The stamp a pull asks from, when no repair is planned (ADR-171, ADR-172).
+///
+/// This node's threshold on the peer, as `VersionVector::behind` gives it.
+/// **Never lowered for a span**: a sender that reads `marked` lowers its own
+/// scan start to the spans, and one that predates the field would serve every
+/// entry from a lowered stamp, the drain ADR-171 removed. When this node is
+/// behind on nothing but names spans, the highest stamp the peer advertises:
+/// a sender that reads `marked` serves the spans, and one that does not
+/// serves the entries at or above that stamp, which this node already holds.
+/// `None` when there is nothing to ask.
+pub fn entries_threshold(
+    mine: &VersionVector,
+    theirs: &VersionVector,
+    marked: &[kimmy_storage::MarkedRange],
+) -> Option<Hlc> {
+    mine.behind(theirs).or_else(|| {
+        (!marked.is_empty()).then(|| theirs.iter().map(|(_, hlc)| hlc).max().unwrap_or(Hlc::ZERO))
+    })
 }
 
 /// How a round repairs a hole against one peer (ADR-148).
@@ -1424,36 +1490,104 @@ impl PeerStalls {
         Self::default()
     }
 
-    /// The held spans worth asking `peer` for this round (ADR-172): `current`,
-    /// unless the last pull from this peer asked for exactly these spans and
-    /// reached its tail. That peer has served every entry it retains inside
-    /// them, and whatever is still held is what it has collected, which
-    /// asking again would re-walk its oplog to find absent on every tick until
-    /// this node's own retention collects the marks. A span that shrank, grew
-    /// or moved is asked again.
+    /// The held spans to name to `peer` on this pull (ADR-172), from `current`,
+    /// the spans this node holds with how many marks each covers.
+    ///
+    /// Each span starts where it resumes against this peer: past what the
+    /// peer's earlier windows served of it. A span resumed past its top is
+    /// left out. That is the peer having served everything it retains inside
+    /// it, and asking again would re-walk its oplog to find the rest absent.
+    /// The record is dropped, and the span asked from its bottom, when this
+    /// node now holds more marks on that origin than when it was recorded,
+    /// when the peer now advertises more of that origin than it did then, or
+    /// [`MARKS_REASK_AFTER`] after the record last moved. Origins no longer
+    /// held are forgotten.
     pub fn marks_to_ask(
         &mut self,
         peer: NodeId,
-        current: Vec<kimmy_storage::MarkedRange>,
+        current: Vec<(kimmy_storage::MarkedRange, usize)>,
+        theirs: &VersionVector,
+        now: std::time::Instant,
     ) -> Vec<kimmy_storage::MarkedRange> {
-        if current.is_empty() {
-            self.marks_asked.remove(&peer);
-            return current;
+        self.marks_asked.retain(|(asked_of, origin), _| {
+            *asked_of != peer || current.iter().any(|(span, _)| span.origin == *origin)
+        });
+        let mut named = Vec::new();
+        for (span, marks) in &current {
+            let key = (peer, span.origin);
+            if self.marks_asked.get(&key).is_some_and(|asked| {
+                *marks > asked.marks
+                    || theirs.get(span.origin) > asked.theirs
+                    || now.saturating_duration_since(asked.at) >= MARKS_REASK_AFTER
+            }) {
+                self.marks_asked.remove(&key);
+            }
+            let from = match self.marks_asked.get_mut(&key) {
+                Some(asked) => {
+                    asked.marks = *marks;
+                    asked.resume.max(span.from)
+                }
+                None => span.from,
+            };
+            if from <= span.through {
+                named.push(kimmy_storage::MarkedRange { from, ..*span });
+            }
         }
-        if self.marks_asked.get(&peer).is_some_and(|(asked, reached)| *reached && *asked == current)
-        {
-            return Vec::new();
-        }
-        self.marks_asked.insert(peer, (current.clone(), false));
-        current
+        let pending = named
+            .iter()
+            .map(|span| {
+                let marks =
+                    current.iter().find(|(c, _)| c.origin == span.origin).map_or(0, |c| c.1);
+                (*span, marks, theirs.get(span.origin))
+            })
+            .collect();
+        self.marks_pending.insert(peer, pending);
+        named
     }
 
-    /// Record whether the pull that asked `peer` for held spans reached its
-    /// tail (ADR-172).
-    pub fn marks_answered(&mut self, peer: NodeId, reached_tail: bool) {
-        if let Some((_, reached)) = self.marks_asked.get_mut(&peer) {
-            *reached = reached_tail;
+    /// Record where the spans the last request to `peer` named resume, from
+    /// the window it answered with (ADR-172): past the window's last entry,
+    /// for a window truncated at the cap, and past each span's top for one
+    /// that reached the peer's tail. The last entry's full stamp decides the
+    /// tie, as the coverage rule's does (ADR-148): an origin that sorts after
+    /// it at the same timestamp was not examined, and resumes at it.
+    pub fn marks_served(
+        &mut self,
+        peer: NodeId,
+        last: Option<kimmy_core::Stamp>,
+        exhausted: bool,
+        now: std::time::Instant,
+    ) {
+        let Some(pending) = self.marks_pending.remove(&peer) else {
+            return;
+        };
+        for (span, marks, theirs) in pending {
+            let resume = if exhausted {
+                span.through.successor()
+            } else {
+                match last {
+                    Some(last) if span.origin <= last.node => last.hlc.successor().max(span.from),
+                    Some(last) => last.hlc.max(span.from),
+                    None => span.from,
+                }
+            };
+            self.marks_asked
+                .insert((peer, span.origin), SpanAsked { resume, marks, theirs, at: now });
         }
+    }
+
+    /// Whether the spans named to `peer` differ, by origin and upper bound,
+    /// from the last ones this answered for (ADR-172). What the log line is
+    /// written on, so a span walked a window at a time is logged once.
+    pub fn marks_named_changed(
+        &mut self,
+        peer: NodeId,
+        named: &[kimmy_storage::MarkedRange],
+    ) -> bool {
+        let now: Vec<(NodeId, Hlc)> =
+            named.iter().map(|span| (span.origin, span.through)).collect();
+        let before = self.marks_logged.insert(peer, now.clone()).unwrap_or_default();
+        before != now
     }
 
     /// Take up the snapshot pulls the engine recorded before this process
@@ -2133,52 +2267,135 @@ mod tests {
         })
     }
 
-    /// The memo `sync_round` asks for held spans through (ADR-172). Spans are
-    /// named on the first pull; left out once a pull asking exactly those
-    /// spans reached the peer's tail, because that peer has served every entry
-    /// it retains inside them; named again when the pull did not reach the
-    /// tail, when the spans change, or of a different peer; and forgotten when
-    /// nothing is held.
+    /// The resume points `sync_round` names held spans through (ADR-172). A
+    /// span is named from its bottom; after a truncated window it resumes past
+    /// the window's last entry, with the full stamp deciding a tie; after a
+    /// window that reached the tail it is left out; and it is named from its
+    /// bottom again when more marks are held on its origin, when the record is
+    /// older than `MARKS_REASK_AFTER`, and of a different peer. Origins no
+    /// longer held are forgotten, and a request answered by anything but a
+    /// window moves nothing.
     #[test]
-    fn peer_stalls_leave_out_spans_a_peer_answered_to_its_tail() {
+    fn peer_stalls_resume_each_span_past_what_the_peer_served() {
         let peer = node(1);
         let other = node(2);
-        let span = |through: u64| kimmy_storage::MarkedRange {
+        let origin = node(3);
+        let at = |wall: u64| kimmy_storage::MarkedRange {
+            origin,
+            from: Hlc::new(wall, 0),
+            through: Hlc::new(100, 0),
+        };
+        let stamp = |wall: u64, n: u128| kimmy_core::Stamp::new(Hlc::new(wall, 0), node(n));
+        let t0 = std::time::Instant::now();
+        let theirs = vector(&[(origin, 100)]);
+        let mut stalls = PeerStalls::new();
+
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 2)], &theirs, t0),
+            vec![at(10)],
+            "first"
+        );
+        // A window truncated at the cap, ending at an entry of this origin.
+        stalls.marks_served(peer, Some(stamp(40, 3)), false, t0);
+        let resumed = stalls.marks_to_ask(peer, vec![(at(10), 2)], &theirs, t0);
+        assert_eq!(
+            resumed,
+            vec![at(40)]
+                .into_iter()
+                .map(|s| kimmy_storage::MarkedRange { from: Hlc::new(40, 0).successor(), ..s })
+                .collect::<Vec<_>>(),
+            "resumes past the last entry"
+        );
+        // Truncated at an entry of an origin that sorts before this one, at
+        // the same timestamp: this origin's entry there was not examined.
+        stalls.marks_served(peer, Some(stamp(60, 2)), false, t0);
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 2)], &theirs, t0),
+            vec![at(60)],
+            "a tie resumes at it"
+        );
+        // Answered by a snapshot or a failed round: nothing recorded, so the
+        // pending request is simply named again.
+        assert_eq!(stalls.marks_to_ask(peer, vec![(at(10), 2)], &theirs, t0), vec![at(60)]);
+        // A window that reached the peer's tail.
+        stalls.marks_served(peer, Some(stamp(200, 3)), true, t0);
+        assert!(
+            stalls.marks_to_ask(peer, vec![(at(10), 2)], &theirs, t0).is_empty(),
+            "answered: left out"
+        );
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 2)], &vector(&[(origin, 101)]), t0),
+            vec![at(10)],
+            "the peer moved on the span's origin: named from the bottom again"
+        );
+        stalls.marks_served(peer, None, true, t0);
+        assert!(
+            stalls.marks_to_ask(peer, vec![(at(10), 1)], &theirs, t0).is_empty(),
+            "a mark released since is still answered"
+        );
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 3)], &theirs, t0),
+            vec![at(10)],
+            "more marks than recorded: named from the bottom again"
+        );
+        stalls.marks_served(peer, None, true, t0);
+        assert!(stalls.marks_to_ask(peer, vec![(at(10), 3)], &theirs, t0).is_empty());
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 3)], &theirs, t0 + MARKS_REASK_AFTER),
+            vec![at(10)],
+            "and after the record expires"
+        );
+        assert_eq!(
+            stalls.marks_to_ask(other, vec![(at(10), 3)], &theirs, t0),
+            vec![at(10)],
+            "another peer"
+        );
+        stalls.marks_served(peer, None, true, t0);
+        assert!(stalls.marks_to_ask(peer, Vec::new(), &theirs, t0).is_empty(), "nothing held");
+        assert_eq!(
+            stalls.marks_to_ask(peer, vec![(at(10), 3)], &theirs, t0),
+            vec![at(10)],
+            "and a span held again after that is named from its bottom"
+        );
+    }
+
+    /// The log line for held spans is written when they change by origin and
+    /// upper bound, not as a span walks a window at a time (ADR-172).
+    #[test]
+    fn the_spans_named_are_logged_when_they_change() {
+        let peer = node(1);
+        let span = |from: u64, through: u64| kimmy_storage::MarkedRange {
             origin: node(3),
-            from: Hlc::new(10, 0),
+            from: Hlc::new(from, 0),
             through: Hlc::new(through, 0),
         };
         let mut stalls = PeerStalls::new();
+        assert!(stalls.marks_named_changed(peer, &[span(10, 100)]));
+        assert!(!stalls.marks_named_changed(peer, &[span(40, 100)]), "resumed, same span");
+        assert!(stalls.marks_named_changed(peer, &[span(40, 90)]), "a new top");
+        assert!(stalls.marks_named_changed(peer, &[]));
+        assert!(!stalls.marks_named_changed(peer, &[]));
+    }
 
-        assert_eq!(stalls.marks_to_ask(peer, vec![span(20)]), vec![span(20)], "first ask");
-        stalls.marks_answered(peer, false);
-        assert_eq!(
-            stalls.marks_to_ask(peer, vec![span(20)]),
-            vec![span(20)],
-            "a pull short of the tail is asked again"
-        );
-        stalls.marks_answered(peer, true);
-        assert!(
-            stalls.marks_to_ask(peer, vec![span(20)]).is_empty(),
-            "the same spans, answered to the tail, are left out"
-        );
-        assert_eq!(
-            stalls.marks_to_ask(other, vec![span(20)]),
-            vec![span(20)],
-            "another peer is asked"
-        );
-        assert_eq!(
-            stalls.marks_to_ask(peer, vec![span(15)]),
-            vec![span(15)],
-            "a span that changed is asked"
-        );
-        stalls.marks_answered(peer, true);
-        assert!(stalls.marks_to_ask(peer, Vec::new()).is_empty(), "nothing held");
-        assert_eq!(
-            stalls.marks_to_ask(peer, vec![span(15)]),
-            vec![span(15)],
-            "and a mark held again after that is asked afresh"
-        );
+    /// The request's `from` is never lowered for a span (ADR-172): the
+    /// threshold when behind, the peer's newest stamp when behind on nothing
+    /// and naming spans, and nothing otherwise.
+    #[test]
+    fn a_pull_asks_from_its_threshold_and_never_from_a_span() {
+        let me = node(1);
+        let peer = node(2);
+        let span = [kimmy_storage::MarkedRange {
+            origin: me,
+            from: Hlc::new(1, 0),
+            through: Hlc::new(2, 0),
+        }];
+        let mine = vector(&[(me, 50), (peer, 30)]);
+        let behind = vector(&[(me, 50), (peer, 40)]);
+        assert_eq!(entries_threshold(&mine, &behind, &span), Some(Hlc::new(30, 0)));
+        assert_eq!(entries_threshold(&mine, &behind, &[]), Some(Hlc::new(30, 0)));
+        let level = vector(&[(me, 45), (peer, 30)]);
+        assert_eq!(entries_threshold(&mine, &level, &span), Some(Hlc::new(45, 0)));
+        assert_eq!(entries_threshold(&mine, &level, &[]), None);
     }
 
     /// The truth table `divergence_probe_for` decides over `PeerStalls`

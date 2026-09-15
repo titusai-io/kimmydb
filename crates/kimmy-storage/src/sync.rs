@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -627,14 +627,33 @@ impl Engine {
     ///
     /// A mark above `witnessed` is left out: the skip does not pass over it,
     /// so an ordinary window serves it. A key this build cannot read is left
-    /// out too, as the grant's release keeps one (ADR-160). Reads the held
-    /// table, which is empty on almost every node and at most the documents a
-    /// snapshot or repair brought on the rest.
+    /// out too, as the grant's release keeps one (ADR-160).
     pub fn held_ranges_covered_by(&self, witnessed: &VersionVector) -> Result<Vec<MarkedRange>> {
+        Ok(self.held_marks_covered_by(witnessed)?.into_iter().map(|(span, _)| span).collect())
+    }
+
+    /// [`Self::held_ranges_covered_by`], with how many marks each span covers:
+    /// what a pull's resume points are invalidated by, since more marks on an
+    /// origin can mean a held entry below where a span last resumed.
+    ///
+    /// **Cost.** A range read of `OPLOG_HELD` up to the highest stamp the
+    /// vector names, on every pull that is not a repair. The table is not
+    /// empty on every member: a member that completed a whole-database
+    /// snapshot against a busy sender holds the marks above the grant, and one
+    /// mid-snapshot holds each page it has applied (see the table's note).
+    /// Marks above `witnessed` for their origin are read and left out.
+    pub fn held_marks_covered_by(
+        &self,
+        witnessed: &VersionVector,
+    ) -> Result<Vec<(MarkedRange, usize)>> {
+        let Some(highest) = witnessed.iter().map(|(_, hlc)| hlc).max() else {
+            return Ok(Vec::new());
+        };
+        let upper = crate::codec::oplog_key(&Stamp::new(highest, NodeId::from_bytes([0xFF; 16])));
         let txn = self.db().begin_read()?;
         let held = txn.open_table(crate::tables::OPLOG_HELD)?;
-        let mut spans: HashMap<NodeId, (Hlc, Hlc)> = HashMap::new();
-        for row in held.iter()? {
+        let mut spans: HashMap<NodeId, (Hlc, Hlc, usize)> = HashMap::new();
+        for row in held.range(..=upper.as_slice())? {
             let (key, _) = row?;
             let Ok(stamp) = crate::codec::decode_oplog_key(key.value()) else {
                 continue;
@@ -644,17 +663,18 @@ impl Engine {
             }
             spans
                 .entry(stamp.node)
-                .and_modify(|(lowest, highest)| {
+                .and_modify(|(lowest, highest, marks)| {
                     *lowest = (*lowest).min(stamp.hlc);
                     *highest = (*highest).max(stamp.hlc);
+                    *marks += 1;
                 })
-                .or_insert((stamp.hlc, stamp.hlc));
+                .or_insert((stamp.hlc, stamp.hlc, 1));
         }
-        let mut out: Vec<MarkedRange> = spans
+        let mut out: Vec<(MarkedRange, usize)> = spans
             .into_iter()
-            .map(|(origin, (from, through))| MarkedRange { origin, from, through })
+            .map(|(origin, (from, through, marks))| (MarkedRange { origin, from, through }, marks))
             .collect();
-        out.sort_by_key(|span| (span.from, span.origin));
+        out.sort_by_key(|(span, _)| (span.from, span.origin));
         Ok(out)
     }
 
