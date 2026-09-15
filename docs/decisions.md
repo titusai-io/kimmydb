@@ -15934,6 +15934,32 @@ rewind fixed, that happens only on a database a build predating the arrival
 index appended to after this one created it. A token that member issued before
 the rebuild can resume past an entry the rebuild moved below the token's.
 
+**Narrower edges, named rather than closed.**
+- **A violation before the start.** On a member other than the issuing one, the
+  start is the first entry above `D` by stamp. A `UniqueViolation` this member
+  reported at an arrival position before that entry is not read, so it is not
+  delivered. Never passing over a violation applies only to what the stream
+  reads.
+- **The retention cap can hide a collected entry.** The collected check is
+  capped at what this member witnessed of an origin. If this member is behind
+  on that origin by more than its retention window, an entry it collected above
+  its own witnessed position does not refuse the token.
+- **The rewind record is keyed on the token's entry.** A rewind on the resuming
+  member that discarded entries above `D`, but not the token's own entry, is not
+  refused. The client may have seen history that member no longer has.
+- **An empty vector.** A token from a stream that never reached the tail after
+  opening `from_start` carries an empty `D`. On any other member that has
+  collected anything, that token is `410`, and the Rust client ends the stream
+  on `410`.
+- **Two read transactions.** `resume_point`'s checks and the walk that finds the
+  start run in separate read transactions. A retention pass that commits
+  between them is not seen by the checks.
+- **Holes in the arrival index.** A rewind and retention both leave holes in the
+  arrival index. A stream resumes each read after the last position the
+  previous read reached, not after as many positions as it returned entries.
+  Counting entries put the next read back inside the last one across a hole,
+  and delivered its tail again on the issuing member.
+
 **Cost.**
 - **Reads.** Each arrival read that reaches the end of the index also reads the
   witnessed vector, one row per origin, in the same transaction.
@@ -15958,7 +15984,8 @@ the rebuild can resume past an entry the rebuild moved below the token's.
   Rust client reports that as an error after its reconnect attempts.
 - **Downgrading a member from 0.30.x to 0.29.x stops its embedding worker at
   start.** 0.29.x cannot decode the recorded position, which 0.30 wrote in the
-  new format.
+  new format. So does restoring a backup taken on 0.30.x onto 0.29.x, because a
+  backup carries `META`, where the position is recorded.
 - **No cluster wire change.** Tokens never cross between members, so a roll
   needs no ordering and no mixed-version test for this.
 - **The clients.**
@@ -15999,9 +16026,10 @@ the rebuild can resume past an entry the rebuild moved below the token's.
   - A and C are then paused while B takes writes of its own, so B holds those
     writes ahead of the token's entry.
   - Then writers run on A and B at once.
-  - Resumed on B, every missed id arrives, and the repeats are asserted to be
-    within one read: 176 events for 175 missed, the repeat being the token's
-    own. Resumed on A, exactly the 175 arrive.
+  - Resumed on B, every missed id arrives, none twice, and fewer of the events
+    the client had seen than it read before the cut; a replay from the start
+    would send all of them. Measured: 176 events for 175 missed, the one repeat
+    being the token's own. Resumed on A, exactly the 175 arrive.
 - `a_token_claims_nothing_its_stream_had_read_but_not_yet_handed_over`: the
   vector moves after hand-over, not at the read.
 - `a_token_from_another_member_is_refused_where_this_member_collected_past_it`
@@ -16010,6 +16038,10 @@ the rebuild can resume past an entry the rebuild moved below the token's.
   only what `D` covers, and refused once it collects one entry more.
 - `a_token_naming_an_entry_a_rewind_discarded_is_refused` and
   `a_rewound_entry_a_peer_sends_back_stays_refused`: the rewind record.
+- `a_hole_a_rewind_leaves_in_the_arrival_index_is_read_across_once`: the mirror
+  order of the next fixture. A local write stamped after the token's entry is
+  discarded, and a replicated one stamped before it is kept, so the issuing
+  member reads across the hole and delivers each entry once.
 - `a_rewind_leaves_the_issuing_members_order_as_its_streams_saw_it`: a rewind,
   a restart, and the issuing member resuming exactly. It delivers the replicated
   entry taken in after the token's but stamped below it.
@@ -16052,3 +16084,9 @@ the rebuild can resume past an entry the rebuild moved below the token's.
   recreated-collection test.
 - **The collected record not capped by what was witnessed:** the seeded-record
   test.
+- **A stream advancing by the number of entries a read returned, not past the
+  last position it reached:** the hole test, whose issuing member delivers
+  `after` twice.
+- **Another member replaying from the start, passing over nothing:** the harness
+  test's bound. B sends all 25 events the client had seen, and 200 events for
+  175 missed.

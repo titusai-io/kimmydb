@@ -482,26 +482,33 @@ impl Engine {
     /// entry the read returned (ADR-173). Read in the same transaction, it
     /// covers only entries at arrival positions the read has already passed,
     /// or entries that were superseded here without being appended.
+    ///
+    /// Also returns the last arrival position the read passed, which is where
+    /// the next read starts after. Positions are not contiguous: a rewind and
+    /// retention both remove rows from the middle of the index, so the count of
+    /// entries read says nothing about how far the read went.
     fn read_arrival_batch(
         &self,
         from: u64,
         limit: usize,
-    ) -> Result<(Vec<OplogEntry>, Option<VersionVector>)> {
+    ) -> Result<(Vec<OplogEntry>, Option<VersionVector>, Option<u64>)> {
         let txn = self.db().begin_read()?;
         let mut out = Vec::new();
+        let mut last = None;
         let mut reached_tail = true;
         {
             let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let oplog = txn.open_table(tables::OPLOG)?;
             for row in arrival.range(from..)? {
-                let (_, key) = row?;
+                let (seq, key) = row?;
+                last = Some(seq.value());
                 let Some(raw) = oplog.get(key.value())? else {
                     warn!("arrival index points at a missing oplog entry");
                     continue;
                 };
                 out.push(codec::decode_oplog_entry(raw.value())?);
                 if out.len() >= limit {
-                    reached_tail = arrival.range(from + out.len() as u64..)?.next().is_none();
+                    reached_tail = arrival.range(seq.value() + 1..)?.next().is_none();
                     break;
                 }
             }
@@ -510,7 +517,7 @@ impl Engine {
             true => Some(Engine::read_versions_in(&txn, tables::OPLOG_WITNESSED)?),
             false => None,
         };
-        Ok((out, witnessed))
+        Ok((out, witnessed, last))
     }
 
     /// Reject a resume token whose position has already been collected.
@@ -744,13 +751,19 @@ impl ChangeStream {
 
             // Phase 3: read whatever has arrived since we last looked.
             match engine.read_arrival_batch(from, REPLAY_BATCH) {
-                Ok((batch, witnessed)) if !batch.is_empty() => {
-                    self.next_replay_from = Some(from + batch.len() as u64);
-                    self.replay = batch.into_iter();
-                    self.pending = witnessed;
-                    continue;
-                }
-                Ok((_, witnessed)) => {
+                Ok((batch, witnessed, last)) => {
+                    // Past the last position the read reached, not past as
+                    // many positions as it returned entries: a hole left by a
+                    // rewind or by retention would otherwise put the next read
+                    // back inside this one, and deliver its tail again.
+                    if let Some(last) = last {
+                        self.next_replay_from = Some(last + 1);
+                    }
+                    if !batch.is_empty() {
+                        self.replay = batch.into_iter();
+                        self.pending = witnessed;
+                        continue;
+                    }
                     // Nothing past the stream's position: it has taken
                     // everything the vector covers already.
                     if let Some(witnessed) = witnessed {
@@ -765,7 +778,7 @@ impl ChangeStream {
             }
 
             // Phase 4: nothing new on disk. Wait to be told to look again.
-            self.next_replay_from = Some(from);
+            self.next_replay_from.get_or_insert(from);
             match self.rx.recv().await {
                 // The payload is deliberately ignored; see the note above.
                 Ok(_) => {}
@@ -2079,6 +2092,44 @@ mod tests {
             )
             .expect("the token's entry survived the rewind");
         assert_eq!(ids(&changes_until(&engine, &mut stream, &["late"]).await), vec!["late"]);
+    }
+
+    #[tokio::test]
+    async fn a_hole_a_rewind_leaves_in_the_arrival_index_is_read_across_once() {
+        // The mirror order of the rebuild test above: after the token's entry,
+        // a local write stamped after it, then a replicated one stamped before
+        // it. The rewind discards the first and keeps the second, leaving a
+        // hole in the arrival positions between the token's entry and the
+        // replicated one.
+        let (engine, coll, _dir) = setup();
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        engine.insert(&coll, doc! { "_id": "t" }).unwrap();
+        let (t, token) = next_change(&engine, &mut stream).await;
+        drop(stream);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+        engine.apply_remote(&coll, &remote_entry(&coll, "late", t.stamp.hlc.wall_ms - 1)).unwrap();
+        engine.rewind_to(t.stamp.hlc).unwrap();
+        engine.insert(&coll, doc! { "_id": "marker" }).unwrap();
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .expect("the token's entry survived the rewind");
+        let mut delivered = ids(&changes_until(&engine, &mut stream, &["after"]).await);
+        // One write more, taken only once everything above is delivered: a read
+        // put back inside the last one delivers its tail again before this.
+        engine.insert(&coll, doc! { "_id": "final" }).unwrap();
+        delivered.extend(ids(&changes_until(&engine, &mut stream, &["final"]).await));
+        assert_eq!(
+            delivered,
+            vec!["late", "marker", "after", "final"],
+            "each entry after the token once, across the hole"
+        );
     }
 
     #[tokio::test]

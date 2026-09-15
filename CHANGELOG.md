@@ -42,7 +42,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     resuming member's retention has collected.
   - **Downgrading a member to 0.29.x stops its embedding worker at start.** The
     worker's recorded position is written in the new format, which 0.29.x
-    cannot read (`embedding worker stopped` in the log).
+    cannot read (`embedding worker stopped` in the log). The same happens when
+    a backup taken on 0.30.0 is restored onto 0.29.x.
 
 ## 0.29.1 - 2026-09-15
 

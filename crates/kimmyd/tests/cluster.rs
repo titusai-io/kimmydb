@@ -1538,15 +1538,6 @@ async fn a_change_stream_resumed_on_another_node_misses_nothing() {
         missed.len()
     );
     assert!(from_b.iter().all(|id| written.contains(id)), "{from_b:?}");
-    // Repeats are bounded by one read of the issuing member's stream
-    // (REPLAY_BATCH): a resume that replayed from the start would pass the
-    // coverage check above and fail this.
-    assert!(
-        from_b.len() <= missed.len() + 1_024,
-        "resumed on B, {} events for {} missed: more repeats than one read",
-        from_b.len(),
-        missed.len()
-    );
     let repeats = from_b.len() - from_b.iter().collect::<BTreeSet<_>>().len();
     let already_seen = from_b.iter().filter(|id| seen.contains(*id)).count();
     eprintln!(
@@ -1554,6 +1545,15 @@ async fn a_change_stream_resumed_on_another_node_misses_nothing() {
          {repeats} repeated",
         from_b.len(),
         missed.len()
+    );
+    // Bounds the fixture can break. B holds each write once, so nothing is
+    // delivered twice; and the only events the client had seen that B may send
+    // again are the ones A's stream sent after its last read that reached the
+    // tail. A resume that replayed from the start would send all CUT_AFTER.
+    assert_eq!(repeats, 0, "resumed on B, an event arrived twice: {from_b:?}");
+    assert!(
+        already_seen < CUT_AFTER,
+        "resumed on B, all {already_seen} events the client had seen were sent again"
     );
 
     // Resumed on A, the member that issued the token: exactly what was missed.
