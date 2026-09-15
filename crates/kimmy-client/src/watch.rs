@@ -5,10 +5,12 @@
 //! interesting part of this file is not opening one; it is what happens after
 //! it closes.
 //!
-//! **Resume tokens are portable across nodes**, verified on a real cluster, so
-//! a reconnect may land somewhere else and continue correctly. That is what
-//! makes automatic reconnection safe here where it would not be in a system
-//! whose cursors belong to a session on one machine.
+//! **A resume token resumes on any node**, verified on a real cluster, so a
+//! reconnect may land somewhere else and miss nothing: exactly on the node that
+//! issued the token, and at-least-once on any other, which may repeat events
+//! sent shortly before it (ADR-173). That is what makes automatic reconnection
+//! safe here where it would not be in a system whose cursors belong to a
+//! session on one machine.
 
 use std::time::Duration;
 

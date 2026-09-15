@@ -46,9 +46,12 @@ not happen: repeating an insert that failed after its commit would apply it
 twice, and no status distinguishes the two. Reads move freely; writes are the
 caller's decision.
 
-**Resume change streams from the last token seen.** Tokens are portable across
-nodes, so a reconnect may land elsewhere and continue correctly — verified on a
-real cluster rather than argued from the design.
+**Resume change streams from the last token seen.** A token resumes on any node:
+exactly on the node that issued it, and on any other with every event the stream
+had not sent but possibly some it had (up to 1,024 once the stream had caught
+up, and everything since it opened before then), so a consumer that fails over
+must tolerate a repeated event. Verified on a real cluster with a stream cut mid-flow
+and resumed on each kind of node ([ADR-173](decisions.md)).
 
 **Make a check-then-act conditional, and never retry a `stale` refusal.**
 Every write answers with the version it produced (`stamp`), `find` returns

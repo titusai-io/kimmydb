@@ -807,7 +807,9 @@ mod tests {
 
         let commits = engine.commits();
         engine
-            .write_batch(WriterHolder::Bulk, |scope| scope.put_consumer_position("worker", token))
+            .write_batch(WriterHolder::Bulk, |scope| {
+                scope.put_consumer_position("worker", token.clone())
+            })
             .unwrap();
         assert_eq!(engine.commits() - commits, 1, "a position is a write, and a write commits");
         assert_eq!(engine.consumer_position("worker").unwrap(), Some(token), "and it is readable");

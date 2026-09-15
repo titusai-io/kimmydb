@@ -12,6 +12,39 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **A change stream resumed on another member misses nothing**
+  ([ADR-173](docs/decisions.md)).
+  - **The defect.** A resume token named only the last delivered entry, and a
+    member translated it to where *it* held that entry, which is not where the
+    member that issued the token held it. A client that failed over mid-stream
+    lost events silently when the member it resumed on had not yet received the
+    token's entry, had superseded that write, or was built from a snapshot: the
+    stream opened at the tail. Where that member did hold the entry, events it
+    had taken in before it were skipped.
+  - **Now.** A token also carries the member that issued it and the vector
+    through which its stream had delivered. Resumed on that member it is exact.
+    On any other it delivers every event the stream had not sent, and may repeat
+    events sent shortly before the token: at most one read, up to 1,024 events,
+    once the stream has caught up. A stream that has not caught up since it
+    opened can repeat everything since it opened.
+  - **Tokens are longer**: 164 characters on a three-member cluster, from 35.
+  - **Tokens issued by 0.29.x and earlier are accepted through 0.30.x.** They
+    resume as before where the member holds the entry, and otherwise from the
+    first entry stamped after it rather than at the tail. A later minor may
+    refuse them ([docs/compatibility.md](docs/compatibility.md)).
+  - **A 0.29.x member refuses a 0.30.0 token** as `400 bad_request`. During a
+    roll, a client that resumes on a member not yet upgraded fails until the
+    roll completes.
+  - **New `410 resume_token_expired` cases**: a token naming an entry a rewind
+    discarded, and a token from another member whose vector is below what the
+    resuming member's retention has collected.
+  - **Downgrading a member to 0.29.x stops its embedding worker at start.** The
+    worker's recorded position is written in the new format, which 0.29.x
+    cannot read (`embedding worker stopped` in the log). The same happens when
+    a backup taken on 0.30.0 is restored onto 0.29.x.
+
 ### Fixed
 
 - **The divergence check's count no longer copies or decodes the documents it

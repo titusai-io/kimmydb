@@ -4,10 +4,12 @@ A change stream is a WebSocket that stays open for as long as the application
 wants events — which is longer than networks stay up. So the interesting part
 of this module is not opening one; it is what happens after it closes.
 
-**Resume tokens are portable across nodes**, verified on a real cluster, so a
-reconnect may land somewhere else and continue correctly. That is what makes
-automatic reconnection safe here where it would not be in a system whose
-cursors belong to a session on one machine.
+**A resume token resumes on any node**, verified on a real cluster, so a
+reconnect may land somewhere else and miss nothing: exactly on the node that
+issued the token, and at-least-once on any other, which may repeat events sent
+shortly before it (ADR-173). That is what makes automatic reconnection safe
+here where it would not be in a system whose cursors belong to a session on
+one machine.
 """
 
 from __future__ import annotations
@@ -108,8 +110,9 @@ class ChangeStream:
     def resume_token(self) -> Optional[str]:
         """The token this stream would resume from.
 
-        Worth storing if the application will restart: it is portable, so the
-        next run may hand it to a different node.
+        Worth storing if the application will restart: any node resumes from
+        it, so the next run may hand it to a different one, which may repeat
+        a few events the stream had already sent.
         """
         return self._resume or self._configured_resume
 

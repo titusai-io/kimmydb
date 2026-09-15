@@ -1316,3 +1316,259 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// A change stream resumed on another member (ADR-173)
+// ---------------------------------------------------------------------------
+
+type Feed =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A change stream on `shop.feed` at `node`, resumed after `resume` when given.
+async fn open_feed(node: &Node, bearer: &str, resume: Option<&str>) -> Feed {
+    let query = resume.map(|t| format!("?resume_after={t}")).unwrap_or_default();
+    let (socket, _) = tokio_tungstenite::connect_async(
+        tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(format!("ws://127.0.0.1:{}/v1/db/shop/coll/feed/watch{query}", node.http))
+            .header("Host", format!("127.0.0.1:{}", node.http))
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .unwrap(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("opening a change stream on {}: {e}", node.name));
+    socket
+}
+
+/// The next document event on `feed`: its `_id` and its resume token.
+async fn next_feed_event(feed: &mut Feed) -> (String, String) {
+    use futures::StreamExt;
+    loop {
+        let message = feed.next().await.expect("the stream closed").expect("a readable frame");
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else { continue };
+        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_ne!(event["operationType"], "invalidate", "the stream ended: {event}");
+        if let (Some(id), Some(token)) =
+            (event["documentKey"]["_id"].as_str(), event["resumeToken"].as_str())
+        {
+            return (id.to_string(), token.to_string());
+        }
+    }
+}
+
+/// Insert `ids` into `shop.feed` through `url`, one request each.
+async fn write_feed(client: reqwest::Client, url: String, bearer: String, ids: Vec<String>) {
+    for id in ids {
+        let res = client
+            .post(&url)
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!([{ "_id": id }]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "writing {id}: {:?}", res.text().await);
+    }
+}
+
+fn feed_ids(prefix: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{prefix}-{i:03}")).collect()
+}
+
+/// A client's stream is cut mid-flow on one member and resumed on another.
+///
+/// The token names a position in the issuing member's arrival order, and the
+/// member it resumes on ordered the same writes differently. The shape makes
+/// that difference certain rather than a race on replication latency: while
+/// the client reads from A, B and C are paused, so the token's event exists on
+/// A alone; then A and C are paused while B takes writes of its own, so on B
+/// those writes arrive *before* the token's event. A resume that translated
+/// the token to its entry's position on B skipped all of them.
+///
+/// On B every id the client was not sent must be delivered, and repeats are
+/// allowed. On A, the issuing member, the resume is exact.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_change_stream_resumed_on_another_node_misses_nothing() {
+    use std::collections::BTreeSet;
+
+    const FIRST: usize = 60;
+    const CUT_AFTER: usize = 25;
+    const SECOND: usize = 40;
+
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    let bearer_a = a.login(&client).await;
+    let bearer_b = b.login(&client).await;
+
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&bearer_a)
+        .json(&serde_json::json!({ "name": "feed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    for node in [&b, &c] {
+        eventually("every member to learn the collection", || {
+            let client = &client;
+            let bearer = bearer_a.clone();
+            async move {
+                client
+                    .get(node.url("/v1/db/shop/coll/feed/indexes"))
+                    .bearer_auth(&bearer)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
+        })
+        .await;
+    }
+
+    // Phase 1: B and C paused. A writer runs on A, and the client's stream on
+    // A is cut after CUT_AFTER events while the writer is still going.
+    b.signal("STOP");
+    c.signal("STOP");
+    let mut first = open_feed(&a, &bearer_a, None).await;
+    let writer = tokio::spawn(write_feed(
+        client.clone(),
+        a.url("/v1/db/shop/coll/feed/bulk"),
+        bearer_a.clone(),
+        feed_ids("a", FIRST),
+    ));
+    let mut seen = BTreeSet::new();
+    let mut token = String::new();
+    while seen.len() < CUT_AFTER {
+        let (id, t) = next_feed_event(&mut first).await;
+        seen.insert(id);
+        token = t;
+    }
+    drop(first);
+    writer.await.unwrap();
+
+    // Phase 2: A and C paused, B running. B's writes arrive on B before the
+    // token's event can reach it.
+    a.signal("STOP");
+    b.signal("CONT");
+    b.wait_ready(&client).await;
+    write_feed(
+        client.clone(),
+        b.url("/v1/db/shop/coll/feed/bulk"),
+        bearer_b.clone(),
+        feed_ids("b", FIRST),
+    )
+    .await;
+
+    // Phase 3: everyone running, with writers on A and B at once.
+    a.signal("CONT");
+    c.signal("CONT");
+    a.wait_ready(&client).await;
+    c.wait_ready(&client).await;
+    let concurrent_a = tokio::spawn(write_feed(
+        client.clone(),
+        a.url("/v1/db/shop/coll/feed/bulk"),
+        bearer_a.clone(),
+        feed_ids("a2", SECOND),
+    ));
+    let concurrent_b = tokio::spawn(write_feed(
+        client.clone(),
+        b.url("/v1/db/shop/coll/feed/bulk"),
+        bearer_b.clone(),
+        feed_ids("b2", SECOND),
+    ));
+    concurrent_a.await.unwrap();
+    concurrent_b.await.unwrap();
+
+    let written: BTreeSet<String> = [
+        feed_ids("a", FIRST),
+        feed_ids("b", FIRST),
+        feed_ids("a2", SECOND),
+        feed_ids("b2", SECOND),
+    ]
+    .concat()
+    .into_iter()
+    .collect();
+    let missed: BTreeSet<String> = written.difference(&seen).cloned().collect();
+
+    // Both members hold every write before either resumed stream is read, so
+    // an id not delivered is the stream's fault and not replication lag.
+    let total = written.len() as i64;
+    for node in [&a, &b] {
+        eventually("A and B to hold every write", || {
+            let client = &client;
+            let bearer = bearer_a.clone();
+            async move {
+                let Ok(res) = client
+                    .post(node.url("/v1/db/shop/coll/feed/count"))
+                    .bearer_auth(&bearer)
+                    .json(&serde_json::json!({ "filter": {} }))
+                    .send()
+                    .await
+                else {
+                    return false;
+                };
+                let body: serde_json::Value = res.json().await.unwrap_or_default();
+                body["count"].as_i64() == Some(total)
+            }
+        })
+        .await;
+    }
+
+    // Resumed on B: every id the client was not sent, repeats allowed.
+    let mut on_b = open_feed(&b, &bearer_b, Some(&token)).await;
+    let mut from_b: Vec<String> = Vec::new();
+    let waited = tokio::time::timeout(patience(), async {
+        while !missed.iter().all(|id| from_b.contains(id)) {
+            from_b.push(next_feed_event(&mut on_b).await.0);
+        }
+    })
+    .await;
+    let not_delivered: Vec<&String> = missed.iter().filter(|id| !from_b.contains(id)).collect();
+    assert!(
+        waited.is_ok(),
+        "resumed on B, {} of {} ids the client was never sent were not delivered: {not_delivered:?}",
+        not_delivered.len(),
+        missed.len()
+    );
+    assert!(from_b.iter().all(|id| written.contains(id)), "{from_b:?}");
+    let repeats = from_b.len() - from_b.iter().collect::<BTreeSet<_>>().len();
+    let already_seen = from_b.iter().filter(|id| seen.contains(*id)).count();
+    eprintln!(
+        "resumed on B: {} delivered for {} missed; {already_seen} the client had already seen, \
+         {repeats} repeated",
+        from_b.len(),
+        missed.len()
+    );
+    // Bounds the fixture can break. B holds each write once, so nothing is
+    // delivered twice; and the only events the client had seen that B may send
+    // again are the ones A's stream sent after its last read that reached the
+    // tail. A resume that replayed from the start would send all CUT_AFTER.
+    assert_eq!(repeats, 0, "resumed on B, an event arrived twice: {from_b:?}");
+    assert!(
+        already_seen < CUT_AFTER,
+        "resumed on B, all {already_seen} events the client had seen were sent again"
+    );
+
+    // Resumed on A, the member that issued the token: exactly what was missed.
+    let mut on_a = open_feed(&a, &bearer_a, Some(&token)).await;
+    let mut from_a: Vec<String> = Vec::new();
+    tokio::time::timeout(patience(), async {
+        while from_a.len() < missed.len() {
+            from_a.push(next_feed_event(&mut on_a).await.0);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("resumed on A, only {} of {} ids arrived", from_a.len(), missed.len())
+    });
+    let unique: BTreeSet<String> = from_a.iter().cloned().collect();
+    assert_eq!(unique.len(), from_a.len(), "the issuing member repeated an event: {from_a:?}");
+    assert_eq!(unique, missed, "the issuing member delivers exactly what the client missed");
+}
