@@ -595,7 +595,27 @@ impl Engine {
         // After the arrival index, whose end the counts' mark is compared
         // against: a rebuilt index renumbers positions, and the counts are
         // rebuilt with it (ADR-174).
-        crate::live_count::rebuild_if_stale(&db)?;
+        {
+            let started = std::time::Instant::now();
+            let txn = db.begin_write()?;
+            match crate::live_count::rebuild_if_stale(&txn)? {
+                Some(rebuilt) => {
+                    txn.commit()?;
+                    // Before the node serves anything: this function has not
+                    // returned. On a large store with a cold page cache the
+                    // walk runs at the disk's speed.
+                    info!(
+                        collections = rebuilt.collections,
+                        records = rebuilt.records,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        previous_mark = ?rebuilt.previous_mark,
+                        arrival = rebuilt.arrival,
+                        "rebuilt the live document counts before serving"
+                    );
+                }
+                None => txn.abort()?,
+            }
+        }
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;

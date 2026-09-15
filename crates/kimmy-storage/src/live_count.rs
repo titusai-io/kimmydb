@@ -23,8 +23,8 @@
 
 use std::collections::BTreeMap;
 
-use redb::{Database, ReadableTable, Table, WriteTransaction};
-use tracing::{info, warn};
+use redb::{ReadableTable, Table, WriteTransaction};
+use tracing::warn;
 
 use crate::codec;
 use crate::error::Result;
@@ -111,13 +111,15 @@ pub(crate) fn mark_through(txn: &WriteTransaction, next: u64) -> Result<()> {
 /// One transaction, and a walk of the whole of `DOCS`, paid only when the mark
 /// is missing or behind: the first start of a build that keeps the count, a
 /// restore, or a start after an older build wrote.
-pub(crate) fn rebuild_if_stale(db: &Database) -> Result<()> {
-    let started = std::time::Instant::now();
-    let txn = db.begin_write()?;
+///
+/// In `txn`, which the caller commits: `Engine::open`, which owns the database
+/// before there is an engine to count a commit against. `None` when nothing
+/// was stale and nothing was written.
+pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>> {
     let next = txn.open_table(tables::OPLOG_ARRIVAL)?.last()?.map_or(0, |(seq, _)| seq.value() + 1);
     let through = txn.open_table(tables::LIVE_COUNTS_THROUGH)?.get(THROUGH)?.map(|n| n.value());
     if through == Some(next) {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
@@ -144,19 +146,17 @@ pub(crate) fn rebuild_if_stale(db: &Database) -> Result<()> {
             table.insert(*id, *n)?;
         }
     }
-    mark_through(&txn, next)?;
-    txn.commit()?;
-    // Before the node serves anything: `Engine::open` has not returned. On a
-    // large store with a cold page cache the walk runs at the disk's speed.
-    info!(
-        collections = counts.len(),
-        records,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        previous_mark = ?through,
-        arrival = next,
-        "rebuilt the live document counts before serving"
-    );
-    Ok(())
+    mark_through(txn, next)?;
+    Ok(Some(Rebuilt { collections: counts.len(), records, previous_mark: through, arrival: next }))
+}
+
+/// What a rebuild did, for the line `Engine::open` logs once it commits.
+#[derive(Debug)]
+pub(crate) struct Rebuilt {
+    pub collections: usize,
+    pub records: usize,
+    pub previous_mark: Option<u64>,
+    pub arrival: u64,
 }
 
 #[cfg(test)]
