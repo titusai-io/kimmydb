@@ -924,7 +924,11 @@ mod tests {
         // residual for reasons of its own. Page writes, fsyncs and file growth
         // happen only inside a write transaction, so every one must be
         // metered. Reads and size reads also happen outside holds, in read
-        // transactions and at open, so the meter may see fewer of those.
+        // transactions and at open, so the meter may see fewer of those — which
+        // means unmetering `read` entirely would still pass here (0 is at most
+        // N). `read` is guarded by `a_page_the_cache_does_not_hold_is_a_read`
+        // and `len` by `redb_reads_the_files_size_only_when_it_opens_and_never_inside_a_hold`;
+        // neither is redundant with this test.
         let (engine, _dir) = fresh();
         let coll = engine.create_collection("shop", "orders").unwrap();
         test_hooks::reset();
