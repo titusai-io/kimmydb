@@ -166,17 +166,36 @@ pub struct RoundReport {
 
 /// Upper bounds of `kimmy_sync_pull_seconds`, in microseconds (ADR-175).
 ///
-/// A pull is bounded above by the tick that makes it — the default interval
-/// is five seconds, and a pull that would not fit what is left of it is not
-/// started (ADR-157) — and below by a converged window of a few entries on
-/// localhost, about a millisecond. A full 1,024-entry batch applied in
-/// 25–30 ms on a local benchmark (0.30.1's notes), and round 0310's drain
-/// fitted 22–23 full windows into a five-second tick, about 220 ms a pull.
-/// The bounds bracket both with room either side, and ten seconds catches a
-/// pull that overran the tick it was started in.
-pub const PULL_BUCKETS_US: [u64; 12] = [
-    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
-    5_000_000, 10_000_000,
+/// Dense where an ordinary pull lands, and reaching as far as a phase can
+/// really go:
+/// - **Bottom:** a converged window of a few entries on localhost takes about
+///   a millisecond.
+/// - **Ordinary pulls:** a full 1,024-entry batch applied in 25–30 ms on a
+///   local benchmark (0.30.1's notes), and round 0310's drain fitted 22–23
+///   full windows into a five-second tick, about 220 ms a pull.
+/// - **Top:** not the tick. The first pull of a contact always runs, and
+///   `cluster.sync_interval_secs` has no upper bound. `serve` is bounded by
+///   the 30 s request timeout. `wait` is bounded by nothing: a replicated
+///   batch takes the writer without a budget, behind whatever holds it, and a
+///   retention pass has held it for ten to twelve minutes. So the bounds
+///   run past 30 s to fifteen minutes.
+pub const PULL_BUCKETS_US: [u64; 16] = [
+    1_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
+    300_000_000,
+    900_000_000,
 ];
 
 /// Upper bounds of `kimmy_sync_entry_wait_seconds`, in microseconds
@@ -633,12 +652,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             .instrument(span)
                             .await;
                     let took = started.elapsed();
+                    // Taken whether the round succeeded or not: a window
+                    // applied before a failure later in the round is work
+                    // done, and the pull series must not lose it in exactly
+                    // the conditions they exist to diagnose (ADR-175).
+                    if let Some(pull) = stalls.take_pull() {
+                        report.pulls.pulled(&pull);
+                    }
                     match pulled {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
-                            if let Some(pull) = &outcome.pull {
-                                report.pulls.pulled(pull);
-                            }
                             health.succeeded(peer);
                             report.ddl_refused += outcome.ddl_refused;
                             report.ddl_declined += outcome.ddl_declined;

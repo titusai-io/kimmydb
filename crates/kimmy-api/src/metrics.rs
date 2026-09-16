@@ -1277,7 +1277,7 @@ fn render_sync_pulls(out: &mut String, pulls: &kimmy_cluster::PullReport) {
     use std::fmt::Write;
 
     out.push_str(
-        "# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. A snapshot page is not a pull and is not observed here.\n\
+        "# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. Under storage.durability = coalesced, the wait for the shared flush's window and for the flush another committer leads is in apply, so there apply includes queueing behind other committers. A snapshot page is not a pull and is not observed here.\n\
          # TYPE kimmy_sync_pull_seconds histogram\n",
     );
     for (phase, histogram) in
@@ -1489,7 +1489,9 @@ mod tests {
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
             repair_rounds: 1,
-            pulls: pulls_observed([8, 200, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
+            // A wait of 45 s: past the old 10 s top, so the golden reads the
+            // buckets a long wait for the writer lands in (ADR-175).
+            pulls: pulls_observed([8, 45_000, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
         });
         for _ in 0..20 {
             m.record_tls_reload(true);
@@ -1930,7 +1932,7 @@ kimmy_backup_duration_seconds_bucket{le=\"3600\"} 1
 kimmy_backup_duration_seconds_bucket{le=\"+Inf\"} 1
 kimmy_backup_duration_seconds_sum 42
 kimmy_backup_duration_seconds_count 1
-# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. A snapshot page is not a pull and is not observed here.
+# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. Under storage.durability = coalesced, the wait for the shared flush's window and for the flush another committer leads is in apply, so there apply includes queueing behind other committers. A snapshot page is not a pull and is not observed here.
 # TYPE kimmy_sync_pull_seconds histogram
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.001\"} 0
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.005\"} 1
@@ -1944,6 +1946,10 @@ kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"1\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"2.5\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"5\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"30\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"60\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"300\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"900\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"+Inf\"} 2
 kimmy_sync_pull_seconds_sum{phase=\"serve\"} 0.011
 kimmy_sync_pull_seconds_count{phase=\"serve\"} 2
@@ -1953,14 +1959,18 @@ kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.01\"} 0
 kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.025\"} 0
 kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.05\"} 1
 kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.1\"} 1
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.25\"} 2
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.5\"} 2
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"1\"} 2
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"2.5\"} 2
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"5\"} 2
-kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.25\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.5\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"1\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"2.5\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"5\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"10\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"30\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"60\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"300\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"900\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"+Inf\"} 2
-kimmy_sync_pull_seconds_sum{phase=\"wait\"} 0.24
+kimmy_sync_pull_seconds_sum{phase=\"wait\"} 45.04
 kimmy_sync_pull_seconds_count{phase=\"wait\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.001\"} 0
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.005\"} 0
@@ -1974,6 +1984,10 @@ kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"1\"} 1
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"2.5\"} 1
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"5\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"30\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"60\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"300\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"900\"} 2
 kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"+Inf\"} 2
 kimmy_sync_pull_seconds_sum{phase=\"apply\"} 3.7
 kimmy_sync_pull_seconds_count{phase=\"apply\"} 2
@@ -2252,12 +2266,12 @@ kimmy_sync_entry_wait_seconds_count 2
         // sum and count for each of the twelve holders (ADR-159); and the
         // backup duration's 10 buckets, +Inf, sum and count (ADR-170). Since
         // ADR-175, six more scalars (pulled entries, clock-ahead pulls, four
-        // contact ends), the pull histogram's 12 buckets, +Inf, sum and count
+        // contact ends), the pull histogram's 16 buckets, +Inf, sum and count
         // for each of three phases, and the entry wait's 11 buckets, +Inf,
         // sum and count.
         assert_eq!(
             samples,
-            104 + 6 + 3 * 15 + 14 + 10 * kimmy_storage::WriterHolder::COUNT,
+            104 + 6 + 3 * 19 + 14 + 10 * kimmy_storage::WriterHolder::COUNT,
             "expected one sample per series: {out}"
         );
     }

@@ -438,12 +438,21 @@ thread_local! {
 /// Nested calls each see their own waits, and the outer one sees the inner
 /// one's too.
 pub fn metered_writer_wait<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
-    let outer = WRITER_WAIT_METER.with(|m| m.replace(Some(std::time::Duration::ZERO)));
-    let value = f();
-    let waited = WRITER_WAIT_METER.with(|m| m.replace(outer)).unwrap_or_default();
-    if let Some(outer) = outer {
-        WRITER_WAIT_METER.with(|m| m.set(Some(outer + waited)));
+    /// Puts the enclosing meter back, with this one's waits added, however
+    /// `f` ends — a panic unwinding through it included, so a thread that
+    /// survives the panic does not go on metering into a scope that is gone.
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let inner = WRITER_WAIT_METER.with(|m| m.get()).unwrap_or_default();
+            WRITER_WAIT_METER.with(|m| m.set(self.0.map(|outer| outer + inner)));
+        }
     }
+
+    let restore = Restore(WRITER_WAIT_METER.with(|m| m.replace(Some(std::time::Duration::ZERO))));
+    let value = f();
+    let waited = WRITER_WAIT_METER.with(|m| m.get()).unwrap_or_default();
+    drop(restore);
     (value, waited)
 }
 
@@ -3165,6 +3174,21 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_meter_a_panic_unwinds_through_is_put_back() {
+        // A thread that survives a panic inside a metered call must not go
+        // on adding its waits to a scope that no longer exists (ADR-175).
+        let outcome = std::panic::catch_unwind(|| {
+            super::metered_writer_wait(|| panic!("inside the metered call"))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(
+            super::WRITER_WAIT_METER.with(|m| m.get()),
+            None,
+            "the thread is metering nothing once the call is gone"
+        );
+    }
+
     /// A file backend that counts the bytes redb asks it for.
     ///
     /// What an open *reads* is not observable from outside otherwise: redb's

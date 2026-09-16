@@ -2358,6 +2358,41 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_at_the_shared_flush_is_metered_as_a_wait_for_the_writer() {
+        // ADR-175: under `coalesced` a commit lets go of the writer and waits
+        // for the shared flush, whose leader takes the writer again. A batch
+        // whose flush queues behind another holder has waited for the writer,
+        // and the meter must say so, not leave it to be read as applying.
+        let (e, _d) = engine();
+        let coll = e.create_collection("shop", "orders").unwrap();
+        e.set_durability(
+            crate::engine::DurabilityClass::Coalesced,
+            std::time::Duration::from_millis(300),
+        );
+
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let e = &e;
+            scope.spawn(move || {
+                // Take the writer while the leader sleeps out its window, and
+                // hold it well past the window's end.
+                started_rx.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _hold = e.hold_writer(crate::engine::WriterHolder::Bulk);
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            });
+            let (_, waited) = crate::engine::metered_writer_wait(|| {
+                started_tx.send(()).unwrap();
+                e.insert(&coll, doc! { "_id": "flushed" }).unwrap();
+            });
+            assert!(
+                waited >= std::time::Duration::from_millis(300),
+                "the flush's leader queued behind the holder: waited {waited:?}"
+            );
+        });
+    }
+
+    #[test]
     fn a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing() {
         // The worse half of the same hole, and the one the exemption used to
         // let through: a peer that hands over *no* entries while naming a
@@ -2384,7 +2419,11 @@ mod tests {
 
         let outcome = b.apply_peer_batch(&theirs, &[], whole.scanned_to, false).unwrap();
 
-        // The wait for the writer is a timing, not something the batch did.
+        // The wait for the writer is a timing, not something the batch did:
+        // an empty window still opens a transaction for its vector, so it is
+        // not zero. Bounded rather than ignored, since nothing holds the
+        // writer here.
+        assert!(outcome.writer_wait < std::time::Duration::from_secs(1), "{outcome:?}");
         assert_eq!(
             outcome,
             SyncOutcome { writer_wait: outcome.writer_wait, ..SyncOutcome::default() },

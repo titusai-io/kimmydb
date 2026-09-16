@@ -988,13 +988,17 @@ where
             let mut outcome = engine
                 .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-            outcome.pull = Some(kimmy_storage::PullTiming {
+            let pull = kimmy_storage::PullTiming {
                 serve: served,
                 wait: outcome.writer_wait,
                 apply: applying.elapsed().saturating_sub(outcome.writer_wait),
                 entries: entries.len(),
                 oldest_lacked,
-            });
+            };
+            // Handed over now, while nothing after the commit can have
+            // failed: see `PeerStalls::pulled`.
+            stalls.pulled = Some(pull);
+            outcome.pull = Some(pull);
             // The peer's tail was reached if the batch took the whole
             // window up to the vector the peer advertised. An entry
             // deferred above that vector does not change that: it lies
@@ -1371,6 +1375,12 @@ pub struct PeerStalls {
     /// The spans each peer was last named in the log, by origin and upper
     /// bound, so the line is written when they change and not on every pull.
     marks_logged: HashMap<NodeId, Vec<(NodeId, Hlc)>>,
+    /// The timing of the last window this node applied, until the loop takes
+    /// it (ADR-175). Here rather than only on the outcome, because the batch
+    /// is committed before the round's fallible tail — the divergence check is
+    /// a network round trip — and a round that fails there, or that the
+    /// timeout cancels, returns no outcome for work that was done.
+    pulled: Option<kimmy_storage::PullTiming>,
 }
 
 /// Where one origin's held span resumes against one peer (ADR-172).
@@ -1515,6 +1525,13 @@ struct Stall {
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The timing of the window the last round applied, if one was applied
+    /// since this was last taken, whether or not the round went on to
+    /// succeed (ADR-175).
+    pub fn take_pull(&mut self) -> Option<kimmy_storage::PullTiming> {
+        self.pulled.take()
     }
 
     /// The held spans to name to `peer` on this pull (ADR-172), from `current`,

@@ -1101,7 +1101,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sync_pull_histograms_summaries_reach_the_bridge() {
+    fn the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge() {
         // The coverage test below matches a series by the stem of its name,
         // and both ADR-175 histograms are in `NOT_BRIDGED` for their buckets,
         // so it would pass with their sums and counts gone from the bridge.
@@ -1118,6 +1118,12 @@ mod tests {
             "kimmy.sync.pulls",
             "kimmy.sync.entry_wait_seconds",
             "kimmy.sync.entry_waits",
+            // Labelled counters are matched by stem too, so any one of the
+            // four satisfies it for all of them.
+            "kimmy.sync.contacts.caught_up",
+            "kimmy.sync.contacts.budget",
+            "kimmy.sync.contacts.ceiling",
+            "kimmy.sync.contacts.failed",
         ] {
             assert_eq!(
                 source.matches(&format!("\"{name}\",")).count(),

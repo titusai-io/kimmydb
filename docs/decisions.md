@@ -16578,6 +16578,11 @@ None has a peer label, like every other sync series.
   fastest.
 - **The tick is the cause, not the applier.** `caught_up` alone, with entry
   waits near the sync interval.
+- **The contact's overhead is the cause.** `budget` rises with every phase's
+  sum flat. A contact is more than its pulls, and part of it is in no phase:
+  the version exchange and the reads that set up each pull, and after the last
+  pull the divergence check and the horizon check. A regression there reads
+  exactly like this, and no series here measures it.
 
 **Wait and apply are measured apart, not derived.** The obvious derivation is
 from `kimmy_write_lock_held_seconds{holder="replication"}` and
@@ -16591,6 +16596,13 @@ from `kimmy_write_lock_held_seconds{holder="replication"}` and
 - **Neither sees the shared flush.** Under `coalesced` a commit releases the
   writer and then waits for the flush, and `apply` includes that wait.
 
+**Under `coalesced`, `apply` includes queueing behind other committers.** A
+commit that lets go of the writer and waits for the shared flush waits out the
+leader's window, or waits for a flush another committer leads, and neither is a
+wait at the writer's gate. Only the leader taking the gate for the flush itself
+is metered as `wait`. The default is `durable`, where none of this arises; on a
+`coalesced` member the HELP text and the operations table say so.
+
 So the batch measures its own wait. `metered_writer_wait` puts a thread-local
 accumulator around `apply_peer_batch`, and every acquisition of the writer's
 queue adds to it: `begin_write`, and the shared flush's gate. A thread-local
@@ -16598,6 +16610,15 @@ rather than a field on the transaction, for two reasons. A batch takes the
 writer from several places, and the storage work is synchronous on one thread:
 `blocking` runs its closure on the thread that called it. `apply` is the call's
 wall time less that sum, so the two cannot overlap.
+
+**A window applied before its round fails is still a pull.** The batch commits
+before the round's fallible tail: the lag reading, the divergence check, which
+is a network round trip, and the horizon check. A round that fails there, or
+that the timeout cancels, returns no outcome, so a timing carried only on the
+outcome would vanish. That is the degraded case the series are for. So the
+transport also leaves the timing on `PeerStalls` as soon as the batch is
+applied, and the loop takes it after every pull, whether the pull succeeded or
+failed.
 
 **Why "the oldest lacked entry", not the first carried.** A repair re-serves
 history this member holds. A pull also serves spans the member holds as state
@@ -16649,14 +16670,24 @@ What the bridge carries:
 
 ### Buckets
 
-- **`kimmy_sync_pull_seconds`: 1 ms to 10 s.**
+- **`kimmy_sync_pull_seconds`: 1 ms to 15 minutes.**
   - **Bottom.** A converged window of a few entries on localhost takes about a
     millisecond.
   - **Measured points inside the range.** A full batch applied in 25–30 ms on
     0.30.1's local benchmark. Round 0310's drain fitted 22–23 full windows into a
     5 s tick, about 220 ms a pull.
-  - **Top.** A pull that would not fit what is left of the tick is not started,
-    so 10 s catches one that overran the tick it started in.
+  - **Top, set by what a phase can reach, not by the tick.** The first form
+    stopped at 10 s on the reasoning that a pull that will not fit the tick is
+    not started. Review found that wrong three ways:
+    - the first pull of a contact always runs;
+    - `cluster.sync_interval_secs` has no upper bound;
+    - `serve` is bounded by the 30 s request timeout, not the tick.
+
+    `wait` is bounded by nothing: a replicated batch takes the writer with no
+    budget, behind whatever holds it, and a retention pass has held it for ten
+    to twelve minutes. A top at 10 s would have put exactly the pulls this
+    series is for into `+Inf`, the defect `kimmy_request_duration_seconds` has
+    under heavy write load. The bounds continue at 30 s, 60 s, 300 s and 900 s.
 - **`kimmy_sync_entry_wait_seconds`: 100 ms to an hour.** Dense below the 5 s
   default interval, where a tick's cadence is read. Wide above it, where a
   backlog's age is.
@@ -16669,7 +16700,12 @@ failure being guarded against, because it is indistinguishable from a healthy
 one.
 
 Each guarded line was broken on its own, with everything else intact, and the
-tests were run: the new cluster tests, the loop's and the renderer's unit tests,
+tests were run. Review found three rows of the first form of this table claimed
+more than the tests held: nothing failed when the `failed` contact end went
+uncounted, when the shared flush's gate went unmetered, or when one of the four
+contact instruments left the bridge while the other three stayed. Each now
+has a test of its own, listed below, and was broken again to show it goes red.
+The tests run: the new cluster tests, the loop's and the renderer's unit tests,
 and the bridge's coverage test. Every break turned at least one test red, and
 restoring the line turned it green again. No guard depends on another being
 absent: two guards that share a test (the wait's meter and the apply
@@ -16686,13 +16722,20 @@ subtraction) fail it on different assertions, each alone.
 | The entries a pull carried are not counted | `a_pull_that_waits_for_the_writer_says_so_apart_from_applying`, `a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited`, `an_entry_served_below_the_members_position_is_not_read_as_a_wait`, `a_drain_the_tick_finishes_is_counted_as_caught_up` |
 | A contact out of time is labelled `ceiling` | `a_contact_ends_on_what_stopped_it`, `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
 | A clock-ahead entry is observed as a zero wait | `an_entry_stamped_ahead_is_counted_and_not_observed_as_a_wait` |
-| The loop does not fold a pull into its report | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up` |
-| The loop does not count how a contact ended | the same two |
+| The loop does not fold a pull into its report | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The loop does not count how a contact ended, for the three ends a pull that succeeded reaches | the same two |
+| The loop does not count a contact ended by a failure | `a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The transport leaves no timing for a window whose round then fails | `a_window_applied_before_its_round_fails_is_still_a_pull`, and both `a_drain_the_tick_*` tests, since the loop now takes every timing from there |
+| The loop takes a window's timing only from a round that succeeded | `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The shared flush's gate is not metered | `a_wait_at_the_shared_flush_is_metered_as_a_wait_for_the_writer` |
+| The pull buckets stop at 10 s | `the_render_is_byte_for_byte_what_a_scrape_receives`, whose golden holds a 45 s wait; `the_render_is_parseable_prometheus_text`; `the_metrics_body_exposes_exactly_these_series_in_exactly_this_order` |
+| The writer-wait meter is not put back when a panic unwinds through it | `a_meter_a_panic_unwinds_through_is_put_back` |
 | The loop reports lag in whole seconds | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
 | The render truncates the lag | `the_lag_gauge_reads_to_the_millisecond`, `the_render_is_byte_for_byte_what_a_scrape_receives`, `the_snapshot_reads_the_same_atomics_the_render_does` |
 | A tick's report replaces the total rather than adding to it | `each_ticks_pulls_land_in_their_own_phase_label_and_bucket`, `the_render_is_byte_for_byte_what_a_scrape_receives` |
 | `ended="budget"` is rendered from `ceiling`'s row | `each_ticks_pulls_land_in_their_own_phase_label_and_bucket`, `the_render_is_byte_for_byte_what_a_scrape_receives`, `the_snapshot_reads_the_same_atomics_the_render_does` |
-| The contact instruments are left off the bridge | `every_metrics_series_reaches_the_bridge` |
+| All four contact instruments are left off the bridge | `every_metrics_series_reaches_the_bridge` |
+| Any one contact instrument is left off the bridge, the other three kept | `the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge` |
 
 **What the positive controls slow, and what must not move with it.** Each of
 the four `a_pull_*` tests slows one thing, by at least 350 ms, and asserts the
@@ -16707,13 +16750,15 @@ The two `a_drain_the_tick_*` tests run the loop itself against the same
 one-second tick and the contact ends `budget`. Directly, a five-second tick
 drains it and every contact ends `caught_up`.
 
-**A guard the bridge's coverage test could not give.** That test matches a
-series by the stem of its name. `kimmy_sync_pull_seconds` and
+**Guards the bridge's coverage test could not give.** That test matches a
+series by the stem of its name, so a labelled counter is covered by any one of
+its instruments. `kimmy_sync_pull_seconds` and
 `kimmy_sync_entry_wait_seconds` are listed in `NOT_BRIDGED` for their buckets,
 as `kimmy_backup_duration_seconds` is, so removing their sums from the bridge
-would not fail it. `the_sync_pull_histograms_summaries_reach_the_bridge` names
-the six instruments one by one. Renaming `kimmy.sync.pull_seconds.apply`, alone,
-turns it red. `kimmy_backup_duration_seconds` keeps the inherited gap.
+would not fail it. `the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge`
+names those six instruments and the four contact instruments one by one.
+Renaming `kimmy.sync.pull_seconds.apply` alone turns it red, and so does
+renaming `kimmy.sync.contacts.failed` alone. `kimmy_backup_duration_seconds` keeps the inherited gap.
 
 ### Costs
 

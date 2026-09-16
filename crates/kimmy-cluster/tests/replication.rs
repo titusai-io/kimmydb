@@ -3343,6 +3343,11 @@ async fn a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the
     assert_eq!(report.failed, 1, "the failure ends the contact, it is not retried: {report:?}");
     assert_eq!(report.divergence_checks, 0, "a failed round has not checked: {report:?}");
     assert_eq!(report.divergence_skips, 1, "and is the contact's one skip: {report:?}");
+    assert_eq!(
+        report.pulls.contacts[kimmy_cluster::ContactEnd::Failed.slot()],
+        1,
+        "and is the one contact counted as ended by a failure (ADR-175): {report:?}"
+    );
 }
 
 /// A byte relay to `target` that hands exactly one connection through and
@@ -5119,4 +5124,82 @@ async fn an_entry_served_below_the_members_position_is_not_read_as_a_wait() {
     let pull = outcome.pull.expect("a window was pulled");
     assert_eq!(pull.entries, 1, "{pull:?}");
     assert_eq!(pull.oldest_lacked, None, "nothing served was lacked: {pull:?}");
+}
+
+/// A plain TCP relay to `target` that passes one round through until the peer
+/// has sent back `served` bytes — a window — and then closes the connection
+/// at this member's next request. The round applies the window and fails on
+/// what comes after it, the divergence check.
+async fn relay_cut_after_a_window(
+    target: std::net::SocketAddr,
+    served: usize,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let Ok(server) = TcpStream::connect(target).await else { return };
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                let sent_back = Arc::new(AtomicUsize::new(0));
+                let up = {
+                    let sent_back = Arc::clone(&sent_back);
+                    async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            let n = cr.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 || sent_back.load(Ordering::SeqCst) >= served {
+                                return;
+                            }
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                };
+                let down = async {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = sr.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 || cw.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                        sent_back.fetch_add(n, Ordering::SeqCst);
+                    }
+                };
+                // Whichever side stops first ends the connection both ways.
+                tokio::select! { _ = up => {}, _ = down => {} }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_window_applied_before_its_round_fails_is_still_a_pull() {
+    use kimmy_cluster::ContactEnd;
+
+    // Fifty documents of 4 KiB each, so the window is far past the handshake
+    // in size and the cut lands after it. The round commits the window, then
+    // fails asking the peer for the divergence check.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let body = "x".repeat(4 * 1024);
+    a.engine
+        .insert_many(&ca, (0..50).map(|i| doc! { "_id": i as i64, "body": body.clone() }).collect())
+        .unwrap();
+    let cut = relay_cut_after_a_window(a.addr, 64 * 1024).await;
+
+    let (seen, _) = loop_until(&b, cut, Duration::from_secs(5), |seen| {
+        seen.contacts[ContactEnd::Failed.slot()] >= 1
+    })
+    .await;
+
+    let cb = b.engine.get_collection("shop", "orders").expect("the window was applied");
+    assert_eq!(b.engine.count(&cb).unwrap(), 50, "and committed before the round failed");
+    assert!(seen.serve.count >= 1, "the applied window is a pull: {seen:?}");
+    assert!(seen.entries >= 51, "carrying what it applied: {seen:?}");
 }
