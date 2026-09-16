@@ -819,10 +819,25 @@ mod tests {
             assert_eq!(thread_cpu(), None, "a platform without the clock says so");
             return;
         }
+        // Spun to a CPU-time deadline rather than a wall-clock one, so a
+        // machine busy with other tests slows it down rather than failing it:
+        // the claim is that the clock advances, and only while the thread
+        // runs, which holds however many cores the thread gets.
         let from = thread_cpu().expect("Linux and macOS have a per-thread CPU clock");
-        test_hooks::spin(Duration::from_millis(60));
+        let wall_from = std::time::Instant::now();
+        let want = Duration::from_millis(30);
+        let mut x = 0u64;
+        while thread_cpu().unwrap() - from < want {
+            x = std::hint::black_box(x.wrapping_add(1));
+            assert!(
+                wall_from.elapsed() < Duration::from_secs(30),
+                "30 s of spinning and the CPU clock has not advanced 30 ms: it is stuck"
+            );
+        }
         let spent = thread_cpu().unwrap() - from;
-        assert!(spent >= Duration::from_millis(30), "60 ms of spinning read as {spent:?}");
+        let wall = wall_from.elapsed();
+        assert!(spent >= want, "{spent:?}");
+        assert!(wall + CPU_CLOCK_GRAIN * 2 >= spent, "{spent:?} of CPU in {wall:?} of wall time");
         let from = thread_cpu().unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let slept = thread_cpu().unwrap() - from;
@@ -1180,10 +1195,24 @@ mod tests {
     fn holds_of_32_and_33_writes_are_measured_exactly_and_34_is_the_first_estimate() {
         // The exactness claim at its boundary: every write up to the 32nd has
         // its CPU read, the 33rd is the first of one-in-32, and the 34th is
-        // the first whose CPU is estimated.
-        for (writes, estimated_calls) in [(31, 0), (32, 0), (33, 0), (34, 1), (65, 31), (66, 32)] {
+        // the first whose CPU is estimated. And the one-in-32 half, by count:
+        // write 33 (index 32), 65 and 97 are sampled, so a hold that sampled
+        // nothing after the first 32 reads 32 at every size past it.
+        for (writes, estimated_calls, sampled_calls) in [
+            (31, 0, 31),
+            (32, 0, 32),
+            (33, 0, 33),
+            (34, 1, 33),
+            (64, 31, 33),
+            (65, 31, 34),
+            (66, 32, 34),
+            (96, 62, 34),
+            (97, 62, 35),
+        ] {
             let meter = hold_of_writes(writes, Duration::ZERO, None);
             assert_eq!(meter.write_calls, writes);
+            assert_eq!(meter.write_sampled_calls, sampled_calls, "a hold of {writes} writes");
+            assert_eq!(meter.write_calls - meter.write_sampled_calls, estimated_calls);
             let sampled = meter.write != meter.write_sampled;
             assert_eq!(
                 sampled,
@@ -1290,6 +1319,144 @@ mod tests {
             assert_eq!(share, expected, "{cpu:?}/{wall:?}");
             let _ = ms(10).mul_f64(share);
         }
+    }
+
+    #[test]
+    fn growing_the_file_inside_a_hold_is_write_time_not_off_cpu() {
+        // redb grows the file with `set_len` from inside a transaction, and
+        // reads its size with `len`. Neither is a page read, write or fsync,
+        // and an unmetered one lands in `off_cpu`, the residual: time asleep
+        // inside either must land in `read` or `write` instead. Against the
+        // same bulk without the sleeps, because an unoptimised build spends
+        // real time off the CPU in a large bulk with nothing contending.
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let bulk = || {
+            let docs = (0..200).map(|i| doc! { "n": i, "body": "x".repeat(4_000) }).collect();
+            engine.insert_many(&coll, docs).unwrap();
+        };
+        let base = during(&engine, WriterHolder::Bulk, bulk);
+        test_hooks::reset();
+        let asleep = Duration::from_millis(200);
+        test_hooks::SLEEP_IN_FILE_SIZE.with(|s| s.set(asleep));
+        let row = during(&engine, WriterHolder::Bulk, bulk);
+        let calls = test_hooks::FILE_SIZE_CALLS.with(|c| c.get());
+        test_hooks::reset();
+        assert!(calls > 0, "the bulk grew the file inside its hold: {row:?}");
+        let slept = asleep * calls as u32;
+        let io = row.get(Component::Read) + row.get(Component::Write);
+        assert!(
+            io >= slept,
+            "{calls} file-size calls asleep {slept:?}, in the calls {io:?}: {row:?}"
+        );
+        let added_off = row.get(Component::OffCpu).saturating_sub(base.get(Component::OffCpu));
+        assert!(
+            added_off < slept / 2,
+            "{slept:?} asleep in file-size calls added {added_off:?} of off_cpu: {row:?} vs {base:?}"
+        );
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn a_clamped_sample_credits_the_unsampled_writes_no_more_than_their_wall_time() {
+        // A sample whose CPU reads more than its wall time — two clocks
+        // rounding over a sub-microsecond call — caps the share at one. The
+        // CPU credited to the unsampled writes is then their wall time and no
+        // more, and a hold with the CPU to cover it is not an over-count.
+        let meter = Meter {
+            cpu: true,
+            write: Duration::from_millis(101),
+            write_calls: 64,
+            write_sampled_calls: 33,
+            write_sampled: Duration::from_micros(1),
+            write_sampled_cpu: Duration::from_millis(1),
+            cpu_reads: 33,
+            ..Meter::default()
+        };
+        let hold = Duration::from_millis(120);
+        let cpu_over_hold = Duration::from_millis(110);
+        let d = decompose(&meter, hold, Some(cpu_over_hold));
+        let credited =
+            cpu_over_hold - meter.write_sampled_cpu - d.components[Component::Cpu.slot()];
+        assert!(credited <= d.write_estimated, "credited {credited:?}: {d:?}");
+        assert!(!d.overcounted, "{d:?}");
+        assert_eq!(d.components.iter().sum::<Duration>(), hold, "{d:?}");
+    }
+
+    #[test]
+    fn cpu_inside_the_calls_past_the_holds_cpu_is_an_overcount_at_the_clocks_grain() {
+        // Both sides of this comparison come from one clock, so it is held to
+        // that clock's grain rather than the wall-clock tolerance: a 43 ms
+        // hold with 1 ms of CPU cannot claim 2.4 ms of CPU inside its calls.
+        let meter = Meter {
+            cpu: true,
+            read: Duration::from_millis(3),
+            read_cpu: Duration::from_micros(2_400),
+            cpu_reads: 10,
+            ..Meter::default()
+        };
+        let d = decompose(&meter, Duration::from_millis(43), Some(Duration::from_millis(1)));
+        assert!(d.overcounted, "{d:?}");
+        // And the grain itself is not an over-count.
+        let meter = Meter { read_cpu: Duration::from_micros(1_010), ..meter };
+        let d = decompose(&meter, Duration::from_millis(43), Some(Duration::from_millis(1)));
+        assert!(!d.overcounted, "{d:?}");
+    }
+
+    #[test]
+    fn a_cpu_clock_that_fails_mid_hold_records_no_cpu() {
+        let scope = Scope::hold();
+        let _ = io(Io::Write, 4_096, || Ok(()));
+        test_hooks::CPU_CLOCK_FAILS.with(|f| f.set(true));
+        let _ = io(Io::Write, 4_096, || Ok(()));
+        test_hooks::CPU_CLOCK_FAILS.with(|f| f.set(false));
+        let (meter, cpu) = scope.finish();
+        test_hooks::reset();
+        assert!(meter.cpu_failed, "the failed read is remembered: {meter:?}");
+        assert!(cpu.is_some(), "the hold's own clock read did not fail");
+        let d = decompose(&meter, Duration::from_millis(10), cpu);
+        assert!(!d.cpu_measured, "a hold with a failed read reports no cpu: {d:?}");
+        assert_eq!(d.components[Component::OffCpu.slot()], Duration::ZERO, "{d:?}");
+    }
+
+    #[test]
+    fn a_served_window_counts_a_unique_violation_entry_as_passed() {
+        // Unique-violation entries are in the oplog and are never served to a
+        // peer: the walk examines them, so they are passed, not served.
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, doc! { "n": 1 }).unwrap();
+        let violation = kimmy_core::OplogEntry {
+            stamp: engine.next_stamp(),
+            kind: kimmy_core::OpKind::UniqueViolation,
+            collection: coll.id,
+            doc_id: None,
+            body: None,
+        };
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        crate::engine::append_oplog(&txn, &violation).unwrap();
+        txn.commit().unwrap();
+        engine.insert(&coll, doc! { "n": 2 }).unwrap();
+
+        let all = engine
+            .read_oplog_from_where(kimmy_core::Hlc::ZERO, usize::MAX, |_| true)
+            .unwrap()
+            .entries;
+        let before = engine.serve_cost();
+        let window = engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[]).unwrap();
+        let after = engine.serve_cost();
+        assert!(window.entries.iter().all(|e| e.kind != kimmy_core::OpKind::UniqueViolation));
+        assert_eq!(after.passed - before.passed, 1, "the one violation entry");
+        assert_eq!(after.entries - before.entries, window.entries.len() as u64);
+        assert_eq!(all.len() as u64, window.entries.len() as u64 + 1, "the walk saw it");
+    }
+
+    #[test]
+    #[should_panic(expected = "nested inside a hold")]
+    #[cfg(debug_assertions)]
+    fn a_walk_scope_cannot_nest_inside_a_hold() {
+        let _hold = Scope::hold();
+        let _walk = Scope::walk();
     }
 
     #[test]
