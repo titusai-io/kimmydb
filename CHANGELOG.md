@@ -10,7 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.31.0 - 2026-09-16
+
+**A minor, for one integer becoming a decimal.** `kimmy_replication_lag_seconds`
+reads to the millisecond, so a scraper that parsed it as an integer, or an OTLP
+pipeline that typed `kimmy.replication.lag` as an integer gauge, needs to accept
+a double; *Changed* has it. Everything else here is new series.
+
+**The new series measure the replica landing-time regression; they do not cure
+it, and its cause remains open.** They say where a pull's time goes, so a later
+round can find that cause ([ADR-175](docs/decisions.md)).
+
+Nothing on disk, in configuration or in packaging changes, and nothing else on
+the wire.
 
 ### Added
 
