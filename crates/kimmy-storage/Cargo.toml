@@ -8,6 +8,17 @@ repository.workspace = true
 authors.workspace = true
 description = "redb-backed storage engine, indexes, and oplog for KimmyDB"
 
+[features]
+# A control for the benchmarks behind ADR-174's addendum, and nothing else.
+#
+# Compiles the live-count and mark work out of the write path entirely, so a
+# benchmark can price that work against the same binary, the same store and the
+# same apply path with only those calls removed. A build with this enabled does
+# NOT keep the counts and must never ship: the divergence check would read a
+# stale number, and the mark would stop telling the next start that a build
+# which does not keep the counts has written.
+bench-no-live-counts = []
+
 [dependencies]
 kimmy-core.workspace = true
 redb.workspace = true

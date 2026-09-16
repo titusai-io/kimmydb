@@ -46,7 +46,7 @@ use kimmy_core::{DocId, DocRecord, OpKind, OplogEntry, Stamp};
 use redb::ReadableTable;
 
 use crate::docs::extract_id;
-use crate::engine::{WriterHolder, append_oplog, doc_range_after};
+use crate::engine::{WriteTxn, WriterHolder, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::{Engine, codec, index, tables};
@@ -372,7 +372,7 @@ impl Engine {
     /// entry to publish once the transaction commits.
     fn modify_in_txn(
         &self,
-        txn: &redb::WriteTransaction,
+        txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         current: Stamp,
         before: &Document,
@@ -539,7 +539,7 @@ impl Engine {
     /// Write the chosen document's new state and return its oplog entry.
     fn write_chosen(
         &self,
-        txn: &redb::WriteTransaction,
+        txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         id: &DocId,
         before: &Document,

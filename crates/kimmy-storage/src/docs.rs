@@ -417,7 +417,7 @@ impl Engine {
     /// document.
     pub(crate) fn insert_in_txn(
         &self,
-        txn: &redb::WriteTransaction,
+        txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
