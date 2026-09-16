@@ -16717,9 +16717,25 @@ turns it red. `kimmy_backup_duration_seconds` keeps the inherited gap.
 
 ### Costs
 
-- **Per pull:** three clock reads, a scan of the window for the first entry
-  above this member's vector, and a thread-local read and write per writer
-  acquisition inside the batch.
+- **None of it lengthens a hold of the writer or the batch's transaction.**
+  That matters because the quantity being measured is time spent holding the
+  writer: work added inside the hold would make the measurement part of the
+  problem. Where each piece runs:
+  - **Before the batch is applied, with no writer taken:** the clock reads that
+    bound `serve` and start `apply`, and the scan for the oldest lacked entry.
+    The scan is one comparison per entry against a vector the round already
+    holds, at most 1,024.
+  - **After `apply_peer_batch` returns, with the writer released:** the clock
+    read that ends `apply`, and building the pull's timing.
+  - **In the loop between pulls:** folding the pull into the tick's report.
+  - **At the end of the tick:** the metrics mutex. It is not the writer and is
+    never held across storage work.
+  - **Inside the gate, the one exception:** one thread-local read and write per
+    acquisition of the writer, not per entry. It sits in `begin_write`, beside
+    the wait histogram's atomics that were already there, and before the hold's
+    clock starts. The shared flush's gate gets the same.
+  - **Inside the transaction: nothing.** No per-entry work is added, and a
+    1,024-entry batch still takes the writer once per run.
 - **Per tick:** one mutex acquisition to fold the tick's report.
 - **Per scrape or export:** one copy of the report.
 - **The lag gauge's type on the bridge** changes from integer to double. The
