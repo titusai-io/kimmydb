@@ -81,38 +81,42 @@ struct Grown {
     _dir: tempfile::TempDir,
 }
 
-/// The shared pre-grown store.
+/// A pre-grown store, built fresh for each caller.
 ///
-/// Every benchmark measuring what the live counts cost runs against this,
-/// because the work in question is table opens and B-tree seeks: on a store
-/// small enough to sit in redb's page cache every page they touch is already
-/// resident, so they cost nothing and the measurement says nothing. That is
-/// exactly how the cost stayed invisible in the bench ADR-174 quoted, where a
+/// Every benchmark measuring what the live counts cost runs against one of
+/// these, because the work in question is table opens and B-tree seeks: on a
+/// store small enough to sit in redb's page cache every page they touch is
+/// already resident, so they cost nothing and the measurement says nothing.
+/// That is how the cost stayed invisible in the bench ADR-174 quoted, where a
 /// synchronous flush dominated a store of a few thousand documents.
 ///
-/// Built once for the whole process, not once per benchmark and certainly not
-/// per sample: the fixture takes minutes, and rebuilding it would measure the
-/// rebuilding. Each benchmark writes into a collection of its own inside it, so
-/// they share the tree's depth without sharing their documents.
-fn grown() -> &'static Grown {
-    static GROWN: std::sync::OnceLock<Grown> = std::sync::OnceLock::new();
-    GROWN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let engine = Engine::open_with_cache(&path, Some(CACHE_BYTES)).unwrap();
-        let coll = engine.create_collection("bench", "grown").unwrap();
-        let mut next = 0i64;
-        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < GROWN_BYTES {
-            let docs: Vec<Document> = (0..GROW_CHUNK)
-                .map(|_| {
-                    next += 1;
-                    document(next)
-                })
-                .collect();
-            engine.insert_many(&coll, docs).unwrap();
-        }
-        Grown { engine, _dir: dir }
-    })
+/// **One per trial, not one per process.** An earlier form shared a single
+/// store between every workload and every trial, so each appended to the store
+/// the next one measured — a local bulk insert drifted from 35 ms to 89 ms
+/// across five trials, drift far larger than the effect being measured. Sharing
+/// is the thing to avoid, so nothing is shared: a workload's trial gets a store
+/// nothing else has written to.
+///
+/// What this still does not isolate: within one trial, criterion runs the
+/// routine many times and those iterations do grow the store. That is not
+/// avoidable while measuring a write, and it falls identically on every
+/// configuration.
+fn grown() -> Grown {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let engine = Engine::open_with_cache(&path, Some(CACHE_BYTES)).unwrap();
+    let coll = engine.create_collection("bench", "grown").unwrap();
+    let mut next = 0i64;
+    while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < GROWN_BYTES {
+        let docs: Vec<Document> = (0..GROW_CHUNK)
+            .map(|_| {
+                next += 1;
+                document(next)
+            })
+            .collect();
+        engine.insert_many(&coll, docs).unwrap();
+    }
+    Grown { engine, _dir: dir }
 }
 
 /// The collection named `name` in the shared store.
@@ -412,23 +416,22 @@ fn batch_apply(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(criterion::Throughput::Elements(BATCH));
 
-    let engine = &grown().engine;
-    let coll = collection(engine, "batch_new");
-    // One origin for the whole run: a fresh node id per entry would add a
-    // version-vector row per document and measure that instead.
-    let origin = NodeId::generate();
-    // Above anything the fixture wrote, so every entry wins its conflict and
-    // the batch does the work a real one does rather than being superseded and
-    // writing nothing.
-    let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
-    let mut next = 0u64;
-
-    // Set up once and measured `TRIALS` times in order: the series is the
-    // result, not its mean.
+    // Measured `TRIALS` times in order, each against a store of its own: the
+    // series is the result, not its mean.
     for trial in 1..=TRIALS {
+        let store = grown();
+        let engine = &store.engine;
+        let coll = collection(engine, "batch_new");
+        // One origin for the whole trial: a fresh node id per entry would add a
+        // version-vector row per document and measure that instead.
+        let origin = NodeId::generate();
+        // Above anything the fixture wrote, so every entry wins its conflict and
+        // the batch does the work a real one does rather than being superseded
+        // and writing nothing.
+        let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
+        let mut next = 0u64;
         group.bench_function(format!("trial_{trial}"), |b| {
             b.iter(|| {
-                // Ids stay unique across trials, as the bulk benchmark's do.
                 let entries: Vec<OplogEntry> = (0..BATCH)
                     .map(|_| {
                         next += 1;
@@ -469,19 +472,20 @@ fn batch_update(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(criterion::Throughput::Elements(BATCH));
 
-    let engine = &grown().engine;
-    let coll = collection(engine, "batch_update");
-    let origin = NodeId::generate();
-    let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
-
-    // The documents the batch updates, written once at the lowest stamps so
-    // that every round after this one out-stamps them and wins.
-    let seed: Vec<OplogEntry> =
-        (0..BATCH).map(|i| entry(origin, base + i, coll.id, i as i64)).collect();
-    engine.apply_batch(&seed).unwrap();
-
-    let mut round = 0u64;
     for trial in 1..=TRIALS {
+        let store = grown();
+        let engine = &store.engine;
+        let coll = collection(engine, "batch_update");
+        let origin = NodeId::generate();
+        let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
+
+        // The documents the batch updates, written once at the lowest stamps so
+        // that every round after this one out-stamps them and wins.
+        let seed: Vec<OplogEntry> =
+            (0..BATCH).map(|i| entry(origin, base + i, coll.id, i as i64)).collect();
+        engine.apply_batch(&seed).unwrap();
+
+        let mut round = 0u64;
         group.bench_function(format!("trial_{trial}"), |b| {
             b.iter(|| {
                 round += 1;
@@ -505,10 +509,11 @@ fn grown_writes(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("insert_one");
         group.sample_size(10);
-        let engine = &grown().engine;
-        let coll = collection(engine, "insert_one");
-        let mut n = 0i64;
         for trial in 1..=TRIALS {
+            let store = grown();
+            let engine = &store.engine;
+            let coll = collection(engine, "insert_one");
+            let mut n = 0i64;
             group.bench_function(format!("trial_{trial}"), |b| {
                 b.iter(|| {
                     n += 1;
@@ -526,10 +531,11 @@ fn grown_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("bulk_new");
     group.sample_size(10);
     group.throughput(criterion::Throughput::Elements(1_000));
-    let engine = &grown().engine;
-    let coll = collection(engine, "bulk_new");
-    let mut next = 0i64;
     for trial in 1..=TRIALS {
+        let store = grown();
+        let engine = &store.engine;
+        let coll = collection(engine, "bulk_new");
+        let mut next = 0i64;
         group.bench_function(format!("trial_{trial}"), |b| {
             b.iter(|| {
                 let docs: Vec<Document> = (0..1_000)

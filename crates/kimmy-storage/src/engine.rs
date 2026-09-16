@@ -638,6 +638,19 @@ impl Engine {
             }
         }
 
+        // A Cargo.toml comment is the only thing standing between the benchmark
+        // control and a person, which is not enough. Such a build keeps no live
+        // counts: nothing here is corrupted on disk — the mark is never written,
+        // so a later ordinary start rebuilds — but *this* process serves an
+        // empty count table, and the divergence check reads that as a
+        // divergence on every contact.
+        #[cfg(feature = "bench-no-live-counts")]
+        tracing::error!(
+            "this build was compiled with `bench-no-live-counts`: it does not keep the live \
+             document counts, and the cross-member divergence check will report differences \
+             that do not exist. It is a benchmark control and must never serve traffic."
+        );
+
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;
 

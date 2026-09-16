@@ -279,7 +279,18 @@ pub(crate) fn mark_through(txn: &WriteTransaction, mark: &[u8]) -> Result<()> {
 ///
 /// A mark that already did not match says an older build wrote behind the
 /// counts, and moving it to the new state would hide that from the next open.
-pub(crate) fn carry_mark(txn: &WriteTransaction, before: &[u8], after: &[u8]) -> Result<()> {
+pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Result<()> {
+    // A transaction that appended would have its own mark waiting in [`Pending`],
+    // and [`flush`] writes that *after* this runs — silently overwriting the
+    // refusal below, moving a stale mark to a fresh one, and letting the next
+    // `Engine::open` skip a rebuild it needed. No path both appends and carries
+    // today (a rewind and a retention pass remove rows without appending), which
+    // is what makes this an assertion rather than a branch.
+    debug_assert!(
+        txn.live_counts().lock().mark.is_none(),
+        "a transaction that appended is also carrying the mark; the flush would overwrite the \
+         carry and a stale mark would be moved forward"
+    );
     let mut table = open_through(txn)?;
     let current = table.get(THROUGH)?.is_some_and(|stored| stored.value() == before);
     if current {

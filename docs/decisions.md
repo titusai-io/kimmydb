@@ -16392,50 +16392,85 @@ where those two tables are already open.
 `a_single_document_write_reaches_for_the_count_tables_twice` holds the count at
 two.
 
-**What it is worth.** `benches/write_path.rs`, one Mac, medians of five trials
-per cell, in ms. Three configurations of the same binary against the same
-fixture: 0.30.0 as shipped, this change, and a control with the live-count and
-mark calls compiled out (the `bench-no-live-counts` feature). The store is grown
-past an 8 MiB page cache, so the tree is deeper than the cache is wide.
+**What it is worth.** `benches/write_path.rs`, one Mac, `durable`. Three
+configurations of the same binary: 0.30.0 as shipped, this change, and a control
+with the live-count and mark calls compiled out (the `bench-no-live-counts`
+feature). Each trial builds its own store, grown to 64 MiB past an 8 MiB page
+cache so the tree is deeper than the cache is wide. Five trials per cell, given
+as the series in order, because a mean hides drift and drift is what wrecked the
+first attempt at this measurement.
 
-| Workload | 0.30.0, per entry | This change, per txn | Control, compiled out |
-|---|---|---|---|
-| `insert_one` — one document, one transaction | 5.79 | 5.72 | 9.65 |
-| `batch_new` — 1,024 replicated inserts | 36.90 | 35.02 | 36.40 |
-| `batch_update` — 1,024 replicated in-place updates | 42.11 | 36.09 | 42.60 |
-| `bulk_new` — 1,000 local inserts, one transaction | 33.12 | 28.83 | 26.12 |
+| Workload | Configuration | Trials 1–5 (ms) | Median | Range |
+|---|---|---|---|---|
+| `batch_new` — 1,024 replicated inserts | 0.30.0 | 33.20 31.96 32.89 35.49 42.77 | 33.20 | 31.96–42.77 |
+| | this change | 32.18 31.26 28.86 28.94 31.09 | 31.09 | 28.86–32.18 |
+| | control | 29.41 30.08 29.59 29.93 31.93 | 29.93 | 29.41–31.93 |
+| `batch_update` — 1,024 replicated in-place updates | 0.30.0 | 32.62 35.35 34.38 34.03 34.62 | 34.38 | 32.62–35.35 |
+| | this change | 34.92 32.85 32.91 32.49 33.12 | 32.91 | 32.49–34.92 |
+| | control | 31.41 32.26 35.06 34.77 34.67 | 34.67 | 31.41–35.06 |
+| `insert_one` — one document, one transaction | 0.30.0 | 5.62 5.63 5.59 5.61 5.67 | 5.62 | 5.59–5.67 |
+| | this change | 5.61 5.73 5.53 5.58 6.06 | 5.61 | 5.53–6.06 |
+| | control | 5.59 5.52 5.63 5.57 5.47 | 5.57 | 5.47–5.63 |
+| `bulk_new` — 1,000 local inserts, one transaction | 0.30.0 | 30.57 29.88 29.35 31.45 29.23 | 29.88 | 29.23–31.45 |
+| | this change | 24.34 24.87 25.71 25.40 25.08 | 25.08 | 24.34–25.71 |
+| | control | 25.71 25.91 25.47 28.06 24.81 | 25.71 | 24.81–28.06 |
 
-**Read that table for what it does not show.** Only `bulk_new` orders the way
-the argument predicts — control fastest, this change next, 0.30.0 slowest — and
-there the whole of the live-count work is about 21% of the write, of which this
-change recovers about 13 points. On both replicated batch rows the control is at
-or *slower* than 0.30.0, and on `insert_one` the control is two thirds slower
-than either. A control that removes work cannot be slower than the code it
-removes the work from, so those cells are measuring the machine rather than the
-change: a single-document write is one fsync, and fsync latency on this host
-moved further between runs than the effect being measured. That is this
-decision's own warning about this bench — "Every write here ends in a
-synchronous flush, which dominates the time" — landing on the attempt to check
-it.
+**One row separates, and only one.** On `bulk_new` the ranges for 0.30.0
+(29.23–31.45) and this change (24.34–25.71) do not overlap, so the difference is
+larger than this bench's own spread: the per-entry work cost about 16% of a
+local bulk insert of 1,000 documents. This change and the control overlap
+completely there, which says the per-transaction form costs no more than
+removing the work altogether — the residue is below what can be measured.
 
-**So the cause of the round-0340 regression is not established here, and goes
-back to open.** The per-entry shape was real and is removed, and it is worth
-something on the one path this bench can resolve; but nothing here shows it
-costing a replica landing time 2.0 s to 6.1 s, and an ADR should not assert a
-cure it cannot demonstrate. What would settle it is a measurement on the
-platform and durability class the finding came from rather than on a developer's
-Mac. The change ships regardless, on the argument this decision already made for
-it: per-transaction is the right shape, and it is O(1) in the batch where the
-old one was O(entries).
+**Everywhere else the effect is inside the spread, and no conclusion is drawn
+from it.** `batch_new` orders the way the argument predicts — control 29.93,
+this change 31.09, 0.30.0 33.20 — but every range overlaps, and a single trial
+(0.30.0's fifth, 42.77) moves the picture more than the effect does.
+`batch_update` does not order at all: the control is the slowest of the three,
+which cannot be a real cost of code it does not run. `insert_one` is flat across
+all three configurations to within 1%, so the fixed per-transaction cost — two
+table opens and one `oplog.last()` — does not register against a write that ends
+in an fsync. That is this decision's own warning about this bench, "Every write
+here ends in a synchronous flush, which dominates the time", holding for the
+attempt to check it.
+
+**What this bench cannot answer, and what would.** The replicated batch is the
+shape the round-0340 finding measured, and it is exactly the shape that stays
+inside the spread here. Two attempts have now failed to settle it from outside
+the product: a live A/B across two replicas, whose poll resolution was 2 s
+against the effect, and this bench, whose run-to-run spread is wider than the
+effect. An independent re-run of `bulk_new` on this machine landed 1.2 ms from
+the figure recorded here, which is itself a large fraction of what is being
+attributed. The instrument is at its limit. What would settle it is a
+sync apply-duration series measured from **inside** the product — the apply path
+timing itself across a batch — rather than black-box timing from outside it.
+
+**So the cause of the round-0340 regression is not established, and stays
+open.** The per-entry shape was real and is removed, and it is worth about 16%
+on the one path this bench resolves; but nothing here shows it costing a replica
+landing time 2.0 s to 6.1 s, and an ADR should not assert a cure it cannot
+demonstrate. The change ships on the argument this decision already made for it:
+per-transaction is the right shape, and it is O(1) in the batch where the old
+one was O(entries).
+
+**What the control does not remove.** It compiles out the table opens and the
+`oplog.last()` seek. The record's liveness header is still decoded and the
+accumulator's mutex is still taken, because those sit on the same lines as the
+writes themselves. So the control is a floor for the table work, not for every
+cost this decision added.
 
 **What the harness had to be fixed for, recorded so the next measurement does
 not repeat it.** The first form grew a 1 GiB fixture shared by every workload in
-one process. Each workload appended to the store the next one measured, and
-within a workload each trial grew the tree under the next; a local bulk insert
-drifted from 35 ms to 89 ms across five trials, a drift far larger than the
-effect. Shrinking redb's cache to 8 MiB rather than growing a gigabyte gives the
-same "deeper than the cache" property in seconds, and lets every workload have a
-fresh store in its own process. The trials are reported as a series rather than
-a mean for the same reason: a mean would have hidden that drift. No
-configuration showed a first trial consistently slower than the rest, so the
-warm-up effect a live A/B had suggested is not visible here.
+one process, and shared it across trials too. Each workload appended to the
+store the next one measured and each trial grew the tree under the next; a local
+bulk insert drifted from 35 ms to 89 ms across five trials, drift far larger
+than the effect, and an ordinary unfiltered `cargo bench` would have printed
+those numbers without anything marking them wrong. Every trial now builds its
+own store, so the obvious command is the correct one. Shrinking redb's cache to
+8 MiB rather than growing a gigabyte is what makes that affordable, and it
+works: the series above are flat where the first form drifted. What is still not
+isolated is that criterion runs its routine many times within one trial, and
+those iterations do grow the store — unavoidable while measuring a write, and it
+falls identically on every configuration. No configuration shows a first trial
+consistently slower than the rest, so the warm-up effect a live A/B had
+suggested is not visible here.
