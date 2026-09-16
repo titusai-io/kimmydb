@@ -16851,6 +16851,14 @@ installed, a backend call costs one thread-local read (2.3 ns) and no clock.
 | `read` | wall time inside the backend's `read`, a page the cache did not hold, and `len` |
 | `write` | wall time inside the backend's `write`, and `set_len`, which grows the file |
 | `sync` | wall time inside the backend's `sync_data`, the fsync |
+
+Wall time for a call whose CPU is read includes the meter's own two CPU clock
+reads, a few hundred nanoseconds, because they sit inside the wall-clock reads.
+The instrument's cost is attributed to `read`, `write` and `sync` rather than
+left in `off_cpu`. The CPU reads nested inside the wall reads also under-count
+the calls' CPU by the clock reads' own cost, so `cpu` reads slightly high and
+`off_cpu` slightly low (about 87 µs on a 170 ms bulk), the direction that cannot
+manufacture apparent contention.
 | `cpu` | the thread's CPU time over the hold, less its CPU time inside those calls |
 | `off_cpu` | the hold less the four above |
 
@@ -16899,10 +16907,17 @@ need no correction for it.
   under-measurement**: a cost inside the hold that no component captures
   silently inflates `off_cpu`, and `off_cpu` is the component a reader will
   interpret as contention. **So a measurement failure and a real finding look
-  identical in the number that matters most.** The uncontended test bounds
-  `off_cpu` as an absolute fraction of the hold (at most 25%, and in practice
-  about 2%: 0.14 ms of a 7.5 ms hold). A reading of it anywhere else should be
-  checked against `write_estimated` first.
+  identical in the number that matters most.** The test guarding against
+  under-measurement uses a baseline, not a bound: the backend's own tally of
+  every call the thread made, metered or not. Every page write, fsync and file
+  growth, which happen only inside a write transaction, must be metered, across
+  inserts, a bulk that grows the file, an index build and a drop. An absolute
+  bound on `off_cpu` (the first version asserted at most 25% of an uncontended
+  hold) could not see the unmetered `set_len` review found, and cannot be
+  trusted in an unoptimised build that inflates the residual for reasons of its
+  own. What no test bounds is a cost inside the hold that is not a backend call:
+  that stays a residual, and a reading of `off_cpu` should be checked against
+  `write_estimated` first.
 
 ### The cost of reading a thread's CPU clock, and the sampling it forced
 
@@ -16959,7 +16974,11 @@ rather than a claimed direction**: `write_estimated` is the wall time of the
 writes whose CPU was estimated, and **the sampling** can move time between the
 two by no more than that. **Reading guidance: trust a rise in `off_cpu` as
 contention only by as much as it exceeds the rise in `write_estimated` for the
-same holder.** For single-document writes that bound is zero.
+same holder.** For single-document writes that bound is zero. **And read
+`off_cpu` only from a release build**: an unoptimised build spends real time off
+the CPU with nothing contending (430–580 ms of a 1.3–1.5 s uncontended bulk on
+macOS, against 0–6 ms in release), so a local debugging session shows
+contention that is not there.
 
 **`write_estimated` bounds the sampling error and nothing else.** It says
 nothing about a cost inside the hold that no component measures, which lands in

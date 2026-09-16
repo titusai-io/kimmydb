@@ -34,6 +34,10 @@ use crate::engine::WriterHolder;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
     /// Wall time inside the backend's `read`: a page redb's cache did not hold.
+    /// Wall time here, and for `Write` and `Sync`, includes the meter's own two
+    /// CPU clock reads around a call whose CPU is read, a few hundred
+    /// nanoseconds, so the instrument's cost is attributed rather than left in
+    /// `OffCpu`.
     /// Also its `len`, the file's size, which redb reads from inside a hold.
     Read,
     /// Wall time inside the backend's `write`: redb writing a page out. Also
@@ -47,7 +51,10 @@ pub enum Component {
     Cpu,
     /// What is left: off the CPU, outside any backend call — scheduler delay,
     /// or a wait on a lock inside redb. **A residual**, so anything the other
-    /// four fail to capture lands here too.
+    /// four fail to capture lands here too. **Read it only from a release
+    /// build**: an unoptimised build spends real time off the CPU with nothing
+    /// contending (430–580 ms of a 1.3–1.5 s uncontended bulk on macOS, against
+    /// 0–6 ms in release), which reads as contention that is not there.
     OffCpu,
 }
 
@@ -249,6 +256,8 @@ pub(crate) fn io<T>(
     // CPU than wall time.
     let from = Instant::now();
     let cpu_from = if with_cpu { thread_cpu() } else { None };
+    #[cfg(test)]
+    test_hooks::metered_call(kind);
     #[cfg(test)]
     test_hooks::inside_io(kind, write_calls);
     let result = call();
@@ -639,23 +648,33 @@ impl MeteredBackend {
 
 impl redb::StorageBackend for MeteredBackend {
     fn len(&self) -> std::result::Result<u64, std::io::Error> {
+        #[cfg(test)]
+        test_hooks::backend_call(Io::Len);
         io(Io::Len, 0, || self.inner.len())
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
         let bytes = out.len();
+        #[cfg(test)]
+        test_hooks::backend_call(Io::Read);
         io(Io::Read, bytes, || self.inner.read(offset, out))
     }
 
     fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+        #[cfg(test)]
+        test_hooks::backend_call(Io::SetLen);
         io(Io::SetLen, 0, || self.inner.set_len(len))
     }
 
     fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
+        #[cfg(test)]
+        test_hooks::backend_call(Io::Sync);
         io(Io::Sync, 0, || self.inner.sync_data())
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
+        #[cfg(test)]
+        test_hooks::backend_call(Io::Write);
         io(Io::Write, data.len(), || self.inner.write(offset, data))
     }
 
@@ -688,6 +707,10 @@ pub(crate) mod test_hooks {
         pub static FILE_SIZE_CALLS: Cell<u64> = const { Cell::new(0) };
         /// `len` calls alone made while a meter was installed.
         pub static LEN_CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Backend calls this thread made, metered or not, by kind in
+        /// `Io` declaration order; and those a meter recorded.
+        pub static BACKEND_CALLS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
+        pub static METERED_CALLS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
         /// Every thread CPU clock read fails while set.
         pub static CPU_CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
         /// Slept inside every write call from this index on.
@@ -703,6 +726,32 @@ pub(crate) mod test_hooks {
         while Instant::now() < until {
             x = std::hint::black_box(x.wrapping_add(1));
         }
+    }
+
+    fn slot(kind: Io) -> usize {
+        match kind {
+            Io::Read => 0,
+            Io::Write => 1,
+            Io::Sync => 2,
+            Io::Len => 3,
+            Io::SetLen => 4,
+        }
+    }
+
+    pub fn backend_call(kind: Io) {
+        BACKEND_CALLS.with(|c| {
+            let mut v = c.get();
+            v[slot(kind)] += 1;
+            c.set(v);
+        });
+    }
+
+    pub fn metered_call(kind: Io) {
+        METERED_CALLS.with(|c| {
+            let mut v = c.get();
+            v[slot(kind)] += 1;
+            c.set(v);
+        });
     }
 
     pub fn at_phase(phase: Phase) {
@@ -738,6 +787,8 @@ pub(crate) mod test_hooks {
         SLEEP_IN_FILE_SIZE.with(|s| s.set(Duration::ZERO));
         FILE_SIZE_CALLS.with(|c| c.set(0));
         LEN_CALLS.with(|c| c.set(0));
+        BACKEND_CALLS.with(|c| c.set([0; 5]));
+        METERED_CALLS.with(|c| c.set([0; 5]));
         CPU_CLOCK_FAILS.with(|f| f.set(false));
     }
 }
@@ -864,18 +915,44 @@ mod tests {
     }
 
     #[test]
-    fn an_uncontended_hold_is_almost_all_measured() {
-        // `off_cpu` is a residual: what no measured component captured lands in
-        // it, and it is the component a reader takes as contention. With
-        // nothing contending, it must be a small, bounded share of the hold.
+    fn every_backend_call_a_hold_makes_is_metered() {
+        // The guard against under-measurement, against a baseline: the
+        // backend's own tally of the calls this thread made, metered or not.
+        // An unmetered call inside a hold lands in `off_cpu` whole, which is how
+        // `set_len` went unseen; an absolute bound on `off_cpu` could not see
+        // it, and cannot be trusted in an unoptimised build that inflates the
+        // residual for reasons of its own. Page writes, fsyncs and file growth
+        // happen only inside a write transaction, so every one must be
+        // metered. Reads and size reads also happen outside holds, in read
+        // transactions and at open, so the meter may see fewer of those.
         let (engine, _dir) = fresh();
-        let row = during(&engine, WriterHolder::Write, || inserts(&engine, 200));
-        let off_cpu = row.get(Component::OffCpu).as_secs_f64() / row.held.as_secs_f64();
-        assert!(
-            off_cpu <= 0.25,
-            "off_cpu is {:.1}% of an uncontended hold: {row:?}",
-            off_cpu * 100.0
-        );
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        test_hooks::reset();
+        for i in 0..50 {
+            engine.insert(&coll, doc! { "n": i }).unwrap();
+        }
+        let docs = (0..2_000).map(|i| doc! { "n": i, "body": "x".repeat(4_000) }).collect();
+        engine.insert_many(&coll, docs).unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![crate::meta::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        engine.drop_collection("shop", "orders").unwrap();
+        let backend = test_hooks::BACKEND_CALLS.with(|c| c.get());
+        let metered = test_hooks::METERED_CALLS.with(|c| c.get());
+        test_hooks::reset();
+        for (slot, kind) in ["write", "sync", "set_len"].iter().zip([1, 2, 4]) {
+            assert!(backend[kind] > 0, "the workload made no {slot}: {backend:?}");
+            assert_eq!(metered[kind], backend[kind], "{slot} calls escaped the meter");
+        }
+        for (slot, kind) in ["read", "len"].iter().zip([0, 3]) {
+            assert!(metered[kind] <= backend[kind], "{slot}: {metered:?} > {backend:?}");
+        }
     }
 
     #[test]
@@ -1333,7 +1410,11 @@ mod tests {
         // redb grows the file with `set_len` from inside a transaction, and
         // reads its size with `len`. Neither is a page read, write or fsync,
         // and an unmetered one lands in `off_cpu`, the residual: time asleep
-        // inside either must land in `read` or `write` instead. Against the
+        // inside either must land in `read` or `write` instead. In practice
+        // the calls counted here are all `set_len`: `len` is metered as a
+        // precaution and never happens in a hold (see
+        // `redb_reads_the_files_size_only_when_it_opens_and_never_inside_a_hold`),
+        // so a non-zero count here proves nothing about `len`. Against the
         // same bulk without the sleeps, because an unoptimised build spends
         // real time off the CPU in a large bulk with nothing contending.
         let (engine, _dir) = fresh();
