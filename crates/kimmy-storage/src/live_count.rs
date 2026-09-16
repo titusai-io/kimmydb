@@ -28,12 +28,11 @@
 //! and rewrites the table unless [`tables::LIVE_COUNTS_THROUGH`] still matches
 //! the store: the arrival index's next position and the oplog's newest key
 //! ([`mark_of`]). The mark is written by any transaction that appended, at its
-//! commit, by a build that keeps the count, and carried forward by a rewind
-//! and by retention, which
-//! remove rows without appending. So it is missing on a database no such build
-//! has opened and on one restored from a backup (which carries neither table),
-//! and it stops matching once a build that does not keep the count wrote a
-//! document — every document write appends to the oplog.
+//! commit, by a build that keeps the count, and carried forward by a rewind and
+//! by retention, which remove rows without appending. So it is missing on a
+//! database no such build has opened and on one restored from a backup (which
+//! carries neither table), and it stops matching once a build that does not
+//! keep the count wrote a document — every document write appends to the oplog.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -286,6 +285,14 @@ pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Res
     // `Engine::open` skip a rebuild it needed. No path both appends and carries
     // today (a rewind and a retention pass remove rows without appending), which
     // is what makes this an assertion rather than a branch.
+    //
+    // **It is order-sensitive, and catches only one order.** This fires for
+    // append-then-carry. Carry-then-append passes it silently, because the
+    // append's mark reaches [`Pending`] after the check has run. That is benign
+    // as things stand — the flush then writes the mark the append read, which
+    // is the correct one either way — so this is not a guarantee in both
+    // directions, and `the_carry_guard_is_blind_to_carry_then_append` pins the
+    // blind side to keep it a known gap rather than an assumed one.
     debug_assert!(
         txn.live_counts().lock().mark.is_none(),
         "a transaction that appended is also carrying the mark; the flush would overwrite the \
@@ -896,5 +903,350 @@ mod tests {
             "these write DOCS without moving the live count, which then drifts:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    fn live_record(engine: &Engine, name: &str) -> Vec<u8> {
+        let body = bson::serialize_to_vec(&doc! { "_id": name }).unwrap();
+        codec::encode_doc_record(&kimmy_core::DocRecord::live(engine.next_stamp(), body))
+    }
+
+    fn tomb_record(engine: &Engine) -> Vec<u8> {
+        codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(engine.next_stamp()))
+    }
+
+    fn write_live(engine: &Engine, txn: &crate::engine::WriteTxn<'_>, coll: u64, names: &[&str]) {
+        let mut docs = txn.open_table(tables::DOCS).unwrap();
+        for name in names {
+            let key = crate::docs::doc_key(&id(name)).unwrap();
+            let rec = live_record(engine, name);
+            put_record(txn, &mut docs, coll, &key, &rec).unwrap();
+        }
+    }
+
+    /// A panic part-way through a transaction loses the deltas with the
+    /// records, and leaves the writer free for the next write.
+    #[test]
+    fn a_panic_mid_transaction_loses_the_deltas_with_the_records() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1));
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            write_live(&engine, &txn, coll.id.0, &["p0", "p1", "p2", "p3"]);
+            panic!("probe: unwinding with four pending deltas");
+        }));
+        assert!(caught.is_err(), "the probe must actually panic");
+
+        assert_counts_exact(&engine, "a panic mid-transaction");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1));
+        // The writer is not left held and no delta survived into the next one.
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+        assert_counts_exact(&engine, "a write after a panic");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(2));
+    }
+
+    /// A transaction dropped rather than committed or aborted loses its
+    /// deltas, as redb loses the records it held.
+    #[test]
+    fn a_dropped_transaction_loses_its_deltas() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            write_live(&engine, &txn, coll.id.0, &["d0", "d1"]);
+            drop(txn);
+        }
+        assert_counts_exact(&engine, "a dropped transaction");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1));
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(2));
+    }
+
+    /// The same for an explicit abort: the deltas go with the records.
+    #[test]
+    fn an_explicit_abort_loses_its_deltas() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            write_live(&engine, &txn, coll.id.0, &["a0", "a1", "a2"]);
+            txn.abort().unwrap();
+        }
+        assert_counts_exact(&engine, "an explicit abort");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1));
+    }
+
+    /// A transaction whose deltas cancel out must not touch the row at all.
+    ///
+    /// Checked as a value as well as an open count: the count is set wrong
+    /// first, so "left alone" is visible as the wrong value surviving.
+    #[test]
+    fn a_net_zero_transaction_touches_no_count_row() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "a" }).unwrap();
+        engine.insert(&coll, doc! { "_id": "b" }).unwrap();
+        // A count deliberately wrong, so "left alone" is visible as a value
+        // and not only as an open count.
+        {
+            let t = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            t.open_table(tables::LIVE_COUNTS).unwrap().insert(coll.id.0, 9).unwrap();
+            t.commit().unwrap();
+        }
+        let before = table_opens();
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            {
+                let mut docs = txn.open_table(tables::DOCS).unwrap();
+                let key = crate::docs::doc_key(&id("z")).unwrap();
+                let live = live_record(&engine, "z");
+                put_record(&txn, &mut docs, coll.id.0, &key, &live).unwrap();
+                let tomb = tomb_record(&engine);
+                put_record(&txn, &mut docs, coll.id.0, &key, &tomb).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            table_opens() - before,
+            0,
+            "a transaction whose deltas cancelled, and which appended nothing, still opened a \
+             count table"
+        );
+        assert_eq!(
+            engine.count_by_id(coll.id).unwrap(),
+            Some(9),
+            "a net-zero transaction rewrote a row it should have left alone"
+        );
+    }
+
+    /// Two collections moved in one transaction land on their own rows, in
+    /// opposite directions.
+    #[test]
+    fn deltas_are_keyed_per_collection_within_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let a = engine.create_collection("app", "a").unwrap();
+        let b = engine.create_collection("app", "b").unwrap();
+        engine.insert(&b, doc! { "_id": "b1" }).unwrap();
+        engine.insert(&b, doc! { "_id": "b2" }).unwrap();
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            write_live(&engine, &txn, a.id.0, &["a1", "a2", "a3"]);
+            {
+                let mut docs = txn.open_table(tables::DOCS).unwrap();
+                let key = crate::docs::doc_key(&id("b1")).unwrap();
+                let tomb = tomb_record(&engine);
+                put_record(&txn, &mut docs, b.id.0, &key, &tomb).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert_counts_exact(&engine, "two collections moved in one transaction");
+        assert_eq!(engine.count_by_id(a.id).unwrap(), Some(3));
+        assert_eq!(engine.count_by_id(b.id).unwrap(), Some(1));
+    }
+
+    /// A schema change mid-batch ends the run and starts another, and the
+    /// counts survive the split.
+    ///
+    /// The one case where a batch is more than one transaction (ADR-119), so
+    /// the accumulator of each run has to land on its own.
+    #[test]
+    fn a_batch_with_a_ddl_entry_mid_run_keeps_the_counts() {
+        let (a, docs_a, _da) = engine();
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        b.create_collection("app", "docs").unwrap();
+
+        for n in 0..3i64 {
+            a.insert(&docs_a, doc! { "_id": n }).unwrap();
+        }
+        a.delete(&docs_a, &DocId::Int64(0)).unwrap();
+        let items = a.create_collection("app", "items").unwrap();
+        for n in 0..3i64 {
+            a.insert(&items, doc! { "_id": n }).unwrap();
+        }
+        a.delete(&items, &DocId::Int64(1)).unwrap();
+
+        let entries: Vec<OplogEntry> = a
+            .entries_for_peer(Hlc::ZERO, 4_096)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_document() || e.collection == items.id)
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.kind.is_ddl()),
+            "the probe needs a schema change in the batch"
+        );
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!(outcome.ddl, 1, "{outcome:?}");
+
+        assert_counts_exact(&b, "a batch with a schema change mid-run");
+        assert_eq!(b.count_by_id(docs_a.id).unwrap(), Some(2));
+        assert_eq!(b.count_by_id(items.id).unwrap(), Some(2));
+    }
+
+    /// The local bulk paths keep the counts: `insert_many`, a `write_batch` of
+    /// deletes and upserts, a closure that fails, and a bulk insert that
+    /// collides part-way.
+    ///
+    /// The verifier walks the single-document paths; these are the two that
+    /// gather many deltas before one commit, and the two whose failure arms
+    /// abort a transaction with an accumulator already populated.
+    #[test]
+    fn insert_many_and_write_batch_keep_the_counts() {
+        let (engine, coll, _dir) = engine();
+        engine
+            .insert_many(&coll, (0..50).map(|i| doc! { "_id": format!("m{i}") }).collect())
+            .unwrap();
+        assert_counts_exact(&engine, "insert_many");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(50));
+
+        engine
+            .write_batch(crate::engine::WriterHolder::Bulk, |scope| {
+                for i in 0..10 {
+                    scope.delete(&coll, &id(&format!("m{i}")))?;
+                }
+                for i in 50..60 {
+                    let name = format!("m{i}");
+                    scope.replace(&coll, &id(&name), doc! { "_id": name.as_str() }, true)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_counts_exact(&engine, "a write_batch of deletes and upserts");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(50));
+
+        let failed = engine.write_batch(crate::engine::WriterHolder::Bulk, |scope| {
+            scope.replace(&coll, &id("m99"), doc! { "_id": "m99" }, true)?;
+            Err::<(), _>(crate::error::StorageError::Database("probe".into()))
+        });
+        assert!(failed.is_err());
+        assert_counts_exact(&engine, "a write_batch aborted by its closure");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(50));
+
+        // A bulk insert that collides mid-batch: aborted after some records
+        // are already in the transaction, with their deltas gathered.
+        let collide = engine.insert_many(
+            &coll,
+            vec![doc! { "_id": "n1" }, doc! { "_id": "n2" }, doc! { "_id": "m20" }],
+        );
+        assert!(collide.is_err());
+        assert_counts_exact(&engine, "a bulk insert aborted mid-batch");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(50));
+    }
+
+    /// A drop purge takes the count down across its chunks and leaves no row
+    /// behind.
+    ///
+    /// The purge is the one count-moving path that runs in many transactions
+    /// rather than one, a chunk at a time (ADR-158), so what is checked is
+    /// that every chunk's accumulator lands and none leaves a residue: the
+    /// dropped collection ends with no row at all, not a row reading zero.
+    #[test]
+    fn a_drop_purge_moves_the_count_down_in_chunks() {
+        let (engine, coll, _dir) = engine();
+        for i in 0..300 {
+            engine.insert(&coll, doc! { "_id": format!("d{i}") }).unwrap();
+        }
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(300));
+        engine.drop_collection("app", "docs").unwrap();
+        assert_counts_exact(&engine, "a drop purge");
+        let db = engine.db();
+        let r = db.begin_read().unwrap();
+        assert_eq!(
+            r.open_table(tables::LIVE_COUNTS).unwrap().get(coll.id.0).unwrap().map(|v| v.value()),
+            None,
+            "the purged collection kept a count row"
+        );
+    }
+
+    /// The `carry_mark` guard fires when one transaction both appends and
+    /// carries.
+    ///
+    /// A `debug_assert` compiles out of a release build, so this is gated to
+    /// the profile that has one to catch — otherwise `cargo test --release`
+    /// would fail on a guard that is simply not there.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a transaction that appended is also carrying the mark")]
+    fn the_carry_guard_fires_on_a_transaction_that_appended() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        let txn = engine.begin_write(crate::engine::WriterHolder::Rewind).unwrap();
+        let entry = OplogEntry {
+            stamp: engine.next_stamp(),
+            kind: OpKind::Insert,
+            collection: coll.id,
+            doc_id: Some(id("two")),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": "two" }).unwrap()),
+        };
+        crate::engine::append_oplog(&txn, &entry).unwrap();
+        carry_mark(&txn, b"before", b"after").unwrap();
+    }
+
+    /// The same guard is blind to the other order: carry first, then append,
+    /// and the commit's flush writes over the carry.
+    ///
+    /// Pinned rather than fixed. The flush writes the mark the append read,
+    /// which is the right one either way, so the blind side is benign — but it
+    /// is a gap, and a test is what keeps it a known one.
+    #[test]
+    fn the_carry_guard_is_blind_to_carry_then_append() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        // The mark as it stands, and a deliberately stale "before" so the
+        // carry refuses -- which is the case the assert exists to protect.
+        let stored_before = {
+            let db = engine.db();
+            let r = db.begin_read().unwrap();
+            let t = r.open_table(tables::LIVE_COUNTS_THROUGH).unwrap();
+            t.get(THROUGH).unwrap().unwrap().value().to_vec()
+        };
+        let txn = engine.begin_write(crate::engine::WriterHolder::Rewind).unwrap();
+        // The carry MATCHES, so it takes -- and then the append's flush lands
+        // on top of it at the commit.
+        carry_mark(&txn, &stored_before, b"a-forged-mark").unwrap();
+        let entry = OplogEntry {
+            stamp: engine.next_stamp(),
+            kind: OpKind::Insert,
+            collection: coll.id,
+            doc_id: Some(id("two")),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": "two" }).unwrap()),
+        };
+        crate::engine::append_oplog(&txn, &entry).unwrap();
+        // No assertion fired, and the flush wrote the append's fresh mark.
+        txn.commit().unwrap();
+        let db = engine.db();
+        let r = db.begin_read().unwrap();
+        let stored =
+            r.open_table(tables::LIVE_COUNTS_THROUGH).unwrap().get(THROUGH).unwrap().unwrap();
+        assert_ne!(stored.value(), b"a-forged-mark", "the carry survived the flush");
+    }
+
+    /// A batch in which every entry is superseded writes nothing, and reaches
+    /// for no count table beyond the one the run's own commit takes.
+    #[test]
+    fn a_wholly_superseded_batch_touches_no_count_table() {
+        let (engine, coll, _dir) = engine();
+        let later = crate::physical_now_ms() + 10_000;
+        let entries: Vec<OplogEntry> = (0..64u64)
+            .map(|i| {
+                let name = format!("s{i}");
+                remote(&coll, &name, later + i, Some(doc! { "_id": name.as_str() }))
+            })
+            .collect();
+        engine.apply_batch(&entries).unwrap();
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(64));
+
+        // The same batch again: every entry is now superseded by its own
+        // equal stamp, so nothing is written.
+        let before = table_opens();
+        let outcome = engine.apply_batch(&entries).unwrap();
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        let opened = table_opens() - before;
+        assert_counts_exact(&engine, "a wholly superseded batch");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(64));
+        assert!(opened <= 2, "a wholly superseded batch opened the count tables {opened} times");
     }
 }
