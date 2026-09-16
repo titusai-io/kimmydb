@@ -1169,6 +1169,12 @@ mod tests {
                 "estimate past the 40 ms bound for sample {sampled:?}/{sampled_cpu:?}: {d:?}"
             );
             assert_eq!(d.components.iter().sum::<Duration>(), hold, "{d:?}");
+            if sampled.is_zero() {
+                // Nothing sampled is nothing to estimate from: no CPU is
+                // credited to the unsampled writes, rather than a ratio of
+                // 0/0 or x/0 whose value depends on how `f64::min` treats NaN.
+                assert_eq!(cpu, Duration::from_millis(60), "{d:?}");
+            }
         }
     }
 
