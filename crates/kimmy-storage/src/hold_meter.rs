@@ -359,13 +359,7 @@ pub(crate) fn decompose(
     let estimated_write_cpu = if meter.write_sampled.is_zero() {
         Duration::ZERO
     } else {
-        let ratio = meter.write_sampled_cpu.as_secs_f64() / meter.write_sampled.as_secs_f64();
-        // `f64::min` is load-bearing: it returns 1.0 for an infinite ratio
-        // and for NaN, which is what keeps the estimate inside
-        // `write_estimated`. Do not rewrite it as `if ratio > 1.0 { 1.0 }
-        // else { ratio }`: `NaN > 1.0` is false, so that lets NaN through,
-        // and `mul_f64` panics on it.
-        out.write_estimated.mul_f64(ratio.min(1.0))
+        out.write_estimated.mul_f64(cpu_share(meter.write_sampled_cpu, meter.write_sampled))
     };
     let cpu_in_io = meter.read_cpu + meter.sync_cpu + meter.write_sampled_cpu + estimated_write_cpu;
     // CPU inside the calls cannot exceed the CPU over the hold except by an
@@ -386,6 +380,19 @@ pub(crate) fn decompose(
     out.components[Component::Cpu.slot()] = cpu;
     out.components[Component::OffCpu.slot()] = hold.saturating_sub(io + cpu);
     out
+}
+
+/// The share of `wall` that was CPU, capped at one (ADR-176): what the
+/// sampled writes say the unsampled ones spent on the CPU.
+///
+/// `f64::min` is load-bearing: it returns 1.0 for an infinite ratio and for
+/// NaN, which is what keeps an estimate inside `write_estimated`. Written as
+/// `if ratio > 1.0 { 1.0 } else { ratio }` it would pass NaN through, since
+/// `NaN > 1.0` is false, and `Duration::mul_f64` panics on NaN — inside a
+/// hold's release. `the_cpu_share_is_a_number_in_zero_to_one_whatever_the_clocks_read`
+/// fails if it is.
+fn cpu_share(cpu: Duration, wall: Duration) -> f64 {
+    (cpu.as_secs_f64() / wall.as_secs_f64()).min(1.0)
 }
 
 /// The per-holder totals of every decomposed hold, since start (ADR-176).
@@ -1180,6 +1187,30 @@ mod tests {
                 // 0/0 or x/0 whose value depends on how `f64::min` treats NaN.
                 assert_eq!(cpu, Duration::from_millis(60), "{d:?}");
             }
+        }
+    }
+
+    #[test]
+    fn the_cpu_share_is_a_number_in_zero_to_one_whatever_the_clocks_read() {
+        // Called directly, past the zero-sample check that keeps these cases
+        // from reaching it through the meter: 0/0 is NaN and x/0 infinite, and
+        // either must come out as a share `Duration::mul_f64` accepts.
+        let ms = Duration::from_millis;
+        for (cpu, wall, expected) in [
+            (Duration::ZERO, Duration::ZERO, 1.0),
+            (ms(5), Duration::ZERO, 1.0),
+            (ms(5), Duration::from_nanos(1), 1.0),
+            (ms(3), ms(2), 1.0),
+            (ms(1), ms(4), 0.25),
+            (Duration::ZERO, ms(4), 0.0),
+        ] {
+            let share = cpu_share(cpu, wall);
+            assert!(
+                share.is_finite() && (0.0..=1.0).contains(&share),
+                "{cpu:?}/{wall:?} gave {share}"
+            );
+            assert_eq!(share, expected, "{cpu:?}/{wall:?}");
+            let _ = ms(10).mul_f64(share);
         }
     }
 
