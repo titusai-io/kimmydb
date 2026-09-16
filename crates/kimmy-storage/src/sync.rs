@@ -219,11 +219,6 @@ pub struct SyncOutcome {
     /// change it recorded, and the shared flush a coalesced commit waits on.
     /// Set by [`Engine::apply_peer_batch`]; zero on every other path.
     pub writer_wait: std::time::Duration,
-    /// Where this pull's time went and how long what it carried had waited
-    /// to be pulled (ADR-175). `None` for a round that pulled no window — a
-    /// converged round, a snapshot page, a round that failed. Set only by
-    /// `kimmy-cluster`'s `sync_once`, like `lag_ms`.
-    pub pull: Option<PullTiming>,
 }
 
 /// One oplog pull, taken apart (ADR-175).

@@ -16616,9 +16616,17 @@ before the round's fallible tail: the lag reading, the divergence check, which
 is a network round trip, and the horizon check. A round that fails there, or
 that the timeout cancels, returns no outcome, so a timing carried only on the
 outcome would vanish. That is the degraded case the series are for. So the
-transport also leaves the timing on `PeerStalls` as soon as the batch is
-applied, and the loop takes it after every pull, whether the pull succeeded or
-failed.
+timing is not on the outcome at all. The transport leaves it on `PeerStalls` as
+soon as the batch is applied, and the loop takes it from there after every pull,
+whether the pull succeeded or failed. The slot is one value, not keyed by peer. It is
+correct because the loop is its only caller and takes it immediately after
+every round. A second caller of `sync_once_with` that shares the loop's
+`PeerStalls` would have to take it the same way. Nothing clears the slot
+defensively: a clear would make a value wrongly left behind look the same as
+nothing stored. The first fix kept a copy on the outcome
+as well. Review removed it: a copy that is right only when a round succeeds is
+a trap for the next reader, and six tests were reading the copy rather than the
+path the loop takes.
 
 **Why "the oldest lacked entry", not the first carried.** A repair re-serves
 history this member holds. A pull also serves spans the member holds as state
@@ -16723,9 +16731,9 @@ subtraction) fail it on different assertions, each alone.
 | A contact out of time is labelled `ceiling` | `a_contact_ends_on_what_stopped_it`, `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
 | A clock-ahead entry is observed as a zero wait | `an_entry_stamped_ahead_is_counted_and_not_observed_as_a_wait` |
 | The loop does not fold a pull into its report | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
-| The loop does not count how a contact ended, for the three ends a pull that succeeded reaches | the same two |
+| The loop does not count how a contact ended, for the three ends a pull that succeeded reaches | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up` |
 | The loop does not count a contact ended by a failure | `a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
-| The transport leaves no timing for a window whose round then fails | `a_window_applied_before_its_round_fails_is_still_a_pull`, and both `a_drain_the_tick_*` tests, since the loop now takes every timing from there |
+| The transport leaves no timing on `PeerStalls` | every test that reads a pull's timing, eight of eight: the four `a_pull_*` phase and wait tests, `an_entry_served_below_the_members_position_is_not_read_as_a_wait`, `a_window_applied_before_its_round_fails_is_still_a_pull`, and both `a_drain_the_tick_*` tests. While the outcome carried a copy, the same break turned three red |
 | The loop takes a window's timing only from a round that succeeded | `a_window_applied_before_its_round_fails_is_still_a_pull` |
 | The shared flush's gate is not metered | `a_wait_at_the_shared_flush_is_metered_as_a_wait_for_the_writer` |
 | The pull buckets stop at 10 s | `the_render_is_byte_for_byte_what_a_scrape_receives`, whose golden holds a 45 s wait; `the_render_is_parseable_prometheus_text`; `the_metrics_body_exposes_exactly_these_series_in_exactly_this_order` |

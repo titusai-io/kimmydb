@@ -985,7 +985,7 @@ where
                 .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
             let applying = std::time::Instant::now();
-            let mut outcome = engine
+            let outcome = engine
                 .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
             let pull = kimmy_storage::PullTiming {
@@ -998,7 +998,6 @@ where
             // Handed over now, while nothing after the commit can have
             // failed: see `PeerStalls::pulled`.
             stalls.pulled = Some(pull);
-            outcome.pull = Some(pull);
             // The peer's tail was reached if the batch took the whole
             // window up to the vector the peer advertised. An entry
             // deferred above that vector does not change that: it lies
@@ -1376,10 +1375,25 @@ pub struct PeerStalls {
     /// bound, so the line is written when they change and not on every pull.
     marks_logged: HashMap<NodeId, Vec<(NodeId, Hlc)>>,
     /// The timing of the last window this node applied, until the loop takes
-    /// it (ADR-175). Here rather than only on the outcome, because the batch
-    /// is committed before the round's fallible tail — the divergence check is
-    /// a network round trip — and a round that fails there, or that the
-    /// timeout cancels, returns no outcome for work that was done.
+    /// it (ADR-175). The only place a pull's timing is carried, and not on the
+    /// outcome: the batch is committed before the round's fallible tail — the
+    /// divergence check is a network round trip — and a round that fails
+    /// there, or that the timeout cancels, returns no outcome for work that
+    /// was done. A second copy on the outcome would be right exactly when it
+    /// is not needed, and a reader of it would lose those pulls silently.
+    ///
+    /// **One slot, not one per peer, and that is only sound under an
+    /// invariant:** whoever calls [`sync_once_with`] with this `PeerStalls`
+    /// takes the slot with [`PeerStalls::take_pull`] immediately after every
+    /// call, whatever the call returned, before calling again. The
+    /// replication loop is the one caller and does. A second caller that
+    /// skipped the take would leave a timing for the next round to collect
+    /// as its own, or have its own overwritten by the next.
+    ///
+    /// Deliberately not cleared anywhere else — not when a tick opens, not
+    /// when a round begins. A defensive clear would make a timing wrongly
+    /// left behind indistinguishable from none having been stored, and
+    /// hide exactly the violation this invariant is written down to catch.
     pulled: Option<kimmy_storage::PullTiming>,
 }
 

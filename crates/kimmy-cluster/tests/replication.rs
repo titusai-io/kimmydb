@@ -4940,6 +4940,19 @@ async fn a_source_holding(n: usize) -> (Node, Node) {
     (a, b)
 }
 
+/// One pull into `into` from `peer`, and its timing as the replication loop
+/// reads it: from the `PeerStalls` the round left it on, the only place a
+/// pull's timing is carried (ADR-175).
+async fn pull_timed(
+    into: &Engine,
+    peer: std::net::SocketAddr,
+) -> (kimmy_storage::SyncOutcome, kimmy_storage::PullTiming) {
+    let mut stalls = PeerStalls::new();
+    let outcome = sync_once_with(into, peer, SECRET, None, &mut stalls).await.expect("pull");
+    let pull = stalls.take_pull().expect("a window was pulled");
+    (outcome, pull)
+}
+
 #[tokio::test]
 async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
     let (a, b) = a_source_holding(50).await;
@@ -4956,9 +4969,8 @@ async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
     });
     held_rx.recv().unwrap();
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
+    let (_, pull) = pull_timed(&b.engine, a.addr).await;
     holder.join().unwrap();
-    let pull = outcome.pull.expect("a window was pulled");
 
     assert!(pull.wait >= FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
     assert!(pull.apply < FLOOR, "and is not also counted as applying: {pull:?}");
@@ -4973,8 +4985,7 @@ async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
     // the batch does after taking the writer, not a wait for it.
     b.engine.set_durability(kimmy_storage::DurabilityClass::Coalesced, SLOW);
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
-    let pull = outcome.pull.expect("a window was pulled");
+    let (_, pull) = pull_timed(&b.engine, a.addr).await;
 
     assert!(pull.apply >= FLOOR, "a slow commit is the apply phase: {pull:?}");
     assert!(pull.wait < FLOOR, "not a wait for the writer: {pull:?}");
@@ -4986,8 +4997,7 @@ async fn a_pull_from_a_slow_peer_says_so_in_serve() {
     let (a, b) = a_source_holding(50).await;
     let slow = slow_relay(a.addr, SLOW).await;
 
-    let outcome = sync_once(&b.engine, slow, SECRET, None).await.expect("pull");
-    let pull = outcome.pull.expect("a window was pulled");
+    let (_, pull) = pull_timed(&b.engine, slow).await;
 
     assert!(pull.serve >= FLOOR, "a slow answer is the serve phase: {pull:?}");
     assert!(pull.wait < FLOOR, "{pull:?}");
@@ -4999,8 +5009,7 @@ async fn a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited() {
     let (a, b) = a_source_holding(10).await;
     tokio::time::sleep(SLOW).await;
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
-    let pull = outcome.pull.expect("a window was pulled");
+    let (_, pull) = pull_timed(&b.engine, a.addr).await;
     match pull.oldest_lacked {
         Some(kimmy_storage::EntryWait::Waited(waited)) => {
             assert!(waited >= FLOOR, "written {SLOW:?} before the pull: {pull:?}")
@@ -5012,8 +5021,7 @@ async fn a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited() {
     // the entries' age, not something the round always adds.
     let ca = a.engine.get_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": "fresh" }).unwrap();
-    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
-    let pull = outcome.pull.expect("a window was pulled");
+    let (_, pull) = pull_timed(&b.engine, a.addr).await;
     match pull.oldest_lacked {
         Some(kimmy_storage::EntryWait::Waited(waited)) => {
             assert!(waited < FLOOR, "written just before the pull: {pull:?}")
@@ -5119,9 +5127,8 @@ async fn an_entry_served_below_the_members_position_is_not_read_as_a_wait() {
     // series meant for the time entries queue.
     let (a, r, _ca, _s) = a_member_holding_a_repaired_entry_below_its_position().await;
 
-    let outcome = sync_once(&r.engine, a.addr, SECRET, None).await.expect("pull");
+    let (outcome, pull) = pull_timed(&r.engine, a.addr).await;
     assert_eq!(outcome.superseded, 1, "the held entry alone is served: {outcome:?}");
-    let pull = outcome.pull.expect("a window was pulled");
     assert_eq!(pull.entries, 1, "{pull:?}");
     assert_eq!(pull.oldest_lacked, None, "nothing served was lacked: {pull:?}");
 }
