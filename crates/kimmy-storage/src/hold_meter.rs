@@ -360,6 +360,11 @@ pub(crate) fn decompose(
         Duration::ZERO
     } else {
         let ratio = meter.write_sampled_cpu.as_secs_f64() / meter.write_sampled.as_secs_f64();
+        // `f64::min` is load-bearing: it returns 1.0 for an infinite ratio
+        // and for NaN, which is what keeps the estimate inside
+        // `write_estimated`. Do not rewrite it as `if ratio > 1.0 { 1.0 }
+        // else { ratio }`: `NaN > 1.0` is false, so that lets NaN through,
+        // and `mul_f64` panics on it.
         out.write_estimated.mul_f64(ratio.min(1.0))
     };
     let cpu_in_io = meter.read_cpu + meter.sync_cpu + meter.write_sampled_cpu + estimated_write_cpu;
