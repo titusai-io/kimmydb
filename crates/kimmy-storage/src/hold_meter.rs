@@ -686,6 +686,8 @@ pub(crate) mod test_hooks {
         pub static SLEEP_IN_FILE_SIZE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         /// `set_len` and `len` calls made while a meter was installed.
         pub static FILE_SIZE_CALLS: Cell<u64> = const { Cell::new(0) };
+        /// `len` calls alone made while a meter was installed.
+        pub static LEN_CALLS: Cell<u64> = const { Cell::new(0) };
         /// Every thread CPU clock read fails while set.
         pub static CPU_CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
         /// Slept inside every write call from this index on.
@@ -711,6 +713,9 @@ pub(crate) mod test_hooks {
     }
 
     pub fn inside_io(kind: Io, write_calls: u64) {
+        if kind == Io::Len {
+            LEN_CALLS.with(|c| c.set(c.get() + 1));
+        }
         if matches!(kind, Io::Len | Io::SetLen) {
             FILE_SIZE_CALLS.with(|c| c.set(c.get() + 1));
             std::thread::sleep(SLEEP_IN_FILE_SIZE.with(|s| s.get()));
@@ -732,6 +737,7 @@ pub(crate) mod test_hooks {
         SLEEP_IN_WRITES_FROM.with(|s| s.set(None));
         SLEEP_IN_FILE_SIZE.with(|s| s.set(Duration::ZERO));
         FILE_SIZE_CALLS.with(|c| c.set(0));
+        LEN_CALLS.with(|c| c.set(0));
         CPU_CLOCK_FAILS.with(|f| f.set(false));
     }
 }
@@ -1356,6 +1362,51 @@ mod tests {
             "{slept:?} asleep in file-size calls added {added_off:?} of off_cpu: {row:?} vs {base:?}"
         );
         assert_adds_up(&row);
+    }
+
+    #[test]
+    fn redb_reads_the_files_size_only_when_it_opens_and_never_inside_a_hold() {
+        // `len` is metered as a precaution, not because a hold reaches it. In
+        // redb 4.1 the backend's `len` is reached only through
+        // `TransactionalMemory::new`, which runs when a database is opened.
+        // Every kind of hold here, the file growing under them, must make
+        // none; a redb upgrade that starts calling it inside a transaction
+        // fails this, and the metering is then what keeps it out of `off_cpu`.
+        let (engine, _dir) = fresh();
+        test_hooks::reset();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..50 {
+            engine.insert(&coll, doc! { "n": i }).unwrap();
+        }
+        let docs = (0..2_000).map(|i| doc! { "n": i, "body": "x".repeat(4_000) }).collect();
+        engine.insert_many(&coll, docs).unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![crate::meta::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        engine.drop_collection("shop", "orders").unwrap();
+        let (len, file_size) = (
+            test_hooks::LEN_CALLS.with(|c| c.get()),
+            test_hooks::FILE_SIZE_CALLS.with(|c| c.get()),
+        );
+        test_hooks::reset();
+        assert!(file_size > 0, "the file grew inside a hold, so the hook was reachable");
+        assert_eq!(len, 0, "redb read the file's size inside a hold");
+
+        // And the hook sees a `len` when one happens: opening a database reads
+        // the file's size, here under a meter installed for the purpose.
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::hold();
+        let _opened = Engine::open(&dir.path().join("other.redb")).unwrap();
+        drop(scope);
+        let opened_len = test_hooks::LEN_CALLS.with(|c| c.get());
+        test_hooks::reset();
+        assert!(opened_len > 0, "an open reads the file's size, and the meter saw none");
     }
 
     #[test]

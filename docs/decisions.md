@@ -16969,7 +16969,13 @@ inside a write transaction, and neither went through the meter. A bulk of 1,000
 documents made two `set_len` calls totalling 84 µs, a cost that grows with the
 store. Both calls are now metered, `len` with `read` and `set_len` with
 `write`, their CPU read exactly, and a test puts time inside them and fails if
-it reaches `off_cpu`. Every call redb's `StorageBackend` makes during a hold now
+it reaches `off_cpu`. **`len` is metered as a precaution**: in redb 4.1 the
+backend's `len` is reached only from `TransactionalMemory::new`, when a database
+is opened. A test runs inserts, a bulk that grows the file, an index build and a
+drop, and fails if any hold reads the file's size, and its positive control
+shows the meter does see the `len` an open makes. A redb upgrade that starts
+reading the size inside a transaction turns that test red, and the metering is
+then what keeps the time out of `off_cpu`. Every call redb's `StorageBackend` makes during a hold now
 goes through the meter; `close` is never called inside one. What remains
 unbounded is anything that is not a backend call.
 
@@ -17208,7 +17214,8 @@ each was broken on its own to watch its test fail for the stated reason.
   instrument extends, so without those names this change had weakened the
   guard on the series round 0350's reading rests on.
 
-**An unoptimised build reads off the CPU for real.** In a debug build on macOS,
+**An unoptimised build reads off the CPU for real** (and the operations guide
+says so beside the `off_cpu` row, where a reader meets it). In a debug build on macOS,
 an uncontended bulk of 2,000 documents of 2 KB spent 430–580 ms of a
 1.3–1.5 s call off the CPU at the thread level, inside the hold and outside it
 alike; a release build on the same machine spent 0–6 ms. The tests that read
