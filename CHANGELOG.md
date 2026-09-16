@@ -10,7 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.30.1 - 2026-09-16
+
+**A patch, and a narrow one.** The live-count bookkeeping moves from once per
+entry to once per transaction: each collection's live document count, and the
+mark beside it, are written when a transaction commits rather than for every
+entry in it ([ADR-174](docs/decisions.md)'s addendum). On a local bulk insert of
+1,000 documents that is about 16% (29.9 ms to 25.1 ms, medians of five trials,
+with ranges that do not overlap), and the fixed form is indistinguishable from a
+control with the bookkeeping compiled out.
+
+**It is not shown to cure the replica landing-time regression round 0340
+measured against 0.30.0, and the cause of that regression remains open.** On a
+replicated batch the difference was not resolvable above the benchmark's own
+spread. What would settle it is a sync apply-duration series measured from
+inside the apply path, which [ADR-174](docs/decisions.md) names.
+
+Nothing on the wire, in configuration, on disk or in packaging changes.
 
 ### Changed
 
@@ -27,16 +43,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   documents in one transaction, about 16% (29.9 ms to 25.1 ms, medians of five
   trials on one Mac). That is the one measurement the benchmark resolves: the
   two ranges behind those medians, 29.23–31.45 ms and 24.34–25.71 ms, do not
-  overlap. On a replicated batch, and on a single-document insert, the
-  difference was **not resolvable** above the benchmark's own run-to-run
-  spread. **This is not shown to cure the replica landing-time regression
+  overlap, while this change and a control built with the bookkeeping
+  compiled out (24.81–28.06 ms) overlap completely. On a replicated batch, and
+  on a single-document insert, the difference was **not resolvable** above the
+  benchmark's own run-to-run spread. **This is not shown to cure the replica landing-time regression
   reported against 0.30.0**; treat the cause of that as still open.
   [ADR-174](docs/decisions.md) records the numbers, and what the benchmark
   could and could not see.
 - **Nothing to do on upgrade.** No on-disk change, no configuration change and
   no migration. Both tables keep their meaning and their contents, a start on
   0.30.0 data neither rebuilds nor converts them, and the startup rebuild
-  described under 0.30.0 is unchanged.
+  described under 0.30.0 is unchanged ([ADR-174](docs/decisions.md)).
 
 ## 0.30.0 - 2026-09-15
 
