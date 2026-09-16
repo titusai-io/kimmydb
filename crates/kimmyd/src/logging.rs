@@ -480,12 +480,106 @@ impl TelemetryGuard {
             "Peers this node's SWIM membership considers alive.",
             cluster_members
         );
+        // To the millisecond since ADR-175, so a floating-point gauge where it
+        // was an integer one: whole seconds could not read an effect of a few.
         observe!(
-            u64_observable_gauge,
+            f64_observable_gauge,
             "kimmy.replication.lag",
             "s",
-            "Seconds since the newest peer entry applied locally where a peer holds newer, worst peer in the last round.",
-            replication_lag_secs
+            "Seconds since the newest peer entry applied locally where a peer holds newer, worst peer in the last round, to the millisecond. Reads 0 once a round's pull reached the vector the peer advertised, including while entries written since wait for the next round.",
+            |s| s.replication_lag_ms as f64 / 1e3
+        );
+        // Where sync pulls spend their time (ADR-175). The two histograms'
+        // buckets stay on `/metrics` (see `NOT_BRIDGED`); each phase's sum and
+        // the pull count are observable, and are what a collector divides for
+        // the mean, one instrument per phase as ADR-159 carries the holders.
+        // The phases share one count: every pull observes all three.
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.pull_seconds.serve",
+            "s",
+            "Seconds sync pulls spent from asking a peer for a window to holding it: the peer's walk of its oplog and the wire.",
+            |s| s.sync_pulls.serve.sum_us as f64 / 1e6
+        );
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.pull_seconds.wait",
+            "s",
+            "Seconds sync pulls spent applying their window waiting for this node's single writer.",
+            |s| s.sync_pulls.wait.sum_us as f64 / 1e6
+        );
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.pull_seconds.apply",
+            "s",
+            "Seconds sync pulls spent applying their window, less the wait for the writer: the entries' work, the commits and their fsync.",
+            |s| s.sync_pulls.apply.sum_us as f64 / 1e6
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.pulls",
+            "{pull}",
+            "Sync pulls of a peer's oplog: the count of each kimmy.sync.pull_seconds phase.",
+            |s| s.sync_pulls.serve.count
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.pulled_entries",
+            "{entry}",
+            "Entries sync pulls carried from peers. Against kimmy.sync.pull_seconds.apply, the cost of applying one.",
+            |s| s.sync_pulls.entries
+        );
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.entry_wait_seconds",
+            "s",
+            "Seconds the oldest entry each sync pull carried that this node lacked had waited when the pull arrived. Divide by kimmy.sync.entry_waits for the mean.",
+            |s| s.sync_pulls.entry_wait.sum_us as f64 / 1e6
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entry_waits",
+            "{pull}",
+            "Sync pulls whose oldest lacked entry's wait was observed in kimmy.sync.entry_wait_seconds.",
+            |s| s.sync_pulls.entry_wait.count
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entry_wait_ahead",
+            "{pull}",
+            "Sync pulls whose oldest lacked entry was stamped ahead of this node's clock, so its wait could not be observed: clock skew between members.",
+            |s| s.sync_pulls.entry_wait_ahead
+        );
+        // How each contact ended, one instrument per label value, in
+        // `ContactEnd::ALL` order.
+        use kimmy_cluster::ContactEnd;
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.contacts.caught_up",
+            "{contact}",
+            "Sync contacts whose last pull did not come back truncated.",
+            |s| s.sync_pulls.contacts[ContactEnd::CaughtUp.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.contacts.budget",
+            "{contact}",
+            "Sync contacts that ended truncated because the next pull would not fit in the tick: a backlog carried into the next tick.",
+            |s| s.sync_pulls.contacts[ContactEnd::Budget.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.contacts.ceiling",
+            "{contact}",
+            "Sync contacts that ended truncated with time left, at the most pulls one contact may make.",
+            |s| s.sync_pulls.contacts[ContactEnd::Ceiling.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.contacts.failed",
+            "{contact}",
+            "Sync contacts ended by a pull that failed.",
+            |s| s.sync_pulls.contacts[ContactEnd::Failed.slot()]
         );
         observe!(
             u64_observable_counter,
@@ -979,6 +1073,20 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          and the longest hold — are observable and are on the bridge.",
     ),
     (
+        "kimmy_sync_pull_seconds",
+        "A histogram, and OpenTelemetry has no observable histogram, so its buckets \
+         stay on /metrics for the same reason as the ones above. Each phase's sum is \
+         bridged as kimmy.sync.pull_seconds.serve, .wait and .apply, and the pull \
+         count they share as kimmy.sync.pulls, so a collector still has where the \
+         pulls' time went (ADR-175).",
+    ),
+    (
+        "kimmy_sync_entry_wait_seconds",
+        "A histogram, for the same reason. Its sum is bridged as \
+         kimmy.sync.entry_wait_seconds and its count as kimmy.sync.entry_waits, and \
+         the pulls it could not observe as kimmy.sync.entry_wait_ahead (ADR-175).",
+    ),
+    (
         "kimmy_backup_duration_seconds",
         "A histogram, and OpenTelemetry has no observable histogram, so its buckets \
          stay on /metrics for the same reason as the two above. Its sum is bridged \
@@ -991,6 +1099,33 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sync_pull_histograms_summaries_reach_the_bridge() {
+        // The coverage test below matches a series by the stem of its name,
+        // and both ADR-175 histograms are in `NOT_BRIDGED` for their buckets,
+        // so it would pass with their sums and counts gone from the bridge.
+        // Those summaries are the only form of either histogram a collector
+        // sees, so they are named here one by one.
+        // Everything above the first test-only item: the instruments, and not
+        // this list of their names.
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
+        for name in [
+            "kimmy.sync.pull_seconds.serve",
+            "kimmy.sync.pull_seconds.wait",
+            "kimmy.sync.pull_seconds.apply",
+            "kimmy.sync.pulls",
+            "kimmy.sync.entry_wait_seconds",
+            "kimmy.sync.entry_waits",
+        ] {
+            assert_eq!(
+                source.matches(&format!("\"{name}\",")).count(),
+                1,
+                "`{name}` is not an instrument on the bridge"
+            );
+        }
+    }
 
     #[test]
     fn every_metrics_series_reaches_the_bridge() {

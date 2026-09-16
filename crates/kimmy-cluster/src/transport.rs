@@ -855,6 +855,9 @@ where
     // its horizon per origin rather than by the threshold alone.
     let mut limit = MAX_BATCH;
     let held = if replay_floor.is_some() { None } else { Some(mine.clone()) };
+    // From the ask to the answer, retry included (ADR-175). Read only for a
+    // window: a snapshot is not asked for here, and its pages are not a pull.
+    let asked = std::time::Instant::now();
     let mut answer = match repair {
         Some((collection, Repair::Snapshot)) => {
             if stalls.snapshot_resumes(their_node, Some(collection)) {
@@ -968,9 +971,30 @@ where
             // this point would resume a walk the position has moved on from.
             stalls.snapshot_forgotten(their_node, None);
             let last = entries.last().map(|entry| entry.stamp.hlc);
-            let outcome = engine
+            let served = asked.elapsed();
+            // The oldest entry this node lacked, and how long it had waited to
+            // be carried here (ADR-175). Lacked, not merely carried: a replay
+            // re-serves history this node holds, and a span it holds as state
+            // sits below its position (ADR-172), and either would read as a
+            // wait as old as the entry. The window is in stamp order, so the
+            // first such entry is the oldest. Taken before applying, so the
+            // clock is read when the batch arrived.
+            let now_ms = kimmy_storage::physical_now_ms();
+            let oldest_lacked = entries
+                .iter()
+                .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
+                .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
+            let applying = std::time::Instant::now();
+            let mut outcome = engine
                 .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            outcome.pull = Some(kimmy_storage::PullTiming {
+                serve: served,
+                wait: outcome.writer_wait,
+                apply: applying.elapsed().saturating_sub(outcome.writer_wait),
+                entries: entries.len(),
+                oldest_lacked,
+            });
             // The peer's tail was reached if the batch took the whole
             // window up to the vector the peer advertised. An entry
             // deferred above that vector does not change that: it lies

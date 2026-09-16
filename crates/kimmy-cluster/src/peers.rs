@@ -158,6 +158,207 @@ pub struct RoundReport {
     /// batch stopped at a collection this node lacks. A counter. Rising is
     /// a repair under way; it stops when the repair is done.
     pub repair_rounds: usize,
+    /// Where the tick's pulls spent their time, how long what they carried
+    /// had waited, and how each contact ended (ADR-175). Counters and
+    /// histograms, summed over the tick.
+    pub pulls: PullReport,
+}
+
+/// Upper bounds of `kimmy_sync_pull_seconds`, in microseconds (ADR-175).
+///
+/// A pull is bounded above by the tick that makes it — the default interval
+/// is five seconds, and a pull that would not fit what is left of it is not
+/// started (ADR-157) — and below by a converged window of a few entries on
+/// localhost, about a millisecond. A full 1,024-entry batch applied in
+/// 25–30 ms on a local benchmark (0.30.1's notes), and round 0310's drain
+/// fitted 22–23 full windows into a five-second tick, about 220 ms a pull.
+/// The bounds bracket both with room either side, and ten seconds catches a
+/// pull that overran the tick it was started in.
+pub const PULL_BUCKETS_US: [u64; 12] = [
+    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
+    5_000_000, 10_000_000,
+];
+
+/// Upper bounds of `kimmy_sync_entry_wait_seconds`, in microseconds
+/// (ADR-175).
+///
+/// An entry written just before a tick waits for the pull alone, a few
+/// milliseconds; one written just after waits the whole interval, five
+/// seconds by default; and one behind a backlog waits as long as the drain.
+/// So the bounds are dense below the interval, where one tick's cadence is
+/// read, and wide above it, where a backlog's age is, up to the hour.
+pub const ENTRY_WAIT_BUCKETS_US: [u64; 11] = [
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
+    300_000_000,
+    3_600_000_000,
+];
+
+/// A histogram as the loop gathers it: observations in each bucket, **not**
+/// cumulative, with an implicit `+Inf` the count covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Histogram<const N: usize> {
+    pub buckets: [u64; N],
+    pub count: u64,
+    pub sum_us: u64,
+}
+
+impl<const N: usize> Default for Histogram<N> {
+    fn default() -> Self {
+        Self { buckets: [0; N], count: 0, sum_us: 0 }
+    }
+}
+
+impl<const N: usize> Histogram<N> {
+    /// One observation against `bounds`, in microseconds.
+    pub fn observe(&mut self, value: Duration, bounds: &[u64; N]) {
+        let us = u64::try_from(value.as_micros()).unwrap_or(u64::MAX);
+        if let Some(slot) = bounds.iter().position(|upper| us <= *upper) {
+            self.buckets[slot] += 1;
+        }
+        self.count += 1;
+        self.sum_us = self.sum_us.saturating_add(us);
+    }
+
+    /// Fold in another histogram over the same bounds.
+    pub fn add(&mut self, other: &Self) {
+        for (into, from) in self.buckets.iter_mut().zip(other.buckets) {
+            *into += from;
+        }
+        self.count += other.count;
+        self.sum_us = self.sum_us.saturating_add(other.sum_us);
+    }
+}
+
+/// How a tick's contact with a peer ended (ADR-175): whether it left a
+/// backlog behind for the next tick, and if so what stopped the drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactEnd {
+    /// The last pull did not come back truncated: nothing more could be
+    /// pulled from this peer at once. The ordinary end. Not proof there is
+    /// nothing left — a batch stopped at a collection this node lacks ends
+    /// here too, and `kimmy_sync_entries_skipped_total` says so — and not
+    /// proof nothing is waiting: what the peer appends after its window was
+    /// served waits for the next tick.
+    CaughtUp,
+    /// Truncated, and the next pull would not have fitted in what was left
+    /// of the tick (ADR-157): a backlog carried into the next tick because
+    /// the tick's time ran out.
+    Budget,
+    /// Truncated with time left, at [`MAX_PULLS_PER_CONTACT`]: a backlog
+    /// carried because the contact made as many pulls as one may.
+    Ceiling,
+    /// A pull failed, which ends the contact however far it got.
+    Failed,
+}
+
+impl ContactEnd {
+    pub const COUNT: usize = 4;
+    pub const ALL: [ContactEnd; Self::COUNT] =
+        [Self::CaughtUp, Self::Budget, Self::Ceiling, Self::Failed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CaughtUp => "caught_up",
+            Self::Budget => "budget",
+            Self::Ceiling => "ceiling",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// What the tick's pulls measured (ADR-175). See [`PullTiming`](kimmy_storage::PullTiming).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PullReport {
+    /// The peer's walk and the wire, per pull.
+    pub serve: Histogram<{ PULL_BUCKETS_US.len() }>,
+    /// Waiting for this node's single writer while applying, per pull.
+    pub wait: Histogram<{ PULL_BUCKETS_US.len() }>,
+    /// Applying, less the wait, per pull.
+    pub apply: Histogram<{ PULL_BUCKETS_US.len() }>,
+    /// Entries the pulls carried. Against `apply`'s sum, the cost of one.
+    pub entries: u64,
+    /// How long the oldest entry this node lacked had waited when its pull
+    /// arrived, per pull that carried one.
+    pub entry_wait: Histogram<{ ENTRY_WAIT_BUCKETS_US.len() }>,
+    /// Pulls whose oldest lacked entry was stamped ahead of this node's
+    /// clock, and so could not be observed in `entry_wait`.
+    pub entry_wait_ahead: u64,
+    /// Contacts, by how they ended, in [`ContactEnd::ALL`] order.
+    pub contacts: [u64; ContactEnd::COUNT],
+}
+
+impl PullReport {
+    /// Fold in one pull.
+    pub fn pulled(&mut self, pull: &kimmy_storage::PullTiming) {
+        self.serve.observe(pull.serve, &PULL_BUCKETS_US);
+        self.wait.observe(pull.wait, &PULL_BUCKETS_US);
+        self.apply.observe(pull.apply, &PULL_BUCKETS_US);
+        self.entries += pull.entries as u64;
+        match pull.oldest_lacked {
+            Some(kimmy_storage::EntryWait::Waited(waited)) => {
+                self.entry_wait.observe(waited, &ENTRY_WAIT_BUCKETS_US)
+            }
+            Some(kimmy_storage::EntryWait::Ahead) => self.entry_wait_ahead += 1,
+            None => {}
+        }
+    }
+
+    /// Count one contact's end.
+    pub fn ended(&mut self, end: ContactEnd) {
+        self.contacts[end.slot()] += 1;
+    }
+
+    /// Fold in another report: a tick's, into a running total.
+    pub fn add(&mut self, other: &PullReport) {
+        for (into, from) in [
+            (&mut self.serve, &other.serve),
+            (&mut self.wait, &other.wait),
+            (&mut self.apply, &other.apply),
+        ] {
+            into.add(from);
+        }
+        self.entries += other.entries;
+        self.entry_wait.add(&other.entry_wait);
+        self.entry_wait_ahead += other.entry_wait_ahead;
+        for (into, from) in self.contacts.iter_mut().zip(other.contacts) {
+            *into += from;
+        }
+    }
+}
+
+/// What a contact does after a pull that succeeded (ADR-157, ADR-175).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterPull {
+    /// Pull from this peer again this tick.
+    Again,
+    /// The contact is over, and this is why.
+    End(ContactEnd),
+}
+
+/// Decide [`AfterPull`] from whether the pull came back `truncated`, whether
+/// another would `fit` in the tick, and how many `pulls` the contact has
+/// made. Out of the loop so the decision the `ended` label reports is one
+/// with a test of its own, and so the label cannot be decided apart from what
+/// the loop does.
+fn after_pull(truncated: bool, fits: bool, pulls: usize) -> AfterPull {
+    match (truncated, fits) {
+        (false, _) => AfterPull::End(ContactEnd::CaughtUp),
+        (true, false) => AfterPull::End(ContactEnd::Budget),
+        (true, true) if pulls < MAX_PULLS_PER_CONTACT => AfterPull::Again,
+        (true, true) => AfterPull::End(ContactEnd::Ceiling),
+    }
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -190,8 +391,9 @@ pub struct ReplicationConfig {
     /// answered. Discovery remains the bootstrap and the fallback.
     pub members: Option<Members>,
     /// Called after each sync round with the round's worst replication lag,
-    /// in seconds: how far behind in time this node is against the peers it
-    /// reached (ADR-122).
+    /// in milliseconds: how far behind in time this node is against the peers
+    /// it reached (ADR-122). Milliseconds since ADR-175: whole seconds,
+    /// truncated, could not read an effect of a few seconds.
     ///
     /// A callback rather than a metrics handle: the peer's version vector —
     /// the only thing lag can honestly be computed from — exists nowhere but
@@ -434,6 +636,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     match pulled {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
+                            if let Some(pull) = &outcome.pull {
+                                report.pulls.pulled(pull);
+                            }
                             health.succeeded(peer);
                             report.ddl_refused += outcome.ddl_refused;
                             report.ddl_declined += outcome.ddl_declined;
@@ -452,11 +657,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // check to fold in and would otherwise be
                             // counted as a skip on a tick that goes on to
                             // check.
-                            if outcome.truncated && contact.fits_before(deadline) {
-                                if contact.pulls < MAX_PULLS_PER_CONTACT {
+                            let fits = outcome.truncated && contact.fits_before(deadline);
+                            let ended = match after_pull(outcome.truncated, fits, contact.pulls) {
+                                AfterPull::Again => {
                                     draining.push_back(contact);
                                     continue;
                                 }
+                                AfterPull::End(ended) => ended,
+                            };
+                            // How the contact ended, counted once per contact
+                            // on the pull that ended it (ADR-175).
+                            report.pulls.ended(ended);
+                            if ended == ContactEnd::Ceiling {
                                 // Budget left and still truncated at the
                                 // ceiling (ADR-157's addendum). The contact
                                 // ends here as though the budget had run out,
@@ -625,6 +837,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // from a member with no peers, while its gauge
                             // served a value nothing had re-examined.
                             report.divergence_skips += 1;
+                            report.pulls.ended(ContactEnd::Failed);
                             if due {
                                 warn!(%peer, error = %e, failures, "sync round failed; backing off");
                             } else {
@@ -637,7 +850,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     }
                 }
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
-                    on_lag(lag_ms / 1_000);
+                    on_lag(lag_ms);
                 }
                 // Read every tick regardless of whether anything reports it,
                 // for the same reason the line above computes `report`
@@ -920,6 +1133,53 @@ async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_contact_ends_on_what_stopped_it() {
+        // ADR-175's `ended` label is this decision, so each arm is checked
+        // on its own: an untruncated pull ends the contact whatever else is
+        // true, a truncated one that would not fit is the budget, and one
+        // that would fit pulls again until the ceiling.
+        assert_eq!(after_pull(false, true, 1), AfterPull::End(ContactEnd::CaughtUp));
+        assert_eq!(
+            after_pull(false, false, MAX_PULLS_PER_CONTACT),
+            AfterPull::End(ContactEnd::CaughtUp)
+        );
+        assert_eq!(after_pull(true, false, 1), AfterPull::End(ContactEnd::Budget));
+        assert_eq!(
+            after_pull(true, false, MAX_PULLS_PER_CONTACT),
+            AfterPull::End(ContactEnd::Budget),
+            "out of time at the ceiling is still out of time"
+        );
+        assert_eq!(after_pull(true, true, MAX_PULLS_PER_CONTACT - 1), AfterPull::Again);
+        assert_eq!(
+            after_pull(true, true, MAX_PULLS_PER_CONTACT),
+            AfterPull::End(ContactEnd::Ceiling)
+        );
+    }
+
+    #[test]
+    fn an_entry_stamped_ahead_is_counted_and_not_observed_as_a_wait() {
+        // ADR-175: a wait that would be negative is clock skew, and folding
+        // it into the histogram as zero would read as an entry that arrived
+        // at once. It is counted apart instead, and a pull that carried
+        // nothing this node lacked is neither.
+        let pull = |oldest_lacked| kimmy_storage::PullTiming {
+            entries: 3,
+            oldest_lacked,
+            ..Default::default()
+        };
+        let mut report = PullReport::default();
+        report.pulled(&pull(Some(kimmy_storage::EntryWait::at(1_000, 900))));
+        report.pulled(&pull(None));
+        report.pulled(&pull(Some(kimmy_storage::EntryWait::at(1_000, 3_500))));
+
+        assert_eq!(report.entry_wait_ahead, 1, "{report:?}");
+        assert_eq!(report.entry_wait.count, 1, "only the real wait is observed: {report:?}");
+        assert_eq!(report.entry_wait.sum_us, 2_500_000, "{report:?}");
+        assert_eq!(report.serve.count, 3, "every pull is a pull, whatever it carried: {report:?}");
+        assert_eq!(report.entries, 9, "{report:?}");
+    }
 
     #[tokio::test]
     async fn resolution_drops_this_node() {

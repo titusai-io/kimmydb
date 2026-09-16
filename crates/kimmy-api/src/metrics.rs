@@ -214,7 +214,8 @@ pub struct MetricsSnapshot {
     pub webhook_invalidated: u64,
     pub webhook_backlog_secs: u64,
     pub cluster_members: u64,
-    pub replication_lag_secs: u64,
+    /// Milliseconds, since ADR-175; rendered and bridged as seconds.
+    pub replication_lag_ms: u64,
     /// Anti-entropy rounds that failed, peers currently backed off, and
     /// replicated schema changes skipped (ADR-123). The failure signals the
     /// lag gauge cannot carry: a failed round reports no lag.
@@ -267,6 +268,11 @@ pub struct MetricsSnapshot {
     /// oplog from below this node's position or pulling its snapshot, on
     /// the strength of a confirmed divergence or a stopped batch.
     pub sync_repair_rounds: u64,
+    /// Where sync pulls spent their time, how long what they carried had
+    /// waited, and how contacts ended (ADR-175): the loop's report, summed
+    /// since start. The histograms' buckets are on `/metrics` alone; their
+    /// sums and counts, and the counters, are what the bridge carries.
+    pub sync_pulls: kimmy_cluster::PullReport,
     /// Worst runtime scheduling delay since the last scrape, microseconds.
     pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
@@ -305,7 +311,13 @@ pub struct Metrics {
     /// buckets; its count is `backups`.
     backup_buckets: [AtomicU64; BACKUP_BUCKETS_US.len()],
     backup_sum_us: AtomicU64,
-    replication_lag_secs: AtomicU64,
+    /// Milliseconds (ADR-175).
+    replication_lag_ms: AtomicU64,
+    /// Every sync tick's [`kimmy_cluster::PullReport`], summed (ADR-175). A
+    /// mutex over the loop's own shape rather than an atomic per bucket: some
+    /// fifty numbers arrive together once a tick and are read together once
+    /// a scrape, and neither holds it for longer than a copy.
+    sync_pulls: parking_lot::Mutex<kimmy_cluster::PullReport>,
     /// Pushed by the replication loop after every sync tick (ADR-123): two
     /// counters and a level. What a wedged round looks like from outside,
     /// which the lag gauge — set only by a round that succeeded — cannot
@@ -403,7 +415,8 @@ impl Default for Metrics {
             latency_count: AtomicU64::new(0),
             backup_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_sum_us: AtomicU64::new(0),
-            replication_lag_secs: AtomicU64::new(0),
+            replication_lag_ms: AtomicU64::new(0),
+            sync_pulls: parking_lot::Mutex::new(kimmy_cluster::PullReport::default()),
             sync_failures: AtomicU64::new(0),
             sync_peers_backing_off: AtomicU64::new(0),
             sync_ddl_refused: AtomicU64::new(0),
@@ -553,8 +566,11 @@ impl Metrics {
     /// this out rather than guessing. Zero when caught up; grows with the
     /// clock while a backlog drains, which the span of the missing history
     /// did not (ADR-122).
-    pub fn set_replication_lag_secs(&self, secs: u64) {
-        self.replication_lag_secs.store(secs, Ordering::Relaxed);
+    ///
+    /// Milliseconds, and rendered to the millisecond (ADR-175). It was whole
+    /// seconds, truncated, which cannot read an effect of a few seconds.
+    pub fn set_replication_lag_ms(&self, ms: u64) {
+        self.replication_lag_ms.store(ms, Ordering::Relaxed);
     }
 
     /// One sync tick of the replication loop: how many rounds failed, how
@@ -622,6 +638,7 @@ impl Metrics {
             round.entries_skipped_beyond_advertised as u64,
         );
         self.sync_repair_rounds.fetch_add(round.repair_rounds as u64, Ordering::Relaxed);
+        self.sync_pulls.lock().add(&round.pulls);
     }
 
     /// Count what a batch left rather than took (ADR-148), on the series a
@@ -829,7 +846,7 @@ impl Metrics {
             webhook_invalidated: self.get(&self.webhook_invalidated),
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: self.get(&self.cluster_members),
-            replication_lag_secs: self.get(&self.replication_lag_secs),
+            replication_lag_ms: self.get(&self.replication_lag_ms),
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
@@ -847,6 +864,7 @@ impl Metrics {
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
+            sync_pulls: *self.sync_pulls.lock(),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -932,6 +950,9 @@ impl Metrics {
                 None => (0, 0, 0, 0, 0, [0; 4]),
             };
         let [t_connect, t_timeout, t_reset, t_other] = transport;
+        // Copied once, so the counters and the histograms below are the same
+        // ticks' worth.
+        let pulls = *self.sync_pulls.lock();
         let mut out = format!(
             "# HELP kimmy_databases Number of databases.\n\
              # TYPE kimmy_databases gauge\n\
@@ -1029,7 +1050,7 @@ impl Metrics {
              # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.\n\
              # TYPE kimmy_cluster_members gauge\n\
              kimmy_cluster_members {cluster}\n\
-             # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
+             # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round, to the millisecond. Measured after each round against the vector the peer advertised when its pull opened, so it reads 0 once a round's pull reached that vector - including while entries the peer wrote since wait up to cluster.sync_interval_secs for the next round. Non-zero means a round ended with a pull still truncated: a backlog deeper than a tick could drain. 0 when clustering is off.\n\
              # TYPE kimmy_replication_lag_seconds gauge\n\
              kimmy_replication_lag_seconds {lag}\n\
              # HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising while kimmy_replication_lag_seconds sits at 0 is a wedged peer, not a healthy one - a failed round reports no lag.\n\
@@ -1071,6 +1092,18 @@ impl Metrics {
              # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.\n\
              # TYPE kimmy_sync_repair_rounds_total counter\n\
              kimmy_sync_repair_rounds_total {sync_repair_rounds}\n\
+             # HELP kimmy_sync_pulled_entries_total Entries sync pulls carried from peers, whatever became of each - applied, superseded, a schema change or left for a later window. Divide the growth of kimmy_sync_pull_seconds_sum{{phase=\"apply\"}} by the growth of this for what applying one entry costs, whatever size the batches were.\n\
+             # TYPE kimmy_sync_pulled_entries_total counter\n\
+             kimmy_sync_pulled_entries_total {sync_pulled_entries}\n\
+             # HELP kimmy_sync_entry_wait_ahead_total Sync pulls whose oldest entry this node lacked carried a timestamp later than this node's clock read when the batch arrived, so its wait could not be taken and is not in kimmy_sync_entry_wait_seconds. A peer's clock, or one its stamps witnessed, runs ahead of this node's; rising steadily is clock skew between members, and the wait histogram is under-reading by the pulls counted here.\n\
+             # TYPE kimmy_sync_entry_wait_ahead_total counter\n\
+             kimmy_sync_entry_wait_ahead_total {sync_entry_wait_ahead}\n\
+             # HELP kimmy_sync_contacts_total Contacts with a peer in a sync tick, by how they ended. caught_up: the last pull did not come back truncated, so nothing more could be pulled at once. budget: a pull came back truncated and the next would not have fitted in what was left of cluster.sync_interval_secs, so a backlog was carried into the next tick. ceiling: truncated with time left, after the most pulls one contact may make. failed: a pull failed. budget rising is a backlog outliving a tick; kimmy_sync_pull_seconds says whether the tick's time went to the peer serving, to waiting for this node's writer, or to applying.\n\
+             # TYPE kimmy_sync_contacts_total counter\n\
+             kimmy_sync_contacts_total{{ended=\"caught_up\"}} {sync_ended_caught_up}\n\
+             kimmy_sync_contacts_total{{ended=\"budget\"}} {sync_ended_budget}\n\
+             kimmy_sync_contacts_total{{ended=\"ceiling\"}} {sync_ended_ceiling}\n\
+             kimmy_sync_contacts_total{{ended=\"failed\"}} {sync_ended_failed}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
@@ -1143,7 +1176,7 @@ impl Metrics {
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = self.get(&self.cluster_members),
-            lag = self.get(&self.replication_lag_secs),
+            lag = self.get(&self.replication_lag_ms) as f64 / 1e3,
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
@@ -1159,6 +1192,12 @@ impl Metrics {
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
+            sync_pulled_entries = pulls.entries,
+            sync_entry_wait_ahead = pulls.entry_wait_ahead,
+            sync_ended_caught_up = pulls.contacts[kimmy_cluster::ContactEnd::CaughtUp.slot()],
+            sync_ended_budget = pulls.contacts[kimmy_cluster::ContactEnd::Budget.slot()],
+            sync_ended_ceiling = pulls.contacts[kimmy_cluster::ContactEnd::Ceiling.slot()],
+            sync_ended_failed = pulls.contacts[kimmy_cluster::ContactEnd::Failed.slot()],
             frozen = kimmy_cluster::FROZEN_CONTACTS,
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
@@ -1172,6 +1211,7 @@ impl Metrics {
         );
         self.render_latency(&mut out);
         self.render_backup_duration(&mut out);
+        render_sync_pulls(&mut out, &pulls);
         out
     }
 
@@ -1227,6 +1267,56 @@ impl Metrics {
         let _ = writeln!(out, "kimmy_request_duration_seconds_sum {sum}");
         let _ = writeln!(out, "kimmy_request_duration_seconds_count {count}");
     }
+}
+
+/// The two sync-pull histograms (ADR-175), in Prometheus's cumulative-bucket
+/// form. Every phase is rendered whether or not a pull has run, for the reason
+/// every holder of the writer-hold histogram is: a dashboard split by phase
+/// must not gain a series the first time a peer answers.
+fn render_sync_pulls(out: &mut String, pulls: &kimmy_cluster::PullReport) {
+    use std::fmt::Write;
+
+    out.push_str(
+        "# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. A snapshot page is not a pull and is not observed here.\n\
+         # TYPE kimmy_sync_pull_seconds histogram\n",
+    );
+    for (phase, histogram) in
+        [("serve", &pulls.serve), ("wait", &pulls.wait), ("apply", &pulls.apply)]
+    {
+        let mut cumulative = 0u64;
+        for (slot, upper) in kimmy_cluster::PULL_BUCKETS_US.iter().enumerate() {
+            cumulative += histogram.buckets[slot];
+            let le = *upper as f64 / 1e6;
+            let _ = writeln!(
+                out,
+                "kimmy_sync_pull_seconds_bucket{{phase=\"{phase}\",le=\"{le}\"}} {cumulative}"
+            );
+        }
+        let count = histogram.count;
+        let sum = histogram.sum_us as f64 / 1e6;
+        let _ = writeln!(
+            out,
+            "kimmy_sync_pull_seconds_bucket{{phase=\"{phase}\",le=\"+Inf\"}} {count}"
+        );
+        let _ = writeln!(out, "kimmy_sync_pull_seconds_sum{{phase=\"{phase}\"}} {sum}");
+        let _ = writeln!(out, "kimmy_sync_pull_seconds_count{{phase=\"{phase}\"}} {count}");
+    }
+
+    out.push_str(
+        "# HELP kimmy_sync_entry_wait_seconds How long the oldest entry a sync pull carried that this node lacked had waited when the pull arrived: from its origin's timestamp to this node's clock. The time an entry spends before any pull takes it - waiting for the next tick, or behind a backlog - which kimmy_sync_pull_seconds does not see. Crosses member clocks, so skew shifts it; a wait that would be negative is counted in kimmy_sync_entry_wait_ahead_total instead.\n\
+         # TYPE kimmy_sync_entry_wait_seconds histogram\n",
+    );
+    let wait = &pulls.entry_wait;
+    let mut cumulative = 0u64;
+    for (slot, upper) in kimmy_cluster::ENTRY_WAIT_BUCKETS_US.iter().enumerate() {
+        cumulative += wait.buckets[slot];
+        let le = *upper as f64 / 1e6;
+        let _ = writeln!(out, "kimmy_sync_entry_wait_seconds_bucket{{le=\"{le}\"}} {cumulative}");
+    }
+    let sum = wait.sum_us as f64 / 1e6;
+    let _ = writeln!(out, "kimmy_sync_entry_wait_seconds_bucket{{le=\"+Inf\"}} {}", wait.count);
+    let _ = writeln!(out, "kimmy_sync_entry_wait_seconds_sum {sum}");
+    let _ = writeln!(out, "kimmy_sync_entry_wait_seconds_count {}", wait.count);
 }
 
 /// The writer-wait histogram, in Prometheus's cumulative-bucket form
@@ -1304,6 +1394,31 @@ mod tests {
     /// the divergence check's age is computed at the read, from an instant
     /// the loop reported (ADR-154), so the instant recorded here is placed
     /// relative to it.
+    /// A tick's pull report: one pull observed at `[serve, wait, apply]`
+    /// milliseconds carrying `entries`, its oldest lacked entry having waited
+    /// `waited` milliseconds, `ahead` pulls that could not observe one, and
+    /// contacts ended in `ContactEnd::ALL` order.
+    fn pulls_observed(
+        [serve, wait, apply]: [u64; 3],
+        entries: usize,
+        waited: Option<u64>,
+        ahead: u64,
+        contacts: [u64; kimmy_cluster::ContactEnd::COUNT],
+    ) -> kimmy_cluster::PullReport {
+        let mut report = kimmy_cluster::PullReport::default();
+        report.pulled(&kimmy_storage::PullTiming {
+            serve: Duration::from_millis(serve),
+            wait: Duration::from_millis(wait),
+            apply: Duration::from_millis(apply),
+            entries,
+            oldest_lacked: waited
+                .map(|ms| kimmy_storage::EntryWait::Waited(Duration::from_millis(ms))),
+        });
+        report.entry_wait_ahead += ahead;
+        report.contacts = contacts;
+        report
+    }
+
     fn every_counter_distinct(now: Instant) -> Metrics {
         let m = Metrics::default();
         // 2 × 2xx, 3 × 4xx (one each of 401/403/429), 4 × 5xx, and one 304
@@ -1333,7 +1448,9 @@ mod tests {
         m.record_webhook_delivery(false, 0);
         m.set_webhook_gauges(15, 16, 17);
         m.set_cluster_members(18);
-        m.set_replication_lag_secs(19);
+        // Not a whole number of seconds: the gauge renders milliseconds
+        // (ADR-175), and a render that truncated would print 19.
+        m.set_replication_lag_ms(19_250);
         // Two ticks: the counters accumulate, the backoff level, the
         // divergence count and the check's instant are each replaced. A
         // render that printed the first tick's level, or a level that
@@ -1356,6 +1473,7 @@ mod tests {
             entries_skipped_unknown_collection: 72,
             entries_skipped_beyond_advertised: 74,
             repair_rounds: 76,
+            pulls: pulls_observed([3, 40, 700], 1_024, Some(1_500), 115, [101, 102, 103, 104]),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 3,
@@ -1371,6 +1489,7 @@ mod tests {
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
             repair_rounds: 1,
+            pulls: pulls_observed([8, 200, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
         });
         for _ in 0..20 {
             m.record_tls_reload(true);
@@ -1690,9 +1809,9 @@ kimmy_webhook_backlog_seconds 17
 # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.
 # TYPE kimmy_cluster_members gauge
 kimmy_cluster_members 18
-# HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.
+# HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round, to the millisecond. Measured after each round against the vector the peer advertised when its pull opened, so it reads 0 once a round's pull reached that vector - including while entries the peer wrote since wait up to cluster.sync_interval_secs for the next round. Non-zero means a round ended with a pull still truncated: a backlog deeper than a tick could drain. 0 when clustering is off.
 # TYPE kimmy_replication_lag_seconds gauge
-kimmy_replication_lag_seconds 19
+kimmy_replication_lag_seconds 19.25
 # HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising while kimmy_replication_lag_seconds sits at 0 is a wedged peer, not a healthy one - a failed round reports no lag.
 # TYPE kimmy_sync_failures_total counter
 kimmy_sync_failures_total 23
@@ -1732,6 +1851,18 @@ kimmy_sync_held_marks 54
 # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.
 # TYPE kimmy_sync_repair_rounds_total counter
 kimmy_sync_repair_rounds_total 77
+# HELP kimmy_sync_pulled_entries_total Entries sync pulls carried from peers, whatever became of each - applied, superseded, a schema change or left for a later window. Divide the growth of kimmy_sync_pull_seconds_sum{phase=\"apply\"} by the growth of this for what applying one entry costs, whatever size the batches were.
+# TYPE kimmy_sync_pulled_entries_total counter
+kimmy_sync_pulled_entries_total 1105
+# HELP kimmy_sync_entry_wait_ahead_total Sync pulls whose oldest entry this node lacked carried a timestamp later than this node's clock read when the batch arrived, so its wait could not be taken and is not in kimmy_sync_entry_wait_seconds. A peer's clock, or one its stamps witnessed, runs ahead of this node's; rising steadily is clock skew between members, and the wait histogram is under-reading by the pulls counted here.
+# TYPE kimmy_sync_entry_wait_ahead_total counter
+kimmy_sync_entry_wait_ahead_total 117
+# HELP kimmy_sync_contacts_total Contacts with a peer in a sync tick, by how they ended. caught_up: the last pull did not come back truncated, so nothing more could be pulled at once. budget: a pull came back truncated and the next would not have fitted in what was left of cluster.sync_interval_secs, so a backlog was carried into the next tick. ceiling: truncated with time left, after the most pulls one contact may make. failed: a pull failed. budget rising is a backlog outliving a tick; kimmy_sync_pull_seconds says whether the tick's time went to the peer serving, to waiting for this node's writer, or to applying.
+# TYPE kimmy_sync_contacts_total counter
+kimmy_sync_contacts_total{ended=\"caught_up\"} 111
+kimmy_sync_contacts_total{ended=\"budget\"} 112
+kimmy_sync_contacts_total{ended=\"ceiling\"} 113
+kimmy_sync_contacts_total{ended=\"failed\"} 114
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
 # TYPE kimmy_tls_reloads_total counter
 kimmy_tls_reloads_total{outcome=\"ok\"} 20
@@ -1799,6 +1930,69 @@ kimmy_backup_duration_seconds_bucket{le=\"3600\"} 1
 kimmy_backup_duration_seconds_bucket{le=\"+Inf\"} 1
 kimmy_backup_duration_seconds_sum 42
 kimmy_backup_duration_seconds_count 1
+# HELP kimmy_sync_pull_seconds Where a sync pull's time went, by phase, one observation per pull of a peer's oplog. serve: from asking the peer for a window to holding it - the peer walking its oplog and the wire. wait: applying the window, waiting for this node's single writer behind whatever else was writing. apply: applying the window less that wait - every entry's work, the commits and their fsync. The three add up to the pull, and each is a different fix. A snapshot page is not a pull and is not observed here.
+# TYPE kimmy_sync_pull_seconds histogram
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.001\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.005\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.01\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.025\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.05\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.1\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.25\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"1\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"2.5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"+Inf\"} 2
+kimmy_sync_pull_seconds_sum{phase=\"serve\"} 0.011
+kimmy_sync_pull_seconds_count{phase=\"serve\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.001\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.005\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.01\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.025\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.05\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.1\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.25\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"1\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"2.5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"+Inf\"} 2
+kimmy_sync_pull_seconds_sum{phase=\"wait\"} 0.24
+kimmy_sync_pull_seconds_count{phase=\"wait\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.001\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.005\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.01\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.025\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.05\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.1\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.25\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.5\"} 0
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"1\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"2.5\"} 1
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"5\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"10\"} 2
+kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"+Inf\"} 2
+kimmy_sync_pull_seconds_sum{phase=\"apply\"} 3.7
+kimmy_sync_pull_seconds_count{phase=\"apply\"} 2
+# HELP kimmy_sync_entry_wait_seconds How long the oldest entry a sync pull carried that this node lacked had waited when the pull arrived: from its origin's timestamp to this node's clock. The time an entry spends before any pull takes it - waiting for the next tick, or behind a backlog - which kimmy_sync_pull_seconds does not see. Crosses member clocks, so skew shifts it; a wait that would be negative is counted in kimmy_sync_entry_wait_ahead_total instead.
+# TYPE kimmy_sync_entry_wait_seconds histogram
+kimmy_sync_entry_wait_seconds_bucket{le=\"0.1\"} 0
+kimmy_sync_entry_wait_seconds_bucket{le=\"0.25\"} 0
+kimmy_sync_entry_wait_seconds_bucket{le=\"0.5\"} 0
+kimmy_sync_entry_wait_seconds_bucket{le=\"1\"} 0
+kimmy_sync_entry_wait_seconds_bucket{le=\"2\"} 1
+kimmy_sync_entry_wait_seconds_bucket{le=\"5\"} 1
+kimmy_sync_entry_wait_seconds_bucket{le=\"10\"} 1
+kimmy_sync_entry_wait_seconds_bucket{le=\"30\"} 1
+kimmy_sync_entry_wait_seconds_bucket{le=\"60\"} 2
+kimmy_sync_entry_wait_seconds_bucket{le=\"300\"} 2
+kimmy_sync_entry_wait_seconds_bucket{le=\"3600\"} 2
+kimmy_sync_entry_wait_seconds_bucket{le=\"+Inf\"} 2
+kimmy_sync_entry_wait_seconds_sum 46.5
+kimmy_sync_entry_wait_seconds_count 2
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -1865,7 +2059,7 @@ kimmy_backup_duration_seconds_count 1
         ));
         expect(&format!("kimmy_webhook_backlog_seconds {}\n", s.webhook_backlog_secs));
         expect(&format!("kimmy_cluster_members {}\n", s.cluster_members));
-        expect(&format!("kimmy_replication_lag_seconds {}\n", s.replication_lag_secs));
+        expect(&format!("kimmy_replication_lag_seconds {}\n", s.replication_lag_ms as f64 / 1e3));
         expect(&format!("kimmy_sync_failures_total {}\n", s.sync_failures));
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
@@ -1902,6 +2096,31 @@ kimmy_backup_duration_seconds_count 1
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
         expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
+        expect(&format!("kimmy_sync_pulled_entries_total {}\n", s.sync_pulls.entries));
+        expect(&format!("kimmy_sync_entry_wait_ahead_total {}\n", s.sync_pulls.entry_wait_ahead));
+        for end in kimmy_cluster::ContactEnd::ALL {
+            expect(&format!(
+                "kimmy_sync_contacts_total{{ended=\"{}\"}} {}\n",
+                end.label(),
+                s.sync_pulls.contacts[end.slot()]
+            ));
+        }
+        for (phase, h) in [
+            ("serve", s.sync_pulls.serve),
+            ("wait", s.sync_pulls.wait),
+            ("apply", s.sync_pulls.apply),
+        ] {
+            expect(&format!(
+                "kimmy_sync_pull_seconds_sum{{phase=\"{phase}\"}} {}\n",
+                h.sum_us as f64 / 1e6
+            ));
+            expect(&format!("kimmy_sync_pull_seconds_count{{phase=\"{phase}\"}} {}\n", h.count));
+        }
+        expect(&format!(
+            "kimmy_sync_entry_wait_seconds_sum {}\n",
+            s.sync_pulls.entry_wait.sum_us as f64 / 1e6
+        ));
+        expect(&format!("kimmy_sync_entry_wait_seconds_count {}\n", s.sync_pulls.entry_wait.count));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
             "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
@@ -1954,6 +2173,57 @@ kimmy_backup_duration_seconds_count 1
     }
 
     #[test]
+    fn the_lag_gauge_reads_to_the_millisecond() {
+        // ADR-175: the loop divided milliseconds by a thousand into an integer
+        // before this ever saw them, so every reading was a whole second,
+        // truncated, and an effect of a few seconds could not be read.
+        let m = Metrics::default();
+        m.set_replication_lag_ms(6_384);
+        let out = m.render();
+        assert!(out.contains("kimmy_replication_lag_seconds 6.384\n"), "{out}");
+        assert_eq!(m.snapshot().replication_lag_ms, 6_384, "the bridge reads the same value");
+    }
+
+    #[test]
+    fn each_ticks_pulls_land_in_their_own_phase_label_and_bucket() {
+        // Three phases and four contact ends share one shape, so a phase or
+        // a label rendered from its neighbour's row compiles and reads
+        // plausibly. Every value here differs from every other, and two
+        // ticks must add rather than replace.
+        let m = Metrics::default();
+        let tick = |serve, wait, apply, contacts| kimmy_cluster::RoundReport {
+            pulls: pulls_observed([serve, wait, apply], 10, Some(700), 0, contacts),
+            ..Default::default()
+        };
+        m.record_sync_round(&tick(2, 30, 400, [1, 2, 3, 4]));
+        m.record_sync_round(&tick(2, 30, 400, [10, 20, 30, 40]));
+
+        let out = m.render();
+        for line in [
+            "kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.005\"} 2\n",
+            "kimmy_sync_pull_seconds_bucket{phase=\"serve\",le=\"0.001\"} 0\n",
+            "kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.025\"} 0\n",
+            "kimmy_sync_pull_seconds_bucket{phase=\"wait\",le=\"0.05\"} 2\n",
+            "kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.25\"} 0\n",
+            "kimmy_sync_pull_seconds_bucket{phase=\"apply\",le=\"0.5\"} 2\n",
+            "kimmy_sync_pull_seconds_sum{phase=\"serve\"} 0.004\n",
+            "kimmy_sync_pull_seconds_sum{phase=\"wait\"} 0.06\n",
+            "kimmy_sync_pull_seconds_sum{phase=\"apply\"} 0.8\n",
+            "kimmy_sync_pull_seconds_count{phase=\"apply\"} 2\n",
+            "kimmy_sync_pulled_entries_total 20\n",
+            "kimmy_sync_entry_wait_seconds_bucket{le=\"0.5\"} 0\n",
+            "kimmy_sync_entry_wait_seconds_bucket{le=\"1\"} 2\n",
+            "kimmy_sync_entry_wait_seconds_sum 1.4\n",
+            "kimmy_sync_contacts_total{ended=\"caught_up\"} 11\n",
+            "kimmy_sync_contacts_total{ended=\"budget\"} 22\n",
+            "kimmy_sync_contacts_total{ended=\"ceiling\"} 33\n",
+            "kimmy_sync_contacts_total{ended=\"failed\"} 44\n",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    #[test]
     fn the_render_is_parseable_prometheus_text() {
         // Every series needs its HELP and TYPE, and every sample line must be
         // `name value`. A scrape failing on a malformed line loses the whole
@@ -1980,10 +2250,14 @@ kimmy_backup_duration_seconds_count 1
         // buckets, +Inf, sum and count; the writer wait's 8 buckets, +Inf,
         // sum and count (ADR-151); and the writer hold's 7 buckets, +Inf,
         // sum and count for each of the twelve holders (ADR-159); and the
-        // backup duration's 10 buckets, +Inf, sum and count (ADR-170).
+        // backup duration's 10 buckets, +Inf, sum and count (ADR-170). Since
+        // ADR-175, six more scalars (pulled entries, clock-ahead pulls, four
+        // contact ends), the pull histogram's 12 buckets, +Inf, sum and count
+        // for each of three phases, and the entry wait's 11 buckets, +Inf,
+        // sum and count.
         assert_eq!(
             samples,
-            104 + 10 * kimmy_storage::WriterHolder::COUNT,
+            104 + 6 + 3 * 15 + 14 + 10 * kimmy_storage::WriterHolder::COUNT,
             "expected one sample per series: {out}"
         );
     }
@@ -2110,7 +2384,7 @@ kimmy_backup_duration_seconds_count 1
         // A non-zero value is the only one that distinguishes the two.
         let m = Metrics::default();
         let now = Instant::now() + Duration::from_secs(100);
-        m.set_replication_lag_secs(7);
+        m.set_replication_lag_ms(7_000);
         m.set_cluster_members(2);
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 1,
@@ -2126,6 +2400,7 @@ kimmy_backup_duration_seconds_count 1
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
+            pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 2,
@@ -2141,6 +2416,7 @@ kimmy_backup_duration_seconds_count 1
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
+            pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_tls_reload(true);
         m.record_tls_reload(false);
@@ -2218,6 +2494,7 @@ kimmy_backup_duration_seconds_count 1
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
+            pulls: kimmy_cluster::PullReport::default(),
         });
         let out = m.render();
         assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
@@ -2261,6 +2538,7 @@ kimmy_backup_duration_seconds_count 1
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
+            pulls: kimmy_cluster::PullReport::default(),
         };
         let age_in = |out: &str| -> u64 {
             out.lines()

@@ -415,6 +415,48 @@ pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+thread_local! {
+    /// What [`metered_writer_wait`] has gathered on this thread so far, or
+    /// `None` outside one.
+    static WRITER_WAIT_METER: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` and say how long it spent waiting for the single writer, across
+/// every time it took it (ADR-175).
+///
+/// The engine-wide wait histogram (ADR-151) cannot answer that for one
+/// caller: every writer on the node lands in it, so a replicated batch that
+/// queued behind a client's bulk and a client's bulk that queued behind the
+/// batch are the same observation. A thread-local rather than a field on the
+/// transaction, because a batch takes the writer from more places than one —
+/// each run, each schema change it records, and the shared flush a coalesced
+/// commit waits on — and every one of them waits at the same gate. The storage
+/// work under `f` is synchronous, and [`blocking`] runs its closure on the
+/// thread it was called from, so every wait `f` makes happens on this thread.
+///
+/// Nested calls each see their own waits, and the outer one sees the inner
+/// one's too.
+pub fn metered_writer_wait<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
+    let outer = WRITER_WAIT_METER.with(|m| m.replace(Some(std::time::Duration::ZERO)));
+    let value = f();
+    let waited = WRITER_WAIT_METER.with(|m| m.replace(outer)).unwrap_or_default();
+    if let Some(outer) = outer {
+        WRITER_WAIT_METER.with(|m| m.set(Some(outer + waited)));
+    }
+    (value, waited)
+}
+
+/// Add a wait for the writer to the meter this thread is running under, if
+/// any.
+fn meter_writer_wait(waited: std::time::Duration) {
+    WRITER_WAIT_METER.with(|m| {
+        if let Some(sofar) = m.get() {
+            m.set(Some(sofar + waited));
+        }
+    });
+}
+
 /// The shared-fsync barrier behind [`DurabilityClass::Coalesced`].
 ///
 /// No background thread and no handle to the engine: the committers
@@ -1851,6 +1893,7 @@ impl Engine {
         });
         let waited = waited_from.elapsed();
         self.record_writer_wait(waited);
+        meter_writer_wait(waited);
         let Some(gate) = gate else {
             self.writer_wait_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
@@ -1968,8 +2011,11 @@ impl Engine {
         // (ADR-159). This is the one path that takes the writer without
         // opening a counted transaction, which is why it was the one hold
         // nothing measured at all: not mislabelled, absent.
+        let waited_from = std::time::Instant::now();
+        let gate = blocking(|| self.writer_gate.lock());
+        meter_writer_wait(waited_from.elapsed());
         let _gate = WriterHold {
-            gate: Some(blocking(|| self.writer_gate.lock())),
+            gate: Some(gate),
             engine: self,
             held_from: std::time::Instant::now(),
             holder: WriterHolder::Durability,

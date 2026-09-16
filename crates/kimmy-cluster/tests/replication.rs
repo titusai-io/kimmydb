@@ -4882,3 +4882,241 @@ async fn while_one_member_keeps_writing_the_count_half_against_it_stays_quiet() 
         assert!(outcome.count_probe_deferred, "round {round}: deferred, not skipped");
     }
 }
+
+// Where a pull's time goes (ADR-175)
+//
+// Each series is proven by making the one thing it measures slow and seeing
+// that series, and not its neighbours, move. A timing that reads small is the
+// failure this guards against: it is indistinguishable from a healthy one.
+
+/// How long a slowed phase must read, and how long the others may: far
+/// enough apart that a loaded machine does not blur them.
+const SLOW: Duration = Duration::from_millis(400);
+const FLOOR: Duration = Duration::from_millis(350);
+
+/// A plain TCP relay to `target` that holds every chunk the far side sends
+/// back for `delay` before passing it on. The TLS inside is untouched: it is
+/// a slow wire, not a party to the conversation.
+async fn slow_relay(target: std::net::SocketAddr, delay: Duration) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(server) = TcpStream::connect(target).await else { return };
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                let up = async { tokio::io::copy(&mut cr, &mut sw).await.map(drop) };
+                let down = async {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = sr.read(&mut buf).await?;
+                        if n == 0 {
+                            return Ok::<(), std::io::Error>(());
+                        }
+                        tokio::time::sleep(delay).await;
+                        cw.write_all(&buf[..n]).await?;
+                    }
+                };
+                let _ = tokio::join!(up, down);
+            });
+        }
+    });
+    addr
+}
+
+/// A source with `n` documents written, and an empty member to pull them.
+async fn a_source_holding(n: usize) -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert_many(&ca, (0..n).map(|i| doc! { "_id": i as i64 }).collect()).unwrap();
+    (a, b)
+}
+
+#[tokio::test]
+async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
+    let (a, b) = a_source_holding(50).await;
+
+    // Something else holds the puller's writer for twice `SLOW` from before
+    // the pull starts, so whatever the handshake costs, the batch still
+    // queues for well past the floor.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let engine = Arc::clone(&b.engine);
+    let holder = std::thread::spawn(move || {
+        let _hold = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+        held_tx.send(()).unwrap();
+        std::thread::sleep(2 * SLOW);
+    });
+    held_rx.recv().unwrap();
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
+    holder.join().unwrap();
+    let pull = outcome.pull.expect("a window was pulled");
+
+    assert!(pull.wait >= FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
+    assert!(pull.apply < FLOOR, "and is not also counted as applying: {pull:?}");
+    assert!(pull.serve < FLOOR, "nor as serving: {pull:?}");
+    assert_eq!(pull.entries, 51, "the creation and the fifty documents: {pull:?}");
+}
+
+#[tokio::test]
+async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
+    let (a, b) = a_source_holding(50).await;
+    // Every commit on the puller waits `SLOW` for the shared flush: work
+    // the batch does after taking the writer, not a wait for it.
+    b.engine.set_durability(kimmy_storage::DurabilityClass::Coalesced, SLOW);
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
+    let pull = outcome.pull.expect("a window was pulled");
+
+    assert!(pull.apply >= FLOOR, "a slow commit is the apply phase: {pull:?}");
+    assert!(pull.wait < FLOOR, "not a wait for the writer: {pull:?}");
+    assert!(pull.serve < FLOOR, "nor serving: {pull:?}");
+}
+
+#[tokio::test]
+async fn a_pull_from_a_slow_peer_says_so_in_serve() {
+    let (a, b) = a_source_holding(50).await;
+    let slow = slow_relay(a.addr, SLOW).await;
+
+    let outcome = sync_once(&b.engine, slow, SECRET, None).await.expect("pull");
+    let pull = outcome.pull.expect("a window was pulled");
+
+    assert!(pull.serve >= FLOOR, "a slow answer is the serve phase: {pull:?}");
+    assert!(pull.wait < FLOOR, "{pull:?}");
+    assert!(pull.apply < FLOOR, "{pull:?}");
+}
+
+#[tokio::test]
+async fn a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited() {
+    let (a, b) = a_source_holding(10).await;
+    tokio::time::sleep(SLOW).await;
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
+    let pull = outcome.pull.expect("a window was pulled");
+    match pull.oldest_lacked {
+        Some(kimmy_storage::EntryWait::Waited(waited)) => {
+            assert!(waited >= FLOOR, "written {SLOW:?} before the pull: {pull:?}")
+        }
+        other => panic!("the oldest lacked entry's wait was not taken: {other:?}"),
+    }
+
+    // Fresh writes, pulled at once, read a wait far shorter: the reading is
+    // the entries' age, not something the round always adds.
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "fresh" }).unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.expect("pull");
+    let pull = outcome.pull.expect("a window was pulled");
+    match pull.oldest_lacked {
+        Some(kimmy_storage::EntryWait::Waited(waited)) => {
+            assert!(waited < FLOOR, "written just before the pull: {pull:?}")
+        }
+        other => panic!("the fresh entry's wait was not taken: {other:?}"),
+    }
+    assert_eq!(pull.entries, 1, "only what it lacked was served: {pull:?}");
+}
+
+/// Run the replication loop on `into` against `peer` until a tick reports
+/// what `done` is waiting for, and return every report and lag it saw.
+async fn loop_until(
+    into: &Node,
+    peer: std::net::SocketAddr,
+    interval: Duration,
+    done: impl Fn(&kimmy_cluster::PullReport) -> bool,
+) -> (kimmy_cluster::PullReport, Vec<u64>) {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let (lag_tx, mut lag_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![peer])], SECRET.into(), into.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    config.on_lag = Some(Arc::new(move |lag| {
+        let _ = lag_tx.send(lag);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&into.engine), config));
+
+    let mut seen = kimmy_cluster::PullReport::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !done(&seen) {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no tick reported it in time; saw {seen:?}"))
+            .expect("the loop must keep reporting");
+        seen.add(&report.pulls);
+    }
+    looping.abort();
+    let mut lags = Vec::new();
+    while let Ok(lag) = lag_rx.try_recv() {
+        lags.push(lag);
+    }
+    (seen, lags)
+}
+
+#[tokio::test]
+async fn a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget() {
+    use kimmy_cluster::ContactEnd;
+
+    // Three full windows behind a peer whose every answer takes `SLOW`: the
+    // first pull alone outlasts a one-second tick, so the contact ends with
+    // the window truncated and the next pull not started.
+    let (a, b) = a_source_holding(3 * kimmy_cluster::protocol::MAX_BATCH).await;
+    let slow = slow_relay(a.addr, SLOW).await;
+
+    let (seen, lags) = loop_until(&b, slow, Duration::from_secs(1), |seen| {
+        seen.contacts[ContactEnd::Budget.slot()] >= 1
+    })
+    .await;
+
+    assert_eq!(seen.contacts[ContactEnd::Ceiling.slot()], 0, "{seen:?}");
+    assert_eq!(seen.contacts[ContactEnd::Failed.slot()], 0, "{seen:?}");
+    assert!(seen.serve.sum_us >= FLOOR.as_micros() as u64, "the tick went to serving: {seen:?}");
+    // The lag the budget left, in milliseconds: the entries were written
+    // before a pull that took longer than a second, so it is past a
+    // thousand, which a reading in whole seconds could not be.
+    assert!(
+        lags.iter().any(|&lag| (1_000..600_000).contains(&lag)),
+        "a truncated contact leaves a lag, reported in milliseconds: {lags:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_drain_the_tick_finishes_is_counted_as_caught_up() {
+    use kimmy_cluster::ContactEnd;
+
+    // The same backlog from a peer that answers at once is drained inside a
+    // generous tick, and no contact ends any other way.
+    let (a, b) = a_source_holding(3 * kimmy_cluster::protocol::MAX_BATCH).await;
+
+    let (seen, _) = loop_until(&b, a.addr, Duration::from_secs(5), |seen| {
+        seen.contacts[ContactEnd::CaughtUp.slot()] >= 1
+    })
+    .await;
+
+    assert_eq!(seen.contacts[ContactEnd::Budget.slot()], 0, "{seen:?}");
+    assert_eq!(seen.contacts[ContactEnd::Ceiling.slot()], 0, "{seen:?}");
+    assert_eq!(seen.contacts[ContactEnd::Failed.slot()], 0, "{seen:?}");
+    assert!(seen.serve.count >= 3, "three windows, each a pull: {seen:?}");
+    assert_eq!(seen.entries, 3 * kimmy_cluster::protocol::MAX_BATCH as u64 + 1, "{seen:?}");
+}
+
+#[tokio::test]
+async fn an_entry_served_below_the_members_position_is_not_read_as_a_wait() {
+    // A span held as state is served below the member's position (ADR-172):
+    // an entry it already covers, however old, is not one it was waiting for,
+    // and reading its age as a wait would put a repair's history into the
+    // series meant for the time entries queue.
+    let (a, r, _ca, _s) = a_member_holding_a_repaired_entry_below_its_position().await;
+
+    let outcome = sync_once(&r.engine, a.addr, SECRET, None).await.expect("pull");
+    assert_eq!(outcome.superseded, 1, "the held entry alone is served: {outcome:?}");
+    let pull = outcome.pull.expect("a window was pulled");
+    assert_eq!(pull.entries, 1, "{pull:?}");
+    assert_eq!(pull.oldest_lacked, None, "nothing served was lacked: {pull:?}");
+}

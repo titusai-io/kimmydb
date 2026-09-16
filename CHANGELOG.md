@@ -10,6 +10,47 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **A sync pull says where its time went** ([ADR-175](docs/decisions.md)). What
+  0.30.1's notes said was missing to settle the replica landing-time regression.
+  - **`kimmy_sync_pull_seconds{phase}`**, a histogram per pull of a peer's
+    oplog. `serve` is the peer's walk and the wire. `wait` is this member
+    queueing for its single writer. `apply` is the batch's own work, less that
+    wait. They are disjoint and add up to the pull.
+  - **`kimmy_sync_pulled_entries_total`**, the entries pulls carried. Divided
+    into `apply`'s sum, it gives what one entry costs, whatever the batch sizes.
+  - **`kimmy_sync_entry_wait_seconds`**, a histogram per pull of how long the
+    oldest entry this member lacked had waited before a pull carried it: the
+    time before any pull starts, which the other series cannot see.
+  - **`kimmy_sync_entry_wait_ahead_total`**, pulls whose oldest lacked entry was
+    stamped ahead of this member's clock. Clock skew between members, counted
+    rather than recorded as a wait of zero.
+  - **`kimmy_sync_contacts_total{ended}`**: `caught_up`, `budget`, `ceiling` or
+    `failed`. `budget` is a backlog carried into the next tick because the
+    tick's time ran out.
+  - **On the OTLP bridge** as the histograms' sums and counts and the counters,
+    one instrument per label value. The buckets stay on `/metrics`, as every
+    histogram's do.
+
+### Changed
+
+- **`kimmy_replication_lag_seconds` reads to the millisecond.** It was whole
+  seconds, rounded down, so it could not read an effect of a few seconds. The
+  name, and what it measures ([ADR-122](docs/decisions.md)), are unchanged.
+  - **A scraper that parsed it as an integer** needs to accept a decimal.
+  - **On the OTLP bridge** `kimmy.replication.lag` is now a double gauge rather
+    than an integer one.
+- **What the lag gauge reads while entries wait is now documented.** It is
+  measured once a tick, after the tick's last pull, against what the peer had
+  when that pull opened. Data waits for the next tick, so the gauge reads 0
+  through a wait of up to `cluster.sync_interval_secs`. It is non-zero only
+  when a tick ended part-way through a backlog. This is how it has always
+  behaved, and nothing about it changes here; `docs/operations.md` now says so
+  beside the gauge, and `kimmy_sync_entry_wait_seconds` shows the wait.
+
 ## 0.30.1 - 2026-09-16
 
 **A patch, and a narrow one.** The live-count bookkeeping moves from once per
