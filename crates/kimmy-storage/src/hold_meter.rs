@@ -1069,6 +1069,109 @@ mod tests {
         assert_eq!(s.component_ns[row][Component::Write.slot()], 5_000_000);
     }
 
+    /// A hold of exactly `writes` write calls through the meter, each call
+    /// sleeping `sleep_from.1` from call index `sleep_from.0` on (off the CPU,
+    /// so its true CPU is near zero), and otherwise spinning `spin` (on it).
+    fn hold_of_writes(writes: u64, spin: Duration, sleep_from: Option<(u64, Duration)>) -> Meter {
+        let scope = Scope::hold();
+        for i in 0..writes {
+            let _ = io(Io::Write, 4_096, || {
+                match sleep_from {
+                    Some((from, d)) if i >= from => std::thread::sleep(d),
+                    _ => test_hooks::spin(spin),
+                }
+                Ok(())
+            });
+        }
+        scope.finish().0
+    }
+
+    #[test]
+    fn holds_of_32_and_33_writes_are_measured_exactly_and_34_is_the_first_estimate() {
+        // The exactness claim at its boundary: every write up to the 32nd has
+        // its CPU read, the 33rd is the first of one-in-32, and the 34th is
+        // the first whose CPU is estimated.
+        for (writes, estimated_calls) in [(31, 0), (32, 0), (33, 0), (34, 1), (65, 31), (66, 32)] {
+            let meter = hold_of_writes(writes, Duration::ZERO, None);
+            assert_eq!(meter.write_calls, writes);
+            let sampled = meter.write != meter.write_sampled;
+            assert_eq!(
+                sampled,
+                estimated_calls > 0,
+                "a hold of {writes} writes: {estimated_calls} estimated calls expected, {meter:?}"
+            );
+            let d = decompose(&meter, meter.write + Duration::from_millis(5), thread_cpu());
+            assert_eq!(d.write_estimated, meter.write - meter.write_sampled, "{meter:?}");
+            if estimated_calls == 0 {
+                assert_eq!(d.write_estimated, Duration::ZERO, "{writes} writes: {d:?}");
+            } else {
+                assert!(d.write_estimated > Duration::ZERO, "{writes} writes: {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn at_34_writes_an_unrepresentative_sample_stays_inside_the_bound() {
+        // The worst case for the estimate: the 33 writes whose CPU is read are
+        // all on the CPU, and the one estimated write is all asleep. The
+        // estimate credits it as CPU; the error is at most its wall time,
+        // which is exactly what `write_estimated` publishes.
+        let spin = Duration::from_millis(2);
+        let asleep = Duration::from_millis(20);
+        let cpu_from = thread_cpu().unwrap();
+        let wall_from = std::time::Instant::now();
+        let meter = hold_of_writes(34, spin, Some((33, asleep)));
+        let hold = wall_from.elapsed();
+        let cpu = thread_cpu().unwrap() - cpu_from;
+        let d = decompose(&meter, hold, Some(cpu));
+        assert!(d.write_estimated >= asleep, "{d:?}");
+        // One call's wall time, a sleep that may oversleep, not two calls'.
+        assert!(d.write_estimated < asleep * 2 + spin * 2, "only the 34th: {d:?}");
+        // Truth: almost no CPU outside the calls, and almost no time off it
+        // outside them either — the sleep is inside a call.
+        let off = d.components[Component::OffCpu.slot()];
+        let slack = Duration::from_millis(3);
+        assert!(off <= d.write_estimated + slack, "off_cpu {off:?} past its bound: {d:?}");
+        // With next to no CPU outside the calls to absorb it, an error this
+        // large exceeds it, and this is the case ADR-176 says the over-count
+        // guard does see.
+        assert!(d.overcounted, "{d:?}");
+    }
+
+    #[test]
+    fn a_near_zero_sampled_wall_time_cannot_inflate_the_estimate_past_its_bound() {
+        // Sub-microsecond page-cache writes can read more CPU than wall time
+        // on two clocks that round differently. The ratio is capped at one, so
+        // the estimate never exceeds the unsampled wall time; a zero sampled
+        // wall time estimates nothing rather than dividing by it.
+        let hold = Duration::from_millis(100);
+        for (sampled, sampled_cpu) in [
+            (Duration::from_nanos(1), Duration::from_millis(5)),
+            (Duration::from_nanos(900), Duration::from_micros(2)),
+            (Duration::ZERO, Duration::from_millis(5)),
+            (Duration::ZERO, Duration::ZERO),
+        ] {
+            let meter = Meter {
+                cpu: true,
+                write: sampled + Duration::from_millis(40),
+                write_calls: 64,
+                write_sampled: sampled,
+                write_sampled_cpu: sampled_cpu,
+                ..Meter::default()
+            };
+            // 60 ms of CPU over the hold, so an estimate of more than the
+            // 40 ms unsampled would show as `cpu` short by more than 40 ms.
+            let d = decompose(&meter, hold, Some(Duration::from_millis(60) + sampled_cpu));
+            assert_eq!(d.write_estimated, Duration::from_millis(40), "{d:?}");
+            let cpu = d.components[Component::Cpu.slot()];
+            assert!(
+                cpu >= Duration::from_millis(20),
+                "estimate past the 40 ms bound for sample {sampled:?}/{sampled_cpu:?}: {d:?}"
+            );
+            assert_eq!(d.components.iter().sum::<Duration>(), hold, "{d:?}");
+        }
+    }
+
     #[test]
     fn a_scope_a_panic_unwinds_through_stops_metering() {
         let outcome = std::panic::catch_unwind(|| {
