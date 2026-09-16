@@ -464,6 +464,16 @@ pub(crate) struct WriteTxn<'a> {
     /// (ADR-159), so a long hold names its cause and the hold histogram can
     /// be split by it.
     holder: WriterHolder,
+    /// What this transaction owes the live-count tables, gathered as it writes
+    /// and written once by [`Self::commit`] before the inner commit (ADR-174).
+    ///
+    /// Here rather than on each write path because the commit is the one point
+    /// every path passes through, which is what keeps the count and the mark
+    /// in the same transaction as the records that moved them — without every
+    /// path having to remember. Behind a mutex because the write paths hold a
+    /// shared reference to the transaction, not an exclusive one; it is never
+    /// contended, since the writer gate means one thread owns this.
+    live_counts: parking_lot::Mutex<crate::live_count::Pending>,
 }
 
 impl WriteTxn<'_> {
@@ -474,7 +484,13 @@ impl WriteTxn<'_> {
         }
     }
 
-    pub(crate) fn commit(mut self) -> std::result::Result<(), redb::CommitError> {
+    /// What this transaction owes the live-count tables, for the write paths
+    /// to add to as they go.
+    pub(crate) fn live_counts(&self) -> &parking_lot::Mutex<crate::live_count::Pending> {
+        &self.live_counts
+    }
+
+    pub(crate) fn commit(mut self) -> Result<()> {
         // The one span in this crate, at the one place a write reaches the
         // disk. `commits_are_counted_at_one_chokepoint` already proves this is
         // the only such place, so the span inherits that proof: redb has a
@@ -488,6 +504,11 @@ impl WriteTxn<'_> {
         // disabled-span check every other `tracing` call site already pays.
         let _span = tracing::info_span!("storage.commit").entered();
         let txn = self.txn.take().expect("a transaction is taken once");
+        // The live counts and their mark, once for the whole transaction and
+        // inside it (ADR-174's addendum). Before the inner commit, so this is
+        // the same commit as the records that moved them and a failure here
+        // fails the write rather than leaving a landed batch miscounted.
+        crate::live_count::flush(&txn, &self.live_counts.lock())?;
         let engine = self.engine;
         let coalesced = self.coalesced;
         // The fsync (or the wait at the barrier) is the blocking part; see
@@ -1842,6 +1863,7 @@ impl Engine {
             gate: Some(gate),
             held_from: std::time::Instant::now(),
             holder,
+            live_counts: Default::default(),
         })
     }
 
@@ -2878,7 +2900,7 @@ pub(crate) enum Position {
     InWindow,
 }
 
-pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
+pub(crate) fn append_oplog(txn: &WriteTxn<'_>, entry: &OplogEntry) -> Result<()> {
     append_oplog_at(txn, entry, Position::Raise).map(|_| ())
 }
 
@@ -2886,7 +2908,7 @@ pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> 
 /// -> whether a held mark was released on an entry this node already held
 /// ([`release_held_in_position`]), for the caller to count once it commits.
 pub(crate) fn append_oplog_at(
-    txn: &redb::WriteTransaction,
+    txn: &WriteTxn<'_>,
     entry: &OplogEntry,
     position: Position,
 ) -> Result<bool> {
@@ -2951,8 +2973,16 @@ pub(crate) fn append_oplog_at(
     by_stamp.insert(key.as_slice(), next)?;
     // Every document write appends, so this is where a build that keeps the
     // live counts says so; a mark that no longer matches at open means one that
-    // does not wrote since (ADR-174).
-    crate::live_count::mark_through(txn, &crate::live_count::mark_of(&arrival, &oplog)?)?;
+    // does not wrote since (ADR-174). Read here, where `arrival` and `oplog`
+    // are already open, and written once at the commit: writing it per entry
+    // rewrote the same single key once for every entry in a batch, while
+    // computing it at the commit instead would have to open these two tables
+    // again on every transaction, single-document writes included.
+    #[cfg(not(feature = "bench-no-live-counts"))]
+    {
+        let mark = crate::live_count::mark_of(&arrival, &oplog)?;
+        txn.live_counts().lock().appended(mark);
+    }
     Ok(false)
 }
 

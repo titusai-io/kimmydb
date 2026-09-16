@@ -35,7 +35,7 @@ use bson::{Document, doc};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kimmy_core::index_meta::IndexField;
 use kimmy_core::vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
-use kimmy_core::{DocId, Hlc, ResumeToken, VectorRecord};
+use kimmy_core::{DocId, Hlc, NodeId, OpKind, OplogEntry, ResumeToken, Stamp, VectorRecord};
 use kimmy_storage::{CollectionMeta, Engine};
 
 /// A document of a size a real application might store.
@@ -55,6 +55,86 @@ fn open() -> (Engine, tempfile::TempDir) {
     let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
     (engine, dir)
 }
+
+/// How large [`grown`] grows its store: larger than [`CACHE_BYTES`], so the
+/// tree is deeper than the cache is wide.
+///
+/// Held down by shrinking the cache rather than by growing a gigabyte. What
+/// the measurement needs is a store the cache cannot hold, and the cheap way
+/// to get one is a small cache — the same trick ADR-174's own cluster test
+/// used, for the same reason. A gigabyte fixture took minutes to build, which
+/// forced every workload to share one store and made the store grow under the
+/// measurement; the drift that produced was larger than the effect being
+/// measured.
+const GROWN_BYTES: u64 = 64 << 20;
+
+/// redb's page cache for the benchmark store: the smallest a node accepts.
+const CACHE_BYTES: usize = 8 << 20;
+
+/// Documents per commit while growing. The bulk path, because growing a
+/// gigabyte one commit per document would take the fixture into hours.
+const GROW_CHUNK: usize = 1_000;
+
+/// A store grown past the page cache, built once per process and shared.
+struct Grown {
+    engine: Engine,
+    _dir: tempfile::TempDir,
+}
+
+/// The shared pre-grown store.
+///
+/// Every benchmark measuring what the live counts cost runs against this,
+/// because the work in question is table opens and B-tree seeks: on a store
+/// small enough to sit in redb's page cache every page they touch is already
+/// resident, so they cost nothing and the measurement says nothing. That is
+/// exactly how the cost stayed invisible in the bench ADR-174 quoted, where a
+/// synchronous flush dominated a store of a few thousand documents.
+///
+/// Built once for the whole process, not once per benchmark and certainly not
+/// per sample: the fixture takes minutes, and rebuilding it would measure the
+/// rebuilding. Each benchmark writes into a collection of its own inside it, so
+/// they share the tree's depth without sharing their documents.
+fn grown() -> &'static Grown {
+    static GROWN: std::sync::OnceLock<Grown> = std::sync::OnceLock::new();
+    GROWN.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open_with_cache(&path, Some(CACHE_BYTES)).unwrap();
+        let coll = engine.create_collection("bench", "grown").unwrap();
+        let mut next = 0i64;
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < GROWN_BYTES {
+            let docs: Vec<Document> = (0..GROW_CHUNK)
+                .map(|_| {
+                    next += 1;
+                    document(next)
+                })
+                .collect();
+            engine.insert_many(&coll, docs).unwrap();
+        }
+        Grown { engine, _dir: dir }
+    })
+}
+
+/// The collection named `name` in the shared store.
+///
+/// Created on first ask and looked up after. Criterion calls a benchmark's
+/// setup more than once, so creating unconditionally fails the second time.
+fn collection(engine: &Engine, name: &str) -> CollectionMeta {
+    engine
+        .get_collection("bench", name)
+        .unwrap_or_else(|_| engine.create_collection("bench", name).unwrap())
+}
+
+/// Entries in a replicated batch: the transport's batch size (ADR-119).
+const BATCH: u64 = 1_024;
+
+/// How many times each workload is measured.
+///
+/// Reported as an ordered series rather than one figure, because a mean hides
+/// the shape that matters most here: a first trial slower than the rest is a
+/// warm-up or page-cache effect rather than a cost of the code, and that is a
+/// live competing explanation for the finding this work came from.
+const TRIALS: usize = 5;
 
 fn field(path: &str) -> IndexField {
     IndexField { path: path.to_string(), descending: false }
@@ -307,11 +387,172 @@ fn vector_writes(c: &mut Criterion) {
     group.finish();
 }
 
+/// What a batch from a peer costs, on a store deep enough for its seeks to be
+/// real.
+///
+/// A replicated batch is one run and one transaction of up to 1,024 entries
+/// (ADR-119), and it is the unit a replica's landing time is made of. Measured
+/// here rather than inferred from `bulk`, because the two differ in what they
+/// do per entry: a bulk insert mints its own stamps, while a batch applies
+/// entries that already carry them and decides last-writer-wins per document
+/// against what the store already holds.
+///
+/// On [`Fixture::Grown`] deliberately. The per-entry work this exists to
+/// measure is table opens and B-tree seeks, and on a small store every page
+/// they touch is already in redb's cache — which is why a bench over a few
+/// thousand documents, where a synchronous flush dominates, reported the cost
+/// of ADR-174's per-entry shape as noise.
+///
+/// `Throughput::Elements` reports per entry, so this reads against
+/// `bulk/batch_size/1000`.
+fn batch_apply(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_new");
+    // The fixture alone is minutes, and every sample applies 1,024 documents
+    // into it; the default 100 samples would take this benchmark into hours.
+    group.sample_size(10);
+    group.throughput(criterion::Throughput::Elements(BATCH));
+
+    let engine = &grown().engine;
+    let coll = collection(engine, "batch_new");
+    // One origin for the whole run: a fresh node id per entry would add a
+    // version-vector row per document and measure that instead.
+    let origin = NodeId::generate();
+    // Above anything the fixture wrote, so every entry wins its conflict and
+    // the batch does the work a real one does rather than being superseded and
+    // writing nothing.
+    let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
+    let mut next = 0u64;
+
+    // Set up once and measured `TRIALS` times in order: the series is the
+    // result, not its mean.
+    for trial in 1..=TRIALS {
+        group.bench_function(format!("trial_{trial}"), |b| {
+            b.iter(|| {
+                // Ids stay unique across trials, as the bulk benchmark's do.
+                let entries: Vec<OplogEntry> = (0..BATCH)
+                    .map(|_| {
+                        next += 1;
+                        entry(origin, base + next, coll.id, next as i64)
+                    })
+                    .collect();
+                black_box(engine.apply_batch(&entries).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
+/// A replicated insert of document `id`, stamped at `wall` from `origin`.
+fn entry(origin: NodeId, wall: u64, collection: kimmy_core::CollectionId, id: i64) -> OplogEntry {
+    OplogEntry {
+        stamp: Stamp::new(Hlc::new(wall, 0), origin),
+        kind: OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::Int64(id)),
+        body: Some(bson::serialize_to_vec(&document(id)).unwrap()),
+    }
+}
+
+/// A replicated batch of **in-place updates**: every entry replaces a document
+/// this node already holds, at a higher stamp.
+///
+/// No live count moves, because nothing changes liveness — so this batch pays
+/// only the mark, while `replicated_batch/batch_size/1024` writes all-new
+/// documents and pays the count as well. The difference between the two is
+/// what the count half costs, and the reason to measure both is that the two
+/// halves have different reach: the count moves only on a write that changes
+/// liveness, the mark is written by every oplog append whatever the write did.
+/// An all-new batch is the worst case and says nothing about the update-heavy
+/// workload, which is the common one.
+fn batch_update(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_update");
+    group.sample_size(10);
+    group.throughput(criterion::Throughput::Elements(BATCH));
+
+    let engine = &grown().engine;
+    let coll = collection(engine, "batch_update");
+    let origin = NodeId::generate();
+    let base = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64 + 1_000_000;
+
+    // The documents the batch updates, written once at the lowest stamps so
+    // that every round after this one out-stamps them and wins.
+    let seed: Vec<OplogEntry> =
+        (0..BATCH).map(|i| entry(origin, base + i, coll.id, i as i64)).collect();
+    engine.apply_batch(&seed).unwrap();
+
+    let mut round = 0u64;
+    for trial in 1..=TRIALS {
+        group.bench_function(format!("trial_{trial}"), |b| {
+            b.iter(|| {
+                round += 1;
+                let entries: Vec<OplogEntry> = (0..BATCH)
+                    .map(|i| entry(origin, base + round * BATCH * 2 + i, coll.id, i as i64))
+                    .collect();
+                black_box(engine.apply_batch(&entries).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
+/// What the live counts cost the two paths a client drives directly, on the
+/// shared pre-grown store.
+///
+/// A single-document write is the sharpest probe there is of per-transaction
+/// work: one entry in one transaction, with no loop to amortise anything over,
+/// so everything the transaction does lands on it whole.
+fn grown_writes(c: &mut Criterion) {
+    {
+        let mut group = c.benchmark_group("insert_one");
+        group.sample_size(10);
+        let engine = &grown().engine;
+        let coll = collection(engine, "insert_one");
+        let mut n = 0i64;
+        for trial in 1..=TRIALS {
+            group.bench_function(format!("trial_{trial}"), |b| {
+                b.iter(|| {
+                    n += 1;
+                    black_box(engine.insert(&coll, document(n)).unwrap())
+                });
+            });
+        }
+        group.finish();
+    }
+
+    // The local bulk path: 1,000 new documents in one transaction, every one
+    // of them changing liveness and so paying both halves. Not one of the
+    // three workloads the comparison turns on, but the round reported a bulk
+    // regression too, so it is measured rather than reasoned about.
+    let mut group = c.benchmark_group("bulk_new");
+    group.sample_size(10);
+    group.throughput(criterion::Throughput::Elements(1_000));
+    let engine = &grown().engine;
+    let coll = collection(engine, "bulk_new");
+    let mut next = 0i64;
+    for trial in 1..=TRIALS {
+        group.bench_function(format!("trial_{trial}"), |b| {
+            b.iter(|| {
+                let docs: Vec<Document> = (0..1_000)
+                    .map(|_| {
+                        next += 1;
+                        document(next)
+                    })
+                    .collect();
+                black_box(engine.insert_many(&coll, docs).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     inserts,
     background_consumer,
     bulk_inserts,
+    batch_apply,
+    batch_update,
+    grown_writes,
     other_mutations,
     vector_writes
 );

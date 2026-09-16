@@ -13,22 +13,36 @@
 //! path forgot drifts silently, and the check then reports a divergence that is
 //! not there or misses one that is.
 //!
+//! **Once per transaction, not once per write in it.** Those two record the
+//! difference in [`Pending`], which the transaction carries, and
+//! `WriteTxn::commit` writes through [`flush`] before the inner commit. A
+//! replicated batch is one transaction of up to 1,024 entries (ADR-119), and
+//! moving the row per entry opened [`tables::LIVE_COUNTS`] 1,024 times, wrote
+//! the single key of [`tables::LIVE_COUNTS_THROUGH`] 1,024 times, and paid an
+//! extra `oplog.last()` seek for each — inside one commit, so it cost landing
+//! time and no commits, which is how it hid. Flushing at the commit keeps both
+//! in the same transaction as the entries, so a write that aborts after its
+//! record still takes the count back with it.
+//!
 //! **Rebuilt when it may be stale.** `Engine::open` walks every record's header
 //! and rewrites the table unless [`tables::LIVE_COUNTS_THROUGH`] still matches
 //! the store: the arrival index's next position and the oplog's newest key
-//! ([`mark_of`]). The mark is written with every oplog append by a build that
-//! keeps the count, and carried forward by a rewind and by retention, which
+//! ([`mark_of`]). The mark is written by any transaction that appended, at its
+//! commit, by a build that keeps the count, and carried forward by a rewind
+//! and by retention, which
 //! remove rows without appending. So it is missing on a database no such build
 //! has opened and on one restored from a backup (which carries neither table),
 //! and it stops matching once a build that does not keep the count wrote a
 //! document — every document write appends to the oplog.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use redb::{ReadableTable, Table, WriteTransaction};
 use tracing::warn;
 
 use crate::codec;
+use crate::engine::WriteTxn;
 use crate::error::Result;
 use crate::tables;
 
@@ -38,10 +52,117 @@ pub(crate) type Docs<'txn> = Table<'txn, (u64, &'static [u8]), &'static [u8]>;
 /// The one key of [`tables::LIVE_COUNTS_THROUGH`].
 pub(crate) const THROUGH: &str = "arrival";
 
+thread_local! {
+    /// Opens of [`tables::LIVE_COUNTS`] or [`tables::LIVE_COUNTS_THROUGH`] for
+    /// writing, on this thread.
+    ///
+    /// Instrumentation, and it earns its keep: the cost this module was changed
+    /// for is invisible to a commit counter and to any assertion about the
+    /// counts themselves, because per-entry work inside one transaction
+    /// produces exactly the right numbers, slowly. redb offers no table-open
+    /// counter, so this is the only place that can say how often the two tables
+    /// are reached for, and
+    /// `the_count_and_the_mark_are_written_once_for_a_replicated_batch` reads
+    /// it.
+    ///
+    /// **Per thread, not per process.** The test binary runs its tests in
+    /// parallel in one process, and a shared counter measures whatever else
+    /// was writing at the time — which makes the guard fail on an innocent
+    /// change and pass on a guilty one. Every open a transaction makes happens
+    /// on the thread driving it: the flush runs in the committing thread,
+    /// before `blocking` is reached, and the rebuild runs in the thread that
+    /// opens the engine.
+    ///
+    /// The read path ([`live_count`]) opens on a read transaction and is
+    /// deliberately not counted: what is bounded here is the write path.
+    static TABLE_OPENS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Opens made on this thread, for the test that bounds them.
+pub(crate) fn table_opens() -> u64 {
+    TABLE_OPENS.with(Cell::get)
+}
+
+fn counted() {
+    TABLE_OPENS.with(|opens| opens.set(opens.get() + 1));
+}
+
+/// [`tables::LIVE_COUNTS`], open for writing and counted.
+fn open_counts(txn: &WriteTransaction) -> Result<Table<'_, u64, u64>> {
+    counted();
+    Ok(txn.open_table(tables::LIVE_COUNTS)?)
+}
+
+/// [`tables::LIVE_COUNTS_THROUGH`], open for writing and counted.
+fn open_through(txn: &WriteTransaction) -> Result<Table<'_, &'static str, &'static [u8]>> {
+    counted();
+    Ok(txn.open_table(tables::LIVE_COUNTS_THROUGH)?)
+}
+
+/// What a transaction owes the two tables, gathered as it writes and written
+/// once by [`flush`] when it commits.
+///
+/// Carried by `WriteTxn` rather than threaded through every write path,
+/// because the commit is the one point all of them pass through — the same
+/// argument that makes `WriteTxn::commit` the commit counter's chokepoint, and
+/// what keeps "the count and the mark land in the same commit as the entries"
+/// true by construction rather than by everyone remembering.
+#[derive(Default)]
+pub(crate) struct Pending {
+    /// Per collection, live records gained less lost in this transaction.
+    /// Signed and accumulated, so a document written and deleted again inside
+    /// one transaction nets to nothing and moves no row.
+    deltas: BTreeMap<u64, i64>,
+    /// Where the counts are kept through, as the last append in this
+    /// transaction left the store, or `None` if it appended nothing.
+    ///
+    /// The bytes rather than a flag, and read at the append rather than at the
+    /// commit. [`mark_of`] needs the arrival index and the oplog, and
+    /// `append_oplog_at` holds both open already — recomputing it at the commit
+    /// would mean opening those two tables again, which is two opens added to
+    /// *every* transaction including a single-document write. Each append
+    /// overwrites this, so what is stored is the last one, which is the state
+    /// the transaction ends in.
+    mark: Option<Vec<u8>>,
+}
+
+impl Pending {
+    /// The control's no-op ([`crate`]'s `bench-no-live-counts`).
+    #[cfg(feature = "bench-no-live-counts")]
+    fn moved(&mut self, _collection: u64, _was_live: bool, _is_live: bool) {}
+
+    /// The control's no-op ([`crate`]'s `bench-no-live-counts`).
+    #[cfg(feature = "bench-no-live-counts")]
+    pub(crate) fn appended(&mut self, _mark: Vec<u8>) {}
+
+    /// Move `collection`'s count by what one write did to liveness there.
+    #[cfg(not(feature = "bench-no-live-counts"))]
+    fn moved(&mut self, collection: u64, was_live: bool, is_live: bool) {
+        let delta = match (was_live, is_live) {
+            (false, true) => 1,
+            (true, false) => -1,
+            // Liveness unchanged: a replace over a live document, or a
+            // tombstone over a tombstone.
+            _ => return,
+        };
+        *self.deltas.entry(collection).or_default() += delta;
+    }
+
+    /// Record where an append left the store, for [`flush`] to write once.
+    #[cfg(not(feature = "bench-no-live-counts"))]
+    pub(crate) fn appended(&mut self, mark: Vec<u8>) {
+        self.mark = Some(mark);
+    }
+}
+
 /// Write the encoded `record` at `key` of `collection`, and move the
 /// collection's live count by what the write did to liveness there.
+///
+/// The move is recorded on the transaction and written by [`flush`] at its
+/// commit, so a run of writes costs one row and one table open between them
+/// rather than one each.
 pub(crate) fn put_record(
-    txn: &WriteTransaction,
+    txn: &WriteTxn<'_>,
     docs: &mut Docs<'_>,
     collection: u64,
     key: &[u8],
@@ -51,13 +172,15 @@ pub(crate) fn put_record(
         Some(previous) => codec::doc_record_is_live(previous.value())?,
         None => false,
     };
-    adjust(txn, collection, was_live, codec::doc_record_is_live(record)?)
+    let is_live = codec::doc_record_is_live(record)?;
+    txn.live_counts().lock().moved(collection, was_live, is_live);
+    Ok(())
 }
 
 /// Remove the record at `key` of `collection`, and move the collection's live
 /// count down if it was live. Whether a record was there.
 pub(crate) fn remove_record(
-    txn: &WriteTransaction,
+    txn: &WriteTxn<'_>,
     docs: &mut Docs<'_>,
     collection: u64,
     key: &[u8],
@@ -66,30 +189,53 @@ pub(crate) fn remove_record(
         Some(previous) => codec::doc_record_is_live(previous.value())?,
         None => return Ok(false),
     };
-    adjust(txn, collection, was_live, false)?;
+    txn.live_counts().lock().moved(collection, was_live, false);
     Ok(true)
 }
 
-fn adjust(txn: &WriteTransaction, collection: u64, was_live: bool, is_live: bool) -> Result<()> {
-    if was_live == is_live {
+/// Write what `pending` gathered, in the transaction that gathered it and
+/// before that transaction commits.
+///
+/// Each table is opened at most once however much the transaction held, so a
+/// 1,024-entry replicated batch pays what a one-entry one pays. A collection
+/// whose moves cancelled out is not written at all.
+///
+/// Called by `WriteTxn::commit` and nowhere else. The three commits that run
+/// before an engine exists (`Engine::open`, the migration, a restore) write
+/// through `rebuild_if_stale` or not at all.
+pub(crate) fn flush(txn: &WriteTransaction, pending: &Pending) -> Result<()> {
+    // The control writes nothing at all (`bench-no-live-counts`).
+    if cfg!(feature = "bench-no-live-counts") {
+        let _ = (txn, pending);
         return Ok(());
     }
-    let mut counts = txn.open_table(tables::LIVE_COUNTS)?;
-    let current = counts.get(collection)?.map(|n| n.value()).unwrap_or(0);
-    let next = match is_live {
-        true => current + 1,
-        // Saturating rather than failing the write: a count already wrong is
-        // repaired at the next open, and refusing a delete for it would turn a
-        // wrong number into lost availability.
-        false => current.saturating_sub(1),
-    };
-    match next {
-        0 => {
-            counts.remove(collection)?;
+    let moved: Vec<(u64, i64)> =
+        pending.deltas.iter().filter(|(_, delta)| **delta != 0).map(|(id, d)| (*id, *d)).collect();
+    if !moved.is_empty() {
+        let mut counts = open_counts(txn)?;
+        for (collection, delta) in moved {
+            let current = counts.get(collection)?.map(|n| n.value()).unwrap_or(0);
+            // Saturating rather than failing the write: a count already wrong
+            // is repaired at the next open, and refusing a delete for it would
+            // turn a wrong number into lost availability.
+            let next = match delta > 0 {
+                true => current.saturating_add(delta.unsigned_abs()),
+                false => current.saturating_sub(delta.unsigned_abs()),
+            };
+            match next {
+                0 => {
+                    counts.remove(collection)?;
+                }
+                n => {
+                    counts.insert(collection, n)?;
+                }
+            }
         }
-        n => {
-            counts.insert(collection, n)?;
-        }
+    }
+    if let Some(mark) = &pending.mark {
+        // Already read, by the last append, from the tables it had open. This
+        // writes the one row and opens nothing else.
+        mark_through(txn, mark)?;
     }
     Ok(())
 }
@@ -124,7 +270,7 @@ pub(crate) fn mark_of(
 /// Record, in the transaction of the write that moved it, that the counts are
 /// kept through `mark` ([`mark_of`], read after the write).
 pub(crate) fn mark_through(txn: &WriteTransaction, mark: &[u8]) -> Result<()> {
-    txn.open_table(tables::LIVE_COUNTS_THROUGH)?.insert(THROUGH, mark)?;
+    open_through(txn)?.insert(THROUGH, mark)?;
     Ok(())
 }
 
@@ -134,7 +280,7 @@ pub(crate) fn mark_through(txn: &WriteTransaction, mark: &[u8]) -> Result<()> {
 /// A mark that already did not match says an older build wrote behind the
 /// counts, and moving it to the new state would hide that from the next open.
 pub(crate) fn carry_mark(txn: &WriteTransaction, before: &[u8], after: &[u8]) -> Result<()> {
-    let mut table = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
+    let mut table = open_through(txn)?;
     let current = table.get(THROUGH)?.is_some_and(|stored| stored.value() == before);
     if current {
         table.insert(THROUGH, after)?;
@@ -154,8 +300,7 @@ pub(crate) fn carry_mark(txn: &WriteTransaction, before: &[u8], after: &[u8]) ->
 /// was stale and nothing was written.
 pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>> {
     let mark = mark_of(&txn.open_table(tables::OPLOG_ARRIVAL)?, &txn.open_table(tables::OPLOG)?)?;
-    let through =
-        txn.open_table(tables::LIVE_COUNTS_THROUGH)?.get(THROUGH)?.map(|m| m.value().to_vec());
+    let through = open_through(txn)?.get(THROUGH)?.map(|m| m.value().to_vec());
     if through.as_deref() == Some(mark.as_slice()) {
         return Ok(None);
     }
@@ -178,7 +323,7 @@ pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>
         }
     }
     {
-        let mut table = txn.open_table(tables::LIVE_COUNTS)?;
+        let mut table = open_counts(txn)?;
         table.retain(|_, _| false)?;
         for (id, n) in &counts {
             table.insert(*id, *n)?;
@@ -380,6 +525,93 @@ mod tests {
         let recreated = a.create_collection("app", "docs").unwrap();
         a.insert(&recreated, doc! { "_id": "again" }).unwrap();
         check("a recreate");
+
+        // A replicated batch: one transaction holding 1,024 entries (ADR-119),
+        // which is the shape whose per-entry count work this narrowed to once
+        // per transaction. Last, so it perturbs none of the sequences above.
+        let batch: Vec<OplogEntry> = (0..1_024u64)
+            .map(|i| {
+                let id = format!("b{i}");
+                remote(&recreated, &id, later + 1_000 + i, Some(doc! { "_id": id.as_str() }))
+            })
+            .collect();
+        a.apply_batch(&batch).unwrap();
+        check("a 1,024-entry replicated batch");
+    }
+
+    /// A single-document write reaches for the two count tables twice: once
+    /// for the count, once for the mark.
+    ///
+    /// The batch guard below says the per-entry work is gone. This one says the
+    /// per-transaction work did not multiply while it went, which is the trap
+    /// in moving work to the commit: a single-document write is one entry in
+    /// one transaction, so it has no loop to amortise anything over and
+    /// whatever the commit does lands on it whole.
+    ///
+    /// **What this cannot see.** It counts opens of the two count tables only,
+    /// so a commit that re-opened the arrival index and the oplog in order to
+    /// recompute the mark would still read two here — and that is a real
+    /// regression, two further opens on every transaction on the node. What
+    /// holds it is reading the mark at the append, where both tables are
+    /// already open, and the `grown/insert_one` benchmark, which prices the
+    /// whole transaction rather than counting one part of it.
+    #[test]
+    fn a_single_document_write_reaches_for_the_count_tables_twice() {
+        let (engine, coll, _dir) = engine();
+        let before = table_opens();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        let opened = table_opens() - before;
+        assert_eq!(
+            opened, 2,
+            "a single-document write opened the live-count tables {opened} times; it is one \
+             open for the count and one for the mark"
+        );
+    }
+
+    /// The count and the mark are written once for the whole transaction, not
+    /// once for every entry in it.
+    ///
+    /// The shape ADR-174 named and deferred. A replicated batch is one run and
+    /// one transaction (ADR-119), so moving the count row and rewriting the
+    /// mark's single key per entry repeated both 1,024 times inside one commit
+    /// — which no commit or fsync counter can see, and which leaves the counts
+    /// themselves perfectly correct. The only thing that can hold it is how
+    /// often the two tables are reached for, which is what [`table_opens`]
+    /// answers.
+    #[test]
+    fn the_count_and_the_mark_are_written_once_for_a_replicated_batch() {
+        let (engine, coll, _dir) = engine();
+        let later = crate::physical_now_ms() + 10_000;
+        let entries: Vec<OplogEntry> = (0..1_024u64)
+            .map(|i| {
+                let id = format!("batch-{i}");
+                remote(&coll, &id, later + i, Some(doc! { "_id": id.as_str() }))
+            })
+            .collect();
+
+        let before = table_opens();
+        let commits = engine.commits();
+        engine.apply_batch(&entries).unwrap();
+        let opened = table_opens() - before;
+
+        // The counts are right, which they were before this too: the point is
+        // what they cost, not what they say.
+        assert_counts_exact(&engine, "a 1,024-entry replicated batch");
+        assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(1_024));
+        // The batch is one run and one transaction (ADR-119). Asserted, so
+        // that a batch which started committing per entry would be read as the
+        // regression it is rather than as this guard passing for a new reason.
+        assert_eq!(
+            engine.commits() - commits,
+            1,
+            "a replicated batch is one run and one commit; this one took more"
+        );
+        assert_eq!(
+            opened, 2,
+            "a 1,024-entry batch reached for the live-count tables {opened} times. The count \
+             and the mark move once per transaction, so it is two: one open of LIVE_COUNTS and \
+             one of LIVE_COUNTS_THROUGH. Per entry it was 2,048."
+        );
     }
 
     #[test]

@@ -575,14 +575,16 @@ mod tests {
         let unreadable =
             crate::codec::encode_doc_record(&kimmy_core::DocRecord::live(stamp, vec![0xFF; 64]));
         let key = crate::docs::doc_key(&kimmy_core::DocId::String("unreadable".into())).unwrap();
-        let db = engine.db();
-        let txn = db.begin_write().unwrap();
+        // Through the engine's own writer, because the kept count is written
+        // when that transaction commits (ADR-174's addendum).
+        let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
         {
             // Through the kept count's own write, which reads the header only.
             let mut docs = txn.open_table(crate::tables::DOCS).unwrap();
             crate::live_count::put_record(&txn, &mut docs, coll.id.0, &key, &unreadable).unwrap();
         }
         txn.commit().unwrap();
+        let db = engine.db();
         assert_eq!(Engine::live_count_in(&db.begin_read().unwrap(), coll.id).unwrap(), 2);
 
         assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(2));

@@ -10,6 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **Each collection's live document count, and the mark beside it, are written
+  once per transaction rather than once per entry in it.** Since 0.30.0 every
+  applied entry opened the live-count table, rewrote the one-row mark table and
+  read the oplog's newest key. A replicated batch is one transaction of up to
+  1,024 entries, so that work repeated up to 1,024 times inside a single
+  commit, where no commit or fsync counter could see it. It is now gathered as
+  the transaction writes and stored once when it commits — in the same commit
+  as the entries that moved it, so a write that fails still takes its count
+  back with it.
+- **What it was measured to be worth.** On a local bulk insert of 1,000
+  documents in one transaction, about 13% (33.1 ms to 28.8 ms, medians of five
+  trials on one Mac). On a replicated batch, and on a single-document insert,
+  the difference was **not resolvable** above the benchmark's own run-to-run
+  spread. **This is not shown to cure the replica landing-time regression
+  reported against 0.30.0**; treat the cause of that as still open.
+  [ADR-174](docs/decisions.md) records the numbers, and what the benchmark
+  could and could not see.
+- **Nothing to do on upgrade.** No on-disk change, no configuration change and
+  no migration. Both tables keep their meaning and their contents, a start on
+  0.30.0 data neither rebuilds nor converts them, and the startup rebuild
+  described under 0.30.0 is unchanged.
+
 ## 0.30.0 - 2026-09-15
 
 **A minor. Read both entries under *Changed* before upgrading.** A change

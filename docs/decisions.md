@@ -16340,3 +16340,102 @@ for a raw write to `DOCS`:
   record as new:** the verifier's second snapshot, and the guard. Before that
   step was added, only the guard caught it, because the first snapshot lands in
   an empty member.
+
+**Addendum (0.30.1): the count and the mark move once per transaction, and what
+that turned out to be worth.**
+
+This decision named the shape in its own Costs section and left it: "The bulk
+insert moves the count row and the mark once per document inside one
+transaction. That is the shape a per-transaction mark and count would remove,
+left for a measurement on Linux under `durable` before it is worth the
+bookkeeping." This is that change, together with the measurement that was owed
+with it — and the measurement is the more useful half, because it does not say
+what was expected.
+
+**What prompted it.** Round 0340 timed a replica's documents becoming visible
+6.1 s after a batch, against 2.0 s in round 0330 on 0.29.0, under the writes
+area's own load and with commit counts flat throughout. Flat commits with a
+longer wait is the signature of work *inside* a transaction, and this decision
+had added exactly that per applied entry: `adjust` opened `LIVE_COUNTS`,
+`mark_through` opened `LIVE_COUNTS_THROUGH` and rewrote its single key, and
+`mark_of` read the oplog's newest key. A replicated batch is one run and one
+transaction of up to 1,024 entries (ADR-119), so all of it repeated up to 1,024
+times inside one commit.
+
+**What moved.** Inside a transaction, `put_record` and `remove_record` no longer
+open `LIVE_COUNTS`; they record a signed per-collection liveness delta on the
+transaction. `append_oplog_at` no longer writes the mark; it reads `mark_of`
+from the arrival index and the oplog it already holds open, and records the
+bytes. `WriteTxn::commit` writes both before the inner commit — `LIVE_COUNTS`
+once per collection whose delta is not zero, `LIVE_COUNTS_THROUGH` once. A
+1,024-entry batch opens each table once instead of 1,024 times. Nothing else
+changes: the two tables keep their meaning, the one-way-in rule stands,
+`carry_mark` is untouched, the rebuild at open is as it was, and there is no
+on-disk change and no migration. This narrows *when* the work happens and
+nothing else.
+
+**The same commit, by construction.** The accumulator is a field on `WriteTxn`
+and is flushed inside `WriteTxn::commit`, which
+`commits_are_counted_at_one_chokepoint` already proves is the only place this
+crate commits. So the count and the mark are still durable in the transaction
+that moved them, and a write that aborts after its record takes the count back
+with it — which is exactly what
+`a_write_that_aborts_after_its_record_leaves_the_count_unchanged` holds, and it
+is unchanged.
+
+**Read at the append, not recomputed at the commit.** The first form of this
+change recomputed `mark_of` in the flush, which meant opening `OPLOG_ARRIVAL`
+and `OPLOG` a second time: two opens added to *every* transaction, including
+every single-document write, in order to save opens on batches. That is a
+regression on the commonest write a node does, and it is why the mark is read
+where those two tables are already open.
+`a_single_document_write_reaches_for_the_count_tables_twice` holds the count at
+two.
+
+**What it is worth.** `benches/write_path.rs`, one Mac, medians of five trials
+per cell, in ms. Three configurations of the same binary against the same
+fixture: 0.30.0 as shipped, this change, and a control with the live-count and
+mark calls compiled out (the `bench-no-live-counts` feature). The store is grown
+past an 8 MiB page cache, so the tree is deeper than the cache is wide.
+
+| Workload | 0.30.0, per entry | This change, per txn | Control, compiled out |
+|---|---|---|---|
+| `insert_one` — one document, one transaction | 5.79 | 5.72 | 9.65 |
+| `batch_new` — 1,024 replicated inserts | 36.90 | 35.02 | 36.40 |
+| `batch_update` — 1,024 replicated in-place updates | 42.11 | 36.09 | 42.60 |
+| `bulk_new` — 1,000 local inserts, one transaction | 33.12 | 28.83 | 26.12 |
+
+**Read that table for what it does not show.** Only `bulk_new` orders the way
+the argument predicts — control fastest, this change next, 0.30.0 slowest — and
+there the whole of the live-count work is about 21% of the write, of which this
+change recovers about 13 points. On both replicated batch rows the control is at
+or *slower* than 0.30.0, and on `insert_one` the control is two thirds slower
+than either. A control that removes work cannot be slower than the code it
+removes the work from, so those cells are measuring the machine rather than the
+change: a single-document write is one fsync, and fsync latency on this host
+moved further between runs than the effect being measured. That is this
+decision's own warning about this bench — "Every write here ends in a
+synchronous flush, which dominates the time" — landing on the attempt to check
+it.
+
+**So the cause of the round-0340 regression is not established here, and goes
+back to open.** The per-entry shape was real and is removed, and it is worth
+something on the one path this bench can resolve; but nothing here shows it
+costing a replica landing time 2.0 s to 6.1 s, and an ADR should not assert a
+cure it cannot demonstrate. What would settle it is a measurement on the
+platform and durability class the finding came from rather than on a developer's
+Mac. The change ships regardless, on the argument this decision already made for
+it: per-transaction is the right shape, and it is O(1) in the batch where the
+old one was O(entries).
+
+**What the harness had to be fixed for, recorded so the next measurement does
+not repeat it.** The first form grew a 1 GiB fixture shared by every workload in
+one process. Each workload appended to the store the next one measured, and
+within a workload each trial grew the tree under the next; a local bulk insert
+drifted from 35 ms to 89 ms across five trials, a drift far larger than the
+effect. Shrinking redb's cache to 8 MiB rather than growing a gigabyte gives the
+same "deeper than the cache" property in seconds, and lets every workload have a
+fresh store in its own process. The trials are reported as a series rather than
+a mean for the same reason: a mean would have hidden that drift. No
+configuration showed a first trial consistently slower than the rest, so the
+warm-up effect a live A/B had suggested is not visible here.
