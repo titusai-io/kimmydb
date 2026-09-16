@@ -16848,8 +16848,8 @@ installed, a backend call costs one thread-local read (2.3 ns) and no clock.
 
 | component | what it is |
 |---|---|
-| `read` | wall time inside the backend's `read`: a page the cache did not hold |
-| `write` | wall time inside the backend's `write` |
+| `read` | wall time inside the backend's `read`, a page the cache did not hold, and `len` |
+| `write` | wall time inside the backend's `write`, and `set_len`, which grows the file |
 | `sync` | wall time inside the backend's `sync_data`, the fsync |
 | `cpu` | the thread's CPU time over the hold, less its CPU time inside those calls |
 | `off_cpu` | the hold less the four above |
@@ -16956,14 +16956,43 @@ safe:
 The time a blocked write spends blocked is in `write` either way: the estimate
 only moves time between `cpu` and `off_cpu`. **So the hold publishes the bound
 rather than a claimed direction**: `write_estimated` is the wall time of the
-writes whose CPU was estimated, and the split can be out by no more than that.
-**Reading guidance: trust a rise in `off_cpu` as contention only by as much as
-it exceeds the rise in `write_estimated` for the same holder.** For
-single-document writes that bound is zero.
+writes whose CPU was estimated, and **the sampling** can move time between the
+two by no more than that. **Reading guidance: trust a rise in `off_cpu` as
+contention only by as much as it exceeds the rise in `write_estimated` for the
+same holder.** For single-document writes that bound is zero.
 
-**Platforms.** `CLOCK_THREAD_CPUTIME_ID` on Linux and macOS, and a test fails if
-60 ms of spinning reads as less than 30 ms of CPU, so a clock stuck at zero
-cannot pass on the machine the gate runs on. Anywhere else, or on a hold where
+**`write_estimated` bounds the sampling error and nothing else.** It says
+nothing about a cost inside the hold that no component measures, which lands in
+`off_cpu` whole. Review found one such cost in the first version of this
+change: redb grows the file with `set_len`, and reads its size with `len`, from
+inside a write transaction, and neither went through the meter. A bulk of 1,000
+documents made two `set_len` calls totalling 84 µs, a cost that grows with the
+store. Both calls are now metered, `len` with `read` and `set_len` with
+`write`, their CPU read exactly, and a test puts time inside them and fails if
+it reaches `off_cpu`. Every call redb's `StorageBackend` makes during a hold now
+goes through the meter; `close` is never called inside one. What remains
+unbounded is anything that is not a backend call.
+
+**The clamp on the sampled ratio.** The first version read a call's CPU clock
+outside its wall-clock reads, so the CPU interval was the wider one: 291 of 323
+sampled calls read more CPU than wall time, and the cap on the ratio was the
+normal path, not an edge case. The CPU reads now sit inside the wall-clock
+reads, and the same probe reads 0 of 323. The cap stays, for the clocks'
+rounding over sub-microsecond calls, and a test holds it at the `decompose`
+level: a sample of 1 µs wall and 1 ms CPU credits the unsampled writes no more
+than their wall time, and is not an over-count.
+
+**The CPU comparison has its own tolerance.** Both sides of "CPU inside the
+calls exceeds CPU over the hold" come from one clock, so it is held to that
+clock's grain, 1 µs per reading (macOS reports microseconds, Linux
+nanoseconds), times the readings taken, plus 1% of the hold's CPU. It is not
+the wall-clock tolerance of 1 ms plus 1% of the hold, which on a 43 ms hold with
+1 ms of CPU would have passed 2.4 ms of CPU inside the calls unflagged.
+
+**Platforms.** `CLOCK_THREAD_CPUTIME_ID` on Linux and macOS, and a test spins
+to a CPU-time deadline of 30 ms and fails if 30 s of wall time pass first, or if
+the CPU read exceeds the wall time it took, so a clock stuck at zero cannot pass
+on the machine the gate runs on, however busy that machine is. Anywhere else, or on a hold where
 a read of the clock fails, `cpu` and `off_cpu` are **not recorded** rather than
 recorded as zero, and `kimmy_write_lock_held_cpu_unmeasured_total` counts the
 hold.
@@ -16973,19 +17002,27 @@ hold.
 Unlike ADR-175's series, this one works inside the hold, because what happens
 inside the hold is what it measures. So its cost was measured, not argued away.
 
-- **Each piece, isolated, in a release build on the Mac:**
-  - a write whose CPU is read: 501 ns extra;
-  - an unsampled write: 45 ns;
-  - a read: 369 ns;
-  - installing, finishing, decomposing and recording a hold: 394 ns;
+- **Each piece, isolated, in a release build on the Mac,** best of twenty runs:
+  - the thread CPU clock, read in process: 135 ns, and the monotonic clock
+    18 ns (the C loop in the table above read 228 ns; the per-call figures
+    below are consistent with the in-process cost, not the C one);
+  - a call whose CPU is read (a read, a sync, a sampled write): 318–378 ns
+    extra;
+  - an unsampled write: 46 ns;
+  - installing, finishing, decomposing and recording a hold: 330 ns;
   - a backend call on a thread with no meter: 2.3 ns.
-- **Multiplied by the call counts above, and scaled to Linux's 290 ns CPU
-  clock:**
-  - a single-document insert costs about 21 µs per hold: **0.05% of the live
-    43 ms**, 0.3% of the local 7 ms.
-  - a bulk of 1,000 costs about 273 µs: **0.16% of the live 170 ms**, 0.34% of
-    the local 81 ms.
-- **An A/B cannot resolve that.** Five alternating trials each, base commit
+- **Scaled to Linux conservatively,** from the table's system-call figure
+  rather than the Mac's in-process one: a call whose CPU is read costs two
+  293.6 ns CPU reads, two 19.9 ns monotonic reads and about 40 ns of
+  bookkeeping, 667 ns; a hold's own pair adds about 650 ns.
+  - A single-document insert makes 32.7 such calls: about 23 µs per hold,
+    **0.05% of the live 43 ms**, 0.3% of the local 7 ms.
+  - A bulk of 1,000 makes about 293 (98 sampled writes, 192 reads, a sync, two
+    `set_len`) plus 2,016 unsampled writes at 46 ns: about 290 µs, **0.17% of
+    the live 170 ms**, 0.36% of the local 81 ms.
+- **An A/B cannot resolve that.** (Taken before review; the changes since add
+  exactly-read `len` and `set_len` calls, a handful per hold, and move where the
+  clock reads sit, not how many there are.) Five alternating trials each, base commit
   against this change, on clones of the same store:
   - single-document insert: 6.75 ms median (6.62–7.04) against 6.93 ms
     (6.84–7.06);
@@ -17020,7 +17057,11 @@ taste. Per single-document hold on the member taking the load:
   hypothesis for the series to test, not a claim. `phase="commit"` will then
   carry the same time. **Refuted if** `sync` per hold stays near its local
   6–7 ms while the hold is 43 ms or more; the inversion hypothesis is refuted if
-  `sync` per bulk hold grows as much as per single-document hold does.
+  `sync` per bulk hold grows as much as per single-document hold does. **Only
+  under `storage.durability = durable`:** under `coalesced` a client write's
+  fsync is the barrier's and appears under `holder="durability"`, so `sync` under
+  `holder="write"` reads near zero for that reason and not because the
+  hypothesis failed. Read the member's durability class before reading this.
 - **`off_cpu` is most of it, beyond the growth of `write_estimated`, which for
   single-document holds is zero.** The holder is not running while it holds the
   writer. That is either the scheduler (request handling, replication, serving
@@ -17029,7 +17070,9 @@ taste. Per single-document hold on the member taking the load:
   not grow. **Refuted if** `off_cpu` per hold is a small share of the hold, as
   locally, or if its rise is no larger than the rise in `write_estimated`; and
   the contention reading is refuted if `off_cpu` does not grow between a light
-  and a 64-client cell of the same round.
+  and a 64-client cell of the same round. `write_estimated` bounds only the
+  sampling error: an `off_cpu` that survives that check is still a residual,
+  and a cost no component measures would read the same.
 - **`read` is most of it, with `kimmy_write_lock_held_io_bytes_total{io="read"}`
   per hold well above its local near-zero.** Cold pages on a large store against
   the cache are the cause. If the same window shows
@@ -17039,19 +17082,29 @@ taste. Per single-document hold on the member taking the load:
   store warm and one with it cold; the contention half is refuted if `read` per
   hold moves while the serve walk's reads do not.
 
-**A store-size effect and a release effect are separable only by comparing
-`read`, and read bytes per hold, across stores of different sizes.** The same
-member's store can grow by an order of magnitude between rounds, and a longer
-hold on a bigger store is what both a slower release and a bigger store
-predict. A round that changes the release and the store size at once cannot
-tell the two apart from these series. It needs a cell at each store size, or
-read bytes per hold that did not move.
+**A store-size effect and a release effect are separable only by comparing the
+byte counters per hold across stores of different sizes.** The same member's
+store can grow by an order of magnitude between rounds, and a longer hold on a
+bigger store is what both a slower release and a bigger store predict. Read
+bytes per hold say how many pages the cache missed, but they also move with how
+warm the cache is. Write bytes per hold say how many pages the work dirtied,
+which a bigger B-tree raises and a warmer cache does not, so they are the less
+confounded of the two. A round that changes the release and the store size at
+once cannot tell the two apart from these series. It needs a cell at each store
+size, or byte counters per hold that did not move.
 
 If none of the three dominates, the decomposition has still said which
-component moved between two rounds, which is the question it exists for. If
-`cpu` dominates, the benchmark's regime was the right one after all, and the
-gap is the work; that is refuted if `cpu` per hold stays near its local
-0.3–0.4 ms. The same three readings apply to `holder="bulk"`, where
+component moved between two rounds, which is the question it exists for.
+
+- **`cpu` is most of it.** The benchmark's regime was the right one after all,
+  and the gap is the work. Then the work is visible elsewhere too: `cpu` per
+  hold should grow with write bytes per hold, since more work dirties more
+  pages, and it should sit in `phase="work"` or `phase="counts"`, which is where
+  the path's own B-tree work and the bookkeeping happen, rather than in
+  `phase="commit"`. **Refuted if** `cpu` per hold stays near its local
+  0.3–0.4 ms; and the "more work" reading is refuted if `cpu` per hold rises
+  while write bytes per hold do not, which is the same work done more slowly, a
+  release effect rather than a size one. The same three readings apply to `holder="bulk"`, where
 `write_estimated` is not zero and bounds how far `off_cpu` can be trusted.
 
 ### The serving side, counted in the engine
@@ -17138,6 +17191,30 @@ each was broken on its own to watch its test fail for the stated reason.
   - A local read is not a window served.
   - A walk off a cold cache reads the disk, and those reads are the walk's, not
     a hold's.
+
+**Added after review,** each broken on its own and red for its own test:
+- time asleep inside `set_len` lands in `write`, not `off_cpu`, and metering
+  `set_len` without attributing it to `write` fails the same test;
+- the sampled **count** at 31, 32, 33, 34, 64, 65, 66, 96 and 97 writes (31, 32,
+  33, 33, 33, 34, 34, 34, 35), so sampling nothing past the first 32 fails;
+- the CPU comparison's own tolerance, a mid-hold clock failure remembered by the
+  meter and honoured by `decompose`, a unique-violation entry counted as passed,
+  a walk scope refused inside a hold (a `debug_assert!`), and the ratio's cap at
+  the `decompose` level;
+- on the bridge, the decomposition's registration counted by the call that
+  registers it (144, twelve per holder), and ADR-159's twenty-four per-holder
+  instruments named one by one. The coverage test's stem for
+  `kimmy_write_lock_held_seconds` is `kimmy_write_lock_held`, which every new
+  instrument extends, so without those names this change had weakened the
+  guard on the series round 0350's reading rests on.
+
+**An unoptimised build reads off the CPU for real.** In a debug build on macOS,
+an uncontended bulk of 2,000 documents of 2 KB spent 430–580 ms of a
+1.3–1.5 s call off the CPU at the thread level, inside the hold and outside it
+alike; a release build on the same machine spent 0–6 ms. The tests that read
+`off_cpu` from a bulk therefore compare against the same bulk without the
+injected time, and a reading of `off_cpu` means something only from a release
+build.
 
 **Coupled guard, removed.** The rule that an unmeasured hold records no CPU was
 enforced twice, in `decompose` and again in the counters, so breaking either

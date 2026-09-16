@@ -31,8 +31,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   - **`off_cpu` is a residual**: anything the other components miss lands in
     it. Read a rise in it beside
     **`kimmy_write_lock_held_write_estimated_seconds_total{holder}`**, which
-    bounds how much of it could be misattributed CPU (0 for single-document
-    writes). **`kimmy_write_lock_held_overcounted_total{holder}`** should read
+    bounds how much of it the CPU sampling could have misattributed (0 for
+    single-document writes) and bounds nothing else. **`kimmy_write_lock_held_overcounted_total{holder}`** should read
     0, and **`kimmy_write_lock_held_cpu_unmeasured_total`** is 0 on Linux and
     macOS.
 - **Serving peers' pulls says what it costs the serving member**
@@ -46,9 +46,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   them the decomposition across all twelve holders, and 151 new bridge
   instruments. A scrape config or golden list that enumerates series needs
   them.
-- **Measured overhead:** about 21 µs per single-document hold and 0.27 ms per
-  bulk of 1,000 on Linux, 0.05% and 0.16% of the holds last measured under
-  load.
+- **Overhead:** about 23 µs per single-document hold and 0.29 ms per bulk of
+  1,000 on Linux, 0.05% and 0.17% of the holds last measured under load. That
+  is itemised from each piece's measured cost; an A/B on a Mac could neither
+  show it nor rule out 1%.
 
 ## 0.31.0 - 2026-09-16
 
