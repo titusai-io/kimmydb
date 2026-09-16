@@ -308,38 +308,10 @@ impl TelemetryGuard {
         // `_io_bytes_total`, `_write_estimated_seconds_total` and
         // `_overcounted_total`, one instrument per holder and label value, as
         // the holders above are carried. Built in a loop, because twelve
-        // holders by twelve columns is a table rather than a list; the names
-        // come from `hold_instrument_names`, which a test holds to the
-        // `/metrics` labels.
-        for holder in WriterHolder::ALL {
-            let row = holder.slot();
-            for (name, unit, description, read) in hold_instruments(holder) {
-                let snapshot = snapshot.clone();
-                if unit == "s" {
-                    let _ = meter
-                        .f64_observable_counter(name)
-                        .with_unit(unit)
-                        .with_description(description)
-                        .with_callback(move |observer| {
-                            if let Some(s) = snapshot() {
-                                observer.observe(read(&s.write_lock_hold, row) as f64 / 1e9, &[]);
-                            }
-                        })
-                        .build();
-                } else {
-                    let _ = meter
-                        .u64_observable_counter(name)
-                        .with_unit(unit)
-                        .with_description(description)
-                        .with_callback(move |observer| {
-                            if let Some(s) = snapshot() {
-                                observer.observe(read(&s.write_lock_hold, row), &[]);
-                            }
-                        })
-                        .build();
-                }
-            }
-        }
+        // holders by twelve columns is a table rather than a list; the table is
+        // `hold_instrument_table`, which a test holds to the `/metrics` labels
+        // and, through this same call, to every holder.
+        register_hold_instruments(&meter, snapshot.clone());
         observe!(
             u64_observable_counter,
             "kimmy.write_lock.held_cpu_unmeasured",
@@ -1191,6 +1163,58 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
     ),
 ];
 
+/// Register every instrument of the hold decomposition (ADR-176), and say how
+/// many were built: the whole of `hold_instrument_table`, which a test holds
+/// to twelve per holder by calling this very function.
+fn register_hold_instruments<F>(meter: &opentelemetry::metrics::Meter, snapshot: F) -> usize
+where
+    F: Fn() -> Option<kimmy_api::metrics::MetricsSnapshot> + Clone + Send + Sync + 'static,
+{
+    let mut built = 0;
+    for (holder, name, unit, description, read) in hold_instrument_table() {
+        let row = holder.slot();
+        let snapshot = snapshot.clone();
+        if unit == "s" {
+            let _ = meter
+                .f64_observable_counter(name)
+                .with_unit(unit)
+                .with_description(description)
+                .with_callback(move |observer| {
+                    if let Some(s) = snapshot() {
+                        observer.observe(read(&s.write_lock_hold, row) as f64 / 1e9, &[]);
+                    }
+                })
+                .build();
+        } else {
+            let _ = meter
+                .u64_observable_counter(name)
+                .with_unit(unit)
+                .with_description(description)
+                .with_callback(move |observer| {
+                    if let Some(s) = snapshot() {
+                        observer.observe(read(&s.write_lock_hold, row), &[]);
+                    }
+                })
+                .build();
+        }
+        built += 1;
+    }
+    built
+}
+
+/// Every holder's instruments, in `WriterHolder::ALL` order.
+fn hold_instrument_table()
+-> Vec<(kimmy_storage::WriterHolder, String, &'static str, String, HoldColumn)> {
+    kimmy_storage::WriterHolder::ALL
+        .into_iter()
+        .flat_map(|holder| {
+            hold_instruments(holder)
+                .into_iter()
+                .map(move |(name, unit, description, read)| (holder, name, unit, description, read))
+        })
+        .collect()
+}
+
 /// What reads one column of a holder's row of the hold decomposition.
 type HoldColumn = fn(&kimmy_storage::HoldDecomposition, usize) -> u64;
 
@@ -1328,15 +1352,46 @@ mod tests {
         // are: their stems overlap, so one would satisfy the match for all.
         let source = include_str!("logging.rs");
         let source = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
-        // And the table is registered, not only defined: the loop is inside
-        // `bridge_metrics`, which ends where the instruments' helpers begin.
-        let bridge = &source[source.find("pub fn bridge_metrics").expect("the bridge")
-            ..source.find("type HoldColumn").expect("the helper")];
+        // And the whole table is registered, every holder of it: counted by
+        // the function the bridge calls, against a meter that exports nothing.
+        let meter = opentelemetry::global::meter("hold-instruments-test");
         assert_eq!(
-            bridge.matches("in hold_instruments(holder)").count(),
-            1,
-            "the hold decomposition's instruments are defined and never registered"
+            register_hold_instruments(&meter, || None),
+            kimmy_storage::WriterHolder::COUNT * 12,
+            "twelve instruments for each of the twelve holders"
         );
+        for holder in kimmy_storage::WriterHolder::ALL {
+            assert_eq!(
+                hold_instrument_table().iter().filter(|(h, ..)| *h == holder).count(),
+                12,
+                "{holder:?} is missing from the table"
+            );
+        }
+        let bridge = &source[source.find("pub fn bridge_metrics").expect("the bridge")
+            ..source
+                .find("/// Register every instrument of the hold decomposition")
+                .expect("the helper")];
+        assert_eq!(
+            bridge.matches("register_hold_instruments(&meter, snapshot.clone());").count(),
+            1,
+            "the bridge does not register the hold decomposition"
+        );
+        // ADR-159's per-holder hold series, named one by one: the coverage
+        // test's stem for `kimmy_write_lock_held_seconds` is
+        // `kimmy_write_lock_held`, which every instrument above extends, so
+        // it would pass with all twenty-four of these gone.
+        for holder in kimmy_storage::WriterHolder::ALL {
+            for name in [
+                format!("kimmy.write_lock.held_seconds.{}", holder.label()),
+                format!("kimmy.write_lock.holds.{}", holder.label()),
+            ] {
+                assert_eq!(
+                    source.matches(&format!("\"{name}\",")).count(),
+                    1,
+                    "`{name}` is not an instrument on the bridge"
+                );
+            }
+        }
         for name in [
             "kimmy.write_lock.held_cpu_unmeasured",
             "kimmy.sync.served_windows",
