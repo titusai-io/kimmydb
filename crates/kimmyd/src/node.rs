@@ -1256,8 +1256,8 @@ async fn spawn_cluster(
             })),
             // The replication loop is the only place a peer's version vector
             // exists, so lag is pushed from there into the gauge (ADR-046).
-            on_lag: Some(std::sync::Arc::new(move |secs| {
-                state.metrics.set_replication_lag_secs(secs);
+            on_lag: Some(std::sync::Arc::new(move |ms| {
+                state.metrics.set_replication_lag_ms(ms);
             })),
         },
     ));

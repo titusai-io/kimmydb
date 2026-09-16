@@ -30,8 +30,9 @@ pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
 pub use peers::{
-    DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, MAX_PULLS_PER_CONTACT, ReplicationConfig,
-    RoundHook, RoundReport, replicate,
+    ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,
+    Histogram, MAX_PULLS_PER_CONTACT, PULL_BUCKETS_US, PullReport, ReplicationConfig, RoundHook,
+    RoundReport, replicate,
 };
 pub use transport::{
     FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, PushOutcome, REPAIR_ATTEMPTS,

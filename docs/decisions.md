@@ -16474,3 +16474,322 @@ those iterations do grow the store — unavoidable while measuring a write, and 
 falls identically on every configuration. No configuration shows a first trial
 consistently slower than the rest, so the warm-up effect a live A/B had
 suggested is not visible here.
+
+---
+
+## ADR-175 — A sync pull says where its time went, and the lag gauge reads to the millisecond
+
+> **Extends [ADR-122](#adr-122--the-replication-lag-gauge-measures-age-behind-not-the-span-of-missing-history)**
+> in resolution only: what the gauge measures, and when, is unchanged.
+> **Answers [ADR-174](#adr-174--a-collection-keeps-its-live-document-count-and-the-divergence-check-reads-it)**'s
+> addendum, which named a sync apply-duration series as what would settle the
+> replica landing-time regression. It does not act on that regression: nothing
+> in ADR-174's design changes here.
+
+**The finding this is for.** A bulk insert on one member of a three-member
+cluster landed on the two replicas in 7.38 s and 6.59 s on 0.30.1. The same
+insert took 2.0 s on each in round 0330 (read every 2 s, so only to the nearest
+2 s). One reading already rules out a slow apply as the whole story. When the
+bulk was accepted, `kimmy_replication_lag_seconds` read 6.0 and 4.0 on the
+replicas, against 0.0 in round 0330. So most of the landing time was spent
+behind a backlog that was already there. A landing time cannot say whether that
+backlog came from a slower apply path or from something else that a fast
+apply path would still wait behind. Three instruments had not separated the
+two.
+
+### The lag gauge's resolution was its own, and so was its cadence
+
+- **Whole seconds, rounded down, in the product.** The replication loop handed
+  the gauge `lag_ms / 1_000` into a `u64`. `/metrics` rendered that integer and
+  the OTLP bridge carried it as an integer gauge. So the gauge could change only
+  in whole seconds.
+- **Not steps of two.** The readings 0, 2, 4 and 6 suggested a gauge that moves
+  in 2 s steps. Nothing in the source does that, and round 0340's own data had a
+  5.0 in it. The pattern comes from the next point.
+- **Set once a tick, at the end of the tick.** The default tick is 5 s, longer
+  when a tick drains a backlog ([ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords)).
+  Round 0350's landing edge was read every 250 ms, but the sampler that took
+  the gauge at acceptance reads every 2 s. A 2 s sampler over a 5 s level reads
+  each value two or three times. Sampling faster changes nothing, because the
+  gauge has nothing newer to give.
+
+**Decision.** The loop passes milliseconds. `/metrics` renders seconds to the
+millisecond (`6.384`), and the bridge carries a double gauge. The cadence stays
+as it is, because it is ADR-122's design and the tick is where the peer's vector
+exists. The name and the meaning are unchanged.
+
+### What the gauge reads while entries wait
+
+This was not what the finding asked about, and it matters more than the
+resolution.
+
+- **When it is measured.** Lag is taken after a pull, against the vector the
+  peer advertised when *that pull opened* (`transport.rs`). If the pull reached
+  that vector, the reading is 0.
+- **Data is not pushed.** Only schema changes are
+  ([ADR-143](#adr-143--a-push-is-a-pull-the-sender-starts-a-members-witnessed-vector-is-raised-only-over-a-window-that-begins-where-its-own-history-ends)).
+  A document the peer writes after its window was served waits for the next
+  tick, up to `cluster.sync_interval_secs`, **and the gauge reads 0 for the
+  whole wait.**
+- **What a non-zero reading means.** A tick ended with a pull still truncated at
+  the batch cap: a backlog deeper than the tick could drain. One ordinary wait
+  for the tick cannot produce it.
+
+**What that changes about the finding.**
+- **0.0 in round 0330 does not mean the replicas were caught up.** It means the
+  last pull of each tick reached what the peer had when asked.
+- **6.0 and 4.0 at acceptance are stronger evidence than they looked.** Each
+  replica's previous tick ended part-way through a drain deeper than a full
+  1,024-entry window.
+
+**Not changed here.** Measuring lag against a vector read at the end of the
+tick, or pushing data, would each change what ADR-122 and ADR-143 settled. This
+assignment makes the regression measurable and does not reopen either.
+- **Documented.** The behaviour is now in `docs/operations.md` beside the gauge,
+  in its `HELP` text and in the bridge's description. It is not a footnote here.
+- **Filed as a follow-up.** *A lag reading that sees entries waiting for the
+  next tick.* It is recorded as a known gap in what the gauge can show, not as a
+  defect in it. `kimmy_sync_entry_wait_seconds`, below, is the reading that
+  shows the wait until then.
+
+### Where a pull's time goes
+
+A replica's landing time for an entry is the time the entry waited before a
+pull carried it, plus the time that pull took. The pull splits three ways, and
+each part points to a different fix.
+
+**Decision: five series, each separating a named part of the landing time.**
+None has a peer label, like every other sync series.
+
+| Series | What it measures | Which reading it separates |
+|---|---|---|
+| `kimmy_sync_pull_seconds{phase="serve"}` | From asking the peer for a window to holding it, including the retry when a full batch would not fit: the peer's walk of its oplog, and the wire | A backlog produced by the peer or the network, which a fast apply path would still sit behind |
+| `kimmy_sync_pull_seconds{phase="wait"}` | Applying the window, the time spent waiting for this member's single writer | A backlog produced by local write traffic starving the applier of the writer |
+| `kimmy_sync_pull_seconds{phase="apply"}` | Applying the window, less `wait`: every entry's work, the commits, and their fsync or the shared flush | A slower apply path that lets a backlog build: the finding's hypothesis |
+| `kimmy_sync_pulled_entries_total` | Entries the pulls carried, whatever became of each | With `apply`'s sum, the cost of one entry, independent of batch size. The direct test of whether per-entry work got more expensive |
+| `kimmy_sync_entry_wait_seconds` | Per pull, how long the oldest entry this member lacked had waited when the batch arrived | Time before any pull starts, which none of the phases can see: the tick's cadence, or a queue |
+| `kimmy_sync_contacts_total{ended}` | How each tick's contact with a peer ended: `caught_up`, `budget`, `ceiling`, `failed` | Whether a backlog outlived the tick, and why. With the phase sums over the same window, what the tick's time went to |
+
+**How they read together.**
+- **Apply is the cause.** `budget` rises and `apply` grows fastest, or the cost
+  per entry is higher than on an earlier release under the same load.
+- **Local writes are the cause.** `budget` rises and `wait` grows fastest.
+- **The peer or the wire is the cause.** `budget` rises and `serve` grows
+  fastest.
+- **The tick is the cause, not the applier.** `caught_up` alone, with entry
+  waits near the sync interval.
+- **The contact's overhead is the cause.** `budget` rises with every phase's
+  sum flat. A contact is more than its pulls, and part of it is in no phase:
+  the version exchange and the reads that set up each pull, and after the last
+  pull the divergence check and the horizon check. A regression there reads
+  exactly like this, and no series here measures it.
+
+**Wait and apply are measured apart, not derived.** The obvious derivation is
+from `kimmy_write_lock_held_seconds{holder="replication"}` and
+`kimmy_write_lock_wait_seconds`, and it does not hold:
+- **The wait histogram has no holder.** Every writer on the member lands in it.
+  So a batch that queued behind a client's bulk and a client's bulk that queued
+  behind a batch are the same observation.
+- **The hold histogram is counted per transaction, not per pull.** A batch
+  opens a transaction per run and one per schema change it records. A pushed
+  schema change is recorded under the same holder.
+- **Neither sees the shared flush.** Under `coalesced` a commit releases the
+  writer and then waits for the flush, and `apply` includes that wait.
+
+**Under `coalesced`, `apply` includes queueing behind other committers.** A
+commit that lets go of the writer and waits for the shared flush waits out the
+leader's window, or waits for a flush another committer leads, and neither is a
+wait at the writer's gate. Only the leader taking the gate for the flush itself
+is metered as `wait`. The default is `durable`, where none of this arises; on a
+`coalesced` member the HELP text and the operations table say so.
+
+So the batch measures its own wait. `metered_writer_wait` puts a thread-local
+accumulator around `apply_peer_batch`, and every acquisition of the writer's
+queue adds to it: `begin_write`, and the shared flush's gate. A thread-local
+rather than a field on the transaction, for two reasons. A batch takes the
+writer from several places, and the storage work is synchronous on one thread:
+`blocking` runs its closure on the thread that called it. `apply` is the call's
+wall time less that sum, so the two cannot overlap.
+
+**A window applied before its round fails is still a pull.** The batch commits
+before the round's fallible tail: the lag reading, the divergence check, which
+is a network round trip, and the horizon check. A round that fails there, or
+that the timeout cancels, returns no outcome, so a timing carried only on the
+outcome would vanish. That is the degraded case the series are for. So the
+timing is not on the outcome at all. The transport leaves it on `PeerStalls` as
+soon as the batch is applied, and the loop takes it from there after every pull,
+whether the pull succeeded or failed. The slot is one value, not keyed by peer. It is
+correct because the loop is its only caller and takes it immediately after
+every round. A second caller of `sync_once_with` that shares the loop's
+`PeerStalls` would have to take it the same way. Nothing clears the slot
+defensively: a clear would make a value wrongly left behind look the same as
+nothing stored. The first fix kept a copy on the outcome
+as well. Review removed it: a copy that is right only when a round succeeds is
+a trap for the next reader, and six tests were reading the copy rather than the
+path the loop takes.
+
+**Why "the oldest lacked entry", not the first carried.** A repair re-serves
+history this member holds. A pull also serves spans the member holds as state
+below its position ([ADR-172](#adr-172--a-member-names-what-it-holds-as-state-below-its-position-and-a-pull-serves-it)).
+Either would read as a wait as old as the entry. Only an entry above this
+member's witnessed vector for its origin is one it was waiting for. The window
+is in stamp order, so the first such entry is the oldest. The clock is read when
+the batch arrives, before applying, so the wait does not include `wait` or
+`apply`.
+
+**Clock skew fails visibly.** The wait compares an origin's HLC wall time with
+this member's clock, as ADR-122's lag does. A peer whose clock runs ahead makes
+the result negative.
+- **Clamping to zero** was rejected: it reads as an entry that arrived at once,
+  which is the healthiest reading the series has.
+- **Exposing the negative value** was rejected: a Prometheus histogram's
+  buckets cannot hold it, and it would drag the sum down unseen.
+- **Chosen: counted and left out.** Such a pull is not observed in the histogram
+  and is counted in `kimmy_sync_entry_wait_ahead_total`. Rising steadily is skew,
+  and the histogram is missing exactly the pulls counted there.
+
+**Why `caught_up` names what it does not prove.** The label means the last pull
+did not come back truncated. Two things end a contact there without everything
+being current:
+- **a batch stopped at a collection this member lacks**, which
+  `kimmy_sync_entries_skipped_total` counts;
+- **entries the peer appended after its window was served.**
+
+Both are in the `HELP` text and the operations table.
+
+**Pending-entry count: not done.** How many entries a replica lacks needs the
+peer's count past this member's vector. A peer advertises only its head per
+origin, so the count needs a wire change. ADR-122 declined that same change for
+an oldest-unapplied stamp. Entry wait and a millisecond lag cover the backlog's
+*age* without it.
+
+**The bridge.** OpenTelemetry has no observable histogram, so the two
+histograms' buckets stay on `/metrics`, as every histogram's do (`NOT_BRIDGED`).
+What the bridge carries:
+- each phase's sum, as `kimmy.sync.pull_seconds.serve`, `.wait` and `.apply`;
+- the count all three phases share, as `kimmy.sync.pulls`;
+- `kimmy.sync.pulled_entries`;
+- the wait histogram's sum and count, as `kimmy.sync.entry_wait_seconds` and
+  `kimmy.sync.entry_waits`;
+- `kimmy.sync.entry_wait_ahead`;
+- one contact instrument per `ended` value, as
+  [ADR-159](#adr-159--the-writer-hold-says-what-held-it) carries
+  the holders.
+
+### Buckets
+
+- **`kimmy_sync_pull_seconds`: 1 ms to 15 minutes.**
+  - **Bottom.** A converged window of a few entries on localhost takes about a
+    millisecond.
+  - **Measured points inside the range.** A full batch applied in 25–30 ms on
+    0.30.1's local benchmark. Round 0310's drain fitted 22–23 full windows into a
+    5 s tick, about 220 ms a pull.
+  - **Top, set by what a phase can reach, not by the tick.** The first form
+    stopped at 10 s on the reasoning that a pull that will not fit the tick is
+    not started. Review found that wrong three ways:
+    - the first pull of a contact always runs;
+    - `cluster.sync_interval_secs` has no upper bound;
+    - `serve` is bounded by the 30 s request timeout, not the tick.
+
+    `wait` is bounded by nothing: a replicated batch takes the writer with no
+    budget, behind whatever holds it, and a retention pass has held it for ten
+    to twelve minutes. A top at 10 s would have put exactly the pulls this
+    series is for into `+Inf`, the defect `kimmy_request_duration_seconds` has
+    under heavy write load. The bounds continue at 30 s, 60 s, 300 s and 900 s.
+- **`kimmy_sync_entry_wait_seconds`: 100 ms to an hour.** Dense below the 5 s
+  default interval, where a tick's cadence is read. Wide above it, where a
+  backlog's age is.
+
+### Proven
+
+Each series has a positive control: the one thing it measures is made slow, and
+that series moves while its neighbours do not. A timing that reads small is the
+failure being guarded against, because it is indistinguishable from a healthy
+one.
+
+Each guarded line was broken on its own, with everything else intact, and the
+tests were run. Review found three rows of the first form of this table claimed
+more than the tests held: nothing failed when the `failed` contact end went
+uncounted, when the shared flush's gate went unmetered, or when one of the four
+contact instruments left the bridge while the other three stayed. Each now
+has a test of its own, listed below, and was broken again to show it goes red.
+The tests run: the new cluster tests, the loop's and the renderer's unit tests,
+and the bridge's coverage test. Every break turned at least one test red, and
+restoring the line turned it green again. No guard depends on another being
+absent: two guards that share a test (the wait's meter and the apply
+subtraction) fail it on different assertions, each alone.
+
+| Broken, alone | Red |
+|---|---|
+| The writer wait is not added to the batch's meter | `a_pull_that_waits_for_the_writer_says_so_apart_from_applying` |
+| `apply` is the batch's wall time, wait included | `a_pull_that_waits_for_the_writer_says_so_apart_from_applying` |
+| `serve` is not timed | `a_pull_from_a_slow_peer_says_so_in_serve`, `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
+| `apply` is not timed | `a_pull_whose_commit_is_slow_says_so_in_apply` |
+| The oldest *carried* entry stands in for the oldest *lacked* one | `an_entry_served_below_the_members_position_is_not_read_as_a_wait` |
+| The entry wait is not taken | `a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited` |
+| The entries a pull carried are not counted | `a_pull_that_waits_for_the_writer_says_so_apart_from_applying`, `a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited`, `an_entry_served_below_the_members_position_is_not_read_as_a_wait`, `a_drain_the_tick_finishes_is_counted_as_caught_up` |
+| A contact out of time is labelled `ceiling` | `a_contact_ends_on_what_stopped_it`, `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
+| A clock-ahead entry is observed as a zero wait | `an_entry_stamped_ahead_is_counted_and_not_observed_as_a_wait` |
+| The loop does not fold a pull into its report | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The loop does not count how a contact ended, for the three ends a pull that succeeded reaches | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget`, `a_drain_the_tick_finishes_is_counted_as_caught_up` |
+| The loop does not count a contact ended by a failure | `a_pull_that_fails_ends_the_contact_rather_than_being_retried_inside_the_tick`, `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The transport leaves no timing on `PeerStalls` | every test that reads a pull's timing, eight of eight: the four `a_pull_*` phase and wait tests, `an_entry_served_below_the_members_position_is_not_read_as_a_wait`, `a_window_applied_before_its_round_fails_is_still_a_pull`, and both `a_drain_the_tick_*` tests. While the outcome carried a copy, the same break turned three red |
+| The loop takes a window's timing only from a round that succeeded | `a_window_applied_before_its_round_fails_is_still_a_pull` |
+| The shared flush's gate is not metered | `a_wait_at_the_shared_flush_is_metered_as_a_wait_for_the_writer` |
+| The pull buckets stop at 10 s | `the_render_is_byte_for_byte_what_a_scrape_receives`, whose golden holds a 45 s wait; `the_render_is_parseable_prometheus_text`; `the_metrics_body_exposes_exactly_these_series_in_exactly_this_order` |
+| The writer-wait meter is not put back when a panic unwinds through it | `a_meter_a_panic_unwinds_through_is_put_back` |
+| The loop reports lag in whole seconds | `a_drain_the_tick_cannot_finish_is_counted_as_ended_by_the_budget` |
+| The render truncates the lag | `the_lag_gauge_reads_to_the_millisecond`, `the_render_is_byte_for_byte_what_a_scrape_receives`, `the_snapshot_reads_the_same_atomics_the_render_does` |
+| A tick's report replaces the total rather than adding to it | `each_ticks_pulls_land_in_their_own_phase_label_and_bucket`, `the_render_is_byte_for_byte_what_a_scrape_receives` |
+| `ended="budget"` is rendered from `ceiling`'s row | `each_ticks_pulls_land_in_their_own_phase_label_and_bucket`, `the_render_is_byte_for_byte_what_a_scrape_receives`, `the_snapshot_reads_the_same_atomics_the_render_does` |
+| All four contact instruments are left off the bridge | `every_metrics_series_reaches_the_bridge` |
+| Any one contact instrument is left off the bridge, the other three kept | `the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge` |
+
+**What the positive controls slow, and what must not move with it.** Each of
+the four `a_pull_*` tests slows one thing, by at least 350 ms, and asserts the
+other phases stay below that:
+- **The writer:** another thread holds this member's writer.
+- **The commit:** coalesced durability with a 400 ms window.
+- **The peer:** a relay holds every chunk the peer sends back.
+- **The entry's age:** documents written 400 ms before the pull.
+
+The two `a_drain_the_tick_*` tests run the loop itself against the same
+3,072-entry backlog. Through the slow relay, the first pull outlasts a
+one-second tick and the contact ends `budget`. Directly, a five-second tick
+drains it and every contact ends `caught_up`.
+
+**Guards the bridge's coverage test could not give.** That test matches a
+series by the stem of its name, so a labelled counter is covered by any one of
+its instruments. `kimmy_sync_pull_seconds` and
+`kimmy_sync_entry_wait_seconds` are listed in `NOT_BRIDGED` for their buckets,
+as `kimmy_backup_duration_seconds` is, so removing their sums from the bridge
+would not fail it. `the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge`
+names those six instruments and the four contact instruments one by one.
+Renaming `kimmy.sync.pull_seconds.apply` alone turns it red, and so does
+renaming `kimmy.sync.contacts.failed` alone. `kimmy_backup_duration_seconds` keeps the inherited gap.
+
+### Costs
+
+- **None of it lengthens a hold of the writer or the batch's transaction.**
+  That matters because the quantity being measured is time spent holding the
+  writer: work added inside the hold would make the measurement part of the
+  problem. Where each piece runs:
+  - **Before the batch is applied, with no writer taken:** the clock reads that
+    bound `serve` and start `apply`, and the scan for the oldest lacked entry.
+    The scan is one comparison per entry against a vector the round already
+    holds, at most 1,024.
+  - **After `apply_peer_batch` returns, with the writer released:** the clock
+    read that ends `apply`, and building the pull's timing.
+  - **In the loop between pulls:** folding the pull into the tick's report.
+  - **At the end of the tick:** the metrics mutex. It is not the writer and is
+    never held across storage work.
+  - **Inside the gate, the one exception:** one thread-local read and write per
+    acquisition of the writer, not per entry. It sits in `begin_write`, beside
+    the wait histogram's atomics that were already there, and before the hold's
+    clock starts. The shared flush's gate gets the same.
+  - **Inside the transaction: nothing.** No per-entry work is added, and a
+    1,024-entry batch still takes the writer once per run.
+- **Per tick:** one mutex acquisition to fold the tick's report.
+- **Per scrape or export:** one copy of the report.
+- **The lag gauge's type on the bridge** changes from integer to double. The
+  changelog says so for a pipeline that typed it.

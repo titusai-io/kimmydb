@@ -415,6 +415,57 @@ pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+thread_local! {
+    /// What [`metered_writer_wait`] has gathered on this thread so far, or
+    /// `None` outside one.
+    static WRITER_WAIT_METER: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` and say how long it spent waiting for the single writer, across
+/// every time it took it (ADR-175).
+///
+/// The engine-wide wait histogram (ADR-151) cannot answer that for one
+/// caller: every writer on the node lands in it, so a replicated batch that
+/// queued behind a client's bulk and a client's bulk that queued behind the
+/// batch are the same observation. A thread-local rather than a field on the
+/// transaction, because a batch takes the writer from more places than one —
+/// each run, each schema change it records, and the shared flush a coalesced
+/// commit waits on — and every one of them waits at the same gate. The storage
+/// work under `f` is synchronous, and [`blocking`] runs its closure on the
+/// thread it was called from, so every wait `f` makes happens on this thread.
+///
+/// Nested calls each see their own waits, and the outer one sees the inner
+/// one's too.
+pub fn metered_writer_wait<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
+    /// Puts the enclosing meter back, with this one's waits added, however
+    /// `f` ends — a panic unwinding through it included, so a thread that
+    /// survives the panic does not go on metering into a scope that is gone.
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let inner = WRITER_WAIT_METER.with(|m| m.get()).unwrap_or_default();
+            WRITER_WAIT_METER.with(|m| m.set(self.0.map(|outer| outer + inner)));
+        }
+    }
+
+    let restore = Restore(WRITER_WAIT_METER.with(|m| m.replace(Some(std::time::Duration::ZERO))));
+    let value = f();
+    let waited = WRITER_WAIT_METER.with(|m| m.get()).unwrap_or_default();
+    drop(restore);
+    (value, waited)
+}
+
+/// Add a wait for the writer to the meter this thread is running under, if
+/// any.
+fn meter_writer_wait(waited: std::time::Duration) {
+    WRITER_WAIT_METER.with(|m| {
+        if let Some(sofar) = m.get() {
+            m.set(Some(sofar + waited));
+        }
+    });
+}
+
 /// The shared-fsync barrier behind [`DurabilityClass::Coalesced`].
 ///
 /// No background thread and no handle to the engine: the committers
@@ -1851,6 +1902,7 @@ impl Engine {
         });
         let waited = waited_from.elapsed();
         self.record_writer_wait(waited);
+        meter_writer_wait(waited);
         let Some(gate) = gate else {
             self.writer_wait_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
@@ -1968,8 +2020,11 @@ impl Engine {
         // (ADR-159). This is the one path that takes the writer without
         // opening a counted transaction, which is why it was the one hold
         // nothing measured at all: not mislabelled, absent.
+        let waited_from = std::time::Instant::now();
+        let gate = blocking(|| self.writer_gate.lock());
+        meter_writer_wait(waited_from.elapsed());
         let _gate = WriterHold {
-            gate: Some(blocking(|| self.writer_gate.lock())),
+            gate: Some(gate),
             engine: self,
             held_from: std::time::Instant::now(),
             holder: WriterHolder::Durability,
@@ -3119,6 +3174,21 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_meter_a_panic_unwinds_through_is_put_back() {
+        // A thread that survives a panic inside a metered call must not go
+        // on adding its waits to a scope that no longer exists (ADR-175).
+        let outcome = std::panic::catch_unwind(|| {
+            super::metered_writer_wait(|| panic!("inside the metered call"))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(
+            super::WRITER_WAIT_METER.with(|m| m.get()),
+            None,
+            "the thread is metering nothing once the call is gone"
+        );
+    }
+
     /// A file backend that counts the bytes redb asks it for.
     ///
     /// What an open *reads* is not observable from outside otherwise: redb's

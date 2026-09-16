@@ -214,6 +214,62 @@ pub struct SyncOutcome {
     /// batch had stopped at a collection this node lacks. Set only by
     /// `kimmy-cluster`'s `sync_once`, like `exhausted`.
     pub repairing: bool,
+    /// How long applying this batch waited for the single writer, over
+    /// every time it took it (ADR-175): each run's transaction, each schema
+    /// change it recorded, and the shared flush a coalesced commit waits on.
+    /// Set by [`Engine::apply_peer_batch`]; zero on every other path.
+    pub writer_wait: std::time::Duration,
+}
+
+/// One oplog pull, taken apart (ADR-175).
+///
+/// A replica's landing time is how long an entry waited before a pull
+/// carried it, plus how long the pull took. The second part splits three
+/// ways, and each is a different fix: the peer walking its oplog and the
+/// wire (`serve`), this node queueing for its single writer behind whatever
+/// else is writing (`wait`), and this node doing the work of applying the
+/// batch (`apply`). The three are disjoint, so they add up to the pull.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PullTiming {
+    /// From asking the peer for the window to holding it: the peer's walk
+    /// of its oplog, the frame's encoding, and the wire, both ways, and the
+    /// retry when the first answer said a full batch would not fit.
+    pub serve: std::time::Duration,
+    /// Waiting for the single writer while applying the batch:
+    /// [`SyncOutcome::writer_wait`].
+    pub wait: std::time::Duration,
+    /// Applying the batch, less `wait`: every entry's work, the commits, and
+    /// the fsync or the shared flush they wait on.
+    pub apply: std::time::Duration,
+    /// Entries the window carried, whatever became of each.
+    pub entries: usize,
+    /// How long the oldest entry this node lacked had waited when the batch
+    /// arrived; `None` when the window carried nothing this node lacked —
+    /// a re-served replay, a span it holds as state.
+    pub oldest_lacked: Option<EntryWait>,
+}
+
+/// How long an entry had waited to be pulled, from its origin stamp to this
+/// node's clock (ADR-175).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryWait {
+    /// Written this long before it arrived.
+    Waited(std::time::Duration),
+    /// Stamped later than this node's clock reads: the origin's clock, or
+    /// one its stamps witnessed, runs ahead of this node's. Not a wait of
+    /// zero, which would read as an entry that arrived at once; a reading
+    /// that cannot be taken, and counted as one.
+    Ahead,
+}
+
+impl EntryWait {
+    /// How long an entry stamped `wall_ms` has waited at `now_ms`.
+    pub fn at(wall_ms: u64, now_ms: u64) -> Self {
+        match now_ms.checked_sub(wall_ms) {
+            Some(ms) => Self::Waited(std::time::Duration::from_millis(ms)),
+            None => Self::Ahead,
+        }
+    }
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of
@@ -511,7 +567,12 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
-        self.apply_batch_absorbing(entries, Some(Introduced { theirs, scanned_to, exhausted }))
+        let (outcome, waited) = crate::engine::metered_writer_wait(|| {
+            self.apply_batch_absorbing(entries, Some(Introduced { theirs, scanned_to, exhausted }))
+        });
+        let mut outcome = outcome?;
+        outcome.writer_wait = waited;
+        Ok(outcome)
     }
 
     /// The window at or after `from` a peer that asked to catch up may be
@@ -2292,6 +2353,41 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_at_the_shared_flush_is_metered_as_a_wait_for_the_writer() {
+        // ADR-175: under `coalesced` a commit lets go of the writer and waits
+        // for the shared flush, whose leader takes the writer again. A batch
+        // whose flush queues behind another holder has waited for the writer,
+        // and the meter must say so, not leave it to be read as applying.
+        let (e, _d) = engine();
+        let coll = e.create_collection("shop", "orders").unwrap();
+        e.set_durability(
+            crate::engine::DurabilityClass::Coalesced,
+            std::time::Duration::from_millis(300),
+        );
+
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let e = &e;
+            scope.spawn(move || {
+                // Take the writer while the leader sleeps out its window, and
+                // hold it well past the window's end.
+                started_rx.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _hold = e.hold_writer(crate::engine::WriterHolder::Bulk);
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            });
+            let (_, waited) = crate::engine::metered_writer_wait(|| {
+                started_tx.send(()).unwrap();
+                e.insert(&coll, doc! { "_id": "flushed" }).unwrap();
+            });
+            assert!(
+                waited >= std::time::Duration::from_millis(300),
+                "the flush's leader queued behind the holder: waited {waited:?}"
+            );
+        });
+    }
+
+    #[test]
     fn a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing() {
         // The worse half of the same hole, and the one the exemption used to
         // let through: a peer that hands over *no* entries while naming a
@@ -2318,7 +2414,16 @@ mod tests {
 
         let outcome = b.apply_peer_batch(&theirs, &[], whole.scanned_to, false).unwrap();
 
-        assert_eq!(outcome, SyncOutcome::default(), "nothing was applied, because nothing came");
+        // The wait for the writer is a timing, not something the batch did:
+        // an empty window still opens a transaction for its vector, so it is
+        // not zero. Bounded rather than ignored, since nothing holds the
+        // writer here.
+        assert!(outcome.writer_wait < std::time::Duration::from_secs(1), "{outcome:?}");
+        assert_eq!(
+            outcome,
+            SyncOutcome { writer_wait: outcome.writer_wait, ..SyncOutcome::default() },
+            "nothing was applied, because nothing came"
+        );
         assert_eq!(witnessed_of(&b, &theirs), Hlc::ZERO, "and nothing may be claimed for it");
         assert!(
             !b.witnessed_vector().unwrap().covers(&theirs),
