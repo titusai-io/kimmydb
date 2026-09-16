@@ -2569,6 +2569,7 @@ dependencies = [
  "criterion",
  "kimmy-core",
  "kimmy-query",
+ "libc",
  "parking_lot",
  "proptest",
  "redb",

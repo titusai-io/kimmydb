@@ -1,0 +1,1136 @@
+//! What the single writer was held *for*, and what serving a peer's window
+//! read (ADR-176).
+//!
+//! `kimmy_write_lock_held_seconds` says how long the writer was held and by
+//! what kind of work. Under load it is the bottleneck for every write shape —
+//! throughput has matched one over the mean hold — and nothing said what a hold
+//! was made of. This module splits every hold two ways.
+//!
+//! **By what the holding thread was doing** ([`Component`]): inside the storage
+//! backend reading a page, writing one, or asking for an fsync; on the CPU
+//! outside those calls; or off the CPU outside them — descheduled, or waiting on
+//! a lock inside redb. The split is sound because of a property of redb 4 rather
+//! than an assumption: redb runs no threads of its own, so every page read, page
+//! write and fsync a transaction causes happens on the thread that holds it,
+//! through [`redb::StorageBackend`]. A write transaction never leaves the thread
+//! that opened it — it holds the writer gate's guard, which is not `Send` — so
+//! what the backend does on that thread between the gate being taken and let go
+//! is what the hold contained, and nothing another thread does can land in it.
+//!
+//! **By where in the transaction** ([`Phase`]): the path's own work, the
+//! live-count flush every commit makes (ADR-174's addendum), and redb's commit.
+//!
+//! The meter is a thread-local, installed for the length of a hold (or of a
+//! served window's walk) and absent otherwise, so a backend call on a thread
+//! with nothing installed costs one thread-local read and no clock.
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
+
+use crate::engine::WriterHolder;
+
+/// What a hold's time was spent on (ADR-176). Disjoint, and together the hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Component {
+    /// Wall time inside the backend's `read`: a page redb's cache did not hold.
+    Read,
+    /// Wall time inside the backend's `write`: redb writing a page out.
+    Write,
+    /// Wall time inside the backend's `sync_data`: the fsync.
+    Sync,
+    /// The thread's CPU time over the hold, less its CPU time inside the three
+    /// calls above: B-tree work over cached pages, encoding, index keys, the
+    /// live-count bookkeeping.
+    Cpu,
+    /// What is left: off the CPU, outside any backend call — scheduler delay,
+    /// or a wait on a lock inside redb. **A residual**, so anything the other
+    /// four fail to capture lands here too.
+    OffCpu,
+}
+
+impl Component {
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] =
+        [Self::Read, Self::Write, Self::Sync, Self::Cpu, Self::OffCpu];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Sync => "sync",
+            Self::Cpu => "cpu",
+            Self::OffCpu => "off_cpu",
+        }
+    }
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// Where in the transaction a hold's time was spent (ADR-176). Consecutive
+/// spans of one timeline, so they add up to the hold exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// From taking the writer to asking to commit: the path's own reads and
+    /// writes. The whole hold of a transaction that aborted.
+    Work,
+    /// The live counts and their mark, written once per transaction before
+    /// the commit (ADR-174's addendum).
+    Counts,
+    /// redb's commit, page writes and fsync included, to letting go.
+    Commit,
+}
+
+impl Phase {
+    pub const COUNT: usize = 3;
+    pub const ALL: [Self; Self::COUNT] = [Self::Work, Self::Counts, Self::Commit];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Counts => "counts",
+            Self::Commit => "commit",
+        }
+    }
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// Every write call in a hold up to this many has the thread's CPU time read
+/// around it (ADR-176). Past it, one in [`WRITE_SAMPLE_EVERY`] does.
+///
+/// Reading a thread's CPU clock is a system call on Linux — the vDSO does not
+/// serve it — at about 290 ns against 20 ns for the monotonic clock. A
+/// single-document insert makes about 31 page writes, so it is measured exactly;
+/// a bulk of 1,000 makes over 2,000, and a clock pair around each would have
+/// cost more than 1% of its hold.
+pub const WRITES_MEASURED: u64 = 32;
+
+/// Past [`WRITES_MEASURED`], the share of write calls whose CPU time is read.
+pub const WRITE_SAMPLE_EVERY: u64 = 32;
+
+/// How far the four measured components may add up past the hold before the
+/// hold is counted as over-counted: a fixed part for the clocks' granularity
+/// and a proportional part for their per-call rounding.
+pub const OVERCOUNT_TOLERANCE: Duration = Duration::from_millis(1);
+
+/// This thread's CPU time, or `None` where the platform has no per-thread CPU
+/// clock (ADR-176).
+///
+/// `CLOCK_THREAD_CPUTIME_ID` on Linux and on macOS. Anywhere else a hold's
+/// `cpu` and `off_cpu` are not recorded at all — never recorded as zero — and
+/// [`HoldCounters::cpu_unmeasured`] counts the hold instead.
+pub fn thread_cpu() -> Option<Duration> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid, writable timespec for the call's duration.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        if rc == 0 {
+            return Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Which backend call is being metered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Io {
+    Read,
+    Write,
+    Sync,
+}
+
+/// What the backend did on this thread while a meter was installed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Meter {
+    /// Whether to read the CPU clock around calls at all: a hold does, a
+    /// served window's walk, which needs only its reads' wall time, does not.
+    cpu: bool,
+    pub read: Duration,
+    pub read_bytes: u64,
+    pub read_cpu: Duration,
+    pub write: Duration,
+    pub write_bytes: u64,
+    pub write_calls: u64,
+    /// Wall and CPU time of the writes whose CPU was read.
+    pub write_sampled: Duration,
+    pub write_sampled_cpu: Duration,
+    pub sync: Duration,
+    pub sync_cpu: Duration,
+    /// Whether a CPU clock read the meter needed failed.
+    pub cpu_failed: bool,
+}
+
+impl Meter {
+    fn add(&mut self, inner: &Meter) {
+        self.read += inner.read;
+        self.read_bytes += inner.read_bytes;
+        self.read_cpu += inner.read_cpu;
+        self.write += inner.write;
+        self.write_bytes += inner.write_bytes;
+        self.write_calls += inner.write_calls;
+        self.write_sampled += inner.write_sampled;
+        self.write_sampled_cpu += inner.write_sampled_cpu;
+        self.sync += inner.sync;
+        self.sync_cpu += inner.sync_cpu;
+        self.cpu_failed |= inner.cpu_failed;
+    }
+}
+
+thread_local! {
+    static METER: RefCell<Option<Meter>> = const { RefCell::new(None) };
+}
+
+/// Run one backend call, metering it if this thread has a meter installed.
+pub(crate) fn io<T>(
+    kind: Io,
+    bytes: usize,
+    call: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let Some((cpu, write_calls)) =
+        METER.with(|m| m.borrow().as_ref().map(|m| (m.cpu, m.write_calls)))
+    else {
+        return call();
+    };
+    let with_cpu = cpu
+        && match kind {
+            // The calls that can block on the disk, and there are few of them:
+            // measured exactly, so time off the CPU inside them is never
+            // mistaken for work.
+            Io::Read | Io::Sync => true,
+            Io::Write => write_calls < WRITES_MEASURED || write_calls % WRITE_SAMPLE_EVERY == 0,
+        };
+    let cpu_from = if with_cpu { thread_cpu() } else { None };
+    let from = Instant::now();
+    #[cfg(test)]
+    test_hooks::inside_io(kind, write_calls);
+    let result = call();
+    let wall = from.elapsed();
+    let cpu_spent = match cpu_from {
+        Some(start) => thread_cpu().map(|end| end.saturating_sub(start)),
+        None => None,
+    };
+    METER.with(|m| {
+        let mut m = m.borrow_mut();
+        let Some(m) = m.as_mut() else { return };
+        if with_cpu && cpu_spent.is_none() {
+            m.cpu_failed = true;
+        }
+        let cpu_spent = cpu_spent.unwrap_or_default();
+        match kind {
+            Io::Read => {
+                m.read += wall;
+                m.read_bytes += bytes as u64;
+                m.read_cpu += cpu_spent;
+            }
+            Io::Write => {
+                m.write += wall;
+                m.write_bytes += bytes as u64;
+                m.write_calls += 1;
+                if with_cpu {
+                    m.write_sampled += wall;
+                    m.write_sampled_cpu += cpu_spent;
+                }
+            }
+            Io::Sync => {
+                m.sync += wall;
+                m.sync_cpu += cpu_spent;
+            }
+        }
+    });
+    result
+}
+
+/// A meter installed on this thread until [`Scope::finish`].
+///
+/// Installing one where another is already installed puts the outer one aside;
+/// finishing puts it back with the inner one's calls added, so an outer scope
+/// sees everything that happened inside it.
+pub(crate) struct Scope {
+    outer: Option<Meter>,
+    cpu_from: Option<Duration>,
+    finished: bool,
+}
+
+impl Scope {
+    /// Start metering a hold: the backend's calls and the thread's CPU time.
+    pub(crate) fn hold() -> Self {
+        Self::install(true)
+    }
+
+    /// Start metering a walk: the backend's calls' wall time and bytes only.
+    pub(crate) fn walk() -> Self {
+        Self::install(false)
+    }
+
+    fn install(cpu: bool) -> Self {
+        let outer = METER.with(|m| m.replace(Some(Meter { cpu, ..Meter::default() })));
+        Self { outer, cpu_from: if cpu { thread_cpu() } else { None }, finished: false }
+    }
+
+    /// Stop metering, and return what was metered and the thread's CPU time
+    /// over the scope (`None` when it could not be read).
+    pub(crate) fn finish(mut self) -> (Meter, Option<Duration>) {
+        let cpu = match self.cpu_from {
+            Some(start) => thread_cpu().map(|end| end.saturating_sub(start)),
+            None => None,
+        };
+        (self.uninstall(), cpu)
+    }
+
+    fn uninstall(&mut self) -> Meter {
+        self.finished = true;
+        let inner = METER.with(|m| m.take()).unwrap_or_default();
+        let outer = self.outer.take().map(|mut outer| {
+            outer.add(&inner);
+            outer
+        });
+        METER.with(|m| *m.borrow_mut() = outer);
+        inner
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        // A scope a panic unwinds through must not leave this thread metering
+        // into it.
+        if !self.finished {
+            self.uninstall();
+        }
+    }
+}
+
+/// One hold, decomposed (ADR-176).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Decomposed {
+    /// Indexed by [`Component::slot`]. `cpu` and `off_cpu` are zero when
+    /// `cpu_measured` is false and are then not recorded.
+    pub components: [Duration; Component::COUNT],
+    pub cpu_measured: bool,
+    /// The four measured components came to more than the hold, past
+    /// [`OVERCOUNT_TOLERANCE`]: something was counted twice.
+    pub overcounted: bool,
+    /// Wall time of the writes whose CPU was estimated rather than read: the
+    /// most the split between `cpu` and `off_cpu` can be wrong by.
+    pub write_estimated: Duration,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// Split a hold of `hold` with `cpu_over_hold` of thread CPU time, given what
+/// the backend did during it (ADR-176).
+///
+/// The CPU inside write calls whose CPU was not read is estimated from the
+/// sampled writes' ratio of CPU to wall time. That estimate can be wrong in
+/// either direction, and `write_estimated` bounds by how much.
+pub(crate) fn decompose(
+    meter: &Meter,
+    hold: Duration,
+    cpu_over_hold: Option<Duration>,
+) -> Decomposed {
+    let mut out = Decomposed {
+        read_bytes: meter.read_bytes,
+        write_bytes: meter.write_bytes,
+        write_estimated: meter.write.saturating_sub(meter.write_sampled),
+        ..Decomposed::default()
+    };
+    out.components[Component::Read.slot()] = meter.read;
+    out.components[Component::Write.slot()] = meter.write;
+    out.components[Component::Sync.slot()] = meter.sync;
+    let io = meter.read + meter.write + meter.sync;
+    let tolerance = OVERCOUNT_TOLERANCE + hold / 100;
+
+    let cpu_over_hold = if meter.cpu_failed { None } else { cpu_over_hold };
+    let Some(cpu_over_hold) = cpu_over_hold else {
+        out.overcounted = io > hold + tolerance;
+        return out;
+    };
+    out.cpu_measured = true;
+
+    let estimated_write_cpu = if meter.write_sampled.is_zero() {
+        Duration::ZERO
+    } else {
+        let ratio = meter.write_sampled_cpu.as_secs_f64() / meter.write_sampled.as_secs_f64();
+        out.write_estimated.mul_f64(ratio.min(1.0))
+    };
+    let cpu_in_io = meter.read_cpu + meter.sync_cpu + meter.write_sampled_cpu + estimated_write_cpu;
+    // CPU inside the calls cannot exceed the CPU over the hold except by an
+    // estimate or a clock that rounds; beyond the tolerance it is a double count.
+    if cpu_in_io > cpu_over_hold + tolerance {
+        out.overcounted = true;
+    }
+    let mut cpu = cpu_over_hold.saturating_sub(cpu_in_io);
+    let measured = io + cpu;
+    if measured > hold + tolerance {
+        out.overcounted = true;
+    }
+    // Within the tolerance, a measured sum past the hold is the clocks'
+    // rounding, and it comes off `cpu`, the one component read from a
+    // different clock: so the five add up to the hold exactly, unless the
+    // backend calls alone outlast it.
+    cpu = cpu.saturating_sub(measured.saturating_sub(hold));
+    out.components[Component::Cpu.slot()] = cpu;
+    out.components[Component::OffCpu.slot()] = hold.saturating_sub(io + cpu);
+    out
+}
+
+/// The per-holder totals of every decomposed hold, since start (ADR-176).
+pub(crate) struct HoldCounters {
+    component_ns: [[AtomicU64; Component::COUNT]; WriterHolder::COUNT],
+    phase_ns: [[AtomicU64; Phase::COUNT]; WriterHolder::COUNT],
+    read_bytes: [AtomicU64; WriterHolder::COUNT],
+    write_bytes: [AtomicU64; WriterHolder::COUNT],
+    write_estimated_ns: [AtomicU64; WriterHolder::COUNT],
+    overcounted: [AtomicU64; WriterHolder::COUNT],
+    cpu_unmeasured: AtomicU64,
+}
+
+impl Default for HoldCounters {
+    fn default() -> Self {
+        let zero = || AtomicU64::new(0);
+        Self {
+            component_ns: std::array::from_fn(|_| std::array::from_fn(|_| zero())),
+            phase_ns: std::array::from_fn(|_| std::array::from_fn(|_| zero())),
+            read_bytes: std::array::from_fn(|_| zero()),
+            write_bytes: std::array::from_fn(|_| zero()),
+            write_estimated_ns: std::array::from_fn(|_| zero()),
+            overcounted: std::array::from_fn(|_| zero()),
+            cpu_unmeasured: zero(),
+        }
+    }
+}
+
+fn ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl HoldCounters {
+    pub(crate) fn record(
+        &self,
+        holder: WriterHolder,
+        hold: &Decomposed,
+        phases: [Duration; Phase::COUNT],
+    ) {
+        let row = holder.slot();
+        // `decompose` leaves `cpu` and `off_cpu` at zero for a hold whose CPU
+        // time could not be read, so adding them adds nothing.
+        for component in Component::ALL {
+            self.component_ns[row][component.slot()]
+                .fetch_add(ns(hold.components[component.slot()]), Relaxed);
+        }
+        if !hold.cpu_measured {
+            self.cpu_unmeasured.fetch_add(1, Relaxed);
+        }
+        for phase in Phase::ALL {
+            self.phase_ns[row][phase.slot()].fetch_add(ns(phases[phase.slot()]), Relaxed);
+        }
+        self.read_bytes[row].fetch_add(hold.read_bytes, Relaxed);
+        self.write_bytes[row].fetch_add(hold.write_bytes, Relaxed);
+        self.write_estimated_ns[row].fetch_add(ns(hold.write_estimated), Relaxed);
+        if hold.overcounted {
+            self.overcounted[row].fetch_add(1, Relaxed);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> HoldDecomposition {
+        HoldDecomposition {
+            component_ns: std::array::from_fn(|h| {
+                std::array::from_fn(|c| self.component_ns[h][c].load(Relaxed))
+            }),
+            phase_ns: std::array::from_fn(|h| {
+                std::array::from_fn(|p| self.phase_ns[h][p].load(Relaxed))
+            }),
+            read_bytes: std::array::from_fn(|h| self.read_bytes[h].load(Relaxed)),
+            write_bytes: std::array::from_fn(|h| self.write_bytes[h].load(Relaxed)),
+            write_estimated_ns: std::array::from_fn(|h| self.write_estimated_ns[h].load(Relaxed)),
+            overcounted: std::array::from_fn(|h| self.overcounted[h].load(Relaxed)),
+            cpu_unmeasured: self.cpu_unmeasured.load(Relaxed),
+        }
+    }
+}
+
+/// What every hold since start was made of, per holder, as a scrape reads it
+/// (ADR-176). Nanoseconds and bytes; rows in [`WriterHolder::ALL`] order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldDecomposition {
+    /// Columns in [`Component::ALL`] order. `cpu` and `off_cpu` hold only
+    /// the holds whose CPU time could be read; see `cpu_unmeasured`.
+    pub component_ns: [[u64; Component::COUNT]; WriterHolder::COUNT],
+    /// Columns in [`Phase::ALL`] order.
+    pub phase_ns: [[u64; Phase::COUNT]; WriterHolder::COUNT],
+    pub read_bytes: [u64; WriterHolder::COUNT],
+    pub write_bytes: [u64; WriterHolder::COUNT],
+    /// The bound on the `cpu`/`off_cpu` split's error: write time whose CPU
+    /// was estimated.
+    pub write_estimated_ns: [u64; WriterHolder::COUNT],
+    pub overcounted: [u64; WriterHolder::COUNT],
+    /// Holds, of any holder, whose `cpu` and `off_cpu` were not recorded
+    /// because this thread's CPU time could not be read.
+    pub cpu_unmeasured: u64,
+}
+
+/// Upper bounds of the serve-walk histogram, in microseconds (ADR-176).
+///
+/// A walk of a caught-up peer's window over a warm cache is well under a
+/// millisecond; a full window of 1,024 entries off a cold cache, or one that
+/// passes over a long run of what the peer already holds (ADR-171), is where
+/// the upper buckets go.
+pub const SERVE_WALK_BUCKETS_US: [u64; 12] = [
+    100, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000,
+    30_000_000,
+];
+
+/// What serving peers' windows has cost this node, since start (ADR-176).
+#[derive(Default)]
+pub(crate) struct ServeCounters {
+    windows: AtomicU64,
+    entries: AtomicU64,
+    passed: AtomicU64,
+    walk_buckets: [AtomicU64; SERVE_WALK_BUCKETS_US.len()],
+    walk_sum_us: AtomicU64,
+    read_ns: AtomicU64,
+    read_bytes: AtomicU64,
+}
+
+impl ServeCounters {
+    pub(crate) fn record(&self, entries: usize, passed: u64, walk: Duration, meter: &Meter) {
+        let us = u64::try_from(walk.as_micros()).unwrap_or(u64::MAX);
+        self.windows.fetch_add(1, Relaxed);
+        self.entries.fetch_add(entries as u64, Relaxed);
+        self.passed.fetch_add(passed, Relaxed);
+        if let Some(slot) = SERVE_WALK_BUCKETS_US.iter().position(|upper| us <= *upper) {
+            self.walk_buckets[slot].fetch_add(1, Relaxed);
+        }
+        self.walk_sum_us.fetch_add(us, Relaxed);
+        self.read_ns.fetch_add(ns(meter.read), Relaxed);
+        self.read_bytes.fetch_add(meter.read_bytes, Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> ServeSnapshot {
+        ServeSnapshot {
+            windows: self.windows.load(Relaxed),
+            entries: self.entries.load(Relaxed),
+            passed: self.passed.load(Relaxed),
+            walk_buckets: std::array::from_fn(|slot| self.walk_buckets[slot].load(Relaxed)),
+            walk_sum_us: self.walk_sum_us.load(Relaxed),
+            read_ns: self.read_ns.load(Relaxed),
+            read_bytes: self.read_bytes.load(Relaxed),
+        }
+    }
+}
+
+/// What serving peers' windows has cost this node, as a scrape reads it
+/// (ADR-176).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServeSnapshot {
+    /// Windows walked for a peer; also the walk histogram's count.
+    pub windows: u64,
+    /// Entries those windows carried.
+    pub entries: u64,
+    /// Entries the walks examined and did not serve: passed over because the
+    /// peer already holds them (ADR-171), or never served to a peer.
+    pub passed: u64,
+    /// Walks in each bucket of [`SERVE_WALK_BUCKETS_US`], **not** cumulative.
+    pub walk_buckets: [u64; SERVE_WALK_BUCKETS_US.len()],
+    pub walk_sum_us: u64,
+    /// Wall time and bytes of the backend reads the walks made.
+    pub read_ns: u64,
+    pub read_bytes: u64,
+}
+
+/// A file backend that meters what it is asked to do (ADR-176). Every engine
+/// opens its database through one.
+#[derive(Debug)]
+pub(crate) struct MeteredBackend {
+    inner: redb::backends::FileBackend,
+}
+
+impl MeteredBackend {
+    pub(crate) fn new(inner: redb::backends::FileBackend) -> Self {
+        Self { inner }
+    }
+}
+
+impl redb::StorageBackend for MeteredBackend {
+    fn len(&self) -> std::result::Result<u64, std::io::Error> {
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
+        let bytes = out.len();
+        io(Io::Read, bytes, || self.inner.read(offset, out))
+    }
+
+    fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
+        io(Io::Sync, 0, || self.inner.sync_data())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
+        io(Io::Write, data.len(), || self.inner.write(offset, data))
+    }
+
+    fn close(&self) -> std::result::Result<(), std::io::Error> {
+        self.inner.close()
+    }
+}
+
+/// Test-only ways to put known work inside a hold, so each component and
+/// phase can be shown to move when what it measures does. `cfg(test)`: none
+/// of this exists in any other build.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    use super::{Io, Phase};
+
+    thread_local! {
+        /// Slept, off the CPU, at the start of each phase of a hold.
+        pub static SLEEP_IN: Cell<[Duration; Phase::COUNT]> =
+            const { Cell::new([Duration::ZERO; Phase::COUNT]) };
+        /// Spun, on the CPU, at the start of the work phase.
+        pub static SPIN_IN_WORK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// Spun inside each read, write and sync call.
+        pub static SPIN_IN_IO: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// Slept inside every write call from this index on.
+        pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
+    }
+
+    pub fn spin(d: Duration) {
+        if d.is_zero() {
+            return;
+        }
+        let until = Instant::now() + d;
+        let mut x = 0u64;
+        while Instant::now() < until {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+    }
+
+    pub fn at_phase(phase: Phase) {
+        std::thread::sleep(SLEEP_IN.with(|s| s.get())[phase.slot()]);
+        if phase == Phase::Work {
+            spin(SPIN_IN_WORK.with(|s| s.get()));
+        }
+    }
+
+    pub fn inside_io(kind: Io, write_calls: u64) {
+        spin(SPIN_IN_IO.with(|s| s.get()));
+        if kind == Io::Write
+            && let Some((from, d)) = SLEEP_IN_WRITES_FROM.with(|s| s.get())
+            && write_calls >= from
+        {
+            std::thread::sleep(d);
+        }
+    }
+
+    /// Put every hook back to doing nothing.
+    pub fn reset() {
+        SLEEP_IN.with(|s| s.set([Duration::ZERO; Phase::COUNT]));
+        SPIN_IN_WORK.with(|s| s.set(Duration::ZERO));
+        SPIN_IN_IO.with(|s| s.set(Duration::ZERO));
+        SLEEP_IN_WRITES_FROM.with(|s| s.set(None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bson::doc;
+
+    use super::*;
+    use crate::engine::{DurabilityClass, Engine};
+
+    fn fresh() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        (engine, dir)
+    }
+
+    /// One holder's row of what changed between two readings.
+    #[derive(Debug, Default)]
+    struct Row {
+        holds: u64,
+        held: Duration,
+        components: [Duration; Component::COUNT],
+        phases: [Duration; Phase::COUNT],
+        read_bytes: u64,
+        write_bytes: u64,
+        write_estimated: Duration,
+        overcounted: u64,
+    }
+
+    impl Row {
+        fn get(&self, c: Component) -> Duration {
+            self.components[c.slot()]
+        }
+        fn phase(&self, p: Phase) -> Duration {
+            self.phases[p.slot()]
+        }
+    }
+
+    /// What `f` added to `holder`'s row.
+    fn during(engine: &Engine, holder: WriterHolder, f: impl FnOnce()) -> Row {
+        let (h0, d0) = (engine.writer_hold(), engine.writer_hold_decomposition());
+        f();
+        let (h1, d1) = (engine.writer_hold(), engine.writer_hold_decomposition());
+        let r = holder.slot();
+        let ns = |n: u64| Duration::from_nanos(n);
+        Row {
+            holds: h1.count[r] - h0.count[r],
+            held: Duration::from_micros(h1.sum_us[r] - h0.sum_us[r]),
+            components: std::array::from_fn(|c| ns(d1.component_ns[r][c] - d0.component_ns[r][c])),
+            phases: std::array::from_fn(|p| ns(d1.phase_ns[r][p] - d0.phase_ns[r][p])),
+            read_bytes: d1.read_bytes[r] - d0.read_bytes[r],
+            write_bytes: d1.write_bytes[r] - d0.write_bytes[r],
+            write_estimated: ns(d1.write_estimated_ns[r] - d0.write_estimated_ns[r]),
+            overcounted: d1.overcounted[r] - d0.overcounted[r],
+        }
+    }
+
+    fn inserts(engine: &Engine, n: usize) {
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..n {
+            engine.insert(&coll, doc! { "n": i as i64, "body": "x".repeat(200) }).unwrap();
+        }
+    }
+
+    /// Every component sums to the hold it came from, to within the rounding of
+    /// the hold histogram's microseconds: one per hold.
+    fn assert_adds_up(row: &Row) {
+        let slack = Duration::from_micros(row.holds);
+        let components: Duration = row.components.iter().sum();
+        let phases: Duration = row.phases.iter().sum();
+        for (what, sum) in [("components", components), ("phases", phases)] {
+            let gap = sum.abs_diff(row.held);
+            assert!(gap <= slack, "{what} sum to {sum:?} of a {:?} hold: {row:?}", row.held);
+        }
+    }
+
+    #[test]
+    fn this_platforms_thread_clock_reads_cpu_time_and_not_zero() {
+        // Condition 2 of ADR-176: a clock stuck at zero would make every `cpu`
+        // assertion below vacuous on the machine the gate runs on.
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert_eq!(thread_cpu(), None, "a platform without the clock says so");
+            return;
+        }
+        let from = thread_cpu().expect("Linux and macOS have a per-thread CPU clock");
+        test_hooks::spin(Duration::from_millis(60));
+        let spent = thread_cpu().unwrap() - from;
+        assert!(spent >= Duration::from_millis(30), "60 ms of spinning read as {spent:?}");
+        let from = thread_cpu().unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let slept = thread_cpu().unwrap() - from;
+        assert!(slept < Duration::from_millis(20), "60 ms asleep read as {slept:?} of CPU");
+    }
+
+    #[test]
+    fn every_hold_decomposes_into_exactly_its_length() {
+        let (engine, _dir) = fresh();
+        let row = during(&engine, WriterHolder::Write, || inserts(&engine, 100));
+        assert_eq!(row.holds, 100);
+        // A single-document insert makes fewer page writes than are measured
+        // exactly, so none of its CPU is estimated.
+        assert_eq!(row.write_estimated, Duration::ZERO, "{row:?}");
+        assert_adds_up(&row);
+        assert_eq!(row.overcounted, 0, "{row:?}");
+        assert_eq!(engine.writer_hold_decomposition().cpu_unmeasured, 0);
+    }
+
+    #[test]
+    fn an_uncontended_hold_is_almost_all_measured() {
+        // `off_cpu` is a residual: what no measured component captured lands in
+        // it, and it is the component a reader takes as contention. With
+        // nothing contending, it must be a small, bounded share of the hold.
+        let (engine, _dir) = fresh();
+        let row = during(&engine, WriterHolder::Write, || inserts(&engine, 200));
+        let off_cpu = row.get(Component::OffCpu).as_secs_f64() / row.held.as_secs_f64();
+        assert!(
+            off_cpu <= 0.25,
+            "off_cpu is {:.1}% of an uncontended hold: {row:?}",
+            off_cpu * 100.0
+        );
+    }
+
+    #[test]
+    fn a_durable_commits_fsync_is_its_own_and_a_coalesced_one_is_the_barriers() {
+        // The pair: under `durable` the fsync is inside the write's hold; under
+        // `coalesced` the write's hold has none and the barrier's has it. A
+        // `sync` that read the same under both would pass either half alone.
+        let (engine, _dir) = fresh();
+        let durable = during(&engine, WriterHolder::Write, || inserts(&engine, 10));
+        assert!(durable.get(Component::Sync) > Duration::ZERO, "{durable:?}");
+        assert!(durable.get(Component::Write) > Duration::ZERO, "{durable:?}");
+        assert!(durable.write_bytes > 0, "{durable:?}");
+
+        let (engine, _dir) = fresh();
+        engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(2));
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let before = engine.writer_hold_decomposition();
+        let write = during(&engine, WriterHolder::Write, || {
+            for i in 0..10 {
+                engine.insert(&coll, doc! { "n": i }).unwrap();
+            }
+        });
+        let after = engine.writer_hold_decomposition();
+        let barrier = WriterHolder::Durability.slot();
+        let barrier_sync = after.component_ns[barrier][Component::Sync.slot()]
+            - before.component_ns[barrier][Component::Sync.slot()];
+        assert_eq!(write.get(Component::Sync), Duration::ZERO, "{write:?}");
+        assert!(barrier_sync > 0, "the barrier's flush is where a coalesced fsync is");
+    }
+
+    #[test]
+    fn a_page_the_cache_does_not_hold_is_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let filler = "x".repeat(1_000);
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            for _ in 0..24 {
+                let docs = (0..1_000).map(|i| doc! { "n": i, "body": filler.clone() }).collect();
+                engine.insert_many(&coll, docs).unwrap();
+            }
+        }
+        // Reopened with a cache far smaller than the store, so an insert's
+        // path to its leaf pages is not all in it.
+        let engine = Engine::open_with_cache(&path, Some(1 << 20)).unwrap();
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let row = during(&engine, WriterHolder::Write, || {
+            for i in 0..50 {
+                engine.insert(&coll, doc! { "n": i, "body": filler.clone() }).unwrap();
+            }
+        });
+        assert!(row.get(Component::Read) > Duration::ZERO, "{row:?}");
+        assert!(row.read_bytes > 0, "{row:?}");
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn work_on_the_cpu_inside_a_hold_is_cpu() {
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        test_hooks::SPIN_IN_WORK.with(|s| s.set(Duration::from_millis(80)));
+        let row = during(&engine, WriterHolder::Write, || {
+            engine.insert(&coll, doc! { "n": 1 }).unwrap();
+        });
+        test_hooks::reset();
+        assert!(row.get(Component::Cpu) >= Duration::from_millis(60), "{row:?}");
+        assert!(row.get(Component::OffCpu) < Duration::from_millis(40), "{row:?}");
+        assert!(row.phase(Phase::Work) >= Duration::from_millis(80), "{row:?}");
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn time_asleep_inside_a_hold_is_off_cpu() {
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        test_hooks::SLEEP_IN
+            .with(|s| s.set([Duration::from_millis(80), Duration::ZERO, Duration::ZERO]));
+        let row = during(&engine, WriterHolder::Write, || {
+            engine.insert(&coll, doc! { "n": 1 }).unwrap();
+        });
+        test_hooks::reset();
+        assert!(row.get(Component::OffCpu) >= Duration::from_millis(80), "{row:?}");
+        assert!(row.get(Component::Cpu) < Duration::from_millis(40), "{row:?}");
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn a_holder_starved_of_the_cpu_reads_off_cpu() {
+        // Real scheduler delay rather than an injected sleep: the hold wants
+        // 300 ms of CPU while four times as many threads as there are cores
+        // spin beside it, so the holder is descheduled for much of it. `spin`
+        // runs to a wall-clock deadline, so the CPU the holder was denied is
+        // time off the CPU inside the hold.
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let row = std::thread::scope(|scope| {
+            for _ in 0..cores * 4 {
+                scope.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::hint::black_box(0u64);
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            test_hooks::SPIN_IN_WORK.with(|s| s.set(Duration::from_millis(300)));
+            let row = during(&engine, WriterHolder::Write, || {
+                engine.insert(&coll, doc! { "n": 1 }).unwrap();
+            });
+            test_hooks::reset();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            row
+        });
+        let off = row.get(Component::OffCpu).as_secs_f64() / row.held.as_secs_f64();
+        assert!(off >= 0.3, "a starved holder read {:.0}% off the CPU: {row:?}", off * 100.0);
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn each_phase_holds_what_happens_in_it() {
+        for phase in Phase::ALL {
+            let (engine, _dir) = fresh();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            let mut sleeps = [Duration::ZERO; Phase::COUNT];
+            sleeps[phase.slot()] = Duration::from_millis(60);
+            test_hooks::SLEEP_IN.with(|s| s.set(sleeps));
+            let row = during(&engine, WriterHolder::Write, || {
+                engine.insert(&coll, doc! { "n": 1 }).unwrap();
+            });
+            test_hooks::reset();
+            for other in Phase::ALL {
+                if other == phase {
+                    assert!(row.phase(other) >= Duration::from_millis(60), "{phase:?}: {row:?}");
+                } else {
+                    assert!(
+                        row.phase(other) < Duration::from_millis(40),
+                        "{phase:?} leaked into {other:?}: {row:?}"
+                    );
+                }
+            }
+            assert_adds_up(&row);
+        }
+    }
+
+    #[test]
+    fn cpu_spent_inside_a_backend_call_is_not_counted_as_cpu_as_well() {
+        // The subtraction that keeps `cpu` and the three call components
+        // disjoint. Without it, every call's own CPU is in both, the measured
+        // sum passes the hold, and the over-count guard fires.
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        test_hooks::SPIN_IN_IO.with(|s| s.set(Duration::from_millis(2)));
+        let row = during(&engine, WriterHolder::Write, || {
+            for i in 0..3 {
+                engine.insert(&coll, doc! { "n": i }).unwrap();
+            }
+        });
+        test_hooks::reset();
+        let io = row.get(Component::Read) + row.get(Component::Write) + row.get(Component::Sync);
+        assert!(io >= Duration::from_millis(60), "{row:?}");
+        assert!(row.get(Component::Cpu) < io / 4, "{row:?}");
+        assert_eq!(row.overcounted, 0, "{row:?}");
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn a_write_that_blocks_past_the_sample_lands_in_write_and_the_split_stays_in_its_bound() {
+        // Dirty-page throttling cannot be reproduced here, so the blocking is
+        // injected: every write call from the one after those measured exactly
+        // sleeps. The sleep is off the CPU inside a call whose CPU is estimated
+        // for most of them, from a sample of calls that did not all sleep. The
+        // time must land in `write` and not in `cpu`, and however wrong the
+        // estimate, `off_cpu` can move by no more than `write_estimated`.
+        let bulk = |engine: &Engine, coll: &crate::meta::CollectionMeta| {
+            let docs = (0..400).map(|i| doc! { "n": i, "body": "x".repeat(300) }).collect();
+            engine.insert_many(coll, docs).unwrap();
+        };
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let base = during(&engine, WriterHolder::Bulk, || bulk(&engine, &coll));
+
+        let sleep = Duration::from_millis(1);
+        test_hooks::SLEEP_IN_WRITES_FROM.with(|s| s.set(Some((WRITES_MEASURED, sleep))));
+        let row = during(&engine, WriterHolder::Bulk, || bulk(&engine, &coll));
+        test_hooks::reset();
+
+        assert!(row.write_estimated > Duration::ZERO, "the bulk passed the sample: {row:?}");
+        let added_write = row.get(Component::Write).saturating_sub(base.get(Component::Write));
+        let added_cpu = row.get(Component::Cpu).saturating_sub(base.get(Component::Cpu));
+        let added_off = row.get(Component::OffCpu).saturating_sub(base.get(Component::OffCpu));
+        assert!(
+            added_write >= Duration::from_millis(20),
+            "the sleeps are write time: {row:?} vs {base:?}"
+        );
+        assert!(added_cpu < added_write / 4, "the sleeps are not CPU: {row:?} vs {base:?}");
+        assert!(
+            added_off <= row.write_estimated + base.get(Component::OffCpu),
+            "off_cpu moved {added_off:?}, past the {:?} bound: {row:?} vs {base:?}",
+            row.write_estimated
+        );
+        assert_adds_up(&row);
+    }
+
+    #[test]
+    fn the_estimate_is_bounded_by_the_write_time_it_covers() {
+        // Pure: a sample of writes that was all CPU, and unsampled writes that
+        // were all asleep. The estimate credits the sleep as CPU, so `cpu`
+        // reads low and `off_cpu` high by the same amount — the direction that
+        // manufactures apparent contention. The over-count guard sees it only
+        // once the error exceeds the CPU spent outside the calls; below that
+        // it is invisible, and bounded only by `write_estimated`.
+        let meter = Meter {
+            cpu: true,
+            write: Duration::from_millis(30),
+            write_calls: 64,
+            write_sampled: Duration::from_millis(10),
+            write_sampled_cpu: Duration::from_millis(10),
+            ..Meter::default()
+        };
+        // Truth: 10 ms of CPU in the sampled writes, 20 ms asleep in the rest,
+        // 30 ms of CPU outside the calls, and 40 ms off the CPU outside them.
+        let hold = Duration::from_millis(100);
+        let d = decompose(&meter, hold, Some(Duration::from_millis(40)));
+        assert_eq!(d.write_estimated, Duration::from_millis(20));
+        let (true_cpu, true_off_cpu) = (Duration::from_millis(30), Duration::from_millis(40));
+        let (cpu, off) =
+            (d.components[Component::Cpu.slot()], d.components[Component::OffCpu.slot()]);
+        assert!(
+            off > true_off_cpu && cpu < true_cpu,
+            "the direction that invents contention: {d:?}"
+        );
+        assert!(off - true_off_cpu <= d.write_estimated, "and within the bound: {d:?}");
+        assert!(!d.overcounted, "and the guard cannot see it: {d:?}");
+    }
+
+    #[test]
+    fn a_measured_sum_past_the_hold_is_an_overcount() {
+        let meter = Meter { cpu: true, write: Duration::from_millis(60), ..Meter::default() };
+        let d = decompose(&meter, Duration::from_millis(50), Some(Duration::ZERO));
+        assert!(d.overcounted, "{d:?}");
+        let meter = Meter {
+            cpu: true,
+            read: Duration::from_millis(5),
+            read_cpu: Duration::from_millis(30),
+            ..Meter::default()
+        };
+        let d = decompose(&meter, Duration::from_millis(50), Some(Duration::from_millis(10)));
+        assert!(d.overcounted, "CPU inside the calls cannot exceed the hold's: {d:?}");
+        let meter = Meter {
+            cpu: true,
+            write: Duration::from_millis(20),
+            write_sampled: Duration::from_millis(20),
+            write_sampled_cpu: Duration::from_millis(15),
+            ..Meter::default()
+        };
+        let d = decompose(&meter, Duration::from_millis(50), Some(Duration::from_millis(25)));
+        assert!(!d.overcounted, "{d:?}");
+        assert_eq!(d.components.iter().sum::<Duration>(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_sum_past_the_hold_within_the_tolerance_is_rounding_and_still_adds_up() {
+        // Two clocks, each rounding: the CPU clock can read a few hundred
+        // microseconds more than the wall clock allows. That is not a double
+        // count, and the five components still add up to the hold.
+        let meter = Meter {
+            cpu: true,
+            write: Duration::from_millis(30),
+            write_sampled: Duration::from_millis(30),
+            write_sampled_cpu: Duration::from_millis(10),
+            ..Meter::default()
+        };
+        let hold = Duration::from_millis(50);
+        let d = decompose(&meter, hold, Some(Duration::from_micros(30_400)));
+        assert!(!d.overcounted, "{d:?}");
+        assert_eq!(d.components.iter().sum::<Duration>(), hold, "{d:?}");
+        assert_eq!(d.components[Component::OffCpu.slot()], Duration::ZERO);
+    }
+
+    #[test]
+    fn a_hold_whose_cpu_cannot_be_read_records_no_cpu_and_says_so() {
+        let meter = Meter { cpu: true, write: Duration::from_millis(5), ..Meter::default() };
+        let d = decompose(&meter, Duration::from_millis(50), None);
+        assert!(!d.cpu_measured);
+        let counters = HoldCounters::default();
+        counters.record(
+            WriterHolder::Write,
+            &d,
+            [Duration::from_millis(50), Duration::ZERO, Duration::ZERO],
+        );
+        let s = counters.snapshot();
+        let row = WriterHolder::Write.slot();
+        assert_eq!(s.cpu_unmeasured, 1);
+        assert_eq!(s.component_ns[row][Component::Cpu.slot()], 0);
+        assert_eq!(
+            s.component_ns[row][Component::OffCpu.slot()],
+            0,
+            "not 45 ms of apparent contention"
+        );
+        assert_eq!(s.component_ns[row][Component::Write.slot()], 5_000_000);
+    }
+
+    #[test]
+    fn a_scope_a_panic_unwinds_through_stops_metering() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _scope = Scope::hold();
+            panic!("inside the scope");
+        });
+        assert!(outcome.is_err());
+        assert_eq!(METER.with(|m| *m.borrow()), None);
+    }
+
+    #[test]
+    fn serving_a_window_counts_what_it_walked_and_what_it_served() {
+        let (engine, _dir) = fresh();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let mut stamps = Vec::new();
+        for i in 0..10 {
+            stamps.push(engine.insert_stamped(&coll, doc! { "n": i }).unwrap().1);
+        }
+        // The peer holds everything up to the fourth insert of this node's.
+        let mut held = kimmy_core::VersionVector::new();
+        held.observe(stamps[3]);
+        let all = engine.entries_for_peer(kimmy_core::Hlc::ZERO, usize::MAX).unwrap().entries;
+        let passed = all.iter().filter(|e| e.stamp.hlc <= stamps[3].hlc).count() as u64;
+
+        let before = engine.serve_cost();
+        let window =
+            engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, Some(&held), &[]).unwrap();
+        let after = engine.serve_cost();
+        assert_eq!(after.windows - before.windows, 1);
+        assert_eq!(after.entries - before.entries, window.entries.len() as u64);
+        assert_eq!(window.entries.len() as u64 + passed, all.len() as u64);
+        assert_eq!(after.passed - before.passed, passed, "the walk's passes are counted");
+        let walks: u64 =
+            after.walk_buckets.iter().sum::<u64>() - before.walk_buckets.iter().sum::<u64>();
+        assert_eq!(walks, 1);
+        // A local read of the same range is not a window served.
+        let _ = engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap();
+        let _ =
+            engine.entries_for_peer_marked(kimmy_core::Hlc::ZERO, 10, Some(&held), &[]).unwrap();
+        assert_eq!(engine.serve_cost().windows, after.windows);
+    }
+
+    #[test]
+    fn a_served_walk_off_a_cold_cache_reads_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let filler = "x".repeat(1_000);
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            for _ in 0..8 {
+                let docs = (0..1_000).map(|i| doc! { "n": i, "body": filler.clone() }).collect();
+                engine.insert_many(&coll, docs).unwrap();
+            }
+        }
+        let engine = Engine::open_with_cache(&path, Some(1 << 20)).unwrap();
+        let window = engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[]).unwrap();
+        assert_eq!(window.entries.len(), 1_024);
+        let cost = engine.serve_cost();
+        assert!(cost.read_bytes > 0 && cost.read_ns > 0, "{cost:?}");
+        // The walk's reads are the walk's, not a hold's.
+        let holds = engine.writer_hold_decomposition();
+        assert!(holds.read_bytes.iter().sum::<u64>() < cost.read_bytes, "{holds:?}");
+    }
+}

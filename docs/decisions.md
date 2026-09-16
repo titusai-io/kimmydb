@@ -16793,3 +16793,366 @@ renaming `kimmy.sync.contacts.failed` alone. `kimmy_backup_duration_seconds` kee
 - **Per scrape or export:** one copy of the report.
 - **The lag gauge's type on the bridge** changes from integer to double. The
   changelog says so for a pipeline that typed it.
+
+---
+
+## ADR-176 — A hold of the writer says what it was made of, and serving a peer says what it cost
+
+> **Extends [ADR-159](#adr-159--the-writer-hold-says-what-held-it)**,
+> which says how long each holder held the writer, with what each hold was made
+> of. The existing hold series keep their meaning, their start point and their
+> buckets. **Does not change [ADR-174](#adr-174--a-collection-keeps-its-live-document-count-and-the-divergence-check-reads-it)**
+> and does not act on the open finding about it: this makes the hold legible,
+> nothing more. **Measures the serving side** that
+> [ADR-175](#adr-175--a-sync-pull-says-where-its-time-went-and-the-lag-gauge-reads-to-the-millisecond)'s
+> `phase="serve"` could only see from the puller.
+
+**The finding this is for.** Round 0350 read `kimmy_write_lock_held_seconds`
+across three rounds on the member taking a 64-client write load. The mean
+single-document hold went 43.0 → 68.9 → 45.6 ms, and in all six stress cells
+throughput equalled one over the mean hold. Under that load writes serialise on
+the writer, so "why did throughput change" and "why did the hold change" are one
+question. Nothing could answer it:
+
+- **The benchmark and the live path are different regimes.** Assignment 27's
+  benchmark put a whole single-document write at 5.6 ms. The live hold was
+  43–69 ms. The per-entry bookkeeping it priced at about 0.05 ms is a hundredth
+  of the 23 ms the live hold swung by.
+- **This machine does not reproduce the live hold either.** On a 3 GiB store
+  with the default 256 MiB cache, a single-document hold is 7.5 ms from one
+  client and 7.1 ms from 64 threads (below). So the effect lives in the live
+  regime, and only a measurement taken there can say what it is.
+- **The serving side was unmeasured.** The member under load serves every pull
+  of its peers, and nothing counted what that serving cost it.
+
+### Why the decomposition is sound, not just plausible
+
+**redb 4 runs no threads of its own.** Every page read, page write and fsync a
+transaction causes happens on the calling thread, through the
+`redb::StorageBackend` the database was opened with. **A write transaction
+never leaves the thread that opened it**, because it holds the writer gate's
+guard, which is not `Send`, and every write path is synchronous. So whatever the
+backend does on that thread between taking the gate and letting it go is what
+the hold contained, and nothing another thread does, a reader or a served walk,
+can land in it.
+
+The engine now opens every database through a `MeteredBackend` wrapping redb's
+own `FileBackend`, with the file opened exactly as `Builder::create` opens it.
+A thread-local meter is installed for the length of each hold. With no meter
+installed, a backend call costs one thread-local read (2.3 ns) and no clock.
+
+### Decision: two partitions of every hold, per holder
+
+**A. What the holding thread was doing**, as
+`kimmy_write_lock_held_component_seconds_total{holder,component}`:
+
+| component | what it is |
+|---|---|
+| `read` | wall time inside the backend's `read`: a page the cache did not hold |
+| `write` | wall time inside the backend's `write` |
+| `sync` | wall time inside the backend's `sync_data`, the fsync |
+| `cpu` | the thread's CPU time over the hold, less its CPU time inside those calls |
+| `off_cpu` | the hold less the four above |
+
+`off_cpu` is off the CPU outside any file call: the scheduler not running the
+holder, or the holder waiting on a lock inside redb's cache or write buffer
+that readers also take.
+
+**B. Where in the transaction**, as
+`kimmy_write_lock_held_phase_seconds_total{holder,phase}`: `work` (taking the
+writer to asking to commit; the whole hold of an abort), `counts` (the
+per-transaction live-count flush, [ADR-174](#adr-174--a-collection-keeps-its-live-document-count-and-the-divergence-check-reads-it)'s
+addendum), and `commit` (redb's commit to letting go). The three are consecutive
+spans of one timeline, cut at instants taken once, so they add up to the hold
+exactly by construction. A says what kind of time; B says where. Together they
+tell "the fsync got slower" from "the counts flush does more fsync", which
+neither does alone.
+
+Beside them: `kimmy_write_lock_held_io_bytes_total{holder,io}`, so that more
+pages can be told from slower pages;
+`kimmy_write_lock_held_write_estimated_seconds_total{holder}` and
+`kimmy_write_lock_held_overcounted_total{holder}`, below; and
+`kimmy_write_lock_held_cpu_unmeasured_total`.
+
+The existing hold's start point is deliberately unchanged. It begins after
+redb's `begin_write`, which runs with the gate already taken. That gap was
+measured on the 3 GiB store: **4.1 µs** mean from one client and **5.7 µs** from
+64 threads, against a hold of about 7 ms. It stays small by construction,
+because every path finishes or drops its redb transaction before letting the
+gate go, so redb's own lock is always free when `begin_write` runs. So the
+hold series, and round 0350's reading of throughput as one over the mean hold,
+need no correction for it.
+
+### How the sum is checked against the whole
+
+- **B** adds up by construction, and says so.
+- **A's first four components are each timed independently of the hold**, by
+  their own clock pairs, so they can come to more than it. That would be a
+  double count: a call metered twice, or CPU inside a call not subtracted from
+  `cpu`. A hold whose four come to more than the hold by more than 1 ms plus 1%
+  is counted in `kimmy_write_lock_held_overcounted_total`, which should read 0.
+  Within that tolerance, the excess is the two clocks rounding, and it comes off
+  `cpu`. So **the five add up to the hold exactly**, unless the file calls alone
+  outlast it.
+- **`off_cpu` is the only computed component, and the guard is asymmetric.**
+  The over-count counter catches over-counting. **It cannot catch
+  under-measurement**: a cost inside the hold that no component captures
+  silently inflates `off_cpu`, and `off_cpu` is the component a reader will
+  interpret as contention. **So a measurement failure and a real finding look
+  identical in the number that matters most.** The uncontended test bounds
+  `off_cpu` as an absolute fraction of the hold (at most 25%, and in practice
+  about 2%: 0.14 ms of a 7.5 ms hold). A reading of it anywhere else should be
+  checked against `write_estimated` first.
+
+### The cost of reading a thread's CPU clock, and the sampling it forced
+
+Measured before building, best of five runs of two million reads:
+
+| | `CLOCK_MONOTONIC` | `CLOCK_THREAD_CPUTIME_ID` |
+|---|---|---|
+| Linux aarch64, musl | 19.9 ns (vDSO) | **293.6 ns (system call)** |
+| Linux aarch64, glibc | 19.9 ns | 290.5 ns |
+| macOS arm64 | 19.5 ns | 227.7 ns |
+
+The vDSO never serves a thread's CPU clock on Linux. **Backend calls per hold**
+on the 3 GiB store, with about 1 KB documents and one secondary index:
+
+| hold | reads | writes | syncs |
+|---|---|---|---|
+| single-document insert | 0.7 | 30.9 | 1 |
+| bulk of 100 | 69.1 | 302.8 | 1 |
+| bulk of 1,000 | 191.8 | **2,114** | 1 |
+
+**Write amplification, for whoever chooses an index:** redb writes every dirty
+page as its own call. A single-document insert with one secondary index is
+about 31 page writes, a bulk of 1,000 documents over 2,100, and the count grows
+with the index entries each document carries.
+
+A CPU clock pair around every call would have cost a bulk of 1,000 about
+1.3 ms, 0.8% of the live 170 ms bulk hold, and past 1% at a slower system call.
+So:
+
+- **The monotonic clock goes around every call** (`read`, `write` and `sync`
+  are wall time).
+- **The CPU clock is read twice per hold, and around every `read` and `sync`
+  exactly.** These are the calls that can block off the CPU on a cold page or a
+  busy disk, and they are few.
+- **Writes are sampled.** Every write up to the 32nd in a hold has its CPU read,
+  then one in 32. The CPU inside the rest is estimated from the sampled writes'
+  ratio of CPU to wall time. A single-document insert, at 31 writes, is
+  measured exactly.
+
+**The estimate can be wrong in either direction**, and neither direction is
+safe:
+
+- **Unsampled writes blocked and sampled ones did not.** This is dirty-page
+  throttling arriving late in a large commit. The estimate credits them too much
+  CPU, so `cpu` reads low and **`off_cpu` reads high**. That is the direction
+  that manufactures apparent contention. The over-count guard sees it only once
+  the error exceeds the CPU spent outside the calls; below that it is invisible.
+- **The sampled writes blocked and the rest did not.** `cpu` reads high and
+  `off_cpu` low, and past the tolerance the over-count guard fires.
+
+The time a blocked write spends blocked is in `write` either way: the estimate
+only moves time between `cpu` and `off_cpu`. **So the hold publishes the bound
+rather than a claimed direction**: `write_estimated` is the wall time of the
+writes whose CPU was estimated, and the split can be out by no more than that.
+**Reading guidance: trust a rise in `off_cpu` as contention only by as much as
+it exceeds the rise in `write_estimated` for the same holder.** For
+single-document writes that bound is zero.
+
+**Platforms.** `CLOCK_THREAD_CPUTIME_ID` on Linux and macOS, and a test fails if
+60 ms of spinning reads as less than 30 ms of CPU, so a clock stuck at zero
+cannot pass on the machine the gate runs on. Anywhere else, or on a hold where
+a read of the clock fails, `cpu` and `off_cpu` are **not recorded** rather than
+recorded as zero, and `kimmy_write_lock_held_cpu_unmeasured_total` counts the
+hold.
+
+### What it costs
+
+Unlike ADR-175's series, this one works inside the hold, because what happens
+inside the hold is what it measures. So its cost was measured, not argued away.
+
+- **Each piece, isolated, in a release build on the Mac:**
+  - a write whose CPU is read: 501 ns extra;
+  - an unsampled write: 45 ns;
+  - a read: 369 ns;
+  - installing, finishing, decomposing and recording a hold: 394 ns;
+  - a backend call on a thread with no meter: 2.3 ns.
+- **Multiplied by the call counts above, and scaled to Linux's 290 ns CPU
+  clock:**
+  - a single-document insert costs about 21 µs per hold: **0.05% of the live
+    43 ms**, 0.3% of the local 7 ms.
+  - a bulk of 1,000 costs about 273 µs: **0.16% of the live 170 ms**, 0.34% of
+    the local 81 ms.
+- **An A/B cannot resolve that.** Five alternating trials each, base commit
+  against this change, on clones of the same store:
+  - single-document insert: 6.75 ms median (6.62–7.04) against 6.93 ms
+    (6.84–7.06);
+  - bulk of 1,000: 81.9 ms (78.1–84.8) against 80.9 ms (79.3–85.5).
+  - The ranges overlap and the spread, set by the Mac's fsync, is about 6%. The
+    A/B neither shows the overhead nor excludes 1%; the itemised cost above is
+    what bounds it.
+
+**What the series showed locally**, 20 s of inserts each on the 3 GiB store:
+
+| | hold | sync | write | cpu | off_cpu | read |
+|---|---|---|---|---|---|---|
+| 1 client | 7.47 ms | 6.56 | 0.41 | 0.34 | 0.14 | 0.03 |
+| 64 threads | 7.11 ms | 6.23 | 0.36 | 0.37 | 0.14 | 0.02 |
+
+By phase, 1 client: commit 7.27, work 0.19, counts 0.011. Over-counted: 0.
+Locally the hold is almost all fsync and does not grow with concurrency. The
+live hold is six to ten times longer, and this is what will say where that
+time goes.
+
+### Written before the first live reading: what each outcome would mean
+
+Locally the hold is almost all fsync and concurrency does not stretch it. The
+live hold is 43–69 ms. These predictions are written before any live reading of
+these series, so that the first one tests something rather than being read to
+taste. Per single-document hold on the member taking the load:
+
+- **`sync` is most of the 43–69 ms.** The disk is slow under concurrent
+  committers, and each hold waits for its own fsync. A candidate worth testing
+  is round 0350's inversion between single-document inserts and bulks: an
+  insert pays one fsync per document and a bulk one per batch. That is a
+  hypothesis for the series to test, not a claim. `phase="commit"` will then
+  carry the same time. **Refuted if** `sync` per hold stays near its local
+  6–7 ms while the hold is 43 ms or more; the inversion hypothesis is refuted if
+  `sync` per bulk hold grows as much as per single-document hold does.
+- **`off_cpu` is most of it, beyond the growth of `write_estimated`, which for
+  single-document holds is zero.** The holder is not running while it holds the
+  writer. That is either the scheduler (request handling, replication, serving
+  and the holder competing for cores) or a lock inside redb that readers also
+  take. `cpu` staying near its local 0.3–0.4 ms would confirm the work itself did
+  not grow. **Refuted if** `off_cpu` per hold is a small share of the hold, as
+  locally, or if its rise is no larger than the rise in `write_estimated`; and
+  the contention reading is refuted if `off_cpu` does not grow between a light
+  and a 64-client cell of the same round.
+- **`read` is most of it, with `kimmy_write_lock_held_io_bytes_total{io="read"}`
+  per hold well above its local near-zero.** Cold pages on a large store against
+  the cache are the cause. If the same window shows
+  `kimmy_sync_serve_walk_read_seconds_total` rising, serving and writing are
+  contending for the cache and the disk. **Refuted if** read bytes per hold stay
+  near zero, or if `read` per hold does not change between a round with the
+  store warm and one with it cold; the contention half is refuted if `read` per
+  hold moves while the serve walk's reads do not.
+
+**A store-size effect and a release effect are separable only by comparing
+`read`, and read bytes per hold, across stores of different sizes.** The same
+member's store can grow by an order of magnitude between rounds, and a longer
+hold on a bigger store is what both a slower release and a bigger store
+predict. A round that changes the release and the store size at once cannot
+tell the two apart from these series. It needs a cell at each store size, or
+read bytes per hold that did not move.
+
+If none of the three dominates, the decomposition has still said which
+component moved between two rounds, which is the question it exists for. If
+`cpu` dominates, the benchmark's regime was the right one after all, and the
+gap is the work; that is refuted if `cpu` per hold stays near its local
+0.3–0.4 ms. The same three readings apply to `holder="bulk"`, where
+`write_estimated` is not zero and bounds how far `off_cpu` can be trusted.
+
+### The serving side, counted in the engine
+
+The walk behind a pull a peer makes is `Engine::entries_for_peer_marked`: one
+synchronous read transaction, on its own thread. It is now reached through
+`Engine::serve_entries_to_peer`, which the replication listener calls and
+nothing else does. The listener needs **no new hook**, and a local read of the
+same range, such as webhook delivery's, is not counted as serving.
+
+| series | what it counts |
+|---|---|
+| `kimmy_sync_served_windows_total` | windows walked for a peer, including one too large for a frame |
+| `kimmy_sync_served_entries_total` | entries those windows carried |
+| `kimmy_sync_serve_passed_entries_total` | entries the walk examined and did not serve, almost all held by the peer already ([ADR-171](#adr-171--a-served-window-passes-over-what-the-puller-has-already-processed)) |
+| `kimmy_sync_serve_walk_seconds` | histogram of the walk, 100 µs to 30 s, the wire left out |
+| `kimmy_sync_serve_walk_read_seconds_total`, `_read_bytes_total` | the walk's backend reads, from a walk meter that reads no CPU clock |
+
+**A walk costs what it examines, not what it sends**, which is why the passed
+count exists. The reads are the serving load on the disk the member's own
+writer uses. The wire is left out because the puller's `phase="serve"` already
+covers it. Snapshot pages served for repair are not counted here.
+
+### On the OTLP bridge
+
+Every series. The decomposition is one instrument per holder and label value,
+as ADR-159's holders are: `kimmy.write_lock.held_component.<holder>.<component>`,
+`.held_phase.<holder>.<phase>`, `.held_io_bytes.<holder>.<io>`,
+`.held_write_estimated.<holder>`, `.held_overcounted.<holder>`, and
+`kimmy.write_lock.held_cpu_unmeasured`. These are built from a table in a loop,
+so a test holds every instrument to the column and label of the `/metrics`
+sample it mirrors, and checks the table is registered. The serve series are
+`kimmy.sync.served_windows`, `.served_entries`, `.serve_passed_entries`,
+`.serve_walk_seconds` (the histogram's sum), `.serve_walk_read_seconds` and
+`.serve_walk_read_bytes`. The walk histogram's buckets stay on `/metrics`.
+
+**Cardinality, and why every holder.** 12 new series on `/metrics`, 165 new samples. That is 144 for
+the decomposition across twelve holders, one for unmeasured CPU, five serve
+scalars, and the walk histogram's 12 buckets, `+Inf`, sum and count. There are
+151 new bridge instruments. The testkit's golden lists need all of them before
+a round can grade them. Decomposing only the holders under investigation
+(`write`, `bulk`, `replication` and `durability`) would cut the cross-product
+to a third. It was not done, for three reasons. The holder set is ADR-159's
+whole set of what takes the writer, and a decomposition that covered part of it
+would make "the five add up to `kimmy_write_lock_held_seconds_sum`" true for
+some holders and not others. The day a retention pass or a drop is the hold
+that matters, the breakdown should already exist. And the cost is render lines
+and bridge callbacks read once per scrape or export, not work on the write
+path.
+
+### Proof
+
+Every component, phase and guard has a positive control that moves it, and
+each was broken on its own to watch its test fail for the stated reason.
+
+- **`sync`, as a coupled pair.** Durable commits put the fsync in `holder="write"`'s
+  `sync`. Coalesced commits leave it at zero there and put it in
+  `holder="durability"`'s. A `sync` that read the same under both would pass
+  either half alone.
+- **`read`.** Inserts into a store opened with a cache far smaller than it.
+- **`write`.** Any commit.
+- **`cpu`.** A spin inside the hold moves `cpu`, and not `off_cpu`.
+- **`off_cpu`, twice.**
+  - A sleep inside the hold moves `off_cpu`, and not `cpu`.
+  - **Real scheduler delay:** a hold that wants 300 ms of CPU, beside four times
+    as many spinning threads as cores, reads at least 30% `off_cpu`.
+- **Each phase.** A sleep placed in each phase in turn lands in that phase and
+  no other.
+- **The CPU-inside-calls subtraction.** A spin inside every backend call lands
+  in the call components, not in `cpu`, and over-counts nothing.
+- **The estimate's bound.**
+  - A bulk whose writes past the 32nd each sleep (**injected**: dirty-page
+    throttling cannot be reproduced in a unit test) puts the sleep in `write`,
+    not `cpu`, and moves `off_cpu` by no more than `write_estimated`.
+  - A pure case constructs the dangerous direction and shows the bound holds
+    while the guard stays silent.
+- **The guards.**
+  - Over-count: a measured sum past the hold is counted.
+  - Rounding within the tolerance still adds up.
+  - An unreadable CPU clock records neither `cpu` nor `off_cpu`.
+  - A scope a panic unwinds through stops metering.
+- **Serving.**
+  - Passed entries are counted exactly.
+  - A local read is not a window served.
+  - A walk off a cold cache reads the disk, and those reads are the walk's, not
+    a hold's.
+
+**Coupled guard, removed.** The rule that an unmeasured hold records no CPU was
+enforced twice, in `decompose` and again in the counters, so breaking either
+alone stayed green. The second copy is gone and the first goes red alone.
+
+**Test isolation.** The tests that read CPU time take every nextest slot
+(`.config/nextest.toml`), so they run alone and measure only what they set up.
+The hooks that put work inside a hold are `#[cfg(test)]` inside kimmy-storage.
+They do not exist in any other build and are reachable from no other crate.
+
+### Costs
+
+- **Inside every hold:** the measured overhead above, about 0.05% of a live
+  single-document hold and 0.16% of a live bulk hold.
+- **Per backend call outside a hold:** one thread-local read.
+- **A new direct dependency:** `libc`, for the thread CPU clock. It is bindings
+  only, links no native library, and was already in the graph.
+- **The golden lists grow** by the counts above.

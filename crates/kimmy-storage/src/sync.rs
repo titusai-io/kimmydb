@@ -668,16 +668,60 @@ impl Engine {
         held: Option<&VersionVector>,
         marked: &[MarkedRange],
     ) -> Result<OplogWindow> {
+        self.entries_for_peer_counting(from, limit, held, marked, &std::cell::Cell::new(0))
+    }
+
+    /// [`Self::entries_for_peer_marked`], for a window this node is serving a
+    /// peer over the wire, counted as such (ADR-176): the walk's time and the
+    /// reads it made, the entries served, and the entries it examined without
+    /// serving — a walk costs what it scans, not what it sends. The one caller
+    /// is the replication listener; a local read of the same range, such as
+    /// webhook delivery's, is not a window served and is not counted.
+    pub fn serve_entries_to_peer(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        marked: &[MarkedRange],
+    ) -> Result<OplogWindow> {
+        let passed = std::cell::Cell::new(0u64);
+        let walk = crate::hold_meter::Scope::walk();
+        let walked_from = std::time::Instant::now();
+        let window = self.entries_for_peer_counting(from, limit, held, marked, &passed);
+        let walked = walked_from.elapsed();
+        let (read, _) = walk.finish();
+        if let Ok(window) = &window {
+            self.serve_counters().record(window.entries.len(), passed.get(), walked, &read);
+        }
+        window
+    }
+
+    /// The walk behind both, adding every entry it examines and does not
+    /// return to `passed`.
+    fn entries_for_peer_counting(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        marked: &[MarkedRange],
+        passed: &std::cell::Cell<u64>,
+    ) -> Result<OplogWindow> {
         let marked = if held.is_some() { marked } else { &[] };
         let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
         self.read_oplog_from_skipping(
             start,
             limit,
             |stamp| {
-                held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
-                    && !marked.iter().any(|span| span.contains(stamp))
+                let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
+                    && !marked.iter().any(|span| span.contains(stamp));
+                passed.set(passed.get() + u64::from(skip));
+                skip
             },
-            |entry| entry.kind != OpKind::UniqueViolation,
+            |entry| {
+                let keep = entry.kind != OpKind::UniqueViolation;
+                passed.set(passed.get() + u64::from(!keep));
+                keep
+            },
         )
     }
 

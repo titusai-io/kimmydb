@@ -303,6 +303,50 @@ impl TelemetryGuard {
             WriterHolder::Rewind,
             "a rewind to a point in time, which runs only in a process that never serves"
         );
+        // What each holder's holds were made of (ADR-176): every column of
+        // `kimmy_write_lock_held_{component,phase}_seconds_total`,
+        // `_io_bytes_total`, `_write_estimated_seconds_total` and
+        // `_overcounted_total`, one instrument per holder and label value, as
+        // the holders above are carried. Built in a loop, because twelve
+        // holders by twelve columns is a table rather than a list; the names
+        // come from `hold_instrument_names`, which a test holds to the
+        // `/metrics` labels.
+        for holder in WriterHolder::ALL {
+            let row = holder.slot();
+            for (name, unit, description, read) in hold_instruments(holder) {
+                let snapshot = snapshot.clone();
+                if unit == "s" {
+                    let _ = meter
+                        .f64_observable_counter(name)
+                        .with_unit(unit)
+                        .with_description(description)
+                        .with_callback(move |observer| {
+                            if let Some(s) = snapshot() {
+                                observer.observe(read(&s.write_lock_hold, row) as f64 / 1e9, &[]);
+                            }
+                        })
+                        .build();
+                } else {
+                    let _ = meter
+                        .u64_observable_counter(name)
+                        .with_unit(unit)
+                        .with_description(description)
+                        .with_callback(move |observer| {
+                            if let Some(s) = snapshot() {
+                                observer.observe(read(&s.write_lock_hold, row), &[]);
+                            }
+                        })
+                        .build();
+                }
+            }
+        }
+        observe!(
+            u64_observable_counter,
+            "kimmy.write_lock.held_cpu_unmeasured",
+            "{hold}",
+            "Holds of the storage writer whose thread CPU time could not be read, and so are not in the cpu and off_cpu components.",
+            |s| s.write_lock_hold.cpu_unmeasured
+        );
         observe!(
             u64_observable_gauge,
             "kimmy.storage.bytes",
@@ -580,6 +624,51 @@ impl TelemetryGuard {
             "{contact}",
             "Sync contacts ended by a pull that failed.",
             |s| s.sync_pulls.contacts[ContactEnd::Failed.slot()]
+        );
+        // What serving peers' windows cost this node (ADR-176). The walk
+        // histogram's buckets stay on `/metrics` (see `NOT_BRIDGED`); its sum
+        // is here and its count is the windows served.
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.served_windows",
+            "{window}",
+            "Windows of this node's oplog walked for pulling peers; also the count of kimmy.sync.serve_walk_seconds.",
+            |s| s.sync_serve.windows
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.served_entries",
+            "{entry}",
+            "Entries the windows this node served to peers carried.",
+            |s| s.sync_serve.entries
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_passed_entries",
+            "{entry}",
+            "Entries the walks behind served windows examined and did not serve, mostly because the peer already held them.",
+            |s| s.sync_serve.passed
+        );
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.serve_walk_seconds",
+            "s",
+            "Seconds this node spent walking its oplog for windows served to peers, the wire not included.",
+            |s| s.sync_serve.walk_sum_us as f64 / 1e6
+        );
+        observe!(
+            f64_observable_counter,
+            "kimmy.sync.serve_walk_read_seconds",
+            "s",
+            "Seconds the walks behind served windows spent reading pages of the storage file its cache did not hold.",
+            |s| s.sync_serve.read_ns as f64 / 1e9
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_read_bytes",
+            "By",
+            "Bytes the walks behind served windows read from the storage file.",
+            |s| s.sync_serve.read_bytes
         );
         observe!(
             u64_observable_counter,
@@ -1087,6 +1176,12 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
          the pulls it could not observe as kimmy.sync.entry_wait_ahead (ADR-175).",
     ),
     (
+        "kimmy_sync_serve_walk_seconds",
+        "A histogram, for the same reason as the ones above. Its sum is bridged as \
+         kimmy.sync.serve_walk_seconds and its count is kimmy.sync.served_windows \
+         (ADR-176).",
+    ),
+    (
         "kimmy_backup_duration_seconds",
         "A histogram, and OpenTelemetry has no observable histogram, so its buckets \
          stay on /metrics for the same reason as the two above. Its sum is bridged \
@@ -1096,9 +1191,168 @@ const NOT_BRIDGED: &[(&str, &str)] = &[
     ),
 ];
 
+/// What reads one column of a holder's row of the hold decomposition.
+type HoldColumn = fn(&kimmy_storage::HoldDecomposition, usize) -> u64;
+
+/// The bridge's instruments for one holder's row of the hold decomposition
+/// (ADR-176): name, unit, description, and what reads the value. Seconds are
+/// read in nanoseconds and published as seconds; the rest are published as
+/// read.
+fn hold_instruments(
+    holder: kimmy_storage::WriterHolder,
+) -> Vec<(String, &'static str, String, HoldColumn)> {
+    use kimmy_storage::{HoldComponent, HoldPhase};
+    let label = holder.label();
+    let mut out: Vec<(String, &'static str, String, HoldColumn)> = Vec::new();
+    for component in HoldComponent::ALL {
+        let read: HoldColumn = match component {
+            HoldComponent::Read => |d, row| d.component_ns[row][HoldComponent::Read.slot()],
+            HoldComponent::Write => |d, row| d.component_ns[row][HoldComponent::Write.slot()],
+            HoldComponent::Sync => |d, row| d.component_ns[row][HoldComponent::Sync.slot()],
+            HoldComponent::Cpu => |d, row| d.component_ns[row][HoldComponent::Cpu.slot()],
+            HoldComponent::OffCpu => |d, row| d.component_ns[row][HoldComponent::OffCpu.slot()],
+        };
+        out.push((
+            format!("kimmy.write_lock.held_component.{label}.{}", component.label()),
+            "s",
+            format!(
+                "Seconds holds of the storage writer by {label} spent as {}: see kimmy_write_lock_held_component_seconds_total.",
+                component.label()
+            ),
+            read,
+        ));
+    }
+    for phase in HoldPhase::ALL {
+        let read: HoldColumn = match phase {
+            HoldPhase::Work => |d, row| d.phase_ns[row][HoldPhase::Work.slot()],
+            HoldPhase::Counts => |d, row| d.phase_ns[row][HoldPhase::Counts.slot()],
+            HoldPhase::Commit => |d, row| d.phase_ns[row][HoldPhase::Commit.slot()],
+        };
+        out.push((
+            format!("kimmy.write_lock.held_phase.{label}.{}", phase.label()),
+            "s",
+            format!(
+                "Seconds holds of the storage writer by {label} spent in their {} phase: see kimmy_write_lock_held_phase_seconds_total.",
+                phase.label()
+            ),
+            read,
+        ));
+    }
+    out.push((
+        format!("kimmy.write_lock.held_io_bytes.{label}.read"),
+        "By",
+        format!("Bytes holds of the storage writer by {label} read from the storage file."),
+        |d, row| d.read_bytes[row],
+    ));
+    out.push((
+        format!("kimmy.write_lock.held_io_bytes.{label}.write"),
+        "By",
+        format!("Bytes holds of the storage writer by {label} wrote to the storage file."),
+        |d, row| d.write_bytes[row],
+    ));
+    out.push((
+        format!("kimmy.write_lock.held_write_estimated.{label}"),
+        "s",
+        format!(
+            "Seconds of page writes in holds by {label} whose CPU time was estimated: the most cpu and off_cpu can be misattributed by."
+        ),
+        |d, row| d.write_estimated_ns[row],
+    ));
+    out.push((
+        format!("kimmy.write_lock.held_overcounted.{label}"),
+        "{hold}",
+        format!("Holds of the storage writer by {label} whose measured components came to more than the hold."),
+        |d, row| d.overcounted[row],
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_column_of_the_hold_decomposition_reaches_the_bridge_under_its_own_label() {
+        // The coverage test below matches a series by its stem, and these
+        // instruments are named in a loop, so it would pass with a column
+        // missing or two columns read from the same slot. Each instrument is
+        // held here to the `/metrics` sample of the same holder and label,
+        // read from a decomposition whose every value differs (ADR-176).
+        let d = kimmy_storage::HoldDecomposition {
+            component_ns: std::array::from_fn(|h| {
+                std::array::from_fn(|c| (h * 100 + c + 1) as u64)
+            }),
+            phase_ns: std::array::from_fn(|h| std::array::from_fn(|p| (h * 100 + p + 11) as u64)),
+            read_bytes: std::array::from_fn(|h| (h * 100 + 21) as u64),
+            write_bytes: std::array::from_fn(|h| (h * 100 + 22) as u64),
+            write_estimated_ns: std::array::from_fn(|h| (h * 100 + 23) as u64),
+            overcounted: std::array::from_fn(|h| (h * 100 + 24) as u64),
+            cpu_unmeasured: 0,
+        };
+        let mut names = std::collections::HashSet::new();
+        for holder in kimmy_storage::WriterHolder::ALL {
+            let row = holder.slot();
+            let instruments = hold_instruments(holder);
+            assert_eq!(instruments.len(), 12, "five components, three phases, two io, two more");
+            let mut values = std::collections::HashSet::new();
+            for (name, _, _, read) in &instruments {
+                assert!(names.insert(name.clone()), "{name} is published twice");
+                assert!(values.insert(read(&d, row)), "{name} reads a column another reads");
+                let parts: Vec<&str> = name.split('.').collect();
+                assert_eq!(parts[3], holder.label(), "{name} is not named for its holder");
+                let expected = match parts[2] {
+                    "held_component" => {
+                        let c = kimmy_storage::HoldComponent::ALL
+                            .into_iter()
+                            .find(|c| c.label() == parts[4])
+                            .unwrap();
+                        d.component_ns[row][c.slot()]
+                    }
+                    "held_phase" => {
+                        let p = kimmy_storage::HoldPhase::ALL
+                            .into_iter()
+                            .find(|p| p.label() == parts[4])
+                            .unwrap();
+                        d.phase_ns[row][p.slot()]
+                    }
+                    "held_io_bytes" if parts[4] == "read" => d.read_bytes[row],
+                    "held_io_bytes" => d.write_bytes[row],
+                    "held_write_estimated" => d.write_estimated_ns[row],
+                    "held_overcounted" => d.overcounted[row],
+                    other => panic!("unexpected instrument family {other}"),
+                };
+                assert_eq!(read(&d, row), expected, "{name} reads the wrong column");
+            }
+        }
+        // The serve series, named one by one for the same reason ADR-175's
+        // are: their stems overlap, so one would satisfy the match for all.
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests").expect("the tests")];
+        // And the table is registered, not only defined: the loop is inside
+        // `bridge_metrics`, which ends where the instruments' helpers begin.
+        let bridge = &source[source.find("pub fn bridge_metrics").expect("the bridge")
+            ..source.find("type HoldColumn").expect("the helper")];
+        assert_eq!(
+            bridge.matches("in hold_instruments(holder)").count(),
+            1,
+            "the hold decomposition's instruments are defined and never registered"
+        );
+        for name in [
+            "kimmy.write_lock.held_cpu_unmeasured",
+            "kimmy.sync.served_windows",
+            "kimmy.sync.served_entries",
+            "kimmy.sync.serve_passed_entries",
+            "kimmy.sync.serve_walk_seconds",
+            "kimmy.sync.serve_walk_read_seconds",
+            "kimmy.sync.serve_walk_read_bytes",
+        ] {
+            assert_eq!(
+                source.matches(&format!("\"{name}\",")).count(),
+                1,
+                "`{name}` is not an instrument on the bridge"
+            );
+        }
+    }
 
     #[test]
     fn the_sync_pull_instruments_the_stem_match_cannot_see_reach_the_bridge() {

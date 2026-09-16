@@ -97,6 +97,11 @@ pub struct StorageReadings {
     /// maximum above says how bad the worst hold was and nothing about what
     /// caused it; this is the reading an operator acts on.
     pub writer_hold: kimmy_storage::WriterHoldSnapshot,
+    /// What those holds were made of, per holder (ADR-176): the reading that
+    /// says *which part* of a hold moved when the hold did.
+    pub writer_hold_decomposition: kimmy_storage::HoldDecomposition,
+    /// What serving peers' windows has cost this node (ADR-176).
+    pub serve: kimmy_storage::ServeSnapshot,
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
@@ -207,6 +212,10 @@ pub struct MetricsSnapshot {
     /// two rows are what the bridge carries, one instrument per holder.
     pub write_lock_holds: [u64; kimmy_storage::WriterHolder::COUNT],
     pub write_lock_held_us: [u64; kimmy_storage::WriterHolder::COUNT],
+    /// What the holds were made of, and what serving peers cost (ADR-176).
+    /// Counters only, so the whole of both is on the bridge.
+    pub write_lock_hold: kimmy_storage::HoldDecomposition,
+    pub sync_serve: kimmy_storage::ServeSnapshot,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -825,6 +834,8 @@ impl Metrics {
             write_lock_held_max_us: readings.writer_hold_max_us,
             write_lock_holds: readings.writer_hold.count,
             write_lock_held_us: readings.writer_hold.sum_us,
+            write_lock_hold: readings.writer_hold_decomposition,
+            sync_serve: readings.serve,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -980,6 +991,7 @@ impl Metrics {
              # TYPE kimmy_write_lock_held_seconds_max gauge\n\
              kimmy_write_lock_held_seconds_max {writer_hold_max}\n\
              {writer_hold}\
+             {hold_decomposition}\
              # HELP kimmy_storage_bytes Size of the database file on disk.\n\
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
@@ -1147,6 +1159,7 @@ impl Metrics {
             grouped = readings.commits_grouped,
             writer_wait = render_writer_wait(&readings.writer_wait),
             writer_hold = render_writer_hold(&readings.writer_hold),
+            hold_decomposition = render_hold_decomposition(&readings.writer_hold_decomposition),
             writer_wait_timeouts = readings.writer_wait_timeouts,
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
@@ -1212,6 +1225,7 @@ impl Metrics {
         self.render_latency(&mut out);
         self.render_backup_duration(&mut out);
         render_sync_pulls(&mut out, &pulls);
+        render_sync_serve(&mut out, &readings.serve);
         out
     }
 
@@ -1377,6 +1391,135 @@ fn render_writer_hold(hold: &kimmy_storage::WriterHoldSnapshot) -> String {
         let _ = writeln!(out, "kimmy_write_lock_held_seconds_count{{holder=\"{label}\"}} {count}");
     }
     out
+}
+
+/// What the writer's holds were made of, per holder (ADR-176): five
+/// components of what the holding thread was doing, three phases of the
+/// transaction, the bytes it read and wrote, the bound on the component
+/// split's error, and the holds whose measured parts came to more than the
+/// hold. Every holder is rendered whether or not it has held the writer, as
+/// the hold histogram's are.
+fn render_hold_decomposition(d: &kimmy_storage::HoldDecomposition) -> String {
+    use kimmy_storage::{HoldComponent, HoldPhase, WriterHolder};
+    use std::fmt::Write;
+
+    let seconds = |ns: u64| ns as f64 / 1e9;
+    let mut out = String::from(
+        "# HELP kimmy_write_lock_held_component_seconds_total Seconds holds of the storage writer spent, by holder and by what the holding thread was doing. read, write, sync: inside the storage file's page reads, page writes and fsyncs. cpu: on the CPU outside those - B-tree work over cached pages, encoding, index keys, bookkeeping. off_cpu: the rest - off the CPU outside any file call, which is scheduler delay or a wait on a lock inside the storage engine. The five add up to kimmy_write_lock_held_seconds_sum. off_cpu is a residual, so anything the other four fail to capture lands there too; read it beside kimmy_write_lock_held_write_estimated_seconds_total. cpu and off_cpu leave out holds counted in kimmy_write_lock_held_cpu_unmeasured_total.\n\
+         # TYPE kimmy_write_lock_held_component_seconds_total counter\n",
+    );
+    for holder in WriterHolder::ALL {
+        for component in HoldComponent::ALL {
+            let _ = writeln!(
+                out,
+                "kimmy_write_lock_held_component_seconds_total{{holder=\"{}\",component=\"{}\"}} {}",
+                holder.label(),
+                component.label(),
+                seconds(d.component_ns[holder.slot()][component.slot()])
+            );
+        }
+    }
+    out.push_str(
+        "# HELP kimmy_write_lock_held_phase_seconds_total Seconds holds of the storage writer spent, by holder and by where in the transaction. work: from taking the writer to asking to commit, the whole hold of one that aborted. counts: writing the collections' live document counts, once per transaction. commit: the storage engine's commit, its page writes and fsync, to letting go. The three add up to kimmy_write_lock_held_seconds_sum.\n\
+         # TYPE kimmy_write_lock_held_phase_seconds_total counter\n",
+    );
+    for holder in WriterHolder::ALL {
+        for phase in HoldPhase::ALL {
+            let _ = writeln!(
+                out,
+                "kimmy_write_lock_held_phase_seconds_total{{holder=\"{}\",phase=\"{}\"}} {}",
+                holder.label(),
+                phase.label(),
+                seconds(d.phase_ns[holder.slot()][phase.slot()])
+            );
+        }
+    }
+    out.push_str(
+        "# HELP kimmy_write_lock_held_io_bytes_total Bytes holds of the storage writer read from and wrote to the storage file, by holder. Beside the read and write components: more bytes is more pages, and the same bytes in more seconds is slower pages.\n\
+         # TYPE kimmy_write_lock_held_io_bytes_total counter\n",
+    );
+    for holder in WriterHolder::ALL {
+        for (io, bytes) in [("read", d.read_bytes), ("write", d.write_bytes)] {
+            let _ = writeln!(
+                out,
+                "kimmy_write_lock_held_io_bytes_total{{holder=\"{}\",io=\"{io}\"}} {}",
+                holder.label(),
+                bytes[holder.slot()]
+            );
+        }
+    }
+    out.push_str(
+        "# HELP kimmy_write_lock_held_write_estimated_seconds_total Seconds of page writes, inside holds of the storage writer, whose CPU time was estimated from a sample rather than read. The most by which cpu and off_cpu in kimmy_write_lock_held_component_seconds_total can be misattributed between each other, in either direction; 0 for a hold of 32 page writes or fewer, which is measured exactly.\n\
+         # TYPE kimmy_write_lock_held_write_estimated_seconds_total counter\n",
+    );
+    for holder in WriterHolder::ALL {
+        let _ = writeln!(
+            out,
+            "kimmy_write_lock_held_write_estimated_seconds_total{{holder=\"{}\"}} {}",
+            holder.label(),
+            seconds(d.write_estimated_ns[holder.slot()])
+        );
+    }
+    out.push_str(
+        "# HELP kimmy_write_lock_held_overcounted_total Holds of the storage writer whose measured components came to more than the hold, past the clocks' tolerance: something was counted twice. Should read 0; it cannot see a component that was missed, which lands in off_cpu instead.\n\
+         # TYPE kimmy_write_lock_held_overcounted_total counter\n",
+    );
+    for holder in WriterHolder::ALL {
+        let _ = writeln!(
+            out,
+            "kimmy_write_lock_held_overcounted_total{{holder=\"{}\"}} {}",
+            holder.label(),
+            d.overcounted[holder.slot()]
+        );
+    }
+    let _ = write!(
+        out,
+        "# HELP kimmy_write_lock_held_cpu_unmeasured_total Holds of the storage writer, of any holder, whose thread CPU time could not be read, so they are not in the cpu and off_cpu components. Rises on every hold on a platform without a per-thread CPU clock; 0 on Linux and macOS.\n\
+         # TYPE kimmy_write_lock_held_cpu_unmeasured_total counter\n\
+         kimmy_write_lock_held_cpu_unmeasured_total {}\n",
+        d.cpu_unmeasured
+    );
+    out
+}
+
+/// What serving peers' windows has cost this node (ADR-176).
+fn render_sync_serve(out: &mut String, serve: &kimmy_storage::ServeSnapshot) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        out,
+        "# HELP kimmy_sync_served_windows_total Windows of this node's oplog walked for peers that pulled from it, including one too large for a frame that the peer is asked to take in fewer entries.\n\
+         # TYPE kimmy_sync_served_windows_total counter\n\
+         kimmy_sync_served_windows_total {}\n\
+         # HELP kimmy_sync_served_entries_total Entries the windows this node served to peers carried.\n\
+         # TYPE kimmy_sync_served_entries_total counter\n\
+         kimmy_sync_served_entries_total {}\n\
+         # HELP kimmy_sync_serve_passed_entries_total Entries the walks behind served windows examined and did not serve, mostly because the pulling peer already held them. A walk costs what it examines: this plus kimmy_sync_served_entries_total.\n\
+         # TYPE kimmy_sync_serve_passed_entries_total counter\n\
+         kimmy_sync_serve_passed_entries_total {}\n\
+         # HELP kimmy_sync_serve_walk_read_seconds_total Seconds the walks behind served windows spent reading pages of the storage file its cache did not hold: the serving load on this node's disk.\n\
+         # TYPE kimmy_sync_serve_walk_read_seconds_total counter\n\
+         kimmy_sync_serve_walk_read_seconds_total {}\n\
+         # HELP kimmy_sync_serve_walk_read_bytes_total Bytes the walks behind served windows read from the storage file.\n\
+         # TYPE kimmy_sync_serve_walk_read_bytes_total counter\n\
+         kimmy_sync_serve_walk_read_bytes_total {}\n\
+         # HELP kimmy_sync_serve_walk_seconds How long this node took to walk its oplog for one window served to a peer, the wire not included.\n\
+         # TYPE kimmy_sync_serve_walk_seconds histogram\n",
+        serve.windows,
+        serve.entries,
+        serve.passed,
+        serve.read_ns as f64 / 1e9,
+        serve.read_bytes,
+    );
+    let mut cumulative = 0u64;
+    for (slot, upper) in kimmy_storage::SERVE_WALK_BUCKETS_US.iter().enumerate() {
+        cumulative += serve.walk_buckets[slot];
+        let le = *upper as f64 / 1e6;
+        let _ = writeln!(out, "kimmy_sync_serve_walk_seconds_bucket{{le=\"{le}\"}} {cumulative}");
+    }
+    let _ = writeln!(out, "kimmy_sync_serve_walk_seconds_bucket{{le=\"+Inf\"}} {}", serve.windows);
+    let _ = writeln!(out, "kimmy_sync_serve_walk_seconds_sum {}", serve.walk_sum_us as f64 / 1e6);
+    let _ = writeln!(out, "kimmy_sync_serve_walk_seconds_count {}", serve.windows);
 }
 
 #[cfg(test)]
@@ -1560,6 +1703,34 @@ mod tests {
             // under another holder's label cannot match the golden. The
             // counts are the buckets' sum, as a real snapshot's are.
             writer_hold: distinct_hold(),
+            writer_hold_decomposition: distinct_decomposition(),
+            serve: kimmy_storage::ServeSnapshot {
+                windows: 1_201,
+                entries: 1_202,
+                passed: 1_203,
+                walk_buckets: [3, 0, 1_190, 0, 0, 0, 0, 0, 0, 0, 0, 7],
+                walk_sum_us: 2_500_000,
+                read_ns: 3_300_000_000,
+                read_bytes: 1_204,
+            },
+        }
+    }
+
+    /// What the holds were made of, with every holder's, component's and
+    /// phase's value distinct from every other, so a value rendered under
+    /// another's labels cannot match the golden (ADR-176).
+    fn distinct_decomposition() -> kimmy_storage::HoldDecomposition {
+        let ms = |n: usize| n as u64 * 1_000_000;
+        kimmy_storage::HoldDecomposition {
+            component_ns: std::array::from_fn(|h| {
+                std::array::from_fn(|c| ms((h + 1) * 100 + c + 1))
+            }),
+            phase_ns: std::array::from_fn(|h| std::array::from_fn(|p| ms((h + 1) * 100 + p + 11))),
+            read_bytes: std::array::from_fn(|h| (h as u64 + 1) * 1_000 + 1),
+            write_bytes: std::array::from_fn(|h| (h as u64 + 1) * 1_000 + 2),
+            write_estimated_ns: std::array::from_fn(|h| ms((h + 1) * 100 + 21)),
+            overcounted: std::array::from_fn(|h| h as u64 + 61),
+            cpu_unmeasured: 99,
         }
     }
 
@@ -1741,6 +1912,163 @@ kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 13
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 14
 kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 18
 kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 14
+# HELP kimmy_write_lock_held_component_seconds_total Seconds holds of the storage writer spent, by holder and by what the holding thread was doing. read, write, sync: inside the storage file's page reads, page writes and fsyncs. cpu: on the CPU outside those - B-tree work over cached pages, encoding, index keys, bookkeeping. off_cpu: the rest - off the CPU outside any file call, which is scheduler delay or a wait on a lock inside the storage engine. The five add up to kimmy_write_lock_held_seconds_sum. off_cpu is a residual, so anything the other four fail to capture lands there too; read it beside kimmy_write_lock_held_write_estimated_seconds_total. cpu and off_cpu leave out holds counted in kimmy_write_lock_held_cpu_unmeasured_total.
+# TYPE kimmy_write_lock_held_component_seconds_total counter
+kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"read\"} 0.101
+kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"write\"} 0.102
+kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"sync\"} 0.103
+kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"cpu\"} 0.104
+kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"off_cpu\"} 0.105
+kimmy_write_lock_held_component_seconds_total{holder=\"bulk\",component=\"read\"} 0.201
+kimmy_write_lock_held_component_seconds_total{holder=\"bulk\",component=\"write\"} 0.202
+kimmy_write_lock_held_component_seconds_total{holder=\"bulk\",component=\"sync\"} 0.203
+kimmy_write_lock_held_component_seconds_total{holder=\"bulk\",component=\"cpu\"} 0.204
+kimmy_write_lock_held_component_seconds_total{holder=\"bulk\",component=\"off_cpu\"} 0.205
+kimmy_write_lock_held_component_seconds_total{holder=\"ddl\",component=\"read\"} 0.301
+kimmy_write_lock_held_component_seconds_total{holder=\"ddl\",component=\"write\"} 0.302
+kimmy_write_lock_held_component_seconds_total{holder=\"ddl\",component=\"sync\"} 0.303
+kimmy_write_lock_held_component_seconds_total{holder=\"ddl\",component=\"cpu\"} 0.304
+kimmy_write_lock_held_component_seconds_total{holder=\"ddl\",component=\"off_cpu\"} 0.305
+kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"read\"} 0.401
+kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"write\"} 0.402
+kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"sync\"} 0.403
+kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"cpu\"} 0.404
+kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"off_cpu\"} 0.405
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"read\"} 0.501
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"write\"} 0.502
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"sync\"} 0.503
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"cpu\"} 0.504
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"off_cpu\"} 0.505
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"read\"} 0.601
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"write\"} 0.602
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"sync\"} 0.603
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"cpu\"} 0.604
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"off_cpu\"} 0.605
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"read\"} 0.701
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"write\"} 0.702
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"sync\"} 0.703
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"cpu\"} 0.704
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"off_cpu\"} 0.705
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"read\"} 0.801
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"write\"} 0.802
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"sync\"} 0.803
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"cpu\"} 0.804
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"off_cpu\"} 0.805
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"read\"} 0.901
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"write\"} 0.902
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"sync\"} 0.903
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"cpu\"} 0.904
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"off_cpu\"} 0.905
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"read\"} 1.001
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"write\"} 1.002
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"sync\"} 1.003
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"cpu\"} 1.004
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"off_cpu\"} 1.005
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"read\"} 1.101
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"write\"} 1.102
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"sync\"} 1.103
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"cpu\"} 1.104
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"off_cpu\"} 1.105
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"read\"} 1.201
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"write\"} 1.202
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"sync\"} 1.203
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"cpu\"} 1.204
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"off_cpu\"} 1.205
+# HELP kimmy_write_lock_held_phase_seconds_total Seconds holds of the storage writer spent, by holder and by where in the transaction. work: from taking the writer to asking to commit, the whole hold of one that aborted. counts: writing the collections' live document counts, once per transaction. commit: the storage engine's commit, its page writes and fsync, to letting go. The three add up to kimmy_write_lock_held_seconds_sum.
+# TYPE kimmy_write_lock_held_phase_seconds_total counter
+kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"work\"} 0.111
+kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"counts\"} 0.112
+kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"commit\"} 0.113
+kimmy_write_lock_held_phase_seconds_total{holder=\"bulk\",phase=\"work\"} 0.211
+kimmy_write_lock_held_phase_seconds_total{holder=\"bulk\",phase=\"counts\"} 0.212
+kimmy_write_lock_held_phase_seconds_total{holder=\"bulk\",phase=\"commit\"} 0.213
+kimmy_write_lock_held_phase_seconds_total{holder=\"ddl\",phase=\"work\"} 0.311
+kimmy_write_lock_held_phase_seconds_total{holder=\"ddl\",phase=\"counts\"} 0.312
+kimmy_write_lock_held_phase_seconds_total{holder=\"ddl\",phase=\"commit\"} 0.313
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"work\"} 0.411
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"counts\"} 0.412
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"commit\"} 0.413
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"work\"} 0.511
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"counts\"} 0.512
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"commit\"} 0.513
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"work\"} 0.611
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"counts\"} 0.612
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"commit\"} 0.613
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"work\"} 0.711
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"counts\"} 0.712
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"commit\"} 0.713
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"work\"} 0.811
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"counts\"} 0.812
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"commit\"} 0.813
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"work\"} 0.911
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"counts\"} 0.912
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"commit\"} 0.913
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"work\"} 1.011
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"counts\"} 1.012
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"commit\"} 1.013
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"work\"} 1.111
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"counts\"} 1.112
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"commit\"} 1.113
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"work\"} 1.211
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"counts\"} 1.212
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"commit\"} 1.213
+# HELP kimmy_write_lock_held_io_bytes_total Bytes holds of the storage writer read from and wrote to the storage file, by holder. Beside the read and write components: more bytes is more pages, and the same bytes in more seconds is slower pages.
+# TYPE kimmy_write_lock_held_io_bytes_total counter
+kimmy_write_lock_held_io_bytes_total{holder=\"write\",io=\"read\"} 1001
+kimmy_write_lock_held_io_bytes_total{holder=\"write\",io=\"write\"} 1002
+kimmy_write_lock_held_io_bytes_total{holder=\"bulk\",io=\"read\"} 2001
+kimmy_write_lock_held_io_bytes_total{holder=\"bulk\",io=\"write\"} 2002
+kimmy_write_lock_held_io_bytes_total{holder=\"ddl\",io=\"read\"} 3001
+kimmy_write_lock_held_io_bytes_total{holder=\"ddl\",io=\"write\"} 3002
+kimmy_write_lock_held_io_bytes_total{holder=\"index_build\",io=\"read\"} 4001
+kimmy_write_lock_held_io_bytes_total{holder=\"index_build\",io=\"write\"} 4002
+kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"read\"} 5001
+kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"write\"} 5002
+kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"read\"} 6001
+kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"write\"} 6002
+kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"read\"} 7001
+kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"write\"} 7002
+kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"read\"} 8001
+kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"write\"} 8002
+kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"read\"} 9001
+kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"write\"} 9002
+kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"read\"} 10001
+kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"write\"} 10002
+kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"read\"} 11001
+kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"write\"} 11002
+kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"read\"} 12001
+kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"write\"} 12002
+# HELP kimmy_write_lock_held_write_estimated_seconds_total Seconds of page writes, inside holds of the storage writer, whose CPU time was estimated from a sample rather than read. The most by which cpu and off_cpu in kimmy_write_lock_held_component_seconds_total can be misattributed between each other, in either direction; 0 for a hold of 32 page writes or fewer, which is measured exactly.
+# TYPE kimmy_write_lock_held_write_estimated_seconds_total counter
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"write\"} 0.121
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"bulk\"} 0.221
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"ddl\"} 0.321
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"index_build\"} 0.421
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"drop\"} 0.521
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"replication\"} 0.621
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"repair\"} 0.721
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"retention\"} 0.821
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"expiry\"} 0.921
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"embedding\"} 1.021
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"durability\"} 1.121
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"rewind\"} 1.221
+# HELP kimmy_write_lock_held_overcounted_total Holds of the storage writer whose measured components came to more than the hold, past the clocks' tolerance: something was counted twice. Should read 0; it cannot see a component that was missed, which lands in off_cpu instead.
+# TYPE kimmy_write_lock_held_overcounted_total counter
+kimmy_write_lock_held_overcounted_total{holder=\"write\"} 61
+kimmy_write_lock_held_overcounted_total{holder=\"bulk\"} 62
+kimmy_write_lock_held_overcounted_total{holder=\"ddl\"} 63
+kimmy_write_lock_held_overcounted_total{holder=\"index_build\"} 64
+kimmy_write_lock_held_overcounted_total{holder=\"drop\"} 65
+kimmy_write_lock_held_overcounted_total{holder=\"replication\"} 66
+kimmy_write_lock_held_overcounted_total{holder=\"repair\"} 67
+kimmy_write_lock_held_overcounted_total{holder=\"retention\"} 68
+kimmy_write_lock_held_overcounted_total{holder=\"expiry\"} 69
+kimmy_write_lock_held_overcounted_total{holder=\"embedding\"} 70
+kimmy_write_lock_held_overcounted_total{holder=\"durability\"} 71
+kimmy_write_lock_held_overcounted_total{holder=\"rewind\"} 72
+# HELP kimmy_write_lock_held_cpu_unmeasured_total Holds of the storage writer, of any holder, whose thread CPU time could not be read, so they are not in the cpu and off_cpu components. Rises on every hold on a platform without a per-thread CPU clock; 0 on Linux and macOS.
+# TYPE kimmy_write_lock_held_cpu_unmeasured_total counter
+kimmy_write_lock_held_cpu_unmeasured_total 99
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
@@ -2007,6 +2335,38 @@ kimmy_sync_entry_wait_seconds_bucket{le=\"3600\"} 2
 kimmy_sync_entry_wait_seconds_bucket{le=\"+Inf\"} 2
 kimmy_sync_entry_wait_seconds_sum 46.5
 kimmy_sync_entry_wait_seconds_count 2
+# HELP kimmy_sync_served_windows_total Windows of this node's oplog walked for peers that pulled from it, including one too large for a frame that the peer is asked to take in fewer entries.
+# TYPE kimmy_sync_served_windows_total counter
+kimmy_sync_served_windows_total 1201
+# HELP kimmy_sync_served_entries_total Entries the windows this node served to peers carried.
+# TYPE kimmy_sync_served_entries_total counter
+kimmy_sync_served_entries_total 1202
+# HELP kimmy_sync_serve_passed_entries_total Entries the walks behind served windows examined and did not serve, mostly because the pulling peer already held them. A walk costs what it examines: this plus kimmy_sync_served_entries_total.
+# TYPE kimmy_sync_serve_passed_entries_total counter
+kimmy_sync_serve_passed_entries_total 1203
+# HELP kimmy_sync_serve_walk_read_seconds_total Seconds the walks behind served windows spent reading pages of the storage file its cache did not hold: the serving load on this node's disk.
+# TYPE kimmy_sync_serve_walk_read_seconds_total counter
+kimmy_sync_serve_walk_read_seconds_total 3.3
+# HELP kimmy_sync_serve_walk_read_bytes_total Bytes the walks behind served windows read from the storage file.
+# TYPE kimmy_sync_serve_walk_read_bytes_total counter
+kimmy_sync_serve_walk_read_bytes_total 1204
+# HELP kimmy_sync_serve_walk_seconds How long this node took to walk its oplog for one window served to a peer, the wire not included.
+# TYPE kimmy_sync_serve_walk_seconds histogram
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.0001\"} 3
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.001\"} 3
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.005\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.01\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.025\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.05\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.1\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.25\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"0.5\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"1\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"5\"} 1193
+kimmy_sync_serve_walk_seconds_bucket{le=\"30\"} 1200
+kimmy_sync_serve_walk_seconds_bucket{le=\"+Inf\"} 1201
+kimmy_sync_serve_walk_seconds_sum 2.5
+kimmy_sync_serve_walk_seconds_count 1201
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -2161,6 +2521,58 @@ kimmy_sync_entry_wait_seconds_count 2
             s.backup_duration_sum_us as f64 / 1e6
         ));
 
+        for holder in kimmy_storage::WriterHolder::ALL {
+            let (row, label) = (holder.slot(), holder.label());
+            let d = &s.write_lock_hold;
+            for c in kimmy_storage::HoldComponent::ALL {
+                expect(&format!(
+                    "kimmy_write_lock_held_component_seconds_total{{holder=\"{label}\",component=\"{}\"}} {}\n",
+                    c.label(),
+                    d.component_ns[row][c.slot()] as f64 / 1e9
+                ));
+            }
+            for p in kimmy_storage::HoldPhase::ALL {
+                expect(&format!(
+                    "kimmy_write_lock_held_phase_seconds_total{{holder=\"{label}\",phase=\"{}\"}} {}\n",
+                    p.label(),
+                    d.phase_ns[row][p.slot()] as f64 / 1e9
+                ));
+            }
+            expect(&format!(
+                "kimmy_write_lock_held_io_bytes_total{{holder=\"{label}\",io=\"read\"}} {}\n",
+                d.read_bytes[row]
+            ));
+            expect(&format!(
+                "kimmy_write_lock_held_io_bytes_total{{holder=\"{label}\",io=\"write\"}} {}\n",
+                d.write_bytes[row]
+            ));
+            expect(&format!(
+                "kimmy_write_lock_held_write_estimated_seconds_total{{holder=\"{label}\"}} {}\n",
+                d.write_estimated_ns[row] as f64 / 1e9
+            ));
+            expect(&format!(
+                "kimmy_write_lock_held_overcounted_total{{holder=\"{label}\"}} {}\n",
+                d.overcounted[row]
+            ));
+        }
+        expect(&format!(
+            "kimmy_write_lock_held_cpu_unmeasured_total {}\n",
+            s.write_lock_hold.cpu_unmeasured
+        ));
+        expect(&format!("kimmy_sync_served_windows_total {}\n", s.sync_serve.windows));
+        expect(&format!("kimmy_sync_served_entries_total {}\n", s.sync_serve.entries));
+        expect(&format!("kimmy_sync_serve_passed_entries_total {}\n", s.sync_serve.passed));
+        expect(&format!(
+            "kimmy_sync_serve_walk_read_seconds_total {}\n",
+            s.sync_serve.read_ns as f64 / 1e9
+        ));
+        expect(&format!("kimmy_sync_serve_walk_read_bytes_total {}\n", s.sync_serve.read_bytes));
+        expect(&format!(
+            "kimmy_sync_serve_walk_seconds_sum {}\n",
+            s.sync_serve.walk_sum_us as f64 / 1e6
+        ));
+        expect(&format!("kimmy_sync_serve_walk_seconds_count {}\n", s.sync_serve.windows));
+
         // Not a rendered series of its own — the histogram prints it in seconds
         // — but the bridge reports microseconds, so the conversion is the thing
         // that can silently be wrong.
@@ -2268,10 +2680,20 @@ kimmy_sync_entry_wait_seconds_count 2
         // ADR-175, six more scalars (pulled entries, clock-ahead pulls, four
         // contact ends), the pull histogram's 16 buckets, +Inf, sum and count
         // for each of three phases, and the entry wait's 11 buckets, +Inf,
-        // sum and count.
+        // sum and count. Since ADR-176, for each of the twelve holders five
+        // components, three phases, two byte counts, the estimate's bound and
+        // the over-count; one scalar for unmeasured CPU; five serve scalars;
+        // and the serve walk's 12 buckets, +Inf, sum and count.
         assert_eq!(
             samples,
-            104 + 6 + 3 * 19 + 14 + 10 * kimmy_storage::WriterHolder::COUNT,
+            104 + 6
+                + 3 * 19
+                + 14
+                + 10 * kimmy_storage::WriterHolder::COUNT
+                + 12 * kimmy_storage::WriterHolder::COUNT
+                + 1
+                + 5
+                + 15,
             "expected one sample per series: {out}"
         );
     }

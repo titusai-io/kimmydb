@@ -10,6 +10,46 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **A hold of the single writer says what it was made of**
+  ([ADR-176](docs/decisions.md)). Under load, throughput has matched one over
+  the mean hold, and nothing said why a hold got longer. These series measure
+  it; they change nothing about how writes are made.
+  - **`kimmy_write_lock_held_component_seconds_total{holder,component}`**: what
+    the holding thread was doing. `read`, `write` and `sync` are time inside the
+    storage file's page reads, page writes and fsyncs. `cpu` is work on the CPU
+    outside those. `off_cpu` is the rest, which is scheduling or lock
+    contention. The five add up to the hold.
+  - **`kimmy_write_lock_held_phase_seconds_total{holder,phase}`**: where in the
+    transaction. `work`, then `counts` (the live-count flush), then `commit`.
+    They add up to the hold.
+  - **`kimmy_write_lock_held_io_bytes_total{holder,io}`**, to tell more pages
+    from slower ones.
+  - **`off_cpu` is a residual**: anything the other components miss lands in
+    it. Read a rise in it beside
+    **`kimmy_write_lock_held_write_estimated_seconds_total{holder}`**, which
+    bounds how much of it could be misattributed CPU (0 for single-document
+    writes). **`kimmy_write_lock_held_overcounted_total{holder}`** should read
+    0, and **`kimmy_write_lock_held_cpu_unmeasured_total`** is 0 on Linux and
+    macOS.
+- **Serving peers' pulls says what it costs the serving member**
+  ([ADR-176](docs/decisions.md)): `kimmy_sync_served_windows_total`,
+  `kimmy_sync_served_entries_total`, `kimmy_sync_serve_passed_entries_total`
+  (what the walk examined and did not send), the `kimmy_sync_serve_walk_seconds`
+  histogram, and the walk's page reads in
+  `kimmy_sync_serve_walk_read_seconds_total` and `_read_bytes_total`.
+- **All of it is on the OTLP bridge**, one instrument per holder and label
+  value. **That is 12 new series and 165 new samples on `/metrics`**, most of
+  them the decomposition across all twelve holders, and 151 new bridge
+  instruments. A scrape config or golden list that enumerates series needs
+  them.
+- **Measured overhead:** about 21 µs per single-document hold and 0.27 ms per
+  bulk of 1,000 on Linux, 0.05% and 0.16% of the holds last measured under
+  load.
+
 ## 0.31.0 - 2026-09-16
 
 **A minor, for one integer becoming a decimal.** `kimmy_replication_lag_seconds`

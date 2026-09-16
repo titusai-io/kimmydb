@@ -16,6 +16,7 @@ pub mod engine;
 pub mod error;
 pub mod expiry;
 pub mod gc;
+pub mod hold_meter;
 pub mod index;
 mod live_count;
 pub mod meta;
@@ -42,6 +43,10 @@ pub use engine::{
 pub use error::{Result, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
+pub use hold_meter::{
+    Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
+    ServeSnapshot,
+};
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
