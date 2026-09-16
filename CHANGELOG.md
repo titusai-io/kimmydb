@@ -24,9 +24,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   as the entries that moved it, so a write that fails still takes its count
   back with it.
 - **What it was measured to be worth.** On a local bulk insert of 1,000
-  documents in one transaction, about 13% (33.1 ms to 28.8 ms, medians of five
-  trials on one Mac). On a replicated batch, and on a single-document insert,
-  the difference was **not resolvable** above the benchmark's own run-to-run
+  documents in one transaction, about 16% (29.9 ms to 25.1 ms, medians of five
+  trials on one Mac). That is the one measurement the benchmark resolves: the
+  two ranges behind those medians, 29.23–31.45 ms and 24.34–25.71 ms, do not
+  overlap. On a replicated batch, and on a single-document insert, the
+  difference was **not resolvable** above the benchmark's own run-to-run
   spread. **This is not shown to cure the replica landing-time regression
   reported against 0.30.0**; treat the cause of that as still open.
   [ADR-174](docs/decisions.md) records the numbers, and what the benchmark
