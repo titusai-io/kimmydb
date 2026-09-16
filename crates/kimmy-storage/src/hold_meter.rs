@@ -1244,12 +1244,13 @@ mod tests {
         let cpu = thread_cpu().unwrap() - cpu_from;
         let d = decompose(&meter, hold, Some(cpu));
         assert!(d.write_estimated >= asleep, "{d:?}");
-        // One call's wall time, a sleep that may oversleep, not two calls'.
-        assert!(d.write_estimated < asleep * 2 + spin * 2, "only the 34th: {d:?}");
+        assert_eq!(meter.write_calls - meter.write_sampled_calls, 1, "only the 34th: {meter:?}");
         // Truth: almost no CPU outside the calls, and almost no time off it
-        // outside them either — the sleep is inside a call.
+        // outside them either — the sleep is inside a call. What a busy
+        // machine adds by descheduling the thread between calls is real time
+        // off the CPU, not error, and the slack allows for it.
         let off = d.components[Component::OffCpu.slot()];
-        let slack = Duration::from_millis(3);
+        let slack = Duration::from_millis(3) + hold / 10;
         assert!(off <= d.write_estimated + slack, "off_cpu {off:?} past its bound: {d:?}");
         // With next to no CPU outside the calls to absorb it, an error this
         // large exceeds it, and this is the case ADR-176 says the over-count
