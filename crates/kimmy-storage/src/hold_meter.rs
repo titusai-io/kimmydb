@@ -34,8 +34,10 @@ use crate::engine::WriterHolder;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Component {
     /// Wall time inside the backend's `read`: a page redb's cache did not hold.
+    /// Also its `len`, the file's size, which redb reads from inside a hold.
     Read,
-    /// Wall time inside the backend's `write`: redb writing a page out.
+    /// Wall time inside the backend's `write`: redb writing a page out. Also
+    /// its `set_len`, which grows the file from inside a hold.
     Write,
     /// Wall time inside the backend's `sync_data`: the fsync.
     Sync,
@@ -118,6 +120,12 @@ pub const WRITE_SAMPLE_EVERY: u64 = 32;
 /// and a proportional part for their per-call rounding.
 pub const OVERCOUNT_TOLERANCE: Duration = Duration::from_millis(1);
 
+/// The coarsest a thread CPU clock reading is rounded to on the platforms
+/// that have one: macOS reports microseconds, Linux nanoseconds. Each call
+/// whose CPU is read contributes two readings, so a sum of them can be off by
+/// twice this per call.
+pub const CPU_CLOCK_GRAIN: Duration = Duration::from_micros(1);
+
 /// This thread's CPU time, or `None` where the platform has no per-thread CPU
 /// clock (ADR-176).
 ///
@@ -125,6 +133,10 @@ pub const OVERCOUNT_TOLERANCE: Duration = Duration::from_millis(1);
 /// `cpu` and `off_cpu` are not recorded at all — never recorded as zero — and
 /// [`HoldCounters::cpu_unmeasured`] counts the hold instead.
 pub fn thread_cpu() -> Option<Duration> {
+    #[cfg(test)]
+    if test_hooks::CPU_CLOCK_FAILS.with(|f| f.get()) {
+        return None;
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -147,6 +159,12 @@ pub(crate) enum Io {
     Read,
     Write,
     Sync,
+    /// The file's size read. Metered with `read`.
+    Len,
+    /// The file grown or shrunk. Metered with `write`, but never sampled:
+    /// its CPU is read exactly, and it counts neither as a page write nor
+    /// towards the sampling of page writes.
+    SetLen,
 }
 
 /// What the backend did on this thread while a meter was installed.
@@ -161,11 +179,20 @@ pub(crate) struct Meter {
     pub write: Duration,
     pub write_bytes: u64,
     pub write_calls: u64,
-    /// Wall and CPU time of the writes whose CPU was read.
+    /// Page writes whose CPU was read, and their wall and CPU time.
+    pub write_sampled_calls: u64,
     pub write_sampled: Duration,
     pub write_sampled_cpu: Duration,
     pub sync: Duration,
     pub sync_cpu: Duration,
+    /// `len` and `set_len`: wall and CPU time, read exactly.
+    pub len: Duration,
+    pub len_cpu: Duration,
+    pub set_len: Duration,
+    pub set_len_cpu: Duration,
+    /// Calls whose CPU time was read, of every kind: what the CPU
+    /// comparison's tolerance scales with.
+    pub cpu_reads: u64,
     /// Whether a CPU clock read the meter needed failed.
     pub cpu_failed: bool,
 }
@@ -178,10 +205,16 @@ impl Meter {
         self.write += inner.write;
         self.write_bytes += inner.write_bytes;
         self.write_calls += inner.write_calls;
+        self.write_sampled_calls += inner.write_sampled_calls;
         self.write_sampled += inner.write_sampled;
         self.write_sampled_cpu += inner.write_sampled_cpu;
         self.sync += inner.sync;
         self.sync_cpu += inner.sync_cpu;
+        self.len += inner.len;
+        self.len_cpu += inner.len_cpu;
+        self.set_len += inner.set_len;
+        self.set_len_cpu += inner.set_len_cpu;
+        self.cpu_reads += inner.cpu_reads;
         self.cpu_failed |= inner.cpu_failed;
     }
 }
@@ -206,24 +239,32 @@ pub(crate) fn io<T>(
             // The calls that can block on the disk, and there are few of them:
             // measured exactly, so time off the CPU inside them is never
             // mistaken for work.
-            Io::Read | Io::Sync => true,
+            Io::Read | Io::Sync | Io::Len | Io::SetLen => true,
             Io::Write => write_calls < WRITES_MEASURED || write_calls % WRITE_SAMPLE_EVERY == 0,
         };
-    let cpu_from = if with_cpu { thread_cpu() } else { None };
+    // The CPU reads nest inside the wall-clock reads, so a call's CPU interval
+    // lies within its wall interval and its CPU time cannot exceed its wall
+    // time except by the two clocks' rounding. Read the other way round, the
+    // CPU interval was the wider one and nearly every sampled write read more
+    // CPU than wall time.
     let from = Instant::now();
+    let cpu_from = if with_cpu { thread_cpu() } else { None };
     #[cfg(test)]
     test_hooks::inside_io(kind, write_calls);
     let result = call();
-    let wall = from.elapsed();
     let cpu_spent = match cpu_from {
         Some(start) => thread_cpu().map(|end| end.saturating_sub(start)),
         None => None,
     };
+    let wall = from.elapsed();
     METER.with(|m| {
         let mut m = m.borrow_mut();
         let Some(m) = m.as_mut() else { return };
         if with_cpu && cpu_spent.is_none() {
             m.cpu_failed = true;
+        }
+        if with_cpu {
+            m.cpu_reads += 1;
         }
         let cpu_spent = cpu_spent.unwrap_or_default();
         match kind {
@@ -237,6 +278,7 @@ pub(crate) fn io<T>(
                 m.write_bytes += bytes as u64;
                 m.write_calls += 1;
                 if with_cpu {
+                    m.write_sampled_calls += 1;
                     m.write_sampled += wall;
                     m.write_sampled_cpu += cpu_spent;
                 }
@@ -244,6 +286,14 @@ pub(crate) fn io<T>(
             Io::Sync => {
                 m.sync += wall;
                 m.sync_cpu += cpu_spent;
+            }
+            Io::Len => {
+                m.len += wall;
+                m.len_cpu += cpu_spent;
+            }
+            Io::SetLen => {
+                m.set_len += wall;
+                m.set_len_cpu += cpu_spent;
             }
         }
     });
@@ -273,6 +323,12 @@ impl Scope {
     }
 
     fn install(cpu: bool) -> Self {
+        // A walk's meter reads no CPU clock, so a hold it nested inside would
+        // lose the CPU of the calls made under it and read that time as `cpu`.
+        debug_assert!(
+            cpu || METER.with(|m| m.borrow().as_ref().is_none_or(|outer| !outer.cpu)),
+            "a scope that reads no CPU clock is nested inside a hold"
+        );
         let outer = METER.with(|m| m.replace(Some(Meter { cpu, ..Meter::default() })));
         Self { outer, cpu_from: if cpu { thread_cpu() } else { None }, finished: false }
     }
@@ -343,10 +399,10 @@ pub(crate) fn decompose(
         write_estimated: meter.write.saturating_sub(meter.write_sampled),
         ..Decomposed::default()
     };
-    out.components[Component::Read.slot()] = meter.read;
-    out.components[Component::Write.slot()] = meter.write;
+    out.components[Component::Read.slot()] = meter.read + meter.len;
+    out.components[Component::Write.slot()] = meter.write + meter.set_len;
     out.components[Component::Sync.slot()] = meter.sync;
-    let io = meter.read + meter.write + meter.sync;
+    let io = meter.read + meter.len + meter.write + meter.set_len + meter.sync;
     let tolerance = OVERCOUNT_TOLERANCE + hold / 100;
 
     let cpu_over_hold = if meter.cpu_failed { None } else { cpu_over_hold };
@@ -361,10 +417,19 @@ pub(crate) fn decompose(
     } else {
         out.write_estimated.mul_f64(cpu_share(meter.write_sampled_cpu, meter.write_sampled))
     };
-    let cpu_in_io = meter.read_cpu + meter.sync_cpu + meter.write_sampled_cpu + estimated_write_cpu;
+    let cpu_in_io = meter.read_cpu
+        + meter.len_cpu
+        + meter.set_len_cpu
+        + meter.sync_cpu
+        + meter.write_sampled_cpu
+        + estimated_write_cpu;
     // CPU inside the calls cannot exceed the CPU over the hold except by an
-    // estimate or a clock that rounds; beyond the tolerance it is a double count.
-    if cpu_in_io > cpu_over_hold + tolerance {
+    // estimate or the clock's rounding; past that it is a double count. Both
+    // sides come from one clock, so the tolerance is that clock's grain per
+    // read, not the wall-clock tolerance above, which on a hold of mostly
+    // off-CPU time would pass several times the CPU there was.
+    let cpu_tolerance = CPU_CLOCK_GRAIN * (2 * (meter.cpu_reads as u32 + 1)) + cpu_over_hold / 100;
+    if cpu_in_io > cpu_over_hold + cpu_tolerance {
         out.overcounted = true;
     }
     let mut cpu = cpu_over_hold.saturating_sub(cpu_in_io);
@@ -574,7 +639,7 @@ impl MeteredBackend {
 
 impl redb::StorageBackend for MeteredBackend {
     fn len(&self) -> std::result::Result<u64, std::io::Error> {
-        self.inner.len()
+        io(Io::Len, 0, || self.inner.len())
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
@@ -583,7 +648,7 @@ impl redb::StorageBackend for MeteredBackend {
     }
 
     fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
-        self.inner.set_len(len)
+        io(Io::SetLen, 0, || self.inner.set_len(len))
     }
 
     fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
@@ -617,6 +682,12 @@ pub(crate) mod test_hooks {
         pub static SPIN_IN_WORK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         /// Spun inside each read, write and sync call.
         pub static SPIN_IN_IO: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// Slept inside every `set_len` and every `len`.
+        pub static SLEEP_IN_FILE_SIZE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// `set_len` and `len` calls made while a meter was installed.
+        pub static FILE_SIZE_CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Every thread CPU clock read fails while set.
+        pub static CPU_CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
         /// Slept inside every write call from this index on.
         pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
     }
@@ -640,6 +711,10 @@ pub(crate) mod test_hooks {
     }
 
     pub fn inside_io(kind: Io, write_calls: u64) {
+        if matches!(kind, Io::Len | Io::SetLen) {
+            FILE_SIZE_CALLS.with(|c| c.set(c.get() + 1));
+            std::thread::sleep(SLEEP_IN_FILE_SIZE.with(|s| s.get()));
+        }
         spin(SPIN_IN_IO.with(|s| s.get()));
         if kind == Io::Write
             && let Some((from, d)) = SLEEP_IN_WRITES_FROM.with(|s| s.get())
@@ -655,6 +730,9 @@ pub(crate) mod test_hooks {
         SPIN_IN_WORK.with(|s| s.set(Duration::ZERO));
         SPIN_IN_IO.with(|s| s.set(Duration::ZERO));
         SLEEP_IN_WRITES_FROM.with(|s| s.set(None));
+        SLEEP_IN_FILE_SIZE.with(|s| s.set(Duration::ZERO));
+        FILE_SIZE_CALLS.with(|c| c.set(0));
+        CPU_CLOCK_FAILS.with(|f| f.set(false));
     }
 }
 
