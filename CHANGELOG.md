@@ -10,7 +10,49 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.30.0 - 2026-09-15
+
+**A minor. Read both entries under *Changed* before upgrading.** A change
+stream's resume token carries more than an entry now ([ADR-173](docs/decisions.md)),
+and each collection keeps its live document count in two new tables
+([ADR-174](docs/decisions.md)), which the first start of this release builds.
+
+**The roll, and what to expect during it.**
+- **A 0.29.x member refuses a 0.30.0 token** with `400 bad_request`. A client
+  whose stream is cut and resumes on a member not yet rolled fails until the
+  roll completes. Tokens 0.29.x and earlier issued are accepted through 0.30.x.
+- **The first start of 0.30.0 rebuilds the live counts before it serves**,
+  reading the header of every document record, and logs `rebuilt the live
+  document counts before serving` at `INFO` with `records` and `elapsed_ms`. On
+  a store larger than the page cache, or with a cold one, that is minutes: a
+  readiness probe that gives up sooner restarts the node into the same walk.
+  The same rebuild runs after `kimmyd restore`, and after an older build has
+  written to the database.
+- **Going back is not symmetrical.** A member downgraded to 0.29.x stops its
+  embedding worker at start, because its recorded position is in the new token
+  format; restoring a backup taken on 0.30.0 onto 0.29.x does the same. A
+  0.29.x build otherwise opens a 0.30.0 store safely: it ignores both new
+  tables, a backup carries neither, and the next 0.30.0 start rebuilds the
+  counts.
+
+**One new `/metrics` series**, `kimmy_sync_held_marks`, on the OTLP bridge as
+`kimmy.sync.held_marks`. Nothing is removed or renamed.
+
+**The roll is not evidence of mixed-version compatibility**
+([docs/compatibility.md](docs/compatibility.md)). 0.30.0 rolls member at a
+time, with no held mixed-version phase.
+- **Nothing changes on the cluster wire**, so what a roll would have exercised
+  is unchanged from 0.29.0, and its evidence is still the tests beside the
+  protocol: `ask_entries_marked_crosses_a_version_boundary_in_both_directions`
+  and `ask_entries_crosses_a_version_boundary_in_both_directions`, which decode
+  each request as an older member reads it and an older request as this release
+  reads it, and
+  `a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_than_before`.
+- **What is new is a client contract, not a member one.** Resume tokens never
+  cross between members, so the roll needs no ordering. The compatibility
+  window is held by `a_single_stamp_token_issued_before_0_30_still_decodes`,
+  which decodes the 0.29 byte layout, and
+  `a_single_stamp_token_naming_an_entry_this_member_lacks_resumes_after_its_stamp`.
 
 ### Added
 
