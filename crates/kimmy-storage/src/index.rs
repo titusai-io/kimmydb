@@ -799,6 +799,9 @@ impl crate::Engine {
         }
 
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexCreation);
         let name = name.unwrap_or_else(|| IndexMeta::default_name(&fields));
 
         // A local create takes the stamp of the entry it is about to mint, so
@@ -904,6 +907,24 @@ impl crate::Engine {
                     // this commit leaves a value the same entry, re-delivered,
                     // computes again and does not move.
                     let txn = self.begin_write(WriterHolder::Ddl)?;
+                    if !crate::Engine::definition_is(&txn, &read)? {
+                        txn.abort()?;
+                        #[cfg(test)]
+                        crate::sync::race_hooks::absorbed(
+                            crate::sync::race_hooks::Race::IndexCreation,
+                        );
+                        return self.create_index_inner(
+                            db,
+                            collection,
+                            index.fields,
+                            unique,
+                            enforcement,
+                            Some(index.name),
+                            expire_after_secs,
+                            index.partial_filter,
+                            origin,
+                        );
+                    }
                     crate::Engine::put_collection_meta(&txn, &meta)?;
                     txn.commit()?;
                     return Ok((IndexCreated::Built(settled), Vec::new()));
@@ -955,6 +976,24 @@ impl crate::Engine {
         }
 
         let txn = self.begin_write(WriterHolder::IndexBuild)?;
+        // Everything above decided from a definition read before the writer;
+        // one that has changed since is decided again (`definition_is`).
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexCreation);
+            return self.create_index_inner(
+                db,
+                collection,
+                index.fields,
+                unique,
+                enforcement,
+                Some(index.name),
+                expire_after_secs,
+                index.partial_filter,
+                origin,
+            );
+        }
         if matches!(origin, CreateOrigin::Local) {
             let minted = self.next_stamp();
             stamp = Some(minted);
@@ -1189,6 +1228,9 @@ impl crate::Engine {
             CoreError::validate_name(name).map_err(StorageError::Core)?;
         }
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexDrop);
         // Derived from the name rather than read from the definition, so the
         // key agrees with what a `CreateIndex` replay will compute whether or
         // not the index is here.
@@ -1210,14 +1252,23 @@ impl crate::Engine {
         };
 
         let Some(index) = meta.index(name).cloned() else {
-            if let Some(stamp) = replicated {
-                self.record_index_drop(meta.id, index_id, stamp)?;
-                return Ok(Dropped { stamp: Some(stamp), removed: false });
-            }
             // Not here, but the drop still happened: the tombstone and the
             // entry go in one transaction, as they do below, so there is no
             // instant in which the drop is recorded and not yet replicable.
             let txn = self.begin_write(WriterHolder::Ddl)?;
+            // "Not here" was read before the writer; an index created since is
+            // one this drop may have to remove (`Engine::definition_is`).
+            if !crate::Engine::definition_is(&txn, &read)? {
+                txn.abort()?;
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
+                return self.drop_index_inner(db, collection, name, replicated);
+            }
+            if let Some(stamp) = replicated {
+                crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+                txn.commit()?;
+                return Ok(Dropped { stamp: Some(stamp), removed: false });
+            }
             let stamp = self.next_stamp();
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
             let entry = drop_entry(stamp)?;
@@ -1234,6 +1285,14 @@ impl crate::Engine {
         };
 
         let txn = self.begin_write(WriterHolder::Drop)?;
+        // The definition written back below was read before the writer
+        // (`Engine::definition_is`).
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
+            return self.drop_index_inner(db, collection, name, replicated);
+        }
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;

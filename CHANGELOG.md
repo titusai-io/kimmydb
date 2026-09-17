@@ -14,6 +14,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Two schema changes to one collection at once no longer lose one of them.**
+  An index create, an index drop, a vector configuration and turning vectors off
+  each read the collection's definition, then took the single writer and wrote
+  their copy of it back. A change that committed in between was erased: of two
+  index creates on one member both answered success and only one definition
+  survived, its rival's entries left behind with no definition over them; a
+  drop could bring back an index dropped meanwhile, or erase one created
+  meanwhile; and a replicated drop of an index not yet held recorded only its
+  tombstone while an index of that name was created under it. Each now checks
+  the definition again once it holds the writer, and decides afresh from what
+  stands if it changed.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the

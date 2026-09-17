@@ -91,6 +91,9 @@ impl crate::Engine {
         }
 
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
 
         // A dimension change is safe exactly when the server can rebuild the
         // vectors itself: the embedding worker treats every ConfigureVectors
@@ -118,6 +121,14 @@ impl crate::Engine {
 
         meta.vector = Some(config.clone());
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // The definition written back was read before the writer
+        // (`Engine::definition_is`).
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorConfiguration);
+            return self.configure_vectors_inner(db, collection, config, log);
+        }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -161,12 +172,23 @@ impl crate::Engine {
         log: bool,
     ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
         if meta.vector.is_none() {
             return Ok(false);
         }
 
         meta.vector = None;
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // The definition written back was read before the writer
+        // (`Engine::definition_is`).
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorRemoval);
+            return self.disable_vectors_inner(db, collection, drop_vectors, log);
+        }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {

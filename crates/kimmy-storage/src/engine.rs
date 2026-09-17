@@ -2973,6 +2973,29 @@ impl Engine {
     }
 
     /// Persist a modified collection definition (used when adding an index).
+    /// Whether the definition standing under `read`'s name in `txn` is still
+    /// exactly `read`.
+    ///
+    /// For a change that decides from a definition read before it took the
+    /// writer and then writes that definition back under it. The read is not
+    /// under the writer, so another change to the collection can commit in
+    /// between, and writing the earlier copy back erased it: of two index
+    /// creates only one definition survived, the other's entries orphaned.
+    /// Checked once the writer is held, a changed definition sends the change
+    /// back to decide again from what stands; nothing can change it after
+    /// that. [`crate::index::mark_multikey`] re-reads through the transaction
+    /// for the same reason.
+    pub(crate) fn definition_is(
+        txn: &redb::WriteTransaction,
+        read: &CollectionMeta,
+    ) -> Result<bool> {
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        Ok(match collections.get((read.db.as_str(), read.name.as_str()))? {
+            Some(standing) => serde_json::from_slice::<CollectionMeta>(standing.value())? == *read,
+            None => false,
+        })
+    }
+
     pub(crate) fn put_collection_meta(
         txn: &redb::WriteTransaction,
         meta: &CollectionMeta,

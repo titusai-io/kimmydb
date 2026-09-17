@@ -1878,6 +1878,15 @@ pub(crate) mod race_hooks {
         /// A snapshot restore found no collection, and has not yet taken the
         /// writer to create it.
         Restore,
+        /// An index create read the collection's definition, and has not yet
+        /// taken the writer to write it back.
+        IndexCreation,
+        /// An index drop read the collection's definition, likewise.
+        IndexDrop,
+        /// A vector configuration read the collection's definition, likewise.
+        VectorConfiguration,
+        /// Turning vectors off read the collection's definition, likewise.
+        VectorRemoval,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -5843,5 +5852,218 @@ mod tests {
         let second = second.expect("the second caller gets it, not CollectionExists");
         assert_eq!(first.id, second.id);
         race_hooks::assert_absorbed(race_hooks::Race::SystemCreate);
+    }
+
+    /// A collection holding a few documents, for the definition races below.
+    fn collection_with_documents() -> (Arc<Engine>, tempfile::TempDir) {
+        let (engine, dir) = engine();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..5 {
+            engine.insert(&orders, doc! { "_id": i, "a": i, "b": i, "text": "x" }).unwrap();
+        }
+        (Arc::new(engine), dir)
+    }
+
+    fn index_names(engine: &Engine) -> Vec<String> {
+        let mut names: Vec<String> = engine
+            .get_collection("shop", "orders")
+            .unwrap()
+            .indexes
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn two_index_creates_at_once_both_stand() {
+        // Each read the definition before the writer and wrote its copy back
+        // under it with its own index added: the second erased the first,
+        // whose entries were left behind with no definition over them.
+        let (engine, _dir) = collection_with_documents();
+        let competing = Arc::clone(&engine);
+        let (outer, first) = race_hooks::race(
+            race_hooks::Race::IndexCreation,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    Some("by_a".into()),
+                )
+            },
+            || engine.create_index("shop", "orders", vec![field("b")], false, Some("by_b".into())),
+        );
+        first.expect("the first create");
+        outer.expect("the second create");
+        assert_eq!(index_names(&engine), ["by_a", "by_b"], "both definitions stand");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexCreation);
+    }
+
+    #[test]
+    fn settling_an_index_creation_stamp_does_not_erase_an_index_created_meanwhile() {
+        // A replicated create of a definition already held here, under a
+        // winning creation stamp, only moves the held definition's stamp; it
+        // wrote the definition read before the writer back all the same.
+        let (engine, _dir) = collection_with_documents();
+        engine
+            .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
+            .unwrap();
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let competing = Arc::clone(&engine);
+        let (settled, created) = race_hooks::race(
+            race_hooks::Race::IndexCreation,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("b")],
+                    false,
+                    Some("by_b".into()),
+                )
+            },
+            || {
+                engine.create_index_inner(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("by_a".into()),
+                    None,
+                    None,
+                    crate::index::CreateOrigin::Replicated(Some(later)),
+                )
+            },
+        );
+        created.expect("the create");
+        settled.expect("the settle");
+        assert_eq!(index_names(&engine), ["by_a", "by_b"], "both definitions stand");
+        let held = engine.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_a").unwrap().created, Some(later), "at the winning stamp");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexCreation);
+    }
+
+    #[test]
+    fn an_index_create_does_not_bring_back_an_index_dropped_meanwhile() {
+        let (engine, _dir) = collection_with_documents();
+        engine
+            .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
+            .unwrap();
+        let competing = Arc::clone(&engine);
+        let (created, dropped) = race_hooks::race(
+            race_hooks::Race::IndexCreation,
+            move || competing.drop_index("shop", "orders", "by_a"),
+            || engine.create_index("shop", "orders", vec![field("b")], false, Some("by_b".into())),
+        );
+        assert!(dropped.unwrap(), "the drop removed it");
+        created.expect("the create");
+        assert_eq!(index_names(&engine), ["by_b"], "the dropped index stays dropped");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexCreation);
+    }
+
+    #[test]
+    fn an_index_drop_does_not_erase_an_index_created_meanwhile() {
+        let (engine, _dir) = collection_with_documents();
+        engine
+            .create_index("shop", "orders", vec![field("a")], false, Some("by_a".into()))
+            .unwrap();
+        let competing = Arc::clone(&engine);
+        let (dropped, created) = race_hooks::race(
+            race_hooks::Race::IndexDrop,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("b")],
+                    false,
+                    Some("by_b".into()),
+                )
+            },
+            || engine.drop_index("shop", "orders", "by_a"),
+        );
+        created.expect("the create");
+        assert!(dropped.unwrap(), "the drop removed what it named");
+        assert_eq!(index_names(&engine), ["by_b"], "and nothing else");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexDrop);
+    }
+
+    #[test]
+    fn a_replicated_drop_of_an_index_not_held_removes_one_created_meanwhile() {
+        // "Not held here" was read before the writer, and the drop recorded
+        // only its tombstone. An index of that name created in between stood
+        // under a tombstone newer than it, which the members that applied the
+        // two the other way round do not hold.
+        let (engine, _dir) = collection_with_documents();
+        let later = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let competing = Arc::clone(&engine);
+        let (dropped, created) = race_hooks::race(
+            race_hooks::Race::IndexDrop,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    Some("by_a".into()),
+                )
+            },
+            || engine.drop_index_inner("shop", "orders", "by_a", Some(later)),
+        );
+        created.expect("the create");
+        assert!(dropped.unwrap().removed, "the later drop removed the index created before it");
+        assert!(index_names(&engine).is_empty());
+        race_hooks::assert_absorbed(race_hooks::Race::IndexDrop);
+    }
+
+    #[test]
+    fn a_vector_configuration_does_not_erase_an_index_created_meanwhile() {
+        let (engine, _dir) = collection_with_documents();
+        let competing = Arc::clone(&engine);
+        let (configured, created) = race_hooks::race(
+            race_hooks::Race::VectorConfiguration,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    Some("by_a".into()),
+                )
+            },
+            || engine.configure_vectors("shop", "orders", vector_config()),
+        );
+        created.expect("the create");
+        configured.expect("the configuration");
+        assert_eq!(index_names(&engine), ["by_a"], "the index stands");
+        assert!(engine.get_collection("shop", "orders").unwrap().vector.is_some());
+        race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    #[test]
+    fn turning_vectors_off_does_not_erase_an_index_created_meanwhile() {
+        let (engine, _dir) = collection_with_documents();
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let competing = Arc::clone(&engine);
+        let (disabled, created) = race_hooks::race(
+            race_hooks::Race::VectorRemoval,
+            move || {
+                competing.create_index(
+                    "shop",
+                    "orders",
+                    vec![field("a")],
+                    false,
+                    Some("by_a".into()),
+                )
+            },
+            || engine.disable_vectors("shop", "orders", false),
+        );
+        created.expect("the create");
+        assert!(disabled.unwrap());
+        assert_eq!(index_names(&engine), ["by_a"], "the index stands");
+        assert!(engine.get_collection("shop", "orders").unwrap().vector.is_none());
+        race_hooks::assert_absorbed(race_hooks::Race::VectorRemoval);
     }
 }
