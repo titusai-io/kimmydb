@@ -1323,6 +1323,48 @@ enum Step {
     Unknown(Option<String>),
 }
 
+/// What judging a replicated document against its collection decided.
+enum Judged {
+    /// Taken without writing: history, or superseded by a drop.
+    Taken(Step),
+    /// To be applied, into this definition.
+    Apply(Arc<CollectionMeta>),
+}
+
+impl Engine {
+    /// Whether a replicated document is history, gone with its collection,
+    /// or to be applied, counting what is taken into `outcome`.
+    fn judge_document(
+        &self,
+        memo: &mut Memo,
+        entry: &OplogEntry,
+        outcome: &mut SyncOutcome,
+    ) -> Result<Judged> {
+        let collection = self.memo_collection(memo, entry.collection)?;
+        if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
+            outcome.superseded += 1;
+            return Ok(Judged::Taken(Step::Taken));
+        }
+
+        let Some(collection) = collection else {
+            // Gone here, and a tombstone says so: history, whichever way the
+            // stamps fall (ADR-148). [`Self::is_history`] turns away a write
+            // from *before* a drop even when the collection was recreated;
+            // this one covers the collection that is simply not here,
+            // including the ordinary race in which a peer wrote into it
+            // before hearing the drop. Waiting for that collection would be
+            // waiting for something that is never coming, which is ADR-123's
+            // case and must not stop the batch.
+            if self.memo_dropped_at(memo, entry.collection)?.is_some() {
+                outcome.superseded += 1;
+                return Ok(Judged::Taken(Step::Taken));
+            }
+            return Ok(Judged::Taken(Step::Unknown(None)));
+        };
+        Ok(Judged::Apply(collection))
+    }
+}
+
 impl Engine {
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
@@ -1382,28 +1424,42 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
-        let collection = self.memo_collection(memo, entry.collection)?;
-        if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
-            outcome.superseded += 1;
-            return Ok(Step::Taken);
-        }
-
-        let Some(collection) = collection else {
-            // Gone here, and a tombstone says so: history, whichever way the
-            // stamps fall (ADR-148). [`Self::is_history`] turns away a write
-            // from *before* a drop even when the collection was recreated;
-            // this one covers the collection that is simply not here,
-            // including the ordinary race in which a peer wrote into it
-            // before hearing the drop. Waiting for that collection would be
-            // waiting for something that is never coming, which is ADR-123's
-            // case and must not stop the batch.
-            if self.memo_dropped_at(memo, entry.collection)?.is_some() {
-                outcome.superseded += 1;
-                return Ok(Step::Taken);
-            }
-            return Ok(Step::Unknown(None));
+        let collection = match self.judge_document(memo, entry, outcome)? {
+            Judged::Taken(step) => return Ok(step),
+            Judged::Apply(collection) => collection,
         };
 
+        // The judgement above is made before the writer, for the first
+        // document of a run, and a drop, or a drop and a recreation, can land
+        // between it and the run's transaction. A tombstone and a floor only
+        // move forward, so an answer of *history* stays true and needs no
+        // writer: a window wholly superseded takes none. An answer of *apply*
+        // can go stale, so it is judged again once the transaction is open,
+        // from a memo cleared with it; applied on the stale answer, the
+        // document landed in the buried collection, or below the floor of
+        // the one recreated after it.
+        #[cfg(test)]
+        race_hooks::reach(race_hooks::Race::DocumentRun);
+        let collection = if run.txn.is_none() {
+            self.run_txn(run)?;
+            *memo = Memo::default();
+            match self.judge_document(memo, entry, outcome)? {
+                Judged::Taken(step) => {
+                    #[cfg(test)]
+                    race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    return Ok(step);
+                }
+                Judged::Apply(current) => {
+                    #[cfg(test)]
+                    if *current != *collection {
+                        race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    }
+                    current
+                }
+            }
+        } else {
+            collection
+        };
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, position)? {
             RemoteApplied::Applied { id, violations, released } => {
@@ -1938,6 +1994,9 @@ pub(crate) mod race_hooks {
         RestoreDefinitions,
         /// Not a race point: a vector configuration judged history.
         VectorHistory,
+        /// A replicated document judged not history, before its run's write
+        /// transaction is open.
+        DocumentRun,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -1953,6 +2012,9 @@ pub(crate) mod race_hooks {
         /// side that loses, and may take an absorbing branch of its own; that
         /// is not the loser absorbing the race, so it records nothing.
         static COMPETING: Cell<bool> = const { Cell::new(false) };
+        /// Writers this thread has taken, for a test that must show a path
+        /// takes none.
+        static WRITERS_TAKEN: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
@@ -1970,6 +2032,16 @@ pub(crate) mod race_hooks {
             return;
         }
         ABSORBED.with(|a| a.set(a.get() | 1 << race as u32));
+    }
+
+    /// Count a writer taken on this thread (`Engine::begin_write`).
+    pub(crate) fn writer_taken() {
+        WRITERS_TAKEN.with(|w| w.set(w.get() + 1));
+    }
+
+    /// Writers taken on this thread so far.
+    pub(crate) fn writers_taken() -> u64 {
+        WRITERS_TAKEN.with(|w| w.get())
     }
 
     /// Whether this thread has absorbed `race` since the last `at`.
@@ -6511,5 +6583,118 @@ mod tests {
         assert!(held.incarnation_floor.is_some(), "with its floor");
         assert!(held.vector.is_none(), "and without the first life's configuration");
         race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    /// `b` holding `orders` as `a` created it, and `a` with a document written
+    /// into it that `b` has not applied yet: the window position of that
+    /// document, and the collection.
+    fn a_document_behind(a: &Engine, b: &Engine) -> CollectionMeta {
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        apply(b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        orders
+    }
+
+    fn rows_under(engine: &Engine, id: CollectionId) -> usize {
+        let txn = engine.db().begin_read().unwrap();
+        let docs = txn.open_table(crate::tables::DOCS).unwrap();
+        docs.range(crate::engine::doc_range(id)).unwrap().count()
+    }
+
+    #[test]
+    fn a_document_judged_before_a_drop_lands_is_not_written_into_the_buried_collection() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a_document_behind(&a, &b);
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [OpKind::CreateCollection, OpKind::Insert, OpKind::DropCollection]
+        );
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 2, 3));
+        let (inserted, dropped) = race_hooks::race(
+            race_hooks::Race::DocumentRun,
+            move || {
+                let (b, theirs, drop) = competing;
+                apply(&b, &theirs, &drop)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 2)),
+        );
+        dropped.expect("the drop applies");
+        let inserted = inserted.expect("the document applies, as history");
+        assert_eq!((inserted.applied, inserted.superseded), (0, 1), "{inserted:?}");
+        assert_eq!(rows_under(&b, orders.id), 0, "nothing is written under the buried collection");
+        race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
+    }
+
+    #[test]
+    fn a_document_judged_before_a_drop_and_recreation_land_is_not_written_below_the_new_floor() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a_document_behind(&a, &b);
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [
+                OpKind::CreateCollection,
+                OpKind::Insert,
+                OpKind::DropCollection,
+                OpKind::CreateCollection
+            ]
+        );
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 2, 4));
+        let (inserted, recreated) = race_hooks::race(
+            race_hooks::Race::DocumentRun,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 2)),
+        );
+        recreated.expect("the drop and the recreation apply");
+        inserted.expect("the document applies, as history");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert_eq!(b.count(&held).unwrap(), 0, "the first life's document stays out of the second");
+        assert_eq!(a.count(&second).unwrap(), 0);
+        race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
+    }
+
+    #[test]
+    fn a_window_of_documents_already_held_takes_no_writer_for_its_documents() {
+        // The judgement under the writer is only for a run that is going to
+        // write: documents already held take no writer of their own. The
+        // batch takes one at its end all the same, to record what the window
+        // proved in the witnessed vector, and that one is counted here.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        for i in 0..3 {
+            a.insert(&orders, doc! { "_id": i }).unwrap();
+        }
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        let documents = slice(&whole, 1, whole.entries.len());
+        assert!(documents.entries.iter().all(|e| e.kind == OpKind::Insert));
+
+        let before = race_hooks::writers_taken();
+        let again = apply(&b, &theirs, &documents).unwrap();
+        assert_eq!(again.superseded, 3, "{again:?}");
+        assert_eq!(
+            race_hooks::writers_taken(),
+            before + 1,
+            "a window wholly held takes only the witnessed vector's writer"
+        );
     }
 }
