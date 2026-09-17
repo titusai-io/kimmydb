@@ -707,7 +707,7 @@ impl crate::Engine {
             expire_after_secs,
             partial_filter,
             CreateOrigin::Local,
-            &|_| false,
+            &|_, _| false,
         )?;
         debug_assert!(
             violations.is_empty(),
@@ -755,12 +755,15 @@ impl crate::Engine {
     /// durable the way a merged write's collisions are (ADR-029, ADR-123).
     /// The returned list is always empty on the local path.
     ///
-    /// `older_than_drop` judges the index's tombstone under the writer: true
-    /// means this creation is older than a drop of the name, and nothing is
-    /// built (`IndexCreated::Older`). A replicated creation checks it before
-    /// calling, cheaply, but not under the writer; a drop recorded between
-    /// that check and here used to be passed over, and the creation built an
-    /// index under a newer tombstone. A local creation passes `|_| false`.
+    /// `history` judges, under the writer, whether this creation belongs to a
+    /// past the collection has moved on from: given the collection's
+    /// definition as it stands and the index's tombstone, true means nothing
+    /// is built or settled (`IndexCreated::Older`). A replicated creation is
+    /// history below a newer drop of the index; a snapshot's definition is
+    /// history when the page names a life of the collection that has since
+    /// been dropped and recreated here. Both callers check before calling,
+    /// cheaply, but not under the writer, and what landed in between used to
+    /// be passed over. A local creation passes `|_, _| false`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_index_inner(
         &self,
@@ -773,7 +776,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
         origin: CreateOrigin,
-        older_than_drop: &dyn Fn(Stamp) -> bool,
+        history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> bool,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
@@ -937,8 +940,12 @@ impl crate::Engine {
                             expire_after_secs,
                             index.partial_filter,
                             origin,
-                            older_than_drop,
+                            history,
                         );
+                    }
+                    if history(&read, self.index_dropped_at(meta.id, id)?) {
+                        txn.abort()?;
+                        return Ok((IndexCreated::Older, Vec::new()));
                     }
                     crate::Engine::put_collection_meta(&txn, &meta)?;
                     txn.commit()?;
@@ -1007,15 +1014,13 @@ impl crate::Engine {
                 expire_after_secs,
                 index.partial_filter,
                 origin,
-                older_than_drop,
+                history,
             );
         }
-        if let Some(dropped_at) = self.index_dropped_at(meta.id, id)?
-            && older_than_drop(dropped_at)
-        {
+        if history(&read, self.index_dropped_at(meta.id, id)?) {
             txn.abort()?;
             #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::ReplicatedIndexCreate);
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexHistory);
             return Ok((IndexCreated::Older, Vec::new()));
         }
         if matches!(origin, CreateOrigin::Local) {

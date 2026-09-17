@@ -1758,6 +1758,7 @@ impl Engine {
                         &target.collection,
                         config,
                         false,
+                        &|standing| aims_at_a_previous_incarnation(standing, entry.stamp.hlc),
                     ))?
                     .map(|_| ()),
                     // Never `drop_vectors`: discarding a peer's stored
@@ -1768,6 +1769,7 @@ impl Engine {
                         &target.collection,
                         false,
                         false,
+                        &|standing| aims_at_a_previous_incarnation(standing, entry.stamp.hlc),
                     ))?
                     .map(|_| ()),
                 };
@@ -1882,7 +1884,7 @@ impl Engine {
             target.index.expire_after_secs,
             target.index.partial_filter.clone(),
             crate::index::CreateOrigin::Replicated(Some(created)),
-            &|dropped_at| stamp < dropped_at,
+            &|_, dropped| dropped.is_some_and(|dropped_at| stamp < dropped_at),
         )?;
         if !violations.is_empty() {
             self.report_index_backfill_violations(&meta, &violations)?;
@@ -1928,6 +1930,14 @@ pub(crate) mod race_hooks {
         /// A replicated index drop found no index of the name created after
         /// it, and has not yet taken the writer to remove it.
         ReplicatedIndexDrop,
+        /// Not a race point: an index creation judged history under the
+        /// writer, whichever race brought it there.
+        IndexHistory,
+        /// A snapshot restore judged the page's life current, and has not yet
+        /// restored its definitions.
+        RestoreDefinitions,
+        /// Not a race point: a vector configuration judged history.
+        VectorHistory,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -6017,7 +6027,7 @@ mod tests {
                     None,
                     None,
                     crate::index::CreateOrigin::Replicated(Some(later)),
-                    &|_| false,
+                    &|_, _| false,
                 )
             },
         );
@@ -6194,7 +6204,7 @@ mod tests {
         both.expect("the creation and the drop apply");
         created.expect("the creation applies, as history");
         assert!(index_names(&b).is_empty(), "the drop stands: {:?}", index_names(&b));
-        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedIndexCreate);
+        race_hooks::assert_absorbed(race_hooks::Race::IndexHistory);
     }
 
     #[test]
@@ -6369,5 +6379,137 @@ mod tests {
         assert_eq!(held.created, second.created, "and it is the new incarnation");
         assert_eq!(b.count(&held).unwrap(), 1, "with its document");
         race_hooks::assert_absorbed(race_hooks::Race::Burial);
+    }
+
+    /// `window` cut to its entries `from..to`, as a window serving only them.
+    fn slice(window: &OplogWindow, from: usize, to: usize) -> OplogWindow {
+        OplogWindow {
+            entries: window.entries[from..to].to_vec(),
+            scanned_to: window.entries[to - 1].stamp.hlc,
+            exhausted: to == window.entries.len() && window.exhausted,
+        }
+    }
+
+    fn apply(engine: &Engine, theirs: &VersionVector, window: &OplogWindow) -> Result<SyncOutcome> {
+        engine.apply_peer_batch(theirs, &window.entries, window.scanned_to, window.exhausted)
+    }
+
+    fn kinds(window: &OplogWindow) -> Vec<OpKind> {
+        window.entries.iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn a_reserved_vector_configuration_of_a_dropped_life_does_not_configure_the_next() {
+        // No race: a window re-served, as overlapping windows are routinely.
+        // The `ConfigureVectors` arm had no incarnation rule, so the first
+        // life's configuration landed on the second and minted it a shadow.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_none());
+        let configure =
+            whole.entries.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+
+        apply(&b, &theirs, &slice(&whole, configure, configure + 1)).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().vector.is_none(),
+            "the first life's configuration stays with the first life"
+        );
+        assert!(b.vector_collection("shop", "orders").unwrap().is_none(), "and mints no shadow");
+    }
+
+    #[test]
+    fn a_reserved_vector_removal_of_a_dropped_life_does_not_turn_off_the_next() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+        let removal = whole
+            .entries
+            .iter()
+            .position(|e| {
+                e.kind == OpKind::ConfigureVectors
+                    && bson::deserialize_from_slice::<kimmy_core::VectorSet>(
+                        e.body.as_ref().unwrap(),
+                    )
+                    .unwrap()
+                    .config
+                    .is_none()
+            })
+            .unwrap();
+
+        apply(&b, &theirs, &slice(&whole, removal, removal + 1)).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().vector.is_some(),
+            "the first life's removal does not turn off the second life's vectors"
+        );
+    }
+
+    #[test]
+    fn a_vector_configuration_does_not_write_a_dropped_lifes_definition_over_the_next() {
+        // Raced: the configuration read the first life's definition, a drop
+        // and the recreation after it landed before the writer, and the
+        // definition it wrote back was the first life's, created stamp and
+        // no floor, over the second. A drop of the first life re-served after
+        // that would have buried the second.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let at = |kind: OpKind| whole.entries.iter().position(|e| e.kind == kind).unwrap();
+        let (create, configure, drop) = (
+            at(OpKind::CreateCollection),
+            at(OpKind::ConfigureVectors),
+            at(OpKind::DropCollection),
+        );
+        apply(&b, &theirs, &slice(&whole, create, create + 1)).unwrap();
+        // Everything from the drop on, the recreation included, without the
+        // shadow's own entries.
+        let after = OplogWindow {
+            entries: whole.entries[drop..]
+                .iter()
+                .filter(|e| e.collection == second.id)
+                .cloned()
+                .collect(),
+            scanned_to: whole.scanned_to,
+            exhausted: whole.exhausted,
+        };
+        assert_eq!(kinds(&after), [OpKind::DropCollection, OpKind::CreateCollection]);
+
+        let competing = (Arc::clone(&b), theirs.clone(), after.clone());
+        let (configured, recreated) = race_hooks::race(
+            race_hooks::Race::VectorConfiguration,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, configure, configure + 1)),
+        );
+        recreated.expect("the drop and the recreation apply");
+        configured.expect("the configuration applies, as history");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created, "the second life's definition stands");
+        assert!(held.incarnation_floor.is_some(), "with its floor");
+        assert!(held.vector.is_none(), "and without the first life's configuration");
+        race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
     }
 }

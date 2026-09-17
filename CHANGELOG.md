@@ -50,6 +50,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   drop checked whether the index was created after it before the writer, and
   removed a recreation that landed in between. Both are judged again under the
   writer.
+- **A dropped collection's vector configuration and indexes no longer land on
+  the collection recreated after it.** A vector configuration, or turning
+  vectors off, replicated from before a drop configured the recreated
+  collection when a window carrying it was served again, and could mint it a
+  shadow collection; applied while the drop and recreation landed, it wrote the
+  dropped collection's definition back over the new one. A snapshot page from
+  a member behind on the drop restored the old collection's indexes and vector
+  configuration into the new one, which its peers never had. Each is now
+  judged against the collection that stands, under the writer.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the

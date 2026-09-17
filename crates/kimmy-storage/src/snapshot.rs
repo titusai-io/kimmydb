@@ -1220,6 +1220,29 @@ impl Engine {
             }
         }
 
+        // A page can name a life of the collection this node has seen dropped
+        // and recreated since: a peer behind on the drop still serves the old
+        // life. Its definitions are that life's, and restored into the one
+        // standing here they gave it an index, or a vector configuration, its
+        // peers never had. Judged here to answer cheaply, and again under the
+        // writer by each definition it would restore.
+        let earlier = |standing: &CollectionMeta| {
+            standing
+                .incarnation_floor
+                .is_some_and(|floor| state.created.is_none_or(|created| created <= floor))
+        };
+        if earlier(&self.get_collection(&state.db, &state.name)?) {
+            debug!(
+                db = %state.db,
+                collection = %state.name,
+                "a snapshot page named a life of the collection dropped since; its definitions \
+                 are not restored into the one that stands"
+            );
+            return Ok(0);
+        }
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::RestoreDefinitions);
+
         let mut refused = 0usize;
         for index in &state.indexes {
             let existing = self.get_collection(&state.db, &state.name)?;
@@ -1244,7 +1267,7 @@ impl Engine {
                 // the stamp existed carries none, and such a rival is refused
                 // and counted rather than silently skipped as it was.
                 crate::index::CreateOrigin::Replicated(index.created),
-                &|_| false,
+                &|standing, _| earlier(standing),
             );
             match crate::sync::settle(created)? {
                 crate::sync::Ddl::Applied((_, violations)) => {
@@ -1278,7 +1301,13 @@ impl Engine {
         if let Some(config) = &state.vector {
             let existing = self.get_collection(&state.db, &state.name)?;
             if existing.vector.as_ref() != Some(config) {
-                self.configure_vectors_inner(&state.db, &state.name, config.clone(), false)?;
+                self.configure_vectors_inner(
+                    &state.db,
+                    &state.name,
+                    config.clone(),
+                    false,
+                    &earlier,
+                )?;
             }
         }
         Ok(refused)
@@ -1466,6 +1495,119 @@ mod tests {
         restored.expect("the page applies");
         assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::Restore);
+    }
+
+    /// A member behind on a drop and a recreation (`stale`), still holding
+    /// the first life with an index only it had, and a member (`current`)
+    /// holding the second life without it.
+    fn a_stale_and_a_current_member()
+    -> (Engine, Engine, tempfile::TempDir, tempfile::TempDir, Engine, tempfile::TempDir) {
+        let (a, da) = engine();
+        let (stale, ds) = engine();
+        let (current, dc) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("life1_only".into()))
+            .unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        transfer(&stale, &a);
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        current
+            .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        (stale, current, ds, dc, a, da)
+    }
+
+    fn index_names(engine: &Engine) -> Vec<String> {
+        engine
+            .get_collection("shop", "orders")
+            .unwrap()
+            .indexes
+            .into_iter()
+            .map(|i| i.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_stale_page_does_not_give_the_standing_life_the_dropped_lifes_index() {
+        // A page from a member behind on the drop names the first life. The
+        // restore found the name taken and restored that life's index into
+        // the second: the member kept an index none of its peers held, and
+        // nothing converged it away.
+        let (stale, current, _ds, _dc, a, _da) = a_stale_and_a_current_member();
+        transfer(&current, &stale);
+        assert!(index_names(&current).is_empty(), "{:?}", index_names(&current));
+        assert!(index_names(&a).is_empty());
+        let held = current.get_collection("shop", "orders").unwrap();
+        assert!(held.vector.is_none(), "nor its vector configuration: {:?}", held.vector);
+    }
+
+    #[test]
+    fn a_page_judged_current_before_a_drop_and_recreation_land_restores_no_definition() {
+        // The page's life judged current against the definition standing
+        // then, and a drop and recreation landing before its indexes are
+        // restored: each index is judged again under the writer.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let created = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        // The member holds the first life, not yet its index.
+        b.apply_peer_batch(&theirs, &created.entries, created.scanned_to, created.exhausted)
+            .unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("life1_only".into()))
+            .unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        let n = window.entries.len();
+        let after = crate::watch::OplogWindow {
+            entries: window.entries[n - 2..].to_vec(),
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+        };
+        assert_eq!(
+            after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [OpKind::DropCollection, OpKind::CreateCollection]
+        );
+
+        let recreating = std::sync::Arc::clone(&b);
+        let (restored, recreated) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::RestoreDefinitions,
+            move || {
+                recreating.apply_peer_batch(
+                    &theirs,
+                    &after.entries,
+                    after.scanned_to,
+                    after.exhausted,
+                )
+            },
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        recreated.expect("the drop and the recreation apply");
+        restored.expect("the page applies");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert!(held.index("life1_only").is_none(), "{:?}", held.indexes);
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::IndexHistory);
     }
 
     #[test]

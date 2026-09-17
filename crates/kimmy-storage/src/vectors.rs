@@ -67,7 +67,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.configure_vectors_inner(db, collection, config, true)
+        self.configure_vectors_inner(db, collection, config, true, &|_| false)
     }
 
     /// `log = false` when applying a replicated configuration. See
@@ -78,6 +78,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
         log: bool,
+        history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<CollectionMeta> {
         config.validate().map_err(|e| StorageError::Core(CoreError::InvalidQuery(e)))?;
 
@@ -94,6 +95,16 @@ impl crate::Engine {
         let read = meta.clone();
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
+        // A configuration of a life of the collection that has since been
+        // dropped and recreated here is history, and is not applied to the
+        // life that stands. Judged on the definition read here, which the
+        // writer's `definition_is` below holds unchanged, and before the shadow
+        // is created, so history mints no shadow either.
+        if history(&meta) {
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorHistory);
+            return Ok(meta);
+        }
 
         // A dimension change is safe exactly when the server can rebuild the
         // vectors itself: the embedding worker treats every ConfigureVectors
@@ -127,7 +138,7 @@ impl crate::Engine {
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorConfiguration);
-            return self.configure_vectors_inner(db, collection, config, log);
+            return self.configure_vectors_inner(db, collection, config, log, history);
         }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
@@ -161,7 +172,7 @@ impl crate::Engine {
     /// Keeping them by default means re-enabling with the same settings does
     /// not force a full re-embed, which for a remote provider is a real cost.
     pub fn disable_vectors(&self, db: &str, collection: &str, drop_vectors: bool) -> Result<bool> {
-        self.disable_vectors_inner(db, collection, drop_vectors, true)
+        self.disable_vectors_inner(db, collection, drop_vectors, true, &|_| false)
     }
 
     pub(crate) fn disable_vectors_inner(
@@ -170,11 +181,17 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
         log: bool,
+        history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
         let read = meta.clone();
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
+        // As `configure_vectors_inner`: turning vectors off for a life that
+        // has since been dropped and recreated here is history.
+        if history(&meta) {
+            return Ok(false);
+        }
         if meta.vector.is_none() {
             return Ok(false);
         }
@@ -187,7 +204,7 @@ impl crate::Engine {
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorRemoval);
-            return self.disable_vectors_inner(db, collection, drop_vectors, log);
+            return self.disable_vectors_inner(db, collection, drop_vectors, log, history);
         }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
