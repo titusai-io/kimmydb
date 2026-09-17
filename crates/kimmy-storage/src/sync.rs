@@ -1120,6 +1120,19 @@ impl Engine {
     }
 }
 
+/// Whether a replicated definition change stamped `stamp` belongs to a life
+/// of the collection before the one standing: at or below its incarnation
+/// floor, the rule [`Engine::is_history`] applies to documents.
+///
+/// Not [`aims_at_a_previous_incarnation`], which is the drop's rule and also
+/// counts a stamp below `created`: two members that create one name
+/// independently stand at whichever creation arrived first, a `created` that
+/// can be later than the other member's changes to the same life, which have
+/// no floor between them to be history behind.
+pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
+    standing.incarnation_floor.is_some_and(|floor| stamp.hlc <= floor)
+}
+
 /// Whether a drop stamped `dropped` is aimed at a life of `current` that has
 /// already ended, rather than at the collection standing here now.
 ///
@@ -1758,7 +1771,7 @@ impl Engine {
                         &target.collection,
                         config,
                         false,
-                        &|standing| aims_at_a_previous_incarnation(standing, entry.stamp.hlc),
+                        &|standing| below_floor(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                     // Never `drop_vectors`: discarding a peer's stored
@@ -1769,7 +1782,7 @@ impl Engine {
                         &target.collection,
                         false,
                         false,
-                        &|standing| aims_at_a_previous_incarnation(standing, entry.stamp.hlc),
+                        &|standing| below_floor(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                 };
@@ -1850,6 +1863,19 @@ impl Engine {
         // here: it backfills over documents written legally once the index
         // was gone, and fails on them (ADR-123).
         let index_id = kimmy_core::IndexMeta::derive_id(&target.index.name);
+        // And a creation from a life of the collection before the one that
+        // stands is history too: a burial writes the collection's tombstone,
+        // not the index's, so the index tombstone alone let a dropped life's
+        // index onto the recreation.
+        if below_floor(&meta, stamp) {
+            debug!(
+                db = %target.db,
+                collection = %target.collection,
+                index = %target.index.name,
+                "ignored an index creation from a life of the collection dropped since"
+            );
+            return Ok(false);
+        }
         if let Some(dropped_at) = self.index_dropped_at(meta.id, index_id)?
             && stamp < dropped_at
         {
@@ -1884,7 +1910,9 @@ impl Engine {
             target.index.expire_after_secs,
             target.index.partial_filter.clone(),
             crate::index::CreateOrigin::Replicated(Some(created)),
-            &|_, dropped| dropped.is_some_and(|dropped_at| stamp < dropped_at),
+            &|standing, dropped| {
+                below_floor(standing, stamp) || dropped.is_some_and(|dropped_at| stamp < dropped_at)
+            },
         )?;
         if !violations.is_empty() {
             self.report_index_backfill_violations(&meta, &violations)?;
@@ -1952,7 +1980,7 @@ pub(crate) mod race_hooks {
         /// Set while the competitor runs. It runs on this thread, inside the
         /// side that loses, and may take an absorbing branch of its own; that
         /// is not the loser absorbing the race, so it records nothing.
-        static COMPETING: Cell<bool> = const { Cell::new(false) };
+        static COMPETING: Cell<u32> = const { Cell::new(0) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
@@ -1966,7 +1994,7 @@ pub(crate) mod race_hooks {
     /// hook that moves ahead of the check it races leaves it unset; and not
     /// while the competitor runs, whose own branches are not the loser's.
     pub(crate) fn absorbed(race: Race) {
-        if COMPETING.with(|c| c.get()) {
+        if COMPETING.with(|c| c.get()) > 0 {
             return;
         }
         ABSORBED.with(|a| a.set(a.get() | 1 << race as u32));
@@ -2020,9 +2048,11 @@ pub(crate) mod race_hooks {
             }
         });
         if let Some(hook) = hook {
-            COMPETING.with(|c| c.set(true));
+            // A depth, not a flag: a competitor that reaches a hook of its
+            // own is still competing when that inner one returns.
+            COMPETING.with(|c| c.set(c.get() + 1));
             hook();
-            COMPETING.with(|c| c.set(false));
+            COMPETING.with(|c| c.set(c.get() - 1));
         }
     }
 }
@@ -6510,6 +6540,209 @@ mod tests {
         assert_eq!(held.created, second.created, "the second life's definition stands");
         assert!(held.incarnation_floor.is_some(), "with its floor");
         assert!(held.vector.is_none(), "and without the first life's configuration");
+        assert!(
+            b.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).is_err(),
+            "and no shadow minted for a configuration that was history"
+        );
         race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    #[test]
+    fn a_vector_configuration_holds_on_a_collection_two_members_created_independently() {
+        // A creates `orders` and configures vectors; C creates `orders` a
+        // moment later, not having heard; B hears C's creation first, so B's
+        // `orders` stands at C's `created`, later than A's configuration. That
+        // is one life, with no floor between the two creations, and A's
+        // configuration is not history on it: judged against `created`, B
+        // turned vectors off where A had them on, while documents, judged on
+        // the floor, converged.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let (c, _c_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        c.create_collection("shop", "orders").unwrap();
+        let from_c = c.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &c.version_vector().unwrap(), &from_c).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().created
+                > a.get_collection("shop", "orders").unwrap().created
+        );
+
+        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &a.version_vector().unwrap(), &from_a).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().vector.is_some(),
+            "A's configuration holds on the one life B stands at"
+        );
+    }
+
+    #[test]
+    fn a_reserved_index_creation_of_a_dropped_life_does_not_land_on_the_next() {
+        // A burial writes the collection's tombstone, not the index's, so the
+        // index tombstone alone let a dropped life's index onto the recreation
+        // when a window carrying its creation was served again.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("a")], false, Some("life1_only".into()))
+            .unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        let create = whole.entries.iter().position(|e| e.kind == OpKind::CreateIndex).unwrap();
+
+        apply(&b, &theirs, &slice(&whole, create, create + 1)).unwrap();
+        assert!(index_names(&b).is_empty(), "{:?}", index_names(&b));
+    }
+
+    #[test]
+    fn a_replicated_index_creation_does_not_land_on_a_life_recreated_while_it_applied() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("a")], false, Some("life1_only".into()))
+            .unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [
+                OpKind::CreateCollection,
+                OpKind::CreateIndex,
+                OpKind::DropCollection,
+                OpKind::CreateCollection
+            ]
+        );
+        apply(&b, &theirs, &slice(&whole, 0, 1)).unwrap();
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 2, 4));
+        let (created, recreated) = race_hooks::race(
+            race_hooks::Race::ReplicatedIndexCreate,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 2)),
+        );
+        recreated.expect("the drop and the recreation apply");
+        created.expect("the index creation applies, as history");
+        assert_eq!(b.get_collection("shop", "orders").unwrap().created, second.created);
+        assert!(index_names(&b).is_empty(), "{:?}", index_names(&b));
+        race_hooks::assert_absorbed(race_hooks::Race::IndexHistory);
+    }
+
+    #[test]
+    fn a_vector_configuration_whose_collection_is_dropped_while_it_applies_mints_no_shadow() {
+        // An index created and the collection dropped between the
+        // configuration's read and its writer: the configuration is decided
+        // again, finds no collection, and must leave no shadow behind whose
+        // creation would replicate.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let orders = a.get_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let mine: Vec<usize> = (0..whole.entries.len())
+            .filter(|&i| whole.entries[i].collection == orders.id)
+            .collect();
+        let pick =
+            |kind: OpKind| mine.iter().copied().find(|&i| whole.entries[i].kind == kind).unwrap();
+        let (create, configure, index, drop) = (
+            pick(OpKind::CreateCollection),
+            pick(OpKind::ConfigureVectors),
+            pick(OpKind::CreateIndex),
+            pick(OpKind::DropCollection),
+        );
+        apply(&b, &theirs, &slice(&whole, create, create + 1)).unwrap();
+        let after = OplogWindow {
+            entries: vec![whole.entries[index].clone(), whole.entries[drop].clone()],
+            scanned_to: whole.scanned_to,
+            exhausted: whole.exhausted,
+        };
+
+        let competing = (Arc::clone(&b), theirs.clone(), after);
+        let (_configured, dropped) = race_hooks::race(
+            race_hooks::Race::VectorConfiguration,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, configure, configure + 1)),
+        );
+        dropped.expect("the index and the drop apply");
+        assert!(b.get_collection("shop", "orders").is_err(), "dropped");
+        assert!(
+            b.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).is_err(),
+            "no shadow for a configuration whose collection is gone"
+        );
+        race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    #[test]
+    fn a_vector_removal_does_not_turn_off_a_life_recreated_while_it_applied() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let first = a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let of = |id: CollectionId, kind: OpKind| -> Vec<usize> {
+            (0..whole.entries.len())
+                .filter(|&i| whole.entries[i].collection == id && whole.entries[i].kind == kind)
+                .collect()
+        };
+        let configures = of(first.id, OpKind::ConfigureVectors);
+        let (configure1, disable1, configure2) = (configures[0], configures[1], configures[2]);
+        let creates = of(first.id, OpKind::CreateCollection);
+        let drop = of(first.id, OpKind::DropCollection)[0];
+        // B holds the first life with vectors on.
+        let held = OplogWindow {
+            entries: vec![whole.entries[creates[0]].clone(), whole.entries[configure1].clone()],
+            scanned_to: whole.entries[configure1].stamp.hlc,
+            exhausted: false,
+        };
+        apply(&b, &theirs, &held).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+        let after = OplogWindow {
+            entries: vec![
+                whole.entries[drop].clone(),
+                whole.entries[creates[1]].clone(),
+                whole.entries[configure2].clone(),
+            ],
+            scanned_to: whole.scanned_to,
+            exhausted: whole.exhausted,
+        };
+
+        let competing = (Arc::clone(&b), theirs.clone(), after);
+        let (disabled, recreated) = race_hooks::race(
+            race_hooks::Race::VectorRemoval,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, disable1, disable1 + 1)),
+        );
+        recreated.expect("the drop, the recreation and its configuration apply");
+        disabled.expect("the removal applies, as history");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert!(held.vector.is_some(), "the second life's vectors stay on");
+        race_hooks::assert_absorbed(race_hooks::Race::VectorRemoval);
     }
 }

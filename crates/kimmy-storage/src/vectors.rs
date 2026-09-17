@@ -128,7 +128,6 @@ impl crate::Engine {
         }
 
         let shadow = vector_meta::shadow_name(collection);
-        self.create_system_collection(db, &shadow)?;
 
         meta.vector = Some(config.clone());
         let txn = self.begin_write(WriterHolder::Ddl)?;
@@ -163,8 +162,48 @@ impl crate::Engine {
             self.publish(vec![entry]);
         }
 
+        // The shadow is minted only now, once the configuration it serves is
+        // judged under the writer and committed, and only while that
+        // configuration still stands: minted before, a configuration that
+        // turned out to be history, or whose collection was dropped in
+        // between, left a shadow whose creation replicated.
+        self.create_shadow_for(db, &shadow, &meta)?;
         info!(db, collection, shadow = %shadow, "configured auto-embedding");
         Ok(meta)
+    }
+
+    /// Create `parent`'s vector shadow `shadow` if it is missing, while the
+    /// collection standing under `parent`'s name is still `parent`'s life with
+    /// `parent`'s configuration.
+    fn create_shadow_for(&self, db: &str, shadow: &str, parent: &CollectionMeta) -> Result<()> {
+        match self.get_collection(db, shadow) {
+            Ok(_) => return Ok(()),
+            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => {}
+            Err(e) => return Err(e),
+        }
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
+        let still = || match self.get_collection(db, &parent.name) {
+            // The same life with the same configuration. Not the whole
+            // definition: a document write marking an index multikey changes
+            // it without changing what the shadow serves.
+            Ok(standing) => Ok(standing.created == parent.created
+                && standing.incarnation_floor == parent.incarnation_floor
+                && standing.vector == parent.vector),
+            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => Ok(false),
+            Err(e) => Err(e),
+        };
+        match self.create_collection_while(db, shadow, true, None, &|_| false, &still) {
+            Ok(_) => Ok(()),
+            // Created by a concurrent configuration of the same parent: the
+            // shadow this one wanted.
+            Err(StorageError::Core(CoreError::CollectionExists { .. })) => {
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::SystemCreate);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Turn off auto-embedding, optionally discarding the vectors.

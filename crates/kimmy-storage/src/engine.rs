@@ -2329,6 +2329,22 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
+        self.create_collection_while(db, name, log, origin, history, &|| Ok(true))
+    }
+
+    /// [`Self::create_collection_inner`], creating only if `wanted`, judged
+    /// with the writer held, still holds: for a collection that exists for
+    /// another's sake, a vector shadow for its parent's configuration, which
+    /// must not be minted for a configuration that no longer stands.
+    pub(crate) fn create_collection_while(
+        &self,
+        db: &str,
+        name: &str,
+        log: bool,
+        origin: Option<Hlc>,
+        history: &dyn Fn(Stamp) -> bool,
+        wanted: &dyn Fn() -> Result<bool>,
+    ) -> Result<Option<CollectionMeta>> {
         // Derived, not allocated: every node computes the same id for the
         // same collection, so a replicated oplog entry addresses the same
         // collection everywhere. See `CollectionId::derive`.
@@ -2383,7 +2399,7 @@ impl Engine {
             // would make whichever node created second silently discard the
             // first one's documents.
             let dropped = self.collection_dropped_at(id)?;
-            if dropped.is_some_and(history) {
+            if dropped.is_some_and(history) || !wanted()? {
                 drop(collections);
                 txn.abort()?;
                 return Ok(None);

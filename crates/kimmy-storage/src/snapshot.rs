@@ -1550,7 +1550,25 @@ mod tests {
         // the second: the member kept an index none of its peers held, and
         // nothing converged it away.
         let (stale, current, _ds, _dc, a, _da) = a_stale_and_a_current_member();
-        transfer(&current, &stale);
+        // The page's index made one this node refuses, so a definition of the
+        // dropped life that reached the restore at all is counted: the page
+        // check is what keeps it from being judged, not only from landing.
+        let mut progress = SnapshotProgress::whole_database();
+        let mut refused = 0;
+        while !progress.is_complete() {
+            let mut page =
+                stale.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            for state in &mut page.collections {
+                for index in &mut state.indexes {
+                    index.enforcement = kimmy_core::Enforcement::Coordinated;
+                }
+            }
+            refused += current
+                .apply_snapshot_page(stale.node_id(), &mut progress, &page)
+                .unwrap()
+                .ddl_refused;
+        }
+        assert_eq!(refused, 0, "a dropped life's definition is neither restored nor refused");
         assert!(index_names(&current).is_empty(), "{:?}", index_names(&current));
         assert!(index_names(&a).is_empty());
         let held = current.get_collection("shop", "orders").unwrap();
@@ -1608,6 +1626,81 @@ mod tests {
         assert_eq!(held.created, second.created);
         assert!(held.index("life1_only").is_none(), "{:?}", held.indexes);
         crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::IndexHistory);
+    }
+
+    #[test]
+    fn a_page_judged_current_before_a_drop_and_recreation_land_restores_no_vectors() {
+        // As for indexes: the page's vector configuration is judged again,
+        // under the writer, against the life that stands.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let created = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        b.apply_peer_batch(&theirs, &created.entries, created.scanned_to, created.exhausted)
+            .unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        // The parent's page alone: the shadow is its own collection.
+        page.collections.retain(|state| state.name == "orders");
+        let orders = a.get_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        let after = crate::watch::OplogWindow {
+            entries: window
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.collection == orders.id
+                        && matches!(e.kind, OpKind::DropCollection | OpKind::CreateCollection)
+                        && e.stamp.hlc > orders.created
+                })
+                .cloned()
+                .collect(),
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+        };
+        assert_eq!(
+            after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [OpKind::DropCollection, OpKind::CreateCollection]
+        );
+
+        let recreating = std::sync::Arc::clone(&b);
+        let (restored, recreated) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::RestoreDefinitions,
+            move || {
+                recreating.apply_peer_batch(
+                    &theirs,
+                    &after.entries,
+                    after.scanned_to,
+                    after.exhausted,
+                )
+            },
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        recreated.expect("the drop and the recreation apply");
+        restored.expect("the page applies");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert!(held.vector.is_none(), "{:?}", held.vector);
+        assert!(b.vector_collection("shop", "orders").unwrap().is_none(), "and no shadow");
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::VectorHistory);
     }
 
     #[test]
