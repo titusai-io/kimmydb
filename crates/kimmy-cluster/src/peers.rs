@@ -1485,7 +1485,7 @@ mod tests {
         )
         .unwrap();
 
-        *crate::transport::test_hooks::FAIL_AFTER_APPLY.lock().unwrap() = Some(a_addr);
+        let _failing = crate::transport::test_hooks::FailingAfterApply::against(a_addr);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
         let mut config =
             ReplicationConfig::new(vec![SeedSource::Static(vec![a_addr])], SECRET.into(), b_addr);
@@ -1499,10 +1499,10 @@ mod tests {
         let mut seen = RoundReport::default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         while seen.failed == 0 || seen.ddl_refused == 0 {
-            let report = tokio::time::timeout_at(deadline, rx.recv())
-                .await
-                .unwrap_or_else(|_| panic!("no report carried both signals in time; saw {seen:?}"))
-                .expect("the loop keeps reporting");
+            // Out of time, the assertions below say which signal never came.
+            let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
             seen.failed += report.failed;
             seen.ddl_refused += report.ddl_refused;
         }
@@ -1514,7 +1514,6 @@ mod tests {
             }
         }
         looping.abort();
-        *crate::transport::test_hooks::FAIL_AFTER_APPLY.lock().unwrap() = None;
 
         assert!(seen.failed >= 1, "the round failed after its apply: {seen:?}");
         assert_eq!(seen.ddl_refused, 1, "and its refusal is reported, once: {seen:?}");

@@ -1031,20 +1031,15 @@ where
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
             clock.applied_for(applying.elapsed());
-            if let Err(e) = applied {
-                // A batch that errors drops its witnessed vector, so its window
-                // is served again and what it refused, deferred or could not
-                // place is counted then. A declined drop is not: its tombstone
-                // was written as it was declined, so the next delivery is a
-                // replay, and it is counted here or never (ADR-177).
-                stalls.applied.ddl_declined += outcome.ddl_declined;
-                return Err(ProtocolError::Malformed(e.to_string()));
-            }
+            // Recorded whether or not the batch then errored: the outcome
+            // holds only what a commit made final, and what none did is
+            // served again and counted then (ADR-177).
             let counted = &mut stalls.applied;
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
             counted.deferred += outcome.deferred;
+            applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
             #[cfg(test)]
             if test_hooks::fails_after_apply(peer) {
                 return Err(ProtocolError::Malformed("a failure injected after the apply".into()));
@@ -2445,7 +2440,24 @@ pub(crate) mod test_hooks {
         std::sync::Mutex::new(None);
 
     pub fn fails_after_apply(peer: std::net::SocketAddr) -> bool {
-        *FAIL_AFTER_APPLY.lock().unwrap() == Some(peer)
+        *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) == Some(peer)
+    }
+
+    /// [`FAIL_AFTER_APPLY`] set for `peer` until dropped, so a test that panics
+    /// does not leave it set.
+    pub struct FailingAfterApply(());
+
+    impl FailingAfterApply {
+        pub fn against(peer: std::net::SocketAddr) -> Self {
+            *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+            Self(())
+        }
+    }
+
+    impl Drop for FailingAfterApply {
+        fn drop(&mut self) {
+            *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     thread_local! {
@@ -4052,7 +4064,9 @@ mod tests {
                 let wall = 1_000 * (n + 1);
                 let next = (n + 1 < PAGES).then(|| cursor(wall));
                 let page = snapshot_page(origin, &[wall], next, theirs.clone(), n == 0);
-                write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.unwrap();
+                if write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.is_err() {
+                    break;
+                }
                 served += 1;
             }
             served
@@ -4072,9 +4086,9 @@ mod tests {
         drop(ours);
         let served = peer.await.unwrap();
 
+        assert!(served < PAGES, "{served} of {PAGES} pages in one round: {round:?}");
         let outcome = round.expect("inside the round's deadline").unwrap();
         assert!(!outcome.exhausted, "left to resume, not run to its end: {outcome:?}");
-        assert!(served < PAGES, "{served} of {PAGES} pages in one round");
         assert!(stalls.snapshot_resumes(node(9), None), "resumed next round from its cursor");
     }
 

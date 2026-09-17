@@ -17317,22 +17317,45 @@ before it, apply included, would fit in the tick's remaining budget, so a
 slow apply ends that contact. The sequential contact loop is held by one round
 for one window's apply, or one page budget, beyond the exchange, as before.
 
-**What an apply that errors counts, and why.** A batch that errors drops its
-witnessed vector with the error, so its window is served again. What it
-refused, deferred or could not place leaves nothing behind, and is counted
-again on that next delivery, once per delivery as ADR-123 counts: counted at
-the error as well, it would be counted twice. **A declined drop is different**:
-its tombstone is written as it is declined, so the next delivery is a replay,
-which is not counted. So an apply that errors reports its declines and
-nothing else (`Engine::apply_peer_batch_into` fills the round's outcome as it
-goes). And `kimmy_sync_repair_rounds_total` counts a round that repaired: a
-pull that failed is not a completed repair round, so it is still read from the
-round's outcome on success.
+**A count is recorded by the commit that makes its decision final.** A
+batch's decisions are not all made final by the same commit, and an error can
+fall between them. What the peer serves next starts above what this node
+witnesses, so a decision covered by a commit is never delivered again, and one
+no commit covered is. Counted at the covering commit, each is counted exactly
+once whatever error follows; counted at success only, or at the error
+wholesale, some are lost and some counted twice. So
+`Engine::apply_peer_batch_into` leaves in the outcome, on success and on
+error alike, exactly what a commit made final, and the round records it:
+
+- **A declined drop** is final when its tombstone commits, as it is declined.
+  The next delivery is a replay, which is not counted.
+- **A refused definition** writes nothing. It is final once the witnessed
+  vector on disk covers its stamp: at the batch's last commit, which carries
+  the window's coverage, or earlier, at any commit that raised its origin past
+  it. An applied definition appends its own entry, and a run commits the
+  documents it wrote, before each schema change; either can cover a refusal
+  from the same origin that precedes it. After an error, the batch reads the
+  witnessed vector and counts the refusals it covers.
+- **An entry deferred beyond the advertised vector, and the entry for an
+  unknown collection the batch stopped at**, are final with the batch's last
+  commit, which records the window as ending before them. They are served
+  again whatever happens, by design (ADR-148), so each delivery whose last
+  commit lands counts them once, as ADR-123 counts per delivery.
+
+A failure before any covering commit leaves the decision to the re-serve,
+which decides and counts it then. A failure after the last commit (reporting
+what the run applied can fail after it commits) loses nothing.
+
+And `kimmy_sync_repair_rounds_total` counts a round that repaired: a pull that
+failed is not a completed repair round, so it is still read from the round's
+outcome on success.
 
 **What is not changed.** A peer that is slow on the wire still fails the round
 at the same deadline, counts and backs off. Nothing about the apply itself
-changes: its duration already reads in `kimmy_sync_pull_seconds{phase="apply"}`
-(ADR-175), so no new series is added. The connect and handshake timeouts are
+changes, and no new series is added: an entries window's apply already reads
+in `kimmy_sync_pull_seconds` (ADR-175), split into `phase="wait"` for the
+writer and `phase="apply"` for the rest, and a snapshot page's apply is
+observed by no series. The connect and handshake timeouts are
 untouched.
 
 **Tests.** Against a fake peer over a duplex stream, with a `cfg(test)` hook
@@ -17351,9 +17374,26 @@ that makes the apply take three times a 200 ms round limit:
   twice, the slow peer gets through.
 - `a_definition_refused_from_a_snapshot_page_is_counted`: a page's refused
   definition reaches what the round applied. Without that line, it is lost.
-- `a_decline_in_a_batch_that_errors_is_counted_once`: a drop declined in a
-  batch that then errors, then the same drop served again, counts one decline.
-  Without the error path's count, the decline is never counted.
+- `a_decline_in_a_batch_that_errors_is_counted_once`: at the transport, a
+  drop declined in a batch that then errors, then the same drop served again,
+  counts one decline. With the outcome dropped on error, it is never counted.
+
+The count rule, in storage, with a `cfg(test)` failure injected before or
+after a batch's last commit, then the re-serve a peer makes from what this
+node then witnesses. Each runs with no failure (the control: no double count)
+and with each failure, and asserts the total across both deliveries:
+
+- `a_refusal_is_counted_once_across_a_failed_delivery_and_its_re_serve`.
+- `a_refusal_covered_by_a_later_definition_is_counted_once_across_a_failed_delivery`.
+- `a_decline_is_counted_once_across_a_failed_delivery_and_its_re_serve`.
+- `a_stop_at_an_unknown_collection_is_counted_by_each_delivery_whose_last_commit_lands`:
+  once per delivery, and not by one that failed before its last commit.
+
+Red, with the error path changed alone: counting nothing on error (the code
+before this) turns all four red; counting declines only turns every one but
+the decline test red; counting everything on error turns the plain refusal and
+the unknown collection red (counted twice); counting refusals only when the
+last commit landed turns the covered refusal red.
 - `peers::a_round_that_fails_after_its_apply_still_reports_what_the_apply_refused`:
   at the loop, against a real `serve`, a refused definition in a round that
   fails after its apply (a `cfg(test)` hook keyed by peer address) reaches the
