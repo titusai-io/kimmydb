@@ -1018,7 +1018,7 @@ curl localhost:7878/v1/version
 
 ```json
 { "protocol": "v1",
-  "version": "0.31.0",
+  "version": "0.32.0",
   "commit": "9f1c2ab",
   "node": "3e98120f-66df-4cf0-9fa0-690e3d57fcea",
   "capabilities": ["aggregation", "bulk-insert", "backup", "change-streams",

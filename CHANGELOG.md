@@ -12,6 +12,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **A schema change confirmed right after its collection was created no longer
+  reports a member pending that holds it.** A member applying a peer's push
+  while its own sync round applied the same collection creation could fail the
+  whole window on "collection already exists"; the push then read
+  `peer closed the connection` and named the member in `confirmation.pending`,
+  and a sync round that lost the same race backed off and fetched the window
+  again. A creation found already made by the other apply now counts as
+  applied. And a member that cannot apply a pushed window now tells the pusher
+  why, so the `pending` reason names the cause instead of a closed connection.
+
+## 0.32.0 - 2026-09-17
+
+**A minor, for additive series; nothing breaks.** A hold of the single writer
+now says what it was made of, and serving a peer's pull says what it cost the
+serving member ([ADR-176](docs/decisions.md)): 12 new series on `/metrics` and
+on the OTLP bridge. It is a minor because those are features, and a scrape
+config or golden list that enumerates series needs them; no existing series,
+label or type changes.
+
+**The series measure where a hold's time goes; they do not shorten it.**
+
+Nothing on the wire, on disk, in configuration or in packaging changes. The
+change-stream and oplog guides are corrected: resume tokens from before 0.30.0
+are still accepted (*Fixed*).
+
 ### Added
 
 - **A hold of the single writer says what it was made of**
@@ -58,15 +85,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   as ADR-173 and [docs/compatibility.md](docs/compatibility.md) allow: 0.30.x
   was the guaranteed minimum, not an end date. A later minor may refuse them,
   and its release notes will say so.
-- **A schema change confirmed right after its collection was created no longer
-  reports a member pending that holds it.** A member applying a peer's push
-  while its own sync round applied the same collection creation could fail the
-  whole window on "collection already exists"; the push then read
-  `peer closed the connection` and named the member in `confirmation.pending`,
-  and a sync round that lost the same race backed off and fetched the window
-  again. A creation found already made by the other apply now counts as
-  applied. And a member that cannot apply a pushed window now tells the pusher
-  why, so the `pending` reason names the cause instead of a closed connection.
 
 ## 0.31.0 - 2026-09-16
 
