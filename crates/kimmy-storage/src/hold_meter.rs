@@ -144,6 +144,10 @@ pub fn thread_cpu() -> Option<Duration> {
     if test_hooks::CPU_CLOCK_FAILS.with(|f| f.get()) {
         return None;
     }
+    #[cfg(test)]
+    if let Some(stuck) = test_hooks::CPU_CLOCK_STUCK_AT.with(|s| s.get()) {
+        return Some(stuck);
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -718,6 +722,9 @@ pub(crate) mod test_hooks {
         pub static METERED_CALLS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
         /// Every thread CPU clock read fails while set.
         pub static CPU_CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
+        /// Every thread CPU clock read returns this while set: a clock that
+        /// has stopped advancing.
+        pub static CPU_CLOCK_STUCK_AT: Cell<Option<Duration>> = const { Cell::new(None) };
         /// Slept inside every write call from this index on.
         pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
     }
@@ -734,16 +741,27 @@ pub(crate) mod test_hooks {
     }
 
     /// [`spin`] to a CPU-time deadline: spins until this thread has spent `d`
-    /// on the CPU, however long that takes on a busy machine.
+    /// on the CPU, however long that takes on a busy machine, and fails if
+    /// 30 s of wall time pass first, as the platform-clock test does: a clock
+    /// that has stopped advancing must fail the test, not hang the job.
     pub fn spin_cpu(d: Duration) {
+        spin_cpu_within(d, Duration::from_secs(30));
+    }
+
+    pub fn spin_cpu_within(d: Duration, limit: Duration) {
         if d.is_zero() {
             return;
         }
         let from =
             super::thread_cpu().expect("a test that spins to CPU time runs where it is read");
+        let started = Instant::now();
         let mut x = 0u64;
         while super::thread_cpu().unwrap().saturating_sub(from) < d {
             x = std::hint::black_box(x.wrapping_add(1));
+            assert!(
+                started.elapsed() < limit,
+                "{limit:?} of spinning and the CPU clock has not advanced {d:?}: it is stuck"
+            );
         }
     }
 
@@ -811,6 +829,7 @@ pub(crate) mod test_hooks {
         BACKEND_CALLS.with(|c| c.set([0; 5]));
         METERED_CALLS.with(|c| c.set([0; 5]));
         CPU_CLOCK_FAILS.with(|f| f.set(false));
+        CPU_CLOCK_STUCK_AT.with(|s| s.set(None));
     }
 }
 
@@ -1062,6 +1081,13 @@ mod tests {
         assert!(row.get(Component::Read) > Duration::ZERO, "{row:?}");
         assert!(row.read_bytes > 0, "{row:?}");
         assert_adds_up(&row);
+    }
+
+    #[test]
+    #[should_panic(expected = "of spinning and the CPU clock has not advanced")]
+    fn a_spin_to_cpu_time_on_a_stuck_clock_fails_rather_than_hangs() {
+        test_hooks::CPU_CLOCK_STUCK_AT.with(|s| s.set(Some(Duration::from_secs(1))));
+        test_hooks::spin_cpu_within(Duration::from_millis(10), Duration::from_millis(200));
     }
 
     #[test]
