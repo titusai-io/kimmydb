@@ -17263,3 +17263,66 @@ They do not exist in any other build and are reachable from no other crate.
 - **A new direct dependency:** `libc`, for the thread CPU clock. It is bindings
   only, links no native library, and was already in the graph.
 - **The golden lists grow** by the counts above.
+
+---
+
+## ADR-178 — A vector shadow is created at the stamp of the change that needs it, and only a client's configuration logs its creation
+
+**Decision.** How a missing vector shadow collection is created depends on
+where the configuration that needs it comes from:
+
+- **A client's configuration on this member** creates the shadow at a stamp
+  minted here and **logs** its `CreateCollection`, before the
+  `ConfigureVectors` entry, **in the configuration's own transaction**. A peer
+  applying the window meets the shadow's creation first and creates it from
+  that entry, at that stamp, like any collection. So one configuration is one
+  logged creation of its shadow, with one `created`, on every member.
+- **A peer's `ConfigureVectors` entry** that finds the shadow missing creates
+  it **at the entry's stamp, unlogged**, and **not at all** when this member
+  holds a shadow tombstone newer than that stamp. It never mints a stamp here.
+- **A snapshot page's vector configuration** creates no shadow: the shadow is
+  its own collection on the page, restored at its own stamp.
+
+**Why.** The shadow used to be created by `create_shadow_for` on every member that
+applied a configuration, after the configuration's commit: at a stamp minted
+there, logged. Each
+member then had its own creation of one shadow, with its own `created`. And a
+member minting the shadow at a clock later than a drop of it resurrected it.
+The case: X configures vectors, then turns them off with a drop of the
+vectors (the shadow's tombstone at t5). Y, away, is served X's configuration
+without the shadow's own creation, and mints the shadow at t9 > t5. When X's
+drop reaches Y it aims at a previous incarnation and is ignored, and Y's
+creation replicates the shadow back to X and Z. At the entry's stamp, Y's
+shadow is older than the drop that buries it.
+
+And the shadow and the configuration it serves commit together. Committed
+apart, a crash between the two left a configuration without its shadow, and
+a failed shadow creation returned an error for a configuration that had
+committed and would replicate.
+
+**A configuration can still stand without its shadow here**, by design: a
+peer's configuration older than a drop of the shadow this member holds, or a
+snapshot page that carried the parent without its shadow. The embedding
+worker read a missing shadow as an error, and its loop stopped for good. It
+now skips such a collection, warns once per scan, and counts it in
+`kimmy_embed_skipped_no_shadow_total` (on the OTLP bridge as
+`kimmy.embed.skipped_no_shadow`), which should read 0.
+
+**Recorded, not changed.** A member that never held the shadow has no
+tombstone for it, so a re-served creation from a life of the shadow that was
+dropped elsewhere can still make an orphan there (the ADR-138 class, predating
+this). And configuration ordering within one life (a configuration and a
+removal of it applied out of order) is not decided here: it has its own ADR to
+come.
+
+**Tests.**
+- `one_configuration_across_three_members_is_one_shadow_creation_at_one_stamp`
+- `a_member_away_while_a_shadow_was_dropped_does_not_bring_it_back`: both orders
+  of configuration and drop.
+- `a_replayed_configuration_makes_no_shadow_under_a_drop_of_it_landed_meanwhile`
+- `a_vector_configuration_and_its_shadow_are_never_visible_one_without_the_other`
+- `a_peers_own_shadow_and_the_origins_shadow_creation_resolve_to_one_shadow`
+- `a_configuration_without_its_shadow_is_skipped_and_counted_not_fatal`
+
+The first three fail on the code before this change. Each goes red alone when
+its rule is removed.

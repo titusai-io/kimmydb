@@ -1305,7 +1305,7 @@ impl Engine {
                     &state.db,
                     &state.name,
                     config.clone(),
-                    false,
+                    crate::vectors::Configured::FromSnapshot,
                     &earlier,
                 )?;
             }

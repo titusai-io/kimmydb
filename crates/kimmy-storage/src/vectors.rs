@@ -55,6 +55,26 @@ impl VectorWrite {
     }
 }
 
+/// Where a vector configuration comes from, which decides how the shadow
+/// collection it needs is created if it is missing (ADR-178).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Configured {
+    /// A client's configuration on this member. The shadow is created at a
+    /// stamp minted here and logged, before the configuration's own entry,
+    /// so a peer applying the window creates it from that entry, at that
+    /// stamp, like any collection.
+    Locally,
+    /// A peer's `ConfigureVectors` entry, stamped so. A shadow missing here is
+    /// created **at that stamp, unlogged**, and not at all when this member
+    /// holds a newer tombstone for it. Never at a stamp minted here: a stamp
+    /// later than the shadow's drop outlived the drop, and the shadow it
+    /// created replicated back to the members that had dropped it.
+    FromEntry(kimmy_core::Stamp),
+    /// A snapshot page's definition. The shadow is its own collection on the
+    /// page, restored at its own stamp, and is not created here.
+    FromSnapshot,
+}
+
 impl crate::Engine {
     /// Enable or replace auto-embedding for a collection.
     ///
@@ -67,7 +87,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.configure_vectors_inner(db, collection, config, true, &|_| false)
+        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| false)
     }
 
     /// `log = false` when applying a replicated configuration. See
@@ -77,9 +97,10 @@ impl crate::Engine {
         db: &str,
         collection: &str,
         config: VectorConfig,
-        log: bool,
+        by: Configured,
         history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<CollectionMeta> {
+        let log = matches!(by, Configured::Locally);
         config.validate().map_err(|e| StorageError::Core(CoreError::InvalidQuery(e)))?;
 
         // A shadow collection holds vectors, not documents; configuring
@@ -151,19 +172,32 @@ impl crate::Engine {
         let txn = self.begin_write(WriterHolder::Ddl)?;
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorsWriting);
-        // The shadow first, so its creation is logged before the
+        // The shadow first, so a local creation is logged before the
         // configuration, the order a peer applying the window meets them in.
-        let shadow_entry = match self.create_collection_in_txn(
-            &txn,
-            db,
-            &shadow,
-            true,
-            None,
-            &|_| false,
-            self.next_stamp(),
-        ) {
-            Ok(crate::engine::InTxn::Created(_, entry)) => entry,
-            Ok(crate::engine::InTxn::Exists) => {
+        let created = match by {
+            Configured::Locally => Some(self.create_collection_in_txn(
+                &txn,
+                db,
+                &shadow,
+                true,
+                None,
+                &|_| false,
+                self.next_stamp(),
+            )),
+            Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
+                &txn,
+                db,
+                &shadow,
+                false,
+                Some(stamp.hlc),
+                &|dropped| stamp < dropped,
+                stamp,
+            )),
+            Configured::FromSnapshot => None,
+        };
+        let shadow_entry = match created {
+            Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
+            Some(Ok(crate::engine::InTxn::Exists)) => {
                 // Made by a concurrent configuration of this collection since
                 // it was found missing: the shadow this one wanted.
                 #[cfg(test)]
@@ -172,8 +206,11 @@ impl crate::Engine {
                 }
                 None
             }
-            Ok(crate::engine::InTxn::History) => None,
-            Err(e) => {
+            // A peer's configuration older than the shadow's drop here: the
+            // configuration still applies, and the drop that came after it
+            // stands.
+            Some(Ok(crate::engine::InTxn::History)) | None => None,
+            Some(Err(e)) => {
                 txn.abort()?;
                 return Err(e);
             }
@@ -182,7 +219,7 @@ impl crate::Engine {
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorConfiguration);
-            return self.configure_vectors_inner(db, collection, config, log, history);
+            return self.configure_vectors_inner(db, collection, config, by, history);
         }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 

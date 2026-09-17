@@ -1770,7 +1770,7 @@ impl Engine {
                         &target.db,
                         &target.collection,
                         config,
-                        false,
+                        crate::vectors::Configured::FromEntry(entry.stamp),
                         &|standing| below_floor(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
@@ -6834,8 +6834,9 @@ mod tests {
     #[test]
     fn a_peers_own_shadow_and_the_origins_shadow_creation_resolve_to_one_shadow() {
         // A member that applies a configuration without the shadow's own
-        // creation entry makes the shadow itself, and logs its creation; the
-        // origin's creation of it, served afterwards, finds it standing.
+        // creation entry makes the shadow itself, at the configuration's
+        // stamp and unlogged (ADR-178); the origin's creation of it, served
+        // afterwards, finds it standing.
         let (a, _a_dir) = engine();
         let (b, _b_dir) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -6864,5 +6865,128 @@ mod tests {
             b.list_collections("shop").unwrap().iter().filter(|c| c.id == shadow).count(),
             1
         );
+    }
+
+    fn shadow_id() -> CollectionId {
+        CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"))
+    }
+
+    /// The stamps of every creation of the shadow in `engine`'s oplog.
+    fn shadow_creations(engine: &Engine) -> Vec<Stamp> {
+        engine
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.kind == OpKind::CreateCollection && e.collection == shadow_id())
+            .map(|e| e.stamp)
+            .collect()
+    }
+
+    #[test]
+    fn one_configuration_across_three_members_is_one_shadow_creation_at_one_stamp() {
+        // Each member used to mint its own shadow at its own clock and log it:
+        // three creations of one shadow, three `created` stamps.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let (c, _c_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &a.version_vector().unwrap(), &from_a).unwrap();
+        let from_b = b.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&c, &b.version_vector().unwrap(), &from_b).unwrap();
+
+        let mut creations: Vec<Stamp> =
+            [&a, &b, &c].iter().flat_map(|e| shadow_creations(e)).collect();
+        creations.sort();
+        creations.dedup();
+        assert_eq!(creations.len(), 1, "one creation of the shadow, logged once: {creations:?}");
+        let created: Vec<Hlc> = [&a, &b, &c]
+            .iter()
+            .map(|e| {
+                e.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders"))
+                    .unwrap()
+                    .created
+            })
+            .collect();
+        assert!(created.windows(2).all(|w| w[0] == w[1]), "one `created` everywhere: {created:?}");
+    }
+
+    #[test]
+    fn a_member_away_while_a_shadow_was_dropped_does_not_bring_it_back() {
+        // X configures, then turns vectors off and drops them, which drops the
+        // shadow. Y, away, is served X's configuration without the shadow's
+        // own creation, and makes the shadow itself. Made at its own later
+        // clock, the shadow outlived X's drop of it when that arrived, and its
+        // creation replicated back to the members that had dropped it. Made at
+        // the configuration's stamp, the drop buries it, whichever of the two
+        // Y is served first.
+        let (x, _x_dir) = engine();
+        x.create_collection("shop", "orders").unwrap();
+        x.configure_vectors("shop", "orders", vector_config()).unwrap();
+        x.disable_vectors("shop", "orders", true).unwrap();
+        let theirs = x.version_vector().unwrap();
+        let whole = x.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let shadow_create =
+            |e: &OplogEntry| e.kind == OpKind::CreateCollection && e.collection == shadow_id();
+        let configure =
+            whole.entries.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+        let before: Vec<OplogEntry> =
+            whole.entries[..=configure].iter().filter(|e| !shadow_create(e)).cloned().collect();
+        let after: Vec<OplogEntry> = whole.entries[configure + 1..].to_vec();
+        assert!(
+            after.iter().any(|e| e.kind == OpKind::DropCollection && e.collection == shadow_id())
+        );
+        let window = |entries: Vec<OplogEntry>| OplogWindow {
+            scanned_to: entries.last().unwrap().stamp.hlc,
+            entries,
+            exhausted: false,
+        };
+
+        // The configuration first, then the drop.
+        let (y, _y_dir) = engine();
+        apply(&y, &theirs, &window(before.clone())).unwrap();
+        assert!(shadow_held(&y), "made from the configuration");
+        assert!(shadow_creations(&y).is_empty(), "and not logged");
+        apply(&y, &theirs, &window(after.clone())).unwrap();
+        assert!(!shadow_held(&y), "the drop buries it");
+
+        // The drop first, then the configuration served again.
+        let (z, _z_dir) = engine();
+        apply(&z, &theirs, &window(before.clone())).unwrap();
+        apply(&z, &theirs, &window(after)).unwrap();
+        apply(&z, &theirs, &window(before)).unwrap();
+        assert!(!shadow_held(&z), "a configuration older than the drop makes no shadow");
+        assert!(shadow_creations(&z).is_empty());
+    }
+
+    #[test]
+    fn a_replayed_configuration_makes_no_shadow_under_a_drop_of_it_landed_meanwhile() {
+        // The shadow's creation is judged against its tombstone inside the
+        // configuration's own transaction: a drop of the shadow landing between
+        // the configuration's read and its writer is seen there.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        assert!(shadow_held(&b));
+        let configure =
+            whole.entries.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+
+        let dropping = Arc::clone(&b);
+        let (configured, disabled) = race_hooks::race(
+            race_hooks::Race::VectorConfiguration,
+            move || dropping.disable_vectors("shop", "orders", true),
+            || apply(&b, &theirs, &slice(&whole, configure, configure + 1)),
+        );
+        disabled.expect("vectors off, shadow dropped");
+        configured.expect("the replayed configuration applies");
+        assert!(!shadow_held(&b), "no shadow under the newer drop of it");
+        race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
     }
 }

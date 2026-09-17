@@ -12,8 +12,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmy_embed_skipped_no_shadow_total`** (`kimmy.embed.skipped_no_shadow` on
+  the OTLP bridge) counts documents and scans the embedding worker skipped
+  because a collection is configured for vectors and has no shadow collection
+  on that node ([ADR-178](docs/decisions.md)). Should read 0. The worker used
+  to stop for good on such a collection.
+
 ### Fixed
 
+- **A vector shadow collection is created once, at one stamp, and stays
+  dropped when it is dropped** ([ADR-178](docs/decisions.md)). A client's
+  configuration creates the shadow at a stamp minted on that member and logs
+  its creation, before the configuration, in the same commit. A member applying
+  a peer's configuration without the shadow's creation makes the shadow at that
+  configuration's stamp, without logging it, and not under a newer drop of the
+  shadow it holds; a snapshot page's configuration makes none. Every member
+  used to create and log its own shadow at its own clock, which could bring a
+  dropped shadow back to every member.
 - **A replicated drop no longer deletes the collection recreated after it.**
   A member applying a drop read the collection, then took the single writer and
   removed whatever stood under its name. When another apply of the same drop,
