@@ -17263,3 +17263,63 @@ They do not exist in any other build and are reachable from no other crate.
 - **A new direct dependency:** `libc`, for the thread CPU clock. It is bindings
   only, links no native library, and was already in the graph.
 - **The golden lists grow** by the counts above.
+
+---
+
+## ADR-177 — A sync round's deadline is the peer's time, and what an apply counted is counted when it commits
+
+> **Refines [ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords)**
+> to match its own reasoning. It does not overturn it: a round that fails is
+> still counted, still skipped for the divergence check, and still backs the
+> peer off.
+
+**Decision.** A sync round is bounded by `REQUEST_TIMEOUT` (30 s) on the time
+it spends **outside this node's own applies**. Each apply of a window, and of
+a snapshot page, adds its duration to the round's deadline, and to the
+snapshot path's page budget. And the counts an apply produces (definitions
+refused and declined, entries skipped for an unknown collection or beyond the
+advertised vector) are recorded as the apply commits, in the `PeerStalls` slot
+the round's pull timing already uses (ADR-175), and taken by the replication
+loop whatever the round returned.
+
+**Why.** Observed in round 0370's teardown: two members' rounds against a
+third timed out while *applying* drop units (apply 60–71 s, writer wait under
+1 s), while the peer had served each window in 0.1 ms. Each round was counted
+in `kimmy_sync_failures_total`, and the healthy peer was backed off. Reading
+the code showed why, and two further consequences:
+
+- The whole round, local apply included, sat inside one
+  `tokio::time::timeout`. The apply is synchronous inside the round's poll, so
+  the timeout could never cut it short: it ran to completion and committed,
+  and the round failed at the next await after it. It was cancellation-safe
+  only because nothing inside the apply awaits.
+- ADR-157's failure path, and `REQUEST_TIMEOUT`'s own purpose, are about a
+  peer that is slow or unreachable. A local apply's duration says nothing
+  about the peer. Charging it to the peer backs off a healthy member exactly
+  when this node is already behind.
+- The report's refused, declined and skipped counts were taken from the
+  round's `SyncOutcome` on success only. A round that failed after its apply
+  committed lost them, and `kimmy_sync_ddl_refused_total` is a divergence
+  signal (ADR-123), not a statistic.
+
+**What is not changed.** A peer that is slow on the wire still fails the round
+at the same deadline, counts and backs off. Nothing about the apply itself
+changes: its duration already reads in `kimmy_sync_pull_seconds{phase="apply"}`
+(ADR-175), so no new series is added. The connect and handshake timeouts are
+untouched.
+
+**Tests.** Against a fake peer over a duplex stream, with a `cfg(test)` hook
+that makes the apply take three times a 200 ms round limit:
+
+- `a_round_whose_own_apply_outlasts_the_deadline_against_a_prompt_peer_succeeds`:
+  succeeds, and the refused definition in its window is counted. With the
+  apply's time charged to the deadline again, it fails `TimedOut`.
+- `what_a_committed_apply_refused_is_counted_when_the_round_then_fails`: the
+  peer stops answering after the window, the round times out, and the refusal
+  is still counted. With the counts taken from the outcome only, it goes red.
+- `a_round_against_a_slow_peer_still_times_out`: the negative. With no deadline
+  at all, it goes red.
+
+**Recorded, not changed.** The apply's CPU between its yielding storage calls
+still runs on the runtime worker (ADR-153's concern), so a 70 s apply occupies
+that tick's sequential contact loop for its whole length.

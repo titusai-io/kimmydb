@@ -659,14 +659,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     if let Some(pull) = stalls.take_pull() {
                         report.pulls.pulled(&pull);
                     }
+                    // Likewise what those applies refused, declined and
+                    // skipped: counted as they committed, not only when the
+                    // round went on to succeed (ADR-177).
+                    let applied = stalls.take_applied();
+                    report.ddl_refused += applied.ddl_refused;
+                    report.ddl_declined += applied.ddl_declined;
+                    report.entries_skipped_unknown_collection += applied.unknown_collection;
+                    report.entries_skipped_beyond_advertised += applied.deferred;
                     match pulled {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
                             health.succeeded(peer);
-                            report.ddl_refused += outcome.ddl_refused;
-                            report.ddl_declined += outcome.ddl_declined;
-                            report.entries_skipped_unknown_collection += outcome.unknown_collection;
-                            report.entries_skipped_beyond_advertised += outcome.deferred;
                             report.repair_rounds += usize::from(outcome.repairing);
                             // More of the peer's oplog behind the cap, and
                             // budget left to go and get it: this contact is

@@ -14,6 +14,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A sync round whose own apply takes longer than 30 s is no longer counted as
+  a failure of the peer** ([ADR-177](docs/decisions.md)). The round's deadline
+  enclosed this node's apply, which runs to completion regardless, so a slow
+  local apply against a peer that had answered at once raised
+  `kimmy_sync_failures_total` and backed the healthy peer off. The deadline now
+  charges only the time spent outside this node's applies; a slow peer still
+  fails the round. And what an apply refused, declined or skipped is counted
+  when it commits, so `kimmy_sync_ddl_refused_total` and its neighbours no
+  longer lose a batch whose round failed afterwards.
 - **A replicated drop no longer deletes the collection recreated after it.**
   A member applying a drop read the collection, then took the single writer and
   removed whatever stood under its name. When another apply of the same drop,
