@@ -1426,4 +1426,97 @@ mod tests {
         assert_eq!(last.age(t3), Some(Duration::ZERO), "a check resets it");
         assert_eq!(last.age(t3 + Duration::from_secs(2)), Some(Duration::from_secs(2)));
     }
+
+    /// ADR-177 at the loop: a round that fails after its apply committed
+    /// still reports what the apply refused. The receiver holds a definition
+    /// it cannot arbitrate against the sender's, so the sender's create is
+    /// refused; the round against the sender then fails right after its
+    /// apply. The refusal must reach the round report once, and the failure
+    /// must too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_round_that_fails_after_its_apply_still_reports_what_the_apply_refused() {
+        const SECRET: &str = "a-loop-test-secret";
+        async fn node() -> (Arc<Engine>, std::net::SocketAddr, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(crate::transport::serve(Arc::clone(&engine), listener, SECRET.into()));
+            (engine, addr, dir)
+        }
+        let (a, a_addr, _a_dir) = node().await;
+        let (b, b_addr, _b_dir) = node().await;
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Engine::open(&source_dir.path().join("kimmy.redb")).unwrap();
+
+        // B holds `by_email` with no creation stamp to arbitrate by; A creates
+        // a different `by_email`, which B must refuse.
+        source.create_collection("shop", "orders").unwrap();
+        source
+            .create_index(
+                "shop",
+                "orders",
+                vec![kimmy_core::IndexField::ascending("email")],
+                false,
+                Some("by_email".into()),
+            )
+            .unwrap();
+        let mut page = source.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            for index in &mut state.indexes {
+                index.created = None;
+            }
+        }
+        page.documents.clear();
+        page.versions = kimmy_core::VersionVector::default();
+        b.apply_snapshot_page(
+            a.node_id(),
+            &mut kimmy_storage::SnapshotProgress::whole_database(),
+            &page,
+        )
+        .unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            true,
+            Some("by_email".into()),
+        )
+        .unwrap();
+
+        *crate::transport::test_hooks::FAIL_AFTER_APPLY.lock().unwrap() = Some(a_addr);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![a_addr])], SECRET.into(), b_addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&b), config));
+
+        let mut seen = RoundReport::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while seen.failed == 0 || seen.ddl_refused == 0 {
+            let report = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no report carried both signals in time; saw {seen:?}"))
+                .expect("the loop keeps reporting");
+            seen.failed += report.failed;
+            seen.ddl_refused += report.ddl_refused;
+        }
+        // A few more ticks: the refusal is not counted again.
+        for _ in 0..3 {
+            if let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            {
+                seen.ddl_refused += report.ddl_refused;
+            }
+        }
+        looping.abort();
+        *crate::transport::test_hooks::FAIL_AFTER_APPLY.lock().unwrap() = None;
+
+        assert!(seen.failed >= 1, "the round failed after its apply: {seen:?}");
+        assert_eq!(seen.ddl_refused, 1, "and its refusal is reported, once: {seen:?}");
+    }
 }

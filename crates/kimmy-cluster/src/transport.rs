@@ -720,9 +720,6 @@ async fn sync_over<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // What a snapshot pull checks between pages (ADR-152): the round's own
-    // deadline, less the reserve, so the round ends on a page boundary
-    // rather than wherever the timeout below cuts it.
     sync_over_within(engine, stream, peer, their_node, probe, stalls, REQUEST_TIMEOUT).await
 }
 
@@ -741,6 +738,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let clock = RoundClock::default();
+    // What a snapshot pull checks between pages (ADR-152): the round's limit
+    // less the reserve, in wall time, applies included. It is what ends a
+    // snapshot round on a page boundary, and what bounds one round's hold on
+    // the tick; the deadline below, which excludes this node's applies
+    // (ADR-177), judges only the peer and would not.
     let snapshot_deadline = Instant::now() + limit.saturating_sub(SNAPSHOT_PAGE_RESERVE);
     within_exchange_budget(
         limit,
@@ -752,9 +754,10 @@ where
 }
 
 /// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
-/// the timeout around it and hands it `snapshot_deadline`, the instant past
-/// which a snapshot pull asks for no more pages this round (ADR-152). Separate
-/// so a test can hand it a deadline of its own.
+/// the peer's deadline around it (ADR-177), hands it `snapshot_deadline`, the
+/// wall-time instant past which a snapshot pull asks for no more pages this
+/// round (ADR-152), and the `clock` its applies are timed on. Separate so a
+/// test can hand it a deadline of its own.
 #[allow(clippy::too_many_arguments)]
 async fn sync_round<S>(
     engine: &Engine,
@@ -1027,6 +1030,10 @@ where
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
             counted.deferred += outcome.deferred;
+            #[cfg(test)]
+            if test_hooks::fails_after_apply(peer) {
+                return Err(ProtocolError::Malformed("a failure injected after the apply".into()));
+            }
             let pull = kimmy_storage::PullTiming {
                 serve: served,
                 wait: outcome.writer_wait,
@@ -2415,6 +2422,17 @@ where
 /// Test-only ways to make a round's own apply slow. `cfg(test)`.
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    /// Rounds against this peer fail right after their window is applied and
+    /// counted. Keyed by the peer's address, so a test's replication loop,
+    /// which runs on the runtime's threads, can set it without touching any
+    /// other test's rounds.
+    pub static FAIL_AFTER_APPLY: std::sync::Mutex<Option<std::net::SocketAddr>> =
+        std::sync::Mutex::new(None);
+
+    pub fn fails_after_apply(peer: std::net::SocketAddr) -> bool {
+        *FAIL_AFTER_APPLY.lock().unwrap() == Some(peer)
+    }
+
     thread_local! {
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
@@ -4043,5 +4061,83 @@ mod tests {
         assert!(!outcome.exhausted, "left to resume, not run to its end: {outcome:?}");
         assert!(served < PAGES, "{served} of {PAGES} pages in one round");
         assert!(stalls.snapshot_resumes(node(9), None), "resumed next round from its cursor");
+    }
+
+    /// A definition a snapshot page carries that this node refuses is counted
+    /// where one reached through the oplog is: in what the round applied,
+    /// which the loop reports whatever the round returned (ADR-177).
+    #[tokio::test]
+    async fn a_definition_refused_from_a_snapshot_page_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        let mut page = snapshot_page(origin, &[1_000], None, theirs.clone(), true);
+        page.collections[0].indexes.push(kimmy_core::IndexMeta {
+            id: kimmy_core::IndexMeta::derive_id("coordinated"),
+            name: "coordinated".into(),
+            fields: vec![kimmy_core::IndexField { path: "a".into(), descending: false }],
+            unique: true,
+            enforcement: kimmy_core::Enforcement::Coordinated,
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter: None,
+            created: Some(kimmy_core::Stamp::new(Hlc::new(500, 0), origin)),
+        });
+
+        let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let _ = read_frame(&mut peer_end).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.unwrap();
+            if let Ok(Message::AskDivergence { .. }) = read_frame(&mut peer_end).await {
+                let answer = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                };
+                let _ = write_frame(&mut peer_end, &answer).await;
+            }
+        });
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let clock = RoundClock::default();
+        let round =
+            sync_round(&engine, &mut ours, addr, node(9), None, &mut stalls, ample(), &clock).await;
+        drop(ours);
+        let _ = peer.await;
+        round.expect("the page applies");
+        assert_eq!(stalls.take_applied().ddl_refused, 1, "the refused definition is counted");
+    }
+
+    /// The deadline moves on by exactly the time applies took, not more: an
+    /// apply buys its own duration and no slack for a peer that is slow after
+    /// it. Counted twice, the extension let such a peer through.
+    #[tokio::test]
+    async fn an_apply_moves_the_deadline_on_by_its_own_duration_and_no_more() {
+        let limit = Duration::from_millis(200);
+        let apply = Duration::from_millis(300);
+        let clock = RoundClock::default();
+        let started = std::time::Instant::now();
+        // Apply, then a peer that answers 300 ms later: 600 ms in all, past the
+        // 500 ms a 200 ms limit and a 300 ms apply allow, and inside 800 ms.
+        let round = within_exchange_budget(limit, &clock, async {
+            let applying = std::time::Instant::now();
+            std::thread::sleep(apply);
+            clock.applied_for(applying.elapsed());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .await;
+        assert!(round.is_none(), "a peer slow past the limit, apply aside, times out");
+        let took = started.elapsed();
+        assert!(
+            took >= limit + apply && took < limit + apply * 2,
+            "at the limit plus the apply: {took:?}"
+        );
+        assert!(clock.applying() >= apply && clock.applying() < apply + Duration::from_millis(50));
     }
 }

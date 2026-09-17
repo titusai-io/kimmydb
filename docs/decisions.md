@@ -17275,7 +17275,11 @@ They do not exist in any other build and are reachable from no other crate.
 
 **Decision.** A sync round is bounded by `REQUEST_TIMEOUT` (30 s) on the time
 it spends **outside this node's own applies**. Each apply of a window, and of
-a snapshot page, adds its duration to the round's deadline. And the counts an apply produces (definitions
+a snapshot page, adds its duration to the round's deadline: the whole apply,
+the wait for the single writer included, which `kimmy_sync_pull_seconds`
+reads as `phase="wait"` beside `phase="apply"`. A snapshot page's apply is
+observed by no series. **[ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped)'s page budget is unchanged**: it
+stays wall time, applies included. And the counts an apply produces (definitions
 refused and declined, entries skipped for an unknown collection or beyond the
 advertised vector) are recorded as the apply commits, in the `PeerStalls` slot
 the round's pull timing already uses (ADR-175), and taken by the replication
@@ -17313,6 +17317,15 @@ before it, apply included, would fit in the tick's remaining budget, so a
 slow apply ends that contact. The sequential contact loop is held by one round
 for one window's apply, or one page budget, beyond the exchange, as before.
 
+**What stays counted only on success, and why.** `kimmy_sync_repair_rounds_total`
+counts a round that repaired. A pull that failed is not a completed repair
+round, so it is still read from the round's outcome. And an apply that
+returns an error is not counted at all, even where a definition it refused
+was decided before the error: the batch's witnessed vector is dropped with
+the error, so the window is served again, and the next delivery refuses the
+definition again and counts it then, once per delivery as ADR-123 counts.
+Counted at the error as well, it would be counted twice.
+
 **What is not changed.** A peer that is slow on the wire still fails the round
 at the same deadline, counts and backs off. Nothing about the apply itself
 changes: its duration already reads in `kimmy_sync_pull_seconds{phase="apply"}`
@@ -17330,6 +17343,16 @@ that makes the apply take three times a 200 ms round limit:
   is still counted. With the counts taken from the outcome only, it goes red.
 - `a_round_against_a_slow_peer_still_times_out`: the negative. With no deadline
   at all, it goes red.
+- `an_apply_moves_the_deadline_on_by_its_own_duration_and_no_more`: an apply
+  followed by a peer slow past the limit times out. With apply time counted
+  twice, the slow peer gets through.
+- `a_definition_refused_from_a_snapshot_page_is_counted`: a page's refused
+  definition reaches what the round applied. Without that line, it is lost.
+- `peers::a_round_that_fails_after_its_apply_still_reports_what_the_apply_refused`:
+  at the loop, against a real `serve`, a refused definition in a round that
+  fails after its apply (a `cfg(test)` hook keyed by peer address) reaches the
+  round report, once. With the loop reading counts from a successful outcome
+  only, it never does.
 - `slow_snapshot_pages_still_end_the_round_at_its_page_budget`: pages that each
   take 300 ms against a 500 ms page budget end the round before the snapshot
   does, left to resume. With the page budget moved on by apply time, the round
