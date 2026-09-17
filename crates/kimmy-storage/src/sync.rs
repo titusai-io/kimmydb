@@ -5844,4 +5844,65 @@ mod tests {
         assert_eq!(first.id, second.id);
         race_hooks::assert_absorbed(race_hooks::Race::SystemCreate);
     }
+
+    #[test]
+    fn a_drop_that_reads_the_collection_before_a_recreation_does_not_bury_the_recreation() {
+        // A drop reads the collection, then takes the writer to bury it. A
+        // concurrent apply of the same drop, the recreation after it, and a
+        // write into the new incarnation can all land in between. The burial
+        // used to remove whatever stood under the name once it held the
+        // writer: the recreation and its documents went, both applies
+        // returned Ok, and the window that carried them was witnessed, so
+        // nothing served them again.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let first = a.create_collection("shop", "orders").unwrap();
+        let (theirs, window) = window_for(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+
+        a.insert(&first, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        a.insert(&second, doc! { "_id": 2 }).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let held = b.witnessed_vector().unwrap();
+        let start = held.behind(&theirs).unwrap();
+        let whole = a.entries_for_peer_holding(start, BATCH, Some(&held)).unwrap();
+        let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [OpKind::Insert, OpKind::DropCollection, OpKind::CreateCollection, OpKind::Insert]
+        );
+        // The same window cut after the drop, as a pull truncated there would
+        // carry it.
+        let through_drop = OplogWindow {
+            entries: whole.entries[..2].to_vec(),
+            scanned_to: whole.entries[1].stamp.hlc,
+            exhausted: false,
+        };
+
+        let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
+        let (dropped, recreated) = race_hooks::race(
+            race_hooks::Race::Burial,
+            move || {
+                let (b, theirs, whole) = competing;
+                b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
+            },
+            || {
+                b.apply_peer_batch(
+                    &theirs,
+                    &through_drop.entries,
+                    through_drop.scanned_to,
+                    through_drop.exhausted,
+                )
+            },
+        );
+        recreated.expect("the whole window applies");
+        dropped.expect("the drop applies");
+        let held = b.get_collection("shop", "orders").expect("the recreation stands");
+        assert_eq!(held.created, second.created, "and it is the new incarnation");
+        assert_eq!(b.count(&held).unwrap(), 1, "with its document");
+        race_hooks::assert_absorbed(race_hooks::Race::Burial);
+    }
 }

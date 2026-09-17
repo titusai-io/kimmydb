@@ -14,6 +14,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A replicated drop no longer deletes the collection recreated after it.**
+  A member applying a drop read the collection, then took the single writer and
+  removed whatever stood under its name. When another apply of the same drop,
+  the recreation that followed it and a write into the new collection landed in
+  between, the drop removed the recreation and its documents; both applies
+  succeeded and the window was witnessed, so replication did not bring them
+  back. The divergence check reported the collection missing and a repair from
+  a peer restored it, but until then the member answered without it. A drop now
+  reads what stands under the writer and leaves a later incarnation alone.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the

@@ -2595,11 +2595,13 @@ impl Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Option<Vec<CollectionId>>> {
-        let meta = match self.get_collection(db, name) {
-            Ok(m) => m,
+        // Nothing to bury, answered without taking the writer. Only that: what
+        // is buried is read again under the writer below.
+        match self.get_collection(db, name) {
+            Ok(_) => {}
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(None),
             Err(e) => return Err(e),
-        };
+        }
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Burial);
 
@@ -2617,9 +2619,6 @@ impl Engine {
         // answering queries. Its chunks are then purged with the parent's
         // documents, in the same chunks and under the same guard: on the
         // measurement this change was made for, the shadow was the slower half.
-        let shadow = (!vector_meta::is_shadow(name))
-            .then(|| self.get_collection(db, &vector_meta::shadow_name(name)).ok())
-            .flatten();
 
         let log = replicated.is_none();
         // `ddl` and not `drop`, and the split is the point of the pairing
@@ -2630,17 +2629,58 @@ impl Engine {
         // drop would put an O(1) transaction in the row an operator reads to
         // find out what is churning through the writer.
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // What is buried is what stands under the name **now**, read under the
+        // writer, and not what the read above found. Between the two, another
+        // burial of the name can land, or a burial and a recreation with
+        // writes into the new incarnation: burying by name alone then removed
+        // the recreation and its documents, on an apply that returned `Ok`
+        // and witnessed the window that carried them. So a replicated drop is
+        // held here to the incarnation rule its caller applies before it
+        // (`aims_at_a_previous_incarnation`, ADR-148): aimed at a life that is
+        // gone, it buries nothing, and the caller records its tombstone as it
+        // does for any drop of a previous life. A local drop mints its stamp
+        // below, ahead of everything, and takes whatever stands.
+        let standing = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let read = |n: &str| -> Result<Option<CollectionMeta>> {
+                collections
+                    .get((db, n))?
+                    .map(|v| serde_json::from_slice(v.value()).map_err(Into::into))
+                    .transpose()
+            };
+            match read(name)? {
+                Some(current)
+                    if replicated.is_none_or(|stamp| {
+                        !crate::sync::aims_at_a_previous_incarnation(&current, stamp.hlc)
+                    }) =>
+                {
+                    let shadow = if vector_meta::is_shadow(name) {
+                        None
+                    } else {
+                        read(&vector_meta::shadow_name(name))?
+                    };
+                    Some((current, shadow))
+                }
+                _ => None,
+            }
+        };
+        let Some((meta, shadow)) = standing else {
+            txn.abort()?;
+            debug!(
+                db,
+                collection = name,
+                "the collection a drop read was buried, or buried and recreated, before the drop \
+                 took the writer; nothing of what stands now is the drop's to bury"
+            );
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
+            return Ok(None);
+        };
         // Under the writer, as `create_collection_inner` mints (ADR-148).
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
-            // Gone already when another burial of the name took the writer
-            // between the read above and here; nothing to remove, and the
-            // tombstone below still stands at the later of the two stamps.
-            if collections.remove((db, name))?.is_none() {
-                #[cfg(test)]
-                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
-            }
+            collections.remove((db, name))?;
             if let Some(shadow) = &shadow {
                 collections.remove((db, shadow.name.as_str()))?;
             }
