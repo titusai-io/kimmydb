@@ -17317,14 +17317,17 @@ before it, apply included, would fit in the tick's remaining budget, so a
 slow apply ends that contact. The sequential contact loop is held by one round
 for one window's apply, or one page budget, beyond the exchange, as before.
 
-**What stays counted only on success, and why.** `kimmy_sync_repair_rounds_total`
-counts a round that repaired. A pull that failed is not a completed repair
-round, so it is still read from the round's outcome. And an apply that
-returns an error is not counted at all, even where a definition it refused
-was decided before the error: the batch's witnessed vector is dropped with
-the error, so the window is served again, and the next delivery refuses the
-definition again and counts it then, once per delivery as ADR-123 counts.
-Counted at the error as well, it would be counted twice.
+**What an apply that errors counts, and why.** A batch that errors drops its
+witnessed vector with the error, so its window is served again. What it
+refused, deferred or could not place leaves nothing behind, and is counted
+again on that next delivery, once per delivery as ADR-123 counts: counted at
+the error as well, it would be counted twice. **A declined drop is different**:
+its tombstone is written as it is declined, so the next delivery is a replay,
+which is not counted. So an apply that errors reports its declines and
+nothing else (`Engine::apply_peer_batch_into` fills the round's outcome as it
+goes). And `kimmy_sync_repair_rounds_total` counts a round that repaired: a
+pull that failed is not a completed repair round, so it is still read from the
+round's outcome on success.
 
 **What is not changed.** A peer that is slow on the wire still fails the round
 at the same deadline, counts and backs off. Nothing about the apply itself
@@ -17348,6 +17351,9 @@ that makes the apply take three times a 200 ms round limit:
   twice, the slow peer gets through.
 - `a_definition_refused_from_a_snapshot_page_is_counted`: a page's refused
   definition reaches what the round applied. Without that line, it is lost.
+- `a_decline_in_a_batch_that_errors_is_counted_once`: a drop declined in a
+  batch that then errors, then the same drop served again, counts one decline.
+  Without the error path's count, the decline is never counted.
 - `peers::a_round_that_fails_after_its_apply_still_reports_what_the_apply_refused`:
   at the loop, against a real `serve`, a refused definition in a round that
   fails after its apply (a `cfg(test)` hook keyed by peer address) reaches the

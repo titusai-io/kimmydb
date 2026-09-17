@@ -1020,11 +1020,26 @@ where
                 .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
             let applying = std::time::Instant::now();
-            let outcome = engine.apply_peer_batch(&theirs, &entries, scanned_to, exhausted);
+            let mut outcome = SyncOutcome::default();
+            let applied = engine.apply_peer_batch_into(
+                &theirs,
+                &entries,
+                scanned_to,
+                exhausted,
+                &mut outcome,
+            );
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
             clock.applied_for(applying.elapsed());
-            let outcome = outcome.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            if let Err(e) = applied {
+                // A batch that errors drops its witnessed vector, so its window
+                // is served again and what it refused, deferred or could not
+                // place is counted then. A declined drop is not: its tombstone
+                // was written as it was declined, so the next delivery is a
+                // replay, and it is counted here or never (ADR-177).
+                stalls.applied.ddl_declined += outcome.ddl_declined;
+                return Err(ProtocolError::Malformed(e.to_string()));
+            }
             let counted = &mut stalls.applied;
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
@@ -4139,5 +4154,78 @@ mod tests {
             "at the limit plus the apply: {took:?}"
         );
         assert!(clock.applying() >= apply && clock.applying() < apply + Duration::from_millis(50));
+    }
+
+    /// A drop declined in a batch that then errors is counted by the round
+    /// that declined it, once: its tombstone is durable, so the window served
+    /// again carries a replay, which is not counted (ADR-177).
+    #[tokio::test]
+    async fn a_decline_in_a_batch_that_errors_is_counted_once() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        // B holds the collection only: the first index never reached it, so
+        // B has no tombstone of the name when the recreation supersedes it.
+        let theirs = a.version_vector().unwrap();
+        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
+            .unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let drop =
+            whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
+        let recreate = whole.entries.last().unwrap().clone();
+        // B holds the recreation, so the older drop is declined there.
+        b.apply_peer_batch(&theirs, std::slice::from_ref(&recreate), recreate.stamp.hlc, false)
+            .unwrap();
+        // An entry that cannot be applied, after the drop in the same batch.
+        let mut broken = whole.entries[0].clone();
+        broken.stamp =
+            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.body = Some(vec![0xde, 0xad]);
+
+        async fn serve_once(
+            mut stream: tokio::io::DuplexStream,
+            theirs: VersionVector,
+            window: Vec<OplogEntry>,
+        ) {
+            let _ = read_frame(&mut stream).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+            let scanned_to = window.last().unwrap().stamp.hlc;
+            let entries = Message::Entries { entries: window, scanned_to, exhausted: false };
+            write_frame(&mut stream, &entries).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+        }
+        // B has witnessed everything A wrote; A advertises further, so B asks.
+        let mut theirs = theirs;
+        theirs.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        let mut declined = 0;
+        for window in [vec![drop.clone(), broken], vec![drop]] {
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(serve_once(peer_end, theirs.clone(), window));
+            let _ = sync_over_within(
+                &b,
+                ours,
+                addr,
+                node(9),
+                None,
+                &mut stalls,
+                Duration::from_secs(5),
+            )
+            .await;
+            let _ = peer.await;
+            declined += stalls.take_applied().ddl_declined;
+        }
+        assert_eq!(declined, 1, "the decline, counted by the batch that declined it");
     }
 }

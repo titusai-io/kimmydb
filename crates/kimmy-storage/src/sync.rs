@@ -567,12 +567,35 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
-        let (outcome, waited) = crate::engine::metered_writer_wait(|| {
-            self.apply_batch_absorbing(entries, Some(Introduced { theirs, scanned_to, exhausted }))
-        });
-        let mut outcome = outcome?;
-        outcome.writer_wait = waited;
+        let mut outcome = SyncOutcome::default();
+        self.apply_peer_batch_into(theirs, entries, scanned_to, exhausted, &mut outcome)?;
         Ok(outcome)
+    }
+
+    /// [`Self::apply_peer_batch`], filling `outcome` as it goes, so a caller
+    /// still holds what the batch did before an error ended it. What of that
+    /// is durable is the caller's to judge: a declined drop's tombstone is
+    /// written when the drop is declined, so its re-delivery is a replay and
+    /// is not counted again, while a refusal, a deferral or an unknown
+    /// collection leaves nothing behind and is counted again when the window
+    /// that errored is served again (ADR-177).
+    pub fn apply_peer_batch_into(
+        &self,
+        theirs: &VersionVector,
+        entries: &[OplogEntry],
+        scanned_to: Hlc,
+        exhausted: bool,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let (applied, waited) = crate::engine::metered_writer_wait(|| {
+            self.apply_batch_absorbing_into(
+                entries,
+                Some(Introduced { theirs, scanned_to, exhausted }),
+                outcome,
+            )
+        });
+        outcome.writer_wait = waited;
+        applied
     }
 
     /// The window at or after `from` a peer that asked to catch up may be
@@ -875,6 +898,16 @@ impl Engine {
         introduced: Option<Introduced<'_>>,
     ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
+        self.apply_batch_absorbing_into(entries, introduced, &mut outcome)?;
+        Ok(outcome)
+    }
+
+    fn apply_batch_absorbing_into(
+        &self,
+        entries: &[OplogEntry],
+        introduced: Option<Introduced<'_>>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
         let mut witnessed = VersionVector::new();
         let mut run = Run::default();
         let mut memo = Memo::default();
@@ -905,7 +938,7 @@ impl Engine {
             // stamp is recorded for an entry that was not applied. See
             // ADR-054. The one entry not taken — a collection this node
             // lacks — is not observed, and the batch ends at it.
-            match self.apply_one(entry, position, &mut run, &mut memo, &mut outcome)? {
+            match self.apply_one(entry, position, &mut run, &mut memo, outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
@@ -972,7 +1005,7 @@ impl Engine {
             ddl_declined = outcome.ddl_declined,
             "merged a batch from a peer"
         );
-        Ok(outcome)
+        Ok(())
     }
 
     /// The run's transaction, opened on first use.
