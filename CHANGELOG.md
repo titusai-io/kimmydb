@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## 0.32.0 - 2026-09-16
+## 0.32.0 - 2026-09-17
 
 **A minor, for additive series; nothing breaks.** A hold of the single writer
 now says what it was made of, and serving a peer's pull says what it cost the
