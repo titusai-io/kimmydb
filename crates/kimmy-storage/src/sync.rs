@@ -5846,6 +5846,37 @@ mod tests {
     }
 
     #[test]
+    fn of_two_local_drops_of_one_collection_one_drops_it_and_one_answers_not_dropped() {
+        // Two clients dropping one collection at once on one member. The one
+        // that takes the writer second finds nothing standing: it answers
+        // `dropped: false`, as a retried drop does, and logs no entry of its
+        // own. It used to answer `true` and log a second drop, whose later
+        // stamp moved the tombstone past the first.
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let competing = Arc::clone(&engine);
+        let (second, first) = race_hooks::race(
+            race_hooks::Race::Burial,
+            move || competing.drop_collection("shop", "orders"),
+            || engine.drop_collection("shop", "orders"),
+        );
+        assert!(first.unwrap(), "the first drop drops it");
+        assert!(!second.unwrap(), "the second answers that it dropped nothing");
+        let drops: Vec<Stamp> = engine
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.kind == OpKind::DropCollection && e.collection == orders.id)
+            .map(|e| e.stamp)
+            .collect();
+        assert_eq!(drops.len(), 1, "one drop replicates: {drops:?}");
+        assert_eq!(engine.collection_dropped_at(orders.id).unwrap(), Some(drops[0]));
+        race_hooks::assert_absorbed(race_hooks::Race::Burial);
+    }
+
+    #[test]
     fn a_drop_that_reads_the_collection_before_a_recreation_does_not_bury_the_recreation() {
         // A drop reads the collection, then takes the writer to bury it. A
         // concurrent apply of the same drop, the recreation after it, and a

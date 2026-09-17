@@ -23,6 +23,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   back. The divergence check reported the collection missing and a repair from
   a peer restored it, but until then the member answered without it. A drop now
   reads what stands under the writer and leaves a later incarnation alone.
+- **Of two drops of one collection sent at once to one member, the second now
+  answers `200 {"dropped": false}`**, as a retried drop already did, and logs
+  nothing. It used to answer `{"dropped": true}` and replicate a second drop of
+  its own, stamped after the first.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the
