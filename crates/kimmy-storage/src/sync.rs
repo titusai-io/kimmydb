@@ -938,7 +938,7 @@ impl Engine {
         // the vector alone — that is the one case a batch costs a commit of
         // bookkeeping, and it used to cost it every time.
         if !witnessed.is_empty() {
-            let txn = self.run_txn(&mut run)?;
+            let txn = self.witness_txn(&mut run)?;
             Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
         }
         self.commit_run(&mut run)?;
@@ -981,6 +981,19 @@ impl Engine {
     /// which turns out to hold only schema changes, or nothing this node
     /// keeps, does not hold redb's single writer for the duration.
     fn run_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
+        if run.txn.is_none() {
+            #[cfg(test)]
+            race_hooks::run_opened();
+            run.txn = Some(self.begin_write(WriterHolder::Replication)?);
+        }
+        Ok(run.txn.as_ref().expect("opened just above"))
+    }
+
+    /// [`Self::run_txn`] for the window's witnessed vector at the end of a
+    /// batch, which every window takes, and which is not a run opened to
+    /// write entries: not counted by the test that pins that a window of
+    /// documents already held opens none.
+    fn witness_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
         if run.txn.is_none() {
             run.txn = Some(self.begin_write(WriterHolder::Replication)?);
         }
@@ -2012,9 +2025,8 @@ pub(crate) mod race_hooks {
         /// side that loses, and may take an absorbing branch of its own; that
         /// is not the loser absorbing the race, so it records nothing.
         static COMPETING: Cell<bool> = const { Cell::new(false) };
-        /// Writers this thread has taken, for a test that must show a path
-        /// takes none.
-        static WRITERS_TAKEN: Cell<u64> = const { Cell::new(0) };
+        /// Replication runs this thread has opened to write entries.
+        static RUNS_OPENED: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
@@ -2034,14 +2046,14 @@ pub(crate) mod race_hooks {
         ABSORBED.with(|a| a.set(a.get() | 1 << race as u32));
     }
 
-    /// Count a writer taken on this thread (`Engine::begin_write`).
-    pub(crate) fn writer_taken() {
-        WRITERS_TAKEN.with(|w| w.set(w.get() + 1));
+    /// Count a replication run opened on this thread to write entries.
+    pub(crate) fn run_opened() {
+        RUNS_OPENED.with(|w| w.set(w.get() + 1));
     }
 
-    /// Writers taken on this thread so far.
-    pub(crate) fn writers_taken() -> u64 {
-        WRITERS_TAKEN.with(|w| w.get())
+    /// Replication runs opened on this thread so far.
+    pub(crate) fn runs_opened() -> u64 {
+        RUNS_OPENED.with(|w| w.get())
     }
 
     /// Whether this thread has absorbed `race` since the last `at`.
@@ -6671,30 +6683,44 @@ mod tests {
     }
 
     #[test]
-    fn a_window_of_documents_already_held_takes_no_writer_for_its_documents() {
-        // The judgement under the writer is only for a run that is going to
-        // write: documents already held take no writer of their own. The
-        // batch takes one at its end all the same, to record what the window
-        // proved in the witnessed vector, and that one is counted here.
+    fn a_window_of_documents_that_are_history_or_gone_opens_no_run() {
+        // A document judged history (below a newer life's floor) or gone (its
+        // collection dropped) is skipped on the judgement made before the
+        // writer, which a tombstone and a floor moving only forward keep true:
+        // no run is opened for it. Only a document to be applied opens one,
+        // and is judged again there. The window's witnessed vector is recorded
+        // at the end of every batch in a transaction not counted here.
         let (a, _a_dir) = engine();
         let (b, _b_dir) = engine();
         let orders = a.create_collection("shop", "orders").unwrap();
         for i in 0..3 {
             a.insert(&orders, doc! { "_id": i }).unwrap();
         }
+        a.drop_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
         let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
         apply(&b, &theirs, &whole).unwrap();
-        let documents = slice(&whole, 1, whole.entries.len());
+        let documents = slice(&whole, 1, 4);
         assert!(documents.entries.iter().all(|e| e.kind == OpKind::Insert));
 
-        let before = race_hooks::writers_taken();
-        let again = apply(&b, &theirs, &documents).unwrap();
-        assert_eq!(again.superseded, 3, "{again:?}");
+        // Gone: the collection is dropped here.
+        let before = race_hooks::runs_opened();
+        let gone = apply(&b, &theirs, &documents).unwrap();
+        assert_eq!(gone.superseded, 3, "{gone:?}");
         assert_eq!(
-            race_hooks::writers_taken(),
-            before + 1,
-            "a window wholly held takes only the witnessed vector's writer"
+            race_hooks::runs_opened(),
+            before,
+            "documents of a dropped collection open no run"
         );
+
+        // History: below the floor of the collection recreated since.
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().incarnation_floor.is_some());
+        let before = race_hooks::runs_opened();
+        let history = apply(&b, &theirs, &documents).unwrap();
+        assert_eq!(history.superseded, 3, "{history:?}");
+        assert_eq!(race_hooks::runs_opened(), before, "documents below the floor open no run");
     }
 }

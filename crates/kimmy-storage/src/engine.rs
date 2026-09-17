@@ -1993,8 +1993,6 @@ impl Engine {
     /// is: the attribution is a compile error to omit, which is the only way
     /// it stays complete (ADR-159).
     pub(crate) fn begin_write(&self, holder: WriterHolder) -> Result<WriteTxn<'_>> {
-        #[cfg(test)]
-        crate::sync::race_hooks::writer_taken();
         let budget = write_wait_budget();
         let waited_from = std::time::Instant::now();
         // Waiting for the writer is the other blocking step. The queue is
