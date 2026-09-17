@@ -1986,6 +1986,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_owner_restored_from_a_scoped_snapshot_embeds_once_the_shadows_snapshot_lands() {
+        // ADR-178: a scoped snapshot of a configured collection carries that
+        // collection only, and names the shadow it left missing, which the
+        // transport pulls as a snapshot of its own. Until it lands the owner
+        // skips and counts; once it has, at the origin's `created`, embedding
+        // proceeds. Left missing, every document was skipped for good and no
+        // member wrote vectors.
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = Engine::open(&origin_dir.path().join("kimmy.redb")).unwrap();
+        let docs = origin.create_collection("app", "docs").unwrap();
+        origin.configure_vectors("app", "docs", config(&["title", "body"])).unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("docs");
+        let origin_shadow = origin.get_collection("app", &shadow_name).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let restore = |id| {
+            let mut progress = kimmy_storage::SnapshotProgress::of_collection(id);
+            let mut missing = Vec::new();
+            while !progress.is_complete() {
+                let page =
+                    origin.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                let applied = engine.apply_snapshot_page(origin.node_id(), &mut progress, &page);
+                missing.extend(applied.unwrap().shadows_missing);
+            }
+            missing
+        };
+        let missing = restore(docs.id);
+        assert_eq!(missing, vec![origin_shadow.id], "the parent's snapshot names its shadow");
+
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        worker.set_provider(coll.id.0, FakeProvider::new(4));
+        engine.insert(&coll, doc! { "_id": 1i64, "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Skipped);
+
+        assert!(restore(origin_shadow.id).is_empty());
+        let shadow = engine.get_collection("app", &shadow_name).unwrap();
+        assert_eq!(
+            shadow.created, origin_shadow.created,
+            "the origin's shadow, not one minted here"
+        );
+        let outcome = worker.process(&entry).await.unwrap();
+        assert!(matches!(outcome, Outcome::Embedded { .. }), "{outcome:?}");
+    }
+
+    #[tokio::test]
     async fn a_locally_written_document_is_counted_when_embedded() {
         // The streaming path — a document this node wrote, embedded from its
         // own entry — is the common case on an owner, and it shipped in 0.5.0

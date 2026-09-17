@@ -17276,35 +17276,59 @@ where the configuration that needs it comes from:
   `ConfigureVectors` entry, **in the configuration's own transaction**. A peer
   applying the window meets the shadow's creation first and creates it from
   that entry, at that stamp, like any collection. So one configuration is one
-  logged creation of its shadow, with one `created`, on every member.
+  logged creation of its shadow, and every member that applies that entry
+  first holds the shadow with the origin's `created`.
 - **A peer's `ConfigureVectors` entry** that finds the shadow missing creates
   it **at the entry's stamp, unlogged**, and **not at all** when this member
   holds a shadow tombstone newer than that stamp. It never mints a stamp here.
+  A shadow made this way carries the configuration entry's stamp, the tick
+  after the origin's creation of it, so its `created` is one tick later than
+  the origin's. That is harmless: `created` decides only whether a drop of the
+  shadow aims at an earlier life, and the only drop stamped between the two is
+  one issued by a member holding a configuration of its own that this one
+  had not seen (a member drops vectors only while configured), which is a
+  removal concurrent with and older than the configuration standing here. That
+  is the configuration-ordering case left to its own ADR (below); whichever way
+  it is decided, the configuration standing here keeps its shadow.
 - **A snapshot page's vector configuration** creates no shadow: the shadow is
-  its own collection on the page, restored at its own stamp.
+  its own collection, restored from its own definition at the origin's
+  `created`. A whole-database snapshot carries it on its first page with the
+  others. A scoped snapshot of a configured collection carries that collection
+  only, so the page names the shadow it left missing
+  (`SnapshotApplied::shadows_missing`) and the transport plans a scoped
+  snapshot of the shadow from the same peer as a repair of its own
+  (`Repair::Snapshot`). The alternative, carrying the shadow's definition on
+  the parent's page, would restore an empty shadow: its vectors are its own
+  documents, which only a snapshot of the shadow brings, and the embedding
+  owner would not rebuild vectors it has already embedded. The repair path
+  already brings a collection this node lacks at the origin's stamp, under the
+  incarnation rules, and needs no change to the page a mixed-version peer
+  reads.
 
-**Why.** The shadow used to be created by `create_shadow_for` on every member that
-applied a configuration, after the configuration's commit: at a stamp minted
-there, logged. Each
-member then had its own creation of one shadow, with its own `created`. And a
-member minting the shadow at a clock later than a drop of it resurrected it.
-The case: X configures vectors, then turns them off with a drop of the
+**Why.** In 0.32.0 every application of a configuration, a client's or a
+peer's, called `create_system_collection` for the shadow first, in a commit of
+its own before the configuration's. The origin created and logged the shadow
+before its configuration, so a peer applying the window found the shadow
+already made and minted nothing. But a member that found the shadow missing
+minted its own, at its own clock, and logged it. That brought a dropped shadow
+back. The case: X configures vectors, then turns them off with a drop of the
 vectors (the shadow's tombstone at t5). Y, away, is served X's configuration
 without the shadow's own creation, and mints the shadow at t9 > t5. When X's
 drop reaches Y it aims at a previous incarnation and is ignored, and Y's
-creation replicates the shadow back to X and Z. At the entry's stamp, Y's
-shadow is older than the drop that buries it.
+logged creation replicates the shadow back to X and Z. At the entry's stamp,
+unlogged, Y's shadow is older than the drop that buries it, and goes nowhere.
 
-And the shadow and the configuration it serves commit together. Committed
-apart, a crash between the two left a configuration without its shadow, and
-a failed shadow creation returned an error for a configuration that had
-committed and would replicate.
+And the shadow and the configuration it serves now commit together. Committed
+apart, a crash between the two left a shadow without its configuration, and a
+failure between them returned an error for a configuration whose shadow had
+committed and replicated.
 
 **A configuration can still stand without its shadow here**, by design: a
 peer's configuration older than a drop of the shadow this member holds, or a
-snapshot page that carried the parent without its shadow. The embedding
-worker read a missing shadow as an error, and its loop stopped for good. It
-now skips such a collection, warns once per scan, and counts it in
+scoped snapshot of the parent until the snapshot of its shadow lands. In
+0.32.0 the embedding worker skipped such a document on its per-document path,
+but its rescan read the missing shadow as an error, and the worker's loop
+stopped for good. It now skips such a collection on every path, warns once per scan, and counts it in
 `kimmy_embed_skipped_no_shadow_total` (on the OTLP bridge as
 `kimmy.embed.skipped_no_shadow`), which should read 0.
 
@@ -17324,6 +17348,12 @@ come.
 - `a_peers_own_shadow_and_the_origins_shadow_creation_resolve_to_one_shadow`
 - `snapshot::a_pages_vector_configuration_makes_no_shadow_the_shadow_has_its_own_page`
 - `a_configuration_without_its_shadow_is_skipped_and_counted_not_fatal`
+- `transport::a_scoped_snapshot_of_a_configured_collection_brings_its_shadow_at_the_origins_stamp`:
+  against a real `serve`, a repair of the parent by scoped snapshot ends with
+  the shadow present at the origin's `created`.
+- `worker::an_owner_restored_from_a_scoped_snapshot_embeds_once_the_shadows_snapshot_lands`:
+  the owner skips while the shadow is missing, and embeds once its snapshot
+  has landed.
 
 The first three fail on the code before this change. With each rule removed
 alone: a peer entry's tombstone rule turns the second and third red; a peer
@@ -17332,3 +17362,5 @@ page's configuration creating a shadow turns the snapshot test red; a missing
 shadow as an error turns the worker test red. The first stays green under a
 peer-entry mutation, because the origin now logs the shadow's creation first
 and a peer meets it before the configuration: it pins the origin's order.
+With no missing shadow reported by the page, the transport and worker tests
+both go red, the transport test at "and its shadow".

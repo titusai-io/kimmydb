@@ -2329,11 +2329,42 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
+        // Derived, not allocated: every node computes the same id for the
+        // same collection, so a replicated oplog entry addresses the same
+        // collection everywhere. See `CollectionId::derive`.
         let id = CollectionId::derive(db, name);
 
+        // A drop is chunked (ADR-158), so a creation of the same name can land
+        // between two of its chunks — and the name derives the same id, so
+        // whatever that drop has not reached yet would be inherited by the new
+        // incarnation: documents of a life that has ended, answering queries
+        // under ids this collection never wrote, and index entries pointing at
+        // them. Finished here, before the definition that would stand over
+        // them exists. Ordinarily there is nothing to finish and this is two
+        // seeks against an empty range; where there is, it is the same bounded
+        // chunks the drop was making, so it does not hold the writer either.
+        // A vector shadow created in its configuration's transaction is purged
+        // the same way, by `configure_vectors_inner`, before it takes the
+        // writer.
+        //
+        // Those chunks are held as `drop` and not as `ddl` (ADR-159): the
+        // holder names the work, and finishing somebody else's drop is drop
+        // work whoever happens to be doing it. A creation that pays for one
+        // says so on the page.
         self.purge_dropped_collection(id)?;
 
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // Minted *after* the writer is held, never before (ADR-148). A stamp
+        // minted while another transaction holds the writer sorts below the
+        // entries that transaction commits first, and a peer that reads this
+        // node's vector and window in that interval witnesses past the stamp
+        // without ever being served the entry it will belong to. Under the
+        // writer, stamp order is commit order: the oplog this node serves is
+        // contiguous for its own origin, which is what makes its advertised
+        // vector a promise a peer can trust. `create_collection_in_txn` takes
+        // the stamp from its caller for that reason: a caller that mints one
+        // mints it with the writer held, and a replicated shadow takes its
+        // configuration entry's stamp.
         let stamp = self.next_stamp();
         match self.create_collection_in_txn(&txn, db, name, log, origin, history, stamp) {
             Ok(InTxn::Created(meta, logged)) => {
@@ -2388,12 +2419,25 @@ impl Engine {
                 return Ok(InTxn::Exists);
             }
 
+            // If this creation follows a drop of the same id — a recreate —
+            // the drop's stamp becomes the new incarnation's floor: replicated
+            // entries stamped at or before it belong to the previous life and
+            // must not enter the replacement, however their stamps sort
+            // against the drop itself. A creation with no tombstone behind it
+            // carries no floor: two nodes deriving the same id independently
+            // is normal convergence, not reincarnation, and flooring there
+            // would make whichever node created second silently discard the
+            // first one's documents.
             let dropped = self.collection_dropped_at(id)?;
             if dropped.is_some_and(history) {
                 return Ok(InTxn::History);
             }
             let incarnation_floor = dropped.map(|stamp| stamp.hlc);
 
+            // The derivation is a 64-bit hash, so a collision is possible in
+            // principle. Checked rather than trusted, because the failure would
+            // be two unrelated collections quietly sharing storage — refusing
+            // to create the second one is recoverable, merging them is not.
             let mut collision = None;
             for existing in collections.iter()? {
                 let (key, value) = existing?;
@@ -2410,12 +2454,18 @@ impl Engine {
                 )));
             }
 
+            // `created` is the stamp of the create that produced this
+            // incarnation *at its origin* — for a replicated create, the
+            // entry's stamp rather than this node's clock at apply time. A
+            // replayed drop is judged against it, and a local clock would
+            // misjudge a legitimate drop stamped just before a late apply.
             let meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
             meta
         };
 
+        // Databases are created implicitly by their first collection.
         {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             if dbs.get(db)?.is_none() {

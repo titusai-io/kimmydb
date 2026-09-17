@@ -221,7 +221,7 @@ pub struct SnapshotTombstone {
 }
 
 /// What applying one snapshot page did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotApplied {
     /// Documents the page wrote — those that won last-writer-wins here —
     /// deletes it applied included (ADR-167).
@@ -244,6 +244,14 @@ pub struct SnapshotApplied {
     /// counted here — a page a member already holds is the ordinary case for
     /// a repair, and it is not news).
     pub superseded: usize,
+    /// The vector shadows of collections the page's definitions left
+    /// configured here, that this node does not hold and the page did not
+    /// carry (ADR-178). A page creates no shadow: the shadow is its own
+    /// collection, with its own `created` and its own documents, and minting
+    /// one here would give it this node's clock. A scoped snapshot of a
+    /// configured collection carries only that collection, so the transport
+    /// plans a scoped snapshot of each shadow named here from the same peer.
+    pub shadows_missing: Vec<CollectionId>,
 }
 
 /// One page of a snapshot.
@@ -676,6 +684,7 @@ impl Engine {
         for state in &page.collections {
             ddl_refused += self.restore_collection(state)?;
         }
+        let shadows_missing = self.shadows_missing(page)?;
 
         // The coverage a whole-database snapshot grants is the first page's
         // vector (module docs), remembered here and recorded with the last.
@@ -863,7 +872,7 @@ impl Engine {
         }
         match failed {
             Some(e) => Err(e),
-            None => Ok(SnapshotApplied { applied, ddl_refused, superseded }),
+            None => Ok(SnapshotApplied { applied, ddl_refused, superseded, shadows_missing }),
         }
     }
 
@@ -1311,6 +1320,38 @@ impl Engine {
             }
         }
         Ok(refused)
+    }
+
+    /// The shadows of the vector configurations `page` restored or found
+    /// standing, that neither this node nor the page holds.
+    fn shadows_missing(&self, page: &SnapshotPage) -> Result<Vec<CollectionId>> {
+        let mut missing = Vec::new();
+        for state in page.collections.iter().filter(|state| state.vector.is_some()) {
+            let shadow = kimmy_core::vector_meta::shadow_name(&state.name);
+            if page.collections.iter().any(|s| s.db == state.db && s.name == shadow) {
+                continue;
+            }
+            let configured = match self.get_collection(&state.db, &state.name) {
+                Ok(standing) => standing.vector.is_some(),
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    ..
+                })) => false,
+                Err(e) => return Err(e),
+            };
+            if !configured {
+                continue;
+            }
+            match self.get_collection(&state.db, &shadow) {
+                Ok(_) => {}
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    ..
+                })) => {
+                    missing.push(CollectionId::derive(&state.db, &shadow));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(missing)
     }
 
     /// Whether a peer asking from `from` can be served from the oplog.

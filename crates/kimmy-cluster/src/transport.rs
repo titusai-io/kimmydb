@@ -2229,6 +2229,21 @@ where
         // metric and the round report do not depend on the route (ADR-123).
         outcome.ddl_refused += applied.ddl_refused;
         superseded += applied.superseded;
+        // A page restores a vector configuration without its shadow, which
+        // is its own collection (ADR-178): a scoped snapshot of a configured
+        // collection carries only that collection. Pulled from the same peer
+        // as a repair of its own, so it arrives at the origin's `created`
+        // with its vectors, rather than minted here at this node's clock.
+        for shadow in &applied.shadows_missing {
+            if stalls.plan_repair(node, *shadow, Repair::Snapshot) {
+                info!(
+                    %peer,
+                    collection = %shadow,
+                    "a snapshot restored a vector configuration whose shadow this node does \
+                     not hold; pulling the peer's snapshot of the shadow"
+                );
+            }
+        }
 
         if complete {
             stalls.snapshot_done(node);
@@ -3373,6 +3388,59 @@ mod tests {
             "abandoned after three rounds that landed nothing"
         );
         assert!(!stalls.repairing(their_node));
+    }
+
+    /// A scoped snapshot of a vector-configured collection carries only that
+    /// collection, and a page makes no shadow (ADR-178). The member used to be
+    /// left configured without a shadow, which nothing healed; the page now
+    /// plans a snapshot of the shadow from the same peer, which brings it at
+    /// the origin's `created`, against a real `serve`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_snapshot_of_a_configured_collection_brings_its_shadow_at_the_origins_stamp() {
+        const SECRET: &str = "a-shadow-repair-secret";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
+
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            kimmy_core::VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1, "text": "hello" }).unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("orders");
+        let origin_shadow = a.get_collection("shop", &shadow_name).unwrap();
+
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        // The hole: the position already claims the origin, so only a repair
+        // of the collection brings it, as a scoped snapshot.
+        b.absorb_witnessed(&a.witnessed_vector().unwrap()).unwrap();
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(a.node_id(), orders.id, Repair::Snapshot));
+
+        for _ in 0..6 {
+            sync_once_with(&b, addr, SECRET, None, &mut stalls).await.unwrap();
+            if !stalls.repairing(a.node_id()) {
+                break;
+            }
+        }
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some(), "configured");
+        let shadow = b.get_collection("shop", &shadow_name).expect("and its shadow");
+        assert_eq!(shadow.created, origin_shadow.created, "at the origin's stamp");
+        assert!(!stalls.repairing(a.node_id()), "both repairs done");
     }
 
     /// The rolling-upgrade half of the tombstone rule, over the wire. A

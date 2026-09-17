@@ -22,15 +22,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
-- **A vector shadow collection is created once, at one stamp, and stays
-  dropped when it is dropped** ([ADR-178](docs/decisions.md)). A client's
-  configuration creates the shadow at a stamp minted on that member and logs
-  its creation, before the configuration, in the same commit. A member applying
-  a peer's configuration without the shadow's creation makes the shadow at that
-  configuration's stamp, without logging it, and not under a newer drop of the
-  shadow it holds; a snapshot page's configuration makes none. Every member
-  used to create and log its own shadow at its own clock, which could bring a
-  dropped shadow back to every member.
+- **A dropped vector shadow collection stays dropped, and a shadow commits
+  with its configuration** ([ADR-178](docs/decisions.md)). A client's
+  configuration creates and logs the shadow before the configuration, as
+  before, now in the same commit. A member applying a peer's configuration
+  without the shadow's creation used to mint the shadow at its own clock and
+  log it, which could bring a shadow dropped elsewhere back to every member; it
+  now makes it at the configuration's stamp, without logging it, and not under
+  a newer drop of the shadow it holds. A snapshot page makes no shadow: a
+  scoped snapshot of a configured collection now pulls the peer's snapshot of
+  its shadow too, where it used to mint one at this member's clock. And the
+  embedding worker's rescan no longer stops for good on a collection whose
+  shadow is missing.
 - **A replicated drop no longer deletes the collection recreated after it.**
   A member applying a drop read the collection, then took the single writer and
   removed whatever stood under its name. When another apply of the same drop,
