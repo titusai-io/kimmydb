@@ -17322,7 +17322,13 @@ come.
 - `a_replayed_configuration_makes_no_shadow_under_a_drop_of_it_landed_meanwhile`
 - `a_vector_configuration_and_its_shadow_are_never_visible_one_without_the_other`
 - `a_peers_own_shadow_and_the_origins_shadow_creation_resolve_to_one_shadow`
+- `snapshot::a_pages_vector_configuration_makes_no_shadow_the_shadow_has_its_own_page`
 - `a_configuration_without_its_shadow_is_skipped_and_counted_not_fatal`
 
-The first three fail on the code before this change. Each goes red alone when
-its rule is removed.
+The first three fail on the code before this change. With each rule removed
+alone: a peer entry's tombstone rule turns the second and third red; a peer
+entry creating a logged shadow at this member's clock turns the second red; a
+page's configuration creating a shadow turns the snapshot test red; a missing
+shadow as an error turns the worker test red. The first stays green under a
+peer-entry mutation, because the origin now logs the shadow's creation first
+and a peer meets it before the configuration: it pins the origin's order.

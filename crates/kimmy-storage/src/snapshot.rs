@@ -1704,6 +1704,57 @@ mod tests {
     }
 
     #[test]
+    fn a_pages_vector_configuration_makes_no_shadow_the_shadow_has_its_own_page() {
+        // A page's configuration used to mint the shadow here, at this
+        // member's clock, logged: a second creation of a shadow the origin
+        // had already created, with its own `created` (ADR-178).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("orders");
+        let origin = a.get_collection("shop", &shadow_name).unwrap();
+        let whole = a.snapshot_page(None, None).unwrap();
+        let (mut parent, mut shadow) = (whole.clone(), whole);
+        parent.collections.retain(|state| state.name == "orders");
+        shadow.collections.retain(|state| state.name == shadow_name);
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &parent)
+            .unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+        assert!(
+            matches!(
+                b.get_collection("shop", &shadow_name),
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+            ),
+            "no shadow from it"
+        );
+        let logged = b.entries_for_peer(Hlc::ZERO, 1_024).unwrap().entries;
+        assert!(
+            logged.iter().all(|e| e.collection != origin.id),
+            "nor a logged creation of one: {logged:?}"
+        );
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &shadow)
+            .unwrap();
+        let held = b.get_collection("shop", &shadow_name).unwrap();
+        assert_eq!(held.created, origin.created, "the shadow's page restores it at its stamp");
+    }
+
+    #[test]
     fn a_snapshot_carries_collections_indexes_and_documents() {
         let (a, _da) = engine();
         let (b, _db) = engine();
