@@ -1970,6 +1970,17 @@ impl PeerStalls {
         }
     }
 
+    /// Cancel the repairs of `collection` still queued against any peer,
+    /// returning how many. One under way finishes as it would: its page has
+    /// already been judged.
+    fn repairs_cancelled(&mut self, collection: CollectionId) -> usize {
+        self.repairs
+            .values_mut()
+            .map(|repairs| repairs.queued.remove(&collection))
+            .filter(Option::is_some)
+            .count()
+    }
+
     /// The repair under way against `peer` is done.
     fn repair_finished(&mut self, peer: NodeId) {
         if let Some(repairs) = self.repairs.get_mut(&peer)
@@ -2379,6 +2390,20 @@ where
                      not hold; pulling the peer's snapshot of the shadow"
                 );
             }
+        }
+        // A shadow whose collection this node buried after the shadow was
+        // created: the peer is behind on that drop, the page restored nothing
+        // (ADR-178), and a pull of it planned from another peer would pull
+        // the same parentless shadow.
+        for shadow in &applied.shadows_orphaned {
+            let cancelled = stalls.repairs_cancelled(*shadow);
+            info!(
+                %peer,
+                collection = %shadow,
+                cancelled,
+                "a snapshot carried a vector shadow whose collection this node has dropped \
+                 since; restored nothing"
+            );
         }
 
         if complete {
@@ -3865,6 +3890,26 @@ mod tests {
         stalls.tick_opened();
         assert_eq!(stalls.repair_due(peer), None);
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
+    }
+
+    /// A shadow's page that restored nothing, because its collection is
+    /// buried here (ADR-178), cancels the pulls of it still queued against
+    /// other peers; the one under way finishes as any repair does.
+    #[test]
+    fn an_orphaned_shadow_cancels_its_queued_repairs_and_not_the_one_under_way() {
+        let (under_way, queued) = (node(1), node(2));
+        let (shadow, other) = (CollectionId(7), CollectionId(8));
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(under_way, shadow, Repair::Snapshot));
+        assert_eq!(stalls.repair_due(under_way), Some((shadow, Repair::Snapshot)));
+        assert!(stalls.plan_repair(queued, other, Repair::Snapshot));
+        assert!(stalls.plan_repair(queued, shadow, Repair::Snapshot));
+
+        assert_eq!(stalls.repairs_cancelled(shadow), 1);
+        assert_eq!(stalls.repair_due(under_way), Some((shadow, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(queued), Some((other, Repair::Snapshot)));
+        stalls.repair_finished(queued);
+        assert!(!stalls.repairing(queued), "the shadow's pull is gone");
     }
 
     /// A tick that pulls from a peer a dozen times while draining a backlog

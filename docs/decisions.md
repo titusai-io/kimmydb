@@ -17470,7 +17470,19 @@ where the configuration that needs it comes from:
   owner would not rebuild vectors it has already embedded. The repair path
   already brings a collection this node lacks at the origin's stamp, under the
   incarnation rules, and needs no change to the page a mixed-version peer
-  reads.
+  reads. The shadow's own page restores **nothing** when the collection it
+  serves is absent here under a tombstone at or after the shadow's `created`,
+  and names it (`SnapshotApplied::shadows_orphaned`) so the transport cancels
+  the pulls of it still queued against other peers. That repair made the
+  ADR-138 orphan reachable: B takes the parent's scoped snapshot from A, which
+  names the shadow; X's drop of the parent reaches B, which holds no shadow and
+  so buries none; B then pulls the shadow from A, which is behind on the drop,
+  and restored it parentless. Judged before the writer to answer cheaply, and
+  again under it in `create_collection_in_txn` for any creation from elsewhere,
+  since the drop can land in between. A page names a shadow missing only where
+  the configuration stands here and this node holds no shadow; the other two
+  conditions it checks (the page carried a configuration, and not the shadow)
+  are belt-and-braces, masked by the listing running after the restore.
 
 **Why.** In 0.32.0 every application of a configuration, a client's or a
 peer's, called `create_system_collection` for the shadow first, in a commit of
@@ -17501,8 +17513,9 @@ stopped for good. It now skips such a collection on every path, warns once per s
 
 **Recorded, not changed.** A member that never held the shadow has no
 tombstone for it, so a re-served creation from a life of the shadow that was
-dropped elsewhere can still make an orphan there (the ADR-138 class, predating
-this). And configuration ordering within one life (a configuration and a
+dropped elsewhere can still make an orphan there where the parent's tombstone
+has not reached it either (the ADR-138 class, predating this); under a parent
+buried here after the shadow, a creation from elsewhere is refused. And configuration ordering within one life (a configuration and a
 removal of it applied out of order) is not decided here: it has its own ADR to
 come.
 
@@ -17521,6 +17534,13 @@ come.
 - `worker::an_owner_restored_from_a_scoped_snapshot_embeds_once_the_shadows_snapshot_lands`:
   the owner skips while the shadow is missing, and embeds once its snapshot
   has landed.
+- `snapshot::a_shadows_page_restores_nothing_under_a_parent_buried_after_the_shadow`
+  and `…_while_it_applied`: the interleaving above, in sequence and with the
+  drop landing between the check and the writer.
+- `snapshot::a_scoped_snapshot_names_no_shadow_this_node_already_holds`, and
+  `a_page_judged_current_before_a_drop_and_recreation_land_restores_no_vectors`
+  asserting its history page names no shadow.
+- `transport::an_orphaned_shadow_cancels_its_queued_repairs_and_not_the_one_under_way`
 
 The first three fail on the code before this change. With each rule removed
 alone: a peer entry's tombstone rule turns the second and third red; a peer
@@ -17530,4 +17550,11 @@ shadow as an error turns the worker test red. The first stays green under a
 peer-entry mutation, because the origin now logs the shadow's creation first
 and a peer meets it before the configuration: it pins the origin's order.
 With no missing shadow reported by the page, the transport and worker tests
-both go red, the transport test at "and its shadow".
+both go red, the transport test at "and its shadow". The first orphan test
+fails on the code before its guard, with the shadow restored. With each rule
+removed alone: the guard under the writer turns the raced orphan test red; no
+orphan listed turns both orphan tests red; listing a shadow this node holds
+turns the held-shadow test red; listing under a configuration that does not
+stand turns the history-page test red; not cancelling turns the transport
+test red. The check before the writer only answers early, and no test sees
+it removed.

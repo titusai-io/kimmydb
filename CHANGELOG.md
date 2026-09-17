@@ -45,7 +45,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   now makes it at the configuration's stamp, without logging it, and not under
   a newer drop of the shadow it holds. A snapshot page makes no shadow: a
   scoped snapshot of a configured collection now pulls the peer's snapshot of
-  its shadow too, where it used to mint one at this member's clock. And the
+  its shadow too, where it used to mint one at this member's clock, and
+  restores no shadow whose collection this member has dropped since. And the
   embedding worker's rescan no longer stops for good on a collection whose
   shadow is missing.
 - **A replicated drop no longer deletes the collection recreated after it.**

@@ -2434,6 +2434,27 @@ impl Engine {
             }
             let incarnation_floor = dropped.map(|stamp| stamp.hlc);
 
+            // A vector shadow from elsewhere whose parent this node has buried
+            // since the shadow was created is a life that drop ended, though
+            // the shadow holds no tombstone of its own: a node that never held
+            // the shadow buries none. A snapshot page brings a shadow on its
+            // own (ADR-178), from a peer that can be behind on the parent's
+            // drop, and created here it stood parentless (ADR-138). Judged
+            // under the writer for the reason `history` is; a creation naming
+            // no stamp reads as the older one, as a page's does.
+            if !log
+                && let Some(base) = kimmy_core::vector_meta::base_name(name)
+                && collections.get((db, base))?.is_none()
+            {
+                let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                if let Some(raw) = tombstones.get(CollectionId::derive(db, base).0)? {
+                    let buried = codec::decode_oplog_key(raw.value())?;
+                    if origin.is_none_or(|created| created <= buried.hlc) {
+                        return Ok(InTxn::History);
+                    }
+                }
+            }
+
             // The derivation is a 64-bit hash, so a collision is possible in
             // principle. Checked rather than trusted, because the failure would
             // be two unrelated collections quietly sharing storage — refusing
