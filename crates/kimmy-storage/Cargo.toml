@@ -19,6 +19,11 @@ description = "redb-backed storage engine, indexes, and oplog for KimmyDB"
 # which does not keep the counts has written.
 bench-no-live-counts = []
 
+# The count rule's failure injection (ADR-177), for another crate's tests: the
+# transport's push tests enable it as a dev-dependency. Never enabled by a
+# build that ships.
+test-hooks = []
+
 [dependencies]
 kimmy-core.workspace = true
 redb.workspace = true

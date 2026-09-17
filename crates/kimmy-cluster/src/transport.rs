@@ -362,17 +362,25 @@ where
                 // before hanging up, as a refused batch size is above: without
                 // it the pusher reads only a closed connection, and the reason
                 // is in this node's log alone.
-                let outcome =
-                    match engine.apply_peer_batch(&versions, &entries, scanned_to, exhausted) {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            let reason = format!("the pushed window could not be applied: {e}");
-                            let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
-                            return Err(ProtocolError::Malformed(reason));
-                        }
-                    };
+                let mut outcome = SyncOutcome::default();
+                let applied = engine.apply_peer_batch_into(
+                    &versions,
+                    &entries,
+                    scanned_to,
+                    exhausted,
+                    &mut outcome,
+                );
+                // Whether or not the window then failed: the outcome holds
+                // only what a commit made final, as a pulled window's does,
+                // and what none did is delivered again and counted then
+                // (ADR-177).
                 if let Some(hook) = on_pushed {
                     hook(&outcome);
+                }
+                if let Err(e) = applied {
+                    let reason = format!("the pushed window could not be applied: {e}");
+                    let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
+                    return Err(ProtocolError::Malformed(reason));
                 }
                 write_frame(
                     &mut stream,
@@ -3868,6 +3876,172 @@ mod tests {
         }
         assert!(matches!(served, Err(ProtocolError::Malformed(_))), "{served:?}");
         assert!(b.get_collection("shop", "orders").is_err(), "nothing was applied");
+    }
+
+    /// Push `entries` to `b` through the served arm, with a push hook, and hand
+    /// back what the hook was given (summed) and whether the push failed.
+    async fn push_counted(
+        b: &Engine,
+        versions: VersionVector,
+        entries: Vec<OplogEntry>,
+    ) -> (SyncOutcome, bool) {
+        const SECRET: &str = "a-push-count-secret";
+        const BINDING: &[u8] = b"a-push-count-binding";
+        let pusher_dir = tempfile::tempdir().unwrap();
+        let pusher = Engine::open(&pusher_dir.path().join("kimmy.redb")).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(SyncOutcome::default()));
+        let hook: PushHook = Arc::new({
+            let seen = Arc::clone(&seen);
+            move |outcome: &SyncOutcome| {
+                let mut seen = seen.lock().unwrap();
+                seen.ddl_refused += outcome.ddl_refused;
+                seen.ddl_declined += outcome.ddl_declined;
+                seen.unknown_collection += outcome.unknown_collection;
+                seen.deferred += outcome.deferred;
+            }
+        });
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = async { serve_peer(b, theirs, SECRET, BINDING, Some(&hook)).await };
+        let pushing = async {
+            open_handshake(&pusher, &mut ours, SECRET, BINDING).await.unwrap();
+            let scanned_to = entries.last().unwrap().stamp.hlc;
+            let push = Message::Push { entries, scanned_to, exhausted: false, versions };
+            write_frame(&mut ours, &push).await.unwrap();
+            let answer = read_frame(&mut ours).await;
+            drop(ours);
+            answer
+        };
+        let (_, answer) = tokio::join!(serving, pushing);
+        assert!(
+            !kimmy_storage::sync::count_hooks::armed(),
+            "the injected failure was never reached"
+        );
+        let failed = matches!(answer, Ok(Message::Fault(_)));
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        (seen, failed)
+    }
+
+    /// The window a pull re-serves `into` from `from` after a push: above what
+    /// `into` witnesses of each origin.
+    fn re_served(into: &Engine, window: &[OplogEntry]) -> Vec<OplogEntry> {
+        let held = into.witnessed_vector().unwrap();
+        window.iter().filter(|e| e.stamp.hlc > held.get(e.stamp.node)).cloned().collect()
+    }
+
+    /// A drop declined in a push that then fails is counted by the push, once:
+    /// the pulled delivery of the same drop after it is a replay (ADR-177).
+    #[tokio::test]
+    async fn a_decline_in_a_push_that_fails_is_counted_once_with_its_pulled_replay() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
+            .unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let drop =
+            whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
+        let recreate = whole.entries.last().unwrap().clone();
+        let theirs = a.version_vector().unwrap();
+        b.apply_peer_batch(&theirs, std::slice::from_ref(&recreate), recreate.stamp.hlc, false)
+            .unwrap();
+        let mut broken = whole.entries[0].clone();
+        broken.stamp =
+            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.body = Some(vec![0xde, 0xad]);
+        let mut versions = theirs.clone();
+        versions.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+
+        let (pushed, failed) = push_counted(&b, versions, vec![drop.clone(), broken]).await;
+        assert!(failed, "the push fails after the decline");
+        let replay = re_served(&b, std::slice::from_ref(&drop));
+        let pulled = match replay.last() {
+            Some(last) => b.apply_peer_batch(&theirs, &replay, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_declined + pulled.ddl_declined,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
+    }
+
+    /// A refusal a push's own earlier commit covered, in a push that then
+    /// fails, is counted by the push: the pull after it starts above it.
+    #[tokio::test]
+    async fn a_refusal_a_failing_push_covered_is_counted_by_the_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let (_, window) = a_window_with_a_refused_index(&orders, origin);
+        let refused = window[1].clone();
+        // A definition B can apply, after the refusal and from the same origin:
+        // its append raises B's witnessed vector past the refusal.
+        let mut applied = refused.clone();
+        let mut create: kimmy_core::IndexCreate =
+            bson::deserialize_from_slice(applied.body.as_ref().unwrap()).unwrap();
+        create.index.name = "by_a".into();
+        create.index.id = kimmy_core::IndexMeta::derive_id("by_a");
+        create.index.unique = false;
+        create.index.enforcement = kimmy_core::Enforcement::Local;
+        applied.body = Some(bson::serialize_to_vec(&create).unwrap());
+        applied.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 1, 0), origin);
+        let mut broken = applied.clone();
+        broken.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 2, 0), origin);
+        broken.body = Some(vec![0xde, 0xad]);
+        let versions = vector(&[(origin, 9_000)]);
+        let window = vec![refused, applied, broken];
+
+        let (pushed, failed) = push_counted(&b, versions.clone(), window.clone()).await;
+        assert!(failed, "the push fails after the covering commit");
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_a").is_some());
+        let again = re_served(&b, &window[..2]);
+        let pulled = match again.last() {
+            Some(last) => b.apply_peer_batch(&versions, &again, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_refused + pulled.ddl_refused,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
+    }
+
+    /// A push whose apply fails after its last commit counts what it refused,
+    /// as the same push succeeding would: nothing of the window is delivered
+    /// again (ADR-177). The failure is injected where reporting a committed
+    /// run can fail, through storage's `test-hooks`.
+    #[tokio::test]
+    async fn a_push_that_fails_after_its_last_commit_counts_what_it_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let (versions, window) = a_window_with_a_refused_index(&orders, origin);
+
+        kimmy_storage::sync::count_hooks::fail_next(
+            kimmy_storage::sync::count_hooks::Fail::AfterLastCommit,
+        );
+        let (pushed, failed) = push_counted(&b, versions.clone(), window.clone()).await;
+        assert!(failed, "the push fails after its last commit");
+        let again = re_served(&b, &window);
+        let pulled = match again.last() {
+            Some(last) => b.apply_peer_batch(&versions, &again, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_refused + pulled.ddl_refused,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
     }
 
     /// A window for a round against a fake peer: an insert into `orders`, and

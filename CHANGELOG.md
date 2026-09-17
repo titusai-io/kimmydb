@@ -21,11 +21,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `kimmy_sync_failures_total` and backed the healthy peer off. The deadline now
   charges only the time spent outside this node's applies; a slow peer still
   fails the round. And what an apply refused, declined or skipped is counted
-  by the commit that makes it final, so `kimmy_sync_ddl_refused_total`,
-  `kimmy_sync_ddl_declined_total` and `kimmy_sync_entries_skipped_total` count
-  each decision once when a batch or its round fails: they used to lose a
-  refusal a later commit had covered, a decline, and everything in a batch that
-  failed after its last commit.
+  by the commit that makes it final, so a pulled or pushed window that fails
+  counts in `kimmy_sync_ddl_refused_total`, `kimmy_sync_ddl_declined_total` and
+  `kimmy_sync_entries_skipped_total` what it would have counted up to where it
+  stopped, and what it did not reach is counted by the next delivery. Both
+  used to count nothing for a window that failed: a decline, a refusal a later
+  commit had covered, and everything in a window that failed after its last
+  commit went uncounted.
 - **A replicated drop no longer deletes the collection recreated after it.**
   A member applying a drop read the collection, then took the single writer and
   removed whatever stood under its name. When another apply of the same drop,

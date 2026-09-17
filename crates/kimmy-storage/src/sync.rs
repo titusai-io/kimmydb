@@ -1019,7 +1019,7 @@ impl Engine {
             let txn = self.run_txn(run)?;
             Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if count_hooks::fails(count_hooks::Fail::BeforeLastCommit) {
             return Err(count_hooks::injected());
         }
@@ -1116,7 +1116,7 @@ impl Engine {
             }
         }
         self.publish(published);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if run.last && count_hooks::fails(count_hooks::Fail::AfterLastCommit) {
             failed.get_or_insert(count_hooks::injected());
         }
@@ -1968,18 +1968,17 @@ impl Engine {
     }
 }
 
-/// Test-only points inside a collection's check-then-act, where a concurrent
-/// creation or burial of the same name lands in production, and a record of
-/// whether the losing side then took the branch that absorbs it. `cfg(test)`:
-/// reachable from no other crate and absent from every other build.
 /// A failure injected on either side of a batch's last commit, for the count
-/// rule (ADR-177). `cfg(test)`, and per thread.
-#[cfg(test)]
-pub(crate) mod count_hooks {
+/// rule (ADR-177). Per thread. Under `cfg(test)`, and under the `test-hooks`
+/// feature, which only another crate's dev-dependency enables (the transport's
+/// push tests), so it is absent from every build that ships.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod count_hooks {
     use std::cell::Cell;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Fail {
+    pub enum Fail {
         BeforeLastCommit,
         /// After the commit, where reporting what it applied can fail.
         AfterLastCommit,
@@ -1990,23 +1989,27 @@ pub(crate) mod count_hooks {
     }
 
     /// Fail the next batch applied on this thread at `at`, once.
-    pub(crate) fn fail_next(at: Fail) {
+    pub fn fail_next(at: Fail) {
         FAIL.with(|f| f.set(Some(at)));
     }
 
-    pub(crate) fn armed() -> bool {
+    pub fn armed() -> bool {
         FAIL.with(|f| f.get().is_some())
     }
 
-    pub(crate) fn fails(at: Fail) -> bool {
+    pub fn fails(at: Fail) -> bool {
         FAIL.with(|f| f.get() == Some(at) && f.take().is_some())
     }
 
-    pub(crate) fn injected() -> crate::StorageError {
+    pub fn injected() -> crate::StorageError {
         crate::StorageError::Database("a failure injected for a test".into())
     }
 }
 
+/// Test-only points inside a collection's check-then-act, where a concurrent
+/// creation or burial of the same name lands in production, and a record of
+/// whether the losing side then took the branch that absorbs it. `cfg(test)`:
+/// reachable from no other crate and absent from every other build.
 #[cfg(test)]
 pub(crate) mod race_hooks {
     use std::cell::{Cell, RefCell};
