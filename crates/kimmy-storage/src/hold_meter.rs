@@ -1163,8 +1163,16 @@ mod tests {
 
     #[test]
     fn each_phase_holds_what_happens_in_it() {
+        // A test of which phase a sleep lands in, not of how fast a disk is.
+        // Under `durable` the commit phase holds a real fsync, and a slow
+        // runner's 139 ms of it read as the work phase's sleep leaking into
+        // the commit. Under `coalesced` the hold writes without its own fsync
+        // and the shared one runs in the barrier's hold, outside this one, so
+        // a phase holds only the sleep the test puts there and the engine's
+        // own work; the first assertion below pins that no fsync is in it.
         for phase in Phase::ALL {
             let (engine, _dir) = fresh();
+            engine.set_durability(DurabilityClass::Coalesced, Duration::from_millis(2));
             let coll = engine.create_collection("shop", "orders").unwrap();
             let mut sleeps = [Duration::ZERO; Phase::COUNT];
             sleeps[phase.slot()] = Duration::from_millis(60);
@@ -1173,6 +1181,7 @@ mod tests {
                 engine.insert(&coll, doc! { "n": 1 }).unwrap();
             });
             test_hooks::reset();
+            assert_eq!(row.get(Component::Sync), Duration::ZERO, "no fsync in the hold: {row:?}");
             for other in Phase::ALL {
                 if other == phase {
                     assert!(row.phase(other) >= Duration::from_millis(60), "{phase:?}: {row:?}");

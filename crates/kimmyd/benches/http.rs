@@ -52,10 +52,11 @@ const SEED: usize = 10_000;
 /// Requests each cell throws away before the clock starts.
 const WARMUP: usize = 200;
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-    listener.local_addr().unwrap().port()
-}
+// A port chosen below the ephemeral range, as the harnesses choose theirs: a
+// port the kernel handed out for an ephemeral bind and then released could be
+// given to an outbound connection before the node bound it.
+#[path = "../tests/ports/mod.rs"]
+mod ports;
 
 /// One spawned `kimmyd`, killed on drop.
 struct Node {
@@ -67,7 +68,7 @@ struct Node {
 impl Node {
     fn spawn(tls: bool) -> Node {
         let dir = tempfile::tempdir().unwrap();
-        let port = free_port();
+        let port = ports::choose();
         let mut tls_block = String::new();
 
         if tls {
