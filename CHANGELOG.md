@@ -10,7 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.32.0 - 2026-09-17
+
+**A minor, for additive series; nothing breaks.** A hold of the single writer
+now says what it was made of, and serving a peer's pull says what it cost the
+serving member ([ADR-176](docs/decisions.md)): 12 new series on `/metrics` and
+on the OTLP bridge. It is a minor because those are features, and a scrape
+config or golden list that enumerates series needs them; no existing series,
+label or type changes.
+
+**The series measure where a hold's time goes; they do not shorten it.**
+
+Nothing on the wire, on disk, in configuration or in packaging changes. The
+change-stream and oplog guides are corrected: resume tokens from before 0.30.0
+are still accepted (*Fixed*).
 
 ### Added
 
