@@ -38,6 +38,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 mod node_logs;
+mod ports;
 
 const ROOT_PASSWORD: &str = "harness-root-password";
 const JWT_SECRET: &str = "a-shared-harness-jwt-secret-value";
@@ -67,19 +68,18 @@ fn patience() -> Duration {
 }
 const POLL: Duration = Duration::from_millis(250);
 
-/// A free localhost port.
-///
-/// Bind-then-drop has an inherent race, but the alternative — a hardcoded
-/// range — collides with everything else on a shared CI machine. Losing the
-/// race fails the node's startup loudly, which `wait_ready` surfaces.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 /// One spawned `kimmyd`, killed on drop.
 struct Node {
     name: &'static str,
-    child: Child,
+    /// Behind a lock so `wait_ready`, which only reads the node, can ask
+    /// whether it has exited.
+    child: std::sync::Mutex<Child>,
+    pid: u32,
+    cluster: u16,
+    /// Chosen by [`ports::choose`], as the cluster port is, and not port 0:
+    /// a clustered node advertises its configured HTTP address to its peers'
+    /// topology (ADR-051), and `every_node_can_tell_a_client_about_every_node`
+    /// checks that address is where it really listens.
     http: u16,
     dir: tempfile::TempDir,
 }
@@ -100,7 +100,7 @@ impl Node {
     /// needs a setting the other tests do not.
     fn spawn_with(name: &'static str, cluster: u16, seeds: &[u16], storage: &str) -> Node {
         let dir = tempfile::tempdir().unwrap();
-        let http = free_port();
+        let http = ports::choose();
         let seed_list =
             seeds.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect::<Vec<_>>().join(", ");
 
@@ -149,7 +149,8 @@ allowed_hosts = ["127.0.0.1"]
             .spawn()
             .expect("spawning kimmyd");
 
-        Node { name, child, http, dir }
+        let pid = child.id();
+        Node { name, child: std::sync::Mutex::new(child), pid, cluster, http, dir }
     }
 
     fn url(&self, path: &str) -> String {
@@ -168,13 +169,28 @@ allowed_hosts = ["127.0.0.1"]
     }
 
     async fn wait_ready(&self, client: &reqwest::Client) {
+        if let Err(exited) = self.try_ready(client).await {
+            panic!("{exited}");
+        }
+    }
+
+    /// [`Self::wait_ready`], answering at once, with the node's stderr, when
+    /// the node has exited instead of waiting out the patience budget for a
+    /// process that is gone. A port taken before the node bound it cost CI
+    /// four minutes that way.
+    async fn try_ready(&self, client: &reqwest::Client) -> Result<(), Exited> {
         let budget = patience();
         let deadline = std::time::Instant::now() + budget;
         loop {
             if let Ok(res) = client.get(self.url("/healthz")).send().await
                 && res.status().is_success()
             {
-                return;
+                return Ok(());
+            }
+            if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                let stderr =
+                    std::fs::read_to_string(self.dir.path().join("stderr.log")).unwrap_or_default();
+                return Err(Exited { name: self.name, status, stderr });
             }
             if std::time::Instant::now() >= deadline {
                 panic!("{}", self.never_became_healthy(budget));
@@ -239,12 +255,9 @@ allowed_hosts = ["127.0.0.1"]
     }
 
     fn signal(&self, sig: &str) {
-        let status = Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
-        assert!(status.success(), "kill -{sig} {}", self.child.id());
+        let status =
+            Command::new("kill").arg(format!("-{sig}")).arg(self.pid.to_string()).status().unwrap();
+        assert!(status.success(), "kill -{sig} {}", self.pid);
     }
 }
 
@@ -254,17 +267,36 @@ impl Drop for Node {
         // ignores everything else, and these are scratch nodes. Unchecked,
         // unlike `signal` — the child may already be dead by a test's own
         // hand, and panicking in a drop during unwind aborts the test binary.
-        let _ = Command::new("kill").arg("-KILL").arg(self.child.id().to_string()).status();
-        let _ = self.child.wait();
+        let _ = Command::new("kill").arg("-KILL").arg(self.pid.to_string()).status();
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.wait();
+        }
         // Kept only when the test failed, and only after the kill, so the
         // files are complete. Every assertion but `wait_ready`'s used to lose
         // them with the scratch directory.
         node_logs::keep_if_failing(
             &node_logs::destination(),
             self.name,
-            self.child.id(),
+            self.pid,
             &[&self.dir.path().join("stdout.log"), &self.dir.path().join("stderr.log")],
         );
+    }
+}
+
+/// A node that exited before it became healthy.
+struct Exited {
+    name: &'static str,
+    status: std::process::ExitStatus,
+    stderr: String,
+}
+
+impl std::fmt::Display for Exited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} exited ({}) before it became healthy.\n--- {} stderr ---\n{}\n--- end ---",
+            self.name, self.status, self.name, self.stderr
+        )
     }
 }
 
@@ -393,15 +425,58 @@ async fn three_nodes(client: &reqwest::Client) -> (Node, Node, Node) {
 }
 
 /// [`three_nodes`], with `storage` added to each node's `[storage]` section.
+///
+/// Ports come from [`ports::choose`], which no outbound connection can be
+/// given. Should another process take one before its node binds it anyway,
+/// the node exits with it in use, and the three start again on new ports:
+/// a few attempts, each answered as soon as a node exits.
 async fn three_nodes_with(client: &reqwest::Client, storage: &str) -> (Node, Node, Node) {
-    let (pa, pb, pc) = (free_port(), free_port(), free_port());
-    let a = Node::spawn_with("node-a", pa, &[pb], storage);
-    let b = Node::spawn_with("node-b", pb, &[pa], storage);
-    let c = Node::spawn_with("node-c", pc, &[pa], storage);
-    a.wait_ready(client).await;
-    b.wait_ready(client).await;
-    c.wait_ready(client).await;
-    (a, b, c)
+    const ATTEMPTS: usize = 5;
+    for _ in 0..ATTEMPTS {
+        let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+        let a = Node::spawn_with("node-a", pa, &[pb], storage);
+        let b = Node::spawn_with("node-b", pb, &[pa], storage);
+        let c = Node::spawn_with("node-c", pc, &[pa], storage);
+        let mut collided = false;
+        for node in [&a, &b, &c] {
+            match node.try_ready(client).await {
+                Ok(()) => {}
+                Err(exited) if ports::in_use(&exited.stderr) => {
+                    eprintln!("{exited}\nstarting the three again on new ports");
+                    collided = true;
+                    break;
+                }
+                Err(exited) => panic!("{exited}"),
+            }
+        }
+        if !collided {
+            return (a, b, c);
+        }
+    }
+    panic!("{ATTEMPTS} attempts at three nodes each lost a port to another process");
+}
+
+/// A cluster port taken by another process between its choosing and its
+/// node's bind: the node exits with it in use, and the harness starts the
+/// three again on new ports at once rather than waiting out its patience for
+/// a process that is gone. The collision is made on purpose, on node A's
+/// port; the cluster that forms is on the ports of the next attempt.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_cluster_port_taken_before_its_node_binds_starts_the_three_again() {
+    let client = reqwest::Client::new();
+    ports::occupy_next(1);
+    let started = std::time::Instant::now();
+    let (a, b, c) = three_nodes(&client).await;
+    let taken = ports::occupied();
+    assert_eq!(taken.len(), 1, "the collision was made: {taken:?}");
+    assert!(![a.cluster, b.cluster, c.cluster].contains(&taken[0]), "on new ports");
+    assert!(
+        started.elapsed() < patience() / 2,
+        "started again at once, not after the patience budget: {:?}",
+        started.elapsed()
+    );
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
 }
 
 /// Every node reports exactly `expected` on the members gauge.
@@ -1643,7 +1718,7 @@ async fn a_change_stream_resumed_on_another_node_misses_nothing() {
 /// cache hits included: `rchar` in `/proc/<pid>/io`.
 #[cfg(target_os = "linux")]
 fn rchar(node: &Node) -> u64 {
-    let io = std::fs::read_to_string(format!("/proc/{}/io", node.child.id())).unwrap();
+    let io = std::fs::read_to_string(format!("/proc/{}/io", node.pid)).unwrap();
     io.lines()
         .find_map(|line| line.strip_prefix("rchar: "))
         .and_then(|n| n.trim().parse().ok())

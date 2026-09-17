@@ -17,6 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod node_logs;
+mod ports;
 
 const JWT_SECRET: &str = "a-lifecycle-harness-jwt-secret-value";
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -25,20 +26,28 @@ const POLL: Duration = Duration::from_millis(100);
 /// The marker `node::run` leaves in the data directory on its way out.
 const LAST_EXIT_FILE: &str = "kimmy.last-exit";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 /// One spawned `kimmyd` on a caller-owned data directory, so a second run
 /// can start where the first left off.
 struct Run {
-    child: Child,
-    http: u16,
+    /// Behind a lock so `wait_ready`, which only reads the run, can ask
+    /// whether it has exited.
+    child: std::sync::Mutex<Child>,
+    pid: u32,
+    /// The HTTP port the node bound: port 0 unless a test names one, read
+    /// from its log once it listens.
+    http: std::sync::OnceLock<u16>,
     stdout: PathBuf,
 }
 
 impl Run {
-    fn spawn(dir: &Path, name: &str, http: u16) -> Run {
+    /// Start a node on `dir` that binds its own HTTP port: none is chosen
+    /// here, so none can be taken before the node binds it.
+    fn spawn(dir: &Path, name: &str) -> Run {
+        Run::spawn_on(dir, name, 0)
+    }
+
+    /// [`Run::spawn`] on a port the test names, for a test about that port.
+    fn spawn_on(dir: &Path, name: &str, http: u16) -> Run {
         let config = format!(
             r#"
 [server]
@@ -66,17 +75,50 @@ jwt_secret = "{JWT_SECRET}"
             .stderr(Stdio::from(std::fs::File::create(stderr).unwrap()))
             .spawn()
             .expect("spawning kimmyd");
-        Run { child, http, stdout }
+        let pid = child.id();
+        let bound = std::sync::OnceLock::new();
+        if http != 0 {
+            let _ = bound.set(http);
+        }
+        Run { child: std::sync::Mutex::new(child), pid, http: bound, stdout }
     }
 
+    /// Wait until the node answers `/healthz`, failing at once, with its
+    /// log, if it exits first rather than waiting out `PATIENCE`.
     async fn wait_ready(&self, client: &reqwest::Client) {
+        if let Err(why) = self.try_ready(client, ports::BOUND_HTTP_LINE).await {
+            panic!("{why}");
+        }
+    }
+
+    /// [`Run::wait_ready`], reading the HTTP port from `line`, and answering
+    /// at once, never after `PATIENCE`, when the node exits or the port cannot
+    /// be read from the log.
+    async fn try_ready(&self, client: &reqwest::Client, line: &str) -> Result<(), String> {
         let deadline = Instant::now() + PATIENCE;
+        let mut line_wait = ports::LineWait::default();
         loop {
-            if let Ok(res) =
-                client.get(format!("http://127.0.0.1:{}/healthz", self.http)).send().await
+            if self.http.get().is_none() {
+                let bound = ports::bound_http_port(&self.stdout, line, self.pid, &[]);
+                match line_wait.judge(bound, line) {
+                    Ok(Some(port)) => {
+                        let _ = self.http.set(port);
+                    }
+                    Ok(None) => {}
+                    Err(why) => return Err(format!("{why}; log: {}", self.log())),
+                }
+            }
+            if let Some(port) = self.http.get()
+                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/healthz")).send().await
                 && res.status().is_success()
             {
-                return;
+                return Ok(());
+            }
+            if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                return Err(format!(
+                    "exited ({status}) before it became healthy; log: {}",
+                    self.log()
+                ));
             }
             assert!(Instant::now() < deadline, "never became healthy; log: {}", self.log());
             tokio::time::sleep(POLL).await;
@@ -84,19 +126,16 @@ jwt_secret = "{JWT_SECRET}"
     }
 
     fn signal(&self, sig: &str) {
-        let status = Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
-        assert!(status.success(), "kill -{sig} {}", self.child.id());
+        let status =
+            Command::new("kill").arg(format!("-{sig}")).arg(self.pid.to_string()).status().unwrap();
+        assert!(status.success(), "kill -{sig} {}", self.pid);
     }
 
     /// Wait for the process to end, and report its status.
     fn wait_exit(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
+            if let Some(status) = self.child.get_mut().unwrap().try_wait().unwrap() {
                 return status;
             }
             assert!(Instant::now() < deadline, "did not exit; log: {}", self.log());
@@ -128,8 +167,10 @@ jwt_secret = "{JWT_SECRET}"
 
 impl Drop for Run {
     fn drop(&mut self) {
-        let _ = Command::new("kill").arg("-KILL").arg(self.child.id().to_string()).status();
-        let _ = self.child.wait();
+        let _ = Command::new("kill").arg("-KILL").arg(self.pid.to_string()).status();
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.wait();
+        }
         // The caller's scratch directory goes when the test ends; a failure
         // keeps this run's logs past it.
         let stderr = self.stdout.with_extension("").with_extension("stderr.log");
@@ -138,7 +179,7 @@ impl Drop for Run {
         node_logs::keep_if_failing(
             &node_logs::destination(),
             name,
-            self.child.id(),
+            self.pid,
             &[&self.stdout, &stderr],
         );
     }
@@ -153,7 +194,7 @@ async fn a_graceful_shutdown_logs_both_lines_and_leaves_a_marker_the_next_start_
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
 
-    let mut first = Run::spawn(dir.path(), "first", free_port());
+    let mut first = Run::spawn(dir.path(), "first");
     first.wait_ready(&client).await;
     assert!(marker(dir.path()).is_none(), "a running node has no marker");
 
@@ -168,10 +209,10 @@ async fn a_graceful_shutdown_logs_both_lines_and_leaves_a_marker_the_next_start_
 
     let marker = marker(dir.path()).expect("a graceful shutdown leaves the marker");
     assert!(marker.contains("exit = \"shutdown\""), "{marker}");
-    assert!(marker.contains(&format!("pid = {}", first.child.id())), "{marker}");
+    assert!(marker.contains(&format!("pid = {}", first.pid)), "{marker}");
 
     // The next start reads it, says so, and consumes it.
-    let mut second = Run::spawn(dir.path(), "second", free_port());
+    let mut second = Run::spawn(dir.path(), "second");
     second.wait_ready(&client).await;
     let log = second.log();
     assert!(log.contains("previous run ended cleanly"), "{log}");
@@ -192,7 +233,7 @@ async fn a_start_after_a_kill_warns_that_the_previous_run_did_not_shut_down_clea
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
 
-    let mut first = Run::spawn(dir.path(), "first", free_port());
+    let mut first = Run::spawn(dir.path(), "first");
     first.wait_ready(&client).await;
     // The exit the field saw: no signal the process could log, nothing
     // written on the way out.
@@ -203,7 +244,7 @@ async fn a_start_after_a_kill_warns_that_the_previous_run_did_not_shut_down_clea
     assert!(!log.contains("shutdown"), "a killed process logs no shutdown: {log}");
     assert!(marker_absent(dir.path()), "a killed process leaves no marker");
 
-    let mut second = Run::spawn(dir.path(), "second", free_port());
+    let mut second = Run::spawn(dir.path(), "second");
     second.wait_ready(&client).await;
     let log = second.log();
     let line = log
@@ -229,7 +270,7 @@ async fn a_start_that_fails_logs_its_exit_and_the_next_start_does_not_call_it_un
     // Hold the port, so the node opens its database and then cannot bind.
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
-    let mut failed = Run::spawn(dir.path(), "failed", port);
+    let mut failed = Run::spawn_on(dir.path(), "failed", port);
     let status = failed.wait_exit();
     assert!(!status.success(), "{status:?}");
     let log = failed.log();
@@ -239,7 +280,7 @@ async fn a_start_that_fails_logs_its_exit_and_the_next_start_does_not_call_it_un
     assert!(marker.contains("exit = \"error\""), "{marker}");
     drop(taken);
 
-    let mut next = Run::spawn(dir.path(), "next", free_port());
+    let mut next = Run::spawn(dir.path(), "next");
     next.wait_ready(&client).await;
     let log = next.log();
     assert!(log.contains("previous run ended cleanly"), "{log}");
@@ -248,4 +289,28 @@ async fn a_start_that_fails_logs_its_exit_and_the_next_start_does_not_call_it_un
 
     next.signal("TERM");
     assert!(next.wait_exit().success());
+}
+
+/// Reading a node's HTTP port from its log couples the harness to that line.
+/// A line renamed, or one without a readable `bind=`, must fail the wait at
+/// once, not after `PATIENCE`. Both are simulated by asking for a line the
+/// node does not log, and for one it logs without a `bind=`.
+#[tokio::test]
+async fn a_port_line_the_harness_cannot_read_fails_at_once() {
+    let client = reqwest::Client::new();
+    for (line, says) in
+        [("a line kimmyd never logs", "never logged"), ("starting kimmyd", "without a bind=ADDR")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let run = Run::spawn(dir.path(), "unreadable");
+        let started = Instant::now();
+        let answer = run.try_ready(&client, line).await;
+        let why = answer.expect_err("the port cannot be read, so the wait fails");
+        assert!(why.contains(says), "{why}");
+        assert!(
+            started.elapsed() < PATIENCE / 4,
+            "answered in {:?}, not at once: {why}",
+            started.elapsed()
+        );
+    }
 }
