@@ -169,7 +169,9 @@ base64url( 0x02 ‖ hlc(10) ‖ node(16) ‖ issued-by(16) ‖ origins(u16) ‖ 
     →   164 characters on a three-member cluster
 ```
 
-A token issued before 0.30.0 is the entry alone, and is accepted through 0.30.x:
+A token issued before 0.30.0 is the entry alone. It is guaranteed to be accepted
+through 0.30.x and has been accepted since; a later minor may refuse it, and its
+release notes will say so:
 
 ```
 base64url( hlc(10 bytes) ‖ node(16 bytes) )   →   35 characters

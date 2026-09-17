@@ -316,9 +316,11 @@ witnessed vector already claimed ([ADR-148](decisions.md)), and a token issued
 after that claim passes over them wherever it resumes. A repair follows a
 divergence the check has already reported (`kimmy_sync_divergent_collections`).
 
-**Tokens from before 0.30.0** name only an entry. They are accepted through
-0.30.x: as before where the member holds the entry, and where it does not, from
-the first entry stamped after it rather than at the tail. A 0.29 member refuses
+**Tokens from before 0.30.0** name only an entry. They are guaranteed to be
+accepted through 0.30.x and have been accepted since; a later minor may refuse
+them, and its release notes will say so. Where accepted, they resume as before
+where the member holds the entry, and where it does not, from the first entry
+stamped after it rather than at the tail. A 0.29 member refuses
 a 0.30 token as malformed (`400`), so a client that fails over during a roll to
 a member not yet upgraded is refused until the roll is done.
 

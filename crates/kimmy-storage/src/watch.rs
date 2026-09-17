@@ -1932,10 +1932,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_stamp_token_naming_an_entry_this_member_lacks_resumes_after_its_stamp() {
-        // What every member issued before 0.30.0, still accepted for one
-        // release. It names an entry this member does not hold, inside the
-        // retained range, and resumes at the first entry stamped after it
-        // rather than at the tail.
+        // What every member issued before 0.30.0, still accepted. It names an
+        // entry this member does not hold, inside the retained range, and
+        // resumes at the first entry stamped after it rather than at the tail.
         let (engine, coll, _dir) = setup();
         engine.insert(&coll, doc! { "_id": "before" }).unwrap();
         let unheld = later_by(newest_stamp(&engine), 1);
