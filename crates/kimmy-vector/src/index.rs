@@ -757,13 +757,13 @@ mod tests {
         }
     }
 
-    /// Deterministic pseudo-random vectors, so recall numbers are reproducible.
     /// The truly orphaned fraction below which a draw counts as a healthy
     /// graph in [`a_healthy_graph_at_a_realistic_width_is_not_rebuilt`]:
     /// above every healthy draw measured at 1,000 × 384 (2.8%), below the one
     /// degraded draw (5.7%).
     const HEALTHY_ORPHANED_BELOW: f64 = 0.04;
 
+    /// Deterministic pseudo-random vectors, so recall numbers are reproducible.
     fn pseudo_random(seed: u64, dim: usize) -> Vec<f32> {
         let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (0..dim)
