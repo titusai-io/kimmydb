@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod node_logs;
+
 const JWT_SECRET: &str = "a-lifecycle-harness-jwt-secret-value";
 const PATIENCE: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(100);
@@ -128,6 +130,17 @@ impl Drop for Run {
     fn drop(&mut self) {
         let _ = Command::new("kill").arg("-KILL").arg(self.child.id().to_string()).status();
         let _ = self.child.wait();
+        // The caller's scratch directory goes when the test ends; a failure
+        // keeps this run's logs past it.
+        let stderr = self.stdout.with_extension("").with_extension("stderr.log");
+        let name = self.stdout.file_name().and_then(|n| n.to_str()).unwrap_or("run");
+        let name = name.trim_end_matches(".stdout.log");
+        node_logs::keep_if_failing(
+            &node_logs::destination(),
+            name,
+            self.child.id(),
+            &[&self.stdout, &stderr],
+        );
     }
 }
 

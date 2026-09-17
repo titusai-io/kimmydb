@@ -37,6 +37,8 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod node_logs;
+
 const ROOT_PASSWORD: &str = "harness-root-password";
 const JWT_SECRET: &str = "a-shared-harness-jwt-secret-value";
 const CLUSTER_SECRET: &str = "a-shared-harness-cluster-secret";
@@ -254,6 +256,15 @@ impl Drop for Node {
         // hand, and panicking in a drop during unwind aborts the test binary.
         let _ = Command::new("kill").arg("-KILL").arg(self.child.id().to_string()).status();
         let _ = self.child.wait();
+        // Kept only when the test failed, and only after the kill, so the
+        // files are complete. Every assertion but `wait_ready`'s used to lose
+        // them with the scratch directory.
+        node_logs::keep_if_failing(
+            &node_logs::destination(),
+            self.name,
+            self.child.id(),
+            &[&self.dir.path().join("stdout.log"), &self.dir.path().join("stderr.log")],
+        );
     }
 }
 
@@ -307,6 +318,48 @@ fn the_stderr_tail_distinguishes_empty_failing_and_unreadable() {
     assert!(answer.contains("address already in use"), "the reason must survive: {answer}");
     assert!(!answer.contains("boot line 0\n"), "and the early noise must not: {answer}");
     assert!(answer.contains("last 40 line(s)"), "{answer}");
+}
+
+/// A node's logs outlive its scratch directory when, and only when, the test
+/// that spawned it fails. Not `#[ignore]`d either: it needs no daemon.
+#[test]
+fn a_failing_test_keeps_its_nodes_logs_and_a_passing_one_does_not() {
+    struct Spawned<'a> {
+        scratch: &'a std::path::Path,
+        into: &'a std::path::Path,
+        kept: &'a std::cell::Cell<Option<std::path::PathBuf>>,
+    }
+    impl Drop for Spawned<'_> {
+        fn drop(&mut self) {
+            let logs = [&self.scratch.join("stdout.log"), &self.scratch.join("stderr.log")];
+            self.kept.set(node_logs::keep_if_failing(
+                self.into,
+                "node-a",
+                42,
+                &logs.map(|p| p.as_path()),
+            ));
+        }
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(scratch.path().join("stdout.log"), "WARN peer connection failed\n").unwrap();
+    std::fs::write(scratch.path().join("stderr.log"), "thread panicked\n").unwrap();
+    let into = tempfile::tempdir().unwrap();
+    let kept = std::cell::Cell::new(None);
+
+    drop(Spawned { scratch: scratch.path(), into: into.path(), kept: &kept });
+    assert_eq!(kept.take(), None, "a passing test keeps nothing");
+    assert_eq!(std::fs::read_dir(into.path()).unwrap().count(), 0);
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _node = Spawned { scratch: scratch.path(), into: into.path(), kept: &kept };
+        panic!("an assertion in the test body");
+    }));
+    assert!(failed.is_err());
+    let at = kept.take().expect("a failing test keeps its nodes' logs");
+    assert!(at.starts_with(into.path()) && at.ends_with("node-a-42"), "{}", at.display());
+    let read = |name: &str| std::fs::read_to_string(at.join(name)).unwrap();
+    assert_eq!(read("stdout.log"), "WARN peer connection failed\n");
+    assert_eq!(read("stderr.log"), "thread panicked\n");
 }
 
 /// Wait until `condition` holds, or fail with `what` after [`patience`].
