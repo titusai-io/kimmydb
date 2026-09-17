@@ -491,7 +491,9 @@ is served intact and short of documents. The `DELETE` itself still answers when
 the removal is finished, so a drop of a large collection is a long request —
 size a client timeout for it, and issue it once rather than retrying, since a
 retry answers `{"dropped": false}` for the drop that is already in progress or
-done. A member restarted mid-drop finishes the removal at its next start, and a
+done. Two drops of one collection sent at once to one member are the same case:
+one answers `200 {"dropped": true}`, the other `200 {"dropped": false}`, and only
+the first replicates. A member restarted mid-drop finishes the removal at its next start, and a
 member whose removal gave up on a busy writer finishes it at its next retention
 pass; the drop itself was durable and replicated before the first row went.
 

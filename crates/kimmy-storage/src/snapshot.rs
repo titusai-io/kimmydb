@@ -1191,8 +1191,22 @@ impl Engine {
             // then advertises as the incarnation it holds.
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Restore);
-            match self.create_collection_inner(&state.db, &state.name, false, state.created) {
-                Ok(_) => {}
+            // The tombstone rule above, judged again under the writer.
+            let history =
+                |dropped: Stamp| state.created.is_none_or(|created| created <= dropped.hlc);
+            match self.create_collection_inner(
+                &state.db,
+                &state.name,
+                false,
+                state.created,
+                &history,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    #[cfg(test)]
+                    crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
+                    return Ok(0);
+                }
                 // Checked outside the writer, so the name can be created in
                 // between, by a pull or a push applying its creation. Found
                 // here, it is the case the check above already leaves alone:
@@ -1416,6 +1430,41 @@ mod tests {
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(b.count(&cb).unwrap(), 10);
         assert!(cb.indexes.iter().any(|i| i.name == "item_1"), "{cb:?}");
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::Restore);
+    }
+
+    #[test]
+    fn a_snapshot_page_does_not_restore_a_collection_dropped_while_it_applied() {
+        // The page names the collection's life before a drop. The restore's
+        // tombstone check is made before the writer, and a pull applying the
+        // creation and the drop can land in between; the restore then
+        // recreated the dropped life.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+
+        let pulling = std::sync::Arc::clone(&b);
+        let (restored, pulled) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::Restore,
+            move || {
+                pulling.apply_peer_batch(
+                    &theirs,
+                    &window.entries,
+                    window.scanned_to,
+                    window.exhausted,
+                )
+            },
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        pulled.expect("the pull creates and drops the collection");
+        restored.expect("the page applies");
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::Restore);
     }
 

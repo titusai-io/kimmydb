@@ -1474,14 +1474,26 @@ impl Engine {
                     })) => {
                         #[cfg(test)]
                         race_hooks::reach(race_hooks::Race::ReplicatedCreate);
+                        // The tombstone rule above, judged again under the
+                        // writer: a drop can land between that check and here.
                         match self.create_collection_inner(
                             &target.db,
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
+                            &|dropped_at| entry.stamp < dropped_at,
                         ) {
-                            Ok(_) => {
+                            Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                            }
+                            Ok(None) => {
+                                #[cfg(test)]
+                                race_hooks::absorbed(race_hooks::Race::ReplicatedCreate);
+                                debug!(
+                                    db = %target.db,
+                                    collection = %target.name,
+                                    "ignored a creation older than a drop that landed while it applied"
+                                );
                             }
                             // The check above is not made under the writer, so a
                             // collection of this name can be created between it
@@ -6217,5 +6229,145 @@ mod tests {
         let index = held.index("by_a").expect("the recreation stands");
         assert_eq!(index.created, recreated.created, "and it is the recreation");
         race_hooks::assert_absorbed(race_hooks::Race::ReplicatedIndexDrop);
+    }
+
+    #[test]
+    fn of_two_local_drops_of_one_collection_one_drops_it_and_one_answers_not_dropped() {
+        // Two clients dropping one collection at once on one member. The one
+        // that takes the writer second finds nothing standing: it answers
+        // `dropped: false`, as a retried drop does, and logs no entry of its
+        // own. It used to answer `true` and log a second drop, whose later
+        // stamp moved the tombstone past the first.
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let competing = Arc::clone(&engine);
+        let (second, first) = race_hooks::race(
+            race_hooks::Race::Burial,
+            move || competing.drop_collection("shop", "orders"),
+            || engine.drop_collection("shop", "orders"),
+        );
+        assert!(first.unwrap(), "the first drop drops it");
+        assert!(!second.unwrap(), "the second answers that it dropped nothing");
+        let drops: Vec<Stamp> = engine
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.kind == OpKind::DropCollection && e.collection == orders.id)
+            .map(|e| e.stamp)
+            .collect();
+        assert_eq!(drops.len(), 1, "one drop replicates: {drops:?}");
+        assert_eq!(engine.collection_dropped_at(orders.id).unwrap(), Some(drops[0]));
+        race_hooks::assert_absorbed(race_hooks::Race::Burial);
+    }
+
+    #[test]
+    fn a_replicated_create_does_not_resurrect_a_collection_dropped_while_it_applied() {
+        // The creation's tombstone check is made before the writer. A
+        // concurrent apply of the creation and the drop after it can land in
+        // between; the creation then found no collection and no reason to
+        // refuse, and made one: this member held a collection its peers had
+        // dropped, created below the tombstone that should have kept it out,
+        // and nothing served the difference again.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let (theirs, whole) = window_for(&b, &a);
+        let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [OpKind::CreateCollection, OpKind::DropCollection]);
+        let through_create = OplogWindow {
+            entries: whole.entries[..1].to_vec(),
+            scanned_to: whole.entries[0].stamp.hlc,
+            exhausted: false,
+        };
+
+        let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
+        let (created, dropped) = race_hooks::race(
+            race_hooks::Race::ReplicatedCreate,
+            move || {
+                let (b, theirs, whole) = competing;
+                b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
+            },
+            || {
+                b.apply_peer_batch(
+                    &theirs,
+                    &through_create.entries,
+                    through_create.scanned_to,
+                    through_create.exhausted,
+                )
+            },
+        );
+        dropped.expect("the creation and the drop apply");
+        created.expect("the creation applies, as history");
+        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
+        assert_eq!(
+            b.collection_dropped_at(orders.id).unwrap(),
+            a.collection_dropped_at(orders.id).unwrap()
+        );
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
+    }
+
+    #[test]
+    fn a_drop_that_reads_the_collection_before_a_recreation_does_not_bury_the_recreation() {
+        // A drop reads the collection, then takes the writer to bury it. A
+        // concurrent apply of the same drop, the recreation after it, and a
+        // write into the new incarnation can all land in between. The burial
+        // used to remove whatever stood under the name once it held the
+        // writer: the recreation and its documents went, both applies
+        // returned Ok, and the window that carried them was witnessed, so
+        // nothing served them again.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let first = a.create_collection("shop", "orders").unwrap();
+        let (theirs, window) = window_for(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+
+        a.insert(&first, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        a.insert(&second, doc! { "_id": 2 }).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let held = b.witnessed_vector().unwrap();
+        let start = held.behind(&theirs).unwrap();
+        let whole = a.entries_for_peer_holding(start, BATCH, Some(&held)).unwrap();
+        let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [OpKind::Insert, OpKind::DropCollection, OpKind::CreateCollection, OpKind::Insert]
+        );
+        // The same window cut after the drop, as a pull truncated there would
+        // carry it.
+        let through_drop = OplogWindow {
+            entries: whole.entries[..2].to_vec(),
+            scanned_to: whole.entries[1].stamp.hlc,
+            exhausted: false,
+        };
+
+        let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
+        let (dropped, recreated) = race_hooks::race(
+            race_hooks::Race::Burial,
+            move || {
+                let (b, theirs, whole) = competing;
+                b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
+            },
+            || {
+                b.apply_peer_batch(
+                    &theirs,
+                    &through_drop.entries,
+                    through_drop.scanned_to,
+                    through_drop.exhausted,
+                )
+            },
+        );
+        recreated.expect("the whole window applies");
+        dropped.expect("the drop applies");
+        let held = b.get_collection("shop", "orders").expect("the recreation stands");
+        assert_eq!(held.created, second.created, "and it is the new incarnation");
+        assert_eq!(b.count(&held).unwrap(), 1, "with its document");
+        race_hooks::assert_absorbed(race_hooks::Race::Burial);
     }
 }
