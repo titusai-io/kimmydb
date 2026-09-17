@@ -127,12 +127,57 @@ impl crate::Engine {
             ))));
         }
 
+        // The shadow is created in the same transaction as the configuration
+        // it serves, so neither is ever durable without the other: minted
+        // before the configuration's own commit, one that turned out history,
+        // or whose collection was dropped in between, left a shadow whose
+        // creation replicated; minted after it, a crash between the two left
+        // a configuration the embedding worker skips for want of a shadow.
+        // What a dropped shadow of this name left behind is purged first,
+        // outside the writer, as any creation's is.
         let shadow = vector_meta::shadow_name(collection);
+        let shadow_missing = match self.get_collection(db, &shadow) {
+            Ok(_) => false,
+            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => true,
+            Err(e) => return Err(e),
+        };
+        if shadow_missing {
+            self.purge_dropped_collection(CollectionId::derive(db, &shadow))?;
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
+        }
 
         meta.vector = Some(config.clone());
         let txn = self.begin_write(WriterHolder::Ddl)?;
-        // The definition written back was read before the writer
-        // (`Engine::definition_is`).
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorsWriting);
+        // The shadow first, so its creation is logged before the
+        // configuration, the order a peer applying the window meets them in.
+        let shadow_entry = match self.create_collection_in_txn(
+            &txn,
+            db,
+            &shadow,
+            true,
+            None,
+            &|_| false,
+            self.next_stamp(),
+        ) {
+            Ok(crate::engine::InTxn::Created(_, entry)) => entry,
+            Ok(crate::engine::InTxn::Exists) => {
+                // Made by a concurrent configuration of this collection since
+                // it was found missing: the shadow this one wanted.
+                #[cfg(test)]
+                if shadow_missing {
+                    crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::SystemCreate);
+                }
+                None
+            }
+            Ok(crate::engine::InTxn::History) => None,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
         if !crate::Engine::definition_is(&txn, &read)? {
             txn.abort()?;
             #[cfg(test)]
@@ -158,52 +203,15 @@ impl crate::Engine {
             None
         };
         txn.commit()?;
-        if let Some(entry) = logged {
-            self.publish(vec![entry]);
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorsCommitted);
+        let published: Vec<_> = shadow_entry.into_iter().chain(logged).collect();
+        if !published.is_empty() {
+            self.publish(published);
         }
 
-        // The shadow is minted only now, once the configuration it serves is
-        // judged under the writer and committed, and only while that
-        // configuration still stands: minted before, a configuration that
-        // turned out to be history, or whose collection was dropped in
-        // between, left a shadow whose creation replicated.
-        self.create_shadow_for(db, &shadow, &meta)?;
         info!(db, collection, shadow = %shadow, "configured auto-embedding");
         Ok(meta)
-    }
-
-    /// Create `parent`'s vector shadow `shadow` if it is missing, while the
-    /// collection standing under `parent`'s name is still `parent`'s life with
-    /// `parent`'s configuration.
-    fn create_shadow_for(&self, db: &str, shadow: &str, parent: &CollectionMeta) -> Result<()> {
-        match self.get_collection(db, shadow) {
-            Ok(_) => return Ok(()),
-            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => {}
-            Err(e) => return Err(e),
-        }
-        #[cfg(test)]
-        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
-        let still = || match self.get_collection(db, &parent.name) {
-            // The same life with the same configuration. Not the whole
-            // definition: a document write marking an index multikey changes
-            // it without changing what the shadow serves.
-            Ok(standing) => Ok(standing.created == parent.created
-                && standing.incarnation_floor == parent.incarnation_floor
-                && standing.vector == parent.vector),
-            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => Ok(false),
-            Err(e) => Err(e),
-        };
-        match self.create_collection_while(db, shadow, true, None, &|_| false, &still) {
-            Ok(_) => Ok(()),
-            // Created by a concurrent configuration of the same parent: the
-            // shadow this one wanted.
-            Err(StorageError::Core(CoreError::CollectionExists { .. })) => {
-                #[cfg(test)]
-                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::SystemCreate);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     }
 
     /// Turn off auto-embedding, optionally discarding the vectors.

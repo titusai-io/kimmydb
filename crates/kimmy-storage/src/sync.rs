@@ -1966,6 +1966,12 @@ pub(crate) mod race_hooks {
         RestoreDefinitions,
         /// Not a race point: a vector configuration judged history.
         VectorHistory,
+        /// A vector configuration holds the writer and has not committed:
+        /// not a race, a point to look at what is visible before its commit.
+        VectorsWriting,
+        /// A vector configuration has committed: not a race, a point to look
+        /// at what the commit made visible.
+        VectorsCommitted,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -1984,7 +1990,17 @@ pub(crate) mod race_hooks {
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
+    ///
+    /// Races do not nest: arming one while another is armed panics. The
+    /// competing depth below counts nested hooks against the day they can;
+    /// that day this assertion goes red, and the nesting it counts gets a
+    /// test.
     pub(crate) fn at(race: Race, competitor: impl FnOnce() + 'static) {
+        HOOK.with(|h| {
+            if let Some((armed, _)) = h.borrow().as_ref() {
+                panic!("a race is already armed ({armed:?}); races do not nest: {race:?}");
+            }
+        });
         ABSORBED.with(|a| a.set(0));
         HOOK.with(|h| *h.borrow_mut() = Some((race, Box::new(competitor))));
     }
@@ -6744,5 +6760,109 @@ mod tests {
         assert_eq!(held.created, second.created);
         assert!(held.vector.is_some(), "the second life's vectors stay on");
         race_hooks::assert_absorbed(race_hooks::Race::VectorRemoval);
+    }
+
+    fn shadow_held(engine: &Engine) -> bool {
+        engine.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).is_ok()
+    }
+
+    fn vectors_on(engine: &Engine) -> bool {
+        engine.get_collection("shop", "orders").is_ok_and(|c| c.vector.is_some())
+    }
+
+    #[test]
+    fn a_vector_configuration_and_its_shadow_are_never_visible_one_without_the_other() {
+        // One commit for both. Looked at while the configuration holds the
+        // writer and has not committed, neither is there; looked at the
+        // instant it has committed, both are. Committed apart, a crash between the two left a shadow
+        // without a configuration, or a configuration the embedding worker
+        // skips for want of a shadow.
+        let (first, _first_dir) = engine();
+        let first = Arc::new(first);
+        first.create_collection("shop", "orders").unwrap();
+
+        let looking = Arc::clone(&first);
+        let (configured, before) = race_hooks::race(
+            race_hooks::Race::VectorsWriting,
+            move || (vectors_on(&looking), shadow_held(&looking)),
+            || first.configure_vectors("shop", "orders", vector_config()),
+        );
+        configured.unwrap();
+        assert_eq!(before, (false, false), "before the commit: neither");
+
+        let (fresh, _fresh_dir) = engine();
+        let fresh = Arc::new(fresh);
+        fresh.create_collection("shop", "orders").unwrap();
+        let looking = Arc::clone(&fresh);
+        let (configured, after) = race_hooks::race(
+            race_hooks::Race::VectorsCommitted,
+            move || (vectors_on(&looking), shadow_held(&looking)),
+            || fresh.configure_vectors("shop", "orders", vector_config()),
+        );
+        configured.unwrap();
+        assert_eq!(after, (true, true), "at the commit: both");
+    }
+
+    #[test]
+    fn a_multikey_flag_set_while_a_configuration_waits_does_not_keep_its_shadow_from_being_made() {
+        // A document write marking an index multikey changes the collection's
+        // definition between the configuration's read and its writer. The
+        // configuration is decided again and still makes its shadow in the
+        // same commit.
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index("shop", "orders", vec![field("tags")], false, Some("by_tags".into()))
+            .unwrap();
+
+        let writing = Arc::clone(&engine);
+        let (configured, written) = race_hooks::race(
+            race_hooks::Race::SystemCreate,
+            move || writing.insert(&orders, doc! { "_id": 1, "tags": [1, 2] }),
+            || engine.configure_vectors("shop", "orders", vector_config()),
+        );
+        written.unwrap();
+        configured.unwrap();
+        let held = engine.get_collection("shop", "orders").unwrap();
+        assert!(held.index("by_tags").unwrap().multikey, "the flag was set meanwhile");
+        assert!(held.vector.is_some());
+        assert!(shadow_held(&engine), "and the shadow was made");
+        race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    #[test]
+    fn a_peers_own_shadow_and_the_origins_shadow_creation_resolve_to_one_shadow() {
+        // A member that applies a configuration without the shadow's own
+        // creation entry makes the shadow itself, and logs its creation; the
+        // origin's creation of it, served afterwards, finds it standing.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"));
+        let is_shadow_create =
+            |e: &OplogEntry| e.kind == OpKind::CreateCollection && e.collection == shadow;
+        let position = whole.entries.iter().position(is_shadow_create).unwrap();
+        let configure =
+            whole.entries.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+        assert!(
+            position < configure,
+            "the origin logs the shadow's creation before the configuration"
+        );
+        let mut without = whole.clone();
+        without.entries.retain(|e| !is_shadow_create(e));
+        apply(&b, &theirs, &without).unwrap();
+        assert!(shadow_held(&b), "made by the member itself");
+
+        let again = apply(&b, &theirs, &slice(&whole, position, position + 1)).unwrap();
+        assert_eq!(again.ddl_refused, 0, "{again:?}");
+        assert!(shadow_held(&b));
+        assert_eq!(
+            b.list_collections("shop").unwrap().iter().filter(|c| c.id == shadow).count(),
+            1
+        );
     }
 }

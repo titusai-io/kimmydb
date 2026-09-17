@@ -60,7 +60,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   Through a snapshot page from a member behind on the drop: the old
   collection's indexes and vector configuration were restored into the new one.
   Each is now judged against the collection that stands, under the writer, and
-  a vector shadow is created only once the configuration it serves is.
+  a vector shadow is created in the same commit as the configuration it serves.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the
