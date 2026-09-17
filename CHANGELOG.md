@@ -23,6 +23,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   again. A creation found already made by the other apply now counts as
   applied. And a member that cannot apply a pushed window now tells the pusher
   why, so the `pending` reason names the cause instead of a closed connection.
+  The same check-then-create race is closed where else it lived: two applies of
+  one vector configuration creating its shadow collection (the second failed
+  its window), a snapshot restore creating a collection a pull created
+  meanwhile (the page failed), and two requests setting up a system collection
+  on first use (the second could be answered `409` once).
 
 ## 0.32.0 - 2026-09-17
 

@@ -3612,10 +3612,10 @@ mod tests {
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
 
-    /// A pushed window this node cannot apply is refused with a `Fault`
-    /// naming why, not a hang-up. The pusher reports what it reads; a closed
-    /// connection told it only "peer closed the connection", on a member that
-    /// had logged the reason.
+    /// A pushed window this node cannot apply is answered with a `Fault`
+    /// naming why, not a hang-up. The pusher reports the member pending with
+    /// what it reads; a closed connection told it only "peer closed the
+    /// connection", on a member that had logged the reason.
     #[tokio::test]
     async fn a_push_that_cannot_be_applied_is_answered_with_the_reason() {
         let a_dir = tempfile::tempdir().unwrap();

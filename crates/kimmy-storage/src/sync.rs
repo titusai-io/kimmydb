@@ -1473,7 +1473,7 @@ impl Engine {
                         ..
                     })) => {
                         #[cfg(test)]
-                        race_hooks::reach(race_hooks::Race::CreateCollection);
+                        race_hooks::reach(race_hooks::Race::ReplicatedCreate);
                         match self.create_collection_inner(
                             &target.db,
                             &target.name,
@@ -1483,18 +1483,23 @@ impl Engine {
                             Ok(_) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
                             }
-                            // The check above is not made under the writer, and
-                            // two applies of this entry can pass it together: a
+                            // The check above is not made under the writer, so a
+                            // collection of this name can be created between it
+                            // and the create: by another apply of this entry (a
                             // peer's push against this node's own pull, or two
-                            // members' pushes. The one that takes the writer
-                            // second finds the collection here, which is the
-                            // case the check already treats as applied. Refused,
-                            // it failed the whole batch: a push answered with a
-                            // closed connection and reported pending, and a pull
-                            // lost its round to a backoff.
+                            // members' pushes), or by any other creation of the
+                            // name, a local client's or a snapshot restore's.
+                            // Found here, it is the case the check already
+                            // treats as applied, and by the same name-only rule:
+                            // whichever creation stands, the name is held.
+                            // Refused, it failed the whole batch: a push
+                            // answered with a closed connection and reported
+                            // pending, and a pull lost its round to a backoff.
                             Err(crate::StorageError::Core(
                                 kimmy_core::Error::CollectionExists { .. },
                             )) => {
+                                #[cfg(test)]
+                                race_hooks::absorbed(race_hooks::Race::ReplicatedCreate);
                                 debug!(
                                     db = %target.db,
                                     collection = %target.name,
@@ -1851,32 +1856,84 @@ impl Engine {
     }
 }
 
-/// Test-only points inside a replicated schema change's check-then-act, where
-/// a concurrent apply of the same entry lands in production. `cfg(test)`:
+/// Test-only points inside a collection's check-then-act, where a concurrent
+/// creation or burial of the same name lands in production, and a record of
+/// whether the losing side then took the branch that absorbs it. `cfg(test)`:
 /// reachable from no other crate and absent from every other build.
 #[cfg(test)]
 pub(crate) mod race_hooks {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Race {
         /// A replicated `CreateCollection` found no collection, and has not
         /// yet taken the writer to create it.
-        CreateCollection,
+        ReplicatedCreate,
         /// A drop read the collection it will bury, and has not yet taken the
         /// writer to bury it.
-        BuryCollection,
+        Burial,
+        /// `create_system_collection` found no collection, and has not yet
+        /// taken the writer to create it.
+        SystemCreate,
+        /// A snapshot restore found no collection, and has not yet taken the
+        /// writer to create it.
+        Restore,
     }
 
     type Hook = Box<dyn FnOnce()>;
 
     thread_local! {
         static HOOK: RefCell<Option<(Race, Hook)>> = const { RefCell::new(None) };
+        static ABSORBED: Cell<Option<Race>> = const { Cell::new(None) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
     pub(crate) fn at(race: Race, competitor: impl FnOnce() + 'static) {
+        ABSORBED.with(|a| a.set(None));
         HOOK.with(|h| *h.borrow_mut() = Some((race, Box::new(competitor))));
+    }
+
+    /// Record that the side that lost `race` found the other side's work
+    /// under the writer and took it as done. Set only in that branch, so a
+    /// hook that moves ahead of the check it races leaves it unset.
+    pub(crate) fn absorbed(race: Race) {
+        ABSORBED.with(|a| a.set(Some(race)));
+    }
+
+    /// Whether this thread's last `absorbed` was `race`.
+    pub(crate) fn was_absorbed(race: Race) -> bool {
+        ABSORBED.with(|a| a.get()) == Some(race)
+    }
+
+    /// Run `outer`, with `competitor` run inside it at `race`, and hand back
+    /// both results. Fails if the competitor never ran, so a removed hook
+    /// cannot pass; [`assert_absorbed`] catches one that has moved.
+    pub(crate) fn race<T, C: 'static>(
+        race: Race,
+        competitor: impl FnOnce() -> C + 'static,
+        outer: impl FnOnce() -> T,
+    ) -> (T, C) {
+        let slot = std::rc::Rc::new(RefCell::new(None));
+        let into = std::rc::Rc::clone(&slot);
+        at(race, move || *into.borrow_mut() = Some(competitor()));
+        let outcome = outer();
+        let competed = slot
+            .take()
+            .unwrap_or_else(|| panic!("the race was never reached, so nothing competed: {race:?}"));
+        (outcome, competed)
+    }
+
+    /// For the end of a race test, after its outcomes are asserted: the side
+    /// that lost took the branch that absorbs the race. Asserted last, so a
+    /// fix that is removed fails on the outcome it breaks, and only a hook
+    /// that has moved ahead of its check, where every outcome is fine because
+    /// nothing raced, fails here.
+    pub(crate) fn assert_absorbed(race: Race) {
+        assert!(
+            was_absorbed(race),
+            "the competitor ran, but the side that lost did not take the branch that absorbs \
+             it: the hook has moved away from the check it races: {race:?}"
+        );
     }
 
     pub(crate) fn reach(race: Race) {
@@ -5650,29 +5707,15 @@ mod tests {
         window: &OplogWindow,
         race: race_hooks::Race,
     ) -> (Result<SyncOutcome>, Result<SyncOutcome>) {
-        let competitor = std::rc::Rc::new(std::cell::RefCell::new(None));
-        {
-            let (engine, theirs, window, competitor) = (
-                Arc::clone(engine),
-                theirs.clone(),
-                window.clone(),
-                std::rc::Rc::clone(&competitor),
-            );
-            race_hooks::at(race, move || {
-                let outcome = engine.apply_peer_batch(
-                    &theirs,
-                    &window.entries,
-                    window.scanned_to,
-                    window.exhausted,
-                );
-                *competitor.borrow_mut() = Some(outcome);
-            });
-        }
-        let outcome =
-            engine.apply_peer_batch(theirs, &window.entries, window.scanned_to, window.exhausted);
-        let competitor =
-            competitor.take().unwrap_or_else(|| panic!("the race was reached: {race:?}"));
-        (outcome, competitor)
+        let apply = |engine: &Engine, theirs: &VersionVector, window: &OplogWindow| {
+            engine.apply_peer_batch(theirs, &window.entries, window.scanned_to, window.exhausted)
+        };
+        let (competing, theirs_c, window_c) = (Arc::clone(engine), theirs.clone(), window.clone());
+        race_hooks::race(
+            race,
+            move || apply(&competing, &theirs_c, &window_c),
+            || apply(engine, theirs, window),
+        )
     }
 
     #[test]
@@ -5692,7 +5735,7 @@ mod tests {
         let (theirs, window) = window_for(&b, &a);
 
         let (pushed, pulled) =
-            apply_racing(&b, &theirs, &window, race_hooks::Race::CreateCollection);
+            apply_racing(&b, &theirs, &window, race_hooks::Race::ReplicatedCreate);
         let pulled = pulled.expect("the round that won applies the window");
         assert_eq!(pulled.ddl, 2, "{pulled:?}");
         let pushed = pushed.expect("the push that lost is answered, not refused");
@@ -5700,6 +5743,7 @@ mod tests {
         assert_eq!(pushed.ddl_refused, 0, "{pushed:?}");
         assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_some());
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pushed:?}");
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
     }
 
     #[test]
@@ -5717,13 +5761,14 @@ mod tests {
         let (theirs, window) = window_for(&b, &a);
 
         let (pulled, pushed) =
-            apply_racing(&b, &theirs, &window, race_hooks::Race::CreateCollection);
+            apply_racing(&b, &theirs, &window, race_hooks::Race::ReplicatedCreate);
         pushed.expect("the push that won applies the window");
         let pulled = pulled.expect("the pull that lost applies its window, not fails it");
         assert_eq!(pulled.ddl, 1, "{pulled:?}");
         assert_eq!(pulled.applied + pulled.superseded, 2, "{pulled:?}");
         assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 2);
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pulled:?}");
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
     }
 
     #[test]
@@ -5745,11 +5790,58 @@ mod tests {
         let dropped_at = a.collection_dropped_at(orders.id).unwrap().expect("a tombstone");
         let (theirs, window) = window_for(&b, &a);
 
-        let (second, first) = apply_racing(&b, &theirs, &window, race_hooks::Race::BuryCollection);
+        let (second, first) = apply_racing(&b, &theirs, &window, race_hooks::Race::Burial);
         first.expect("the first drop applies");
         second.expect("the second drop, of a collection already buried, applies too");
         assert!(b.get_collection("shop", "orders").is_err(), "dropped");
         assert_eq!(b.collection_dropped_at(orders.id).unwrap(), Some(dropped_at));
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None);
+        race_hooks::assert_absorbed(race_hooks::Race::Burial);
+    }
+
+    #[test]
+    fn two_applies_of_one_vector_configuration_both_create_or_find_its_shadow() {
+        // `ConfigureVectors` creates the shadow collection through
+        // `create_system_collection` when the member does not hold it, which
+        // checks outside the writer as the `CreateCollection` arm does: two
+        // applies of one entry could both find the shadow absent, and the
+        // second failed its batch on `CollectionExists` for the shadow. The
+        // shadow's own creation entry is left out of the window, so the
+        // configuration is what creates it here.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let (theirs, mut window) = window_for(&b, &a);
+        let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"));
+        window.entries.retain(|e| !(e.kind == OpKind::CreateCollection && e.collection == shadow));
+        assert!(window.entries.iter().any(|e| e.kind == OpKind::ConfigureVectors));
+
+        let (second, first) = apply_racing(&b, &theirs, &window, race_hooks::Race::SystemCreate);
+        first.expect("the first apply creates the shadow");
+        second.expect("the second apply finds the shadow, not fails its batch");
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+        assert!(b.vector_collection("shop", "orders").unwrap().is_some(), "the shadow stands");
+        assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None);
+        race_hooks::assert_absorbed(race_hooks::Race::SystemCreate);
+    }
+
+    #[test]
+    fn two_callers_setting_up_one_system_collection_both_get_it() {
+        // The same check-then-create reached from a request path: two
+        // requests setting up a system collection on first use.
+        let (engine, _dir) = engine();
+        let engine = Arc::new(engine);
+        let competing = Arc::clone(&engine);
+        let (second, first) = race_hooks::race(
+            race_hooks::Race::SystemCreate,
+            move || competing.create_system_collection("__kimmy", "__nodes"),
+            || engine.create_system_collection("__kimmy", "__nodes"),
+        );
+        let first = first.expect("the first caller creates it");
+        let second = second.expect("the second caller gets it, not CollectionExists");
+        assert_eq!(first.id, second.id);
+        race_hooks::assert_absorbed(race_hooks::Race::SystemCreate);
     }
 }

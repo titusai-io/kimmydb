@@ -1189,7 +1189,21 @@ impl Engine {
             // create carries at its origin, which is what a replayed drop is
             // judged against (`create_collection_inner`) and what this node
             // then advertises as the incarnation it holds.
-            self.create_collection_inner(&state.db, &state.name, false, state.created)?;
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Restore);
+            match self.create_collection_inner(&state.db, &state.name, false, state.created) {
+                Ok(_) => {}
+                // Checked outside the writer, so the name can be created in
+                // between, by a pull or a push applying its creation. Found
+                // here, it is the case the check above already leaves alone:
+                // the name is held, and the indexes and documents below go
+                // into what stands, as they would have a moment later.
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionExists { .. })) => {
+                    #[cfg(test)]
+                    crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let mut refused = 0usize;
@@ -1363,6 +1377,45 @@ mod tests {
         let cb = b.get_collection("shop", &name).unwrap();
         assert_eq!(cb.id, ca.id);
         assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE + 1);
+    }
+
+    #[test]
+    fn a_snapshot_restoring_a_collection_a_pull_creates_meanwhile_restores_into_it() {
+        // `restore_collection` checks the name outside the writer, so a pull
+        // applying the collection's creation can land between the check and
+        // the create. The restore used to fail the page on `CollectionExists`.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("item")], true, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        for i in 0..10i64 {
+            a.insert(&ca, doc! { "_id": i, "item": format!("item-{i}") }).unwrap();
+        }
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+
+        let pulling = std::sync::Arc::clone(&b);
+        let (restored, pulled) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::Restore,
+            move || {
+                pulling.apply_peer_batch(
+                    &theirs,
+                    &window.entries,
+                    window.scanned_to,
+                    window.exhausted,
+                )
+            },
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        pulled.expect("the pull creates the collection");
+        restored.expect("the restore finds it and restores into it, not fails the page");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap(), 10);
+        assert!(cb.indexes.iter().any(|i| i.name == "item_1"), "{cb:?}");
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::Restore);
     }
 
     #[test]
