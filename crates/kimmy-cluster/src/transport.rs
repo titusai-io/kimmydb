@@ -276,7 +276,7 @@ where
                 // retained oplog to reach the first entry it lacks, in one read
                 // transaction (ADR-153).
                 let window = kimmy_storage::blocking(|| {
-                    engine.entries_for_peer_marked(from, limit, held.as_ref(), &marked)
+                    engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked)
                 })
                 .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 

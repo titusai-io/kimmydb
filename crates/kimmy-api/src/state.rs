@@ -196,6 +196,12 @@ impl AppState {
             // and says nothing about which path an operator should go and
             // look at.
             writer_hold: self.engine.writer_hold(),
+            // What those holds were made of (ADR-176). Not read atomically
+            // with the histogram: a scrape can catch a hold in one and not yet
+            // the other, which the next scrape evens out.
+            writer_hold_decomposition: self.engine.writer_hold_decomposition(),
+            // What serving peers' windows has cost this node (ADR-176).
+            serve: self.engine.serve_cost(),
             // Entries held as state that a window released (ADR-169's
             // addendum), counted by the engine on commit so a pulled and a
             // pushed window land on the same series.

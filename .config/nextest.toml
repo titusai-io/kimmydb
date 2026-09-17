@@ -1,0 +1,8 @@
+# The write-lock hold decomposition's tests read this thread's CPU time and
+# assert how much of a hold was on the CPU and how much off it (ADR-176). Run
+# beside the rest of the workspace's tests, the machine's other threads decide
+# that, and one of them deliberately starves its holder of the CPU. Each takes
+# every slot, so it runs alone and measures only what it set up.
+[[profile.default.overrides]]
+filter = 'package(kimmy-storage) & test(/^hold_meter::tests::/)'
+threads-required = "num-cpus"
