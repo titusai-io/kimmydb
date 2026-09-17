@@ -1893,25 +1893,37 @@ pub(crate) mod race_hooks {
 
     thread_local! {
         static HOOK: RefCell<Option<(Race, Hook)>> = const { RefCell::new(None) };
-        static ABSORBED: Cell<Option<Race>> = const { Cell::new(None) };
+        /// Every race absorbed since the last `at`, one bit per `Race`: a
+        /// change that absorbs one race and then another on its way (a vector
+        /// configuration that finds its shadow made, then its definition
+        /// changed) records both.
+        static ABSORBED: Cell<u32> = const { Cell::new(0) };
+        /// Set while the competitor runs. It runs on this thread, inside the
+        /// side that loses, and may take an absorbing branch of its own; that
+        /// is not the loser absorbing the race, so it records nothing.
+        static COMPETING: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
     pub(crate) fn at(race: Race, competitor: impl FnOnce() + 'static) {
-        ABSORBED.with(|a| a.set(None));
+        ABSORBED.with(|a| a.set(0));
         HOOK.with(|h| *h.borrow_mut() = Some((race, Box::new(competitor))));
     }
 
     /// Record that the side that lost `race` found the other side's work
     /// under the writer and took it as done. Set only in that branch, so a
-    /// hook that moves ahead of the check it races leaves it unset.
+    /// hook that moves ahead of the check it races leaves it unset; and not
+    /// while the competitor runs, whose own branches are not the loser's.
     pub(crate) fn absorbed(race: Race) {
-        ABSORBED.with(|a| a.set(Some(race)));
+        if COMPETING.with(|c| c.get()) {
+            return;
+        }
+        ABSORBED.with(|a| a.set(a.get() | 1 << race as u32));
     }
 
-    /// Whether this thread's last `absorbed` was `race`.
+    /// Whether this thread has absorbed `race` since the last `at`.
     pub(crate) fn was_absorbed(race: Race) -> bool {
-        ABSORBED.with(|a| a.get()) == Some(race)
+        ABSORBED.with(|a| a.get()) & 1 << race as u32 != 0
     }
 
     /// Run `outer`, with `competitor` run inside it at `race`, and hand back
@@ -1957,7 +1969,9 @@ pub(crate) mod race_hooks {
             }
         });
         if let Some(hook) = hook {
+            COMPETING.with(|c| c.set(true));
             hook();
+            COMPETING.with(|c| c.set(false));
         }
     }
 }
@@ -5725,6 +5739,33 @@ mod tests {
             move || apply(&competing, &theirs_c, &window_c),
             || apply(engine, theirs, window),
         )
+    }
+
+    #[test]
+    fn a_race_counts_what_the_losing_side_absorbs_and_not_what_the_competitor_does() {
+        // The competitor runs inside the loser, on this thread; a branch it
+        // takes must not stand in for one the loser did not.
+        let (outer, ()) = race_hooks::race(
+            race_hooks::Race::Restore,
+            || race_hooks::absorbed(race_hooks::Race::Restore),
+            || {
+                race_hooks::reach(race_hooks::Race::Restore);
+                race_hooks::was_absorbed(race_hooks::Race::Restore)
+            },
+        );
+        assert!(!outer, "an absorb inside the competitor records nothing");
+        race_hooks::absorbed(race_hooks::Race::Restore);
+        race_hooks::assert_absorbed(race_hooks::Race::Restore);
+        // And `at` clears what an earlier race recorded, before the next
+        // competitor can run.
+        let ((), ()) = race_hooks::race(
+            race_hooks::Race::Burial,
+            || {},
+            || {
+                race_hooks::reach(race_hooks::Race::Burial);
+            },
+        );
+        assert!(!race_hooks::was_absorbed(race_hooks::Race::Restore));
     }
 
     #[test]
