@@ -10,6 +10,16 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The change-stream and oplog guides no longer read as if resume tokens from
+  before 0.30.0 stopped being accepted after 0.30.x.** They are still accepted,
+  as ADR-173 and [docs/compatibility.md](docs/compatibility.md) allow: 0.30.x
+  was the guaranteed minimum, not an end date. A later minor may refuse them,
+  and its release notes will say so.
+
 ## 0.31.0 - 2026-09-16
 
 **A minor, for one integer becoming a decimal.** `kimmy_replication_lag_seconds`
