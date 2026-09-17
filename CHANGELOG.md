@@ -10,6 +10,25 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A schema change confirmed right after its collection was created no longer
+  reports a member pending that holds it.** A member applying a peer's push
+  while its own sync round applied the same collection creation could fail the
+  whole window on "collection already exists"; the push then read
+  `peer closed the connection` and named the member in `confirmation.pending`,
+  and a sync round that lost the same race backed off and fetched the window
+  again. A creation found already made by the other apply now counts as
+  applied. And a member that cannot apply a pushed window now tells the pusher
+  why, so the `pending` reason names the cause instead of a closed connection.
+  The same check-then-create race is closed where else it lived: two applies of
+  one vector configuration creating its shadow collection (the second failed
+  its window), a snapshot restore creating a collection a pull created
+  meanwhile (the page failed), and two requests setting up a system collection
+  on first use (the second could be answered `409` once).
+
 ## 0.32.0 - 2026-09-17
 
 **A minor, for additive series; nothing breaks.** A hold of the single writer

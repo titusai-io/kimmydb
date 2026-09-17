@@ -2271,7 +2271,23 @@ impl Engine {
         match self.get_collection(db, name) {
             Ok(existing) => Ok(existing),
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => {
-                self.create_collection_unchecked(db, name)
+                #[cfg(test)]
+                crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
+                match self.create_collection_unchecked(db, name) {
+                    // Checked outside the writer, so two callers can both find
+                    // it absent: two applies of one `ConfigureVectors` creating
+                    // its shadow, or two requests setting up the same system
+                    // collection. The second finds it here, and wants what it
+                    // would have had a moment earlier: the collection.
+                    Err(StorageError::Core(CoreError::CollectionExists { .. })) => {
+                        #[cfg(test)]
+                        crate::sync::race_hooks::absorbed(
+                            crate::sync::race_hooks::Race::SystemCreate,
+                        );
+                        self.get_collection(db, name)
+                    }
+                    created => created,
+                }
             }
             Err(e) => Err(e),
         }
@@ -2584,6 +2600,8 @@ impl Engine {
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(None),
             Err(e) => return Err(e),
         };
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Burial);
 
         // A vector-enabled collection keeps its vectors in a shadow collection,
         // which is an ordinary collection with its own id and so is not carried
@@ -2616,7 +2634,13 @@ impl Engine {
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
-            collections.remove((db, name))?;
+            // Gone already when another burial of the name took the writer
+            // between the read above and here; nothing to remove, and the
+            // tombstone below still stands at the later of the two stamps.
+            if collections.remove((db, name))?.is_none() {
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
+            }
             if let Some(shadow) = &shadow {
                 collections.remove((db, shadow.name.as_str()))?;
             }

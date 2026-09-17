@@ -358,9 +358,19 @@ where
                 // appended onward; one it cannot apply is refused, counted and
                 // reported (ADR-123), which is the answer the pusher is waiting
                 // for (ADR-140).
-                let outcome = engine
-                    .apply_peer_batch(&versions, &entries, scanned_to, exhausted)
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                // A batch this node could not apply is said to the pusher
+                // before hanging up, as a refused batch size is above: without
+                // it the pusher reads only a closed connection, and the reason
+                // is in this node's log alone.
+                let outcome =
+                    match engine.apply_peer_batch(&versions, &entries, scanned_to, exhausted) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            let reason = format!("the pushed window could not be applied: {e}");
+                            let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
+                            return Err(ProtocolError::Malformed(reason));
+                        }
+                    };
                 if let Some(hook) = on_pushed {
                     hook(&outcome);
                 }
@@ -3600,5 +3610,48 @@ mod tests {
             assert_eq!(stalls.repair_due(peer), None);
         }
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
+    }
+
+    /// A pushed window this node cannot apply is answered with a `Fault`
+    /// naming why, not a hang-up. The pusher reports the member pending with
+    /// what it reads; a closed connection told it only "peer closed the
+    /// connection", on a member that had logged the reason.
+    #[tokio::test]
+    async fn a_push_that_cannot_be_applied_is_answered_with_the_reason() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let mut window = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        // A creation whose body does not decode: an error from the apply
+        // itself, after the batch passed every check the arm makes first.
+        window.entries[0].body = Some(vec![0xde, 0xad]);
+
+        const SECRET: &str = "a-push-test-secret";
+        const BINDING: &[u8] = b"a-push-test-binding";
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = async { serve_peer(&b, theirs, SECRET, BINDING, None).await };
+        let pushing = async {
+            open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+            let push = Message::Push {
+                entries: window.entries,
+                scanned_to: window.scanned_to,
+                exhausted: window.exhausted,
+                versions: a.version_vector().unwrap(),
+            };
+            write_frame(&mut ours, &push).await.unwrap();
+            read_frame(&mut ours).await
+        };
+        let (served, answer) = tokio::join!(serving, pushing);
+
+        match answer {
+            Ok(Message::Fault(reason)) => {
+                assert!(reason.contains("could not be applied"), "{reason}");
+            }
+            other => panic!("expected a Fault naming the reason, got {other:?}"),
+        }
+        assert!(matches!(served, Err(ProtocolError::Malformed(_))), "{served:?}");
+        assert!(b.get_collection("shop", "orders").is_err(), "nothing was applied");
     }
 }
