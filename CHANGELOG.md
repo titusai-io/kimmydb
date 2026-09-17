@@ -25,6 +25,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   tombstone while an index of that name was created under it. Each now checks
   the definition again once it holds the writer, and decides afresh from what
   stands if it changed.
+- **A replicated index creation or drop no longer passes over a change that
+  landed while it applied.** A creation checked the index's tombstone before
+  the single writer, and built an index under a drop recorded in between; a
+  drop checked whether the index was created after it before the writer, and
+  removed a recreation that landed in between. Both are judged again under the
+  writer.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the

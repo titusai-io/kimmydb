@@ -1679,6 +1679,8 @@ impl Engine {
                     return Ok(DdlOutcome::Declined);
                 }
 
+                #[cfg(test)]
+                race_hooks::reach(race_hooks::Race::ReplicatedIndexDrop);
                 let dropped = self.drop_index_inner(
                     &target.db,
                     &target.collection,
@@ -1686,6 +1688,24 @@ impl Engine {
                     Some(entry.stamp),
                 );
                 match settle(dropped)? {
+                    // The check above, judged again under the writer, found
+                    // the index created after the drop in between: declined
+                    // exactly as it would have been here.
+                    Ddl::Applied(crate::index::Dropped { declined: Some(replay), .. }) => {
+                        info!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            index = %target.index,
+                            drop = ?entry.stamp,
+                            replay,
+                            "declined a drop older than an index created while it applied"
+                        );
+                        return Ok(if replay {
+                            DdlOutcome::DeclinedReplay
+                        } else {
+                            DdlOutcome::Declined
+                        });
+                    }
                     Ddl::Applied(_) => {}
                     Ddl::Gone => {
                         // The collection is gone, and with it the index; the
@@ -1837,6 +1857,8 @@ impl Engine {
         // no entry behind them — and one rule for reading it is better than
         // two. A payload from a build that recorded no stamp falls back to
         // the entry's, which is the same value the origin would have used.
+        #[cfg(test)]
+        race_hooks::reach(race_hooks::Race::ReplicatedIndexCreate);
         let created = target.index.created.unwrap_or(stamp);
         let (created, violations) = self.create_index_inner(
             &target.db,
@@ -1848,6 +1870,7 @@ impl Engine {
             target.index.expire_after_secs,
             target.index.partial_filter.clone(),
             crate::index::CreateOrigin::Replicated(Some(created)),
+            &|dropped_at| stamp < dropped_at,
         )?;
         if !violations.is_empty() {
             self.report_index_backfill_violations(&meta, &violations)?;
@@ -1887,6 +1910,12 @@ pub(crate) mod race_hooks {
         VectorConfiguration,
         /// Turning vectors off read the collection's definition, likewise.
         VectorRemoval,
+        /// A replicated index creation found no newer drop of the name, and
+        /// has not yet taken the writer to build it.
+        ReplicatedIndexCreate,
+        /// A replicated index drop found no index of the name created after
+        /// it, and has not yet taken the writer to remove it.
+        ReplicatedIndexDrop,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -5976,6 +6005,7 @@ mod tests {
                     None,
                     None,
                     crate::index::CreateOrigin::Replicated(Some(later)),
+                    &|_| false,
                 )
             },
         );
@@ -6106,5 +6136,86 @@ mod tests {
         assert_eq!(index_names(&engine), ["by_a"], "the index stands");
         assert!(engine.get_collection("shop", "orders").unwrap().vector.is_none());
         race_hooks::assert_absorbed(race_hooks::Race::VectorRemoval);
+    }
+
+    /// `into`'s window from `from`, passed over what `into` holds.
+    fn held_window(into: &Engine, from: &Engine) -> (VersionVector, OplogWindow) {
+        let theirs = from.version_vector().unwrap();
+        let held = into.witnessed_vector().unwrap();
+        let start = held.behind(&theirs).expect("behind the peer");
+        (theirs, from.entries_for_peer_holding(start, BATCH, Some(&held)).unwrap())
+    }
+
+    /// `window` cut after its first `n` entries, as a pull truncated there.
+    fn first(window: &OplogWindow, n: usize) -> OplogWindow {
+        OplogWindow {
+            entries: window.entries[..n].to_vec(),
+            scanned_to: window.entries[n - 1].stamp.hlc,
+            exhausted: false,
+        }
+    }
+
+    #[test]
+    fn a_replicated_index_create_does_not_build_under_a_drop_recorded_while_it_applied() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let (theirs, window) = held_window(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        let (theirs, whole) = held_window(&b, &a);
+        let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [OpKind::CreateIndex, OpKind::DropIndex]);
+        let create = first(&whole, 1);
+
+        let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
+        let (created, both) = race_hooks::race(
+            race_hooks::Race::ReplicatedIndexCreate,
+            move || {
+                let (b, theirs, whole) = competing;
+                b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
+            },
+            || b.apply_peer_batch(&theirs, &create.entries, create.scanned_to, create.exhausted),
+        );
+        both.expect("the creation and the drop apply");
+        created.expect("the creation applies, as history");
+        assert!(index_names(&b).is_empty(), "the drop stands: {:?}", index_names(&b));
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedIndexCreate);
+    }
+
+    #[test]
+    fn a_replicated_index_drop_does_not_remove_the_index_recreated_while_it_applied() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        let (theirs, window) = held_window(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        let recreated =
+            a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
+        let (theirs, whole) = held_window(&b, &a);
+        let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [OpKind::DropIndex, OpKind::CreateIndex]);
+        let drop = first(&whole, 1);
+
+        let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
+        let (dropped, both) = race_hooks::race(
+            race_hooks::Race::ReplicatedIndexDrop,
+            move || {
+                let (b, theirs, whole) = competing;
+                b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
+            },
+            || b.apply_peer_batch(&theirs, &drop.entries, drop.scanned_to, drop.exhausted),
+        );
+        both.expect("the drop and the recreation apply");
+        dropped.expect("the drop applies, declined");
+        let held = b.get_collection("shop", "orders").unwrap();
+        let index = held.index("by_a").expect("the recreation stands");
+        assert_eq!(index.created, recreated.created, "and it is the recreation");
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedIndexDrop);
     }
 }

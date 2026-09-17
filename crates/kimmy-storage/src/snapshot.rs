@@ -1230,6 +1230,7 @@ impl Engine {
                 // the stamp existed carries none, and such a rival is refused
                 // and counted rather than silently skipped as it was.
                 crate::index::CreateOrigin::Replicated(index.created),
+                &|_| false,
             );
             match crate::sync::settle(created)? {
                 crate::sync::Ddl::Applied((_, violations)) => {
