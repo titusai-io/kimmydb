@@ -17017,7 +17017,11 @@ the wall-clock tolerance of 1 ms plus 1% of the hold, which on a 43 ms hold with
 **Platforms.** `CLOCK_THREAD_CPUTIME_ID` on Linux and macOS, and a test spins
 to a CPU-time deadline of 30 ms and fails if 30 s of wall time pass first, or if
 the CPU read exceeds the wall time it took, so a clock stuck at zero cannot pass
-on the machine the gate runs on, however busy that machine is. Anywhere else, or on a hold where
+on the machine the gate runs on, however busy that machine is, and neither can
+one that runs fast. The CPU reads nest inside the wall reads, and the excess
+allowed is the grain of two readings plus 1%: `CLOCK_MONOTONIC` is slewed by NTP,
+up to 500 ppm, and the thread CPU clock is not, so a grain-only tolerance failed
+on a CI runner whose clocks differed by about 128 ppm. Anywhere else, or on a hold where
 a read of the clock fails, `cpu` and `off_cpu` are **not recorded** rather than
 recorded as zero, and `kimmy_write_lock_held_cpu_unmeasured_total` counts the
 hold.

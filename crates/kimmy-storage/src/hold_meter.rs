@@ -880,8 +880,10 @@ mod tests {
         // machine busy with other tests slows it down rather than failing it:
         // the claim is that the clock advances, and only while the thread
         // runs, which holds however many cores the thread gets.
-        let from = thread_cpu().expect("Linux and macOS have a per-thread CPU clock");
+        // The CPU reads nest inside the wall reads, as in `io`, so the CPU
+        // interval cannot start before the wall interval or end after it.
         let wall_from = std::time::Instant::now();
+        let from = thread_cpu().expect("Linux and macOS have a per-thread CPU clock");
         let want = Duration::from_millis(30);
         let mut x = 0u64;
         while thread_cpu().unwrap() - from < want {
@@ -894,11 +896,38 @@ mod tests {
         let spent = thread_cpu().unwrap() - from;
         let wall = wall_from.elapsed();
         assert!(spent >= want, "{spent:?}");
-        assert!(wall + CPU_CLOCK_GRAIN * 2 >= spent, "{spent:?} of CPU in {wall:?} of wall time");
+        assert!(cpu_fits_in_wall(spent, wall), "{spent:?} of CPU in {wall:?} of wall time");
         let from = thread_cpu().unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let slept = thread_cpu().unwrap() - from;
         assert!(slept < Duration::from_millis(20), "60 ms asleep read as {slept:?} of CPU");
+    }
+
+    /// Whether `spent` of thread CPU fits in `wall` of monotonic time, as a
+    /// clock that reads CPU time must. Not within the grain alone: the two
+    /// clocks do not run at one rate. `Instant` is `CLOCK_MONOTONIC`, which NTP
+    /// slews by up to 500 ppm, and the thread CPU clock is the scheduler's
+    /// accounting, which it does not; so the tolerance is the grain of the two
+    /// CPU reads plus 1% of the interval, as `decompose`'s is.
+    fn cpu_fits_in_wall(spent: Duration, wall: Duration) -> bool {
+        spent <= wall + CPU_CLOCK_GRAIN * 2 + wall / 100
+    }
+
+    #[test]
+    fn cpu_past_wall_by_a_clock_rate_fits_and_a_clock_running_fast_does_not() {
+        // The reading CI took on Linux: 3.8 µs past 30 ms of wall time, about
+        // 128 ppm, which the grain alone refused.
+        assert!(cpu_fits_in_wall(
+            Duration::from_nanos(30_001_006),
+            Duration::from_nanos(29_997_178)
+        ));
+        // The bound of a slewed monotonic clock.
+        assert!(cpu_fits_in_wall(Duration::from_micros(30_015), Duration::from_millis(30)));
+        // What the leg is for, and what the sleep leg cannot see: a clock that
+        // advances only while the thread runs, but too fast. Twice the rate,
+        // or a unit mistaken by 1,000, reads zero asleep all the same.
+        assert!(!cpu_fits_in_wall(Duration::from_millis(60), Duration::from_millis(30)));
+        assert!(!cpu_fits_in_wall(Duration::from_micros(30_400), Duration::from_millis(30)));
     }
 
     #[test]
@@ -1324,11 +1353,11 @@ mod tests {
         // which is exactly what `write_estimated` publishes.
         let spin = Duration::from_millis(2);
         let asleep = Duration::from_millis(20);
-        let cpu_from = thread_cpu().unwrap();
         let wall_from = std::time::Instant::now();
+        let cpu_from = thread_cpu().unwrap();
         let meter = hold_of_writes(34, spin, Some((33, asleep)));
-        let hold = wall_from.elapsed();
         let cpu = thread_cpu().unwrap() - cpu_from;
+        let hold = wall_from.elapsed();
         let d = decompose(&meter, hold, Some(cpu));
         assert!(d.write_estimated >= asleep, "{d:?}");
         assert_eq!(meter.write_calls - meter.write_sampled_calls, 1, "only the 34th: {meter:?}");
