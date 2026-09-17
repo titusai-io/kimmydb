@@ -562,6 +562,8 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         writer_wait_timeouts: 12,
         writer_hold_max_us: 13,
         writer_hold: kimmy_storage::WriterHoldSnapshot::default(),
+        writer_hold_decomposition: kimmy_storage::HoldDecomposition::default(),
+        serve: kimmy_storage::ServeSnapshot::default(),
         held_marks_released: 14,
         held_marks: 15,
     };

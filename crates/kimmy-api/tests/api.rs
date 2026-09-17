@@ -8083,6 +8083,21 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         )
         .chain(["kimmy_write_lock_held_seconds_sum", "kimmy_write_lock_held_seconds_count"])
     });
+    // What the holds were made of (ADR-176), built the same way: a row per
+    // holder of each series, the labels pinned by the golden in `metrics.rs`.
+    let holders = kimmy_storage::WriterHolder::COUNT;
+    let decomposition = std::iter::repeat_n(
+        "kimmy_write_lock_held_component_seconds_total",
+        holders * kimmy_storage::HoldComponent::COUNT,
+    )
+    .chain(std::iter::repeat_n(
+        "kimmy_write_lock_held_phase_seconds_total",
+        holders * kimmy_storage::HoldPhase::COUNT,
+    ))
+    .chain(std::iter::repeat_n("kimmy_write_lock_held_io_bytes_total", holders * 2))
+    .chain(std::iter::repeat_n("kimmy_write_lock_held_write_estimated_seconds_total", holders))
+    .chain(std::iter::repeat_n("kimmy_write_lock_held_overcounted_total", holders))
+    .chain(["kimmy_write_lock_held_cpu_unmeasured_total"]);
     let expected: Vec<&str> = [
         "kimmy_databases",
         "kimmy_collections",
@@ -8106,6 +8121,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
     ]
     .into_iter()
     .chain(hold)
+    .chain(decomposition)
     .chain([
         "kimmy_storage_bytes",
         "kimmy_vector_index_cache_bytes",
@@ -8269,7 +8285,17 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_entry_wait_seconds_bucket",
         "kimmy_sync_entry_wait_seconds_sum",
         "kimmy_sync_entry_wait_seconds_count",
+        "kimmy_sync_served_windows_total",
+        "kimmy_sync_served_entries_total",
+        "kimmy_sync_serve_passed_entries_total",
+        "kimmy_sync_serve_walk_read_seconds_total",
+        "kimmy_sync_serve_walk_read_bytes_total",
     ])
+    .chain(std::iter::repeat_n(
+        "kimmy_sync_serve_walk_seconds_bucket",
+        kimmy_storage::SERVE_WALK_BUCKETS_US.len() + 1,
+    ))
+    .chain(["kimmy_sync_serve_walk_seconds_sum", "kimmy_sync_serve_walk_seconds_count"])
     .collect();
 
     assert_eq!(series, expected, "the /metrics series set or its order changed:\n{body}");

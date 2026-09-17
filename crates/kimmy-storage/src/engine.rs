@@ -125,6 +125,10 @@ pub struct Engine {
         [[std::sync::atomic::AtomicU64; WRITER_HOLD_BUCKETS_US.len()]; WriterHolder::COUNT],
     writer_hold_count: [std::sync::atomic::AtomicU64; WriterHolder::COUNT],
     writer_hold_sum_us: [std::sync::atomic::AtomicU64; WriterHolder::COUNT],
+    /// What the holds above were made of, per holder (ADR-176).
+    hold_counters: crate::hold_meter::HoldCounters,
+    /// What serving peers' windows cost this node (ADR-176).
+    serve_counters: crate::hold_meter::ServeCounters,
     /// Where the retention pass's tombstone scan resumes next pass
     /// (ADR-151): the last document key it visited, or `None` to start from
     /// the top. The scan visits a bounded number of documents per pass.
@@ -334,6 +338,28 @@ pub struct WriterHold<'a> {
     engine: &'a Engine,
     held_from: std::time::Instant,
     holder: WriterHolder,
+    /// What the hold is made of (ADR-176), metered from `held_from`.
+    meter: Option<crate::hold_meter::Scope>,
+    /// When the hold's commit began, if it made one: the end of its `work`
+    /// phase. A hold that commits nothing is all `work`.
+    commit_from: Option<std::time::Instant>,
+}
+
+impl WriterHold<'_> {
+    fn new<'a>(
+        engine: &'a Engine,
+        gate: parking_lot::MutexGuard<'a, ()>,
+        holder: WriterHolder,
+    ) -> WriterHold<'a> {
+        WriterHold {
+            gate: Some(gate),
+            engine,
+            held_from: std::time::Instant::now(),
+            holder,
+            meter: Some(crate::hold_meter::Scope::hold()),
+            commit_from: None,
+        }
+    }
 }
 
 impl Drop for WriterHold<'_> {
@@ -344,7 +370,15 @@ impl Drop for WriterHold<'_> {
         // next writer in the queue should be waiting through, and two
         // paths that release the same gate should not do it in two orders.
         if self.gate.take().is_some() {
-            self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+            let released = std::time::Instant::now();
+            let from = self.held_from;
+            let commit_from = self.commit_from.unwrap_or(released);
+            self.engine.record_writer_hold(
+                released - from,
+                self.holder,
+                self.meter.take(),
+                [commit_from - from, std::time::Duration::ZERO, released - commit_from],
+            );
         }
     }
 }
@@ -511,6 +545,14 @@ pub(crate) struct WriteTxn<'a> {
     gate: Option<parking_lot::MutexGuard<'a, ()>>,
     /// When the writer was taken, for the hold measurement.
     held_from: std::time::Instant,
+    /// What the hold is made of (ADR-176), metered from `held_from` to the
+    /// release.
+    meter: Option<crate::hold_meter::Scope>,
+    /// Where the hold's phases end (ADR-176): the commit asked for, and the
+    /// live counts flushed. Unset for a transaction that never committed,
+    /// whose whole hold is `work`.
+    commit_from: Option<std::time::Instant>,
+    counted_at: Option<std::time::Instant>,
     /// What this transaction is doing, declared by the path that opened it
     /// (ADR-159), so a long hold names its cause and the hold histogram can
     /// be split by it.
@@ -531,7 +573,16 @@ impl WriteTxn<'_> {
     /// Let go of the writer and record how long it was held.
     fn release(&mut self) {
         if self.gate.take().is_some() {
-            self.engine.record_writer_hold(self.held_from.elapsed(), self.holder);
+            let released = std::time::Instant::now();
+            let from = self.held_from;
+            let commit_from = self.commit_from.unwrap_or(released);
+            let counted_at = self.counted_at.unwrap_or(commit_from);
+            self.engine.record_writer_hold(
+                released - from,
+                self.holder,
+                self.meter.take(),
+                [commit_from - from, counted_at - commit_from, released - counted_at],
+            );
         }
     }
 
@@ -554,12 +605,20 @@ impl WriteTxn<'_> {
         // configured a collector, and if none is configured this is the same
         // disabled-span check every other `tracing` call site already pays.
         let _span = tracing::info_span!("storage.commit").entered();
+        #[cfg(test)]
+        crate::hold_meter::test_hooks::at_phase(crate::hold_meter::Phase::Work);
+        self.commit_from = Some(std::time::Instant::now());
+        #[cfg(test)]
+        crate::hold_meter::test_hooks::at_phase(crate::hold_meter::Phase::Counts);
         let txn = self.txn.take().expect("a transaction is taken once");
         // The live counts and their mark, once for the whole transaction and
         // inside it (ADR-174's addendum). Before the inner commit, so this is
         // the same commit as the records that moved them and a failure here
         // fails the write rather than leaving a landed batch miscounted.
         crate::live_count::flush(&txn, &self.live_counts.lock())?;
+        self.counted_at = Some(std::time::Instant::now());
+        #[cfg(test)]
+        crate::hold_meter::test_hooks::at_phase(crate::hold_meter::Phase::Commit);
         let engine = self.engine;
         let coalesced = self.coalesced;
         // The fsync (or the wait at the barrier) is the blocking part; see
@@ -624,10 +683,22 @@ impl Engine {
     /// every collection dropped and nothing to do. `None` is redb's own
     /// default (1 GiB). The daemon sets this from `storage.cache_bytes`.
     pub fn open_with_cache(path: &Path, cache_bytes: Option<usize>) -> Result<Self> {
-        let db = match cache_bytes {
-            Some(bytes) => Database::builder().set_cache_size(bytes).create(path)?,
-            None => Database::create(path)?,
-        };
+        // Through a backend that meters what it is asked for, so a hold can
+        // say how much of it was the disk (ADR-176). Opened exactly as
+        // `Builder::create` opens it.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let backend =
+            crate::hold_meter::MeteredBackend::new(redb::backends::FileBackend::new(file)?);
+        let mut builder = Database::builder();
+        if let Some(bytes) = cache_bytes {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder.create_with_backend(backend)?;
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
@@ -742,6 +813,8 @@ impl Engine {
             }),
             writer_hold_count: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_hold_sum_us: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            hold_counters: Default::default(),
+            serve_counters: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
         };
 
@@ -792,6 +865,20 @@ impl Engine {
         )
     }
 
+    /// What every hold since start was made of, per holder (ADR-176).
+    pub fn writer_hold_decomposition(&self) -> crate::hold_meter::HoldDecomposition {
+        self.hold_counters.snapshot()
+    }
+
+    /// What serving peers' windows has cost this node, since start (ADR-176).
+    pub fn serve_cost(&self) -> crate::hold_meter::ServeSnapshot {
+        self.serve_counters.snapshot()
+    }
+
+    pub(crate) fn serve_counters(&self) -> &crate::hold_meter::ServeCounters {
+        &self.serve_counters
+    }
+
     /// How long each holder has held the writer, since start (ADR-159).
     pub fn writer_hold(&self) -> WriterHoldSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
@@ -813,7 +900,7 @@ impl Engine {
     /// the holder it is given is the one whose hold it is standing in for.
     pub fn hold_writer(&self, holder: WriterHolder) -> WriterHold<'_> {
         let gate = blocking(|| self.writer_gate.lock());
-        WriterHold { gate: Some(gate), engine: self, held_from: std::time::Instant::now(), holder }
+        WriterHold::new(self, gate, holder)
     }
 
     fn record_writer_wait(&self, waited: std::time::Duration) {
@@ -826,8 +913,23 @@ impl Engine {
         self.writer_wait_sum_us.fetch_add(us, Relaxed);
     }
 
-    fn record_writer_hold(&self, held: std::time::Duration, holder: WriterHolder) {
+    /// Record a hold that has just been let go: its length and holder
+    /// (ADR-159), and what it was made of (ADR-176) — `meter` is the scope
+    /// that metered it, finished here, after the release, and `phases` its
+    /// `work`, `counts` and `commit` spans.
+    fn record_writer_hold(
+        &self,
+        held: std::time::Duration,
+        holder: WriterHolder,
+        meter: Option<crate::hold_meter::Scope>,
+        phases: [std::time::Duration; crate::hold_meter::Phase::COUNT],
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
+        if let Some(meter) = meter {
+            let (metered, cpu) = meter.finish();
+            let hold = crate::hold_meter::decompose(&metered, held, cpu);
+            self.hold_counters.record(holder, &hold, phases);
+        }
         let us = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
         self.writer_hold_max_us.fetch_max(us, Relaxed);
         let row = holder.slot();
@@ -1927,6 +2029,9 @@ impl Engine {
             coalesced,
             gate: Some(gate),
             held_from: std::time::Instant::now(),
+            meter: Some(crate::hold_meter::Scope::hold()),
+            commit_from: None,
+            counted_at: None,
             holder,
             live_counts: Default::default(),
         })
@@ -2023,12 +2128,7 @@ impl Engine {
         let waited_from = std::time::Instant::now();
         let gate = blocking(|| self.writer_gate.lock());
         meter_writer_wait(waited_from.elapsed());
-        let _gate = WriterHold {
-            gate: Some(gate),
-            engine: self,
-            held_from: std::time::Instant::now(),
-            holder: WriterHolder::Durability,
-        };
+        let mut gate = WriterHold::new(self, gate, WriterHolder::Durability);
         let mut txn = blocking(|| self.db.begin_write()).map_err(|e| {
             redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
         })?;
@@ -2046,8 +2146,10 @@ impl Engine {
                 )))
             })?;
         }
+        gate.commit_from = Some(std::time::Instant::now());
         txn.commit()?;
         self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        drop(gate);
         Ok(())
     }
 

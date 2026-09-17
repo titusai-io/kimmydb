@@ -107,6 +107,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 parking_lot = "0.12"
+# Per-thread CPU time, which the standard library does not expose (ADR-176).
+# Bindings only: no native library, and already in the graph.
+libc = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"
 
