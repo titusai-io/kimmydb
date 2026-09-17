@@ -758,6 +758,12 @@ mod tests {
     }
 
     /// Deterministic pseudo-random vectors, so recall numbers are reproducible.
+    /// The truly orphaned fraction below which a draw counts as a healthy
+    /// graph in [`a_healthy_graph_at_a_realistic_width_is_not_rebuilt`]:
+    /// above every healthy draw measured at 1,000 × 384 (2.8%), below the one
+    /// degraded draw (5.7%).
+    const HEALTHY_ORPHANED_BELOW: f64 = 0.04;
+
     fn pseudo_random(seed: u64, dim: usize) -> Vec<f32> {
         let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (0..dim)
@@ -826,40 +832,100 @@ mod tests {
     /// 4,000 vectors was discarded, rebuilt twice, and then reported as losing
     /// data. Three times the build cost and a false alarm, on a good graph.
     ///
-    /// The margin is wide on purpose: measured over 20 builds at this size and
-    /// width, `unreachable` had a median of 1 and never exceeded 4, against a
-    /// threshold of 8. If this starts failing, the thing to measure is
-    /// `reachability_distribution_by_collection_size` — not this number.
+    /// **Only healthy draws are graded, because not every draw is healthy.**
+    /// Measured over 300 builds at this size and width, with every point
+    /// checked rather than a sample, the builder is bimodal:
+    ///
+    /// | draws | truly orphaned | sampled score |
+    /// |---|---|---|
+    /// | 297 healthy | 0.3%–2.8% | 0–6 |
+    /// | 1 grey | 5.7% | 7 |
+    /// | 2 catastrophic | 20.7%, 24.7% | 23, 32 |
+    ///
+    /// A catastrophic draw is what [`HnswIndex::build`] exists to discard, so a
+    /// score of 8 or more on one is the threshold working, not failing. This
+    /// test used to assert it of three raw draws, and at ~0.67% a draw it went
+    /// red on about 2% of runs for doing its job. So each draw's true orphaned
+    /// fraction is measured first, and only a draw below
+    /// [`HEALTHY_ORPHANED_BELOW`] is held to the threshold. That cutoff sits
+    /// above every healthy draw observed (2.8%) and below the grey one (5.7%),
+    /// which is degraded rather than healthy and which the threshold catches
+    /// about half the time by design.
+    ///
+    /// **Expected rate of a red.** A healthy draw scores 8 or more by sampling
+    /// alone about once in 1,400 (a 128-of-1,000 draw at each healthy build's
+    /// own orphaned count), so this test, grading up to three, goes red about
+    /// once in 470 runs with nothing wrong. Much more often than that means the
+    /// threshold is discarding healthy graphs; measure
+    /// `reachability_distribution_by_collection_size` before touching it.
+    ///
+    /// **A run that grades nothing fails.** Three catastrophic draws in a row
+    /// is about one run in three million at the measured rate; a builder whose
+    /// failure rate climbed would make it routine, and that must be a red
+    /// test, not a pass that graded nothing.
     ///
     /// **Ignored, and run by its own CI job in release.** A 384-dimensional
     /// graph costs 146 seconds to build in a debug profile against 21 in
     /// release, and doubling the default suite to hold one property is a good
     /// way to have the property removed later. Same arrangement, and the same
-    /// reasoning, as the cluster harness.
+    /// reasoning, as the cluster harness. Checking every point adds about eight
+    /// seconds a draw there.
     #[test]
     #[ignore = "384-dimensional builds are minutes in debug; CI runs this in release"]
     fn a_healthy_graph_at_a_realistic_width_is_not_rebuilt() {
         const COUNT: usize = 1_000;
         const DIM: usize = 384;
+        const DRAWS: usize = 3;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
-        for build in 0..3 {
-            let (_, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let mut records = Vec::new();
+        engine
+            .for_each_vector(&shadow, |r| {
+                records.push(r);
+                Ok(true)
+            })
+            .unwrap();
+
+        let mut graded = 0;
+        for draw in 0..DRAWS {
+            let (index, reach) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
             assert_eq!(reach.sampled, REACHABILITY_SAMPLE, "the sample must be full at this size");
             assert!(
                 reach.unreachable <= reach.missed,
                 "a confirmed loss is a subset of the misses it was found among"
             );
+            // Every point, not the sample: the ground truth the score is
+            // judged against.
+            let orphaned = (0..index.keys.len())
+                .filter(|&i| !index.finds_itself(&records[i].vector, i))
+                .count();
+            if orphaned as f64 >= HEALTHY_ORPHANED_BELOW * index.keys.len() as f64 {
+                println!(
+                    "draw {draw}: {orphaned} of {} truly orphaned (sampled score {}); not a \
+                     healthy graph, so not graded",
+                    index.keys.len(),
+                    reach.unreachable,
+                );
+                continue;
+            }
+            graded += 1;
             assert!(
                 reach.unreachable < REACHABILITY_MAX_UNREACHABLE,
-                "build {build}: a healthy {DIM}-dimensional graph of {COUNT} vectors scored \
-                 {} unreachable of {} sampled ({} missed at ordinary effort) and would be \
-                 discarded and rebuilt",
+                "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors ({orphaned} \
+                 truly orphaned) scored {} unreachable of {} sampled ({} missed at ordinary \
+                 effort) and would be discarded and rebuilt",
                 reach.unreachable,
                 reach.sampled,
                 reach.missed,
             );
         }
+        assert!(
+            graded > 0,
+            "none of {DRAWS} draws was a healthy graph, so this run graded nothing; at the \
+             measured ~0.67% catastrophic rate that is about one run in three million, so the \
+             builder's failure rate has risen"
+        );
     }
 
     /// The distribution the reachability constants are sized from.
