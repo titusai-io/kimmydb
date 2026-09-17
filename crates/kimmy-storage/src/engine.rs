@@ -2284,7 +2284,19 @@ impl Engine {
                         crate::sync::race_hooks::absorbed(
                             crate::sync::race_hooks::Race::SystemCreate,
                         );
-                        self.get_collection(db, name)
+                        // Buried again before this read, it is gone for a
+                        // reason this caller did not see: fail with that, not
+                        // with `CollectionNotFound`, which a replicated
+                        // `ConfigureVectors` reads as its *parent* missing.
+                        self.get_collection(db, name).map_err(|e| match e {
+                            StorageError::Core(CoreError::CollectionNotFound { .. }) => {
+                                StorageError::Transaction(format!(
+                                    "{db}.{name} was created and dropped again while this node \
+                                     was creating it; retry"
+                                ))
+                            }
+                            other => other,
+                        })
                     }
                     created => created,
                 }
@@ -2294,18 +2306,29 @@ impl Engine {
     }
 
     fn create_collection_unchecked(&self, db: &str, name: &str) -> Result<CollectionMeta> {
-        self.create_collection_inner(db, name, true, None)
+        Ok(self
+            .create_collection_inner(db, name, true, None, &|_| false)?
+            .expect("a creation that judges nothing history always creates"))
     }
 
     /// `log = false` when applying a replicated creation. See
     /// `create_index_inner` for why a replicated change must not mint an entry.
+    ///
+    /// `history` judges the collection's tombstone, if it has one, **under the
+    /// writer**: true means this creation is of a life that drop ended, and
+    /// nothing is created (`None`). A caller that arrives with a creation from
+    /// elsewhere checks its tombstone before calling, to answer cheaply, but
+    /// that check is not under the writer: the drop can land between it and
+    /// here, and a creation older than it then resurrected the collection the
+    /// drop had just removed (ADR-148). A local creation passes `|_| false`.
     pub(crate) fn create_collection_inner(
         &self,
         db: &str,
         name: &str,
         log: bool,
         origin: Option<Hlc>,
-    ) -> Result<CollectionMeta> {
+        history: &dyn Fn(Stamp) -> bool,
+    ) -> Result<Option<CollectionMeta>> {
         // Derived, not allocated: every node computes the same id for the
         // same collection, so a replicated oplog entry addresses the same
         // collection everywhere. See `CollectionId::derive`.
@@ -2359,7 +2382,13 @@ impl Engine {
             // is normal convergence, not reincarnation, and flooring there
             // would make whichever node created second silently discard the
             // first one's documents.
-            let incarnation_floor = self.collection_dropped_at(id)?.map(|stamp| stamp.hlc);
+            let dropped = self.collection_dropped_at(id)?;
+            if dropped.is_some_and(history) {
+                drop(collections);
+                txn.abort()?;
+                return Ok(None);
+            }
+            let incarnation_floor = dropped.map(|stamp| stamp.hlc);
 
             // The derivation is a 64-bit hash, so a collision is possible in
             // principle. Checked rather than trusted, because the failure would
@@ -2422,7 +2451,7 @@ impl Engine {
         }
 
         info!(db, collection = name, id = %meta.id, "created collection");
-        Ok(meta)
+        Ok(Some(meta))
     }
 
     pub fn get_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {

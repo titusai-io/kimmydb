@@ -23,6 +23,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   back. The divergence check reported the collection missing and a repair from
   a peer restored it, but until then the member answered without it. A drop now
   reads what stands under the writer and leaves a later incarnation alone.
+- **A replicated creation no longer brings back a collection dropped while it
+  applied.** Its check against the drop's tombstone was made before the single
+  writer, so a pull or push applying the creation and the drop after it could
+  land in between, and the creation then made the collection its peers had
+  dropped. A snapshot restore of the dropped life had the same gap. The
+  tombstone is now judged again under the writer.
 - **Of two drops of one collection sent at once to one member, the second now
   answers `200 {"dropped": false}`**, as a retried drop already did, and logs
   nothing. It used to answer `{"dropped": true}` and replicate a second drop of
