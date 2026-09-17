@@ -144,6 +144,10 @@ pub fn thread_cpu() -> Option<Duration> {
     if test_hooks::CPU_CLOCK_FAILS.with(|f| f.get()) {
         return None;
     }
+    #[cfg(test)]
+    if let Some(stuck) = test_hooks::CPU_CLOCK_STUCK_AT.with(|s| s.get()) {
+        return Some(stuck);
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -699,6 +703,11 @@ pub(crate) mod test_hooks {
             const { Cell::new([Duration::ZERO; Phase::COUNT]) };
         /// Spun, on the CPU, at the start of the work phase.
         pub static SPIN_IN_WORK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// Spun, on the CPU, at the start of the work phase, until this much
+        /// of this thread's CPU time has passed rather than this much wall
+        /// time: what a test needs when the claim is about CPU time and the
+        /// machine may be lending the thread's core to someone else.
+        pub static SPIN_CPU_IN_WORK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         /// Spun inside each read, write and sync call.
         pub static SPIN_IN_IO: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         /// Slept inside every `set_len` and every `len`.
@@ -713,6 +722,9 @@ pub(crate) mod test_hooks {
         pub static METERED_CALLS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
         /// Every thread CPU clock read fails while set.
         pub static CPU_CLOCK_FAILS: Cell<bool> = const { Cell::new(false) };
+        /// Every thread CPU clock read returns this while set: a clock that
+        /// has stopped advancing.
+        pub static CPU_CLOCK_STUCK_AT: Cell<Option<Duration>> = const { Cell::new(None) };
         /// Slept inside every write call from this index on.
         pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
     }
@@ -725,6 +737,31 @@ pub(crate) mod test_hooks {
         let mut x = 0u64;
         while Instant::now() < until {
             x = std::hint::black_box(x.wrapping_add(1));
+        }
+    }
+
+    /// [`spin`] to a CPU-time deadline: spins until this thread has spent `d`
+    /// on the CPU, however long that takes on a busy machine, and fails if
+    /// 30 s of wall time pass first, as the platform-clock test does: a clock
+    /// that has stopped advancing must fail the test, not hang the job.
+    pub fn spin_cpu(d: Duration) {
+        spin_cpu_within(d, Duration::from_secs(30));
+    }
+
+    pub fn spin_cpu_within(d: Duration, limit: Duration) {
+        if d.is_zero() {
+            return;
+        }
+        let from =
+            super::thread_cpu().expect("a test that spins to CPU time runs where it is read");
+        let started = Instant::now();
+        let mut x = 0u64;
+        while super::thread_cpu().unwrap().saturating_sub(from) < d {
+            x = std::hint::black_box(x.wrapping_add(1));
+            assert!(
+                started.elapsed() < limit,
+                "{limit:?} of spinning and the CPU clock has not advanced {d:?}: it is stuck"
+            );
         }
     }
 
@@ -758,6 +795,7 @@ pub(crate) mod test_hooks {
         std::thread::sleep(SLEEP_IN.with(|s| s.get())[phase.slot()]);
         if phase == Phase::Work {
             spin(SPIN_IN_WORK.with(|s| s.get()));
+            spin_cpu(SPIN_CPU_IN_WORK.with(|s| s.get()));
         }
     }
 
@@ -782,6 +820,7 @@ pub(crate) mod test_hooks {
     pub fn reset() {
         SLEEP_IN.with(|s| s.set([Duration::ZERO; Phase::COUNT]));
         SPIN_IN_WORK.with(|s| s.set(Duration::ZERO));
+        SPIN_CPU_IN_WORK.with(|s| s.set(Duration::ZERO));
         SPIN_IN_IO.with(|s| s.set(Duration::ZERO));
         SLEEP_IN_WRITES_FROM.with(|s| s.set(None));
         SLEEP_IN_FILE_SIZE.with(|s| s.set(Duration::ZERO));
@@ -790,6 +829,7 @@ pub(crate) mod test_hooks {
         BACKEND_CALLS.with(|c| c.set([0; 5]));
         METERED_CALLS.with(|c| c.set([0; 5]));
         CPU_CLOCK_FAILS.with(|f| f.set(false));
+        CPU_CLOCK_STUCK_AT.with(|s| s.set(None));
     }
 }
 
@@ -1044,17 +1084,32 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "of spinning and the CPU clock has not advanced")]
+    fn a_spin_to_cpu_time_on_a_stuck_clock_fails_rather_than_hangs() {
+        test_hooks::CPU_CLOCK_STUCK_AT.with(|s| s.set(Some(Duration::from_secs(1))));
+        test_hooks::spin_cpu_within(Duration::from_millis(10), Duration::from_millis(200));
+    }
+
+    #[test]
     fn work_on_the_cpu_inside_a_hold_is_cpu() {
+        // Spun to 80 ms of this thread's CPU time, not of wall time. Spun to a
+        // wall-clock deadline on a machine lending the core elsewhere, the
+        // thread got 55 ms of CPU in its 80 ms and the test read that as the
+        // meter losing CPU. It is the claim that CPU time spent in a hold is
+        // `cpu`, so it is held to CPU time: all of it, less the clock's
+        // rounding, whatever else the machine is doing. How much *off* the
+        // CPU the spin also took is the machine's, not the meter's, and is
+        // not asserted; the components still add up to the hold.
         let (engine, _dir) = fresh();
         let coll = engine.create_collection("shop", "orders").unwrap();
-        test_hooks::SPIN_IN_WORK.with(|s| s.set(Duration::from_millis(80)));
+        let spun = Duration::from_millis(80);
+        test_hooks::SPIN_CPU_IN_WORK.with(|s| s.set(spun));
         let row = during(&engine, WriterHolder::Write, || {
             engine.insert(&coll, doc! { "n": 1 }).unwrap();
         });
         test_hooks::reset();
-        assert!(row.get(Component::Cpu) >= Duration::from_millis(60), "{row:?}");
-        assert!(row.get(Component::OffCpu) < Duration::from_millis(40), "{row:?}");
-        assert!(row.phase(Phase::Work) >= Duration::from_millis(80), "{row:?}");
+        assert!(row.get(Component::Cpu) >= spun - Duration::from_millis(1), "{row:?}");
+        assert!(row.phase(Phase::Work) >= spun - Duration::from_millis(1), "{row:?}");
         assert_adds_up(&row);
     }
 
@@ -1458,7 +1513,10 @@ mod tests {
         };
         let base = during(&engine, WriterHolder::Bulk, bulk);
         test_hooks::reset();
-        let asleep = Duration::from_millis(200);
+        // Long against what a busy machine adds to `off_cpu` by itself: a
+        // bulk here has read 50 ms more of it than the same bulk before it,
+        // with nothing wrong, and the bound below is half of this.
+        let asleep = Duration::from_secs(1);
         test_hooks::SLEEP_IN_FILE_SIZE.with(|s| s.set(asleep));
         let row = during(&engine, WriterHolder::Bulk, bulk);
         let calls = test_hooks::FILE_SIZE_CALLS.with(|c| c.get());
