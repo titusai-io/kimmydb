@@ -2440,8 +2440,12 @@ impl Engine {
             // the shadow buries none. A snapshot page brings a shadow on its
             // own (ADR-178), from a peer that can be behind on the parent's
             // drop, and created here it stood parentless (ADR-138). Judged
-            // under the writer for the reason `history` is; a creation naming
-            // no stamp reads as the older one, as a page's does.
+            // under the writer for the reason `history` is. Only under a
+            // tombstone: a parent absent with none has not arrived yet, and the
+            // shadow is created. A creation naming no `created` of its own (a
+            // page from a sender before the field) under such a tombstone reads
+            // as the older one, as `restore_collection` reads that page's
+            // collection.
             if !log
                 && let Some(base) = kimmy_core::vector_meta::base_name(name)
                 && collections.get((db, base))?.is_none()

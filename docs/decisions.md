@@ -17479,7 +17479,11 @@ where the configuration that needs it comes from:
   so buries none; B then pulls the shadow from A, which is behind on the drop,
   and restored it parentless. Judged before the writer to answer cheaply, and
   again under it in `create_collection_in_txn` for any creation from elsewhere,
-  since the drop can land in between. A page names a shadow missing only where
+  since the drop can land in between. The rule needs the parent's tombstone: a
+  parent absent with none has not arrived yet, and its shadow is created as
+  before. A shadow with no `created` at all, from a sender before the field,
+  reads under such a tombstone as older than the drop, the choice
+  `restore_collection` already makes for that sender's collections. A page names a shadow missing only where
   the configuration stands here and this node holds no shadow; the other two
   conditions it checks (the page carried a configuration, and not the shadow)
   are belt-and-braces, masked by the listing running after the restore.

@@ -1402,7 +1402,9 @@ impl Engine {
     /// Whether `name` is a vector shadow whose parent is absent here under a
     /// tombstone at or after `created`: a shadow the parent's drop ended,
     /// though a node that never held the shadow buried none (ADR-178). A
-    /// shadow naming no stamp reads as the older, as a page's creation does.
+    /// parent absent with no tombstone has not arrived yet: `false`. A shadow
+    /// with no `created` (a sender before the field) under a parent tombstone
+    /// reads as the older, as `restore_collection` reads a page's creation.
     /// Answered cheaply here; `create_collection_in_txn` judges it again
     /// under the writer.
     fn parent_buried_since(&self, db: &str, name: &str, created: Option<Hlc>) -> Result<bool> {
