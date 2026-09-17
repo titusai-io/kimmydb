@@ -17275,8 +17275,7 @@ They do not exist in any other build and are reachable from no other crate.
 
 **Decision.** A sync round is bounded by `REQUEST_TIMEOUT` (30 s) on the time
 it spends **outside this node's own applies**. Each apply of a window, and of
-a snapshot page, adds its duration to the round's deadline, and to the
-snapshot path's page budget. And the counts an apply produces (definitions
+a snapshot page, adds its duration to the round's deadline. And the counts an apply produces (definitions
 refused and declined, entries skipped for an unknown collection or beyond the
 advertised vector) are recorded as the apply commits, in the `PeerStalls` slot
 the round's pull timing already uses (ADR-175), and taken by the replication
@@ -17302,6 +17301,18 @@ the code showed why, and two further consequences:
   committed lost them, and `kimmy_sync_ddl_refused_total` is a divergence
   signal (ADR-123), not a statistic.
 
+**What still bounds a round in wall time.** The deadline no longer does, so
+the bound is stated here. An entries round applies one window, so it takes at
+most that apply plus 30 s of exchange, which is what it took before: the apply
+was never cut short. A snapshot round applies pages while its page budget
+lasts, and **that budget stays wall time, apply included** (ADR-152): moved on
+by apply time like the deadline, pages that were slow to apply would each buy
+the next, and a slow snapshot would run to its end in one round. And across
+rounds, ADR-157's tick starts another pull from a peer only when the pull
+before it, apply included, would fit in the tick's remaining budget, so a
+slow apply ends that contact. The sequential contact loop is held by one round
+for one window's apply, or one page budget, beyond the exchange, as before.
+
 **What is not changed.** A peer that is slow on the wire still fails the round
 at the same deadline, counts and backs off. Nothing about the apply itself
 changes: its duration already reads in `kimmy_sync_pull_seconds{phase="apply"}`
@@ -17319,6 +17330,10 @@ that makes the apply take three times a 200 ms round limit:
   is still counted. With the counts taken from the outcome only, it goes red.
 - `a_round_against_a_slow_peer_still_times_out`: the negative. With no deadline
   at all, it goes red.
+- `slow_snapshot_pages_still_end_the_round_at_its_page_budget`: pages that each
+  take 300 ms against a 500 ms page budget end the round before the snapshot
+  does, left to resume. With the page budget moved on by apply time, the round
+  applies every page.
 
 **Recorded, not changed.** The apply's CPU between its yielding storage calls
 still runs on the runtime worker (ADR-153's concern), so a 70 s apply occupies
