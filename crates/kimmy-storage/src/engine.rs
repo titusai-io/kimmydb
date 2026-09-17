@@ -2584,6 +2584,8 @@ impl Engine {
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(None),
             Err(e) => return Err(e),
         };
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BuryCollection);
 
         // A vector-enabled collection keeps its vectors in a shadow collection,
         // which is an ordinary collection with its own id and so is not carried

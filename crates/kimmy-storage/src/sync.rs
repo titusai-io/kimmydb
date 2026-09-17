@@ -1472,13 +1472,37 @@ impl Engine {
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
                         ..
                     })) => {
-                        self.create_collection_inner(
+                        #[cfg(test)]
+                        race_hooks::reach(race_hooks::Race::CreateCollection);
+                        match self.create_collection_inner(
                             &target.db,
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
-                        )?;
-                        debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                        ) {
+                            Ok(_) => {
+                                debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                            }
+                            // The check above is not made under the writer, and
+                            // two applies of this entry can pass it together: a
+                            // peer's push against this node's own pull, or two
+                            // members' pushes. The one that takes the writer
+                            // second finds the collection here, which is the
+                            // case the check already treats as applied. Refused,
+                            // it failed the whole batch: a push answered with a
+                            // closed connection and reported pending, and a pull
+                            // lost its round to a backoff.
+                            Err(crate::StorageError::Core(
+                                kimmy_core::Error::CollectionExists { .. },
+                            )) => {
+                                debug!(
+                                    db = %target.db,
+                                    collection = %target.name,
+                                    "a replicated collection was created by a concurrent apply"
+                                );
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     Err(e) => return Err(e),
                 }
@@ -1824,6 +1848,51 @@ impl Engine {
             self.report_index_backfill_violations(&meta, &violations)?;
         }
         Ok(matches!(created, crate::index::IndexCreated::Built(_)))
+    }
+}
+
+/// Test-only points inside a replicated schema change's check-then-act, where
+/// a concurrent apply of the same entry lands in production. `cfg(test)`:
+/// reachable from no other crate and absent from every other build.
+#[cfg(test)]
+pub(crate) mod race_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Race {
+        /// A replicated `CreateCollection` found no collection, and has not
+        /// yet taken the writer to create it.
+        CreateCollection,
+        /// A drop read the collection it will bury, and has not yet taken the
+        /// writer to bury it.
+        BuryCollection,
+    }
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<(Race, Hook)>> = const { RefCell::new(None) };
+    }
+
+    /// Run `competitor` the first time this thread reaches `race`.
+    pub(crate) fn at(race: Race, competitor: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some((race, Box::new(competitor))));
+    }
+
+    pub(crate) fn reach(race: Race) {
+        let hook = HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            match h.take() {
+                Some((at, hook)) if at == race => Some(hook),
+                other => {
+                    *h = other;
+                    None
+                }
+            }
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -5562,5 +5631,125 @@ mod tests {
         );
         assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and stays converged");
+    }
+
+    /// What a peer serves `into`'s position from `from`: the window, and the
+    /// vector it was served under, as a push or a pull would carry them.
+    fn window_for(into: &Engine, from: &Engine) -> (VersionVector, OplogWindow) {
+        let theirs = from.version_vector().unwrap();
+        let start = into.witnessed_vector().unwrap().behind(&theirs).expect("behind the peer");
+        (theirs, from.entries_for_peer(start, BATCH).unwrap())
+    }
+
+    /// Apply `window` into `engine` twice, the second apply running inside
+    /// the first at `race`: the interleaving of two applies of one entry that
+    /// both passed a check made outside the writer.
+    fn apply_racing(
+        engine: &Arc<Engine>,
+        theirs: &VersionVector,
+        window: &OplogWindow,
+        race: race_hooks::Race,
+    ) -> (Result<SyncOutcome>, Result<SyncOutcome>) {
+        let competitor = std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let (engine, theirs, window, competitor) = (
+                Arc::clone(engine),
+                theirs.clone(),
+                window.clone(),
+                std::rc::Rc::clone(&competitor),
+            );
+            race_hooks::at(race, move || {
+                let outcome = engine.apply_peer_batch(
+                    &theirs,
+                    &window.entries,
+                    window.scanned_to,
+                    window.exhausted,
+                );
+                *competitor.borrow_mut() = Some(outcome);
+            });
+        }
+        let outcome =
+            engine.apply_peer_batch(theirs, &window.entries, window.scanned_to, window.exhausted);
+        let competitor =
+            competitor.take().unwrap_or_else(|| panic!("the race was reached: {race:?}"));
+        (outcome, competitor)
+    }
+
+    #[test]
+    fn a_push_that_loses_its_collection_to_a_concurrent_pull_is_applied_not_refused() {
+        // A collection and its index pushed together (ADR-143), while this
+        // node's own sync round applies the same window: the round takes the
+        // writer between the push's check that the collection is absent and
+        // its create. The push used to fail its whole batch on
+        // `CollectionExists`, and the pusher read a closed connection and
+        // reported the member pending though it held both.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let (theirs, window) = window_for(&b, &a);
+
+        let (pushed, pulled) =
+            apply_racing(&b, &theirs, &window, race_hooks::Race::CreateCollection);
+        let pulled = pulled.expect("the round that won applies the window");
+        assert_eq!(pulled.ddl, 2, "{pulled:?}");
+        let pushed = pushed.expect("the push that lost is answered, not refused");
+        assert_eq!(pushed.ddl, 2, "the collection counts as applied, and the index: {pushed:?}");
+        assert_eq!(pushed.ddl_refused, 0, "{pushed:?}");
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_some());
+        assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pushed:?}");
+    }
+
+    #[test]
+    fn a_pull_that_loses_its_collection_to_a_concurrent_push_applies_the_rest_of_its_window() {
+        // The other way round: a member's push takes the writer inside this
+        // node's pull. The pull's window carries documents after the creation,
+        // and they used to go down with it, the round backing off and serving
+        // them again on the next.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        a.insert(&orders, doc! { "_id": 2 }).unwrap();
+        let (theirs, window) = window_for(&b, &a);
+
+        let (pulled, pushed) =
+            apply_racing(&b, &theirs, &window, race_hooks::Race::CreateCollection);
+        pushed.expect("the push that won applies the window");
+        let pulled = pulled.expect("the pull that lost applies its window, not fails it");
+        assert_eq!(pulled.ddl, 1, "{pulled:?}");
+        assert_eq!(pulled.applied + pulled.superseded, 2, "{pulled:?}");
+        assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 2);
+        assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pulled:?}");
+    }
+
+    #[test]
+    fn two_applies_of_one_drop_that_both_find_the_collection_both_succeed() {
+        // The drop arm checks outside the writer too, and so does the burial
+        // under it: two applies of one drop can both read the collection, and
+        // the second then buries one that is already gone. Neither may fail,
+        // and the tombstone must stand at the drop's stamp.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        let (theirs, window) = window_for(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+        assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 1);
+
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped_at = a.collection_dropped_at(orders.id).unwrap().expect("a tombstone");
+        let (theirs, window) = window_for(&b, &a);
+
+        let (second, first) = apply_racing(&b, &theirs, &window, race_hooks::Race::BuryCollection);
+        first.expect("the first drop applies");
+        second.expect("the second drop, of a collection already buried, applies too");
+        assert!(b.get_collection("shop", "orders").is_err(), "dropped");
+        assert_eq!(b.collection_dropped_at(orders.id).unwrap(), Some(dropped_at));
+        assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None);
     }
 }
