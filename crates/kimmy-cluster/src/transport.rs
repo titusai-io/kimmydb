@@ -2322,6 +2322,8 @@ where
         let before = progress.pages();
         let applying = std::time::Instant::now();
         let applied = engine.apply_snapshot_page(node, progress, &page);
+        #[cfg(test)]
+        std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
         clock.applied_for(applying.elapsed());
         let advanced = progress.pages() > before;
         let complete = progress.is_complete();
@@ -2353,9 +2355,12 @@ where
             );
             return Ok(SnapshotPulled { outcome, complete: true });
         }
-        // The page budget moves on by the apply time too: pages this node was
-        // slow to apply are not the peer's time.
-        if Instant::now() >= deadline + clock.applying() {
+        // The page budget stays wall time, apply included (ADR-152): it is what
+        // bounds how long one round with this peer holds the tick's sequential
+        // contact loop. Moved on by apply time like the round's deadline, pages
+        // this node was slow to apply would each buy the next, and a slow
+        // snapshot would run to its end in one round.
+        if Instant::now() >= deadline {
             info!(
                 %peer,
                 pages,
@@ -3985,5 +3990,58 @@ mod tests {
         assert!(matches!(round, Err(ProtocolError::TimedOut(_))), "{round:?}");
         assert!(started.elapsed() < limit * 5, "at the deadline: {:?}", started.elapsed());
         assert_eq!(stalls.take_applied(), AppliedCounts::default(), "nothing was applied");
+    }
+
+    /// ADR-177 keeps a snapshot's page budget on wall time, apply included:
+    /// it is what bounds one round's hold on the tick's sequential contact
+    /// loop (ADR-152, ADR-157). Pages that are slow to apply each spend it;
+    /// they do not each buy the next.
+    #[tokio::test]
+    async fn slow_snapshot_pages_still_end_the_round_at_its_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        const PAGES: u64 = 6;
+
+        let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let _ = read_frame(&mut peer_end).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
+            let mut served = 0;
+            for n in 0..PAGES {
+                let Ok(Message::AskSnapshot { .. }) = read_frame(&mut peer_end).await else {
+                    break;
+                };
+                let wall = 1_000 * (n + 1);
+                let next = (n + 1 < PAGES).then(|| cursor(wall));
+                let page = snapshot_page(origin, &[wall], next, theirs.clone(), n == 0);
+                write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.unwrap();
+                served += 1;
+            }
+            served
+        });
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::from_millis(300)));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let clock = RoundClock::default();
+        let round = within_exchange_budget(
+            Duration::from_secs(30),
+            &clock,
+            sync_round(&engine, &mut ours, addr, node(9), None, &mut stalls, deadline, &clock),
+        )
+        .await;
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        drop(ours);
+        let served = peer.await.unwrap();
+
+        let outcome = round.expect("inside the round's deadline").unwrap();
+        assert!(!outcome.exhausted, "left to resume, not run to its end: {outcome:?}");
+        assert!(served < PAGES, "{served} of {PAGES} pages in one round");
+        assert!(stalls.snapshot_resumes(node(9), None), "resumed next round from its cursor");
     }
 }
