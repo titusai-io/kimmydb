@@ -401,8 +401,13 @@ jobs:
       # and the RUSTFLAGS dist sets for a musl target, on this step only.
       # Cargo records RUSTFLAGS in every artifact's fingerprint, so a
       # dependency built without them is a dependency the tag rebuilds. The
-      # second command adds the conformance driver, still workspace-wide so
-      # the feature set stays the same.
+      # second command adds the conformance driver. It does not keep the
+      # feature set: an example is built with its package's dev-dependencies,
+      # and features unify across the workspace, so it rebuilds part of the
+      # graph (tokio among it) with more features on, and a plain workspace
+      # build after it rebuilds them back. `kimmyd` is not in what it builds,
+      # so the server in the artifact is the first command's, the build the
+      # release makes; only the driver carries the wider set.
       - name: Build the server and the Rust conformance driver
         env:
           RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
