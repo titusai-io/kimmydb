@@ -6625,7 +6625,7 @@ collection is counted. Those checks read collection metadata through read
 transactions, which see the state before the open run — which this record
 argued was safe, "because a run contains no schema change by construction".
 
-> **Corrected: that argument is false, and the code no longer relies on it.**
+> **Corrected by [ADR-179](#adr-179--a-replicated-document-run-judges-its-first-document-again-once-it-holds-the-writer): that argument is false, and the code no longer relies on it.**
 > It holds against a schema change *inside the batch*, which does end a run,
 > and says nothing about a **concurrent** one on another thread. A pull or
 > push applying a drop, or a drop and a recreation, can land between the
@@ -17586,3 +17586,58 @@ turns the held-shadow test red; listing under a configuration that does not
 stand turns the history-page test red; not cancelling turns the transport
 test red. The check before the writer only answers early, and no test sees
 it removed.
+
+---
+
+## ADR-179 — A replicated document run judges its first document again once it holds the writer
+
+**Decision.** A document run judges its first document **twice**: once before
+the writer, to decide whether the run is worth opening at all, and again once
+the run's transaction is open, from a memo cleared with it. The second
+judgement decides. A run already holding the writer judges no further
+document, because every later one reads a memo refilled under it.
+
+The two answers are not equally durable, and that is what makes one
+re-judgement enough:
+
+- **History is monotone.** A drop tombstone and an incarnation floor only move
+  forward, so a document judged *history* before the writer is still history
+  under it. A window wholly superseded takes no writer at all.
+- **Apply is not.** A document judged *to be applied* can have its collection
+  dropped, or dropped and recreated, between the judgement and the writer. So
+  that answer is never acted on without being made again.
+
+**Why.** [ADR-119](#adr-119--a-replica-applies-a-peer-batch-in-one-transaction)
+held that the per-entry checks could read collection metadata through read
+transactions, which see the state before the open run, *"because a run
+contains no schema change by construction"*. That is true of a schema change
+**inside the batch**, which ends a run, and says nothing about a **concurrent**
+one on another thread. A pull or push applying a drop, or a drop and a
+recreation, lands between the judgement and the writer; the member wrote the
+document into the buried collection, or into the recreation below its floor,
+and then held a document its peers did not. Replication did not bring it back:
+both applies succeeded and the window was witnessed. The correction is
+recorded at ADR-119 as well, where the claim was made.
+
+**The defect was whole-run, not first-document.** Every document of the run
+was judged against the same stale answer, so a three-document run put all
+three into the buried collection. One re-judgement covers them because the
+memo is cleared when the transaction opens and refilled under the writer: the
+first document pays for the rest.
+
+**What this does not change.** No new transaction and no extra commit: the
+re-judgement happens inside the run's own transaction, which was being opened
+anyway. A document already held still takes no writer of its own. The
+per-entry checks, their order and their counting are as ADR-119 left them.
+
+**How it can be broken.** Removing the second judgement turns three tests red
+— the buried-collection race, the recreated-below-the-floor race, and the
+multi-document run, which then reports `applied: 3` where it must report
+`(applied, superseded) = (0, 3)`. The guard that a window of history-or-gone
+documents opens no run is separate and stays green, because it pins cost
+rather than correctness: it counts every `WriterHolder::Replication`
+transaction in `begin_write` and asserts a batch opened only the one
+bookkeeping transaction it cannot avoid. A stray replication write added to
+the skip path turns it red at four against one; asserting instead that
+`run_txn` went uncalled would pass that unchanged, which is why it counts
+rather than watches one function.

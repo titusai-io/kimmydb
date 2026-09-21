@@ -50,7 +50,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   embedding worker's rescan no longer stops for good on a collection whose
   shadow is missing.
 - **A replicated document no longer lands in a collection dropped while it
-  applied, or in the collection recreated after that drop.** A member judged
+  applied, or in the collection recreated after that drop**
+  ([ADR-179](docs/decisions.md)). A member judged
   the first document of a replicated run against its collection before taking
   the single writer. When a pull or push applying the drop, or the drop and a
   recreation, landed in between, the document was written under the buried
