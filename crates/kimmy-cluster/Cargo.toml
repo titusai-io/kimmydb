@@ -37,6 +37,7 @@ hickory-resolver.workspace = true
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 
 [dev-dependencies]
+kimmy-storage = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

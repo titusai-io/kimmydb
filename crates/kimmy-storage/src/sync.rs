@@ -567,12 +567,36 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
-        let (outcome, waited) = crate::engine::metered_writer_wait(|| {
-            self.apply_batch_absorbing(entries, Some(Introduced { theirs, scanned_to, exhausted }))
-        });
-        let mut outcome = outcome?;
-        outcome.writer_wait = waited;
+        let mut outcome = SyncOutcome::default();
+        self.apply_peer_batch_into(theirs, entries, scanned_to, exhausted, &mut outcome)?;
         Ok(outcome)
+    }
+
+    /// [`Self::apply_peer_batch`], filling `outcome` as it goes, so a caller
+    /// still holds what the batch decided before an error ended it.
+    ///
+    /// After an error, `outcome`'s counts of refused, declined, deferred and
+    /// unknown entries hold exactly the decisions a commit made final, and a
+    /// caller records them as it would on success (ADR-177). A decision no
+    /// commit covered is left out: the entry is served again, and decided and
+    /// counted then.
+    pub fn apply_peer_batch_into(
+        &self,
+        theirs: &VersionVector,
+        entries: &[OplogEntry],
+        scanned_to: Hlc,
+        exhausted: bool,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let (applied, waited) = crate::engine::metered_writer_wait(|| {
+            self.apply_batch_absorbing_into(
+                entries,
+                Some(Introduced { theirs, scanned_to, exhausted }),
+                outcome,
+            )
+        });
+        outcome.writer_wait = waited;
+        applied
     }
 
     /// The window at or after `from` a peer that asked to catch up may be
@@ -875,8 +899,62 @@ impl Engine {
         introduced: Option<Introduced<'_>>,
     ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
-        let mut witnessed = VersionVector::new();
+        self.apply_batch_absorbing_into(entries, introduced, &mut outcome)?;
+        Ok(outcome)
+    }
+
+    /// Apply `entries`, counting each decision in `outcome` only once a commit
+    /// has made it final (ADR-177), on success and on error alike.
+    ///
+    /// - **A declined drop** is final when its tombstone commits, inside
+    ///   [`Self::apply_ddl`]: counted as it returns.
+    /// - **A refusal** writes nothing, so it is final once the witnessed vector
+    ///   on disk covers it: at the batch's last commit, or earlier, at any
+    ///   commit that raised its origin past it (an applied definition appends
+    ///   its own entry, and a run commits the documents it wrote). The re-serve
+    ///   starts above what is witnessed, so a refusal covered and not counted
+    ///   would never be counted, and one counted and not covered would be
+    ///   counted again.
+    /// - **A deferred entry, and the entry the batch stopped at** are final
+    ///   with the batch's last commit, which records the window as ending
+    ///   before them.
+    fn apply_batch_absorbing_into(
+        &self,
+        entries: &[OplogEntry],
+        introduced: Option<Introduced<'_>>,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let (unknown, deferred) = (outcome.unknown_collection, outcome.deferred);
         let mut run = Run::default();
+        let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
+        let refused = std::mem::take(&mut run.refused);
+        match &applied {
+            Ok(()) => outcome.ddl_refused += refused.len(),
+            Err(_) => {
+                if !run.last_committed {
+                    outcome.unknown_collection = unknown;
+                    outcome.deferred = deferred;
+                }
+                // Read after the error, so what landed before it is what
+                // decides. A read that fails counts nothing: under-counting
+                // an entry served again is the lesser error.
+                if let Ok(covered) = self.witnessed_vector() {
+                    outcome.ddl_refused +=
+                        refused.iter().filter(|stamp| stamp.hlc <= covered.get(stamp.node)).count();
+                }
+            }
+        }
+        applied
+    }
+
+    fn apply_batch_run<'e>(
+        &'e self,
+        entries: &[OplogEntry],
+        introduced: Option<Introduced<'_>>,
+        outcome: &mut SyncOutcome,
+        run: &mut Run<'e>,
+    ) -> Result<()> {
+        let mut witnessed = VersionVector::new();
         let mut memo = Memo::default();
         let mut stopped_at: Option<Stamp> = None;
         // A window a peer introduced is served from this node's own position,
@@ -905,7 +983,7 @@ impl Engine {
             // stamp is recorded for an entry that was not applied. See
             // ADR-054. The one entry not taken — a collection this node
             // lacks — is not observed, and the batch ends at it.
-            match self.apply_one(entry, position, &mut run, &mut memo, &mut outcome)? {
+            match self.apply_one(entry, position, run, &mut memo, outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
@@ -938,10 +1016,18 @@ impl Engine {
         // the vector alone — that is the one case a batch costs a commit of
         // bookkeeping, and it used to cost it every time.
         if !witnessed.is_empty() {
-            let txn = self.witness_txn(&mut run)?;
+            let txn = self.witness_txn(run)?;
             Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
         }
-        self.commit_run(&mut run)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if count_hooks::fails(count_hooks::Fail::BeforeLastCommit) {
+            return Err(count_hooks::injected());
+        }
+        run.last = true;
+        self.commit_run(run)?;
+        // A batch that wrote nothing at its end commits nothing: nothing
+        // after this can fail, so its decisions stand as they are.
+        run.last_committed = true;
 
         if let Some(unknown) = &outcome.unknown {
             warn!(
@@ -972,7 +1058,7 @@ impl Engine {
             ddl_declined = outcome.ddl_declined,
             "merged a batch from a peer"
         );
-        Ok(outcome)
+        Ok(())
     }
 
     /// The run's transaction, opened on first use.
@@ -1020,6 +1106,9 @@ impl Engine {
             return Ok(());
         };
         txn.commit()?;
+        if run.last {
+            run.last_committed = true;
+        }
         // Counted only now: a release in a run that failed to commit did not
         // happen, and the next window releases it again (ADR-169's addendum).
         self.count_held_marks_released(std::mem::take(&mut run.released));
@@ -1040,6 +1129,10 @@ impl Engine {
             }
         }
         self.publish(published);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if run.last && count_hooks::fails(count_hooks::Fail::AfterLastCommit) {
+            failed.get_or_insert(count_hooks::injected());
+        }
         match failed {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1199,6 +1292,13 @@ struct Run<'e> {
     pending: Vec<Pending>,
     /// Held marks released into `txn` (ADR-169), counted when it commits.
     released: u64,
+    /// The stamps of the definitions the batch refused, counted once a commit
+    /// covers them (ADR-177).
+    refused: Vec<Stamp>,
+    /// Whether the commit about to run is the batch's last, and whether that
+    /// commit has landed, even if what follows it then failed.
+    last: bool,
+    last_committed: bool,
 }
 
 /// An entry applied into the open run, with what its commit owes.
@@ -1424,7 +1524,7 @@ impl Engine {
                         return Ok(Step::Unknown(Some(name)));
                     }
                 }
-                DdlOutcome::Refused => outcome.ddl_refused += 1,
+                DdlOutcome::Refused => run.refused.push(entry.stamp),
                 DdlOutcome::Declined => outcome.ddl_declined += 1,
                 // Deliberately uncounted: see `DdlOutcome::DeclinedReplay`.
                 DdlOutcome::DeclinedReplay => {}
@@ -1959,6 +2059,44 @@ impl Engine {
             self.report_index_backfill_violations(&meta, &violations)?;
         }
         Ok(matches!(created, crate::index::IndexCreated::Built(_)))
+    }
+}
+
+/// A failure injected on either side of a batch's last commit, for the count
+/// rule (ADR-177). Per thread. Under `cfg(test)`, and under the `test-hooks`
+/// feature, which only another crate's dev-dependency enables (the transport's
+/// push tests), so it is absent from every build that ships.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod count_hooks {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fail {
+        BeforeLastCommit,
+        /// After the commit, where reporting what it applied can fail.
+        AfterLastCommit,
+    }
+
+    thread_local! {
+        static FAIL: Cell<Option<Fail>> = const { Cell::new(None) };
+    }
+
+    /// Fail the next batch applied on this thread at `at`, once.
+    pub fn fail_next(at: Fail) {
+        FAIL.with(|f| f.set(Some(at)));
+    }
+
+    pub fn armed() -> bool {
+        FAIL.with(|f| f.get().is_some())
+    }
+
+    pub fn fails(at: Fail) -> bool {
+        FAIL.with(|f| f.get() == Some(at) && f.take().is_some())
+    }
+
+    pub fn injected() -> crate::StorageError {
+        crate::StorageError::Database("a failure injected for a test".into())
     }
 }
 
@@ -6722,5 +6860,155 @@ mod tests {
         let history = apply(&b, &theirs, &documents).unwrap();
         assert_eq!(history.superseded, 3, "{history:?}");
         assert_eq!(race_hooks::runs_opened(), before, "documents below the floor open no run");
+    }
+
+    /// What one delivery recorded, as the transport records it: whatever the
+    /// outcome holds, whether or not the batch then errored (ADR-177).
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Counted {
+        refused: usize,
+        declined: usize,
+        unknown: usize,
+    }
+
+    /// A transport-shaped delivery from `from` into `into`, the window passed
+    /// through `serve`, failing at `fail`, then the re-serve the peer makes
+    /// from what `into` then witnesses. The two deliveries' counts, in order.
+    fn delivered_then_re_served(
+        into: &Engine,
+        from: &Engine,
+        fail: Option<count_hooks::Fail>,
+        serve: impl Fn(Vec<OplogEntry>) -> Vec<OplogEntry>,
+    ) -> [Counted; 2] {
+        let deliver = |fail: Option<count_hooks::Fail>| {
+            let theirs = from.version_vector().unwrap();
+            let Some(start) = into.witnessed_vector().unwrap().behind(&theirs) else {
+                return (Ok(()), Counted::default());
+            };
+            let window = from.entries_for_peer(start, BATCH).unwrap();
+            let entries = serve(window.entries);
+            if let Some(at) = fail {
+                count_hooks::fail_next(at);
+            }
+            let mut outcome = SyncOutcome::default();
+            let applied = into.apply_peer_batch_into(
+                &theirs,
+                &entries,
+                window.scanned_to,
+                window.exhausted,
+                &mut outcome,
+            );
+            assert!(!count_hooks::armed(), "the injected failure was never reached");
+            let counted = Counted {
+                refused: outcome.ddl_refused,
+                declined: outcome.ddl_declined,
+                unknown: outcome.unknown_collection,
+            };
+            (applied, counted)
+        };
+        let (first, delivered) = deliver(fail);
+        assert_eq!(first.is_err(), fail.is_some(), "{first:?}");
+        let (again, re_served) = deliver(None);
+        again.unwrap();
+        [delivered, re_served]
+    }
+
+    const FAILS: [Option<count_hooks::Fail>; 3] =
+        [None, Some(count_hooks::Fail::BeforeLastCommit), Some(count_hooks::Fail::AfterLastCommit)];
+
+    /// B holds `by_email` with no creation stamp, so A's definition of the
+    /// name is refused there (ADR-123).
+    fn refusing_pair() -> ((Engine, tempfile::TempDir), (Engine, tempfile::TempDir)) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
+            .unwrap();
+        b.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        restamp_index(&b, "shop", "orders", "by_email", None);
+        ((a, da), (b, db))
+    }
+
+    #[test]
+    fn a_refusal_is_counted_once_across_a_failed_delivery_and_its_re_serve() {
+        for fail in FAILS {
+            let ((a, _da), (b, _db)) = refusing_pair();
+            let ca = a.get_collection("shop", "orders").unwrap();
+            a.insert(&ca, doc! { "_id": "after" }).unwrap();
+            let [delivered, re_served] = delivered_then_re_served(&b, &a, fail, |w| w);
+            assert_eq!(
+                delivered.refused + re_served.refused,
+                1,
+                "{fail:?}: {delivered:?} then {re_served:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_covered_by_a_later_definition_is_counted_once_across_a_failed_delivery() {
+        // The definition applied after the refusal appends its own entry, which
+        // raises A in what B witnesses past the refusal: the re-serve starts
+        // above it, so it is counted by the delivery that refused it or never.
+        for fail in FAILS {
+            let ((a, _da), (b, _db)) = refusing_pair();
+            a.create_index("shop", "orders", vec![field("name")], false, Some("by_name".into()))
+                .unwrap();
+            let [delivered, re_served] = delivered_then_re_served(&b, &a, fail, |w| w);
+            assert_eq!(
+                delivered.refused + re_served.refused,
+                1,
+                "{fail:?}: {delivered:?} then {re_served:?}"
+            );
+            assert!(b.get_collection("shop", "orders").unwrap().index("by_name").is_some());
+        }
+    }
+
+    #[test]
+    fn a_decline_is_counted_once_across_a_failed_delivery_and_its_re_serve() {
+        // The decline's tombstone commits as it is declined, so the re-serve
+        // carries a replay, which is not counted.
+        for fail in FAILS {
+            let (a, _da) = engine();
+            let (b, _db) = engine();
+            a.create_collection("shop", "orders").unwrap();
+            b.create_collection("shop", "orders").unwrap();
+            b.drop_index_stamped("shop", "orders", "by_email").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+                .unwrap();
+            let [delivered, re_served] = delivered_then_re_served(&a, &b, fail, |w| w);
+            assert_eq!(
+                delivered.declined + re_served.declined,
+                1,
+                "{fail:?}: {delivered:?} then {re_served:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_at_an_unknown_collection_is_counted_by_each_delivery_whose_last_commit_lands() {
+        // Served again whatever happens, by design (ADR-148): counted once per
+        // delivery that records the window as ending before it, and not by one
+        // that failed before recording that.
+        for (fail, counts) in FAILS.into_iter().zip([[1, 1], [0, 1], [1, 1]]) {
+            let (a, _da) = engine();
+            let (b, _db) = engine();
+            let ca = a.create_collection("shop", "orders").unwrap();
+            a.create_collection("shop", "known").unwrap();
+            a.insert(&ca, doc! { "_id": "lost" }).unwrap();
+            let [delivered, re_served] = delivered_then_re_served(&b, &a, fail, |window| {
+                window
+                    .into_iter()
+                    .filter(|e| e.collection != ca.id || e.kind.is_document())
+                    .collect()
+            });
+            assert_eq!(
+                [delivered.unknown, re_served.unknown],
+                counts,
+                "{fail:?}: {delivered:?} then {re_served:?}"
+            );
+        }
     }
 }
