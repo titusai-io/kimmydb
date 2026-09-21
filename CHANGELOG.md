@@ -10,6 +10,52 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`kimmy_sync_ddl_relogged_total`** (`kimmy.sync.ddl_relogged` on the OTLP
+  bridge) counts schema changes a snapshot restore appended to this node's
+  oplog so that it can serve them onward ([ADR-180](docs/decisions.md)). Not
+  an error: it reads 0 on a member that never caught up by snapshot, and a
+  rise is the fix below doing its job. A scrape config or a golden list that
+  enumerates series needs the new name.
+
+### Fixed
+
+- **A member that caught up by snapshot now serves onward the index
+  definitions it restored** ([ADR-180](docs/decisions.md)). A snapshot wrote
+  each definition as state with no entry behind it, while completing the
+  snapshot granted the member coverage of the stamp it was created at. So a
+  member pulling from it was served a window without the index, moved past
+  it, and was never served it again: that member lacked the index
+  permanently, and nothing counted it. For a unique index, that member then
+  accepted duplicates its peers refused. The restore now appends the entry
+  the index's origin logged, at the origin's stamp, in the same commit as the
+  definition. It leaves an entry it already holds untouched, and a chain of
+  snapshot hops still ends with the origin's one entry. **Only index
+  definitions are fixed.** A collection created, a vector configuration, and
+  the removals (a collection, an index, a configuration turned off, a
+  document) can still fail to reach a member through a peer that caught up by
+  snapshot, because a snapshot page does not carry what their entries need.
+- **Every member now builds an index from its definition as stored, and its
+  `CreateIndex` entry carries that definition** ([ADR-180](docs/decisions.md)).
+  This changes what a local create builds, answers and logs, not only what a
+  restore appends. Collection metadata stores a partial filter's small `Int64`
+  as an `Int32` and a generic `Binary` as an array, so the filter a client sent
+  was not the filter any member holds. The member that created the index built
+  it from the filter as sent. A peer built from whatever the entry carried, and
+  a member restoring from a snapshot built from the stored form, so members
+  could hold different memberships for one definition. The create now answers
+  with the filter its listing shows. The entry carries that filter and
+  `multikey: false`: each member sets `multikey` from its own documents, and no
+  member reads it from an entry. **For a partial filter holding a generic
+  `Binary` this is deliberately worse on the member that creates the index**,
+  until the partial filter itself is fixed. That member no longer indexes, and
+  a TTL index no longer expires, the documents already present that match the
+  binary. It only held them until each was next written, and every member now
+  agrees.
+
 ## 0.33.0 - 2026-09-21
 
 **A minor, for one additive series; nothing breaks.**

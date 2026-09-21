@@ -69,6 +69,12 @@ pub struct Engine {
     /// the standing number per index as `unkeyed` on the listing, and this is
     /// the rate, for the metrics endpoint.
     unkeyed_writes: std::sync::atomic::AtomicU64,
+    /// Entries a snapshot restore appended behind the schema it restored, so
+    /// that this node can serve them onward (ADR-180), since start. Counted
+    /// after the commit that made each one durable, here rather than on the
+    /// page's result: a page can fail after its definitions committed, and a
+    /// count carried on a result that is never returned would be lost.
+    ddl_relogged: std::sync::atomic::AtomicU64,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -793,6 +799,7 @@ impl Engine {
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
+            ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -994,6 +1001,12 @@ impl Engine {
         self.unkeyed_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many schema changes a snapshot restore has appended to this node's
+    /// oplog since start, so that it can serve them onward (ADR-180).
+    pub fn ddl_relogged(&self) -> u64 {
+        self.ddl_relogged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many durable write transactions have committed since start.
     ///
     /// One per unit of work is the expectation. Anything that turns one
@@ -1023,6 +1036,15 @@ impl Engine {
 
     pub(crate) fn count_unkeyed(&self, n: u64) {
         self.unkeyed_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What has to follow the commit of an entry a snapshot restore appended
+    /// (ADR-180): counted, the origin's clock folded into this node's, and
+    /// published, as `sync::apply_ddl` does for one that arrived in a window.
+    pub(crate) fn relogged(&self, entry: OplogEntry) {
+        self.ddl_relogged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.witness(&entry.stamp);
+        self.publish(vec![entry]);
     }
 
     /// Record that a collection's vectors have changed.
@@ -3348,6 +3370,55 @@ pub(crate) fn append_oplog_at(
         txn.live_counts().lock().appended(mark);
     }
     Ok(false)
+}
+
+/// Append an entry a snapshot restore rebuilt (ADR-180), in the transaction
+/// that restores the state it describes — unless this node already holds an
+/// entry under its stamp. -> whether it was appended.
+///
+/// **Checked before writing, never after.** [`append_oplog_at`] writes and
+/// then asks whether the key was taken, which is harmless for a re-delivery
+/// through the entries path: the bytes are the origin's own. A rebuilt entry
+/// is not guaranteed to be. It is built from a definition as it stands on the
+/// page, and an entry an origin logged before ADR-180 can differ from any
+/// rebuild — it carries the `multikey` that origin observed. Written over,
+/// the origin's entry would be replaced by a reconstruction under the
+/// origin's stamp, on exactly the members that held it right. So a key
+/// already taken is left as it is, whatever it holds.
+///
+/// Under [`Position::Hold`], as a snapshot document is: what the restore
+/// writes is state, arriving outside any window, and the coverage a snapshot
+/// grants is recorded once, when it completes — which releases the mark.
+pub(crate) fn relog(txn: &WriteTxn<'_>, entry: &OplogEntry) -> Result<bool> {
+    let key = codec::oplog_key(&entry.stamp);
+    if txn.open_table(tables::OPLOG)?.get(key.as_slice())?.is_some() {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    if relog_hooks::fails() {
+        return Err(StorageError::Database("a failure injected at a re-log".into()));
+    }
+    append_oplog_at(txn, entry, Position::Hold)?;
+    Ok(true)
+}
+
+/// A failure injected at the next re-log on this thread, for the test that
+/// the entry commits with the state it describes or not at all (ADR-180).
+#[cfg(test)]
+pub(crate) mod relog_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn fail_next() {
+        FAIL.with(|f| f.set(true));
+    }
+
+    pub(crate) fn fails() -> bool {
+        FAIL.with(|f| f.replace(false))
+    }
 }
 
 /// Release the held mark (ADR-160) on the entry stored under `stamp`, because

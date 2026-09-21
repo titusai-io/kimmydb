@@ -74,10 +74,15 @@ pub struct IndexMeta {
     /// there is no separate `sparse` flag: MongoDB treats partial as
     /// superseding sparse and so does this.
     ///
-    /// Stored as the filter document. Verified to round-trip losslessly
-    /// through both boundaries it crosses — canonical Extended JSON in the
-    /// collection metadata, BSON in the replicated [`crate::IndexCreate`] —
-    /// including dates and integers above 2^53.
+    /// Stored as the filter document, and it crosses two boundaries: BSON in
+    /// the replicated [`crate::IndexCreate`], which keeps every type, and
+    /// **relaxed** Extended JSON in the collection metadata, which does not
+    /// quite. Dates, integers above 2^53 and most other types come back as
+    /// they went in, but an `Int64` that fits in 32 bits comes back as an
+    /// `Int32`, and a generic-subtype `Binary` as an array of integers. The
+    /// encoding is idempotent — a filter stored once is stored unchanged
+    /// again — so every member builds the index from, stores, and logs in its
+    /// `CreateIndex` entry the filter as stored rather than as sent (ADR-180).
     #[serde(default)]
     pub partial_filter: Option<Document>,
     /// The stamp of the create that produced *this* index, at its origin:
