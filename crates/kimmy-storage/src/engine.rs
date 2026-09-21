@@ -2016,6 +2016,14 @@ impl Engine {
             return Err(StorageError::WriterBusy { waited });
         };
         let mut txn = blocking(|| self.db.begin_write())?;
+        // Counted here rather than at any one caller, so the guard that a
+        // window of documents already held opens no write transaction is an
+        // allowlist: a new replication write path is counted by existing here,
+        // not by remembering to call something.
+        #[cfg(test)]
+        if holder == WriterHolder::Replication {
+            crate::sync::race_hooks::replication_write_opened();
+        }
         let coalesced = self.coalescer.lock().is_some();
         if coalesced {
             // No persistent savepoints exist in this engine, so the one

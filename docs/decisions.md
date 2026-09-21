@@ -6622,8 +6622,32 @@ read against `kimmy_requests_total` and a replica's commits answer no request.
 per entry, in stamp order: a peer's `UniqueViolation` is refused, the drop
 tombstone and the incarnation floor supersede what predates them, an unknown
 collection is counted. Those checks read collection metadata through read
-transactions, which see the state before the open run — which is safe,
-because a run contains no schema change by construction. The one piece of
+transactions, which see the state before the open run — which this record
+argued was safe, "because a run contains no schema change by construction".
+
+> **Corrected: that argument is false, and the code no longer relies on it.**
+> It holds against a schema change *inside the batch*, which does end a run,
+> and says nothing about a **concurrent** one on another thread. A pull or
+> push applying a drop, or a drop and a recreation, can land between the
+> judgement made before the writer and the run's transaction, so the
+> judgement a read transaction gave is stale by the time the run holds the
+> writer. A member applying on the stale answer wrote the document under the
+> buried collection, or into the recreated one below its floor, and then held
+> a document its peers did not.
+>
+> The first document of a run is therefore judged **again** once the
+> transaction is open, from a memo cleared with it (`sync::apply_one`). The
+> answer *history* needs no writer, because a tombstone and an incarnation
+> floor only move forward, so it stays true; the answer *apply* can go stale
+> and is not trusted. One re-judgement covers the whole run: every later
+> document reads a memo refilled under the writer.
+>
+> The sentence above is kept rather than deleted because it is the claim the
+> defect came from — read it as disproved, not as the rule. **A later reader
+> who judges the re-judgement redundant on the strength of it reinstates the
+> defect**, which is precisely how it arrived.
+
+The one piece of
 metadata a document write does touch, an index's multikey flag, is re-read
 through the write transaction by `index::maintain_remote` and
 `index::mark_multikey` themselves, so an entry that flips it is seen by the
