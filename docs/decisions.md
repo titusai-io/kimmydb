@@ -18093,12 +18093,12 @@ A filter already converted stays converted. The store holds the array, and nothi
 
 ### What this does to ADR-180
 
-ADR-180 made every member build, store and log a definition **as stored** (`index::as_stored`), because the store changed the filter. The store no longer changes it, so `as_stored` is now the identity on every filter. It stays as the place that rule is enforced, so a future encoding that lost something would be held to one value again. Four of ADR-180's test premises, one of them a fixture shared by eight tests, asserted before anything else that the store changes the filter, so that they could see the normalisation. That premise is no longer true, and they failed on it, which is what a premise is for. Each is rewritten around what is true now:
+ADR-180 made every member build, store and log a definition **as stored** (`index::as_stored`), because the store changed the filter. The store no longer changes it, so `as_stored` is now the identity on every filter. It stays as the place that rule is enforced, so a future encoding that lost something would be held to one value again. Four of ADR-180's test premises, one of them a fixture shared by eight tests, asserted before anything else that the store changes the filter, so that they could see the normalisation. **When this record landed, those four premises detected that the thing they were written to observe had stopped happening, which is what they are for.** They did not quietly go on passing on a case that no longer exists: they failed, and said why. Every other premise assertion in this series caught a mistake made while the test was being written. These caught a change made later, for a different reason, in a different record. Each is rewritten around what is true now:
 - the store keeps the filter as sent;
 - the create answers and lists the filter as sent;
 - **every member**, meaning the origin, a peer applying its entry and a member restoring from its snapshot, **indexes the binary document and not the array one**.
 
-That last is this record's user-visible fix, held across replication.
+That last is this record's user-visible fix, held across replication. It is a stronger claim than the test it replaces made: that one proved the members agreed with each other; this one proves they agree with what the client asked for.
 
 **The class sweep.** One dynamically typed value is stored in collection metadata: `IndexMeta.partial_filter`. The look-alikes:
 - `VectorConfig` is fully typed.
