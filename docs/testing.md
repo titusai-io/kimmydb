@@ -821,15 +821,14 @@ here whose subject is a *document*.
 | The advertised capabilities are the documented ones, each with an explanation | `the_capability_set_is_the_documented_one` |
 | Topology lists the answering node, which the member set never contains | `topology_lists_this_node_even_though_the_member_set_never_contains_it` |
 | A registered peer reads `unknown` until membership sees it | `a_registered_peer_is_reported_unknown_until_membership_sees_it` |
+| A cursor's refusals — with `skip`, with a foreign `sort`, malformed | inside `documented_refusals_use_the_documented_envelope` |
+| An unlimited `find` is a page, not the collection | `an_unlimited_find_returns_a_page_and_not_the_collection` |
+| A final full page still offers a token, and the next page is empty | `a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty` |
 
 The coverage assertion is the load-bearing part: it means a route cannot be
 added to the router and the specification without also being driven here. A
 specification entry nothing executes is the failure mode this whole file exists
 to prevent — a claim with no mechanism behind it.
-
-| A cursor's refusals — with `skip`, with a foreign `sort`, malformed | inside `documented_refusals_use_the_documented_envelope` |
-| An unlimited `find` is a page, not the collection | `an_unlimited_find_returns_a_page_and_not_the_collection` |
-| A final full page still offers a token, and the next page is empty | `a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty` |
 
 **Two of those rows belong to a claim only the cluster harness can settle.**
 `every_node_can_tell_a_client_about_every_node` boots three real nodes and

@@ -16875,6 +16875,8 @@ installed, a backend call costs one thread-local read (2.3 ns) and no clock.
 | `read` | wall time inside the backend's `read`, a page the cache did not hold, and `len` |
 | `write` | wall time inside the backend's `write`, and `set_len`, which grows the file |
 | `sync` | wall time inside the backend's `sync_data`, the fsync |
+| `cpu` | the thread's CPU time over the hold, less its CPU time inside those calls |
+| `off_cpu` | the hold less the four above |
 
 Wall time for a call whose CPU is read includes the meter's own two CPU clock
 reads, a few hundred nanoseconds, because they sit inside the wall-clock reads.
@@ -16883,8 +16885,6 @@ left in `off_cpu`. The CPU reads nested inside the wall reads also under-count
 the calls' CPU by the clock reads' own cost, so `cpu` reads slightly high and
 `off_cpu` slightly low (about 87 µs on a 170 ms bulk), the direction that cannot
 manufacture apparent contention.
-| `cpu` | the thread's CPU time over the hold, less its CPU time inside those calls |
-| `off_cpu` | the hold less the four above |
 
 `off_cpu` is off the CPU outside any file call: the scheduler not running the
 holder, or the holder waiting on a lock inside redb's cache or write buffer
