@@ -30,6 +30,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Dropping a large index no longer stalls every write for tens of seconds,
+  or needs gigabytes of free disk while it runs.** The storage call that
+  cleared an index's entries was slow in the way that matters. For 742,858
+  entries it held the single writer for 35 s and grew the file from 2.1 to
+  12 GiB before handing the space back over the next commits. Entries are now
+  removed by key, still in one transaction: 0.5 s, with no growth. The same
+  call ran in four other places, fixed the same way:
+  - a peer's later definition of an index replacing this node's (ADR-132),
+    which happens with nobody choosing it;
+  - the end of a whole-database snapshot, releasing its held marks, where
+    releasing 19,968 marks grew the file eightfold;
+  - rebuilding the oplog arrival index at open;
+  - moving a collection to its derived id.
+  The space was always handed back after the fact, so there is nothing to
+  clean up.
 - **TTL expiry no longer deletes documents its index's partial filter does not
   select** ([ADR-181](docs/decisions.md)). A TTL index with a partial filter
   could delete documents outside it, in two ways.

@@ -1159,7 +1159,7 @@ impl crate::Engine {
         if let Some(loser) = &superseded {
             {
                 let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
-                entries.retain_in(index_id_range(meta.id, loser.id), |_, _| false)?;
+                clear_index_entries(&mut entries, index_id_range(meta.id, loser.id))?;
             }
             // Under the *winner's* stamp. The upper bound is the load-bearing
             // half: anything above it would make the winner's own re-delivery
@@ -1476,7 +1476,7 @@ impl crate::Engine {
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
-            entries.retain_in(index_id_range(meta.id, index.id), |_, _| false)?;
+            clear_index_entries(&mut entries, index_id_range(meta.id, index.id))?;
         }
         // Entries are removed above, in this same transaction, which is what
         // makes it safe for an index later recreated under the same name to
@@ -2065,11 +2065,111 @@ impl crate::Engine {
     }
 }
 
+/// How many keys [`clear_index_entries`] gathers before removing them.
+///
+/// Gathering every key of a large index first holds them all in memory:
+/// 675 MiB of peak RSS at 7.4 million entries. Fifty thousand at a time added
+/// nothing measurable, in the same time, and all of it still commits as one.
+///
+/// Tiny under test, so that every clear in every test crosses many batch
+/// boundaries: at the shipped size no test's data would reach the second
+/// batch, and the code that resumes after one could be wrong unseen. The
+/// shipped size is [`SHIPPED_CLEAR_BATCH`], which a test pins, since no test
+/// runs a clear at it.
+pub(crate) const CLEAR_BATCH: usize = if cfg!(test) { 64 } else { SHIPPED_CLEAR_BATCH };
+
+/// [`CLEAR_BATCH`] outside this crate's own tests: in every other crate's
+/// tests, and in the binary.
+pub(crate) const SHIPPED_CLEAR_BATCH: usize = 50_000;
+
+/// A batch that read `read` keys and removed `removed` of them is done with;
+/// fewer means a key the range yields cannot be removed.
+///
+/// Every by-key clear here re-reads its range from the start, so it ends only
+/// because each batch removed what it read. A key that did not round-trip from
+/// the read to the removal would be read again, batch after batch, for ever,
+/// inside a held write transaction: a hang with the writer held, not an error.
+/// Stopping turns that into an error the transaction aborts on.
+pub(crate) fn ensure_removed(read: usize, removed: usize, table: &str) -> Result<()> {
+    if removed == read {
+        return Ok(());
+    }
+    Err(StorageError::Corrupt(format!(
+        "clearing {table}: a batch read {read} keys and removed {removed}; stopping rather than \
+         reading the same keys again with the writer held"
+    )))
+}
+
+/// Test-only: make the by-key clears of one table leave their keys in place,
+/// as a key that does not round-trip from the read to the removal would.
+#[cfg(test)]
+pub(crate) mod clear_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEPT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// From now on, on this thread, removals from `table` do nothing.
+    pub(crate) fn keep_keys_of(table: &'static str) {
+        KEPT.with(|k| k.set(Some(table)));
+    }
+
+    pub(crate) fn keeps(table: &str) -> bool {
+        KEPT.with(|k| k.get() == Some(table))
+    }
+}
+
+/// Remove every index entry in `range`, inside the caller's transaction, and
+/// answer how many.
+///
+/// **Never `retain_in`.** redb's `retain_in` with a predicate that keeps
+/// nothing is not a faster way to remove a range; it is a slower one. Measured
+/// on 742,858 entries: `retain_in` took 33 s and grew the file from 2.1 to
+/// 12 GiB inside the transaction, while gathering the keys and removing each
+/// took 0.51 s and grew it not at all. redb hands the growth back within a
+/// couple of commits, but it has to be free when the clear runs, and the
+/// writer is held throughout. That is on a drop, and on a peer's rival
+/// definition superseding this node's inside the winner's build, where nobody
+/// chose to wait.
+pub(crate) fn clear_index_entries(
+    entries: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
+    range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
+) -> Result<usize> {
+    let mut removed = 0;
+    loop {
+        #[allow(clippy::type_complexity)]
+        let batch: Vec<(u64, u32, Vec<u8>, Vec<u8>)> = entries
+            .range(range.clone())?
+            .take(CLEAR_BATCH)
+            .map(|row| {
+                let (key, _) = row?;
+                let (collection, index, value, doc_key) = key.value();
+                Ok((collection, index, value.to_vec(), doc_key.to_vec()))
+            })
+            .collect::<Result<_>>()?;
+        if batch.is_empty() {
+            return Ok(removed);
+        }
+        let mut gone = 0;
+        for (collection, index, value, doc_key) in &batch {
+            #[cfg(test)]
+            if clear_hooks::keeps("index entries") {
+                continue;
+            }
+            let key = (*collection, *index, value.as_slice(), doc_key.as_slice());
+            gone += usize::from(entries.remove(key)?.is_some());
+        }
+        ensure_removed(batch.len(), gone, "index entries")?;
+        removed += batch.len();
+    }
+}
+
 /// Key range covering every entry belonging to one index.
 fn index_id_range(
     coll: CollectionId,
     index_id: u32,
-) -> impl std::ops::RangeBounds<tables::IndexKey<'static>> {
+) -> impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static {
     use std::ops::Bound;
     let start = Bound::Included((coll.0, index_id, [].as_slice(), [].as_slice()));
     let end = match index_id.checked_add(1) {
@@ -3908,5 +4008,164 @@ mod tests {
                 assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
             }
         }
+    }
+}
+
+/// Clearing an index's entries, held to a bound `retain_in` breaks: at this
+/// size it grew the file seven and a half times over, and clearing by key
+/// does not grow it at all. A test that only checked the entries were gone
+/// passed under both, which is how `retain_in` shipped.
+#[cfg(test)]
+mod clearing {
+    use super::*;
+    use bson::doc;
+
+    const ENTRIES: i64 = 5_000;
+
+    /// `shop.t` holding `ENTRIES` documents, indexed by `by_x`, the index
+    /// each test clears, and by `by_y`, its sibling on the same collection,
+    /// which each test holds untouched: a clear that removed more than its
+    /// own index's range would otherwise pass every assertion about growth
+    /// and emptiness.
+    fn indexed() -> (crate::Engine, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        let t = engine.create_collection("shop", "t").unwrap();
+        let docs: Vec<Document> = (0..ENTRIES).map(|i| doc! {"_id": i, "x": i, "y": i}).collect();
+        engine.insert_many(&t, docs).unwrap();
+        for (field, name) in [("x", "by_x"), ("y", "by_y")] {
+            engine
+                .create_index(
+                    "shop",
+                    "t",
+                    vec![IndexField::ascending(field)],
+                    false,
+                    Some(name.into()),
+                )
+                .unwrap();
+        }
+        assert_eq!(entries_of(&engine, "by_y"), ENTRIES as usize, "premise: the sibling is full");
+        (engine, dir, path)
+    }
+
+    fn assert_sibling_untouched(engine: &crate::Engine) {
+        assert_eq!(
+            entries_of(engine, "by_y"),
+            ENTRIES as usize,
+            "the clear reached past its own index into the sibling's entries"
+        );
+    }
+
+    fn file(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn entries_of(engine: &crate::Engine, index: &str) -> usize {
+        let coll = engine.get_collection("shop", "t").unwrap();
+        let id = IndexMeta::derive_id(index);
+        scan_range(engine.db(), coll.id, id, &[], None, Unkeyed::Include).unwrap().len()
+    }
+
+    fn assert_no_growth(before: u64, after: u64, what: &str) {
+        assert!(
+            after <= before + before / 4,
+            "{what} grew the file from {before} to {after} bytes; a clear that grows the file \
+             is retain_in's cost, see clear_index_entries"
+        );
+    }
+
+    #[test]
+    fn dropping_an_index_does_not_grow_the_file() {
+        let (engine, _dir, path) = indexed();
+        assert_eq!(entries_of(&engine, "by_x"), ENTRIES as usize, "premise: the index is full");
+        let before = file(&path);
+
+        engine.drop_index("shop", "t", "by_x").unwrap();
+
+        assert_eq!(entries_of(&engine, "by_x"), 0);
+        assert_sibling_untouched(&engine);
+        assert_no_growth(before, file(&path), "dropping the index");
+    }
+
+    #[test]
+    fn the_shipped_clear_batch_is_the_measured_one() {
+        // Every test in this crate runs the small batch, and every other
+        // crate's tests never reach a second batch at the shipped size, so no
+        // test anywhere runs a clear at it. It is held here instead, to the
+        // size measured: 50,000 keys at a time added no memory, where
+        // gathering all 7.4 million added 675 MiB.
+        assert_eq!(SHIPPED_CLEAR_BATCH, 50_000);
+        assert_eq!(CLEAR_BATCH, 64, "premise: this crate's own tests run the small batch");
+    }
+
+    #[test]
+    fn a_clear_whose_keys_do_not_go_stops_instead_of_spinning_with_the_writer_held() {
+        let (engine, _dir, _path) = indexed();
+        let engine = std::sync::Arc::new(engine);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clearing = std::sync::Arc::clone(&engine);
+        // On a thread of its own, so that a clear that spins fails this test
+        // at the deadline rather than hanging the suite.
+        std::thread::spawn(move || {
+            clear_hooks::keep_keys_of("index entries");
+            let coll = clearing.get_collection("shop", "t").unwrap();
+            let db = clearing.db();
+            let txn = db.begin_write().unwrap();
+            let outcome = {
+                let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+                clear_index_entries(
+                    &mut entries,
+                    index_id_range(coll.id, IndexMeta::derive_id("by_x")),
+                )
+            };
+            let _ = tx.send(outcome.map_err(|e| e.to_string()));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the clear re-read keys it could not remove, and never returned");
+        let err = outcome.expect_err("a clear that removed nothing reports it");
+        assert!(err.contains("clearing index entries"), "{err}");
+    }
+
+    #[test]
+    fn a_peers_rival_definition_clears_the_loser_without_growing_the_file() {
+        // The site nobody chooses: a replicated definition of the same name,
+        // created later on a peer, supersedes this node's inside the build
+        // that installs it (ADR-132). The winner selects nothing here, so what
+        // the transaction writes is the loser's clear and little else.
+        let (engine, _dir, path) = indexed();
+        let t = engine.get_collection("shop", "t").unwrap();
+        let later = Stamp::new(engine.next_stamp().hlc, kimmy_core::NodeId::from_bytes([9; 16]));
+        let rival = kimmy_core::IndexCreate {
+            db: "shop".into(),
+            collection: "t".into(),
+            index: IndexMeta {
+                id: IndexMeta::derive_id("by_x"),
+                name: "by_x".into(),
+                fields: vec![IndexField::ascending("x")],
+                unique: false,
+                enforcement: Enforcement::Local,
+                multikey: false,
+                expire_after_secs: None,
+                partial_filter: Some(doc! {"never": true}),
+                created: Some(later),
+            },
+        };
+        let entry =
+            crate::engine::ddl_entry(later, kimmy_core::OpKind::CreateIndex, t.id, &rival).unwrap();
+        let before = file(&path);
+
+        engine.apply_batch(std::slice::from_ref(&entry)).unwrap();
+
+        let standing = engine.get_collection("shop", "t").unwrap();
+        assert_eq!(
+            standing.index("by_x").unwrap().partial_filter,
+            Some(doc! {"never": true}),
+            "premise: the peer's definition superseded this node's"
+        );
+        assert_eq!(entries_of(&engine, "by_x"), 0, "the loser's entries are gone");
+        assert_sibling_untouched(&engine);
+        assert_no_growth(before, file(&path), "superseding the index");
     }
 }
