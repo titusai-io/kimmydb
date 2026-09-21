@@ -49,6 +49,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   restores no shadow whose collection this member has dropped since. And the
   embedding worker's rescan no longer stops for good on a collection whose
   shadow is missing.
+- **A replicated document no longer lands in a collection dropped while it
+  applied, or in the collection recreated after that drop**
+  ([ADR-179](docs/decisions.md)). A member judged
+  the first document of a replicated run against its collection before taking
+  the single writer. When a pull or push applying the drop, or the drop and a
+  recreation, landed in between, the document was written under the buried
+  collection, or into the recreated one below its floor, where the member then
+  held a document its peers did not. It is judged again once the run holds the
+  writer; documents already held still take no writer of their own.
 - **A replicated drop no longer deletes the collection recreated after it.**
   A member applying a drop read the collection, then took the single writer and
   removed whatever stood under its name. When another apply of the same drop,

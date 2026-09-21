@@ -850,11 +850,17 @@ impl Engine {
     /// order: a node's own `UniqueViolation` is refused, a drop tombstone or an
     /// incarnation floor supersedes what predates it, an unknown collection is
     /// counted. They read collection metadata through read transactions,
-    /// which see the state *before* the open run — safe, because a run holds
-    /// no schema change (a DDL entry ends it) and the one piece of metadata a
-    /// document write does touch, the multikey flag, is re-read through the
-    /// write transaction by `index::maintain_remote` and `index::mark_multikey`
-    /// themselves.
+    /// which see the state *before* the open run.
+    ///
+    /// ADR-119 called that safe "because a run holds no schema change (a DDL
+    /// entry ends it)". **That is false against a concurrent schema change on
+    /// another thread**, which no property of the batch excludes: the answer
+    /// is stale by the time the run holds the writer. So the first document
+    /// of a run is judged again under the writer — see `apply_one` — and the
+    /// read-transaction answer is relied on only where it cannot go stale.
+    /// The one piece of metadata a document write does touch, the multikey
+    /// flag, is re-read through the write transaction by
+    /// `index::maintain_remote` and `index::mark_multikey` themselves.
     ///
     /// What waits for the commit: publishing to change streams, and recording
     /// a unique violation, which mints a local entry in a transaction of its
@@ -1016,7 +1022,7 @@ impl Engine {
         // the vector alone — that is the one case a batch costs a commit of
         // bookkeeping, and it used to cost it every time.
         if !witnessed.is_empty() {
-            let txn = self.run_txn(run)?;
+            let txn = self.witness_txn(run)?;
             Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
         }
         #[cfg(any(test, feature = "test-hooks"))]
@@ -1067,6 +1073,19 @@ impl Engine {
     /// which turns out to hold only schema changes, or nothing this node
     /// keeps, does not hold redb's single writer for the duration.
     fn run_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
+        if run.txn.is_none() {
+            run.txn = Some(self.begin_write(WriterHolder::Replication)?);
+        }
+        Ok(run.txn.as_ref().expect("opened just above"))
+    }
+
+    /// [`Self::run_txn`] for the window's witnessed vector at the end of a
+    /// batch, which every window takes: the one bookkeeping transaction a
+    /// batch costs, and the one the guard below subtracts rather than
+    /// exempts. It is counted like every other replication write, in
+    /// `begin_write`, because a guard that exempts a path is a guard a new
+    /// path can walk past.
+    fn witness_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
         if run.txn.is_none() {
             run.txn = Some(self.begin_write(WriterHolder::Replication)?);
         }
@@ -1264,9 +1283,14 @@ pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: 
 
 /// Collection metadata as resolved during one batch.
 ///
-/// Valid until the next schema change, which is the only thing in a batch
-/// that can create, drop or recreate a collection — a document run cannot —
-/// so it is cleared at every DDL entry and nowhere else. An entry's own
+/// Valid until the next schema change, which is the only thing *in this
+/// batch* that can create, drop or recreate a collection — a document run
+/// cannot — so it is cleared at every DDL entry. It is also cleared when a
+/// run's transaction opens, because a schema change on **another thread** can
+/// land between the judgement made before the writer and the writer itself,
+/// and the memo filled before it would carry that stale answer into the run.
+/// Those are the only two places, and the second is load-bearing: see
+/// `apply_one`, and the correction on ADR-119. An entry's own
 /// write may set an index's multikey flag, which the memoised copy will not
 /// show; nothing here reads it (the index paths re-read the definition
 /// through the write transaction), and `collection_by_id` returned the
@@ -1436,6 +1460,51 @@ enum Step {
     Unknown(Option<String>),
 }
 
+/// What judging a replicated document against its collection decided.
+enum Judged {
+    /// Decided without the writer and without writing: history, superseded
+    /// by a drop, or *left* because the collection is not here and no
+    /// tombstone says why -- which ADR-148 defines as left, not taken, and
+    /// which the carried `Step` distinguishes.
+    Decided(Step),
+    /// To be applied, into this definition.
+    Apply(Arc<CollectionMeta>),
+}
+
+impl Engine {
+    /// Whether a replicated document is history, gone with its collection,
+    /// or to be applied, counting what is taken into `outcome`.
+    fn judge_document(
+        &self,
+        memo: &mut Memo,
+        entry: &OplogEntry,
+        outcome: &mut SyncOutcome,
+    ) -> Result<Judged> {
+        let collection = self.memo_collection(memo, entry.collection)?;
+        if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
+            outcome.superseded += 1;
+            return Ok(Judged::Decided(Step::Taken));
+        }
+
+        let Some(collection) = collection else {
+            // Gone here, and a tombstone says so: history, whichever way the
+            // stamps fall (ADR-148). [`Self::is_history`] turns away a write
+            // from *before* a drop even when the collection was recreated;
+            // this one covers the collection that is simply not here,
+            // including the ordinary race in which a peer wrote into it
+            // before hearing the drop. Waiting for that collection would be
+            // waiting for something that is never coming, which is ADR-123's
+            // case and must not stop the batch.
+            if self.memo_dropped_at(memo, entry.collection)?.is_some() {
+                outcome.superseded += 1;
+                return Ok(Judged::Decided(Step::Taken));
+            }
+            return Ok(Judged::Decided(Step::Unknown(None)));
+        };
+        Ok(Judged::Apply(collection))
+    }
+}
+
 impl Engine {
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
@@ -1495,28 +1564,50 @@ impl Engine {
             return Ok(Step::Taken);
         }
 
-        let collection = self.memo_collection(memo, entry.collection)?;
-        if self.is_history(memo, collection.as_deref(), entry.collection, entry.stamp)? {
-            outcome.superseded += 1;
-            return Ok(Step::Taken);
-        }
-
-        let Some(collection) = collection else {
-            // Gone here, and a tombstone says so: history, whichever way the
-            // stamps fall (ADR-148). [`Self::is_history`] turns away a write
-            // from *before* a drop even when the collection was recreated;
-            // this one covers the collection that is simply not here,
-            // including the ordinary race in which a peer wrote into it
-            // before hearing the drop. Waiting for that collection would be
-            // waiting for something that is never coming, which is ADR-123's
-            // case and must not stop the batch.
-            if self.memo_dropped_at(memo, entry.collection)?.is_some() {
-                outcome.superseded += 1;
-                return Ok(Step::Taken);
-            }
-            return Ok(Step::Unknown(None));
+        let collection = match self.judge_document(memo, entry, outcome)? {
+            Judged::Decided(step) => return Ok(step),
+            Judged::Apply(collection) => collection,
         };
 
+        // The judgement above is made before the writer, for the first
+        // document of a run, and a drop, or a drop and a recreation, can land
+        // between it and the run's transaction. A tombstone and a floor only
+        // move forward, so an answer of *history* stays true and needs no
+        // writer: a window wholly superseded takes none. An answer of *apply*
+        // can go stale, so it is judged again once the transaction is open,
+        // from a memo cleared with it; applied on the stale answer, the
+        // document landed in the buried collection, or below the floor of
+        // the one recreated after it.
+        let collection = if run.txn.is_none() {
+            // Inside the guard, not before it. The competitor runs on this
+            // thread, and `begin_write` takes `writer_gate` with no budget
+            // outside a task-local scope, so reaching this with the run's
+            // transaction already open would be an unbounded self-deadlock
+            // rather than a bounded `WriterBusy`. Today `HOOK` is single-shot
+            // and is consumed at the first applying document, where `run.txn`
+            // is always `None`; placing it here makes that structural instead
+            // of incidental.
+            #[cfg(test)]
+            race_hooks::reach(race_hooks::Race::DocumentRun);
+            self.run_txn(run)?;
+            *memo = Memo::default();
+            match self.judge_document(memo, entry, outcome)? {
+                Judged::Decided(step) => {
+                    #[cfg(test)]
+                    race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    return Ok(step);
+                }
+                Judged::Apply(current) => {
+                    #[cfg(test)]
+                    if *current != *collection {
+                        race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    }
+                    current
+                }
+            }
+        } else {
+            collection
+        };
         let txn = self.run_txn(run)?;
         match self.apply_remote_in_txn(txn, &collection, entry, position)? {
             RemoteApplied::Applied { id, violations, released } => {
@@ -2110,6 +2201,9 @@ pub(crate) mod race_hooks {
         /// A vector configuration has committed: not a race, a point to look
         /// at what the commit made visible.
         VectorsCommitted,
+        /// A replicated document judged not history, before its run's write
+        /// transaction is open.
+        DocumentRun,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -2125,6 +2219,11 @@ pub(crate) mod race_hooks {
         /// side that loses, and may take an absorbing branch of its own; that
         /// is not the loser absorbing the race, so it records nothing.
         static COMPETING: Cell<u32> = const { Cell::new(0) };
+        /// Write transactions this thread has opened as
+        /// [`WriterHolder::Replication`], counted in `begin_write` — every
+        /// one, including the batch's single bookkeeping transaction for the
+        /// witnessed vector.
+        static REPLICATION_WRITES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Run `competitor` the first time this thread reaches `race`.
@@ -2152,6 +2251,18 @@ pub(crate) mod race_hooks {
             return;
         }
         ABSORBED.with(|a| a.set(a.get() | 1 << race as u32));
+    }
+
+    /// Count a `WriterHolder::Replication` write transaction opened on this
+    /// thread. Called from `begin_write` alone, so nothing can open one
+    /// without being counted.
+    pub(crate) fn replication_write_opened() {
+        REPLICATION_WRITES.with(|w| w.set(w.get() + 1));
+    }
+
+    /// Replication write transactions opened on this thread so far.
+    pub(crate) fn replication_writes_opened() -> u64 {
+        REPLICATION_WRITES.with(|w| w.get())
     }
 
     /// Whether this thread has absorbed `race` since the last `at`.
@@ -7126,6 +7237,210 @@ mod tests {
         configured.expect("the replayed configuration applies");
         assert!(!shadow_held(&b), "no shadow under the newer drop of it");
         race_hooks::assert_absorbed(race_hooks::Race::VectorConfiguration);
+    }
+
+    /// `b` holding `orders` as `a` created it, and `a` with a document written
+    /// into it that `b` has not applied yet: the window position of that
+    /// document, and the collection.
+    fn a_document_behind(a: &Engine, b: &Engine) -> CollectionMeta {
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        apply(b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        orders
+    }
+
+    fn rows_under(engine: &Engine, id: CollectionId) -> usize {
+        let txn = engine.db().begin_read().unwrap();
+        let docs = txn.open_table(crate::tables::DOCS).unwrap();
+        docs.range(crate::engine::doc_range(id)).unwrap().count()
+    }
+
+    #[test]
+    fn a_document_judged_before_a_drop_lands_is_not_written_into_the_buried_collection() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a_document_behind(&a, &b);
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [OpKind::CreateCollection, OpKind::Insert, OpKind::DropCollection]
+        );
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 2, 3));
+        let (inserted, dropped) = race_hooks::race(
+            race_hooks::Race::DocumentRun,
+            move || {
+                let (b, theirs, drop) = competing;
+                apply(&b, &theirs, &drop)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 2)),
+        );
+        dropped.expect("the drop applies");
+        let inserted = inserted.expect("the document applies, as history");
+        assert_eq!((inserted.applied, inserted.superseded), (0, 1), "{inserted:?}");
+        assert_eq!(rows_under(&b, orders.id), 0, "nothing is written under the buried collection");
+        race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
+    }
+
+    #[test]
+    fn a_document_judged_before_a_drop_and_recreation_land_is_not_written_below_the_new_floor() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        a_document_behind(&a, &b);
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [
+                OpKind::CreateCollection,
+                OpKind::Insert,
+                OpKind::DropCollection,
+                OpKind::CreateCollection
+            ]
+        );
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 2, 4));
+        let (inserted, recreated) = race_hooks::race(
+            race_hooks::Race::DocumentRun,
+            move || {
+                let (b, theirs, after) = competing;
+                apply(&b, &theirs, &after)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 2)),
+        );
+        recreated.expect("the drop and the recreation apply");
+        inserted.expect("the document applies, as history");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert_eq!(b.count(&held).unwrap(), 0, "the first life's document stays out of the second");
+        assert_eq!(a.count(&second).unwrap(), 0);
+        race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
+    }
+
+    #[test]
+    fn a_window_of_documents_that_are_history_or_gone_opens_no_run() {
+        // A document judged history (below a newer life's floor) or gone (its
+        // collection dropped) is skipped on the judgement made before the
+        // writer, which a tombstone and a floor moving only forward keep true:
+        // no run is opened for it. Only a document to be applied opens one,
+        // and is judged again there.
+        //
+        // Counted as an allowlist, not a blacklist. `begin_write` counts
+        // **every** `WriterHolder::Replication` transaction, so the assertion
+        // below is not "nothing called `run_txn`" -- which a future path
+        // opening one another way would pass silently -- but "this batch
+        // opened exactly the one transaction it cannot avoid": the
+        // bookkeeping one that carries the window's witnessed vector. A
+        // second write transaction of any origin fails it.
+        const BOOKKEEPING: u64 = 1;
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        for i in 0..3 {
+            a.insert(&orders, doc! { "_id": i }).unwrap();
+        }
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        apply(&b, &theirs, &whole).unwrap();
+        let documents = slice(&whole, 1, 4);
+        assert!(documents.entries.iter().all(|e| e.kind == OpKind::Insert));
+
+        // Gone: the collection is dropped here.
+        let before = race_hooks::replication_writes_opened();
+        let gone = apply(&b, &theirs, &documents).unwrap();
+        assert_eq!(gone.superseded, 3, "{gone:?}");
+        assert_eq!(
+            race_hooks::replication_writes_opened() - before,
+            BOOKKEEPING,
+            "documents of a dropped collection open no write transaction of their own"
+        );
+
+        // History: below the floor of the collection recreated since.
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().incarnation_floor.is_some());
+        let before = race_hooks::replication_writes_opened();
+        let history = apply(&b, &theirs, &documents).unwrap();
+        assert_eq!(history.superseded, 3, "{history:?}");
+        assert_eq!(
+            race_hooks::replication_writes_opened() - before,
+            BOOKKEEPING,
+            "documents below the floor open no write transaction of their own"
+        );
+
+        // And the allowlist can tell the difference: a window that does apply
+        // opens the run's transaction beside the bookkeeping one.
+        let live = a.create_collection("shop", "live").unwrap();
+        a.insert(&live, doc! { "_id": 1 }).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let before = race_hooks::replication_writes_opened();
+        apply(&b, &theirs, &whole).unwrap();
+        assert!(
+            race_hooks::replication_writes_opened() - before > BOOKKEEPING,
+            "a window that applies must open more than the bookkeeping transaction, \
+             or this guard cannot fail"
+        );
+    }
+
+    #[test]
+    fn a_whole_run_is_re_judged_by_its_first_document_not_only_that_document() {
+        // The defect was whole-run, not first-document: with the drop landing
+        // between the judgement and the writer, every document of the run
+        // used to land in the buried collection. One re-judgement suffices --
+        // the later documents take the `run.txn.is_some()` branch and read a
+        // memo refilled under the writer -- so this pins that the run as a
+        // whole is covered, not merely the document the race is armed at.
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let b = Arc::new(b);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        for i in 0..3 {
+            a.insert(&orders, doc! { "_id": i }).unwrap();
+        }
+        a.drop_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        assert_eq!(
+            kinds(&whole),
+            [
+                OpKind::CreateCollection,
+                OpKind::Insert,
+                OpKind::Insert,
+                OpKind::Insert,
+                OpKind::DropCollection
+            ]
+        );
+
+        let competing = (Arc::clone(&b), theirs.clone(), slice(&whole, 4, 5));
+        let (inserted, dropped) = race_hooks::race(
+            race_hooks::Race::DocumentRun,
+            move || {
+                let (b, theirs, drop) = competing;
+                apply(&b, &theirs, &drop)
+            },
+            || apply(&b, &theirs, &slice(&whole, 1, 4)),
+        );
+        dropped.expect("the drop applies");
+        let inserted = inserted.expect("the documents apply, as history");
+        assert_eq!(
+            (inserted.applied, inserted.superseded),
+            (0, 3),
+            "every document of the run is judged again, not just the first: {inserted:?}"
+        );
+        assert_eq!(rows_under(&b, orders.id), 0, "nothing is written under the buried collection");
+        race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
     }
 
     /// What one delivery recorded, as the transport records it: whatever the
