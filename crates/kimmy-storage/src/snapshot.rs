@@ -5085,3 +5085,108 @@ mod relog_feasibility {
         );
     }
 }
+
+/// Which schema changes carry enough to rebuild their originating entry?
+///
+/// An `OplogEntry` needs a full `Stamp { hlc, node }`. These tests ask, per
+/// case, whether the page carries one -- and what the only available
+/// substitute, the sending member's node id, is worth at two hops.
+#[cfg(test)]
+mod what_the_page_carries {
+    use super::*;
+    use bson::doc;
+
+    fn engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+    }
+
+    fn field(path: &str) -> crate::meta::IndexField {
+        crate::meta::IndexField { path: path.into(), descending: false }
+    }
+
+    fn snapshot(into: &Engine, from: &Engine) {
+        let mut progress = SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_index_definition_carries_its_origin_stamp_across_two_hops() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let (q, _dq) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        let origin = a.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+        assert!(origin.is_some(), "a local create stamps the definition");
+        assert_eq!(origin.unwrap().node, a.node_id(), "at A, the origin");
+
+        snapshot(&p, &a);
+        snapshot(&q, &p);
+
+        let at_q = q.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+        assert_eq!(at_q, origin, "the origin stamp, node included, survives both hops");
+        assert_ne!(p.node_id(), a.node_id(), "and P is not A");
+    }
+
+    #[test]
+    fn a_collection_creation_carries_no_origin_node_and_the_sender_is_the_wrong_one() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let (q, _dq) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+
+        // The page says WHEN, never WHO: `CollectionState.created` is an Hlc.
+        let page = a.snapshot_page(None, None).unwrap();
+        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
+        assert_eq!(state.created, Some(ca.created), "the creation Hlc travels");
+        // ...and there is no node beside it. The only node a receiver has is
+        // the one it was handed, which is the SENDER.
+        snapshot(&p, &a);
+        snapshot(&q, &p);
+        assert_eq!(
+            q.get_collection("shop", "orders").unwrap().created,
+            ca.created,
+            "the Hlc reaches Q intact"
+        );
+        // At hop two the sender is P, not A. Substituting the sender's node
+        // would attribute A's creation to P.
+        assert_ne!(p.node_id(), a.node_id(), "the sender at Q's hop is not the origin");
+    }
+
+    #[test]
+    fn a_vector_configuration_carries_no_stamp_at_all() {
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            kimmy_core::VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
+        assert!(state.vector.is_some(), "the configuration travels");
+        // `VectorConfig` is the configuration only. Nothing on the page, and
+        // nothing on `CollectionMeta`, records when it was made or by whom.
+        let held = a.get_collection("shop", "orders").unwrap();
+        assert!(held.vector.is_some());
+        assert_eq!(
+            held.created,
+            a.get_collection("shop", "orders").unwrap().created,
+            "the only stamp on the meta is the collection's own creation"
+        );
+    }
+}
