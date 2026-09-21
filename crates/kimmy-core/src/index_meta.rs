@@ -81,8 +81,8 @@ pub struct IndexMeta {
     /// they went in, but an `Int64` that fits in 32 bits comes back as an
     /// `Int32`, and a generic-subtype `Binary` as an array of integers. The
     /// encoding is idempotent — a filter stored once is stored unchanged
-    /// again — so every member holds the same filter, and a `CreateIndex`
-    /// entry carries the filter as stored rather than as sent (ADR-180).
+    /// again — so every member builds the index from, stores, and logs in its
+    /// `CreateIndex` entry the filter as stored rather than as sent (ADR-180).
     #[serde(default)]
     pub partial_filter: Option<Document>,
     /// The stamp of the create that produced *this* index, at its origin:

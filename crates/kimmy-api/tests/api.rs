@@ -6334,6 +6334,30 @@ async fn an_unsupported_partial_filter_is_refused_at_creation() {
 }
 
 #[tokio::test]
+async fn a_partial_index_is_answered_with_the_filter_it_is_listed_with() {
+    // The metadata stores a generic `Binary` as an array, and the index is
+    // built, maintained and replicated with the filter as stored (ADR-180).
+    // The create answered with the filter as sent, so the client was shown
+    // one definition and every later listing another.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"items"})).await;
+    let sent = json!({"k": {"$binary": {"base64": "AQI=", "subType": "00"}}});
+    let created = server
+        .post(
+            "/v1/db/app/coll/items/indexes",
+            Some(&token),
+            json!({"name": "x_k", "fields": [{"path": "x"}], "partialFilterExpression": sent}),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    let listed = server.get("/v1/db/app/coll/items/indexes", Some(&token)).await;
+    let listed = &listed.body["indexes"][0]["partialFilterExpression"];
+    assert_ne!(listed, &sent, "premise: the filter is one the metadata encoding changes");
+    assert_eq!(&created.body["partialFilterExpression"], listed);
+}
+
+#[tokio::test]
 async fn creating_a_partial_unique_index_judges_only_the_documents_it_covers() {
     // Existing data that violates the constraint *outside* the filter is not a
     // violation, because those documents are not in the index. Refusing here

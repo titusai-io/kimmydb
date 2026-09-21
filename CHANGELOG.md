@@ -38,17 +38,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the removals (a collection, an index, a configuration turned off, a
   document) can still fail to reach a member through a peer that caught up by
   snapshot, because a snapshot page does not carry what their entries need.
-- **An index's `CreateIndex` entry now carries its definition as every member
-  stores it** ([ADR-180](docs/decisions.md)). This changes what a local
-  create logs, not only what a restore appends. The entry used to carry the
-  `multikey` flag the creating member had observed, and the partial filter as
-  the client sent it, where every member stores a small `Int64` as an `Int32`
-  and a generic `Binary` as an array. It now carries `multikey: false` and the
-  filter as stored. No member reads either difference from an entry: each
-  sets `multikey` from its own documents, and stores the filter through the
-  same encoding whichever form arrives. What changes is that the entry under
-  a stamp is the same wherever it is built, which is what lets a restore
-  rebuild it.
+- **Every member now builds an index from its definition as stored, and its
+  `CreateIndex` entry carries that definition** ([ADR-180](docs/decisions.md)).
+  This changes what a local create builds, answers and logs, not only what a
+  restore appends. Collection metadata stores a partial filter's small `Int64`
+  as an `Int32` and a generic `Binary` as an array, so the filter a client sent
+  was not the filter any member holds. The member that created the index built
+  it from the filter as sent. A peer built from whatever the entry carried, and
+  a member restoring from a snapshot built from the stored form, so members
+  could hold different memberships for one definition. The create now answers
+  with the filter its listing shows. The entry carries that filter and
+  `multikey: false`: each member sets `multikey` from its own documents, and no
+  member reads it from an entry. **For a partial filter holding a generic
+  `Binary` this is deliberately worse on the member that creates the index**,
+  until the partial filter itself is fixed. That member no longer indexes, and
+  a TTL index no longer expires, the documents already present that match the
+  binary. It only held them until each was next written, and every member now
+  agrees.
 
 ## 0.33.0 - 2026-09-21
 

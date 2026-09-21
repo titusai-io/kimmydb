@@ -17654,11 +17654,14 @@ appended only if nothing is already held under that stamp.
 
 And, because a rebuilt entry can only be the origin's entry if the two are
 built from the same thing, **a `CreateIndex` entry now carries the definition
-as every member stores it, and nothing a member observed.** This changes what
-the **entries path** logs as well as what the snapshot path appends. A local
-create now logs `multikey: false` and the partial filter as the metadata
-store holds it. Before, it logged the `multikey` its own backfill saw and the
-filter as the client sent it. No receiver reads either difference. The section
+as every member stores it, and nothing a member observed — and every member
+builds the index from that same definition.** This changes the **entries
+path** and the origin's own create as well as what the snapshot path appends.
+A local create now builds from, and logs, the partial filter as the metadata
+store holds it, and logs `multikey: false`. Before, it built from and logged
+the filter as the client sent it, and logged the `multikey` its own backfill
+saw. For a filter holding a generic `Binary` that deliberately makes the
+origin index fewer documents until the filter itself is fixed. The section
 below on what an entry carries gives the reasons.
 
 Of the seven relay cases the sweep found, **this record closes one**: an index
@@ -17830,27 +17833,73 @@ pre-existing inconsistencies that this work exposed rather than introduced:
   member holds.
 
 **So the entry is the definition as stored, with `multikey: false`**, at the
-origin and in a rebuild alike: `index::logged_definition` passes the
-definition through the metadata encoding and clears the flag. The encoding is
-idempotent — a filter stored once is stored unchanged again, which a test
-pins across every BSON type — so a rebuild from a stored definition equals the
-origin's entry.
+origin and in a rebuild alike. The encoding is idempotent — a filter stored
+once is stored unchanged again, which a test pins across every BSON type — so a
+rebuild from a stored definition equals the origin's entry.
 
-**Nothing a receiver does changes.** The enumeration behind that claim: the
-one production reader of a `CreateIndex` body is `sync::apply_ddl` →
-`apply_remote_index`. It reads `db`, `collection`, and seven fields of the
-definition: `name`, `created`, `fields`, `unique`, `enforcement`,
-`expire_after_secs` and `partial_filter`. It reads neither `multikey` nor
-`id`. Every other reader of an entry's body filters DDL out first: change
-streams render document kinds only, webhooks deliver only what `wanted`
-accepts, the embedding worker skips an entry with no document id, the vector
-cache listens for `DropCollection` and `ConfigureVectors`, and rewind passes
-schema kinds over before reading a body. Serving, backup and the codec carry
-the body as bytes. The search found every one of the seven fields read, which
-is its control. And a test applies one entry, logged `multikey: true` and then
-`false`, to one member holding arrays and to one that does not. The first ends
-multikey and the second does not, whatever the entry said. The filter is
-stored through the same encoding whichever form arrives.
+**What a receiver reads from the body.** The one production reader of a
+`CreateIndex` body is `sync::apply_ddl` → `apply_remote_index`. It reads `db`,
+`collection`, and seven fields of the definition: `name`, `created`, `fields`,
+`unique`, `enforcement`, `expire_after_secs` and `partial_filter`. It reads
+neither `multikey` nor `id`. Every other reader of an entry's body filters DDL
+out first: change streams render document kinds only, webhooks deliver only
+what `wanted` accepts, the embedding worker skips an entry with no document id,
+the vector cache listens for `DropCollection` and `ConfigureVectors`, and
+rewind passes schema kinds over before reading a body. Serving, backup and the
+codec carry the body as bytes. The search found every one of the seven fields
+read, which is its control. And a test applies one entry, logged
+`multikey: true` and then `false`, to one member holding arrays and to one that
+does not. The first ends multikey and the second does not, whatever the entry
+said. So `multikey` in the body changes nothing any member does.
+
+**The filter is another matter: storing the same definition is not building
+the same membership.** A receiver stores whatever filter arrives through the
+same encoding, so every member always **stored** one filter. But each member
+**built** the index from the filter in front of it at the time:
+
+- the origin built from the filter as the client sent it;
+- a peer applying the entry built from the filter the entry carried;
+- a member restoring from a snapshot built from the page's filter, which is
+  the stored form;
+- and every member, on every later write, maintained the index under the
+  stored filter it re-reads from its metadata.
+
+Where the encoding changes the filter so that it selects different documents,
+those builds disagree, on the same definition. A generic `Binary` does that.
+Before this record, the origin and an entry-path peer built one membership and
+a snapshot-restored member another. Logging the stored filter would have moved
+the entry-path peer to the snapshot member's side, leaving **the origin alone,
+different from every replica** — a fix for a replication divergence that ships
+one. So `create_index_inner` passes every definition through the metadata
+encoding (`index::as_stored`) **before it compares, builds, stores or logs
+it**. The origin, a peer, a restore and a rebuild all build, store and log one
+value, and the create answers with the filter the listing shows. *Tests:* an
+origin, a peer that applied its entry and a member that restored from its
+snapshot hold the same membership. The test first asserts that the filter as
+sent and as stored disagree on a document present at creation, so a fixture
+that stops being that case fails as a fixture. And through the API, the create
+answers with the listed filter.
+
+**This deliberately makes the origin worse, for now, and it is not an
+oversight.** For a partial filter holding a generic `Binary`, the member that
+creates the index no longer indexes the documents already present that match
+the binary. A TTL index with such a filter no longer expires them either. It
+only ever held them until each was next written, when maintenance under the
+stored filter dropped it. Every member is now wrong the same way, where the
+origin used to be partly right and different from everyone. In a replicated
+system a member that is wrong in a way that can be stated is worth more than
+one that is right in a way nobody can predict. The alternative of carrying the
+filter **as sent** keeps the old uniform wrongness for entries, but a page
+holds the stored form, so a rebuilt entry could never match a live one, and
+the stamp would stop determining the entry. **What makes this right is the
+fix to the filter itself**, which is its own record. That fix needs two parts:
+an encoding that keeps a filter's types, and a partial-filter matcher that
+compares a whole array as the query matcher does. Today `PartialFilter::matches`
+tests each element of an array field and never the whole array, so a filter
+with an array operand selects fewer documents than a query that
+`covered_by` says it contains — and the planner then answers that query from
+an index that lacks them. That is true of an array written into a filter
+directly, with no `Binary` involved.
 
 **The historical residue, and the guard for it.** Entries logged before this
 record can still differ from any rebuild: an index created over arrays is
@@ -17986,13 +18035,13 @@ run against the mutation that removes it:
 
 | Taken out | Fails |
 | --- | --- |
-| the re-log itself (a restore as before this record) | the relay reproduction through real rounds, the two-hop relay, and eight of the thirteen storage tests; the control, with the snapshot hop removed, passes |
+| the re-log itself (a restore as before this record) | the relay reproduction through real rounds, the two-hop relay, and eight of the fourteen storage tests; the control, with the snapshot hop removed, passes |
 | appending in the definition's own transaction (a second transaction after it) | the injected-failure test, and only it |
 | `Position::Hold` (appending under `Raise`) | the coverage-until-granted test, and only it |
 | the don't-rewrite guard | the bytes-unchanged test, at its bytes assertion, and the dedup test |
 | the origin's stamp (the sender's instead) | the two-hop tests, and **not** the one-hop ones |
 | `multikey: false` in the entry | every test built on the origin fixture, at its premise, and the receiver-side rebuild test |
-| the filter as stored (as sent instead) | the six tests that compare a rebuilt entry with the origin's |
+| the definition as stored before anything is built (as sent instead) | the six tests that compare a rebuilt entry with the origin's, the membership test, and the API test that the create answers with the listed filter |
 | the re-log for a definition already held | the held-without-its-entry test |
 | the re-log when a stamp is adopted | the held-without-a-stamp test |
 

@@ -638,39 +638,41 @@ pub(crate) enum CreateOrigin {
     Restored(Stamp),
 }
 
-/// The body of the `CreateIndex` entry for `index`: the definition as every
-/// member stores it, and nothing this node observed about it (ADR-180).
+/// `index` as every member stores it: through the collection metadata's own
+/// encoding, which is not the identity on every definition (ADR-180).
 ///
-/// A snapshot restore rebuilds the entry from the definition a page carries,
-/// which is the stored one as it stands later, so an entry that differed
-/// from that could not be rebuilt — the stamp would stop determining the
-/// entry. Two things made it differ:
+/// The metadata is stored as JSON, which reads a small `Int64` in a partial
+/// filter back as an `Int32` and a generic `Binary` back as an array. So the
+/// filter a client sent is not the filter any member holds — and **storing
+/// the same definition is not building the same membership**: a build from
+/// the filter as sent selected documents that every later write, maintained
+/// under the stored filter, did not; and a member that took the definition
+/// from a snapshot page, which carries the stored form, built something else
+/// again. `create_index_inner` passes every definition through here before it
+/// compares, builds, stores or logs it, so each member builds, stores and
+/// logs one value. The encoding is idempotent, so a definition already stored
+/// comes back unchanged.
+fn as_stored(index: IndexMeta) -> Result<IndexMeta> {
+    Ok(serde_json::from_slice(&serde_json::to_vec(&index)?)?)
+}
+
+/// The body of the `CreateIndex` entry for `index`: the definition, and
+/// nothing this node observed about it (ADR-180).
 ///
-/// - **`multikey`**, a node-local observation: each member sets it from the
-///   documents it holds, and no receiver reads it from an entry. Logged as
-///   observed, an origin creating the index over documents that already held
-///   arrays logged `true`, one creating it before any did logged `false`,
-///   and nothing on a page tells the two apart. Always `false` here.
-/// - **The partial filter's representation.** Collection metadata is stored
-///   as JSON, which reads a small `Int64` back as an `Int32` and a generic
-///   `Binary` back as an array; the filter a client sent is not the filter
-///   any member holds. Logged as sent, the entry named a filter no member
-///   stores. Logged as stored — through that same encoding, which is
-///   idempotent — the entry and every member's definition agree.
-///
-/// Neither changes what a receiver holds: it builds `multikey` from its own
-/// documents, and stores the filter through the same encoding either way.
-fn logged_definition(
-    db: &str,
-    collection: &str,
-    index: &IndexMeta,
-) -> Result<kimmy_core::IndexCreate> {
-    let stored: IndexMeta = serde_json::from_slice(&serde_json::to_vec(index)?)?;
-    Ok(kimmy_core::IndexCreate {
+/// `index` is already as stored ([`as_stored`]); what is left is `multikey`,
+/// a node-local observation. Each member sets it from the documents it
+/// holds, and no receiver reads it from an entry. Logged as observed, an
+/// origin creating the index over documents that already held arrays logged
+/// `true`, one creating it before any did logged `false`, and nothing on a
+/// snapshot page tells the two apart, so an entry rebuilt from one could not
+/// be the origin's. Always `false` here, so the entry under a stamp is the
+/// same bytes wherever and whenever it is built.
+fn logged_definition(db: &str, collection: &str, index: &IndexMeta) -> kimmy_core::IndexCreate {
+    kimmy_core::IndexCreate {
         db: db.to_string(),
         collection: collection.to_string(),
-        index: IndexMeta { multikey: false, ..stored },
-    })
+        index: IndexMeta { multikey: false, ..index.clone() },
+    }
 }
 
 /// Append, in `txn`, the entry behind a definition a snapshot restored at
@@ -897,7 +899,10 @@ impl crate::Engine {
         // Derived from the name so every node agrees, which is what lets an
         // index definition replicate at all.
         let id = IndexMeta::derive_id(&name);
-        let mut index = IndexMeta {
+        // As stored, before anything is decided or built from it: a local
+        // create, a peer's entry and a snapshot page then all build the
+        // membership every later write maintains (ADR-180).
+        let mut index = as_stored(IndexMeta {
             id,
             name,
             fields,
@@ -907,7 +912,7 @@ impl crate::Engine {
             expire_after_secs,
             partial_filter,
             created: stamp,
-        };
+        })?;
 
         // The name may already be taken. Idempotent when the definition
         // matches, a conflict when it does not — silently keeping the old
@@ -999,7 +1004,7 @@ impl crate::Engine {
                                 txn.abort()?;
                                 return Ok((IndexCreated::Older, Vec::new()));
                             }
-                            let body = logged_definition(db, collection, &index)?;
+                            let body = logged_definition(db, collection, &index);
                             match relog_restored(&txn, meta.id, &body, created)? {
                                 Some(entry) => {
                                     txn.commit()?;
@@ -1054,7 +1059,7 @@ impl crate::Engine {
                         CreateOrigin::Restored(created) => relog_restored(
                             &txn,
                             meta.id,
-                            &logged_definition(db, collection, &index)?,
+                            &logged_definition(db, collection, &index),
                             created,
                         )?,
                         CreateOrigin::Local | CreateOrigin::Replicated(_) => None,
@@ -1271,7 +1276,7 @@ impl crate::Engine {
                     stamp.expect("a local create mints its stamp above"),
                     kimmy_core::OpKind::CreateIndex,
                     meta.id,
-                    &logged_definition(db, collection, &index)?,
+                    &logged_definition(db, collection, &index),
                 )?;
                 crate::engine::append_oplog(&txn, &entry)?;
                 Some(entry)
@@ -1280,7 +1285,7 @@ impl crate::Engine {
             // In the transaction that builds the definition, so the entry and
             // the state it describes commit together or not at all (ADR-180).
             CreateOrigin::Restored(created) => {
-                relog_restored(&txn, meta.id, &logged_definition(db, collection, &index)?, created)?
+                relog_restored(&txn, meta.id, &logged_definition(db, collection, &index), created)?
             }
         };
         txn.commit()?;

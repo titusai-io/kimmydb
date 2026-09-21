@@ -5220,6 +5220,85 @@ mod relog {
         assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
     }
 
+    /// The `_id`s `index` holds on `engine`, over its whole range.
+    fn members(engine: &Engine, index: &str) -> Vec<Bson> {
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let id = coll.index(index).unwrap().id;
+        let keys = crate::index::scan_range(
+            engine.db(),
+            coll.id,
+            id,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap();
+        let mut ids: Vec<Bson> = keys
+            .into_iter()
+            .filter_map(|key| engine.get_by_encoded_key(&coll, &key).unwrap())
+            .map(|doc| doc.get("_id").unwrap().clone())
+            .collect();
+        ids.sort_by(kimmy_core::canonical_cmp);
+        ids
+    }
+
+    #[test]
+    fn every_member_builds_the_same_membership_from_a_filter_the_encoding_changes() {
+        // Storing the same definition is not building the same membership. A
+        // generic `Binary` in a partial filter is stored as an array, and a
+        // document selected by the one is not selected by the other: an
+        // origin that built from the filter as sent held it, and a member
+        // that built from the stored form -- a peer applying an entry that
+        // carries it, or a snapshot page, which always did -- did not.
+        let binary = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: vec![1, 2],
+        });
+        let (a, _da) = engine();
+        let (r, _dr) = engine();
+        let (p, _dp) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1, "k": binary.clone(), "x": 1 }).unwrap();
+        a.insert(&orders, doc! { "_id": 2, "k": [[1, 2]], "x": 1 }).unwrap();
+        r.apply_batch(&a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries).unwrap();
+
+        let sent = doc! { "k": binary };
+        let created = a
+            .create_index_with(
+                "shop",
+                "orders",
+                vec![field("x")],
+                false,
+                crate::meta::Enforcement::Local,
+                Some("by_x".into()),
+                None,
+                Some(sent.clone()),
+            )
+            .unwrap();
+
+        // The case that diverged: a document present at creation that the
+        // filter as sent selects and the filter as stored does not. Were this
+        // to stop holding, every build would agree whether or not the create
+        // normalised, and the equality below would prove nothing.
+        let stored = a.get_collection("shop", "orders").unwrap();
+        let stored = stored.index("by_x").unwrap().partial_filter.clone().unwrap();
+        let first = a.get(&orders, &DocId::Int64(1)).unwrap().unwrap();
+        assert!(
+            kimmy_core::PartialFilter::parse(&sent).unwrap().matches(&first)
+                && !kimmy_core::PartialFilter::parse(&stored).unwrap().matches(&first),
+            "premise: the filter as sent and as stored disagree on a document already here"
+        );
+        assert_eq!(created.partial_filter, Some(stored), "the create answers with what is stored");
+
+        let entry = a.oplog_entry(&created.created.unwrap()).unwrap().unwrap();
+        r.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        transfer(&p, &a).unwrap();
+
+        let built = members(&a, "by_x");
+        assert_eq!(members(&r, "by_x"), built, "a peer that applied the entry");
+        assert_eq!(members(&p, "by_x"), built, "a member that restored it from a snapshot");
+    }
+
     #[test]
     fn a_second_hop_relogs_the_origins_stamp_and_not_the_senders() {
         // One hop cannot tell "at the origin's stamp" from "at the sender's":
