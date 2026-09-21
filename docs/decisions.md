@@ -18067,3 +18067,60 @@ array, and a second test gives the receiver an array before it restores.
 **Each asserts its premise before asserting the rebuild**, so a fixture that
 stops being able to tell the two values apart fails as a fixture instead of
 passing as a test.
+
+---
+
+## ADR-181 — Expiry deletes a document only if its index's filter, read as `find` reads it, still selects it
+
+**Decision.** The guarded delete behind TTL expiry already re-reads the document under the writer and checks its date. It now **also checks the index's partial filter**, evaluated as `find` evaluates the same expression (`PartialFilter::selects`), against the document as it stands at that moment. A candidate the filter does not select is left alone, exactly as a candidate whose date has moved on is, and it is counted in a series of its own, `kimmy_ttl_skipped_filter_total`. A TTL index with no partial filter behaves as before.
+
+It is the first of three records on partial filters, and the one that ships alone. It needs no rebuild, no migration, no format change and no coordination state. **It is bigger than "the TTL guard" suggests**, because the guard needs `find`'s semantics inside `kimmy-storage`, and those live in `kimmy-query`. So this record also moves `find`'s evaluation of `$exists`, equality and the four comparisons into `kimmy-core`. That move is described below, with how it was shown to change no answer.
+
+**Why. Expiry trusted index membership, and membership is not the filter.** Two separate failures reach the same line, and both were demonstrated rather than argued:
+
+1. **A race, independent of any matcher.** Expiry reads its candidates from the index in one transaction and deletes each in another. `delete_guarded` exists for exactly that interleaving: its comment names a document *"whose date is bumped in between — a session heartbeat ... would otherwise be deleted while live"*. But the guard re-checked only the date. The partial filter is the other half of what made the document a candidate, and nothing re-checked it. *Demonstrated:* a TTL index on `seen` with the filter `{state: "done"}`. After the scan, a client reopens the document to `{state: "open"}` and keeps its date. Maintenance takes the entry out of the index in that commit, correctly. **The delete still removed the reopened document.**
+2. **Membership that is wrong today.** The index's membership rule (`PartialFilter::matches`) compares across type brackets, so `{size: {$gt: 5}}` holds a string, a document and a boolean. *Demonstrated:* with that filter, `find` selects one of five expired documents, and **one expiry pass deleted four**. This reaches any range-filtered TTL index over a field whose values are of mixed types, which is an ordinary schema. ADR-183 corrects membership. This record stops the deletions before it does.
+
+**Why `find`'s reading of the filter, and not the index's own.** The filter means what `find` with the same expression returns: that is the meaning a client writes and can observe. The index's membership rule is the defect, and the guard must not borrow it. The tests tell the two apart: evaluating the guard with the membership rule keeps the race test green and turns the mixed-type test red.
+
+### `find`'s evaluation moves to `kimmy-core`, and `find` is unchanged
+
+`kimmy-storage` does not depend on `kimmy-query`, deliberately: its manifest says *"No production dependency in this direction"*. The precedent for exactly this need is recorded under *Superseded / reconsidered*: `keyenc` moved to `kimmy-core` because *"kimmy-query needs the comparison semantics; putting both in core avoids query→storage coupling"*. `canonical_cmp` lives there for the same reason. So the operators a partial filter can carry are now evaluated in `kimmy_core::matching`:
+- `exists`;
+- `equals`, including null matching a missing field;
+- `compares`, which checks within a type bracket;
+- `any_element`, the value-or-element rule.
+
+`same_type_group` moves to `kimmy_core::cmp`. **`kimmy-query`'s filter calls these same functions** for `$exists`, `$eq`, `$gt`, `$gte`, `$lt` and `$lte`, and uses the moved `any_element` for every operator that walks array elements. `PartialFilter::selects` calls them too. That makes one definition, not a second implementation agreeing with the first. Two definitions of what one expression selects is how the partial-filter defects happened. ADR-183 points index membership at the same functions.
+
+**This changes the code behind the hottest path in the product, so "the query tests still pass" is not the proof.** Those tests are what let this class of change through. The proof is a differential against the **old** implementation. `crates/kimmy-query/tests/find_differential.rs` writes `find`'s answer for:
+- 47 value shapes, as the field, one level down, and through an array of documents;
+- every operator the move touches, and every one that shares `any_element` (`$ne`, `$in`, `$nin`, `$all`, `$not` and a compound range);
+- every value as an operand;
+- both paths.
+
+Generated on the parent commit and on the move, the two tables are **byte-identical over 160,744 rows**: 43,193 match, 114,143 do not, and 3,408 are refused at parse. The table can see corners. Dropping the null-matches-missing rule changes 225 of its rows, and taking `Symbol` out of the string bracket changes 129. The harness is an ignored test documented as the two-commit procedure, so a reviewer can reproduce it. A second test, run by default, holds `PartialFilter::selects` equal to `find` for every expression the partial language can carry. Its premise is that the membership rule and `find` disagree on 19,339 of its cases, so a `selects` that borrowed the membership rule could not pass.
+
+### This record also makes an existing guard testable for the first time
+
+The date check is not new, and it shipped with one test, which refreshed the document **before** the pass. The index is keyed by that date, so the refreshed document was never a candidate, and the guard never ran. Measured: with the date check removed outright, every test in `kimmy-storage` and in `kimmy-api` passed. That is recorded as its own finding. This record adds a test-only hook between the scan and the deletes (`expiry::hooks`). The date is then checked by a test that refreshes the document **after** the scan, and the filter by one that moves it out of the filter there. The old test keeps what it does show, that a document refreshed before the pass is not a candidate, under a name that says so.
+
+### What it does not do
+
+- It does not expire a document the index **lacks**, where the membership rule under-includes (a whole array, `$exists` on `[]`, a null matching a missing field). That keeps a document longer than asked, which is not data loss. ADR-183's rebuild closes it.
+- It reads the filter **as stored**. A generic `Binary` already stored as an array is honoured as the array, because nothing on a member records what the client sent. ADR-182 stops new conversions. Old ones need the index recreated.
+- It adds no read and no commit. The filter is parsed once per pass per index, and checked on the document the guard already reads, under the writer it already holds.
+
+### A series of its own
+
+A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP bridge), not in `kimmy_ttl_skipped_total`. That series' description names one mechanism, a refresh landing while the pass ran, and widening it would make the description partly false. More importantly, the two mean different things **over time**. Between this record and ADR-183, a filter decline is mostly the membership defect firing: a document the index should never have held, which expiry used to delete. After ADR-183 it is mostly a genuine race. That fall in rate is the one measurement of how much damage was being done. Inside a counter that also carries heartbeat races, it could not be seen. The series' description says it should fall to near zero once membership is correct.
+
+### Tests, and how they break
+
+| Taken out | Fails |
+| --- | --- |
+| the filter check | the race test and the mixed-type test |
+| `find`'s reading (the membership rule instead) | the mixed-type test, and **not** the race test |
+| the date check | the date test through the hook, and nothing else |
+| null matching a missing field, in the moved `equals` (a control on the differential) | 225 rows of the two-commit differential |
+| `Symbol` in the string bracket, in the moved `same_type_group` (the same) | 129 rows of it |
