@@ -18282,6 +18282,21 @@ Every partial index is therefore rebuilt, and the migration is **schema 3 → 4*
 
 So the cost is paid at the first start, and announced before it is paid. Making it lazy is not an optimisation this record passed over: it is ruled out.
 
+**Considered, proven, not taken: skipping the indexes whose membership cannot differ.**
+- **The class.** A filter whose every predicate is an equality on an operand that is **neither null nor an array**. `canonical_cmp` returns `Equal` only within one `type_rank`, and arrays rank alone. So a non-array operand can never equal a whole array, which is the one thing `find` tests that the old rule did not. Both rules resolve paths with the same `path::resolve`.
+- **Everything else depends on the data:**
+  - an equality with null differs on a missing field;
+  - an equality with an array differs on a whole-array match;
+  - `$exists: true` differs on a path that resolves only to empty arrays;
+  - every bound differs on a value of another type bracket.
+- **Proved.** `a_filter_of_equalities_on_operands_neither_null_nor_array_selects_the_same_under_both_rules` runs the old rule, kept verbatim, against `selects`. Its 482 documents span every type bracket, at `k` and `k.a`: bare, in arrays, nested an array deeper, and through arrays of documents. 2,310 filters in the class, single and conjoined, agree on all 1,113,420 (filter, document) pairs. That agreement is evidence only because of the control: the same corpus separates every excluded kind, and widening the class to any one of them fails with a named counterexample:
+  - `{k: null}` on `{}`;
+  - `{k: []}` on `{k: []}`;
+  - `{k: {$exists: true}}` on `{k: []}`;
+  - `{k: {$gt: null}}` on `{k: {}}`.
+- **Why not taken.** The migration's whole audience is databases that predate this release. Schema 3 exists only if a build before this one created it, and every database after starts at 4 and never migrates. So the 12-minute case at 100 million documents occurs in no deployment that will ever run this migration. How much real use the class covers could not have been measured either, since there is no filter population yet. The one partial-index idiom the documentation teaches, `{email: {$exists: true}}`, is outside it.
+- **The reason expires.** It is a fact about where the product stands now, not a property of the design. A later migration that rebuilds every partial index, for an audience that includes databases created after launch, should take the class. The proof is done, and it runs with the suite.
+
 **What the operator sees.** A synchronous rebuild at open looks like a hung node, so:
 - **Before it starts, one line states the whole job:** how many partial indexes, how many documents across them, an estimate for the whole migration from the measured rate, and the free space the largest needs. That figure is sized from the largest collection's document count, an upper bound on its index's entries unless the index is multikey.
 - Then a line per index as it starts ("*n* of *m*").
@@ -18335,3 +18350,4 @@ An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where i
 | the announcement's staleness check, trusting the counts always | the restored-backup and stale-mark tests |
 | the same check, counting always | the kept-counts test, and only it |
 | the estimate sized per index, from the largest | the estimate test, and only it |
+| the skip class widened to any one excluded kind | the skip-class differential, with that kind's counterexample |

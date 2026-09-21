@@ -963,6 +963,199 @@ mod membership_migration {
         })
     }
 
+    /// Whether a filter's membership cannot differ between the old rule and
+    /// `find`'s, decided from the filter alone: every predicate an equality
+    /// whose operand is neither null nor an array.
+    ///
+    /// The migration rebuilds these anyway, because its only audience is
+    /// databases created before this release (ADR-183). The class is proven
+    /// here so that a later migration with a wider audience can skip them.
+    fn cannot_differ(filter: &PartialFilter) -> bool {
+        filter.predicates().all(
+            |(_, op)| matches!(op, PartialOp::Eq(v) if !matches!(v, Bson::Null | Bson::Array(_))),
+        )
+    }
+
+    /// The find differential's values, every type bracket and its edges.
+    fn skip_class_values() -> Vec<Bson> {
+        use bson::Binary;
+        use bson::spec::BinarySubtype;
+        let oid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
+        vec![
+            Bson::Null,
+            Bson::Undefined,
+            Bson::MinKey,
+            Bson::MaxKey,
+            Bson::Boolean(false),
+            Bson::Boolean(true),
+            Bson::Int32(0),
+            Bson::Int32(-1),
+            Bson::Int32(1),
+            Bson::Int32(5),
+            Bson::Int32(i32::MAX),
+            Bson::Int64(5),
+            Bson::Int64(i64::MIN),
+            Bson::Double(5.0),
+            Bson::Double(-0.0),
+            Bson::Double(7.5),
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::INFINITY),
+            Bson::Double(f64::NEG_INFINITY),
+            Bson::Decimal128(bson::Decimal128::from_bytes([0; 16])),
+            Bson::String(String::new()),
+            Bson::String("5".into()),
+            Bson::String("x".into()),
+            Bson::Symbol("x".into()),
+            Bson::Document(doc! {}),
+            Bson::Document(doc! {"a": 1}),
+            Bson::Document(doc! {"a": null}),
+            Bson::Document(doc! {"a": [1]}),
+            Bson::Array(vec![]),
+            Bson::Array(vec![Bson::Array(vec![])]),
+            Bson::Array(vec![1.into(), 2.into()]),
+            Bson::Array(vec![Bson::Array(vec![1.into(), 2.into()])]),
+            Bson::Array(vec![5.into()]),
+            Bson::Array(vec![1.into(), "x".into()]),
+            Bson::Array(vec![Bson::Null]),
+            Bson::Array(vec![Bson::Document(doc! {"a": 1})]),
+            Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] }),
+            Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes: vec![0; 16] }),
+            Bson::ObjectId(oid),
+            Bson::DateTime(bson::DateTime::from_millis(1_000)),
+            Bson::DateTime(bson::DateTime::from_millis(-1_000)),
+            Bson::Timestamp(bson::Timestamp { time: 5, increment: 1 }),
+            Bson::RegularExpression(bson::Regex {
+                pattern: "^x".try_into().unwrap(),
+                options: "".try_into().unwrap(),
+            }),
+        ]
+    }
+
+    /// Every value at `k` and at `k.a`, bare, in an array, beside another
+    /// element, nested an array deeper, and through an array of documents;
+    /// and the empty shapes, where presence and elements part company.
+    fn skip_class_docs() -> Vec<Document> {
+        let mut out = vec![
+            doc! {},
+            doc! {"k": []},
+            doc! {"k": {}},
+            doc! {"k": [[]]},
+            doc! {"k": [{}]},
+            doc! {"k": {"a": []}},
+            doc! {"k": [{"a": []}]},
+            doc! {"k": [[{"a": 1}]]},
+            doc! {"k": [{"b": 1}]},
+        ];
+        for v in skip_class_values() {
+            out.push(doc! {"k": v.clone()});
+            out.push(doc! {"k": [v.clone()]});
+            out.push(doc! {"k": [v.clone(), 1]});
+            out.push(doc! {"k": [[v.clone()]]});
+            out.push(doc! {"k": {"a": v.clone()}});
+            out.push(doc! {"k": {"a": [v.clone()]}});
+            out.push(doc! {"k": {"a": [[v.clone()]]}});
+            out.push(doc! {"k": [{"a": v.clone()}]});
+            out.push(doc! {"k": [{"a": v.clone()}, {"a": 1}]});
+            out.push(doc! {"k": [{"a": [v.clone()]}]});
+            out.push(doc! {"k": [{"b": 1}, {"a": v.clone()}]});
+        }
+        out
+    }
+
+    /// Every one-predicate filter the language carries, over `k` and `k.a`,
+    /// with every value as its operand, in both spellings of equality; then
+    /// every two-predicate conjunction of an equality on `k` with any of
+    /// those on `k.a`.
+    fn skip_class_filters() -> Vec<Document> {
+        let mut single = Vec::new();
+        for path in ["k", "k.a"] {
+            single.push(doc! {path: {"$exists": true}});
+            for v in skip_class_values() {
+                single.push(doc! {path: v.clone()});
+                for op in ["$eq", "$gt", "$gte", "$lt", "$lte"] {
+                    single.push(doc! {path: {op: v.clone()}});
+                }
+            }
+        }
+        let mut out = single.clone();
+        for v in skip_class_values() {
+            for other in single.iter().filter(|f| f.contains_key("k.a")) {
+                let mut both = doc! {"k": v.clone()};
+                both.extend(other.clone());
+                out.push(both);
+            }
+        }
+        out
+    }
+
+    /// What a filter's one predicate is, for the control's tally.
+    fn kind(filter: &PartialFilter) -> &'static str {
+        let ops: Vec<_> = filter.predicates().map(|(_, op)| op).collect();
+        match ops.as_slice() {
+            [PartialOp::Exists] => "$exists",
+            [PartialOp::Eq(Bson::Null)] => "equality with null",
+            [PartialOp::Eq(Bson::Array(_))] => "equality with an array",
+            [PartialOp::Eq(_)] => "equality with anything else",
+            [PartialOp::Gt(_)] => "$gt",
+            [PartialOp::Gte(_)] => "$gte",
+            [PartialOp::Lt(_)] => "$lt",
+            [PartialOp::Lte(_)] => "$lte",
+            _ => "a conjunction",
+        }
+    }
+
+    #[test]
+    fn a_filter_of_equalities_on_operands_neither_null_nor_array_selects_the_same_under_both_rules()
+    {
+        let docs = skip_class_docs();
+        let mut in_class = (0usize, 0usize);
+        let mut differ: std::collections::BTreeMap<&str, usize> = Default::default();
+        for f in skip_class_filters() {
+            let Ok(partial) = PartialFilter::parse(&f) else { continue };
+            let class = cannot_differ(&partial);
+            in_class.0 += usize::from(class);
+            for d in &docs {
+                let (old, new) = (old_rule(&f, d), partial.selects(d));
+                if class {
+                    assert_eq!(old, new, "{f:?} is in the class and the rules differ on {d:?}");
+                    in_class.1 += 1;
+                } else if old != new {
+                    *differ.entry(kind(&partial)).or_default() += 1;
+                }
+            }
+        }
+        eprintln!(
+            "SKIP CLASS: {} filters in the class agreed on all {} (filter, document) pairs over {} \
+             documents; outside it the rules differed {differ:?}",
+            in_class.0,
+            in_class.1,
+            docs.len()
+        );
+        // The control: every kind the class leaves out, the corpus can tell
+        // apart. A corpus that could not would agree on everything, and so
+        // would pass a class that took them in.
+        for kind in [
+            "$exists",
+            "equality with null",
+            "equality with an array",
+            "$gt",
+            "$gte",
+            "$lt",
+            "$lte",
+            "a conjunction",
+        ] {
+            assert!(
+                differ.get(kind).copied().unwrap_or(0) > 0,
+                "premise: the corpus separates {kind}"
+            );
+        }
+        assert!(
+            !differ.contains_key("equality with anything else"),
+            "the class's own kind never differs"
+        );
+        assert!(in_class.0 > 1_000, "premise: the class is exercised, single and conjoined");
+    }
+
     /// Put a schema 4 database back where a schema 3 node leaves it: every
     /// partial index holding what the old rule selects, and version 3.
     fn as_schema_3(path: &std::path::Path, unique: &[&str]) {
