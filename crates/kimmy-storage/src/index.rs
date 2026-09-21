@@ -652,7 +652,7 @@ pub(crate) enum CreateOrigin {
 /// compares, builds, stores or logs it, so each member builds, stores and
 /// logs one value. The encoding is idempotent, so a definition already stored
 /// comes back unchanged.
-fn as_stored(index: IndexMeta) -> Result<IndexMeta> {
+pub(crate) fn as_stored(index: IndexMeta) -> Result<IndexMeta> {
     Ok(serde_json::from_slice(&serde_json::to_vec(&index)?)?)
 }
 
@@ -977,8 +977,12 @@ impl crate::Engine {
                         // node already holds still has its entry appended if
                         // it is not here, as the entries path appends a
                         // creation of a definition it already holds (ADR-180).
-                        // The writer is taken to ask; a page with nothing to
-                        // append costs no commit.
+                        // The writer is taken to ask: a page with nothing to
+                        // append costs no commit, but it does cost the
+                        // acquisition, so a restore can now meet `WriterBusy`
+                        // here — once per definition already held, on the
+                        // first page only, where the page's documents take the
+                        // writer anyway.
                         if let CreateOrigin::Restored(created) = origin {
                             let txn = self.begin_write(WriterHolder::Ddl)?;
                             if !crate::Engine::definition_is(&txn, &read)? {

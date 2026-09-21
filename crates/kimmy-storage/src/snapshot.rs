@@ -5158,25 +5158,41 @@ mod relog {
             "code": Bson::JavaScriptCode("x".into()), "symbol": Bson::Symbol("s".into()),
             "max": Bson::MaxKey, "min": Bson::MinKey, "undefined": Bson::Undefined,
         };
-        let store = |f: &bson::Document| -> bson::Document {
-            let index = IndexMeta {
-                id: 0,
-                name: "f".into(),
-                fields: vec![field("f")],
-                unique: false,
-                enforcement: Default::default(),
-                multikey: false,
-                expire_after_secs: None,
-                partial_filter: Some(f.clone()),
-                created: None,
-            };
-            let meta: IndexMeta =
-                serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-            meta.partial_filter.unwrap()
+        let definition = |f: &bson::Document| IndexMeta {
+            id: IndexMeta::derive_id("f"),
+            name: "f".into(),
+            fields: vec![field("f")],
+            unique: false,
+            enforcement: Default::default(),
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter: Some(f.clone()),
+            created: None,
+        };
+        let store = |f: &bson::Document| {
+            crate::index::as_stored(definition(f)).unwrap().partial_filter.unwrap()
         };
         let once = store(&filter);
         assert_ne!(once, filter, "premise: the encoding is not the identity on this filter");
-        assert_eq!(store(&once), once);
+        assert_eq!(store(&once), once, "storing twice is storing once");
+
+        // And `as_stored` is what the store does: the filter an index is
+        // created with reads back from the metadata as `as_stored` says.
+        let (e, _d) = engine();
+        e.create_collection("shop", "orders").unwrap();
+        e.create_index_with(
+            "shop",
+            "orders",
+            vec![field("f")],
+            false,
+            crate::meta::Enforcement::Local,
+            Some("f".into()),
+            None,
+            Some(filter.clone()),
+        )
+        .unwrap();
+        let held = e.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("f").unwrap().partial_filter.as_ref(), Some(&once));
     }
 
     #[test]

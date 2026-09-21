@@ -17738,7 +17738,10 @@ here unchanged counts as applying. A restore does the same. A definition
 already standing under the page's stamp with no entry behind it gets the
 entry. It can be in that state because retention collected the entry, or
 because a restore before this record never wrote one. The writer is taken to
-ask; a page with nothing to append aborts, so it costs no commit. A
+ask. A page with nothing to append aborts, so it costs no commit, but it does
+cost the acquisition: a restore can now return `WriterBusy` there, where it
+could not before. That happens at most once per definition already held, on
+the first page only, and the page's documents take the writer anyway. A
 definition standing with **no** stamp that adopts the page's commits the
 stamp and the entry together.
 
@@ -17983,7 +17986,17 @@ they are rebuilt.
   no index tombstone on the page and no record that a configuration was turned
   off, so absence is not expressible and there is no stamp to append an entry
   at. Closing these means extending the page to convey absence, structurally
-  the move ADR-162 made for collections, and it is its own record.
+  the move ADR-162 made for collections, and it is its own record. **One
+  consequence of this record falls here.** A restore judges a definition
+  against the collection's floor and not against this node's index tombstone:
+  its `history` closure ignores the tombstone, where the entries path's does
+  not. So a member that dropped an index, restoring from a peer that is behind
+  on the drop, brings the index back. That resurrection predates this record,
+  but it stayed on the one member. Now the member re-logs the peer's
+  `CreateIndex` and serves the resurrection onward. A peer holding a live
+  tombstone refuses the entry, and the same path was reachable from a
+  long-partitioned member. It is closed by the record that makes a page convey
+  an index drop.
 - **A document delete**, for a different reason, and not a format one.
   [ADR-167](#adr-167--a-document-delete-travels-in-a-snapshot-by-key-to-a-receiver-that-holds-the-document)
   has the receiver recover the `_id` from **its own copy** of the document,
