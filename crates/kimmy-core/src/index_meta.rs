@@ -75,15 +75,15 @@ pub struct IndexMeta {
     /// superseding sparse and so does this.
     ///
     /// Stored as the filter document, and it crosses two boundaries: BSON in
-    /// the replicated [`crate::IndexCreate`], which keeps every type, and
-    /// **relaxed** Extended JSON in the collection metadata, which does not
-    /// quite. Dates, integers above 2^53 and most other types come back as
-    /// they went in, but an `Int64` that fits in 32 bits comes back as an
-    /// `Int32`, and a generic-subtype `Binary` as an array of integers. The
-    /// encoding is idempotent — a filter stored once is stored unchanged
-    /// again — so every member builds the index from, stores, and logs in its
-    /// `CreateIndex` entry the filter as stored rather than as sent (ADR-180).
-    #[serde(default)]
+    /// the replicated [`crate::IndexCreate`], and JSON in the collection
+    /// metadata. Both keep every type (ADR-182). The JSON is **canonical**
+    /// Extended JSON (`{"$numberLong": "5"}`, `{"$binary": ...}`), written by
+    /// [`stored_filter`]. It used to be the relaxed form, which read a small
+    /// `Int64` back as an `Int32` and a generic `Binary` back as an array, so
+    /// the filter every member held and built from was not the filter the
+    /// client wrote. A filter stored that way before ADR-182 is still read as
+    /// it was stored, an array included: nothing records what it was sent as.
+    #[serde(default, with = "stored_filter")]
     pub partial_filter: Option<Document>,
     /// The stamp of the create that produced *this* index, at its origin:
     /// the stamp of the `CreateIndex` entry a local create minted, or the
@@ -109,6 +109,34 @@ pub struct IndexMeta {
     /// collection's incarnation floor before ADR-081.
     #[serde(default)]
     pub created: Option<Stamp>,
+}
+
+/// How [`IndexMeta::partial_filter`] crosses serde (ADR-182).
+///
+/// **Written** as canonical Extended JSON to a human-readable serializer —
+/// the collection metadata's JSON — and as the plain document to any other,
+/// which is BSON: a `CreateIndex` body and a snapshot page are the bytes they
+/// always were. **Read** exactly as before. The reader already understood the
+/// canonical form, which is why an older build reads a filter a newer one
+/// wrote, and a newer one reads the relaxed form an older one left behind.
+pub mod stored_filter {
+    use bson::{Bson, Document};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(filter: &Option<Document>, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            filter
+                .as_ref()
+                .map(|filter| Bson::Document(filter.clone()).into_canonical_extjson())
+                .serialize(s)
+        } else {
+            filter.serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Document>, D::Error> {
+        Option::<Document>::deserialize(d)
+    }
 }
 
 /// How far a unique constraint reaches.
@@ -266,5 +294,85 @@ impl IndexMeta {
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.fields.iter().map(|f| f.path.as_str())
+    }
+}
+
+/// ADR-182: the partial filter keeps its types in the store, and the wire is
+/// the bytes it always was.
+#[cfg(test)]
+mod stored_filter_tests {
+    use super::*;
+    use bson::{Binary, Bson, doc, spec::BinarySubtype};
+
+    fn filter() -> Document {
+        doc! {
+            "k": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] }),
+            "n": { "$gte": 5_i64 },
+        }
+    }
+
+    fn index(partial_filter: Option<Document>) -> IndexMeta {
+        IndexMeta {
+            id: IndexMeta::derive_id("f"),
+            name: "f".into(),
+            fields: vec![IndexField::ascending("x")],
+            unique: false,
+            enforcement: Enforcement::Local,
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter,
+            created: None,
+        }
+    }
+
+    #[test]
+    fn the_store_keeps_every_type_of_a_filter() {
+        let text = serde_json::to_string(&index(Some(filter()))).unwrap();
+        assert!(text.contains("$binary") && text.contains("$numberLong"), "canonical: {text}");
+        let back: IndexMeta = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.partial_filter, Some(filter()));
+    }
+
+    #[test]
+    fn a_filter_an_earlier_build_stored_reads_as_it_was_stored() {
+        // The relaxed form: what a build before ADR-182 wrote for `filter()`.
+        let text = r#"{"id":1,"name":"f","fields":[{"path":"x","descending":false}],
+                       "partial_filter":{"k":[1,2],"n":{"$gte":5}}}"#;
+        let read: IndexMeta = serde_json::from_str(text).unwrap();
+        assert_eq!(read.partial_filter, Some(doc! {"k": [1, 2], "n": {"$gte": 5_i32}}));
+    }
+
+    /// `IndexMeta` as it was before ADR-182, field for field, without the
+    /// store's encoding of the filter.
+    #[derive(Serialize)]
+    struct Before {
+        id: u32,
+        name: String,
+        fields: Vec<IndexField>,
+        unique: bool,
+        enforcement: Enforcement,
+        multikey: bool,
+        expire_after_secs: Option<i64>,
+        partial_filter: Option<Document>,
+        created: Option<Stamp>,
+    }
+
+    #[test]
+    fn the_replicated_body_is_the_bytes_it_always_was() {
+        // BSON reports itself not human-readable, so a `CreateIndex` body and
+        // a snapshot page carry the filter exactly as before.
+        let now = index(Some(filter()));
+        let before = Before {
+            id: now.id,
+            name: now.name.clone(),
+            fields: now.fields.clone(),
+            unique: now.unique,
+            enforcement: now.enforcement,
+            multikey: now.multikey,
+            expire_after_secs: now.expire_after_secs,
+            partial_filter: now.partial_filter.clone(),
+            created: now.created,
+        };
+        assert_eq!(bson::serialize_to_vec(&now).unwrap(), bson::serialize_to_vec(&before).unwrap());
     }
 }

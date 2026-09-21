@@ -2031,6 +2031,37 @@ impl crate::Engine {
 }
 
 /// Key range covering every entry belonging to one index.
+/// Every partial index whose filter holds an array anywhere among its
+/// operands, as `(database, collection, index)` (ADR-182).
+///
+/// A generic `Binary` in a filter was stored as an array of integers before
+/// ADR-182, and cannot be told apart from an array the client wrote, so this
+/// names them all and claims nothing about which is which.
+pub(crate) fn partial_filters_holding_an_array(
+    db: &redb::Database,
+) -> Result<Vec<(String, String, String)>> {
+    fn holds_an_array(value: &Bson) -> bool {
+        match value {
+            Bson::Array(_) => true,
+            Bson::Document(inner) => inner.values().any(holds_an_array),
+            _ => false,
+        }
+    }
+    let txn = db.begin_read()?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut out = Vec::new();
+    for row in collections.iter()? {
+        let (_, raw) = row?;
+        let meta: crate::CollectionMeta = serde_json::from_slice(raw.value())?;
+        for index in &meta.indexes {
+            if index.partial_filter.as_ref().is_some_and(|f| f.values().any(holds_an_array)) {
+                out.push((meta.db.clone(), meta.name.clone(), index.name.clone()));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn index_id_range(
     coll: CollectionId,
     index_id: u32,
@@ -3873,5 +3904,44 @@ mod tests {
                 assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod array_filters {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn every_partial_filter_holding_an_array_is_named_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        engine.create_collection("shop", "t").unwrap();
+        let create = |name: &str, filter: Option<Document>| {
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![IndexField::ascending(name)],
+                    false,
+                    Enforcement::Local,
+                    Some(name.into()),
+                    None,
+                    filter,
+                )
+                .unwrap();
+        };
+        create("equals_an_array", Some(doc! {"k": [1, 2]}));
+        create("bounded_by_an_array", Some(doc! {"k": {"$gte": [1]}}));
+        create("scalar", Some(doc! {"k": 5}));
+        create("whole", None);
+        drop(engine);
+
+        let db = redb::Database::create(&path).unwrap();
+        let mut named: Vec<String> =
+            partial_filters_holding_an_array(&db).unwrap().into_iter().map(|(_, _, i)| i).collect();
+        named.sort();
+        assert_eq!(named, ["bounded_by_an_array", "equals_an_array"]);
     }
 }

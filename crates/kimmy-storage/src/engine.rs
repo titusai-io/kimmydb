@@ -741,6 +741,20 @@ impl Engine {
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::rebuild_version_vector_if_stale(&db)?;
         Self::seed_collected_if_untracked(&db)?;
+        // A filter created with a generic `Binary` before ADR-182 was stored
+        // as an array, and nothing records which arrays those were, so every
+        // array is named -- each open, since an operator who never restarts
+        // after upgrading would otherwise never be told.
+        for (db_name, collection, index) in crate::index::partial_filters_holding_an_array(&db)? {
+            info!(
+                db = %db_name,
+                collection = %collection,
+                index = %index,
+                "this partial index's filter holds an array, which may have been converted from \
+                 a generic Binary by a build before ADR-182; if it was created with a Binary \
+                 value, drop and recreate it. An array the client wrote is left as it is"
+            );
+        }
         // After the arrival index, whose end the counts' mark is compared
         // against: a rebuilt index renumbers positions, and the counts are
         // rebuilt with it (ADR-174).
