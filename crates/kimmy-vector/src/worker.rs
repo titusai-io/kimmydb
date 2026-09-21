@@ -432,6 +432,13 @@ pub struct WorkerCounters {
     /// collection. The signature of ownership working: without the gate this
     /// counter's work would have been duplicate provider calls.
     pub skipped_not_owned: AtomicU64,
+    /// Documents or scans skipped because a collection is configured for
+    /// vectors and its shadow collection is not here (ADR-178). A
+    /// configuration can stand without its shadow: restored from a snapshot
+    /// page that did not carry the shadow, or applied from an entry older
+    /// than a drop of the shadow this member holds. Skipped and counted
+    /// rather than failing, which stopped the worker for good.
+    pub skipped_no_shadow: AtomicU64,
     /// Provider calls that failed, retryable and permanent together. A
     /// number climbing while `documents_embedded` does not move is the
     /// "provider is down" signature.
@@ -857,8 +864,10 @@ impl EmbeddingWorker {
                     self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let Some(shadow) = self.engine.vector_collection(&db.name, &collection.name)?
-                else {
+                if collection.vector.is_none() {
+                    continue;
+                }
+                let Some(shadow) = self.shadow_of(&db.name, &collection.name, true)? else {
                     continue;
                 };
                 embedded += self
@@ -953,6 +962,35 @@ impl EmbeddingWorker {
         embedded
     }
 
+    /// The shadow collection of `db.collection`, or `None`, counted, when a
+    /// collection configured for vectors has none here (ADR-178). `warn` for
+    /// a scan of the whole collection, not for each document.
+    fn shadow_of(
+        &self,
+        db: &str,
+        collection: &str,
+        warn: bool,
+    ) -> Result<Option<kimmy_storage::CollectionMeta>> {
+        match self.engine.get_collection(db, &kimmy_core::vector_meta::shadow_name(collection)) {
+            Ok(shadow) => Ok(Some(shadow)),
+            Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                ..
+            })) => {
+                self.counters.skipped_no_shadow.fetch_add(1, Ordering::Relaxed);
+                if warn {
+                    warn!(
+                        db,
+                        collection,
+                        "a collection is configured for vectors and has no shadow collection \
+                         here; skipped, counted in kimmy_embed_skipped_no_shadow_total"
+                    );
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn embed_deferred(&mut self, item: &Deferred) -> Result<Recheck> {
         let Some(collection) = self.engine.collection_by_id(item.collection)? else {
             // The collection was dropped while this waited. Nothing to embed,
@@ -979,10 +1017,9 @@ impl EmbeddingWorker {
         if !config.provider.embeds_server_side() {
             return Ok(Recheck::Gone);
         }
-        let shadow = self.engine.get_collection(
-            &collection.db,
-            &kimmy_core::vector_meta::shadow_name(&collection.name),
-        )?;
+        let Some(shadow) = self.shadow_of(&collection.db, &collection.name, false)? else {
+            return Ok(Recheck::Gone);
+        };
         // `force: false` is the whole point: this re-reads the document's
         // current stamp and does nothing if the previous owner's vectors
         // arrived before it left.
@@ -1072,10 +1109,9 @@ impl EmbeddingWorker {
             return Ok(Prepared::Done(Outcome::Skipped));
         }
 
-        let shadow = self.engine.get_collection(
-            &collection.db,
-            &kimmy_core::vector_meta::shadow_name(&collection.name),
-        )?;
+        let Some(shadow) = self.shadow_of(&collection.db, &collection.name, false)? else {
+            return Ok(Prepared::Done(Outcome::Skipped));
+        };
 
         // Before the provider check, deliberately: a `byo` collection's
         // vectors are the client's to supply, but not the client's to clean
@@ -1160,9 +1196,9 @@ impl EmbeddingWorker {
             // Dropped since the entry was written; nothing to scan.
             return Ok(Outcome::Skipped);
         };
-        let shadow = self
-            .engine
-            .get_collection(&set.db, &kimmy_core::vector_meta::shadow_name(&set.collection))?;
+        let Some(shadow) = self.shadow_of(&set.db, &set.collection, true)? else {
+            return Ok(Outcome::Skipped);
+        };
 
         // One node scans. A `ConfigureVectors` entry replicates to every
         // member, and before this gate each of them ran the same full-
@@ -1929,6 +1965,72 @@ mod tests {
     /// The oplog entry a write produced.
     fn last_entry(engine: &Engine) -> kimmy_core::OplogEntry {
         engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap().pop().expect("an entry")
+    }
+
+    #[tokio::test]
+    async fn a_configuration_without_its_shadow_is_skipped_and_counted_not_fatal() {
+        // ADR-178: a configuration can stand without its shadow here (a
+        // snapshot page that did not carry the shadow, or an entry older than
+        // a drop of the shadow this member holds). The rescan used to
+        // propagate the missing shadow as an error, and the worker's loop
+        // stopped for good on it.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        engine.drop_collection("app", &kimmy_core::vector_meta::shadow_name("docs")).unwrap();
+        assert!(engine.get_collection("app", "docs").unwrap().vector.is_some());
+
+        worker.rescan_owned().await.expect("skipped, not an error");
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        assert_eq!(worker.process(&last_entry(&engine)).await.unwrap(), Outcome::Skipped);
+        let skipped = worker.counters().skipped_no_shadow.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(skipped, 2, "the rescan and the document, each counted");
+    }
+
+    #[tokio::test]
+    async fn an_owner_restored_from_a_scoped_snapshot_embeds_once_the_shadows_snapshot_lands() {
+        // ADR-178: a scoped snapshot of a configured collection carries that
+        // collection only, and names the shadow it left missing, which the
+        // transport pulls as a snapshot of its own. Until it lands the owner
+        // skips and counts; once it has, at the origin's `created`, embedding
+        // proceeds. Left missing, every document was skipped for good and no
+        // member wrote vectors.
+        let origin_dir = tempfile::tempdir().unwrap();
+        let origin = Engine::open(&origin_dir.path().join("kimmy.redb")).unwrap();
+        let docs = origin.create_collection("app", "docs").unwrap();
+        origin.configure_vectors("app", "docs", config(&["title", "body"])).unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("docs");
+        let origin_shadow = origin.get_collection("app", &shadow_name).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let restore = |id| {
+            let mut progress = kimmy_storage::SnapshotProgress::of_collection(id);
+            let mut missing = Vec::new();
+            while !progress.is_complete() {
+                let page =
+                    origin.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                let applied = engine.apply_snapshot_page(origin.node_id(), &mut progress, &page);
+                missing.extend(applied.unwrap().shadows_missing);
+            }
+            missing
+        };
+        let missing = restore(docs.id);
+        assert_eq!(missing, vec![origin_shadow.id], "the parent's snapshot names its shadow");
+
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        worker.set_provider(coll.id.0, FakeProvider::new(4));
+        engine.insert(&coll, doc! { "_id": 1i64, "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Skipped);
+
+        assert!(restore(origin_shadow.id).is_empty());
+        let shadow = engine.get_collection("app", &shadow_name).unwrap();
+        assert_eq!(
+            shadow.created, origin_shadow.created,
+            "the origin's shadow, not one minted here"
+        );
+        let outcome = worker.process(&entry).await.unwrap();
+        assert!(matches!(outcome, Outcome::Embedded { .. }), "{outcome:?}");
     }
 
     #[tokio::test]

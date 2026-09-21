@@ -12,6 +12,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmy_embed_skipped_no_shadow_total`** (`kimmy.embed.skipped_no_shadow` on
+  the OTLP bridge) counts documents and scans the embedding worker skipped
+  because a collection is configured for vectors and has no shadow collection
+  on that node ([ADR-178](docs/decisions.md)). Should read 0. The worker used
+  to stop for good on such a collection.
+
 ### Fixed
 
 - **A sync round whose own apply takes longer than 30 s is no longer counted as
@@ -28,6 +36,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   used to count nothing for a window that failed: a decline, a refusal a later
   commit had covered, and everything in a window that failed after its last
   commit went uncounted.
+- **A dropped vector shadow collection stays dropped, and a shadow commits
+  with its configuration** ([ADR-178](docs/decisions.md)). A client's
+  configuration creates and logs the shadow before the configuration, as
+  before, now in the same commit. A member applying a peer's configuration
+  without the shadow's creation used to mint the shadow at its own clock and
+  log it, which could bring a shadow dropped elsewhere back to every member; it
+  now makes it at the configuration's stamp, without logging it, and not under
+  a newer drop of the shadow it holds. A snapshot page makes no shadow: a
+  scoped snapshot of a configured collection now pulls the peer's snapshot of
+  its shadow too, where it used to mint one at this member's clock, and
+  restores no shadow whose collection this member has dropped since. And the
+  embedding worker's rescan no longer stops for good on a collection whose
+  shadow is missing.
 - **A replicated document no longer lands in a collection dropped while it
   applied, or in the collection recreated after that drop.** A member judged
   the first document of a replicated run against its collection before taking
@@ -73,14 +94,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   removed a recreation that landed in between. Both are judged again under the
   writer.
 - **A dropped collection's vector configuration and indexes no longer land on
-  the collection recreated after it.** A vector configuration, or turning
-  vectors off, replicated from before a drop configured the recreated
-  collection when a window carrying it was served again, and could mint it a
-  shadow collection; applied while the drop and recreation landed, it wrote the
-  dropped collection's definition back over the new one. A snapshot page from
-  a member behind on the drop restored the old collection's indexes and vector
-  configuration into the new one, which its peers never had. Each is now
-  judged against the collection that stands, under the writer.
+  the collection recreated after it.** Through replication: a vector
+  configuration, turning vectors off, or an index creation from before a drop
+  applied to the recreated collection when a window carrying it was served
+  again, or when it applied while the drop and recreation landed; a
+  configuration could also write the dropped collection's definition back over
+  the new one, and mint a vector shadow collection whose creation replicated.
+  Through a snapshot page from a member behind on the drop: the old
+  collection's indexes and vector configuration were restored into the new one.
+  Each is now judged against the collection that stands, under the writer, and
+  a vector shadow is created in the same commit as the configuration it serves.
 - **A schema change confirmed right after its collection was created no longer
   reports a member pending that holds it.** A member applying a peer's push
   while its own sync round applied the same collection creation could fail the

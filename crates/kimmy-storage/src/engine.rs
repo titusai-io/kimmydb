@@ -2343,6 +2343,9 @@ impl Engine {
         // them exists. Ordinarily there is nothing to finish and this is two
         // seeks against an empty range; where there is, it is the same bounded
         // chunks the drop was making, so it does not hold the writer either.
+        // A vector shadow created in its configuration's transaction is purged
+        // the same way, by `configure_vectors_inner`, before it takes the
+        // writer.
         //
         // Those chunks are held as `drop` and not as `ddl` (ADR-159): the
         // holder names the work, and finishing somebody else's drop is drop
@@ -2358,19 +2361,62 @@ impl Engine {
         // without ever being served the entry it will belong to. Under the
         // writer, stamp order is commit order: the oplog this node serves is
         // contiguous for its own origin, which is what makes its advertised
-        // vector a promise a peer can trust.
+        // vector a promise a peer can trust. `create_collection_in_txn` takes
+        // the stamp from its caller for that reason: a caller that mints one
+        // mints it with the writer held, and a replicated shadow takes its
+        // configuration entry's stamp.
         let stamp = self.next_stamp();
-
-        let meta = {
-            let mut collections = txn.open_table(tables::COLLECTIONS)?;
-            if collections.get((db, name))?.is_some() {
-                drop(collections);
+        match self.create_collection_in_txn(&txn, db, name, log, origin, history, stamp) {
+            Ok(InTxn::Created(meta, logged)) => {
+                txn.commit()?;
+                if let Some(entry) = logged {
+                    self.publish(vec![entry]);
+                }
+                info!(db, collection = name, id = %meta.id, "created collection");
+                Ok(Some(*meta))
+            }
+            Ok(InTxn::Exists) => {
                 txn.abort()?;
-                return Err(CoreError::CollectionExists {
+                Err(CoreError::CollectionExists {
                     db: db.to_string(),
                     collection: name.to_string(),
                 }
-                .into());
+                .into())
+            }
+            Ok(InTxn::History) => {
+                txn.abort()?;
+                Ok(None)
+            }
+            Err(e) => {
+                txn.abort()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::create_collection_inner`] inside a transaction the
+    /// caller holds and commits, so a collection that exists for another's
+    /// sake is created in the same commit as the change it serves: a vector
+    /// shadow with its parent's configuration. Nothing is published; the
+    /// caller publishes the entry, if one is logged, once it commits. Any
+    /// remains of a dropped life under the name must be purged before the
+    /// caller takes the writer, as `create_collection_inner` does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_collection_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        db: &str,
+        name: &str,
+        log: bool,
+        origin: Option<Hlc>,
+        history: &dyn Fn(Stamp) -> bool,
+        stamp: Stamp,
+    ) -> Result<InTxn> {
+        let id = CollectionId::derive(db, name);
+        let meta = {
+            let mut collections = txn.open_table(tables::COLLECTIONS)?;
+            if collections.get((db, name))?.is_some() {
+                return Ok(InTxn::Exists);
             }
 
             // If this creation follows a drop of the same id — a recreate —
@@ -2384,11 +2430,34 @@ impl Engine {
             // first one's documents.
             let dropped = self.collection_dropped_at(id)?;
             if dropped.is_some_and(history) {
-                drop(collections);
-                txn.abort()?;
-                return Ok(None);
+                return Ok(InTxn::History);
             }
             let incarnation_floor = dropped.map(|stamp| stamp.hlc);
+
+            // A vector shadow from elsewhere whose parent this node has buried
+            // since the shadow was created is a life that drop ended, though
+            // the shadow holds no tombstone of its own: a node that never held
+            // the shadow buries none. A snapshot page brings a shadow on its
+            // own (ADR-178), from a peer that can be behind on the parent's
+            // drop, and created here it stood parentless (ADR-138). Judged
+            // under the writer for the reason `history` is. Only under a
+            // tombstone: a parent absent with none has not arrived yet, and the
+            // shadow is created. A creation naming no `created` of its own (a
+            // page from a sender before the field) under such a tombstone reads
+            // as the older one, as `restore_collection` reads that page's
+            // collection.
+            if !log
+                && let Some(base) = kimmy_core::vector_meta::base_name(name)
+                && collections.get((db, base))?.is_none()
+            {
+                let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                if let Some(raw) = tombstones.get(CollectionId::derive(db, base).0)? {
+                    let buried = codec::decode_oplog_key(raw.value())?;
+                    if origin.is_none_or(|created| created <= buried.hlc) {
+                        return Ok(InTxn::History);
+                    }
+                }
+            }
 
             // The derivation is a 64-bit hash, so a collision is possible in
             // principle. Checked rather than trusted, because the failure would
@@ -2405,8 +2474,6 @@ impl Engine {
                 }
             }
             if let Some(other) = collision {
-                drop(collections);
-                txn.abort()?;
                 return Err(StorageError::Corrupt(format!(
                     "collection id for {db}.{name} collides with {other}; rename one of them"
                 )));
@@ -2439,19 +2506,12 @@ impl Engine {
                 meta.id,
                 &kimmy_core::CollectionRef::new(db, name),
             )?;
-            append_oplog(&txn, &entry)?;
+            append_oplog(txn, &entry)?;
             Some(entry)
         } else {
             None
         };
-
-        txn.commit()?;
-        if let Some(entry) = logged {
-            self.publish(vec![entry]);
-        }
-
-        info!(db, collection = name, id = %meta.id, "created collection");
-        Ok(Some(meta))
+        Ok(InTxn::Created(Box::new(meta), logged))
     }
 
     pub fn get_collection(&self, db: &str, name: &str) -> Result<CollectionMeta> {
@@ -3074,6 +3134,16 @@ impl Engine {
             .insert((meta.db.as_str(), meta.name.as_str()), serde_json::to_vec(meta)?.as_slice())?;
         Ok(())
     }
+}
+
+/// What creating a collection inside a caller's transaction found.
+pub(crate) enum InTxn {
+    /// Created, with the entry logged for it if one was asked for.
+    Created(Box<CollectionMeta>, Option<OplogEntry>),
+    /// A collection of the name already stands.
+    Exists,
+    /// The caller's tombstone rule judged the creation history.
+    History,
 }
 
 /// Build a DDL oplog entry with a BSON-encoded payload.

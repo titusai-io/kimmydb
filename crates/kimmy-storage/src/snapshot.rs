@@ -221,7 +221,7 @@ pub struct SnapshotTombstone {
 }
 
 /// What applying one snapshot page did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotApplied {
     /// Documents the page wrote — those that won last-writer-wins here —
     /// deletes it applied included (ADR-167).
@@ -244,6 +244,20 @@ pub struct SnapshotApplied {
     /// counted here — a page a member already holds is the ordinary case for
     /// a repair, and it is not news).
     pub superseded: usize,
+    /// The vector shadows of collections the page's definitions left
+    /// configured here, that this node does not hold and the page did not
+    /// carry (ADR-178). A page creates no shadow: the shadow is its own
+    /// collection, with its own `created` and its own documents, and minting
+    /// one here would give it this node's clock. A scoped snapshot of a
+    /// configured collection carries only that collection, so the transport
+    /// plans a scoped snapshot of each shadow named here from the same peer.
+    pub shadows_missing: Vec<CollectionId>,
+    /// The vector shadows the page carried and restored nothing of, because
+    /// the collection each serves is absent here under a tombstone newer
+    /// than the shadow's `created` (ADR-178): the page's sender is behind on
+    /// that drop, and restoring the shadow would leave it parentless here
+    /// (ADR-138). The transport cancels a repair still queued for each.
+    pub shadows_orphaned: Vec<CollectionId>,
 }
 
 /// One page of a snapshot.
@@ -676,6 +690,8 @@ impl Engine {
         for state in &page.collections {
             ddl_refused += self.restore_collection(state)?;
         }
+        let shadows_missing = self.shadows_missing(page)?;
+        let shadows_orphaned = self.shadows_orphaned(page)?;
 
         // The coverage a whole-database snapshot grants is the first page's
         // vector (module docs), remembered here and recorded with the last.
@@ -863,7 +879,13 @@ impl Engine {
         }
         match failed {
             Some(e) => Err(e),
-            None => Ok(SnapshotApplied { applied, ddl_refused, superseded }),
+            None => Ok(SnapshotApplied {
+                applied,
+                ddl_refused,
+                superseded,
+                shadows_missing,
+                shadows_orphaned,
+            }),
         }
     }
 
@@ -1185,6 +1207,14 @@ impl Engine {
                 );
                 return Ok(0);
             }
+            if self.parent_buried_since(&state.db, &state.name, state.created)? {
+                debug!(
+                    db = %state.db,
+                    collection = %state.name,
+                    "ignored a vector shadow whose collection was dropped here after it was created"
+                );
+                return Ok(0);
+            }
             // `state.created` and not this node's clock: it is the stamp the
             // create carries at its origin, which is what a replayed drop is
             // judged against (`create_collection_inner`) and what this node
@@ -1305,12 +1335,90 @@ impl Engine {
                     &state.db,
                     &state.name,
                     config.clone(),
-                    false,
+                    crate::vectors::Configured::FromSnapshot,
                     &earlier,
                 )?;
             }
         }
         Ok(refused)
+    }
+
+    /// The shadows of the vector configurations `page` restored or found
+    /// standing, that neither this node nor the page holds.
+    ///
+    /// Two conditions decide: the configuration stands here, and this node
+    /// holds no shadow. The other two — the page carried a configuration, and
+    /// did not carry the shadow — are belt-and-braces: this runs after the
+    /// page's definitions are restored. A configuration standing here that
+    /// the page did not carry was made by an entry, which creates its shadow
+    /// with it, or by an earlier page, which listed the shadow then; a shadow
+    /// the page carried is held here unless its restore was refused, and
+    /// pulled again it would be refused the same way. They keep the listing
+    /// to what this page restored, and cost nothing.
+    fn shadows_missing(&self, page: &SnapshotPage) -> Result<Vec<CollectionId>> {
+        let mut missing = Vec::new();
+        for state in page.collections.iter().filter(|state| state.vector.is_some()) {
+            let shadow = kimmy_core::vector_meta::shadow_name(&state.name);
+            if page.collections.iter().any(|s| s.db == state.db && s.name == shadow) {
+                continue;
+            }
+            let configured = match self.get_collection(&state.db, &state.name) {
+                Ok(standing) => standing.vector.is_some(),
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    ..
+                })) => false,
+                Err(e) => return Err(e),
+            };
+            if !configured {
+                continue;
+            }
+            match self.get_collection(&state.db, &shadow) {
+                Ok(_) => {}
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    ..
+                })) => {
+                    missing.push(CollectionId::derive(&state.db, &shadow));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(missing)
+    }
+
+    /// The shadows `page` carried that this node does not hold because the
+    /// collection each serves is buried here since it was created.
+    fn shadows_orphaned(&self, page: &SnapshotPage) -> Result<Vec<CollectionId>> {
+        let mut orphaned = Vec::new();
+        for state in &page.collections {
+            if self.parent_buried_since(&state.db, &state.name, state.created)?
+                && self.get_collection(&state.db, &state.name).is_err()
+            {
+                orphaned.push(CollectionId::derive(&state.db, &state.name));
+            }
+        }
+        Ok(orphaned)
+    }
+
+    /// Whether `name` is a vector shadow whose parent is absent here under a
+    /// tombstone at or after `created`: a shadow the parent's drop ended,
+    /// though a node that never held the shadow buried none (ADR-178). A
+    /// parent absent with no tombstone has not arrived yet: `false`. A shadow
+    /// with no `created` (a sender before the field) under a parent tombstone
+    /// reads as the older, as `restore_collection` reads a page's creation.
+    /// Answered cheaply here; `create_collection_in_txn` judges it again
+    /// under the writer.
+    fn parent_buried_since(&self, db: &str, name: &str, created: Option<Hlc>) -> Result<bool> {
+        let Some(base) = kimmy_core::vector_meta::base_name(name) else {
+            return Ok(false);
+        };
+        match self.get_collection(db, base) {
+            Ok(_) => return Ok(false),
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(self
+            .collection_dropped_at(CollectionId::derive(db, base))?
+            .is_some_and(|buried| created.is_none_or(|created| created <= buried.hlc)))
     }
 
     /// Whether a peer asking from `from` can be served from the oplog.
@@ -1550,7 +1658,25 @@ mod tests {
         // the second: the member kept an index none of its peers held, and
         // nothing converged it away.
         let (stale, current, _ds, _dc, a, _da) = a_stale_and_a_current_member();
-        transfer(&current, &stale);
+        // The page's index made one this node refuses, so a definition of the
+        // dropped life that reached the restore at all is counted: the page
+        // check is what keeps it from being judged, not only from landing.
+        let mut progress = SnapshotProgress::whole_database();
+        let mut refused = 0;
+        while !progress.is_complete() {
+            let mut page =
+                stale.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            for state in &mut page.collections {
+                for index in &mut state.indexes {
+                    index.enforcement = kimmy_core::Enforcement::Coordinated;
+                }
+            }
+            refused += current
+                .apply_snapshot_page(stale.node_id(), &mut progress, &page)
+                .unwrap()
+                .ddl_refused;
+        }
+        assert_eq!(refused, 0, "a dropped life's definition is neither restored nor refused");
         assert!(index_names(&current).is_empty(), "{:?}", index_names(&current));
         assert!(index_names(&a).is_empty());
         let held = current.get_collection("shop", "orders").unwrap();
@@ -1608,6 +1734,269 @@ mod tests {
         assert_eq!(held.created, second.created);
         assert!(held.index("life1_only").is_none(), "{:?}", held.indexes);
         crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::IndexHistory);
+    }
+
+    #[test]
+    fn a_page_judged_current_before_a_drop_and_recreation_land_restores_no_vectors() {
+        // As for indexes: the page's vector configuration is judged again,
+        // under the writer, against the life that stands.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let created = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        b.apply_peer_batch(&theirs, &created.entries, created.scanned_to, created.exhausted)
+            .unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        // The parent's page alone: the shadow is its own collection.
+        page.collections.retain(|state| state.name == "orders");
+        let orders = a.get_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        let after = crate::watch::OplogWindow {
+            entries: window
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.collection == orders.id
+                        && matches!(e.kind, OpKind::DropCollection | OpKind::CreateCollection)
+                        && e.stamp.hlc > orders.created
+                })
+                .cloned()
+                .collect(),
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+        };
+        assert_eq!(
+            after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            [OpKind::DropCollection, OpKind::CreateCollection]
+        );
+
+        let recreating = std::sync::Arc::clone(&b);
+        let (restored, recreated) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::RestoreDefinitions,
+            move || {
+                recreating.apply_peer_batch(
+                    &theirs,
+                    &after.entries,
+                    after.scanned_to,
+                    after.exhausted,
+                )
+            },
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        recreated.expect("the drop and the recreation apply");
+        let restored = restored.expect("the page applies");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert!(held.vector.is_none(), "{:?}", held.vector);
+        assert!(b.vector_collection("shop", "orders").unwrap().is_none(), "and no shadow");
+        // The page carried a configuration and this node holds no shadow, but
+        // the configuration did not stand: nothing to pull (ADR-178).
+        assert_eq!(restored.shadows_missing, [], "nor one to pull");
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::VectorHistory);
+    }
+
+    #[test]
+    fn a_pages_vector_configuration_makes_no_shadow_the_shadow_has_its_own_page() {
+        // A page's configuration used to mint the shadow here, at this
+        // member's clock, logged: a second creation of a shadow the origin
+        // had already created, with its own `created` (ADR-178).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let shadow_name = kimmy_core::vector_meta::shadow_name("orders");
+        let origin = a.get_collection("shop", &shadow_name).unwrap();
+        let whole = a.snapshot_page(None, None).unwrap();
+        let (mut parent, mut shadow) = (whole.clone(), whole);
+        parent.collections.retain(|state| state.name == "orders");
+        shadow.collections.retain(|state| state.name == shadow_name);
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &parent)
+            .unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+        assert!(
+            matches!(
+                b.get_collection("shop", &shadow_name),
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+            ),
+            "no shadow from it"
+        );
+        let logged = b.entries_for_peer(Hlc::ZERO, 1_024).unwrap().entries;
+        assert!(
+            logged.iter().all(|e| e.collection != origin.id),
+            "nor a logged creation of one: {logged:?}"
+        );
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &shadow)
+            .unwrap();
+        let held = b.get_collection("shop", &shadow_name).unwrap();
+        assert_eq!(held.created, origin.created, "the shadow's page restores it at its stamp");
+    }
+
+    fn byo() -> VectorConfig {
+        VectorConfig {
+            fields: vec!["text".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 4,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        }
+    }
+
+    /// The scoped snapshot of a collection, page by page, with the shadows
+    /// its pages named missing and orphaned.
+    fn scoped(
+        into: &Engine,
+        from: &Engine,
+        id: CollectionId,
+    ) -> (Vec<CollectionId>, Vec<CollectionId>) {
+        let (mut missing, mut orphaned) = (Vec::new(), Vec::new());
+        let mut progress = SnapshotProgress::of_collection(id);
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            let applied = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            missing.extend(applied.shadows_missing);
+            orphaned.extend(applied.shadows_orphaned);
+        }
+        (missing, orphaned)
+    }
+
+    /// ADR-178's repair made the ADR-138 orphan reachable. B takes the
+    /// parent's scoped snapshot from A, which names the shadow; X drops the
+    /// parent. Returned with B holding the parent and no shadow, and with X's
+    /// drop, which buries no shadow on a node that holds none, still to reach
+    /// it; A is behind on the drop and still serves the shadow.
+    #[allow(clippy::type_complexity)]
+    fn a_shadow_pull_behind_its_parents_drop() -> (
+        [(Engine, tempfile::TempDir); 3],
+        CollectionMeta,
+        (VersionVector, crate::watch::OplogWindow),
+    ) {
+        let (a, x, b) = (engine(), engine(), engine());
+        let orders = a.0.create_collection("shop", "orders").unwrap();
+        a.0.configure_vectors("shop", "orders", byo()).unwrap();
+        a.0.insert(&orders, doc! { "_id": 1, "text": "hello" }).unwrap();
+        let shadow = a.0.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders"));
+        let shadow = shadow.unwrap();
+
+        let theirs = a.0.version_vector().unwrap();
+        let window = a.0.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        x.0.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        x.0.drop_collection("shop", "orders").unwrap();
+
+        assert_eq!(scoped(&b.0, &a.0, orders.id), (vec![shadow.id], vec![]), "the parent names it");
+
+        // X's own entries only: A's would bring the configuration, whose
+        // replay makes the shadow here.
+        let theirs = x.0.version_vector().unwrap();
+        let mut window = x.0.entries_for_peer(Hlc::ZERO, 1_024).unwrap();
+        window.entries.retain(|e| e.stamp.node == x.0.node_id());
+        assert!(window.entries.iter().any(|e| e.kind == OpKind::DropCollection));
+        ([a, x, b], shadow, (theirs, window))
+    }
+
+    fn holds_no_shadow_and_nothing_else(b: &Engine, shadow: &CollectionMeta) {
+        assert!(
+            matches!(
+                b.get_collection("shop", &shadow.name),
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. }))
+            ),
+            "no shadow restored"
+        );
+        assert!(b.all_collection_ids().unwrap().is_empty(), "nothing, as on A's peers");
+    }
+
+    #[test]
+    fn a_shadows_page_restores_nothing_under_a_parent_buried_after_the_shadow() {
+        let ([(a, _da), _x, (b, _db)], shadow, (theirs, drop)) =
+            a_shadow_pull_behind_its_parents_drop();
+        b.apply_peer_batch(&theirs, &drop.entries, drop.scanned_to, drop.exhausted).unwrap();
+        let buried = b.collection_dropped_at(CollectionId::derive("shop", "orders")).unwrap();
+        let buried = buried.expect("the parent is buried");
+        assert!(shadow.created < buried.hlc, "the fixture must bury the parent after the shadow");
+
+        assert_eq!(scoped(&b, &a, shadow.id), (vec![], vec![shadow.id]), "named orphaned");
+        holds_no_shadow_and_nothing_else(&b, &shadow);
+    }
+
+    #[test]
+    fn a_shadows_page_restores_nothing_under_a_parent_buried_while_it_applied() {
+        // The parent's tombstone is checked before the writer; the drop can
+        // land in between, and is judged again under it.
+        let ([(a, _da), _x, (b, _db)], shadow, (theirs, drop)) =
+            a_shadow_pull_behind_its_parents_drop();
+        let b = std::sync::Arc::new(b);
+        let page = a.snapshot_page(None, Some(shadow.id)).unwrap();
+        let pulling = std::sync::Arc::clone(&b);
+        let (restored, pulled) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::Restore,
+            move || {
+                pulling.apply_peer_batch(&theirs, &drop.entries, drop.scanned_to, drop.exhausted)
+            },
+            || {
+                b.apply_snapshot_page(
+                    a.node_id(),
+                    &mut SnapshotProgress::of_collection(shadow.id),
+                    &page,
+                )
+            },
+        );
+        pulled.expect("the drop applies");
+        assert_eq!(restored.expect("the page applies").shadows_orphaned, [shadow.id]);
+        holds_no_shadow_and_nothing_else(&b, &shadow);
+        crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::Restore);
+    }
+
+    #[test]
+    fn a_scoped_snapshot_names_no_shadow_this_node_already_holds() {
+        // Listed regardless, every scoped repair of a configured collection
+        // pulled its whole shadow again, vectors and all.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", byo()).unwrap();
+        a.insert(&orders, doc! { "_id": 1, "text": "hello" }).unwrap();
+        let shadow = a.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders"));
+        let shadow = shadow.unwrap();
+        assert_eq!(scoped(&b, &a, orders.id), (vec![shadow.id], vec![]));
+        assert_eq!(scoped(&b, &a, shadow.id), (vec![], vec![]));
+
+        assert_eq!(scoped(&b, &a, orders.id), (vec![], vec![]), "held, so not pulled again");
     }
 
     #[test]

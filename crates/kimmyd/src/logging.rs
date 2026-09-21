@@ -835,6 +835,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.embed.skipped_no_shadow",
+            "{document}",
+            "Documents and scans skipped because a collection configured for vectors has no shadow collection here.",
+            embed_skipped_no_shadow
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.embed.failures",
             "{document}",
             "Embedding attempts that failed.",
