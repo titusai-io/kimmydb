@@ -12,6 +12,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Upgrading rebuilds every partial index at startup, and a downgrade is
+refused.** This release moves the storage schema to 4
+([ADR-183](docs/decisions.md)).
+- **Startup.** The first start rebuilds each partial index before the node
+  serves anything, logging the whole job up front: indexes, documents, an
+  estimate, and the free space the largest needs. Measured on the development
+  machine, a partial index over 10 million documents added about 73 seconds
+  to that start (7 µs per document per partial index).
+- **Disk.** Have free space of at least the largest partial index's size
+  (about 80 bytes per entry) plus about 2 GiB.
+- **Downgrade.** An older build refuses a schema 4 database rather than open
+  it and corrupt its partial indexes.
+  - To roll back **one member**, wipe its data directory and start the older
+    build: it catches up from its peers.
+  - To roll back **the whole cluster**, restore a backup taken before the
+    upgrade.
+
 ### Added
 
 - **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP
@@ -30,6 +47,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A partial index now holds exactly what `find` with its filter returns,
+  and is used only for a query whose every match it holds**
+  ([ADR-183](docs/decisions.md)). Membership had its own rule, which differed
+  from `find` in three ways:
+  - it never matched a whole array, so `{k: [1, 2]}` did not hold a document
+    whose `k` is `[1, 2]`;
+  - it did not count an empty array as present;
+  - it compared across types, so `{size: {$gt: 5}}` held strings, documents
+    and booleans.
+
+  And the planner judged a query contained by reasoning across types too. A
+  query answered from a partial index could therefore miss documents a
+  collection scan returns: 18 such cases were found. A unique partial index
+  was enforced on the wrong documents. Existing partial indexes are rebuilt
+  at startup (above), and duplicates the rebuild finds in a unique one are
+  reported as a replicated build's are, not refused.
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
   in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an

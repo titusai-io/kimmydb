@@ -31,29 +31,49 @@ use crate::meta::CollectionMeta;
 use crate::tables;
 
 /// The database layout this build writes and understands.
-pub const SCHEMA_VERSION: u8 = 3;
+///
+/// **4 (ADR-183) is the first bump that moves no bytes.** Schemas 2 and 3
+/// renumbered collection and index ids; 4 leaves the layout byte-identical and
+/// changes what a partial index's entries mean: its membership is now what
+/// `find` selects with its filter. An older build would parse every byte and
+/// maintain the index under its own rule, re-corrupting it on every write. So
+/// the version guards "this build can correctly **maintain** this data", not
+/// only "this build can parse it", and a build that cannot is refused here
+/// rather than let loose on it.
+pub const SCHEMA_VERSION: u8 = 4;
+
+/// What a migration found that has to be reported once the engine exists:
+/// the collisions a rebuilt unique partial index holds (ADR-183).
+pub(crate) type Unreported = Vec<(CollectionMeta, Vec<crate::index::UniqueViolation>)>;
 
 /// Bring a database up to [`SCHEMA_VERSION`], or refuse if it cannot be.
-pub(crate) fn run(db: &Database) -> Result<()> {
+pub(crate) fn run(db: &Database) -> Result<Unreported> {
     let found = stored_version(db)?;
 
     match found {
         // A fresh database: nothing to migrate, just stamp it.
-        None => write_version(db, SCHEMA_VERSION),
-        Some(SCHEMA_VERSION) => Ok(()),
+        None => write_version(db, SCHEMA_VERSION).map(|()| Vec::new()),
+        Some(SCHEMA_VERSION) => Ok(Vec::new()),
         // Migrations run in sequence, so a schema 1 database steps through 2
-        // rather than needing its own path to the latest.
+        // rather than needing its own path to the latest. The last step
+        // writes the version itself, with its own bookkeeping.
         Some(1) => {
             info!("migrating storage schema 1 -> 2 (derived collection ids)");
             derive_collection_ids(db)?;
             info!("migrating storage schema 2 -> 3 (derived index ids)");
             derive_index_ids(db)?;
-            write_version(db, SCHEMA_VERSION)
+            info!("migrating storage schema 3 -> 4 (partial index membership)");
+            rebuild_partial_indexes(db)
         }
         Some(2) => {
             info!("migrating storage schema 2 -> 3 (derived index ids)");
             derive_index_ids(db)?;
-            write_version(db, SCHEMA_VERSION)
+            info!("migrating storage schema 3 -> 4 (partial index membership)");
+            rebuild_partial_indexes(db)
+        }
+        Some(3) => {
+            info!("migrating storage schema 3 -> 4 (partial index membership)");
+            rebuild_partial_indexes(db)
         }
         // A newer schema means a newer build wrote this directory. Refusing is
         // the right failure: guessing at a layout we do not know would corrupt
@@ -61,6 +81,282 @@ pub(crate) fn run(db: &Database) -> Result<()> {
         Some(other) => {
             Err(StorageError::UnsupportedFormat { found: other, expected: SCHEMA_VERSION })
         }
+    }
+}
+
+/// The partial indexes rebuilt so far, by `(collection, index)`: node-local,
+/// written in each index's own transaction, and deleted in the commit that
+/// writes schema 4. Its rows are what a migration interrupted part-way does
+/// not do again.
+const PARTIAL_REBUILT: redb::TableDefinition<(u64, u32), ()> =
+    redb::TableDefinition::new("partial_rebuilt_under_find");
+
+/// The measured cost of a rebuild, per document per index, on the machine the
+/// migration was written on (ADR-183): about 73 s for 10 million documents. What the
+/// up-front estimate is made from, and no more exact than that.
+const MICROS_PER_DOCUMENT: u64 = 8;
+
+/// The measured size of an index entry on disk, including the tree's own
+/// overhead (ADR-183): 553 MiB for 7.43 million entries. A rebuild needs about
+/// this much free inside the file for its largest index.
+const BYTES_PER_ENTRY: u64 = 80;
+
+/// How many documents between two progress lines. Small under test, so a
+/// small fixture shows that the beat is kept.
+#[cfg(not(test))]
+const PROGRESS_EVERY: u64 = 100_000;
+#[cfg(test)]
+const PROGRESS_EVERY: u64 = 10;
+
+/// What the migration is about to do, stated before it starts.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PartialRebuildPlan {
+    /// `(collection, index, documents to scan)`, in the order they run.
+    pub indexes: Vec<(CollectionMeta, crate::IndexMeta, u64)>,
+    pub documents: u64,
+    /// The most documents any one partial index's collection holds: an upper
+    /// bound on its entries for an index that is not multikey.
+    pub largest_documents: u64,
+}
+
+impl PartialRebuildPlan {
+    pub(crate) fn estimate_secs(&self) -> u64 {
+        self.documents * MICROS_PER_DOCUMENT / 1_000_000
+    }
+
+    pub(crate) fn largest_needs_mib(&self) -> u64 {
+        self.largest_documents * BYTES_PER_ENTRY / (1 << 20)
+    }
+}
+
+/// Every partial index not yet rebuilt, with what the announcement states.
+///
+/// Each collection's size comes from its kept live count (ADR-174), one row,
+/// when the counts are current. Counting instead -- ten million documents and
+/// six million entries -- took 48 s just to announce the job, more than half
+/// the job itself. This runs before `Engine::open` rebuilds stale counts,
+/// though, and a database restored from a backup carries none: trusted then,
+/// the announcement would say nothing was to be done. So when the counts'
+/// mark does not match the store, each collection's records are counted, and
+/// that open pays the 48 s.
+pub(crate) fn partial_rebuild_plan(db: &Database) -> Result<PartialRebuildPlan> {
+    let txn = db.begin_read()?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let counts = txn.open_table(tables::LIVE_COUNTS)?;
+    let current = crate::live_count::counts_are_current(&txn)?;
+    let docs = txn.open_table(tables::DOCS)?;
+    let done: std::collections::HashSet<(u64, u32)> = match txn.open_table(PARTIAL_REBUILT) {
+        Ok(table) => table.iter()?.map(|row| Ok(row?.0.value())).collect::<Result<_>>()?,
+        Err(redb::TableError::TableDoesNotExist(_)) => Default::default(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut plan = PartialRebuildPlan::default();
+    for row in collections.iter()? {
+        let (_, value) = row?;
+        let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+        let mut documents = None;
+        for index in &meta.indexes {
+            if index.partial_filter.is_none() || done.contains(&(meta.id.0, index.id)) {
+                continue;
+            }
+            let documents = match documents {
+                Some(n) => n,
+                None if current => {
+                    *documents.insert(counts.get(meta.id.0)?.map_or(0, |n| n.value()))
+                }
+                None => {
+                    *documents.insert(docs.range(crate::engine::doc_range(meta.id))?.count() as u64)
+                }
+            };
+            plan.documents += documents;
+            plan.largest_documents = plan.largest_documents.max(documents);
+            plan.indexes.push((meta.clone(), index.clone(), documents));
+        }
+    }
+    Ok(plan)
+}
+
+/// Rebuild every partial index under `find`'s semantics, then write schema 4
+/// (ADR-183).
+///
+/// One transaction per index: its entries are cleared by key and rebuilt from
+/// every document, its `multikey` flag raised if the new membership makes it
+/// so, and its marker written, all in that commit. A crash rolls that index
+/// back, marker and all, and the next open does it again; the ones already
+/// marked are not redone. Nothing reads the index meanwhile: this runs inside
+/// `Engine::open` before the engine exists, and redb refuses a second opener.
+///
+/// A unique index is rebuilt in full whatever its documents share, and the
+/// keys two or more of them share are returned for the engine to report as a
+/// replicated build's are (ADR-020, ADR-123): a migration cannot refuse, and
+/// documents accepted while the constraint was misapplied are real.
+fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
+    let plan = partial_rebuild_plan(db)?;
+    let total = plan.indexes.len();
+    if total > 0 {
+        info!(
+            partial_indexes = total,
+            documents = plan.documents,
+            estimate_secs = plan.estimate_secs(),
+            largest_collection_documents = plan.largest_documents,
+            largest_needs_free_mib = plan.largest_needs_mib(),
+            "rebuilding every partial index so its membership is what find selects (ADR-183), \
+             before this node serves anything; each index is rebuilt in one transaction and \
+             needs about its own size free inside the database file, up to the figure for the \
+             largest"
+        );
+    }
+    let mut unreported = Vec::new();
+    for (n, (meta, index, documents)) in plan.indexes.iter().enumerate() {
+        let started = std::time::Instant::now();
+        info!(
+            n = n + 1,
+            of = total,
+            db = %meta.db,
+            collection = %meta.name,
+            index = %index.name,
+            documents,
+            "rebuilding a partial index"
+        );
+        let txn = db.begin_write()?;
+        let (built, multikey, violations) = {
+            let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+            crate::index::clear_index_entries(
+                &mut entries,
+                crate::index::index_id_range(meta.id, index.id),
+            )?;
+            let docs = txn.open_table(tables::DOCS)?;
+            let mut holders: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+            let (mut built, mut scanned, mut multikey) = (0u64, 0u64, false);
+            for row in docs.range(crate::engine::doc_range(meta.id))? {
+                let (key, value) = row?;
+                let record = codec::decode_doc_record(value.value())?;
+                let Some(doc) = record.document()? else { continue };
+                let (_, doc_key) = key.value();
+                match crate::index::document_keys(index, &doc)? {
+                    crate::index::DocumentKeys::Keyed { keys, multikey: many } => {
+                        multikey |= many;
+                        for key in keys {
+                            if index.unique {
+                                holders.entry(key.clone()).or_default().push(doc_key.to_vec());
+                            }
+                            entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
+                            built += 1;
+                        }
+                    }
+                    crate::index::DocumentKeys::Unkeyed { multikey: many, .. } => {
+                        multikey |= many;
+                        entries
+                            .insert((meta.id.0, index.id, crate::index::UNKEYED, doc_key), ())?;
+                        built += 1;
+                    }
+                }
+                scanned += 1;
+                if scanned % PROGRESS_EVERY == 0 {
+                    #[cfg(test)]
+                    hooks::progress();
+                    info!(n = n + 1, of = total, index = %index.name, scanned, of_documents = documents, "rebuilding a partial index");
+                }
+            }
+            let mut violations: Vec<crate::index::UniqueViolation> = holders
+                .into_iter()
+                .filter(|(_, holders)| holders.len() > 1)
+                .map(|(key, holders)| crate::index::UniqueViolation {
+                    index: index.name.clone(),
+                    key,
+                    holders,
+                })
+                .collect();
+            violations.sort_by(|a, b| a.key.cmp(&b.key));
+            (built, multikey, violations)
+        };
+        // One-way, like every other write that can make an index multikey:
+        // a two-sided range over one that is and says it is not loses rows.
+        let mut standing = meta.clone();
+        if multikey && !index.multikey {
+            let mut collections = txn.open_table(tables::COLLECTIONS)?;
+            let fresh = collections
+                .get((meta.db.as_str(), meta.name.as_str()))?
+                .map(|raw| serde_json::from_slice::<CollectionMeta>(raw.value()))
+                .transpose()?;
+            if let Some(mut fresh) = fresh {
+                for held in fresh.indexes.iter_mut().filter(|i| i.id == index.id) {
+                    held.multikey = true;
+                }
+                collections.insert(
+                    (meta.db.as_str(), meta.name.as_str()),
+                    serde_json::to_vec(&fresh)?.as_slice(),
+                )?;
+                standing = fresh;
+            }
+        }
+        txn.open_table(PARTIAL_REBUILT)?.insert((meta.id.0, index.id), ())?;
+        #[cfg(test)]
+        if hooks::fails_at(n + 1) {
+            drop(txn);
+            return Err(StorageError::Database("a failure injected mid-migration".into()));
+        }
+        txn.commit()?;
+        info!(
+            n = n + 1,
+            of = total,
+            index = %index.name,
+            entries = built,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "rebuilt a partial index"
+        );
+        if !violations.is_empty() {
+            unreported.push((standing, violations));
+        }
+    }
+    // The version and the end of the bookkeeping in one commit: a crash
+    // before it leaves schema 3 and the markers, and the next open finishes.
+    let txn = db.begin_write()?;
+    match txn.delete_table(PARTIAL_REBUILT) {
+        Ok(_) => {}
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    txn.open_table(tables::META)?
+        .insert(tables::META_FORMAT_VERSION, [SCHEMA_VERSION].as_slice())?;
+    txn.commit()?;
+    Ok(unreported)
+}
+
+/// Test-only points in the membership migration.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PROGRESS: Cell<usize> = const { Cell::new(0) };
+        static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn progress() {
+        PROGRESS.with(|p| p.set(p.get() + 1));
+    }
+
+    /// Progress lines written on this thread so far.
+    pub(crate) fn progress_lines() -> usize {
+        PROGRESS.with(|p| p.get())
+    }
+
+    /// Fail the next migration on this thread at the `n`th index (from 1),
+    /// after its work and before its commit, as a crash there would.
+    pub(crate) fn fail_at_index(n: usize) {
+        FAIL_AT.with(|f| f.set(Some(n)));
+    }
+
+    pub(crate) fn fails_at(n: usize) -> bool {
+        FAIL_AT.with(|f| {
+            if f.get() == Some(n) {
+                f.set(None);
+                true
+            } else {
+                false
+            }
+        })
     }
 }
 
@@ -626,5 +922,472 @@ mod tests {
 
     fn field(path: &str) -> crate::meta::IndexField {
         crate::meta::IndexField { path: path.into(), descending: false }
+    }
+}
+
+/// ADR-183: the schema 3 -> 4 migration rebuilds every partial index so its
+/// membership is what `find` selects.
+#[cfg(test)]
+mod membership_migration {
+    use std::cmp::Ordering;
+    use std::collections::BTreeSet;
+
+    use bson::{Bson, Document, doc};
+    use kimmy_core::{PartialFilter, PartialOp, canonical_cmp, path};
+    use redb::{Database, ReadableDatabase, ReadableTable};
+
+    use super::*;
+    use crate::Engine;
+
+    /// Partial-index membership as it was before ADR-183, verbatim: each
+    /// element of an array against the operand and never the whole array,
+    /// comparisons across type brackets, and a missing field matching
+    /// nothing. The fixture needs it to build what a schema 3 node holds.
+    fn old_rule(filter: &Document, doc: &Document) -> bool {
+        fn holds(op: &PartialOp, value: &Bson) -> bool {
+            match op {
+                PartialOp::Exists => true,
+                PartialOp::Eq(want) => canonical_cmp(value, want) == Ordering::Equal,
+                PartialOp::Gt(b) => canonical_cmp(value, b) == Ordering::Greater,
+                PartialOp::Gte(b) => canonical_cmp(value, b) != Ordering::Less,
+                PartialOp::Lt(b) => canonical_cmp(value, b) == Ordering::Less,
+                PartialOp::Lte(b) => canonical_cmp(value, b) != Ordering::Greater,
+            }
+        }
+        let filter = PartialFilter::parse(filter).unwrap();
+        filter.predicates().all(|(field, op)| {
+            path::resolve(doc, field).iter().any(|value| match value {
+                Bson::Array(items) => items.iter().any(|item| holds(op, item)),
+                other => holds(op, other),
+            })
+        })
+    }
+
+    /// Put a schema 4 database back where a schema 3 node leaves it: every
+    /// partial index holding what the old rule selects, and version 3.
+    fn as_schema_3(path: &std::path::Path, unique: &[&str]) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut collections = txn.open_table(tables::COLLECTIONS).unwrap();
+            let rows: Vec<(String, String, CollectionMeta)> = collections
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (k, v) = row.unwrap();
+                    let (d, c) = k.value();
+                    (d.to_string(), c.to_string(), serde_json::from_slice(v.value()).unwrap())
+                })
+                .collect();
+            let docs = txn.open_table(tables::DOCS).unwrap();
+            let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+            for (d, c, mut meta) in rows {
+                for index in meta.indexes.iter_mut() {
+                    if unique.contains(&index.name.as_str()) {
+                        index.unique = true;
+                    }
+                    let Some(filter) = index.partial_filter.clone() else { continue };
+                    crate::index::clear_index_entries(
+                        &mut entries,
+                        crate::index::index_id_range(meta.id, index.id),
+                    )
+                    .unwrap();
+                    let whole = crate::IndexMeta { partial_filter: None, ..index.clone() };
+                    for row in docs.range(crate::engine::doc_range(meta.id)).unwrap() {
+                        let (key, value) = row.unwrap();
+                        let doc = codec::decode_doc_record(value.value())
+                            .unwrap()
+                            .document()
+                            .unwrap()
+                            .unwrap();
+                        if !old_rule(&filter, &doc) {
+                            continue;
+                        }
+                        if let crate::index::DocumentKeys::Keyed { keys, .. } =
+                            crate::index::document_keys(&whole, &doc).unwrap()
+                        {
+                            for k in keys {
+                                entries
+                                    .insert((meta.id.0, index.id, k.as_slice(), key.value().1), ())
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                collections
+                    .insert((d.as_str(), c.as_str()), serde_json::to_vec(&meta).unwrap().as_slice())
+                    .unwrap();
+            }
+            txn.open_table(tables::META)
+                .unwrap()
+                .insert(tables::META_FORMAT_VERSION, [3u8].as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// The `_id`s an index holds, read from the file.
+    fn members(path: &std::path::Path, index: &str) -> BTreeSet<i64> {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let collections = txn.open_table(tables::COLLECTIONS).unwrap();
+        let meta: CollectionMeta =
+            serde_json::from_slice(collections.get(("shop", "t")).unwrap().unwrap().value())
+                .unwrap();
+        let id = meta.index(index).unwrap().id;
+        let entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+        let docs = txn.open_table(tables::DOCS).unwrap();
+        entries
+            .range(crate::index::index_id_range(meta.id, id))
+            .unwrap()
+            .map(|row| {
+                let (k, _) = row.unwrap();
+                let doc_key = k.value().3.to_vec();
+                let raw = docs.get((meta.id.0, doc_key.as_slice())).unwrap().unwrap();
+                let doc =
+                    codec::decode_doc_record(raw.value()).unwrap().document().unwrap().unwrap();
+                doc.get("_id")
+                    .unwrap()
+                    .as_i64()
+                    .or_else(|| doc.get_i32("_id").ok().map(i64::from))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn version(path: &std::path::Path) -> Option<u8> {
+        stored_version(&Database::create(path).unwrap()).unwrap()
+    }
+
+    /// `shop.t` with two partial indexes on `x`, one over an array operand
+    /// and one over a range, and twenty-five other documents.
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        let t = engine.create_collection("shop", "t").unwrap();
+        let mut docs = vec![
+            doc! {"_id": 1_i64, "k": [1, 2], "x": 1},
+            doc! {"_id": 3_i64, "k": [[1, 2]], "x": 3},
+            doc! {"_id": 4_i64, "size": 10, "x": 4},
+            doc! {"_id": 5_i64, "size": "large", "x": 5},
+        ];
+        docs.extend((100..125_i64).map(|i| doc! {"_id": i, "x": i}));
+        engine.insert_many(&t, docs).unwrap();
+        for (name, filter) in
+            [("by_array", doc! {"k": [1, 2]}), ("by_range", doc! {"size": {"$gt": 5}})]
+        {
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![crate::meta::IndexField::ascending("x")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some(name.into()),
+                    None,
+                    Some(filter),
+                )
+                .unwrap();
+        }
+        drop(engine);
+        as_schema_3(&path, &[]);
+        (dir, path)
+    }
+
+    fn assert_the_fixture_is_the_old_membership(path: &std::path::Path) {
+        assert_eq!(
+            members(path, "by_array"),
+            BTreeSet::from([3]),
+            "premise: lacks the whole array"
+        );
+        assert_eq!(members(path, "by_range"), BTreeSet::from([4, 5]), "premise: holds the string");
+    }
+
+    #[test]
+    fn a_partial_index_built_under_the_old_rule_is_rebuilt_to_what_find_selects() {
+        let (_dir, path) = fixture();
+        assert_the_fixture_is_the_old_membership(&path);
+        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
+        assert_eq!(plan.indexes.len(), 2);
+        assert_eq!(plan.documents, 2 * 29, "each index scans the collection's 29 documents");
+        assert_eq!(plan.largest_documents, 29);
+        let lines_before = hooks::progress_lines();
+
+        drop(Engine::open(&path).unwrap());
+
+        assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]));
+        assert_eq!(members(&path, "by_range"), BTreeSet::from([4]));
+        assert_eq!(version(&path), Some(SCHEMA_VERSION));
+        let db = Database::create(&path).unwrap();
+        assert!(
+            db.begin_read().unwrap().open_table(PARTIAL_REBUILT).is_err(),
+            "the markers are gone"
+        );
+        assert!(hooks::progress_lines() - lines_before >= 4, "every ten documents, on each index");
+    }
+
+    /// Rewrites the kept counts of every collection to `n` in place, leaving
+    /// their mark alone.
+    fn set_kept_counts(path: &std::path::Path, n: Option<u64>) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut counts = txn.open_table(tables::LIVE_COUNTS).unwrap();
+            let ids: Vec<u64> = counts.iter().unwrap().map(|row| row.unwrap().0.value()).collect();
+            assert!(!ids.is_empty(), "premise: the fixture's counts are kept");
+            for id in ids {
+                match n {
+                    Some(n) => counts.insert(id, n).unwrap(),
+                    None => counts.remove(id).unwrap(),
+                };
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn the_announcement_reads_the_kept_counts_when_they_are_current() {
+        let (_dir, path) = fixture();
+        set_kept_counts(&path, Some(7));
+        let db = Database::create(&path).unwrap();
+        assert!(
+            crate::live_count::counts_are_current(&db.begin_read().unwrap()).unwrap(),
+            "premise: rewriting a count in place leaves its mark matching"
+        );
+        let plan = partial_rebuild_plan(&db).unwrap();
+        // Seven, not the 29 documents there are: the count was read, not
+        // walked for.
+        assert_eq!((plan.documents, plan.largest_documents), (2 * 7, 7));
+    }
+
+    #[test]
+    fn the_announcement_counts_the_collection_when_a_restore_left_no_counts() {
+        let (_dir, path) = fixture();
+        // What a backup restores: neither the counts nor their mark (ADR-174).
+        set_kept_counts(&path, None);
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_COUNTS_THROUGH)
+                .unwrap()
+                .remove(crate::live_count::THROUGH)
+                .unwrap()
+                .expect("premise: the fixture's counts had a mark");
+            txn.commit().unwrap();
+        }
+        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
+        assert_eq!((plan.documents, plan.largest_documents), (2 * 29, 29));
+    }
+
+    #[test]
+    fn the_announcement_counts_the_collection_when_the_counts_mark_is_behind() {
+        let (_dir, path) = fixture();
+        // An older build wrote since: the counts stand at 7 and the mark no
+        // longer matches the oplog.
+        set_kept_counts(&path, Some(7));
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_COUNTS_THROUGH)
+                .unwrap()
+                .insert(crate::live_count::THROUGH, &[0u8; 8][..])
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
+        assert_eq!((plan.documents, plan.largest_documents), (2 * 29, 29));
+    }
+
+    #[test]
+    fn a_migration_interrupted_between_indexes_finishes_without_redoing_one() {
+        let (_dir, path) = fixture();
+        assert_the_fixture_is_the_old_membership(&path);
+
+        hooks::fail_at_index(2);
+        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
+
+        assert_eq!(version(&path), Some(3), "still schema 3");
+        assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]), "the first index committed");
+        assert_eq!(members(&path, "by_range"), BTreeSet::from([4, 5]), "the second rolled back");
+        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
+        let pending: Vec<&str> = plan.indexes.iter().map(|(_, i, _)| i.name.as_str()).collect();
+        assert_eq!(pending, ["by_range"], "only the unfinished index is left to do");
+
+        drop(Engine::open(&path).unwrap());
+        assert_eq!(members(&path, "by_range"), BTreeSet::from([4]));
+        assert_eq!(version(&path), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn a_rebuild_that_takes_in_an_array_raises_multikey() {
+        // A document the old rule left out now belongs, and it holds an array
+        // at the indexed path. Left unraised, the planner would read both ends
+        // of a range on an index that is multikey, and lose rows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            engine.insert(&t, doc! {"_id": 1_i64, "k": [1, 2], "tags": ["a", "b"]}).unwrap();
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![crate::meta::IndexField::ascending("tags")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("tagged".into()),
+                    None,
+                    Some(doc! {"k": [1, 2]}),
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &[]);
+        {
+            // What a schema 3 node holds: the flag as its own build left it.
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut collections = txn.open_table(tables::COLLECTIONS).unwrap();
+                let mut meta: CollectionMeta = serde_json::from_slice(
+                    collections.get(("shop", "t")).unwrap().unwrap().value(),
+                )
+                .unwrap();
+                meta.indexes[0].multikey = false;
+                collections
+                    .insert(("shop", "t"), serde_json::to_vec(&meta).unwrap().as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(members(&path, "tagged").is_empty(), "premise: the old rule left it out");
+
+        let engine = Engine::open(&path).unwrap();
+
+        let index = engine.get_collection("shop", "t").unwrap().index("tagged").unwrap().clone();
+        assert!(index.multikey, "the rebuild took in an array, and says so");
+        drop(engine);
+        assert_eq!(members(&path, "tagged"), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn a_unique_index_the_rebuild_finds_shared_keys_in_reports_them_and_completes() {
+        // Two documents sharing an email, outside the old membership of a
+        // unique index over an array operand: accepted while the constraint
+        // was misapplied. The rebuild takes both in, and a migration cannot
+        // refuse -- so they are reported as a replicated build reports them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            engine
+                .insert_many(
+                    &t,
+                    vec![
+                        doc! {"_id": 1_i64, "k": [1, 2], "email": "a"},
+                        doc! {"_id": 2_i64, "k": [1, 2], "email": "a"},
+                    ],
+                )
+                .unwrap();
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![crate::meta::IndexField::ascending("email")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("email_once".into()),
+                    None,
+                    Some(doc! {"k": [1, 2]}),
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &["email_once"]);
+        assert!(members(&path, "email_once").is_empty(), "premise: neither was a member");
+
+        let engine = Engine::open(&path).unwrap();
+
+        assert_eq!(engine.unique_violations(), 1, "one shared key, reported");
+        drop(engine);
+        assert_eq!(members(&path, "email_once"), BTreeSet::from([1, 2]), "built in full");
+        assert_eq!(version(&path), Some(SCHEMA_VERSION));
+    }
+}
+
+/// What the schema 3 -> 4 migration costs on a realistic collection
+/// (ADR-183): a harness, not a test, run in release on the machine a figure
+/// is quoted from.
+///
+/// ```text
+/// MIGRATION_N=10000000 cargo test --release -p kimmy-storage --lib \
+///     migrate::migration_cost -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod migration_cost {
+    use bson::doc;
+
+    use super::*;
+    use crate::Engine;
+
+    #[test]
+    #[ignore = "a measurement harness: see the module documentation"]
+    fn measure() {
+        let n: i64 = std::env::var("MIGRATION_N").map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            let pad = "p".repeat(200);
+            for start in (0..n).step_by(10_000) {
+                let docs: Vec<bson::Document> = (start..(start + 10_000).min(n))
+                    .map(|i| {
+                        let size = if i % 7 == 0 { bson::Bson::from("large") } else { (i % 20).into() };
+                        doc! {"_id": i, "size": size, "at": bson::DateTime::from_millis(i), "pad": &pad}
+                    })
+                    .collect();
+                engine.insert_many(&t, docs).unwrap();
+            }
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![crate::meta::IndexField::ascending("at")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("ttl".into()),
+                    Some(3600),
+                    Some(doc! {"size": {"$gt": 5}}),
+                )
+                .unwrap();
+        }
+        write_version(&redb::Database::create(&path).unwrap(), 3).unwrap();
+        let plan = partial_rebuild_plan(&redb::Database::create(&path).unwrap()).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len() >> 20;
+        let planned = std::time::Instant::now();
+        drop(partial_rebuild_plan(&redb::Database::create(&path).unwrap()).unwrap());
+        let planning = planned.elapsed();
+        let started = std::time::Instant::now();
+        drop(Engine::open(&path).unwrap());
+        let migrated = started.elapsed();
+        // The control: the same open with nothing to migrate.
+        let reopened = std::time::Instant::now();
+        drop(Engine::open(&path).unwrap());
+        eprintln!(
+            "MIGRATION n={n}: planning alone {planning:?}; an ordinary open afterwards {:?}",
+            reopened.elapsed()
+        );
+        eprintln!(
+            "MIGRATION n={n}: open with the migration took {migrated:?}; announced {} documents, \
+             estimate {} s, largest collection {} documents needing up to {} MiB; file {before} -> \
+             {} MiB",
+            plan.documents,
+            plan.estimate_secs(),
+            plan.largest_documents,
+            plan.largest_needs_mib(),
+            std::fs::metadata(&path).unwrap().len() >> 20
+        );
     }
 }

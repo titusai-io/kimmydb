@@ -166,13 +166,12 @@ fn partial_filters() -> Vec<Document> {
 
 #[test]
 fn a_partial_filter_selects_exactly_what_find_returns() {
-    // `PartialFilter::selects` is what TTL expiry asks before deleting
-    // (ADR-181), and it must be `find`'s answer for every expression the
-    // partial language can carry. It shares `kimmy_core::matching` with
-    // `find`; this holds the path resolution and the conjunction around it to
-    // the same answer too.
+    // `PartialFilter::selects` is index membership (ADR-183) and what TTL
+    // expiry asks before deleting (ADR-181), and it must be `find`'s answer
+    // for every expression the partial language can carry. It shares
+    // `kimmy_core::matching` with `find`; this holds the path resolution and
+    // the conjunction around it to the same answer too.
     let docs = docs();
-    let mut membership_differs = 0usize;
     for f in partial_filters() {
         let Ok(partial) = kimmy_core::PartialFilter::parse(&f) else { continue };
         let query = filter::parse(&f).unwrap();
@@ -182,13 +181,6 @@ fn a_partial_filter_selects_exactly_what_find_returns() {
                 filter::matches(&query, d),
                 "selects and find disagree on {f:?} for {d:?}"
             );
-            membership_differs += usize::from(partial.matches(d) != partial.selects(d));
         }
     }
-    // The corpus has to be able to tell `find`'s answer from the index's
-    // membership rule, which is the one the guard must not borrow. If it
-    // could not, an implementation of `selects` that called `matches` would
-    // pass.
-    assert!(membership_differs > 0, "premise: the corpus separates the two rules");
-    eprintln!("membership rule and find differ on {membership_differs} cases");
 }

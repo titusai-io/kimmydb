@@ -700,9 +700,11 @@ mod tests {
     #[test]
     fn a_range_filter_expires_only_what_find_selects() {
         // `{size: {$gt: 5}}` as `find` reads it selects a number above five.
-        // The index's membership rule compares across type brackets, so it
-        // also holds a string, a document and a boolean -- and expiry deleted
-        // all four (ADR-181).
+        // Membership used to compare across type brackets, so the index also
+        // held a string, a document and a boolean, and expiry deleted all
+        // four; ADR-181 made the delete re-check the filter. Since ADR-183 the
+        // index holds only what the filter selects, so the other three are
+        // never candidates at all.
         let (engine, _, _dir) = engine();
         let filter = doc! {"size": {"$gt": 5}};
         let (coll, index) = with_filtered_ttl(&engine, filter.clone());
@@ -713,21 +715,20 @@ mod tests {
                 .insert(&coll, doc! {"_id": id as i64, "size": size.clone(), "seen": dt(0)})
                 .unwrap();
         }
-
-        // The fixture has to be the case that deletes wrongly: documents the
-        // index holds that the filter does not select.
-        let parsed = kimmy_core::PartialFilter::parse(&filter).unwrap();
-        let wrongly_held = sizes[2..]
-            .iter()
-            .map(|size| doc! {"size": size.clone()})
-            .filter(|d| parsed.matches(d) && !parsed.selects(d))
-            .count();
-        assert_eq!(wrongly_held, 3, "premise: the index holds three the filter does not select");
+        let held = crate::index::scan_range(
+            engine.db(),
+            coll.id,
+            index.id,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap();
+        assert_eq!(held.len(), 1, "the index holds only the number above five");
 
         let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
 
-        assert_eq!(out.deleted, 1, "{out:?}");
-        assert_eq!(out.skipped_filter, 3, "{out:?}");
+        assert_eq!((out.deleted, out.skipped_filter), (1, 0), "{out:?}");
         let left: Vec<i64> = (0..5)
             .filter(|id| engine.get(&coll, &kimmy_core::DocId::Int64(*id)).unwrap().is_some())
             .collect();

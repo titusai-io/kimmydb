@@ -61,23 +61,28 @@ pub enum PartialOp {
 }
 
 impl PartialOp {
-    /// Whether a document's value at the path satisfies this.
+    /// Whether this holds on one value, as `find` tests one value: the
+    /// predicate `any_element` applies to a value and to each element of an
+    /// array value, **without** looking inside the value itself.
     ///
-    /// `value` is `None` for an absent field. Absence satisfies nothing here —
-    /// not even a comparison — because a missing field would otherwise be
-    /// indexed as null and compare below everything, quietly pulling every
-    /// incomplete document into a `$lt` index.
-    fn holds(&self, value: Option<&Bson>) -> bool {
-        let Some(value) = value else {
-            return false;
+    /// What [`Self::implies`] reasons with. A document matches a query
+    /// predicate through some value or element `w`, and that same `w` is
+    /// among what the filter predicate is tested on -- but `w`'s own elements
+    /// are not, when `w` is itself an element of an array, since `find`
+    /// descends one level. So implication is judged on the value alone.
+    fn holds_on_value(&self, value: &Bson) -> bool {
+        use crate::cmp::same_type_group;
+        let compares = |bound: &Bson, accept: &[Ordering]| {
+            same_type_group(value, bound) && accept.contains(&canonical_cmp(value, bound))
         };
         match self {
             PartialOp::Exists => true,
+            PartialOp::Eq(Bson::Null) => matches!(value, Bson::Null),
             PartialOp::Eq(want) => canonical_cmp(value, want) == Ordering::Equal,
-            PartialOp::Gt(bound) => canonical_cmp(value, bound) == Ordering::Greater,
-            PartialOp::Gte(bound) => canonical_cmp(value, bound) != Ordering::Less,
-            PartialOp::Lt(bound) => canonical_cmp(value, bound) == Ordering::Less,
-            PartialOp::Lte(bound) => canonical_cmp(value, bound) != Ordering::Greater,
+            PartialOp::Gt(bound) => compares(bound, &[Ordering::Greater]),
+            PartialOp::Gte(bound) => compares(bound, &[Ordering::Greater, Ordering::Equal]),
+            PartialOp::Lt(bound) => compares(bound, &[Ordering::Less]),
+            PartialOp::Lte(bound) => compares(bound, &[Ordering::Less, Ordering::Equal]),
         }
     }
 
@@ -98,32 +103,66 @@ impl PartialOp {
         }
     }
 
-    /// Whether satisfying `self` guarantees satisfying `other`.
+    /// Whether satisfying `self` guarantees satisfying `other`, both read as
+    /// `find` reads them (ADR-183).
     ///
     /// This is the whole containment question, and it is decidable precisely
-    /// because the language is this small. Every arm is a fact about the total
-    /// order `canonical_cmp` defines, not a heuristic.
+    /// because the language is this small. A document satisfies `self`
+    /// through some value or array element `w`; the question is whether
+    /// every such `w` also satisfies `other`. Two things make that a
+    /// question about `find` and not about the canonical order alone:
+    ///
+    /// - **A bound implies a bound only within one type bracket.** `find`
+    ///   compares a value only with a bound of its own bracket, so `{$gt: 5}`
+    ///   selects no string and no array. Judged on `canonical_cmp` alone, a
+    ///   query `{k: [1, 2]}` or `{k: {$gt: "a"}}` was taken to imply
+    ///   `{k: {$gt: 5}}`, because arrays and strings sort above numbers, and
+    ///   the planner answered it from an index that holds neither.
+    /// - **`{k: null}` matches a missing field**, so it implies nothing about
+    ///   presence and no bound: only itself.
     pub fn implies(&self, other: &PartialOp) -> bool {
+        use crate::cmp::same_type_group;
+        let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);
         match (self, other) {
-            // Anything that can hold at all implies presence.
+            // A null equality is satisfied by absence, which satisfies only
+            // another null equality.
+            (PartialOp::Eq(Bson::Null), o) => matches!(o, PartialOp::Eq(Bson::Null)),
+            // Anything else that holds at all implies presence.
             (_, PartialOp::Exists) => true,
             // A known value implies whatever that value satisfies.
-            (PartialOp::Eq(v), o) => o.holds(Some(v)),
+            (PartialOp::Eq(v), o) => o.holds_on_value(v),
             (PartialOp::Exists, _) => false,
 
-            // Lower bounds: the tighter one implies the looser.
-            (PartialOp::Gt(a), PartialOp::Gt(b)) => canonical_cmp(a, b) != Ordering::Less,
-            (PartialOp::Gt(a), PartialOp::Gte(b)) => canonical_cmp(a, b) != Ordering::Less,
-            (PartialOp::Gte(a), PartialOp::Gte(b)) => canonical_cmp(a, b) != Ordering::Less,
+            // Lower bounds: the tighter one implies the looser, within one
+            // bracket.
+            (PartialOp::Gt(a), PartialOp::Gt(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Less
+            }
+            (PartialOp::Gt(a), PartialOp::Gte(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Less
+            }
+            (PartialOp::Gte(a), PartialOp::Gte(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Less
+            }
             // `>= a` implies `> b` only when a is strictly past b, since a
             // itself satisfies the former and must also satisfy the latter.
-            (PartialOp::Gte(a), PartialOp::Gt(b)) => canonical_cmp(a, b) == Ordering::Greater,
+            (PartialOp::Gte(a), PartialOp::Gt(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) == Ordering::Greater
+            }
 
             // Upper bounds, mirrored.
-            (PartialOp::Lt(a), PartialOp::Lt(b)) => canonical_cmp(a, b) != Ordering::Greater,
-            (PartialOp::Lt(a), PartialOp::Lte(b)) => canonical_cmp(a, b) != Ordering::Greater,
-            (PartialOp::Lte(a), PartialOp::Lte(b)) => canonical_cmp(a, b) != Ordering::Greater,
-            (PartialOp::Lte(a), PartialOp::Lt(b)) => canonical_cmp(a, b) == Ordering::Less,
+            (PartialOp::Lt(a), PartialOp::Lt(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Greater
+            }
+            (PartialOp::Lt(a), PartialOp::Lte(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Greater
+            }
+            (PartialOp::Lte(a), PartialOp::Lte(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) != Ordering::Greater
+            }
+            (PartialOp::Lte(a), PartialOp::Lt(b)) => {
+                bracket(a, b) && canonical_cmp(a, b) == Ordering::Less
+            }
 
             // A bound in one direction says nothing about the other.
             _ => false,
@@ -169,37 +208,17 @@ impl PartialFilter {
         self.predicates.iter().map(|(p, o)| (p.as_str(), o))
     }
 
-    /// Whether this document belongs in the index: the membership rule index
-    /// maintenance applies today.
-    ///
-    /// A path that fans out through an array satisfies the predicate if **any**
-    /// of its values does — an index over `tags` with a partial filter on
-    /// `tags` must hold a document whose array contains a qualifying element.
-    ///
-    /// **It is not what `find` selects with the same expression**, and
-    /// [`Self::selects`] is. It compares across type brackets, so `{$gt: 5}`
-    /// holds a string; it never compares a whole array; and it treats a
-    /// missing field as matching nothing. Anything that acts on a document
-    /// because the filter selects it asks `selects`, not this (ADR-181).
-    pub fn matches(&self, doc: &Document) -> bool {
-        self.predicates.iter().all(|(field, op)| {
-            let resolved = path::resolve(doc, field);
-            if resolved.is_empty() {
-                return op.holds(None);
-            }
-            resolved.iter().any(|value| match value {
-                Bson::Array(items) => items.iter().any(|item| op.holds(Some(item))),
-                other => op.holds(Some(other)),
-            })
-        })
-    }
-
-    /// Whether `find` with this filter as its expression would return `doc`.
+    /// Whether `find` with this filter as its expression would return `doc`
+    /// -- which is also whether `doc` belongs in the index (ADR-183).
     ///
     /// Evaluated by [`crate::matching`], the same code `kimmy-query`'s filter
     /// evaluates these operators with, so the answer is `find`'s by
     /// construction rather than by a second implementation agreeing with it.
-    /// TTL expiry asks this before it deletes (ADR-181).
+    /// Index maintenance asks it for membership, and TTL expiry asks it again
+    /// before it deletes (ADR-181). There used to be a second rule, for
+    /// membership, that compared across type brackets, never compared a whole
+    /// array, and read a missing field as matching nothing; containment was
+    /// judged against the one while `find` answered by the other.
     pub fn selects(&self, doc: &Document) -> bool {
         self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
     }
@@ -355,8 +374,8 @@ mod tests {
     #[test]
     fn a_literal_subdocument_is_equality_not_a_nested_predicate() {
         let f = parse(doc! {"addr": {"city": "London"}}).unwrap();
-        assert!(f.matches(&doc! {"addr": {"city": "London"}}));
-        assert!(!f.matches(&doc! {"addr": {"city": "Paris"}}));
+        assert!(f.selects(&doc! {"addr": {"city": "London"}}));
+        assert!(!f.selects(&doc! {"addr": {"city": "Paris"}}));
     }
 
     // -- membership -------------------------------------------------------
@@ -365,10 +384,10 @@ mod tests {
     fn exists_selects_only_documents_carrying_the_field() {
         // The motivating case: unique only where the field is present.
         let f = parse(doc! {"email": {"$exists": true}}).unwrap();
-        assert!(f.matches(&doc! {"_id": 1, "email": "a@b.c"}));
-        assert!(!f.matches(&doc! {"_id": 2}));
+        assert!(f.selects(&doc! {"_id": 1, "email": "a@b.c"}));
+        assert!(!f.selects(&doc! {"_id": 2}));
         // Explicitly null is *present*, and Mongo agrees.
-        assert!(f.matches(&doc! {"_id": 3, "email": Bson::Null}));
+        assert!(f.selects(&doc! {"_id": 3, "email": Bson::Null}));
     }
 
     #[test]
@@ -376,37 +395,70 @@ mod tests {
         // If absence were treated as null it would sort below everything and
         // pull every incomplete document into a `$lt` index.
         let f = parse(doc! {"qty": {"$lt": 5}}).unwrap();
-        assert!(f.matches(&doc! {"qty": 1}));
-        assert!(!f.matches(&doc! {"other": 1}));
+        assert!(f.selects(&doc! {"qty": 1}));
+        assert!(!f.selects(&doc! {"other": 1}));
     }
 
     #[test]
     fn a_conjunction_needs_every_predicate() {
         let f = parse(doc! {"status": "active", "qty": {"$gte": 10}}).unwrap();
-        assert!(f.matches(&doc! {"status": "active", "qty": 10}));
-        assert!(!f.matches(&doc! {"status": "active", "qty": 9}));
-        assert!(!f.matches(&doc! {"status": "done", "qty": 10}));
+        assert!(f.selects(&doc! {"status": "active", "qty": 10}));
+        assert!(!f.selects(&doc! {"status": "active", "qty": 9}));
+        assert!(!f.selects(&doc! {"status": "done", "qty": 10}));
     }
 
     #[test]
     fn an_array_matches_when_any_element_does() {
         let f = parse(doc! {"tags": "urgent"}).unwrap();
-        assert!(f.matches(&doc! {"tags": ["slow", "urgent"]}));
-        assert!(!f.matches(&doc! {"tags": ["slow"]}));
+        assert!(f.selects(&doc! {"tags": ["slow", "urgent"]}));
+        assert!(!f.selects(&doc! {"tags": ["slow"]}));
     }
 
     #[test]
     fn a_dotted_path_reaches_into_a_subdocument() {
         let f = parse(doc! {"user.active": true}).unwrap();
-        assert!(f.matches(&doc! {"user": {"active": true}}));
-        assert!(!f.matches(&doc! {"user": {"active": false}}));
-        assert!(!f.matches(&doc! {"user": {}}));
+        assert!(f.selects(&doc! {"user": {"active": true}}));
+        assert!(!f.selects(&doc! {"user": {"active": false}}));
+        assert!(!f.selects(&doc! {"user": {}}));
     }
 
     #[test]
-    fn membership_compares_across_types_the_way_indexes_do() {
+    fn membership_equates_numbers_across_types_as_find_does() {
         let f = parse(doc! {"n": 5}).unwrap();
-        assert!(f.matches(&doc! {"n": 5.0}), "5 and 5.0 share an index entry");
+        assert!(f.selects(&doc! {"n": 5.0}), "5 and 5.0 share an index entry");
+    }
+
+    // Where membership used to differ from `find`, and no longer can
+    // (ADR-183): the one rule is `find`'s.
+
+    #[test]
+    fn a_whole_array_equal_to_the_operand_is_a_member() {
+        let f = parse(doc! {"k": [1, 2]}).unwrap();
+        assert!(f.selects(&doc! {"k": [1, 2]}), "the whole array");
+        assert!(f.selects(&doc! {"k": [[1, 2]]}), "an element equal to it");
+        assert!(!f.selects(&doc! {"k": [2, 1]}));
+    }
+
+    #[test]
+    fn an_empty_array_is_present() {
+        let f = parse(doc! {"k": {"$exists": true}}).unwrap();
+        assert!(f.selects(&doc! {"k": []}));
+    }
+
+    #[test]
+    fn a_bound_selects_only_its_own_type_bracket() {
+        let f = parse(doc! {"size": {"$gt": 5}}).unwrap();
+        assert!(f.selects(&doc! {"size": 10}));
+        for other in [Bson::String("large".into()), doc! {"w": 1}.into(), true.into(), Bson::Null] {
+            assert!(!f.selects(&doc! {"size": other.clone()}), "{other:?} is not a number");
+        }
+    }
+
+    #[test]
+    fn a_null_equality_selects_a_missing_field() {
+        let f = parse(doc! {"deleted": null}).unwrap();
+        assert!(f.selects(&doc! {"deleted": null}));
+        assert!(f.selects(&doc! {"other": 1}), "absent reads as null, as in find");
     }
 
     // -- containment ------------------------------------------------------
@@ -488,45 +540,75 @@ mod tests {
         assert!(!f.covered_by(&q("status", PartialOp::Eq("done".into()))));
     }
 
-    #[test]
-    fn implication_agrees_with_membership() {
-        // The property the whole thing rests on: if a query predicate implies
-        // the index predicate, then every document the query can match is one
-        // the index actually holds.
-        let values: Vec<Bson> = (0..20).map(Bson::Int32).collect();
-        let index_ops = [
-            PartialOp::Gt(Bson::Int32(10)),
-            PartialOp::Gte(Bson::Int32(10)),
-            PartialOp::Lt(Bson::Int32(10)),
-            PartialOp::Lte(Bson::Int32(10)),
-            PartialOp::Exists,
-        ];
-        let query_ops = [
-            PartialOp::Gt(Bson::Int32(9)),
-            PartialOp::Gt(Bson::Int32(10)),
-            PartialOp::Gte(Bson::Int32(10)),
-            PartialOp::Gte(Bson::Int32(11)),
-            PartialOp::Lt(Bson::Int32(10)),
-            PartialOp::Lte(Bson::Int32(10)),
-            PartialOp::Eq(Bson::Int32(10)),
-        ];
+    /// Values of every type bracket a filter can compare, as a field holds
+    /// them: scalars, arrays whole and nested, documents, and null.
+    fn corpus() -> Vec<Bson> {
+        vec![
+            Bson::Null,
+            Bson::Int32(5),
+            Bson::Int32(6),
+            Bson::Int64(5),
+            Bson::Double(7.5),
+            Bson::Int32(-1),
+            "x".into(),
+            "".into(),
+            "a".into(),
+            Bson::Array(vec![]),
+            Bson::Array(vec![1.into(), 2.into()]),
+            Bson::Array(vec![Bson::Array(vec![1.into(), 2.into()])]),
+            Bson::Array(vec![5.into()]),
+            Bson::Array(vec![1.into(), "x".into()]),
+            Bson::Array(vec![Bson::Null]),
+            doc! {"a": 1}.into(),
+            Bson::Array(vec![doc! {"a": 1}.into()]),
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: vec![1, 2],
+            }),
+            true.into(),
+            Bson::DateTime(bson::DateTime::from_millis(1_000)),
+        ]
+    }
 
-        for iop in &index_ops {
-            for qop in &query_ops {
-                if !qop.implies(iop) {
+    fn ops() -> Vec<PartialOp> {
+        let mut ops = vec![PartialOp::Exists];
+        for v in corpus() {
+            ops.push(PartialOp::Eq(v.clone()));
+            ops.push(PartialOp::Gt(v.clone()));
+            ops.push(PartialOp::Gte(v.clone()));
+            ops.push(PartialOp::Lt(v.clone()));
+            ops.push(PartialOp::Lte(v));
+        }
+        ops
+    }
+
+    #[test]
+    fn implication_is_sound_for_what_find_selects() {
+        // The property the whole thing rests on: if a query predicate implies
+        // the index predicate, every document the query matches is one the
+        // index holds. Over every type bracket, because the defect it guards
+        // against lived between brackets: an all-integer corpus could never
+        // have failed.
+        let mut docs = vec![doc! {}];
+        docs.extend(corpus().into_iter().map(|v| doc! {"k": v}));
+        let mut implied = 0usize;
+        for qop in ops() {
+            for iop in ops() {
+                if !qop.implies(&iop) {
                     continue;
                 }
-                for v in &values {
-                    if qop.holds(Some(v)) {
-                        assert!(
-                            iop.holds(Some(v)),
-                            "{qop:?} claims to imply {iop:?}, but {v:?} matches the query and \
-                             is not in the index — this is the silent document loss"
-                        );
-                    }
+                implied += 1;
+                for d in &docs {
+                    let values = path::resolve(d, "k");
+                    assert!(
+                        !qop.selects(&values) || iop.selects(&values),
+                        "{qop:?} claims to imply {iop:?}, but {d:?} matches the query and \
+                         is not in the index -- this is the silent document loss"
+                    );
                 }
             }
         }
+        assert!(implied > 600, "premise: the corpus exercises implication (692 pairs): {implied}");
     }
 
     // -- round-tripping ---------------------------------------------------

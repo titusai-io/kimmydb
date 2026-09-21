@@ -988,3 +988,142 @@ mod tests {
         assert_eq!(p.ranges.len(), 1, "the equality prefix answers this alone");
     }
 }
+
+/// ADR-183: a partial index is used only for a query whose every match it
+/// holds, judged through the planner's own `containment_predicates`.
+#[cfg(test)]
+mod containment_is_sound {
+    use super::*;
+    use bson::{Binary, Document, doc, spec::BinarySubtype};
+
+    fn values() -> Vec<Option<Bson>> {
+        vec![
+            None,
+            Some(Bson::Null),
+            Some(5.into()),
+            Some(6.into()),
+            Some(Bson::Int64(5)),
+            Some(7.5.into()),
+            Some("x".into()),
+            Some("".into()),
+            Some(Bson::Array(vec![])),
+            Some(Bson::Array(vec![1.into(), 2.into()])),
+            Some(Bson::Array(vec![Bson::Array(vec![1.into(), 2.into()])])),
+            Some(Bson::Array(vec![5.into()])),
+            Some(Bson::Array(vec![1.into(), "x".into()])),
+            Some(Bson::Array(vec![Bson::Null])),
+            Some(doc! {"a": 1}.into()),
+            Some(Bson::Array(vec![doc! {"a": 1}.into()])),
+            Some(Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] })),
+            Some(true.into()),
+            Some(Bson::DateTime(bson::DateTime::from_millis(1_000))),
+        ]
+    }
+
+    fn doc_with(k: &Option<Bson>) -> Document {
+        let mut d = doc! {"_id": 1};
+        if let Some(v) = k {
+            d.insert("k", v.clone());
+        }
+        d
+    }
+
+    fn filters() -> Vec<Document> {
+        let bin = Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] });
+        vec![
+            doc! {"k": 5},
+            doc! {"k": [1, 2]},
+            doc! {"k": null},
+            doc! {"k": {"$exists": true}},
+            doc! {"k": {"$gt": 5}},
+            doc! {"k": {"$gte": 5}},
+            doc! {"k": {"$lt": 5}},
+            doc! {"k": {"$lte": 5}},
+            doc! {"k": "x"},
+            doc! {"k": {"a": 1}},
+            doc! {"k": {"$gt": [1]}},
+            doc! {"k": {"$lt": "z"}},
+            doc! {"k": bin},
+            doc! {"k.a": 1},
+            doc! {"k": [5]},
+        ]
+    }
+
+    fn queries() -> Vec<Document> {
+        let mut q = filters();
+        q.extend([
+            doc! {"k": 6},
+            doc! {"k": {"$gt": 6}},
+            doc! {"k": {"$gt": "a"}},
+            doc! {"k": {"$lt": 3}},
+            doc! {"k": {"$gte": [1]}},
+            doc! {"k": "a"},
+        ]);
+        q
+    }
+
+    /// Whether `filter`'s index may be used for `query` and then misses `doc`.
+    fn misses(filter: &Document, query: &Document, doc: &Document) -> bool {
+        let index = kimmy_core::PartialFilter::parse(filter).unwrap();
+        let query = crate::filter::parse(query).unwrap();
+        index.covered_by(&containment_predicates(&query))
+            && crate::filter::matches(&query, doc)
+            && !index.selects(doc)
+    }
+
+    #[test]
+    fn no_filter_is_used_for_a_query_it_does_not_contain() {
+        let mut used = 0usize;
+        for f in filters() {
+            let index = kimmy_core::PartialFilter::parse(&f).unwrap();
+            for q in queries() {
+                let parsed = crate::filter::parse(&q).unwrap();
+                if !index.covered_by(&containment_predicates(&parsed)) {
+                    continue;
+                }
+                used += 1;
+                for v in values() {
+                    let d = doc_with(&v);
+                    assert!(!misses(&f, &q, &d), "index {f} used for {q} misses {d}");
+                }
+            }
+        }
+        assert!(used > 20, "premise: the corpus lets the planner use a partial index: {used}");
+    }
+
+    #[test]
+    fn the_uses_that_missed_documents_before_adr_183_do_not() {
+        // Each found by a differential through this planner: a partial index
+        // used for a query, missing a document the query returns.
+        let arr = |v: Vec<Bson>| Bson::Array(v);
+        let cases: Vec<(Document, Document, Bson)> = vec![
+            // Whole-array equality.
+            (doc! {"k": [1, 2]}, doc! {"k": [1, 2]}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": [5]}, doc! {"k": [5]}, arr(vec![5.into()])),
+            // `$exists` on an empty array.
+            (doc! {"k": {"$exists": true}}, doc! {"k": {"$exists": true}}, arr(vec![])),
+            // Containment across type brackets.
+            (doc! {"k": {"$gt": 5}}, doc! {"k": [1, 2]}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gt": 5}}, doc! {"k": {"$gt": [1]}}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gt": 5}}, doc! {"k": {"$gt": [1]}}, arr(vec![5.into()])),
+            (doc! {"k": {"$gt": 5}}, doc! {"k": [5]}, arr(vec![5.into()])),
+            (doc! {"k": {"$gt": 5}}, doc! {"k": {"$gte": [1]}}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gt": 5}}, doc! {"k": {"$gte": [1]}}, arr(vec![5.into()])),
+            (doc! {"k": {"$gte": 5}}, doc! {"k": [1, 2]}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gte": 5}}, doc! {"k": {"$gt": [1]}}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gte": 5}}, doc! {"k": {"$gte": [1]}}, arr(vec![1.into(), 2.into()])),
+            // Array bounds.
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": [1, 2]}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": {"$gt": [1]}}, arr(vec![1.into(), 2.into()])),
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": {"$gt": [1]}}, arr(vec![5.into()])),
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": {"$gt": [1]}}, arr(vec![1.into(), "x".into()])),
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": {"$gt": [1]}}, arr(vec![doc! {"a": 1}.into()])),
+            (doc! {"k": {"$gt": [1]}}, doc! {"k": [5]}, arr(vec![5.into()])),
+        ];
+        assert_eq!(cases.len(), 18);
+        for (filter, query, k) in cases {
+            let d = doc! {"_id": 1, "k": k};
+            assert!(!misses(&filter, &query, &d), "index {filter} used for {query} misses {d}");
+        }
+    }
+}

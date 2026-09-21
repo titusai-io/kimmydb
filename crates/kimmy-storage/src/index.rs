@@ -95,7 +95,9 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
 /// The only error left is a partial filter that will not parse, which is a
 /// fact about the definition rather than the document.
 pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<DocumentKeys> {
-    // A partial index holds only the documents its filter selects. Returning
+    // A partial index holds only the documents its filter selects, as `find`
+    // reads the filter (ADR-183) -- the rule containment is proven against,
+    // and the one TTL expiry re-checks before it deletes. Returning
     // no keys here is what makes membership fall out of the ordinary
     // maintenance path: entering the filter adds entries, leaving it removes
     // them, because `apply_entries` derives both sides from this function.
@@ -105,7 +107,7 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
     // make an index range unsound. Nor is such a document ever unkeyed: it is
     // not in the index at all.
     if let Some(filter) = index.partial()
-        && !filter?.matches(doc)
+        && !filter?.selects(doc)
     {
         return Ok(DocumentKeys::Keyed { keys: Vec::new(), multikey: false });
     }
@@ -2205,7 +2207,7 @@ pub(crate) fn clear_index_entries(
 }
 
 /// Key range covering every entry belonging to one index.
-fn index_id_range(
+pub(crate) fn index_id_range(
     coll: CollectionId,
     index_id: u32,
 ) -> impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static {
