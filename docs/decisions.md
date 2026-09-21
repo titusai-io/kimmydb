@@ -17741,6 +17741,55 @@ untouched, because no entry is minted under this node's stamp anywhere in it.
    converges to one entry per change. Proven at two hops, not one — one hop
    cannot distinguish "at the origin's stamp" from "at the sender's".
 
+### What appending old stamps does not move
+
+Appending entries *below* the member's own servable vector invites an obvious
+worry: that it drags the member's serve-from horizon backwards, so it starts
+advertising a window it cannot serve — this defect wearing a different hat. It
+does not, for two independent reasons.
+
+**The horizon is a retention record, not a scan.** `can_serve_peer_holding`
+asks `lacks_collected`, which compares the peer's coverage against
+`OPLOG_COLLECTED` — *"per origin, the highest `Hlc` retention has removed from
+the oplog"* — written only by the garbage collector. Nothing derives the
+horizon from the oldest entry present, so adding entries cannot move it.
+
+**And appending is monotone in the right direction anyway.** An entry added at
+an old stamp can turn a window this member could not serve into one it can. It
+cannot turn a servable window into an unservable one. So the gap between what
+a member advertises and what it can actually serve only ever narrows here —
+which is the whole point of the record.
+
+**Order does not matter either.** The oplog is a redb table keyed by
+`codec::oplog_key(stamp)`, so it is sorted by stamp however it was filled.
+There is no monotonic-append requirement to satisfy and no ordering constraint
+on the several entries one page restores.
+
+### The one real hazard: an entry already held must not be overwritten
+
+`append_oplog_at` writes before it checks: `oplog.insert(key, encoded)` returns
+the previous value, and the new bytes are already in place by the time
+`existed` is consulted. For a re-delivery through the entries path that is
+harmless, because the entry is byte-identical to the one already there.
+
+**A reconstructed entry is not guaranteed to be.** A `CreateIndex` body is
+`IndexCreate { db, collection, index: IndexMeta }`, and the page carries the
+`IndexMeta` **as it stands now**, not as the origin logged it. `IndexMeta`
+carries `multikey`, which is documented as *"a node-local observation"* set on
+the write path after creation and never cleared. Rebuilding the entry from the
+page would therefore embed the *sending* member's local flag into an entry
+stamped as the origin's, and overwrite the origin's own entry on every member
+that already holds it — turning a node-local observation into replicated
+history, which is exactly what `multikey` is defined not to be.
+
+So the append must **leave an entry already present exactly as it is**, and
+reconstruct only where the key is absent. The dedup constraint above is
+usually read as "do not append twice"; this is the sharper form of it: do not
+*rewrite*. A test that restores a snapshot onto a member that already holds
+the originating entry, and asserts the entry's bytes are unchanged, is the one
+that catches this — and it is not the same test as the one that counts
+appends.
+
 ### What this does NOT close
 
 **This is not the whole fix, and must not be read as one.** It closes five of
@@ -17772,10 +17821,16 @@ A restore that re-logs is a path an operator currently cannot see, and the
 reason this defect went unnoticed is that it moves no number at all. So it
 gets one:
 
-- `kimmy_snapshot_ddl_relogged_total` — *"Schema changes a snapshot restore
+- `kimmy_sync_ddl_relogged_total` — *"Schema changes a snapshot restore
   appended to this node's oplog so that it can serve them onward."*
-- `kimmy.snapshot.ddl_relogged` on the OTLP bridge, unit `{change}`, as every
+- `kimmy.sync.ddl_relogged` on the OTLP bridge, unit `{change}`, as every
   counter is.
+
+It goes in the `sync` namespace rather than a `snapshot` one of its own, beside
+`kimmy.sync.ddl_declined` and `kimmy.sync.ddl_refused`. Those two plus this one
+are the whole account of what becomes of a replicated schema change — declined,
+refused, re-logged — and the adjacency teaches the distinction faster than a
+help string can. A namespace holding one series would be speculative generality.
 
 It reads 0 on a member that has never taken a snapshot, and rises once per
 schema change restored. It is not an error count: a non-zero value is the fix
