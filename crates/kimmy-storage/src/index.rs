@@ -1519,20 +1519,49 @@ impl crate::Engine {
         scan_range(self.db(), coll.id, index_id, lower, Some(upper), Unkeyed::Include)
     }
 
-    /// Document keys filed under keys in a range, and nothing else.
+    /// Keyed entries in `lower..=upper`, in index order, strictly after
+    /// `after` when given, at most `limit` of them: `(index key, document
+    /// key)`.
     ///
-    /// For a reader asking about the *keys* rather than about the documents —
-    /// TTL expiry, which reads the dates the index holds — where a document
-    /// the index could not key has no key to be found by, and including it
-    /// would make every pass reconsider it for nothing.
-    pub fn index_keyed_candidates(
+    /// For TTL expiry, which reads the dates the index holds and resumes where
+    /// its last pass stopped (ADR-181). A document the index could not key has
+    /// no key to be found by, and including it would make every pass
+    /// reconsider it for nothing (ADR-139); `lower` is above the unkeyed run.
+    pub(crate) fn index_keyed_entries_after(
         &self,
         coll: &crate::CollectionMeta,
         index_id: u32,
         lower: &[u8],
         upper: &[u8],
-    ) -> Result<Vec<Vec<u8>>> {
-        scan_range(self.db(), coll.id, index_id, lower, Some(upper), Unkeyed::Exclude)
+        after: Option<&crate::expiry::ExpiryCursor>,
+        limit: usize,
+    ) -> Result<Vec<crate::expiry::ExpiryCursor>> {
+        use std::ops::Bound;
+
+        let txn = self.db().begin_read()?;
+        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        let start = match after {
+            Some((key, doc_key)) => {
+                Bound::Excluded((coll.id.0, index_id, key.as_slice(), doc_key.as_slice()))
+            }
+            None => Bound::Included((coll.id.0, index_id, lower, [].as_slice())),
+        };
+        let mut out = Vec::new();
+        for entry in table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))? {
+            let (found, _) = entry?;
+            let (c, i, key, doc_key) = found.value();
+            if c != coll.id.0 || i != index_id || key > upper {
+                break;
+            }
+            if key < lower {
+                continue;
+            }
+            out.push((key.to_vec(), doc_key.to_vec()));
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// How many documents an index holds that it could not key.

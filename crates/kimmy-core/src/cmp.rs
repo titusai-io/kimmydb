@@ -226,7 +226,7 @@ fn cmp_numbers(a: &Bson, b: &Bson) -> Ordering {
 /// sort and an index need. A filter's `$gt` does not: a string is not greater
 /// than a number, it is not comparable with one. [`crate::matching`] asks
 /// this before it compares.
-pub fn same_type_group(a: &Bson, b: &Bson) -> bool {
+pub(crate) fn same_type_group(a: &Bson, b: &Bson) -> bool {
     fn group(v: &Bson) -> u8 {
         match v {
             Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 1,

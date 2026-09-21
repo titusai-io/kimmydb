@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::error::{Result, StorageError};
+use crate::expiry::ExpiryCursor;
 use crate::meta::{CollectionMeta, DatabaseMeta};
 use crate::tables;
 
@@ -139,6 +140,12 @@ pub struct Engine {
     /// (ADR-151): the last document key it visited, or `None` to start from
     /// the top. The scan visits a bounded number of documents per pass.
     gc_scan_cursor: parking_lot::Mutex<Option<(u64, Vec<u8>)>>,
+    /// Where each TTL index's expiry scan resumes next pass (ADR-181): the
+    /// last `(index key, document key)` it examined, by `(collection id,
+    /// index id)`. Absent to start from the front of the expired range. In
+    /// memory, as `gc_scan_cursor` is: a restart or an ownership change
+    /// starts from the front, which costs one extra cycle, not a wedge.
+    expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
 }
 
 /// Upper bounds of the writer-wait histogram, in microseconds.
@@ -823,6 +830,7 @@ impl Engine {
             hold_counters: Default::default(),
             serve_counters: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
+            expiry_cursors: Default::default(),
         };
 
         // Here rather than beside the rebuilds above, because it is the one
@@ -963,6 +971,19 @@ impl Engine {
 
     pub(crate) fn set_gc_scan_cursor(&self, cursor: Option<(u64, Vec<u8>)>) {
         *self.gc_scan_cursor.lock() = cursor;
+    }
+
+    /// Where the expiry scan of `(collection, index)` resumes (ADR-181).
+    pub(crate) fn expiry_cursor(&self, at: (u64, u32)) -> Option<ExpiryCursor> {
+        self.expiry_cursors.lock().get(&at).cloned()
+    }
+
+    pub(crate) fn set_expiry_cursor(&self, at: (u64, u32), cursor: Option<ExpiryCursor>) {
+        let mut cursors = self.expiry_cursors.lock();
+        match cursor {
+            Some(cursor) => cursors.insert(at, cursor),
+            None => cursors.remove(&at),
+        };
     }
 
     pub fn node_id(&self) -> NodeId {

@@ -27,8 +27,11 @@
 //! encoded dates therefore skips a document whose indexed field holds a string
 //! without needing to look at it — which is also MongoDB's behaviour.
 
+use std::collections::HashSet;
+
 use bson::{Bson, Document};
 use kimmy_core::{IndexMeta, keyenc, path};
+use tracing::warn;
 
 use crate::Engine;
 use crate::error::Result;
@@ -42,6 +45,10 @@ use crate::meta::CollectionMeta;
 /// passes instead of in one stall; the pass reports whether it hit the bound
 /// so the caller can say so.
 pub const MAX_EXPIRED_PER_PASS: usize = 1_000;
+
+/// Where a TTL index's expiry scan resumes: the last `(index key, document
+/// key)` a pass examined (ADR-181).
+pub(crate) type ExpiryCursor = (Vec<u8>, Vec<u8>);
 
 /// What one collection's pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,7 +65,10 @@ pub struct ExpiryOutcome {
     /// while the pass ran, or one the index held that the filter never
     /// selected.
     pub skipped_filter: u64,
-    /// Whether the pass stopped at [`MAX_EXPIRED_PER_PASS`] with more to do.
+    /// Whether the pass stopped at [`MAX_EXPIRED_PER_PASS`] with more of its
+    /// cycle to do. The next pass resumes after the last entry this one
+    /// examined; a pass that reaches the end of the expired range ends the
+    /// cycle, and the one after it starts again from the front.
     pub truncated: bool,
 }
 
@@ -85,15 +95,56 @@ impl Engine {
         // Parsed once for the pass. Membership in the index is not taken to
         // mean the filter selects a document: it can be stale by the delete,
         // and the index can hold what the filter never selected (ADR-181).
-        let filter = index.partial().transpose()?;
+        // A filter this build cannot parse skips the index for the pass,
+        // deleting nothing, with one line naming it: nothing it holds can be
+        // checked against the filter, and the index's other collections'
+        // expiry goes on.
+        let filter = match index.partial().transpose() {
+            Ok(filter) => filter,
+            Err(e) => {
+                warn!(
+                    db = %coll.db,
+                    collection = %coll.name,
+                    index = %index.name,
+                    error = %e,
+                    "TTL index skipped this pass: its partial filter does not parse, so nothing \
+                     it holds can be checked against the filter, and nothing is deleted"
+                );
+                return Ok(ExpiryOutcome::default());
+            }
+        };
 
-        let candidates = self.expired_candidates(coll, index, cutoff_ms)?;
+        // From where the last pass stopped, not from the front: the guard
+        // below can decline a candidate and leave its entry in the index, and
+        // a scan that started from the front every pass read the same declined
+        // entries first, every pass, and never reached what was behind them
+        // (ADR-181). Resuming, a declined entry is examined once a cycle.
+        let (lower, upper) = expired_range(index, cutoff_ms)?;
+        let at = (coll.id.0, index.id);
+        let resume = self.expiry_cursor(at);
+        let mut candidates = self.index_keyed_entries_after(
+            coll,
+            index.id,
+            &lower,
+            &upper,
+            resume.as_ref(),
+            MAX_EXPIRED_PER_PASS + 1,
+        )?;
         let truncated = candidates.len() > MAX_EXPIRED_PER_PASS;
+        candidates.truncate(MAX_EXPIRED_PER_PASS);
+        // Set before the deletes, so that one that errors cannot pin the scan
+        // to itself either: the next pass goes on past it.
+        self.set_expiry_cursor(at, if truncated { candidates.last().cloned() } else { None });
         #[cfg(test)]
         hooks::between_scan_and_delete();
 
         let mut outcome = ExpiryOutcome { truncated, ..Default::default() };
-        for key in candidates.into_iter().take(MAX_EXPIRED_PER_PASS) {
+        // A document an index keys more than once is one candidate.
+        let mut seen = HashSet::new();
+        for (_, key) in candidates {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             // The scan hands back encoded document keys, and `keyenc` is
             // one-way, so the id comes from the document itself.
             let Some(doc) = self.get_by_encoded_key(coll, &key)? else {
@@ -129,28 +180,23 @@ impl Engine {
         }
         Ok(outcome)
     }
+}
 
-    /// Encoded document keys whose indexed date is at or before `cutoff_ms`.
-    fn expired_candidates(
-        &self,
-        coll: &CollectionMeta,
-        index: &IndexMeta,
-        cutoff_ms: i64,
-    ) -> Result<Vec<Vec<u8>>> {
-        // Encoded exactly as the index encodes its keys, direction included —
-        // a descending field inverts the ordering, so the two bounds swap.
-        let descending = index.fields.first().is_some_and(|f| f.descending);
-        let oldest = date_key(i64::MIN, descending)?;
-        let cutoff = date_key(cutoff_ms, descending)?;
-        let (lower, upper) = if descending { (cutoff, oldest) } else { (oldest, cutoff) };
-
-        // The upper bound is inclusive, which is what makes a document whose
-        // date lands exactly on the cutoff expire rather than waiting a pass.
-        // Keyed entries only: a document the index could not key holds no
-        // date it can be expired by, and reading it here would make every
-        // pass reconsider it and count it as skipped (ADR-139).
-        self.index_keyed_candidates(coll, index.id, &lower, &upper)
-    }
+/// The index keys whose date is at or before `cutoff_ms`, as `(lower,
+/// upper)`, both inclusive.
+///
+/// Encoded exactly as the index encodes its keys, direction included: a
+/// descending field inverts the ordering, so the two bounds swap. The upper
+/// bound is inclusive, which is what makes a document whose date lands exactly
+/// on the cutoff expire rather than waiting a pass. Keyed entries only: a
+/// document the index could not key holds no date it can be expired by, and
+/// reading it would make every pass reconsider it and count it as skipped
+/// (ADR-139). The unkeyed run sorts below either bound.
+fn expired_range(index: &IndexMeta, cutoff_ms: i64) -> Result<(Vec<u8>, Vec<u8>)> {
+    let descending = index.fields.first().is_some_and(|f| f.descending);
+    let oldest = date_key(i64::MIN, descending)?;
+    let cutoff = date_key(cutoff_ms, descending)?;
+    Ok(if descending { (cutoff, oldest) } else { (oldest, cutoff) })
 }
 
 /// One index key holding a single date, encoded as the index stores it.
@@ -492,6 +538,60 @@ mod tests {
 
         assert_eq!(out.skipped, 1, "offered by the scan, declined by the date: {out:?}");
         assert_eq!((out.deleted, out.skipped_filter), (0, 0), "{out:?}");
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn declined_candidates_do_not_keep_a_pass_from_what_is_behind_them() {
+        // The review's shape (ADR-181). More documents than one pass
+        // examines, which the index holds and `find` does not select, all
+        // expired, and one genuinely expired document dated after them. When
+        // every pass started from the front, each declined the same entries
+        // first and none reached the last one: TTL for the index made no
+        // progress again.
+        let (engine, _, _dir) = engine();
+        let (coll, index) = with_filtered_ttl(&engine, doc! {"size": {"$gt": 5}});
+        let stale = MAX_EXPIRED_PER_PASS as i64;
+        let mut docs: Vec<Document> =
+            (0..stale).map(|i| doc! {"_id": i, "size": "large", "seen": dt(i)}).collect();
+        docs.push(doc! {"_id": stale, "size": 10, "seen": dt(stale + 1_000)});
+        engine.insert_many(&coll, docs).unwrap();
+        let now = 10_000_000;
+
+        let first = engine.expire_documents(&coll, &index, now).unwrap();
+        assert_eq!(
+            (first.deleted, first.skipped_filter, first.truncated),
+            (0, stale as u64, true),
+            "premise: the first pass is all declines, and says there is more: {first:?}"
+        );
+
+        // Within ceil(1,001 / 1,000) = 2 passes, and without examining the
+        // declined entries again inside the cycle.
+        let second = engine.expire_documents(&coll, &index, now).unwrap();
+        assert_eq!((second.deleted, second.skipped_filter), (1, 0), "{second:?}");
+        assert!(!second.truncated, "the cycle ended: {second:?}");
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(stale)).unwrap().is_none());
+
+        // A new cycle starts from the front: a declined entry is examined
+        // once a cycle, not never.
+        let third = engine.expire_documents(&coll, &index, now).unwrap();
+        assert_eq!((third.deleted, third.skipped_filter), (0, stale as u64), "{third:?}");
+    }
+
+    #[test]
+    fn a_filter_this_build_cannot_parse_skips_its_index_and_deletes_nothing() {
+        // A filter an earlier build accepted and this one refuses: a
+        // `Decimal128` operand, from before parsing refused it, handed to the
+        // pass as a definition that build stored would be.
+        let (engine, _, _dir) = engine();
+        let (coll, mut index) = with_filtered_ttl(&engine, doc! {"size": {"$gt": 5}});
+        engine.insert(&coll, doc! {"_id": 1, "size": 10, "seen": dt(0)}).unwrap();
+        index.partial_filter = Some(doc! {"size": {"$gt": bson::Decimal128::from_bytes([0; 16])}});
+        assert!(index.partial().unwrap().is_err(), "premise: this build refuses the filter");
+
+        let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+
+        assert_eq!(out, ExpiryOutcome::default(), "skipped, not failed");
         assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
     }
 

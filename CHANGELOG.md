@@ -45,6 +45,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   change: the evaluation of `$exists`, equality and the comparisons moved into
   a shared place, and a differential over 160,744 cases shows identical
   results before and after.
+
+  **A pass now resumes where the last one stopped**, instead of starting
+  from the oldest expired document every time. Otherwise the documents the
+  filter now declines, which stay in the index until it is rebuilt, came
+  first on every pass and stopped expiry for that index altogether. **When
+  TTL fires changes for one case:** a document that is already expired when
+  written, and is dated behind where the pass has reached, waits until the
+  pass comes round again. That is at most `ceil(expired candidates / 1,000)`
+  passes of `storage.ttl_interval_secs` each. A TTL index whose stored filter
+  this build cannot parse is skipped, deleting nothing, with a warning that
+  names it.
 - **A member that caught up by snapshot now serves onward the index
   definitions it restored** ([ADR-180](docs/decisions.md)). A snapshot wrote
   each definition as state with no entry behind it, while completing the

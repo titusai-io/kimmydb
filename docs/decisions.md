@@ -18111,6 +18111,40 @@ The date check is not new, and it shipped with one test, which refreshed the doc
 - It reads the filter **as stored**. A generic `Binary` already stored as an array is honoured as the array, because nothing on a member records what the client sent. ADR-182 stops new conversions. Old ones need the index recreated.
 - It adds no read and no commit. The filter is parsed once per pass per index, and checked on the document the guard already reads, under the writer it already holds.
 
+### The pass resumes where the last one stopped
+
+**The guard alone wedged expiry for good.** It declines a candidate the filter does not select, and leaves that document's index entry where it is. The pass read its candidates from the front of the expired range, up to its budget of `MAX_EXPIRED_PER_PASS`, in an order that does not change between passes. So with more such entries than the budget, **the same declined entries came first on every pass**, and nothing behind them was ever reached. With 1,000 documents the index holds and `find` does not select, and one genuinely expired document dated after them, every pass declined the same 1,000 and deleted nothing. The race half clears itself, because a document moved out of the filter loses its entry in that same write. The membership half does not: those entries stay until ADR-183 rebuilds the index. Below the budget it is still a permanent tax, where N declined documents take N of every pass.
+
+**Decision: the pass resumes from a cursor.** Each pass reads from just after the last entry the pass before it examined, in index order, up to the budget, and remembers where it stopped. A pass that reaches the end of the expired range ends the cycle, and the next starts again from the front.
+- **Bounded:** the budget counts every candidate examined, declined or not.
+- **Progressing:** the cursor moves past a declined entry, so it is examined once a cycle, not first on every pass.
+- **Membership untouched.**
+
+This is the retention pass's tombstone scan again, which resumes where its budget stopped it (ADR-151). It is also ADR-139's lesson applied to declines: a scan that reconsiders the same entries every pass makes no progress.
+
+**The cost: when TTL fires.** A document already expired when it is written, dated behind the cursor, waits until the cycle ends and the next starts from the front. The wait is at most one cycle: `ceil(candidates / MAX_EXPIRED_PER_PASS)` passes, each `storage.ttl_interval_secs` apart. An index with 250,000 expired candidates at the 60-second default can take 250 passes, about four hours, to reach such a document. Someone who observes "my document did not expire for an hour" can compute the answer from those figures.
+
+**The cursor lives in memory**, per node and per index, as the tombstone scan's does. A restart, or the collection's ownership moving to another node, starts from the front, which costs one extra cycle at most. Persisting it would cost a write every pass to save at most one cycle. It is saved before the pass's deletes, so a delete that keeps failing cannot pin the scan to itself either.
+
+**Two alternatives were rejected:**
+- **Removing the stale entry when the filter declines.** It looks self-healing, but it is unsafe before ADR-183, for three reasons:
+  - it fixes one half of a compensating pair, which is the next section;
+  - expiry runs only on the collection's owner, and an index write carries no oplog entry. So only the owner's index would be trimmed, and the same query would return different rows on different members until each migrates;
+  - maintenance recomputes keys under the old rule and puts the entry back on the document's next write, so it converges on nothing, and each removal costs a commit.
+- **Not counting declines against the budget.** That fixes the wedge by making the pass proportional to the stale entries, every pass, for ever. That is the unbounded work the budget exists to prevent.
+
+### Where two unsound rules cancel, fixing either alone is worse than fixing neither
+
+Partial-index containment (`PartialFilter::implies`, before ADR-183) compares bounds in the canonical order with no type-bracket check. So a query `{k: {$gt: "a"}}` is taken to imply the filter `{k: {$gt: 5}}`, because strings sort above numbers, and the planner answers it from that index. **It returns the right rows only because the membership rule is unsound in the same direction:** the index holds those strings, because membership also compares across brackets.
+
+The two rules cancel. Removing from the index the entries `find` does not select would correct membership alone and **turn a masked bug into wrong query answers**. That is why ADR-183 corrects membership and containment together. **Where two unsound rules cancel, the pair must move together**; this record is the first place the codebase names that trap.
+
+### A filter this build cannot parse
+
+The guard parses the stored filter once per pass. A filter this build refuses **skips its index for that pass**: nothing is deleted, and one warning names the database, the collection and the index. For example, a filter holding a `Decimal128`, stored before parsing refused one. Before this record the pass never parsed the filter, so such an index expired as usual. The skip fails safe.
+- **No series counts it.** The condition is transient: ADR-183's migration re-parses every partial filter, and a permanent series for a pre-1.0 window is a cost carried for ever.
+- `IndexMeta::partial`'s documentation, which said a parse failure could only mean tampering, now names this case.
+
 ### A series of its own
 
 A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP bridge), not in `kimmy_ttl_skipped_total`. That series' description names one mechanism, a refresh landing while the pass ran, and widening it would make the description partly false. More importantly, the two mean different things **over time**. Between this record and ADR-183, a filter decline is mostly the membership defect firing: a document the index should never have held, which expiry used to delete. After ADR-183 it is mostly a genuine race. That fall in rate is the one measurement of how much damage was being done. Inside a counter that also carries heartbeat races, it could not be seen. The series' description says it should fall to near zero once membership is correct.
@@ -18119,8 +18153,12 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 
 | Taken out | Fails |
 | --- | --- |
-| the filter check | the race test and the mixed-type test |
-| `find`'s reading (the membership rule instead) | the mixed-type test, and **not** the race test |
-| the date check | the date test through the hook, and nothing else |
+| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,470 |
+| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,470 |
+| the date check | the date test through the hook, **and nothing else**: 1 of 2,470 |
+| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
+| skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
+
+The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast`, 2,470 tests, on the tree under review. A run that stops at its first failing binary cannot support "and nothing else".
 | null matching a missing field, in the moved `equals` (a control on the differential) | 225 rows of the two-commit differential |
 | `Symbol` in the string bracket, in the moved `same_type_group` (the same) | 129 rows of it |
