@@ -7,6 +7,7 @@
 
 use bson::{Bson, Document};
 use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
+use kimmy_core::matching::{self, any_element};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
@@ -465,23 +466,20 @@ fn expr_matches(e: &Expr, doc: &Document) -> bool {
 /// specially.
 fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
     match condition {
-        Condition::Exists(want) => values.is_empty() != *want,
-
-        // `{a: null}` matches an explicit null *and* a missing field, which is
-        // the single most surprising Mongo rule to get wrong.
-        Condition::Eq(Bson::Null) => {
-            values.is_empty() || any_element(values, |v| matches!(v, Bson::Null))
-        }
-
-        Condition::Eq(expected) => {
-            any_element(values, |v| canonical_cmp(v, expected) == Ordering::Equal)
-        }
+        // The operators a partial filter may also carry are evaluated in
+        // `kimmy_core::matching`, once, for both (ADR-181).
+        Condition::Exists(want) => matching::exists(values, *want),
+        Condition::Eq(expected) => matching::equals(values, expected),
         Condition::Ne(expected) => !condition_matches(&Condition::Eq(expected.clone()), values),
 
-        Condition::Gt(bound) => compare_any(values, bound, &[Ordering::Greater]),
-        Condition::Gte(bound) => compare_any(values, bound, &[Ordering::Greater, Ordering::Equal]),
-        Condition::Lt(bound) => compare_any(values, bound, &[Ordering::Less]),
-        Condition::Lte(bound) => compare_any(values, bound, &[Ordering::Less, Ordering::Equal]),
+        Condition::Gt(bound) => matching::compares(values, bound, &[Ordering::Greater]),
+        Condition::Gte(bound) => {
+            matching::compares(values, bound, &[Ordering::Greater, Ordering::Equal])
+        }
+        Condition::Lt(bound) => matching::compares(values, bound, &[Ordering::Less]),
+        Condition::Lte(bound) => {
+            matching::compares(values, bound, &[Ordering::Less, Ordering::Equal])
+        }
 
         Condition::In(options) => {
             options.iter().any(|option| condition_matches(&Condition::Eq(option.clone()), values))
@@ -548,48 +546,6 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
         Condition::AlwaysTrue => true,
         Condition::Both(a, b) => condition_matches(a, values) && condition_matches(b, values),
     }
-}
-
-/// Apply a predicate to each value, and — because a field holding an array
-/// matches if any *element* matches — to each element as well.
-fn any_element(values: &[&Bson], predicate: impl Fn(&Bson) -> bool) -> bool {
-    values.iter().any(|value| {
-        if predicate(value) {
-            return true;
-        }
-        match value {
-            Bson::Array(items) => items.iter().any(&predicate),
-            _ => false,
-        }
-    })
-}
-
-fn compare_any(values: &[&Bson], bound: &Bson, accept: &[Ordering]) -> bool {
-    any_element(values, |v| {
-        // Comparisons only apply within a type group; Mongo does not report
-        // that a string is greater than a number.
-        same_type_group(v, bound) && accept.contains(&canonical_cmp(v, bound))
-    })
-}
-
-/// Whether two values are comparable, i.e. in the same canonical type group.
-fn same_type_group(a: &Bson, b: &Bson) -> bool {
-    fn group(v: &Bson) -> u8 {
-        match v {
-            Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 1,
-            Bson::String(_) | Bson::Symbol(_) => 2,
-            Bson::Document(_) => 3,
-            Bson::Array(_) => 4,
-            Bson::Binary(_) => 5,
-            Bson::ObjectId(_) => 6,
-            Bson::Boolean(_) => 7,
-            Bson::DateTime(_) => 8,
-            Bson::Timestamp(_) => 9,
-            Bson::Null | Bson::Undefined => 10,
-            _ => 11,
-        }
-    }
-    group(a) == group(b)
 }
 
 /// Test one array element against a filter, for the update language's

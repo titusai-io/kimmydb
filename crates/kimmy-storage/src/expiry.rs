@@ -52,6 +52,12 @@ pub struct ExpiryOutcome {
     /// delete transaction re-read them — a document whose date moved on
     /// between the scan and the write.
     pub skipped: u64,
+    /// Candidates the index held that its partial filter did not select when
+    /// the delete transaction re-read them, the filter evaluated as `find`
+    /// evaluates it (ADR-181). Not deleted: a document moved out of the filter
+    /// while the pass ran, or one the index held that the filter never
+    /// selected.
+    pub skipped_filter: u64,
     /// Whether the pass stopped at [`MAX_EXPIRED_PER_PASS`] with more to do.
     pub truncated: bool,
 }
@@ -76,8 +82,15 @@ impl Engine {
         // deleting the collection.
         let cutoff_ms = (now_ms as i64).saturating_sub(secs.saturating_mul(1_000));
 
+        // Parsed once for the pass. Membership in the index is not taken to
+        // mean the filter selects a document: it can be stale by the delete,
+        // and the index can hold what the filter never selected (ADR-181).
+        let filter = index.partial().transpose()?;
+
         let candidates = self.expired_candidates(coll, index, cutoff_ms)?;
         let truncated = candidates.len() > MAX_EXPIRED_PER_PASS;
+        #[cfg(test)]
+        hooks::between_scan_and_delete();
 
         let mut outcome = ExpiryOutcome { truncated, ..Default::default() };
         for key in candidates.into_iter().take(MAX_EXPIRED_PER_PASS) {
@@ -91,12 +104,25 @@ impl Engine {
                 continue;
             };
 
-            // The guard re-reads inside the write transaction: between the
-            // scan and here, something may have pushed the date forward.
-            let removed =
-                self.delete_guarded(coll, &id, |current| is_expired(current, field, cutoff_ms))?;
+            // The guard re-reads inside the write transaction. Between the
+            // scan and here, something may have pushed the date forward, or
+            // moved the document out of the index's filter: both halves of
+            // what made it a candidate are checked on what stands now.
+            let outside_filter = std::cell::Cell::new(false);
+            let removed = self.delete_guarded(coll, &id, |current| {
+                if !is_expired(current, field, cutoff_ms) {
+                    return false;
+                }
+                if filter.as_ref().is_some_and(|filter| !filter.selects(current)) {
+                    outside_filter.set(true);
+                    return false;
+                }
+                true
+            })?;
             if removed {
                 outcome.deleted += 1;
+            } else if outside_filter.get() {
+                outcome.skipped_filter += 1;
             } else {
                 outcome.skipped += 1;
             }
@@ -148,6 +174,29 @@ fn is_expired(doc: &Document, field: &str, cutoff_ms: i64) -> bool {
             _ => None,
         })
         .is_some_and(|millis| millis <= cutoff_ms)
+}
+
+/// A test-only point between an expiry pass's candidate scan and its deletes,
+/// where a concurrent write lands in production. Per thread, and absent from
+/// every build that ships.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Run `write` once, in the next pass on this thread, after its scan.
+    pub(crate) fn after_the_next_scan(write: impl FnOnce() + 'static) {
+        BETWEEN.with(|b| *b.borrow_mut() = Some(Box::new(write)));
+    }
+
+    pub(super) fn between_scan_and_delete() {
+        if let Some(write) = BETWEEN.with(|b| b.borrow_mut().take()) {
+            write();
+        }
+    }
 }
 
 /// TTL indexes on a collection, in definition order.
@@ -235,10 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn a_document_whose_date_moved_on_is_skipped_not_deleted() {
-        // The heartbeat case, and the reason the guard runs inside the write
-        // transaction. The scan is taken against an old cutoff, the document
-        // is then refreshed, and the delete must decline.
+    fn a_document_refreshed_before_the_pass_is_not_a_candidate() {
+        // Refreshed before the pass runs, the document's date is outside the
+        // range the scan reads, so it is never offered and the delete's guard
+        // never sees it. This test used to be the date guard's only one and
+        // could not fail without it (ADR-181);
+        // `a_document_refreshed_after_the_scan_is_not_deleted` is the guard's.
         let (engine, _, _dir) = engine();
         let (coll, index) = with_ttl(&engine, 60);
         engine.insert(&coll, doc! {"_id": 1, "seen": dt(0)}).unwrap();
@@ -360,5 +411,124 @@ mod tests {
 
         let names: Vec<&str> = ttl_indexes(&coll).map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["ttl_seen"]);
+    }
+
+    /// A shared engine with `app.sessions`, for a test whose hook writes to it
+    /// from inside a pass.
+    fn shared() -> (std::sync::Arc<Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "sessions").unwrap();
+        (std::sync::Arc::new(engine), dir)
+    }
+
+    /// A TTL index on `seen`, 60 s, with `filter` as its partial filter.
+    fn with_filtered_ttl(engine: &Engine, filter: Document) -> (CollectionMeta, IndexMeta) {
+        let index = engine
+            .create_index_with(
+                "app",
+                "sessions",
+                vec![IndexField::ascending("seen")],
+                false,
+                Default::default(),
+                Some("ttl_seen".into()),
+                Some(60),
+                Some(filter),
+            )
+            .unwrap();
+        (engine.get_collection("app", "sessions").unwrap(), index)
+    }
+
+    #[test]
+    fn a_document_moved_out_of_the_filter_after_the_scan_is_not_deleted() {
+        // The race: the scan offers the document, a client reopens it -- out
+        // of the filter, date unchanged -- and the delete comes after. The
+        // index's maintenance takes it out of the index in that write, but
+        // the candidate list was read before it (ADR-181).
+        let (engine, _dir) = shared();
+        let (coll, index) = with_filtered_ttl(&engine, doc! {"state": "done"});
+        engine.insert(&coll, doc! {"_id": 1, "state": "done", "seen": dt(0)}).unwrap();
+
+        let (writer, at) = (engine.clone(), coll.clone());
+        hooks::after_the_next_scan(move || {
+            writer
+                .replace(
+                    &at,
+                    &kimmy_core::DocId::Int64(1),
+                    doc! {"_id": 1, "state": "open", "seen": dt(0)},
+                    false,
+                )
+                .unwrap();
+        });
+        let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
+
+        assert_eq!(out.skipped_filter, 1, "offered by the scan, declined by the filter: {out:?}");
+        assert_eq!((out.deleted, out.skipped), (0, 0), "{out:?}");
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_document_refreshed_after_the_scan_is_not_deleted() {
+        // The heartbeat, landing where it lands in production: after the scan
+        // and before the delete. The document stays in the filter, so only
+        // the date can decline it -- which is what tells the date check and
+        // the filter check apart.
+        let (engine, _dir) = shared();
+        let (coll, index) = with_filtered_ttl(&engine, doc! {"state": "done"});
+        engine.insert(&coll, doc! {"_id": 1, "state": "done", "seen": dt(0)}).unwrap();
+
+        let (writer, at) = (engine.clone(), coll.clone());
+        hooks::after_the_next_scan(move || {
+            writer
+                .replace(
+                    &at,
+                    &kimmy_core::DocId::Int64(1),
+                    doc! {"_id": 1, "state": "done", "seen": dt(100_000)},
+                    false,
+                )
+                .unwrap();
+        });
+        let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
+
+        assert_eq!(out.skipped, 1, "offered by the scan, declined by the date: {out:?}");
+        assert_eq!((out.deleted, out.skipped_filter), (0, 0), "{out:?}");
+        assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_range_filter_expires_only_what_find_selects() {
+        // `{size: {$gt: 5}}` as `find` reads it selects a number above five.
+        // The index's membership rule compares across type brackets, so it
+        // also holds a string, a document and a boolean -- and expiry deleted
+        // all four (ADR-181).
+        let (engine, _, _dir) = engine();
+        let filter = doc! {"size": {"$gt": 5}};
+        let (coll, index) = with_filtered_ttl(&engine, filter.clone());
+        let sizes =
+            [Bson::Int32(10), Bson::Int32(3), "large".into(), doc! {"w": 1}.into(), true.into()];
+        for (id, size) in sizes.iter().enumerate() {
+            engine
+                .insert(&coll, doc! {"_id": id as i64, "size": size.clone(), "seen": dt(0)})
+                .unwrap();
+        }
+
+        // The fixture has to be the case that deletes wrongly: documents the
+        // index holds that the filter does not select.
+        let parsed = kimmy_core::PartialFilter::parse(&filter).unwrap();
+        let wrongly_held = sizes[2..]
+            .iter()
+            .map(|size| doc! {"size": size.clone()})
+            .filter(|d| parsed.matches(d) && !parsed.selects(d))
+            .count();
+        assert_eq!(wrongly_held, 3, "premise: the index holds three the filter does not select");
+
+        let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
+
+        assert_eq!(out.deleted, 1, "{out:?}");
+        assert_eq!(out.skipped_filter, 3, "{out:?}");
+        let left: Vec<i64> = (0..5)
+            .filter(|id| engine.get(&coll, &kimmy_core::DocId::Int64(*id)).unwrap().is_some())
+            .collect();
+        assert_eq!(left, [1, 2, 3, 4], "only size 10 expires");
     }
 }

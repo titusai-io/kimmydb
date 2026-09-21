@@ -81,6 +81,23 @@ impl PartialOp {
         }
     }
 
+    /// Whether the values a path resolves to satisfy this, as `find`
+    /// evaluates the same operator: `values` is empty when the path is absent.
+    pub fn selects(&self, values: &[&Bson]) -> bool {
+        match self {
+            PartialOp::Exists => crate::matching::exists(values, true),
+            PartialOp::Eq(want) => crate::matching::equals(values, want),
+            PartialOp::Gt(bound) => crate::matching::compares(values, bound, &[Ordering::Greater]),
+            PartialOp::Gte(bound) => {
+                crate::matching::compares(values, bound, &[Ordering::Greater, Ordering::Equal])
+            }
+            PartialOp::Lt(bound) => crate::matching::compares(values, bound, &[Ordering::Less]),
+            PartialOp::Lte(bound) => {
+                crate::matching::compares(values, bound, &[Ordering::Less, Ordering::Equal])
+            }
+        }
+    }
+
     /// Whether satisfying `self` guarantees satisfying `other`.
     ///
     /// This is the whole containment question, and it is decidable precisely
@@ -152,12 +169,18 @@ impl PartialFilter {
         self.predicates.iter().map(|(p, o)| (p.as_str(), o))
     }
 
-    /// Whether this document belongs in the index.
+    /// Whether this document belongs in the index: the membership rule index
+    /// maintenance applies today.
     ///
     /// A path that fans out through an array satisfies the predicate if **any**
-    /// of its values does, matching how the filter layer treats arrays — an
-    /// index over `tags` with a partial filter on `tags` must hold a document
-    /// whose array contains a qualifying element.
+    /// of its values does — an index over `tags` with a partial filter on
+    /// `tags` must hold a document whose array contains a qualifying element.
+    ///
+    /// **It is not what `find` selects with the same expression**, and
+    /// [`Self::selects`] is. It compares across type brackets, so `{$gt: 5}`
+    /// holds a string; it never compares a whole array; and it treats a
+    /// missing field as matching nothing. Anything that acts on a document
+    /// because the filter selects it asks `selects`, not this (ADR-181).
     pub fn matches(&self, doc: &Document) -> bool {
         self.predicates.iter().all(|(field, op)| {
             let resolved = path::resolve(doc, field);
@@ -169,6 +192,16 @@ impl PartialFilter {
                 other => op.holds(Some(other)),
             })
         })
+    }
+
+    /// Whether `find` with this filter as its expression would return `doc`.
+    ///
+    /// Evaluated by [`crate::matching`], the same code `kimmy-query`'s filter
+    /// evaluates these operators with, so the answer is `find`'s by
+    /// construction rather than by a second implementation agreeing with it.
+    /// TTL expiry asks this before it deletes (ADR-181).
+    pub fn selects(&self, doc: &Document) -> bool {
+        self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
     }
 
     /// Whether a query carrying `query` is provably contained by this filter.
