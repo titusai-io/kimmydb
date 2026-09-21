@@ -305,7 +305,12 @@ kind: Service
 metadata:
   name: kimmy-headless
 spec:
-  clusterIP: None          # headless: resolves to every ready pod IP
+  clusterIP: None          # headless: one A record per pod
+  # Ready or not. Peers find each other through this Service, so if it
+  # published only ready pods, readiness could never wait on anything a peer
+  # provides without deadlocking a whole-cluster cold start: no pod ready, so
+  # none discoverable, so none ever ready.
+  publishNotReadyAddresses: true
   selector: { app: kimmy }
   ports:
     - { name: http,   port: 7878 }
@@ -350,6 +355,19 @@ spec:
               valueFrom: { secretKeyRef: { name: kimmy, key: root-password } }
             - name: KIMMY_CLUSTER_SECRET
               valueFrom: { secretKeyRef: { name: kimmy, key: cluster-secret } }
+          # Nothing listens until the database is open, and liveness does not
+          # run until this succeeds. An open walks the retained oplog, about
+          # 46 s per 10 million entries (the writes of
+          # storage.oplog_retention_secs, 24 h by default); the first start
+          # after an upgrade that rebuilds partial indexes adds 7 us per
+          # document per partial index. Allow at least twice your expected
+          # open as periodSeconds x failureThreshold. These values are for 10
+          # million retained entries and one partial index over 10 million
+          # documents: about 2 minutes, so 4. Compute yours.
+          startupProbe:
+            httpGet: { path: /healthz, port: 7878 }
+            periodSeconds: 10
+            failureThreshold: 24
           livenessProbe:
             httpGet: { path: /healthz, port: 7878 }
           readinessProbe:
@@ -368,8 +386,17 @@ spec:
 > which is what makes the misconfiguration look healthy. The downward-API
 > snippet above is the fix.
 
-A headless Service resolving to every ready pod IP is exactly the seed set a
-SWIM member needs, which is why `k8s:` discovery is a one-liner.
+A headless Service resolving to every pod IP is exactly the seed set a SWIM
+member needs, which is why `k8s:` discovery is a one-liner. It resolves every
+pod, not only the ready ones, because of `publishNotReadyAddresses: true`: a
+Service that published only ready pods would make readiness a precondition of
+being found, and a cluster starting from cold would have no pod ready to find.
+
+**Without the `startupProbe`, a node whose open outlasts the liveness probe
+never starts.** Kubernetes' defaults restart a container after about 30
+seconds of failed liveness checks, and nothing listens until the open
+completes, so an open longer than that is killed and begun again for ever.
+The comment beside the probe gives the arithmetic for your own numbers.
 
 ### Discovery formats
 

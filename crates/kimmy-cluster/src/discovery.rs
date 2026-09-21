@@ -3,8 +3,11 @@
 //! KimmyDB has no seed list to hand-maintain and no leader to bootstrap from. A
 //! node is told *where to look* for peers and re-resolves that periodically. In
 //! Kubernetes this is the whole story: a headless Service resolves to every
-//! ready pod IP, which is exactly the peer set — which is also why membership
-//! gossip was not worth building ([ADR-037](../../../docs/decisions.md)).
+//! pod IP, which is exactly the peer set — which is also why membership
+//! gossip was not worth building ([ADR-037](../../../docs/decisions.md)). Every
+//! pod, ready or not, when the Service sets `publishNotReadyAddresses`, as the
+//! operations guide's does: otherwise only ready pods can be found, and a
+//! cluster starting from cold has none.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -27,7 +30,8 @@ pub enum SeedSource {
     /// so peers need not agree on one in advance.
     DnsSrv { name: String },
     /// `k8s:kimmy-headless.default.svc.cluster.local` — a headless Service,
-    /// which resolves to one A record per ready pod.
+    /// which resolves to one A record per pod (per ready pod, unless it sets
+    /// `publishNotReadyAddresses`).
     Kubernetes { name: String, port: u16 },
 }
 
