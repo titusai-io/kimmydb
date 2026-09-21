@@ -703,3 +703,131 @@ fn the_json_boundary_lists_decimal128_as_read_and_written() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A table keeps its rows
+// ---------------------------------------------------------------------------
+
+/// Where a run of table rows starts without a header, by line number.
+///
+/// GitHub renders a table only from a header row followed by a delimiter row.
+/// A run of rows that does not open that way is not a table: after a paragraph
+/// it renders as text run into the paragraph, and after a blank line as a
+/// paragraph of pipes. Either way the rows are gone from the table they were
+/// written for, and nothing reports it. The usual cause is a paragraph added
+/// in the middle of a table, which cuts the rows below it off from the header.
+///
+/// A row is any line whose first non-blank character is `|`. What that reads
+/// wrongly, and what is done about it:
+/// - an example table inside a fenced code block is skipped, fence by fence;
+/// - a line of prose that happens to contain a pipe is not a row, because it
+///   does not start with one;
+/// - a line of prose or an indented code block that does **start** with a pipe
+///   is taken for a row and reported. No file has one; if one is ever needed,
+///   fence it.
+fn rows_without_a_header(markdown: &str) -> Vec<usize> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let is_row = |line: &str| line.trim_start().starts_with('|');
+    let is_delimiter = |line: &str| {
+        let cells = line.trim().trim_matches('|');
+        !cells.is_empty()
+            && cells.split('|').all(|cell| {
+                let cell = cell.trim().trim_start_matches(':').trim_end_matches(':');
+                cell.len() >= 3 && cell.chars().all(|c| c == '-')
+            })
+    };
+    let mut found = Vec::new();
+    let mut fenced = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("```") {
+            fenced = !fenced;
+            i += 1;
+            continue;
+        }
+        if fenced || !is_row(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < lines.len() && is_row(lines[i]) {
+            i += 1;
+        }
+        if !(start + 1 < i && is_delimiter(lines[start + 1])) {
+            found.push(start + 1);
+        }
+    }
+    found
+}
+
+/// Every Markdown file under the repository root, relative to it, outside
+/// build output and hidden directories.
+fn markdown_files() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a readable directory") {
+            let path = entry.expect("a directory entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "target" {
+                    walk(&path, out);
+                }
+            } else if name.ends_with(".md") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    let mut out: Vec<_> =
+        out.iter().map(|p| p.strip_prefix(&root).expect("under the root").to_path_buf()).collect();
+    out.sort();
+    (root, out)
+}
+
+#[test]
+fn rows_cut_off_from_their_header_are_found() {
+    let whole = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+    assert_eq!(rows_without_a_header(whole), Vec::<usize>::new(), "a whole table");
+    let aligned = "| a | b |\n| :--- | ---: |\n| 1 | 2 |\n";
+    assert_eq!(rows_without_a_header(aligned), Vec::<usize>::new(), "aligned columns");
+
+    // A paragraph added in the middle, with and without a blank line after.
+    let run_into = "| a | b |\n|---|---|\n| 1 | 2 |\n\nA note.\n| 3 | 4 |\n";
+    assert_eq!(rows_without_a_header(run_into), [6], "rows run into a paragraph");
+    let after_blank = "| a | b |\n|---|---|\n| 1 | 2 |\n\nA note.\n\n| 3 | 4 |\n| 5 | 6 |\n";
+    assert_eq!(rows_without_a_header(after_blank), [7], "rows after a blank line");
+
+    // What is not a table is not asked to have a header.
+    let fenced = "```\n| not | a table |\n```\n";
+    assert_eq!(rows_without_a_header(fenced), Vec::<usize>::new(), "inside a fence");
+    let prose = "A pipe in a sentence, `a | b`, is not a row.\n";
+    assert_eq!(rows_without_a_header(prose), Vec::<usize>::new(), "a pipe inside prose");
+}
+
+#[test]
+fn every_table_in_the_documentation_keeps_its_rows() {
+    let (root, files) = markdown_files();
+    // Premise: the walk reaches the files the documentation lives in, among
+    // them the two where cut-off rows were first found, so an empty answer
+    // is not an empty walk.
+    for known in ["docs/decisions.md", "docs/testing.md", "CHANGELOG.md"] {
+        assert!(
+            files.iter().any(|f| f.ends_with(known)),
+            "the walk did not reach {known}: {files:?}"
+        );
+    }
+    let mut cut_off = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(root.join(file)).expect("a readable file");
+        for line in rows_without_a_header(&text) {
+            cut_off.push(format!("{}:{line}", file.display()));
+        }
+    }
+    assert!(
+        cut_off.is_empty(),
+        "table rows with no header above them, which render as text rather than as rows; \
+         move whatever was added between them and their table:\n  {}",
+        cut_off.join("\n  ")
+    );
+}
