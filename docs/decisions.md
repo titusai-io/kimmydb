@@ -17641,3 +17641,155 @@ bookkeeping transaction it cannot avoid. A stray replication write added to
 the skip path turns it red at four against one; asserting instead that
 `run_txn` went uncalled would pass that unchanged, which is why it counts
 rather than watches one function.
+
+---
+
+## ADR-180 — A snapshot restore appends the entry behind each schema change it restores
+
+**Decision.** When a snapshot page restores a schema change, the receiver
+**appends the originating entry for it**, at the **origin's own stamp**, in the
+same transaction that writes the state. It does not mint an entry of its own.
+
+Five cases, every one of which the page already carries the stamp for:
+
+| Restored | Entry appended | Stamp from |
+| --- | --- | --- |
+| A collection | `CreateCollection` | `CollectionState.created` |
+| A collection tombstone ([ADR-162](#adr-162--a-whole-database-snapshot-page-carries-the-senders-drops-so-it-can-convey-absence)) | `DropCollection` | `dropped_collections` |
+| An index definition | `CreateIndex` | `IndexMeta.created` |
+| A vector configuration | `ConfigureVectors` | the configuration's stamp |
+| **A vector shadow** | **none, deliberately** | — |
+
+The shadow is the case that looks missing and is not. A shadow creation entry
+is exactly what
+[ADR-178](#adr-178--a-vector-shadow-is-created-at-the-stamp-of-the-change-that-needs-it-and-only-a-clients-configuration-logs-its-creation)
+forbids: a member applying a peer's configuration mints the shadow at the
+configuration's stamp, **unlogged**. Appending the `ConfigureVectors` entry is
+therefore sufficient and is the only correct move — a member receiving it
+mints its own shadow through ADR-178's path, which is what it already does for
+a configuration that arrives through the oplog.
+
+**Why. A restore leaves the member advertising a window it cannot serve.**
+[ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window)
+fixes the meaning of the servable vector: *"this node can serve a contiguous
+window containing this"*. Completing a snapshot grants the receiver the
+sender's coverage ([ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped),
+ADR-162), and the restore writes schema as state with no entry behind it. The
+member's vector then covers stamps it has no entry for, so a peer pulling from
+it is served a window with the schema change silently absent. Nothing errors
+and nothing is counted.
+
+This is ADR-162's own defect one hop further out. That record named the
+mechanism exactly — *"completing a whole-database snapshot absorbs the
+sender's first-page vector... so no peer will ever serve that entry to the
+receiver afterwards either"* — and closed it for the member that takes the
+snapshot. It was never carried to that member's own peers.
+
+**Measured, not argued.** Seven cases across the five schema kinds — the two
+vector ones counted as turning on, the shadow, and turning off — driven
+through real rounds (`sync_once`), with the serving member's oplog aged out so
+the middle member can only catch up by snapshot. **All seven fail** to reach a
+member relayed through it. The same seven with the oplog left intact, so the
+middle member catches up by entries instead, **all pass** — so the topology is
+sound and the snapshot hop is the whole difference.
+Two controls locate it: **documents do relay**, because the restore
+reconstructs a `Replace` at the document's own stamp and appends it, and the
+restoring member itself holds every schema change correctly. The defect is not
+in what a restore applies. It is that the member cannot pass on what it
+correctly holds.
+
+### Re-logging is not minting
+
+This has to be said plainly, because ADR-178 has just written down a rule that
+looks like it forbids this, and the next reader will reach for it.
+
+The rule is on `index::create_index_inner`: a replicated definition *"must not
+mint an entry of its own: the originating entry is appended by the caller, and
+minting a second one under this node's stamp would send the same change back
+to the peer, which would apply it and mint another. That amplifies without
+bound."*
+
+The prohibition is on **a new entry under this node's stamp**. What it
+protects is convergence: an entry stamped here is new to every peer, so it
+travels back and is minted again. An entry at the **origin's** stamp is not
+new to anybody — it is byte-identical to the one the origin appended, so a
+peer that holds it supersedes it and a peer that does not applies it once.
+
+And that is not a new behaviour being introduced here. It is what the entries
+path already does, and what the sync round's own comment relies on:
+*"Replicated DDL that applies is not among them: `apply_ddl` appends the
+originating entry."* The snapshot path is the one path that materialises
+schema without doing it. This record makes the snapshot path do what the
+entries path and the document path both already do; ADR-178's rule is
+untouched, because no entry is minted under this node's stamp anywhere in it.
+
+### Three things that must hold
+
+1. **The append commits with the restore, or not at all.** The entry and the
+   state it describes go into one transaction. Appending after the restore
+   commits leaves a window in which the member advertises coverage it cannot
+   serve — which is this defect, briefly, rather than permanently. This is the
+   same shape as ADR-178's "a configuration and its shadow commit together",
+   and it is the failure that looks fine in the happy path.
+2. **The append goes through the entries path's own dedup.** A re-served entry
+   arriving later from the origin, or from another peer, must supersede rather
+   than append a second time. ADR-123 and ADR-141 both turned on re-served-entry
+   behaviour and neither may be reopened.
+3. **No amplification across hops.** A third member catching up from the
+   restoring one by snapshot re-logs at the **origin's** stamp again, never the
+   restoring member's. A chain of snapshot hops therefore mints nothing and
+   converges to one entry per change. Proven at two hops, not one — one hop
+   cannot distinguish "at the origin's stamp" from "at the sender's".
+
+### What this does NOT close
+
+**This is not the whole fix, and must not be read as one.** It closes five of
+the seven relay cases above. Two remain, and a third case in the same family
+that the sweep found separately:
+
+- **An index drop** and **a vector configuration turned off.**
+  `CollectionState` carries `indexes` and `vector` — presence only. There is
+  no index tombstone on the page and no record that a configuration was turned
+  off, so absence is not expressible and there is no stamp to append an entry
+  at. Closing these means extending the page to convey absence, which is
+  structurally the move ADR-162 made for collections, and is its own record.
+- **A document delete**, for a different reason, and not a format one.
+  [ADR-167](#adr-167--a-document-delete-travels-in-a-snapshot-by-key-to-a-receiver-that-holds-the-document)
+  has the receiver recover the `_id` from **its own copy** of the document,
+  because nobody else has one: `DocRecord::tombstone` carries an empty body,
+  so the `_id` is destroyed at delete time on every member, and the key cannot
+  yield it — `keyenc` is order-preserving and one-way, and `Int32(1)`,
+  `Int64(1)` and `Double(1.0)` encode to identical bytes. A member restoring a
+  snapshot never held the document, so there is nothing to recover from and no
+  entry can be built. No page field fixes this, because no member has the
+  fact. It needs either the tombstone to retain the `_id` at delete time — a
+  storage change, and not retroactive — or a delete-by-key entry shape. Its
+  own record either way.
+
+### Observability
+
+A restore that re-logs is a path an operator currently cannot see, and the
+reason this defect went unnoticed is that it moves no number at all. So it
+gets one:
+
+- `kimmy_snapshot_ddl_relogged_total` — *"Schema changes a snapshot restore
+  appended to this node's oplog so that it can serve them onward."*
+- `kimmy.snapshot.ddl_relogged` on the OTLP bridge, unit `{change}`, as every
+  counter is.
+
+It reads 0 on a member that has never taken a snapshot, and rises once per
+schema change restored. It is not an error count: a non-zero value is the fix
+working. What it makes visible is the case nobody could previously ask about —
+whether a member ever joined past its peers' retention horizon and then served
+a third.
+
+### How it can be broken
+
+Removing the append turns the five relay cases red while every control stays
+green, which is the pair that matters: the controls prove the topology
+converges without the snapshot hop, so a failure is the hop and not the test.
+Appending at this node's stamp rather than the origin's passes a one-hop test
+and fails a two-hop one, which is why the amplification proof is at two hops.
+Appending in a second transaction after the restore passes every steady-state
+test and fails only a test that looks between the two commits — so that test
+is the one to write first.
