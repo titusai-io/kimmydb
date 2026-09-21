@@ -344,6 +344,11 @@ mod stored_filter_tests {
 
     /// `IndexMeta` as it was before ADR-182, field for field, without the
     /// store's encoding of the filter.
+    ///
+    /// Its limit: a field added later to both `IndexMeta` and this mirror
+    /// keeps the test green while the wire changes. It proves that ADR-182
+    /// changed nothing on the wire; it does not guard a later change to the
+    /// wire, which needs a byte test of its own.
     #[derive(Serialize)]
     struct Before {
         id: u32,

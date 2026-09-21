@@ -18089,7 +18089,7 @@ Every member stored the converted filter, and since ADR-180 every member builds 
 
 A filter already converted stays converted. The store holds the array, and nothing on a member distinguishes a converted `Binary` from an array a client wrote. The as-sent filter survives only in a `CreateIndex` entry logged before ADR-180, which logged the filter as sent, and only **while retention still holds that entry**. That is a clock, and it is why this record came second in its queue: every day it is not in place, more of those entries age out. ADR-180 stopped new entries carrying the as-sent form, so from ADR-180 until this record nothing retained it at all.
 
-**No automatic recovery.** Rewriting a stored definition from a retained entry would change the definition on the members that still hold that entry and not on the others. That divergence of the definition itself is worse than the conversion. Operators recreate instead. To make that possible, **every open logs an info line for each partial index whose filter holds an array**, anywhere among its operands, saying that it **may have been converted** from a generic `Binary` by an earlier build, and to drop and recreate the index if it was created with a `Binary` value. It says "may", never "is broken", because an array can be exactly what the client wrote. **What it cannot do:** it is written at open, so an operator who does not restart after upgrading never sees it. Silence before a restart does not mean there are none.
+**No automatic recovery.** Rewriting a stored definition from a retained entry would change the definition on the members that still hold that entry and not on the others. That divergence of the definition itself is worse than the conversion. Operators recreate instead. To make that possible, **every open logs an info line for each partial index whose filter holds an array**, anywhere among its operands, a scoped JavaScript value's scope included, saying that it **may have been converted** from a generic `Binary` by an earlier build, and to drop and recreate the index if it was created with a `Binary` value. It says "may", never "is broken", because an array can be exactly what the client wrote. **What it cannot do:** it is written at open, so an operator who does not restart after upgrading never sees it. Silence before a restart does not mean there are none.
 
 ### What this does to ADR-180
 
@@ -18113,6 +18113,10 @@ That last is this record's user-visible fix, held across replication. It is a st
 | --- | --- |
 | canonical form in the store (relaxed again) | the store test, the fidelity test, the membership test across replication, the API test, and every test built on ADR-180's origin fixture, at its premise |
 | the plain document on the wire (canonical there too) | the byte-identity test for a `CreateIndex` body, **and nothing else**, which is why it exists |
-| the info line's detection | the test that names exactly the filters holding an array, a bound included, and not a scalar one |
+| the info line's detection | the test that names exactly the filters holding an array, a bound and a scoped code value included, and not a scalar one |
+| the detection's scoped-code arm | the same test |
+| the info line's **emission**, the loop in `Engine::open` | the test that opens twice and reads the line each time, **and nothing else**: 1 of 2,469 tests, measured with `--no-fail-fast` |
+
+Detection and emission are separate rules, and the table used to list only the first. The emission's test was added in review, after removing the loop left every test in the workspace green. The line is the whole remedy this record offers, so it is held to its own test.
 
 A relaxed filter written by an earlier build is read as it was stored, which the compatibility test holds.
