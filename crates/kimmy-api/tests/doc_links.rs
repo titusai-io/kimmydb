@@ -649,11 +649,28 @@ fn every_link_between_the_repositorys_markdown_files_resolves() {
         report.to_files,
         report.external
     );
+    // Every ADR heading was read *as that heading*, by anchor, not by count.
+    // Counting cannot see this: decisions.md has far more headings than ADRs,
+    // so a parser that lost a whole region -- a mis-paired fence swallowing it,
+    // say -- still reports more headings than there are ADRs and passes. The
+    // unclosed-fence report only catches a fence left open to the end of file.
     let decisions = std::fs::read_to_string(root.join("docs/decisions.md")).unwrap();
-    let adrs = decisions.lines().filter(|l| l.starts_with("## ADR-")).count();
+    let adr_slugs: Vec<String> = decisions
+        .lines()
+        .filter(|l| l.starts_with("## ADR-"))
+        .map(|l| github_slug(atx(l).expect("a `## ` line is an ATX heading")))
+        .collect();
+    assert!(adr_slugs.len() > 100, "premise: the ADRs were found ({})", adr_slugs.len());
+    let anchors = parse(&decisions).anchors;
+    let missing: Vec<&str> =
+        adr_slugs.iter().filter(|s| !anchors.contains(*s)).map(String::as_str).collect();
     assert!(
-        parse(&decisions).headings >= adrs && adrs > 100,
-        "premise: every ADR heading was read as a heading ({adrs} in the file)"
+        missing.is_empty(),
+        "premise: {} of {} ADR headings in docs/decisions.md were not read as headings, so a \
+         region of the file was parsed as something other than what it is, and no link inside \
+         it was checked: {missing:?}",
+        missing.len(),
+        adr_slugs.len()
     );
 
     assert!(
