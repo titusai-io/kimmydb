@@ -10,6 +10,46 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`kimmy_sync_ddl_relogged_total`** (`kimmy.sync.ddl_relogged` on the OTLP
+  bridge) counts schema changes a snapshot restore appended to this node's
+  oplog so that it can serve them onward ([ADR-180](docs/decisions.md)). Not
+  an error: it reads 0 on a member that never caught up by snapshot, and a
+  rise is the fix below doing its job. A scrape config or a golden list that
+  enumerates series needs the new name.
+
+### Fixed
+
+- **A member that caught up by snapshot now serves onward the index
+  definitions it restored** ([ADR-180](docs/decisions.md)). A snapshot wrote
+  each definition as state with no entry behind it, while completing the
+  snapshot granted the member coverage of the stamp it was created at. So a
+  member pulling from it was served a window without the index, moved past
+  it, and was never served it again: that member lacked the index
+  permanently, and nothing counted it. For a unique index, that member then
+  accepted duplicates its peers refused. The restore now appends the entry
+  the index's origin logged, at the origin's stamp, in the same commit as the
+  definition. It leaves an entry it already holds untouched, and a chain of
+  snapshot hops still ends with the origin's one entry. **Only index
+  definitions are fixed.** A collection created, a vector configuration, and
+  the removals (a collection, an index, a configuration turned off, a
+  document) can still fail to reach a member through a peer that caught up by
+  snapshot, because a snapshot page does not carry what their entries need.
+- **An index's `CreateIndex` entry now carries its definition as every member
+  stores it** ([ADR-180](docs/decisions.md)). This changes what a local
+  create logs, not only what a restore appends. The entry used to carry the
+  `multikey` flag the creating member had observed, and the partial filter as
+  the client sent it, where every member stores a small `Int64` as an `Int32`
+  and a generic `Binary` as an array. It now carries `multikey: false` and the
+  filter as stored. No member reads either difference from an entry: each
+  sets `multikey` from its own documents, and stores the filter through the
+  same encoding whichever form arrives. What changes is that the entry under
+  a stamp is the same wherever it is built, which is what lets a restore
+  rebuild it.
+
 ## 0.33.0 - 2026-09-21
 
 **A minor, for one additive series; nothing breaks.**

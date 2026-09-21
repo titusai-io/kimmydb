@@ -672,6 +672,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.ddl_relogged",
+            "{change}",
+            "Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward.",
+            sync_ddl_relogged
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.tls.reloads.ok",
             "{reload}",
             "Certificate reloads that succeeded.",

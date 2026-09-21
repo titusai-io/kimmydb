@@ -86,6 +86,11 @@ pub struct StorageReadings {
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
+    /// Schema changes a snapshot restore appended to the oplog since start
+    /// (`Engine::ddl_relogged`, ADR-180). A reading rather than a counter
+    /// here: the engine counts each once its commit lands, which a round's
+    /// report, returned only when the whole page succeeds, could not.
+    pub sync_ddl_relogged: u64,
     /// How long writes waited for the single writer, the writes that gave
     /// up waiting inside their budget, and the longest any one transaction
     /// held it (ADR-151). The wait is the part of a write's latency that
@@ -234,6 +239,9 @@ pub struct MetricsSnapshot {
     /// Replicated index drops declined as older than the index standing
     /// here (ADR-141).
     pub sync_ddl_declined: u64,
+    /// Schema changes a snapshot restore re-logged so that this node can
+    /// serve them onward (ADR-180). One of the engine's readings.
+    pub sync_ddl_relogged: u64,
     /// Collections the cross-member divergence check currently has confirmed
     /// (ADR-133): held by a peer and not here, or held by both with
     /// disagreeing document counts, seen on two ticks running. Moves for a
@@ -863,6 +871,7 @@ impl Metrics {
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
             sync_ddl_declined: self.get(&self.sync_ddl_declined),
+            sync_ddl_relogged: readings.sync_ddl_relogged,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
@@ -1083,6 +1092,9 @@ impl Metrics {
              # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
+             # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
+             # TYPE kimmy_sync_ddl_relogged_total counter\n\
+             kimmy_sync_ddl_relogged_total {sync_ddl_relogged}\n\
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
@@ -1203,6 +1215,7 @@ impl Metrics {
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
             sync_ddl_declined = self.get(&self.sync_ddl_declined),
+            sync_ddl_relogged = readings.sync_ddl_relogged,
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
             sync_div_skipped = self.get(&self.sync_divergence_skips),
@@ -1700,6 +1713,7 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
+            sync_ddl_relogged: 91,
             writer_wait: kimmy_storage::WriterWaitSnapshot {
                 buckets: [1, 2, 0, 0, 3, 0, 0, 1],
                 count: 8,
@@ -2164,6 +2178,9 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
+# HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
+# TYPE kimmy_sync_ddl_relogged_total counter
+kimmy_sync_ddl_relogged_total 91
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
@@ -2451,6 +2468,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
         expect(&format!("kimmy_sync_ddl_declined_total {}\n", s.sync_ddl_declined));
+        expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
             "kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {}\n",
@@ -2698,10 +2716,11 @@ kimmy_sync_serve_walk_seconds_count 1201
         // components, three phases, two byte counts, the estimate's bound and
         // the over-count; one scalar for unmeasured CPU; five serve scalars;
         // and the serve walk's 12 buckets, +Inf, sum and count. Since
-        // ADR-178, one scalar for embedding skipped for want of a shadow.
+        // ADR-178, one scalar for embedding skipped for want of a shadow;
+        // since ADR-180, one for schema changes a snapshot restore re-logged.
         assert_eq!(
             samples,
-            105 + 6
+            106 + 6
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT

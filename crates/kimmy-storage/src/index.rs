@@ -626,6 +626,65 @@ pub(crate) enum CreateOrigin {
     /// or one lifted out of a snapshot written by such a build; it reads as
     /// older than every rival (ADR-132).
     Replicated(Option<Stamp>),
+    /// A definition a snapshot page restores, stamped where it was created.
+    ///
+    /// Decided exactly as `Replicated(Some(_))` is, and one thing more: the
+    /// entry the origin logged for it is rebuilt and appended under the
+    /// origin's stamp, in the transaction that settles the definition here,
+    /// so that this node can serve onward what it now holds (ADR-180). Not
+    /// minting: the stamp is the origin's, and the entry is the one every
+    /// member holding it already has. A definition that carries no stamp has
+    /// no entry to rebuild, and is restored as `Replicated(None)`.
+    Restored(Stamp),
+}
+
+/// The body of the `CreateIndex` entry for `index`: the definition as every
+/// member stores it, and nothing this node observed about it (ADR-180).
+///
+/// A snapshot restore rebuilds the entry from the definition a page carries,
+/// which is the stored one as it stands later, so an entry that differed
+/// from that could not be rebuilt — the stamp would stop determining the
+/// entry. Two things made it differ:
+///
+/// - **`multikey`**, a node-local observation: each member sets it from the
+///   documents it holds, and no receiver reads it from an entry. Logged as
+///   observed, an origin creating the index over documents that already held
+///   arrays logged `true`, one creating it before any did logged `false`,
+///   and nothing on a page tells the two apart. Always `false` here.
+/// - **The partial filter's representation.** Collection metadata is stored
+///   as JSON, which reads a small `Int64` back as an `Int32` and a generic
+///   `Binary` back as an array; the filter a client sent is not the filter
+///   any member holds. Logged as sent, the entry named a filter no member
+///   stores. Logged as stored — through that same encoding, which is
+///   idempotent — the entry and every member's definition agree.
+///
+/// Neither changes what a receiver holds: it builds `multikey` from its own
+/// documents, and stores the filter through the same encoding either way.
+fn logged_definition(
+    db: &str,
+    collection: &str,
+    index: &IndexMeta,
+) -> Result<kimmy_core::IndexCreate> {
+    let stored: IndexMeta = serde_json::from_slice(&serde_json::to_vec(index)?)?;
+    Ok(kimmy_core::IndexCreate {
+        db: db.to_string(),
+        collection: collection.to_string(),
+        index: IndexMeta { multikey: false, ..stored },
+    })
+}
+
+/// Append, in `txn`, the entry behind a definition a snapshot restored at
+/// `created` (ADR-180) — the entry, when it was appended.
+fn relog_restored(
+    txn: &crate::engine::WriteTxn<'_>,
+    collection: CollectionId,
+    body: &kimmy_core::IndexCreate,
+    created: Stamp,
+) -> Result<Option<kimmy_core::OplogEntry>> {
+    debug_assert_eq!(body.index.created, Some(created), "the body names the stamp it is logged at");
+    let entry =
+        crate::engine::ddl_entry(created, kimmy_core::OpKind::CreateIndex, collection, body)?;
+    Ok(crate::engine::relog(txn, &entry)?.then_some(entry))
 }
 
 /// What a drop did.
@@ -832,6 +891,7 @@ impl crate::Engine {
         let mut stamp = match origin {
             CreateOrigin::Local => None,
             CreateOrigin::Replicated(created) => created,
+            CreateOrigin::Restored(created) => Some(created),
         };
 
         // Derived from the name so every node agrees, which is what lets an
@@ -908,6 +968,46 @@ impl crate::Engine {
                         _ => None,
                     };
                     let Some(merged) = merged else {
+                        // Nothing to settle — but a restored definition this
+                        // node already holds still has its entry appended if
+                        // it is not here, as the entries path appends a
+                        // creation of a definition it already holds (ADR-180).
+                        // The writer is taken to ask; a page with nothing to
+                        // append costs no commit.
+                        if let CreateOrigin::Restored(created) = origin {
+                            let txn = self.begin_write(WriterHolder::Ddl)?;
+                            if !crate::Engine::definition_is(&txn, &read)? {
+                                txn.abort()?;
+                                #[cfg(test)]
+                                crate::sync::race_hooks::absorbed(
+                                    crate::sync::race_hooks::Race::IndexCreation,
+                                );
+                                return self.create_index_inner(
+                                    db,
+                                    collection,
+                                    index.fields,
+                                    unique,
+                                    enforcement,
+                                    Some(index.name),
+                                    expire_after_secs,
+                                    index.partial_filter,
+                                    origin,
+                                    history,
+                                );
+                            }
+                            if history(&read, self.index_dropped_at(meta.id, id)?) {
+                                txn.abort()?;
+                                return Ok((IndexCreated::Older, Vec::new()));
+                            }
+                            let body = logged_definition(db, collection, &index)?;
+                            match relog_restored(&txn, meta.id, &body, created)? {
+                                Some(entry) => {
+                                    txn.commit()?;
+                                    self.relogged(entry);
+                                }
+                                None => txn.abort()?,
+                            }
+                        }
                         return Ok((IndexCreated::Built(existing), Vec::new()));
                     };
                     let mut settled = existing;
@@ -948,7 +1048,21 @@ impl crate::Engine {
                         return Ok((IndexCreated::Older, Vec::new()));
                     }
                     crate::Engine::put_collection_meta(&txn, &meta)?;
+                    // A restored definition's entry, with the stamp it settles
+                    // on, in the stamp's own commit (ADR-180).
+                    let relogged = match origin {
+                        CreateOrigin::Restored(created) => relog_restored(
+                            &txn,
+                            meta.id,
+                            &logged_definition(db, collection, &index)?,
+                            created,
+                        )?,
+                        CreateOrigin::Local | CreateOrigin::Replicated(_) => None,
+                    };
                     txn.commit()?;
+                    if let Some(entry) = relogged {
+                        self.relogged(entry);
+                    }
                     return Ok((IndexCreated::Built(settled), Vec::new()));
                 }
                 match (origin, existing.created, index.created) {
@@ -959,12 +1073,12 @@ impl crate::Engine {
                     // how two concurrent writes to one document already
                     // settle (ADR-020, ADR-132). The loser is removed in the
                     // transaction that builds the winner, below.
-                    (CreateOrigin::Replicated(_), Some(held), Some(arriving))
-                        if arriving.wins_over(&held) =>
-                    {
-                        Some(existing)
-                    }
-                    (CreateOrigin::Replicated(_), Some(_), Some(_)) => {
+                    (
+                        CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
+                        Some(held),
+                        Some(arriving),
+                    ) if arriving.wins_over(&held) => Some(existing),
+                    (CreateOrigin::Replicated(_) | CreateOrigin::Restored(_), Some(_), Some(_)) => {
                         // The definition here is the later one. The arrival is
                         // history: nothing to do, and the caller must not
                         // append it onward.
@@ -1157,20 +1271,24 @@ impl crate::Engine {
                     stamp.expect("a local create mints its stamp above"),
                     kimmy_core::OpKind::CreateIndex,
                     meta.id,
-                    &kimmy_core::IndexCreate {
-                        db: db.to_string(),
-                        collection: collection.to_string(),
-                        index: index.clone(),
-                    },
+                    &logged_definition(db, collection, &index)?,
                 )?;
                 crate::engine::append_oplog(&txn, &entry)?;
                 Some(entry)
             }
             CreateOrigin::Replicated(_) => None,
+            // In the transaction that builds the definition, so the entry and
+            // the state it describes commit together or not at all (ADR-180).
+            CreateOrigin::Restored(created) => {
+                relog_restored(&txn, meta.id, &logged_definition(db, collection, &index)?, created)?
+            }
         };
         txn.commit()?;
         if let Some(entry) = logged {
-            self.publish(vec![entry]);
+            match origin {
+                CreateOrigin::Restored(_) => self.relogged(entry),
+                CreateOrigin::Local | CreateOrigin::Replicated(_) => self.publish(vec![entry]),
+            }
         }
 
         if let Some(loser) = &superseded {

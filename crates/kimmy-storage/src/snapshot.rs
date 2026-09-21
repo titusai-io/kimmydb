@@ -1287,16 +1287,23 @@ impl Engine {
                 // would leave a collection that silently stopped expiring.
                 index.expire_after_secs,
                 index.partial_filter.clone(),
-                // The definition's own creation stamp, which is the only
-                // ordering fact a snapshot carries — there is no entry behind
-                // it. A name already held here by a different definition is
-                // resolved against it exactly as a replicated `CreateIndex`
-                // is (ADR-132); a definition already here under this name is
-                // returned unchanged, which is what makes calling this for
-                // every index of the page cheap. A snapshot written before
-                // the stamp existed carries none, and such a rival is refused
-                // and counted rather than silently skipped as it was.
-                crate::index::CreateOrigin::Replicated(index.created),
+                // The definition's own creation stamp, the one ordering fact
+                // the page carries for it. A name already held here by a
+                // different definition is resolved against it exactly as a
+                // replicated `CreateIndex` is (ADR-132), and a definition
+                // already here under this name is returned unchanged. A
+                // snapshot written before the stamp existed carries none, and
+                // such a rival is refused and counted rather than silently
+                // skipped as it was.
+                //
+                // With a stamp, the entry behind the definition is rebuilt at
+                // it and appended with the restore (ADR-180): the page grants
+                // this node coverage of that stamp, and without the entry the
+                // node would serve windows across it that leave the index out.
+                match index.created {
+                    Some(created) => crate::index::CreateOrigin::Restored(created),
+                    None => crate::index::CreateOrigin::Replicated(None),
+                },
                 &|standing, _| earlier(standing),
             );
             match crate::sync::settle(created)? {
@@ -5036,65 +5043,13 @@ mod tests {
     }
 }
 
+/// ADR-180: a snapshot restore appends the entry behind each index definition
+/// it restores, at the origin's stamp, so that the member can serve onward
+/// what it holds.
 #[cfg(test)]
-mod relog_feasibility {
+mod relog {
     use super::*;
-    use bson::doc;
-
-    fn engine() -> (Engine, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
-    }
-
-    /// A `DropCollection` body is `CollectionRef { db, name }`. Can a member
-    /// that restored the drop from a whole-database page name the collection?
-    #[test]
-    fn a_restored_drop_carries_no_name_to_rebuild_its_entry_from() {
-        let (a, _da) = engine();
-        let (p, _dp) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        a.insert(&ca, doc! { "_id": 1 }).unwrap();
-        a.drop_collection("shop", "orders").unwrap();
-        a.create_collection("shop", "keep").unwrap();
-
-        // P is fresh: it never held `shop.orders`.
-        let mut progress = SnapshotProgress::whole_database();
-        while !progress.is_complete() {
-            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            assert!(
-                page.collections.iter().all(|c| c.name != "orders"),
-                "a dropped collection is not among the page's live definitions"
-            );
-            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-        }
-
-        // P holds the tombstone, by id.
-        assert!(
-            p.collection_dropped_at(ca.id).unwrap().is_some(),
-            "P restored the drop, so it holds the tombstone"
-        );
-        // But nothing on P can turn that id back into `("shop", "orders")`.
-        assert!(
-            p.collection_by_id(ca.id).unwrap().is_none(),
-            "and holds no definition to read the name from"
-        );
-        assert_eq!(
-            kimmy_core::CollectionId::derive("shop", "orders"),
-            ca.id,
-            "the id is a hash of db and name, so it cannot be inverted"
-        );
-    }
-}
-
-/// Which schema changes carry enough to rebuild their originating entry?
-///
-/// An `OplogEntry` needs a full `Stamp { hlc, node }`. These tests ask, per
-/// case, whether the page carries one -- and what the only available
-/// substitute, the sending member's node id, is worth at two hops.
-#[cfg(test)]
-mod what_the_page_carries {
-    use super::*;
-    use bson::doc;
+    use bson::{Bson, doc};
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -5105,88 +5060,426 @@ mod what_the_page_carries {
         crate::meta::IndexField { path: path.into(), descending: false }
     }
 
-    fn snapshot(into: &Engine, from: &Engine) {
+    /// A page as the transport carries it: through BSON. A rebuilt entry is
+    /// only as exact as the definition that reaches the receiver, and the
+    /// in-process transfer never serialises.
+    fn over_the_wire(page: SnapshotPage) -> SnapshotPage {
+        bson::deserialize_from_slice(&bson::serialize_to_vec(&page).unwrap()).unwrap()
+    }
+
+    /// A whole-database snapshot of `from` into `into`, page by page.
+    fn transfer(into: &Engine, from: &Engine) -> Result<()> {
         let mut progress = SnapshotProgress::whole_database();
         while !progress.is_complete() {
-            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope())?;
+            into.apply_snapshot_page(from.node_id(), &mut progress, &over_the_wire(page))?;
+        }
+        Ok(())
+    }
+
+    /// Every `CreateIndex` entry `engine` holds, as the bytes it stores.
+    fn index_entries(engine: &Engine) -> Vec<(Stamp, Vec<u8>)> {
+        engine
+            .entries_for_peer(Hlc::ZERO, 10_000)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind == OpKind::CreateIndex)
+            .map(|e| (e.stamp, codec::encode_oplog_entry(&e)))
+            .collect()
+    }
+
+    fn logged(entry: &OplogEntry) -> kimmy_core::IndexCreate {
+        bson::deserialize_from_slice(entry.body.as_ref().unwrap()).unwrap()
+    }
+
+    /// `A` holds `shop.orders` with an index `by_x` it created, and returns
+    /// the entry it logged for it. Made so that an entry logged as observed,
+    /// or as sent, would differ from any rebuild: the collection already
+    /// holds an array when the index is created, so the origin's own build
+    /// is multikey — while a fresh receiver restores definitions before
+    /// documents, and its build is not; and the partial filter holds an
+    /// `Int64` small enough for the metadata encoding to read back as an
+    /// `Int32`.
+    fn origin_with_an_index(a: &Engine) -> OplogEntry {
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1, "x": [1, 2], "tier": "gold", "age": 30_i64 }).unwrap();
+        let sent = doc! { "tier": "gold", "age": { "$gte": 5_i64 } };
+        let created = a
+            .create_index_with(
+                "shop",
+                "orders",
+                vec![field("x")],
+                false,
+                crate::meta::Enforcement::Local,
+                Some("by_x".into()),
+                None,
+                Some(sent.clone()),
+            )
+            .unwrap();
+        a.insert(&orders, doc! { "_id": 2, "x": 2, "tier": "gold", "age": 40_i64 }).unwrap();
+
+        // What the fixture has to be able to see. Were either premise to stop
+        // holding, the entry would equal a rebuild whether or not the origin
+        // normalised it, and the tests below would pass without testing that.
+        assert!(created.multikey, "premise: the origin's build of the index is multikey");
+        let standing = a.get_collection("shop", "orders").unwrap();
+        assert_ne!(
+            standing.index("by_x").unwrap().partial_filter.as_ref(),
+            Some(&sent),
+            "premise: the filter every member stores is not the one the client sent"
+        );
+        let stamp = created.created.expect("a local create stamps the definition");
+        let entry = a.oplog_entry(&stamp).unwrap().expect("the origin logged the create");
+        assert!(!logged(&entry).index.multikey, "the origin's entry is not multikey");
+        entry
+    }
+
+    #[test]
+    fn the_metadata_encoding_of_a_filter_is_idempotent() {
+        // What makes a rebuilt entry exact. The origin logs a definition as
+        // it is stored, and a rebuild logs one a page carried, which was
+        // stored and is logged as stored again: equal only if storing twice
+        // is storing once. Every BSON type a filter can hold, including the
+        // two the encoding changes.
+        let filter = doc! {
+            "int32": 5_i32, "int64-small": 5_i64, "int64-large": 5_000_000_000_i64,
+            "double": 1.0_f64, "string": "s", "bool": true, "null": Bson::Null,
+            "date": bson::DateTime::from_millis(1_700_000_000_000),
+            "oid": bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap(),
+            "binary": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![1, 2] },
+            "uuid": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: vec![0; 16] },
+            "array": [1_i64, 2], "nested": { "z": 1_i64, "a": 2 },
+            "timestamp": Bson::Timestamp(bson::Timestamp { time: 5, increment: 1 }),
+            "regex": Bson::RegularExpression(bson::Regex {
+                pattern: "^a".try_into().unwrap(),
+                options: "i".try_into().unwrap(),
+            }),
+            "code": Bson::JavaScriptCode("x".into()), "symbol": Bson::Symbol("s".into()),
+            "max": Bson::MaxKey, "min": Bson::MinKey, "undefined": Bson::Undefined,
+        };
+        let store = |f: &bson::Document| -> bson::Document {
+            let index = IndexMeta {
+                id: 0,
+                name: "f".into(),
+                fields: vec![field("f")],
+                unique: false,
+                enforcement: Default::default(),
+                multikey: false,
+                expire_after_secs: None,
+                partial_filter: Some(f.clone()),
+                created: None,
+            };
+            let meta: IndexMeta =
+                serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            meta.partial_filter.unwrap()
+        };
+        let once = store(&filter);
+        assert_ne!(once, filter, "premise: the encoding is not the identity on this filter");
+        assert_eq!(store(&once), once);
+    }
+
+    #[test]
+    fn a_restored_definition_is_logged_at_the_origins_stamp_in_the_origins_bytes() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let origin = origin_with_an_index(&a);
+
+        transfer(&p, &a).unwrap();
+
+        assert_eq!(
+            index_entries(&p),
+            vec![(origin.stamp, codec::encode_oplog_entry(&origin))],
+            "P holds the origin's entry, byte for byte, and nothing else"
+        );
+        assert_eq!(p.ddl_relogged(), 1, "counted once");
+    }
+
+    #[test]
+    fn a_member_whose_documents_make_the_index_multikey_rebuilds_the_same_bytes() {
+        // The other side of `multikey`. The origin created the index over no
+        // array; this member already holds one, so its own build of the
+        // restored definition is multikey, and an entry logged as observed
+        // would say so under the origin's stamp.
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1, "x": 1 }).unwrap();
+        p.apply_batch(&a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries).unwrap();
+        let held = p.get_collection("shop", "orders").unwrap();
+        p.insert(&held, doc! { "_id": 2, "x": [3, 4] }).unwrap();
+        let created =
+            a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        assert!(!created.multikey, "premise: the origin's build is not multikey");
+        let origin = a.oplog_entry(&created.created.unwrap()).unwrap().unwrap();
+
+        transfer(&p, &a).unwrap();
+
+        let rebuilt = p.get_collection("shop", "orders").unwrap();
+        assert!(rebuilt.index("by_x").unwrap().multikey, "premise: this member's build is");
+        assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
+    }
+
+    #[test]
+    fn a_second_hop_relogs_the_origins_stamp_and_not_the_senders() {
+        // One hop cannot tell "at the origin's stamp" from "at the sender's":
+        // at one hop they are the same member. At two they are not.
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let (q, _dq) = engine();
+        let origin = origin_with_an_index(&a);
+
+        transfer(&p, &a).unwrap();
+        transfer(&q, &p).unwrap();
+
+        assert_ne!(p.node_id(), a.node_id(), "premise: Q's sender is not the origin");
+        assert_eq!(
+            index_entries(&q),
+            vec![(origin.stamp, codec::encode_oplog_entry(&origin))],
+            "Q holds A's entry, at A's stamp, in A's bytes: minted by nobody"
+        );
+        assert_eq!(index_entries(&p), index_entries(&q), "and the same one P holds");
+        assert_eq!(q.ddl_relogged(), 1);
+    }
+
+    #[test]
+    fn a_relogged_entry_moves_no_coverage_until_the_snapshot_grants_it() {
+        // State, not history, until the snapshot completes: part-way through,
+        // this member holds the entry but not the origin's history around it,
+        // and a window served across it would be the hole ADR-148 closes.
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let origin = origin_with_an_index(&a);
+        let orders = a.get_collection("shop", "orders").unwrap();
+        for i in 10..10 + SNAPSHOT_PAGE as i64 {
+            a.insert(&orders, doc! { "_id": i, "x": i }).unwrap();
+        }
+
+        let mut progress = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some(), "premise: the snapshot takes more than one page");
+        p.apply_snapshot_page(a.node_id(), &mut progress, &over_the_wire(first)).unwrap();
+        assert!(
+            p.oplog_entry(&origin.stamp).unwrap().is_some(),
+            "the entry is appended with the definition, on the first page"
+        );
+        assert_eq!(p.version_vector().unwrap().get(a.node_id()), Hlc::ZERO, "and covers nothing");
+
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut progress, &over_the_wire(page)).unwrap();
+        }
+        assert!(p.version_vector().unwrap().get(a.node_id()) >= origin.stamp.hlc, "until granted");
+        assert_eq!(p.held_len().unwrap(), 0, "and the grant releases its mark");
+    }
+
+    #[test]
+    fn the_entry_commits_with_the_definition_or_not_at_all() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let origin = origin_with_an_index(&a);
+
+        crate::engine::relog_hooks::fail_next();
+        assert!(transfer(&p, &a).is_err(), "premise: the injected failure was reached");
+
+        let held = p.get_collection("shop", "orders").expect("the collection is its own commit");
+        assert!(
+            held.index("by_x").is_none(),
+            "a definition committed without its entry is the defect, for as long as it lasts"
+        );
+        assert!(p.oplog_entry(&origin.stamp).unwrap().is_none());
+        assert_eq!(p.ddl_relogged(), 0);
+
+        transfer(&p, &a).unwrap();
+        assert!(p.get_collection("shop", "orders").unwrap().index("by_x").is_some());
+        assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
+        assert_eq!(p.ddl_relogged(), 1);
+    }
+
+    #[test]
+    fn a_restore_appends_nothing_a_member_already_holds() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let origin = origin_with_an_index(&a);
+
+        // Twice from the origin: the second finds the definition and the
+        // entry both here.
+        transfer(&p, &a).unwrap();
+        transfer(&p, &a).unwrap();
+        assert_eq!(p.ddl_relogged(), 1, "the second restore appended nothing");
+
+        // And the origin re-serving the entry in a window after the restore
+        // does not give it a second copy.
+        p.apply_batch(std::slice::from_ref(&origin)).unwrap();
+        assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
+    }
+
+    #[test]
+    fn a_member_holding_the_origins_entry_keeps_its_bytes_through_a_restore() {
+        // What an origin logged before ADR-180, for an index created over
+        // documents that already held arrays: the multikey it observed. A
+        // rebuild cannot produce it, so a restore that wrote over it would
+        // replace the origin's entry with a reconstruction under the
+        // origin's stamp.
+        let (a, _da) = engine();
+        let (m, _dm) = engine();
+        let current = origin_with_an_index(&a);
+        let mut before = logged(&current);
+        before.index.multikey = true;
+        let older = crate::engine::ddl_entry(
+            current.stamp,
+            OpKind::CreateIndex,
+            current.collection,
+            &before,
+        )
+        .unwrap();
+
+        // M took it from the origin through the entries path.
+        let orders = m.create_collection("shop", "orders").unwrap();
+        m.insert(&orders, doc! { "_id": 1, "x": 1, "tier": "gold", "age": 30_i64 }).unwrap();
+        m.apply_batch(std::slice::from_ref(&older)).unwrap();
+        let held = m.oplog_entry(&older.stamp).unwrap().expect("M holds the entry");
+        // The fixture must hold what the guard is for. If it ever stops --
+        // regenerated from a build that normalises -- the rewrite changes
+        // nothing and this test stops being able to see the guard.
+        assert!(logged(&held).index.multikey, "premise: M holds an entry logged with multikey");
+        assert_ne!(
+            codec::encode_oplog_entry(&held),
+            codec::encode_oplog_entry(&current),
+            "premise: and a rebuild would differ from it"
+        );
+
+        transfer(&m, &a).unwrap();
+
+        assert_eq!(
+            codec::encode_oplog_entry(&m.oplog_entry(&older.stamp).unwrap().unwrap()),
+            codec::encode_oplog_entry(&held),
+            "the entry M already held is untouched"
+        );
+        assert_eq!(m.ddl_relogged(), 0);
+    }
+
+    /// [`transfer`], from a sender whose build recorded no creation stamp on
+    /// an index definition.
+    fn transfer_without_stamps(into: &Engine, from: &Engine) {
+        let mut progress = SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let mut page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            for state in &mut page.collections {
+                for index in &mut state.indexes {
+                    index.created = None;
+                }
+            }
             into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
         }
     }
 
     #[test]
-    fn an_index_definition_carries_its_origin_stamp_across_two_hops() {
+    fn a_definition_restored_without_a_stamp_appends_nothing() {
+        // There is no stamp to append an entry at, and one invented here
+        // would be minting.
         let (a, _da) = engine();
         let (p, _dp) = engine();
-        let (q, _dq) = engine();
-        a.create_collection("shop", "orders").unwrap();
-        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
-        let origin = a.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
-        assert!(origin.is_some(), "a local create stamps the definition");
-        assert_eq!(origin.unwrap().node, a.node_id(), "at A, the origin");
+        origin_with_an_index(&a);
 
-        snapshot(&p, &a);
-        snapshot(&q, &p);
+        transfer_without_stamps(&p, &a);
 
-        let at_q = q.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
-        assert_eq!(at_q, origin, "the origin stamp, node included, survives both hops");
-        assert_ne!(p.node_id(), a.node_id(), "and P is not A");
+        assert!(p.get_collection("shop", "orders").unwrap().index("by_x").is_some());
+        assert!(index_entries(&p).is_empty());
+        assert_eq!(p.ddl_relogged(), 0);
     }
 
     #[test]
-    fn a_collection_creation_carries_no_origin_node_and_the_sender_is_the_wrong_one() {
+    fn a_definition_held_without_a_stamp_takes_the_pages_stamp_and_its_entry() {
+        // The settle that adopts a stamp commits it with the entry at it.
         let (a, _da) = engine();
         let (p, _dp) = engine();
-        let (q, _dq) = engine();
-        let ca = a.create_collection("shop", "orders").unwrap();
-        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        let origin = origin_with_an_index(&a);
+        transfer_without_stamps(&p, &a);
+        let held = p.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_x").unwrap().created, None, "premise: held with no stamp");
 
-        // The page says WHEN, never WHO: `CollectionState.created` is an Hlc.
-        let page = a.snapshot_page(None, None).unwrap();
-        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
-        assert_eq!(state.created, Some(ca.created), "the creation Hlc travels");
-        // ...and there is no node beside it. The only node a receiver has is
-        // the one it was handed, which is the SENDER.
-        snapshot(&p, &a);
-        snapshot(&q, &p);
-        assert_eq!(
-            q.get_collection("shop", "orders").unwrap().created,
-            ca.created,
-            "the Hlc reaches Q intact"
-        );
-        // At hop two the sender is P, not A. Substituting the sender's node
-        // would attribute A's creation to P.
-        assert_ne!(p.node_id(), a.node_id(), "the sender at Q's hop is not the origin");
+        transfer(&p, &a).unwrap();
+
+        let held = p.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_x").unwrap().created, Some(origin.stamp));
+        assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
+        assert_eq!(p.ddl_relogged(), 1);
     }
 
     #[test]
-    fn a_vector_configuration_carries_no_stamp_at_all() {
+    fn a_definition_already_held_gets_its_entry_from_a_restore_when_the_oplog_lacks_it() {
+        // A definition standing here under the page's stamp, with no entry
+        // behind it -- retention collected it, or a restore made before
+        // ADR-180 never wrote one. The entries path appends a creation of a
+        // definition it already holds, and so does a restore.
         let (a, _da) = engine();
-        a.create_collection("shop", "orders").unwrap();
-        a.configure_vectors(
-            "shop",
-            "orders",
-            kimmy_core::VectorConfig {
-                fields: vec!["text".into()],
-                provider: kimmy_core::ProviderConfig::Byo {},
-                dim: 4,
-                metric: Default::default(),
-                document_prefix: None,
-                query_prefix: None,
-                chunk: Default::default(),
-            },
+        let (p, _dp) = engine();
+        let origin = origin_with_an_index(&a);
+        transfer(&p, &a).unwrap();
+        p.collect_garbage_at(
+            crate::physical_now_ms() + 1_000_000_000,
+            crate::RetentionPolicy::new(0, u64::MAX),
         )
         .unwrap();
-        let page = a.snapshot_page(None, None).unwrap();
-        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
-        assert!(state.vector.is_some(), "the configuration travels");
-        // `VectorConfig` is the configuration only. Nothing on the page, and
-        // nothing on `CollectionMeta`, records when it was made or by whom.
-        let held = a.get_collection("shop", "orders").unwrap();
-        assert!(held.vector.is_some());
-        assert_eq!(
-            held.created,
-            a.get_collection("shop", "orders").unwrap().created,
-            "the only stamp on the meta is the collection's own creation"
-        );
+        let held = p.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_x").unwrap().created, Some(origin.stamp), "premise: held");
+        assert!(index_entries(&p).is_empty(), "premise: with no entry behind it");
+
+        transfer(&p, &a).unwrap();
+
+        assert_eq!(index_entries(&p), vec![(origin.stamp, codec::encode_oplog_entry(&origin))]);
+        assert_eq!(p.ddl_relogged(), 2, "the first restore's entry, and this one");
+    }
+
+    #[test]
+    fn a_local_create_logs_the_definition_and_not_what_it_observed() {
+        // The origin half of ADR-180's rule. An index created over documents
+        // that already hold arrays is multikey here from its first commit,
+        // and its entry says `false` all the same.
+        let (a, _da) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 1, "tags": ["a", "b"] }).unwrap();
+        let created = a.create_index("shop", "orders", vec![field("tags")], false, None).unwrap();
+
+        assert!(created.multikey, "the definition returned and stored is what was observed");
+        let entry = a.oplog_entry(&created.created.unwrap()).unwrap().unwrap();
+        assert!(!logged(&entry).index.multikey, "the entry carries the definition alone");
+    }
+
+    #[test]
+    fn a_receiver_sets_multikey_from_its_own_documents_whatever_the_entry_says() {
+        // Why logging `false` loses nothing: no receiver reads the field. The
+        // same entry, logged either way, makes one member multikey and leaves
+        // another not, by what each holds.
+        let (a, _da) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let created = a.create_index("shop", "orders", vec![field("tags")], false, None).unwrap();
+        let entry = a.oplog_entry(&created.created.unwrap()).unwrap().unwrap();
+        let _ = orders;
+
+        for says in [false, true] {
+            let mut body = logged(&entry);
+            body.index.multikey = says;
+            let sent =
+                crate::engine::ddl_entry(entry.stamp, OpKind::CreateIndex, entry.collection, &body)
+                    .unwrap();
+
+            let (arrays, _d1) = engine();
+            let held = arrays.create_collection("shop", "orders").unwrap();
+            arrays.insert(&held, doc! { "_id": 1, "tags": ["a", "b"] }).unwrap();
+            arrays.apply_batch(std::slice::from_ref(&sent)).unwrap();
+
+            let (scalars, _d2) = engine();
+            let held = scalars.create_collection("shop", "orders").unwrap();
+            scalars.insert(&held, doc! { "_id": 1, "tags": "a" }).unwrap();
+            scalars.apply_batch(std::slice::from_ref(&sent)).unwrap();
+
+            let multikey = |e: &Engine| {
+                e.get_collection("shop", "orders").unwrap().index("tags_1").unwrap().multikey
+            };
+            assert!(multikey(&arrays), "an entry saying {says}: arrays here make it multikey");
+            assert!(!multikey(&scalars), "an entry saying {says}: none here leaves it not");
+        }
     }
 }

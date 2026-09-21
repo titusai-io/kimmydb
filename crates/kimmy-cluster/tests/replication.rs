@@ -5247,3 +5247,106 @@ async fn a_window_applied_before_its_round_fails_is_still_a_pull() {
     assert!(seen.serve.count >= 1, "the applied window is a pull: {seen:?}");
     assert!(seen.entries >= 51, "carrying what it applied: {seen:?}");
 }
+
+// ---------------------------------------------------------------------------
+// ADR-180: a member that caught up by snapshot serves onward the index
+// definitions it restored. `m` holds a prefix of `a`'s history and is behind
+// the change; `a`'s oplog is then aged out entirely, so `p` joining afresh can
+// only catch up by snapshot -- state, with no entry behind it until this
+// record. `m` then syncs from `p` alone, through real rounds.
+// ---------------------------------------------------------------------------
+
+/// Age `engine`'s oplog out completely, so a peer behind it must snapshot.
+fn age_out_fully(engine: &Engine) {
+    engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+}
+
+/// `a` with `shop.orders` and a document `m` has already pulled; then the
+/// index `by_x` and a second document, which `m` has not.
+/// Whether `engine` still holds the entry for `a`'s index `by_x`: without
+/// it, a member that lacks the index can only have it from `engine` by
+/// snapshot.
+fn holds_the_index_entry(engine: &Engine, a: &Engine) -> bool {
+    let stamp = a.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+    engine.oplog_entry(&stamp.unwrap()).unwrap().is_some()
+}
+
+async fn origin_ahead_of_m_by_an_index() -> (Node, Node) {
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+
+    a.engine.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    (a, m)
+}
+
+#[tokio::test]
+async fn an_index_restored_by_snapshot_relays_to_a_member_that_holds_the_collection() {
+    // The reproduction. Before ADR-180 `p` served `m` a window with the
+    // document after the index and not the index, `m` witnessed past it, and
+    // nothing ever served it again.
+    let (a, m) = origin_ahead_of_m_by_an_index().await;
+    age_out_fully(&a.engine);
+    assert!(
+        !holds_the_index_entry(&a.engine, &a.engine),
+        "premise: p can only have it by snapshot"
+    );
+
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    sync_once(&m.engine, p.addr, SECRET, None).await.unwrap();
+
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(m.engine.count(&held).unwrap(), 2, "m took the window: {:?}", held.indexes);
+    assert!(held.index("by_x").is_some(), "and the index in it: {:?}", held.indexes);
+    assert_eq!(p.engine.ddl_relogged(), 1, "counted where p re-logged it");
+}
+
+#[tokio::test]
+async fn control_the_same_relay_without_the_snapshot_hop() {
+    // Same topology, `a`'s oplog left intact, so `p` catches up by entries.
+    // Passing on main as well: the relay is sound, and the hop is the whole
+    // difference.
+    let (a, m) = origin_ahead_of_m_by_an_index().await;
+
+    assert!(holds_the_index_entry(&a.engine, &a.engine), "premise: p can have it by entries");
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    sync_once(&m.engine, p.addr, SECRET, None).await.unwrap();
+
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_some(), "control: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn an_index_relays_through_two_snapshot_hops() {
+    // `q` catches up from `p` by snapshot too, so what `q` serves `m` is a
+    // re-log of a re-log -- at `a`'s stamp, never at `p`'s.
+    let (a, m) = origin_ahead_of_m_by_an_index().await;
+    let stamp = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+    age_out_fully(&a.engine);
+
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    age_out_fully(&p.engine);
+    assert!(
+        !holds_the_index_entry(&p.engine, &a.engine),
+        "premise: q can only have it by snapshot"
+    );
+    let q = node().await;
+    sync_once(&q.engine, p.addr, SECRET, None).await.unwrap();
+
+    sync_once(&m.engine, q.addr, SECRET, None).await.unwrap();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_some(), "m learned the index from q: {:?}", held.indexes);
+    let entry = q.engine.oplog_entry(&stamp.unwrap()).unwrap().expect("q holds the entry");
+    assert_eq!(entry.stamp.node, a.engine.node_id(), "at a's stamp, not p's");
+}
