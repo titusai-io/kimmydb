@@ -426,22 +426,40 @@ mod tests {
         // A test that only checked the documents arrived passed under both.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
+        // Two collections, both moved: each one's clear of its old range must
+        // leave the other's documents and index entries where they are.
         {
             let engine = Engine::open(&path).unwrap();
-            engine.create_collection("shop", "orders").unwrap();
-            engine.create_index("shop", "orders", vec![field("item")], false, None).unwrap();
-            let orders = engine.get_collection("shop", "orders").unwrap();
-            let docs: Vec<bson::Document> =
-                (0..5_000i64).map(|i| doc! { "_id": i, "item": format!("w{i}") }).collect();
-            engine.insert_many(&orders, docs).unwrap();
+            for name in ["orders", "lines"] {
+                engine.create_collection("shop", name).unwrap();
+                engine.create_index("shop", name, vec![field("item")], false, None).unwrap();
+                let coll = engine.get_collection("shop", name).unwrap();
+                let docs: Vec<bson::Document> =
+                    (0..5_000i64).map(|i| doc! { "_id": i, "item": format!("w{i}") }).collect();
+                engine.insert_many(&coll, docs).unwrap();
+            }
         }
-        rewind_to_schema_1(&path, &[("shop", "orders", 7)]);
+        rewind_to_schema_1(&path, &[("shop", "orders", 7), ("shop", "lines", 8)]);
         let before = std::fs::metadata(&path).unwrap().len();
 
         let engine = Engine::open(&path).unwrap();
 
-        let orders = engine.get_collection("shop", "orders").unwrap();
-        assert_eq!(engine.count(&orders).unwrap(), 5_000, "premise: the migration moved them");
+        for name in ["orders", "lines"] {
+            let coll = engine.get_collection("shop", name).unwrap();
+            assert_eq!(engine.count(&coll).unwrap(), 5_000, "{name}: every document moved");
+            let index = &coll.indexes[0];
+            let entries = crate::index::scan_range(
+                engine.db(),
+                coll.id,
+                index.id,
+                &[],
+                None,
+                crate::index::Unkeyed::Include,
+            )
+            .unwrap()
+            .len();
+            assert_eq!(entries, 5_000, "{name}: every index entry moved");
+        }
         let after = std::fs::metadata(&path).unwrap().len();
         assert!(
             after <= before + before / 4,

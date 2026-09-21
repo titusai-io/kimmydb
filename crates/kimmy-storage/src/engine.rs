@@ -1139,9 +1139,15 @@ impl Engine {
                 if batch.is_empty() {
                     break;
                 }
-                for seq in batch {
-                    arrival.remove(seq)?;
+                let mut gone = 0;
+                for seq in &batch {
+                    #[cfg(test)]
+                    if crate::index::clear_hooks::keeps("the arrival index") {
+                        continue;
+                    }
+                    gone += usize::from(arrival.remove(*seq)?.is_some());
                 }
+                crate::index::ensure_removed(batch.len(), gone, "the arrival index")?;
             }
             loop {
                 let batch: Vec<Vec<u8>> = by_stamp
@@ -1152,9 +1158,15 @@ impl Engine {
                 if batch.is_empty() {
                     break;
                 }
+                let mut gone = 0;
                 for key in &batch {
-                    by_stamp.remove(key.as_slice())?;
+                    #[cfg(test)]
+                    if crate::index::clear_hooks::keeps("the arrival index by stamp") {
+                        continue;
+                    }
+                    gone += usize::from(by_stamp.remove(key.as_slice())?.is_some());
                 }
+                crate::index::ensure_removed(batch.len(), gone, "the arrival index by stamp")?;
             }
 
             let mut seq = 0u64;
@@ -5004,23 +5016,7 @@ mod clearing {
     fn rebuilding_the_arrival_index_does_not_grow_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
-        {
-            let engine = super::Engine::open(&path).unwrap();
-            let t = engine.create_collection("shop", "t").unwrap();
-            let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
-            engine.insert_many(&t, docs).unwrap();
-        }
-        {
-            // One row short, as a database an older build appended to is.
-            let db = redb::Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            {
-                let mut arrival = txn.open_table(crate::tables::OPLOG_ARRIVAL).unwrap();
-                let last = arrival.last().unwrap().map(|(k, _)| k.value()).unwrap();
-                arrival.remove(last).unwrap();
-            }
-            txn.commit().unwrap();
-        }
+        let written = one_arrival_row_short(&path);
         let before = file(&path);
 
         // Measured with the engine still open: redb hands the growth back
@@ -5034,8 +5030,55 @@ mod clearing {
         let oplog = txn.open_table(crate::tables::OPLOG).unwrap().len().unwrap();
         let arrival = txn.open_table(crate::tables::OPLOG_ARRIVAL).unwrap().len().unwrap();
         let by_stamp = txn.open_table(crate::tables::OPLOG_ARRIVAL_SEQ).unwrap().len().unwrap();
+        // The oplog is the neighbour: the rebuild clears the two index
+        // tables whole and refills them from it, so a clear that reached it
+        // too would leave all three empty and equal.
+        assert_eq!(oplog, written, "the oplog the index is rebuilt from is untouched");
         assert_eq!((arrival, by_stamp), (oplog, oplog), "premise: the index was rebuilt");
         assert_no_growth(before, during, "rebuilding the arrival index");
+    }
+
+    /// A database of 5,000 documents whose arrival index is one row short,
+    /// as a database an older build appended to is. Answers how many oplog
+    /// entries it holds.
+    fn one_arrival_row_short(path: &std::path::Path) -> u64 {
+        {
+            let engine = super::Engine::open(path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
+            engine.insert_many(&t, docs).unwrap();
+        }
+        let db = redb::Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        let written = {
+            let mut arrival = txn.open_table(crate::tables::OPLOG_ARRIVAL).unwrap();
+            let last = arrival.last().unwrap().map(|(k, _)| k.value()).unwrap();
+            arrival.remove(last).unwrap();
+            txn.open_table(crate::tables::OPLOG).unwrap().len().unwrap()
+        };
+        txn.commit().unwrap();
+        assert!(written > 5_000, "premise: every insert is in the oplog");
+        written
+    }
+
+    #[test]
+    fn an_arrival_rebuild_whose_keys_do_not_go_stops_instead_of_spinning() {
+        // Each of the rebuild's two clears, on its own.
+        for table in ["the arrival index", "the arrival index by stamp"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("kimmy.redb");
+            one_arrival_row_short(&path);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                crate::index::clear_hooks::keep_keys_of(table);
+                let _ = tx.send(super::Engine::open(&path).map(drop).map_err(|e| e.to_string()));
+            });
+            let outcome = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("clearing {table} never returned"));
+            let err = outcome.expect_err("an open whose rebuild cannot clear reports it");
+            assert!(err.contains(&format!("clearing {table}:")), "{err}");
+        }
     }
 
     #[test]
@@ -5057,9 +5100,29 @@ mod clearing {
             }
             let held = p.held_len().unwrap();
             assert!(held > 1_000, "premise: the final page's grant has marks to release: {held}");
+            // The neighbour: a mark from an origin the grant does not mention,
+            // which it must keep. A release that cleared the whole table would
+            // otherwise pass as one that released exactly what it covers.
+            let stranger = kimmy_core::NodeId::from_bytes([7; 16]);
+            let kept = crate::codec::oplog_key(&kimmy_core::Stamp::new(
+                kimmy_core::Hlc::new(1_000, 0),
+                stranger,
+            ));
+            {
+                let txn = p.db().begin_write().unwrap();
+                txn.open_table(crate::tables::OPLOG_HELD)
+                    .unwrap()
+                    .insert(kept.as_slice(), ())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
             let before = file(&path);
             p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-            assert_eq!(p.held_len().unwrap(), 0, "the grant released every mark it covers");
+            assert_eq!(
+                p.held_len().unwrap(),
+                1,
+                "the grant released every mark it covers, and kept the one it does not"
+            );
             assert_no_growth(before, file(&path), "the final page's release");
             break;
         }
