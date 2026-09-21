@@ -1127,8 +1127,35 @@ impl Engine {
             let oplog = txn.open_table(tables::OPLOG)?;
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
-            arrival.retain(|_, _| false)?;
-            by_stamp.retain(|_, _| false)?;
+            // Cleared by key, a batch at a time, never with `retain`: see
+            // `index::clear_index_entries` for what `retain` costs. Both
+            // tables are one row per oplog entry.
+            loop {
+                let batch: Vec<u64> = arrival
+                    .iter()?
+                    .take(crate::index::CLEAR_BATCH)
+                    .map(|row| Ok(row?.0.value()))
+                    .collect::<Result<_>>()?;
+                if batch.is_empty() {
+                    break;
+                }
+                for seq in batch {
+                    arrival.remove(seq)?;
+                }
+            }
+            loop {
+                let batch: Vec<Vec<u8>> = by_stamp
+                    .iter()?
+                    .take(crate::index::CLEAR_BATCH)
+                    .map(|row| Ok(row?.0.value().to_vec()))
+                    .collect::<Result<_>>()?;
+                if batch.is_empty() {
+                    break;
+                }
+                for key in &batch {
+                    by_stamp.remove(key.as_slice())?;
+                }
+            }
 
             let mut seq = 0u64;
             for row in oplog.iter()? {
@@ -1731,31 +1758,65 @@ impl Engine {
     /// rebuild able to re-derive the coverage it is there to re-derive.
     ///
     /// The table is NOT bounded by "a snapshot in flight" -- see the note on
-    /// `OPLOG_HELD` -- so this removes in place rather than collecting the
-    /// covered keys first. Materialising them would put an allocation
-    /// proportional to a repaired collection inside the final page's write
-    /// transaction, holding the single writer while it built.
+    /// `OPLOG_HELD` -- so the covered keys are gathered and removed a batch at
+    /// a time, resuming after the last key examined. Gathering them all first
+    /// would put an allocation proportional to a repaired collection inside
+    /// the final page's write transaction.
+    ///
+    /// **Not redb's `retain`**, which this used to be: on a snapshot's final
+    /// page releasing 19,968 marks it grew the file from 17 to 145 MiB inside
+    /// the transaction, while every page before it grew nothing. See
+    /// `index::clear_index_entries` for what `retain` costs.
     fn release_held_under(
         txn: &redb::WriteTransaction,
         granted: &kimmy_core::VersionVector,
     ) -> Result<bool> {
+        use std::ops::Bound;
+        let mut held = txn.open_table(tables::OPLOG_HELD)?;
         let mut released = false;
-        txn.open_table(tables::OPLOG_HELD)?.retain(|key, ()| {
-            let Ok(stamp) = codec::decode_oplog_key(key) else {
-                // A key this build cannot read is kept. Dropping it would
-                // silently raise the position over whatever it named.
-                return true;
-            };
-            // `get` answers `Hlc::ZERO` for an origin the grant does not
-            // mention, so such an entry is covered only if its own stamp is
-            // ZERO — which no real entry's is, since `HlcClock::tick` never
-            // mints one. An unmentioned origin therefore keeps its marks,
-            // which is the conservative half.
-            let covered = stamp.hlc <= granted.get(stamp.node);
-            released |= covered;
-            !covered
-        })?;
-        Ok(released)
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let mut covered: Vec<Vec<u8>> = Vec::new();
+            let mut last = None;
+            let mut exhausted = true;
+            {
+                let from = match &after {
+                    Some(key) => Bound::Excluded(key.as_slice()),
+                    None => Bound::Unbounded,
+                };
+                for row in held.range::<&[u8]>((from, Bound::Unbounded))? {
+                    let (key, _) = row?;
+                    let key = key.value();
+                    last = Some(key.to_vec());
+                    // A key this build cannot read is kept. Dropping it would
+                    // silently raise the position over whatever it named.
+                    let Ok(stamp) = codec::decode_oplog_key(key) else {
+                        continue;
+                    };
+                    // `get` answers `Hlc::ZERO` for an origin the grant does
+                    // not mention, so such an entry is covered only if its own
+                    // stamp is ZERO — which no real entry's is, since
+                    // `HlcClock::tick` never mints one. An unmentioned origin
+                    // therefore keeps its marks, which is the conservative
+                    // half.
+                    if stamp.hlc <= granted.get(stamp.node) {
+                        covered.push(key.to_vec());
+                        if covered.len() == crate::index::CLEAR_BATCH {
+                            exhausted = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            for key in &covered {
+                held.remove(key.as_slice())?;
+            }
+            released |= !covered.is_empty();
+            if exhausted {
+                return Ok(released);
+            }
+            after = last;
+        }
     }
 
     /// The highest `Hlc` retention has removed from the oplog.
@@ -3516,7 +3577,7 @@ pub(crate) fn doc_range(id: CollectionId) -> impl std::ops::RangeBounds<(u64, &'
 /// Key range covering every index entry in a collection.
 pub(crate) fn index_range(
     id: CollectionId,
-) -> impl std::ops::RangeBounds<(u64, u32, &'static [u8], &'static [u8])> {
+) -> impl std::ops::RangeBounds<(u64, u32, &'static [u8], &'static [u8])> + Clone + 'static {
     use std::ops::Bound;
     let start = Bound::Included((id.0, 0u32, [].as_slice(), [].as_slice()));
     let end = match id.0.checked_add(1) {
@@ -4917,5 +4978,90 @@ mod tests {
             .await
             .unwrap();
         assert!(written.is_ok(), "{written:?}");
+    }
+}
+
+/// Whole-table clears, held to the bound redb's `retain` breaks (see
+/// `index::clear_index_entries`).
+#[cfg(test)]
+mod clearing {
+    use bson::doc;
+    use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+
+    fn file(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn assert_no_growth(before: u64, after: u64, what: &str) {
+        assert!(
+            after <= before + before / 4,
+            "{what} grew the file from {before} to {after} bytes; a clear that grows the file \
+             is retain's cost, see index::clear_index_entries"
+        );
+    }
+
+    #[test]
+    fn rebuilding_the_arrival_index_does_not_grow_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = super::Engine::open(&path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
+            engine.insert_many(&t, docs).unwrap();
+        }
+        {
+            // One row short, as a database an older build appended to is.
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut arrival = txn.open_table(crate::tables::OPLOG_ARRIVAL).unwrap();
+                let last = arrival.last().unwrap().map(|(k, _)| k.value()).unwrap();
+                arrival.remove(last).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let before = file(&path);
+
+        // Measured with the engine still open: redb hands the growth back
+        // within a commit or two, and closing the engine commits.
+        let engine = super::Engine::open(&path).unwrap();
+        let during = file(&path);
+        drop(engine);
+
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let oplog = txn.open_table(crate::tables::OPLOG).unwrap().len().unwrap();
+        let arrival = txn.open_table(crate::tables::OPLOG_ARRIVAL).unwrap().len().unwrap();
+        let by_stamp = txn.open_table(crate::tables::OPLOG_ARRIVAL_SEQ).unwrap().len().unwrap();
+        assert_eq!((arrival, by_stamp), (oplog, oplog), "premise: the index was rebuilt");
+        assert_no_growth(before, during, "rebuilding the arrival index");
+    }
+
+    #[test]
+    fn a_snapshots_grant_releases_its_marks_without_growing_the_file() {
+        let (a_dir, p_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = super::Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let path = p_dir.path().join("kimmy.redb");
+        let p = super::Engine::open(&path).unwrap();
+        let t = a.create_collection("shop", "t").unwrap();
+        let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
+        a.insert_many(&t, docs).unwrap();
+
+        let mut progress = crate::snapshot::SnapshotProgress::whole_database();
+        loop {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            if page.next.is_some() {
+                p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+                continue;
+            }
+            let held = p.held_len().unwrap();
+            assert!(held > 1_000, "premise: the final page's grant has marks to release: {held}");
+            let before = file(&path);
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            assert_eq!(p.held_len().unwrap(), 0, "the grant released every mark it covers");
+            assert_no_growth(before, file(&path), "the final page's release");
+            break;
+        }
     }
 }

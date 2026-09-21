@@ -269,7 +269,12 @@ fn move_documents(db: &Database, old: u64, new: u64) -> Result<()> {
         for (key, value) in &rows {
             docs.insert((new, key.as_slice()), value.as_slice())?;
         }
-        docs.retain_in(crate::engine::doc_range(CollectionId(old)), |_, _| false)?;
+        // By key, not `retain_in`: see `index::clear_index_entries` for what
+        // `retain_in` costs over a range. The rows are all in hand already,
+        // and nothing else writes while a migration runs at open.
+        for (key, _) in &rows {
+            docs.remove((old, key.as_slice()))?;
+        }
     }
     txn.commit()?;
     Ok(())
@@ -296,7 +301,10 @@ fn move_index_entries(db: &Database, old: u64, new: u64) -> Result<()> {
         for (index_id, value, doc_key) in &rows {
             entries.insert((new, *index_id, value.as_slice(), doc_key.as_slice()), ())?;
         }
-        entries.retain_in(crate::engine::index_range(CollectionId(old)), |_, _| false)?;
+        crate::index::clear_index_entries(
+            &mut entries,
+            crate::engine::index_range(CollectionId(old)),
+        )?;
     }
     txn.commit()?;
     Ok(())
@@ -409,6 +417,36 @@ mod tests {
         assert_eq!(orders.id, CollectionId::derive("shop", "orders"), "id must be renumbered");
         assert_eq!(engine.count(&orders).unwrap(), 5, "documents must move with the id");
         assert!(engine.get(&orders, &DocId::Int64(3)).unwrap().is_some());
+    }
+
+    #[test]
+    fn moving_a_collection_to_its_derived_id_does_not_grow_the_file() {
+        // The old range goes by key, not `retain_in`, which at this size made
+        // the migration double the file (see `index::clear_index_entries`).
+        // A test that only checked the documents arrived passed under both.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            engine.create_index("shop", "orders", vec![field("item")], false, None).unwrap();
+            let orders = engine.get_collection("shop", "orders").unwrap();
+            let docs: Vec<bson::Document> =
+                (0..5_000i64).map(|i| doc! { "_id": i, "item": format!("w{i}") }).collect();
+            engine.insert_many(&orders, docs).unwrap();
+        }
+        rewind_to_schema_1(&path, &[("shop", "orders", 7)]);
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let engine = Engine::open(&path).unwrap();
+
+        let orders = engine.get_collection("shop", "orders").unwrap();
+        assert_eq!(engine.count(&orders).unwrap(), 5_000, "premise: the migration moved them");
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after <= before + before / 4,
+            "the migration grew the file from {before} to {after}"
+        );
     }
 
     #[test]
