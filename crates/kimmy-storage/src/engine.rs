@@ -143,8 +143,11 @@ pub struct Engine {
     /// Where each TTL index's expiry scan resumes next pass (ADR-181): the
     /// last `(index key, document key)` it examined, by `(collection id,
     /// index id)`. Absent to start from the front of the expired range. In
-    /// memory, as `gc_scan_cursor` is: a restart or an ownership change
-    /// starts from the front, which costs one extra cycle, not a wedge.
+    /// memory, as `gc_scan_cursor` is: a restart starts from the front, which
+    /// costs one extra cycle, not a wedge. Ownership moving away does not
+    /// clear it, so a cursor is used again if ownership returns, at the same
+    /// cost at most. A drop of the index or its collection forgets it, and so
+    /// does building an index under the name.
     expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
 }
 
@@ -984,6 +987,19 @@ impl Engine {
             Some(cursor) => cursors.insert(at, cursor),
             None => cursors.remove(&at),
         };
+    }
+
+    /// Forget where the expiry scans of `collection` resume: of `index` when
+    /// it is given, of every index on it when not (ADR-181).
+    ///
+    /// For where an index or a collection is removed or replaced. Ids are
+    /// derived from names, so a cursor left behind is not only a leak: the
+    /// next index or collection of the same name lands on it, and its first
+    /// pass starts after a position in an index that no longer exists.
+    pub(crate) fn forget_expiry_cursors(&self, collection: CollectionId, index: Option<u32>) {
+        self.expiry_cursors
+            .lock()
+            .retain(|&(c, i), _| c != collection.0 || index.is_some_and(|index| index != i));
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -2875,6 +2891,11 @@ impl Engine {
         txn.commit()?;
         if let Some(entry) = logged {
             self.publish(vec![entry]);
+        }
+        // After the commit, so a pass that reads a cursor from here on finds
+        // the collection gone. A recreation lands on the same ids.
+        for id in &buried {
+            self.forget_expiry_cursors(*id, None);
         }
 
         if let Some(shadow) = &shadow {

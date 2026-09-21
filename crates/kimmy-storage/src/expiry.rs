@@ -578,6 +578,108 @@ mod tests {
         assert_eq!((third.deleted, third.skipped_filter), (0, stale as u64), "{third:?}");
     }
 
+    /// A TTL index on `seen`, 60 s, over 1,001 expired documents dated by
+    /// `_id`, after a pass that stopped at its budget: `_id` 1,000 is left,
+    /// and the cursor is at `_id` 999.
+    fn after_a_truncated_pass(engine: &Engine) -> (CollectionMeta, IndexMeta) {
+        let (coll, index) = with_ttl(engine, 60);
+        let docs = (0..=MAX_EXPIRED_PER_PASS as i64).map(|i| doc! {"_id": i, "seen": dt(i)});
+        engine.insert_many(&coll, docs.collect()).unwrap();
+        let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+        assert!(out.truncated, "premise: the pass stops at its budget: {out:?}");
+        assert!(engine.expiry_cursor((coll.id.0, index.id)).is_some(), "premise: with a cursor");
+        (coll, index)
+    }
+
+    #[test]
+    fn a_collection_dropped_and_recreated_expires_from_the_front() {
+        // Ids are derived from names, so a recreation lands on the cursor the
+        // dropped collection's last pass left, unless the drop forgets it. Its
+        // first pass then started after a position in an index that no longer
+        // exists, and deleted nothing dated below it (ADR-181).
+        let (engine, _, _dir) = engine();
+        let (dropped, dropped_index) = after_a_truncated_pass(&engine);
+        assert!(engine.drop_collection("app", "sessions").unwrap());
+        assert!(
+            engine.expiry_cursor((dropped.id.0, dropped_index.id)).is_none(),
+            "the drop forgets where the collection's scan stopped"
+        );
+
+        engine.create_collection("app", "sessions").unwrap();
+        let (coll, index) = with_ttl(&engine, 60);
+        assert_eq!(
+            (coll.id, index.id),
+            (dropped.id, dropped_index.id),
+            "premise: the recreation lands on the same ids"
+        );
+        // Dated below where the dropped collection's pass stopped.
+        engine.insert(&coll, doc! {"_id": 0, "seen": dt(0)}).unwrap();
+
+        let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+        assert_eq!(out.deleted, 1, "on the recreation's first pass: {out:?}");
+    }
+
+    #[test]
+    fn an_index_dropped_and_recreated_expires_from_the_front() {
+        let (engine, _, _dir) = engine();
+        let (coll, dropped) = after_a_truncated_pass(&engine);
+        assert!(engine.drop_index("app", "sessions", "ttl_seen").unwrap());
+        assert!(
+            engine.expiry_cursor((coll.id.0, dropped.id)).is_none(),
+            "the drop forgets where the index's scan stopped"
+        );
+
+        let (coll, index) = with_ttl(&engine, 60);
+        assert_eq!(index.id, dropped.id, "premise: the recreation lands on the same id");
+        // Dated below where the dropped index's pass stopped; `_id` 1,000 is
+        // above it.
+        engine.insert(&coll, doc! {"_id": -1, "seen": dt(0)}).unwrap();
+
+        let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+        assert_eq!(out.deleted, 2, "on the recreation's first pass: {out:?}");
+    }
+
+    #[test]
+    fn an_index_superseded_under_its_name_expires_from_the_front() {
+        // A peer's definition of the name, created later, replaces the one
+        // here without a drop (ADR-132), under the same derived id.
+        let (engine, _, _dir) = engine();
+        let (_, held) = after_a_truncated_pass(&engine);
+        let later = kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(u64::MAX / 2, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
+        );
+        engine
+            .create_index_inner(
+                "app",
+                "sessions",
+                vec![IndexField::ascending("seen")],
+                false,
+                Default::default(),
+                Some("ttl_seen".into()),
+                Some(120),
+                None,
+                crate::index::CreateOrigin::Replicated(Some(later)),
+                &|_, _| false,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "sessions").unwrap();
+        let index = coll.index("ttl_seen").unwrap().clone();
+        assert_eq!(
+            (index.id, index.expire_after_secs),
+            (held.id, Some(120)),
+            "premise: the peer's definition stands, under the same id"
+        );
+        assert!(
+            engine.expiry_cursor((coll.id.0, index.id)).is_none(),
+            "building it forgets where the superseded index's scan stopped"
+        );
+
+        engine.insert(&coll, doc! {"_id": -1, "seen": dt(0)}).unwrap();
+        let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
+        assert_eq!(out.deleted, 2, "on the new definition's first pass: {out:?}");
+    }
+
     #[test]
     fn a_filter_this_build_cannot_parse_skips_its_index_and_deletes_nothing() {
         // A filter an earlier build accepted and this one refuses: a

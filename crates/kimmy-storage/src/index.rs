@@ -1299,6 +1299,10 @@ impl crate::Engine {
                 CreateOrigin::Local | CreateOrigin::Replicated(_) => self.publish(vec![entry]),
             }
         }
+        // Built just now, so nothing an expiry pass remembered under this id
+        // is a position in it: a superseded definition's cursor, which no drop
+        // forgot, or one a pass saved after the drop that preceded this.
+        self.forget_expiry_cursors(meta.id, Some(index.id));
 
         if let Some(loser) = &superseded {
             // The operator's signal, and the only one: an index they created
@@ -1494,6 +1498,8 @@ impl crate::Engine {
         if let Some(entry) = logged {
             self.publish(vec![entry]);
         }
+        // An index recreated under the name receives the same derived id.
+        self.forget_expiry_cursors(meta.id, Some(index.id));
 
         tracing::info!(db, collection, index = name, "dropped index");
         Ok(Dropped { stamp: Some(stamp), removed: true, declined: None })
