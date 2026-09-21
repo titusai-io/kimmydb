@@ -18158,7 +18158,7 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 | the date check | the date test through the hook, **and nothing else**: 1 of 2,470 |
 | the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
 | skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
-
-The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast`, 2,470 tests, on the tree under review. A run that stops at its first failing binary cannot support "and nothing else".
 | null matching a missing field, in the moved `equals` (a control on the differential) | 225 rows of the two-commit differential |
 | `Symbol` in the string bracket, in the moved `same_type_group` (the same) | 129 rows of it |
+
+The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast`, 2,470 tests, on the tree under review. A run that stops at its first failing binary cannot support "and nothing else".
