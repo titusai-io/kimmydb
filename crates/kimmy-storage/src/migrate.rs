@@ -129,6 +129,50 @@ impl PartialRebuildPlan {
     }
 }
 
+/// Refuse the migration, naming every partial index whose stored filter this
+/// build will not parse, before anything is rebuilt.
+///
+/// The rebuild derives each index's membership from its filter, so an index
+/// whose filter this build refuses has no membership this build can build. A
+/// filter can be one an earlier build accepted and this one does not -- one
+/// holding a `Decimal128`, from before parsing refused it -- which is stored
+/// metadata, a fact about a definition rather than about any document.
+///
+/// **It refuses rather than skipping**, unlike a TTL pass, which skips such an
+/// index and deletes nothing (ADR-181). A pass is a recurring runtime gate
+/// where refusing would stop every other index's expiry; an upgrade is a gate
+/// where refusing costs nothing irreversible, and skipping would make the
+/// condition permanent in a schema 4 file, which is exactly what ADR-181 relies
+/// on not happening when it calls the condition transient. A skipped index
+/// would also leave a node running for weeks with a collection refusing every
+/// write, explained by one line at a start nobody reads again.
+///
+/// **Every partial index in the file is parsed**, in every database, whether or
+/// not its collection holds a document and whether or not an interrupted
+/// migration already marked it rebuilt: an index on an empty collection is
+/// never handed a document, so the rebuild alone would never parse its filter
+/// and would mark it done. **Every offender is named at once**, so one pass
+/// with the previous build fixes them all rather than finding the next on the
+/// next upgrade attempt.
+fn refuse_unparseable_partial_filters(db: &Database) -> Result<()> {
+    let txn = db.begin_read()?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut refused = Vec::new();
+    for row in collections.iter()? {
+        let (_, value) = row?;
+        let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+        for index in &meta.indexes {
+            if let Some(Err(e)) = index.partial() {
+                refused.push(format!("{}.{} index {:?}: {e}", meta.db, meta.name, index.name));
+            }
+        }
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(StorageError::UnparseablePartialFilter { refused })
+}
+
 /// Every partial index not yet rebuilt, with what the announcement states.
 ///
 /// Each collection's size comes from its kept live count (ADR-174), one row,
@@ -191,6 +235,7 @@ pub(crate) fn partial_rebuild_plan(db: &Database) -> Result<PartialRebuildPlan> 
 /// replicated build's are (ADR-020, ADR-123): a migration cannot refuse, and
 /// documents accepted while the constraint was misapplied are real.
 fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
+    refuse_unparseable_partial_filters(db)?;
     let plan = partial_rebuild_plan(db)?;
     let total = plan.indexes.len();
     if total > 0 {
@@ -1217,6 +1262,191 @@ mod membership_migration {
                 .unwrap();
         }
         txn.commit().unwrap();
+    }
+
+    /// Rewrite the stored `partialFilterExpression` of each named index to one
+    /// this build refuses: a bound on a `Decimal128`, which `PartialFilter::parse`
+    /// declines because it ranks equal to every other number (ADR-181).
+    ///
+    /// Written straight into the metadata, because `create_index_inner` parses
+    /// the filter for every origin, so no door of this build stores one. That is
+    /// the point of the case: such a definition can only have been stored by an
+    /// earlier build whose parser accepted it.
+    fn store_unparseable_filter(path: &std::path::Path, named: &[(&str, &str, &str)]) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut collections = txn.open_table(tables::COLLECTIONS).unwrap();
+            let rows: Vec<(String, String, CollectionMeta)> = collections
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (k, v) = row.unwrap();
+                    let (d, c) = k.value();
+                    (d.to_string(), c.to_string(), serde_json::from_slice(v.value()).unwrap())
+                })
+                .collect();
+            for (d, c, mut meta) in rows {
+                let mut touched = false;
+                for index in meta.indexes.iter_mut() {
+                    if named.iter().any(|(db, coll, name)| {
+                        *db == d && *coll == c && *name == index.name
+                    }) {
+                        index.partial_filter = Some(doc! {"size": {"$gt":
+                            bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]))}});
+                        touched = true;
+                    }
+                }
+                assert!(touched || named.iter().all(|(db, coll, _)| *db != d || *coll != c));
+                if touched {
+                    collections
+                        .insert(
+                            (d.as_str(), c.as_str()),
+                            serde_json::to_vec(&meta).unwrap().as_slice(),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    /// How many index entries the file holds for `db.coll`, over every index.
+    fn entry_count(path: &std::path::Path, db_name: &str, coll: &str) -> usize {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let collections = txn.open_table(tables::COLLECTIONS).unwrap();
+        let meta: CollectionMeta =
+            serde_json::from_slice(collections.get((db_name, coll)).unwrap().unwrap().value())
+                .unwrap();
+        let entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+        meta.indexes
+            .iter()
+            .map(|index| {
+                entries.range(crate::index::index_id_range(meta.id, index.id)).unwrap().count()
+            })
+            .sum()
+    }
+
+    /// A schema 3 database holding two partial indexes whose stored filters this
+    /// build refuses: one on a collection with documents, one on an empty
+    /// collection.
+    ///
+    /// The empty one is the case the rebuild alone cannot see. It is handed no
+    /// document, so `document_keys` never parses its filter, and the migration
+    /// would mark it rebuilt and move on.
+    fn schema_3_with_unparseable_filters() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            for name in ["held", "empty"] {
+                engine.create_collection("shop", name).unwrap();
+                engine
+                    .create_index_with(
+                        "shop",
+                        name,
+                        vec![crate::meta::IndexField::ascending("x")],
+                        false,
+                        crate::meta::Enforcement::Local,
+                        Some("by_size".into()),
+                        None,
+                        Some(doc! {"size": {"$gt": 5}}),
+                    )
+                    .unwrap();
+            }
+            let held = engine.get_collection("shop", "held").unwrap();
+            engine
+                .insert_many(
+                    &held,
+                    (0..5_i64).map(|i| doc! {"_id": i, "size": 10, "x": i}).collect(),
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &[]);
+        store_unparseable_filter(
+            &path,
+            &[("shop", "held", "by_size"), ("shop", "empty", "by_size")],
+        );
+        (dir, path)
+    }
+
+    #[test]
+    fn a_stored_filter_this_build_refuses_stops_the_migration_before_it_writes() {
+        let (_dir, path) = schema_3_with_unparseable_filters();
+        let before = entry_count(&path, "shop", "held");
+        assert!(before > 0, "premise: the index the migration would rebuild holds entries");
+        assert_eq!(version(&path), Some(3), "premise: a schema 3 database");
+
+        let err = match Engine::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("the open must refuse a filter it cannot parse"),
+        };
+
+        let StorageError::UnparseablePartialFilter { refused } = &err else {
+            panic!("the wrong error: {err}");
+        };
+        // Both offenders in one refusal, so one pass with the previous build
+        // fixes them: the one on a collection holding documents, and the one no
+        // rebuild would ever have parsed.
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        for coll in ["held", "empty"] {
+            let named = format!("shop.{coll} index \"by_size\"");
+            assert!(refused.iter().any(|r| r.contains(&named)), "{coll} unnamed: {refused:?}");
+        }
+        let message = err.to_string();
+        assert!(message.contains("Decimal128"), "no parse error in the message: {message}");
+        assert!(
+            message.contains("previous build") && message.contains("drop each index"),
+            "no remedy in the message: {message}"
+        );
+
+        // Nothing written: the previous build still opens this directory, and
+        // the entries a rebuild would have cleared are where they were.
+        assert_eq!(version(&path), Some(3), "the version is still 3");
+        assert_eq!(entry_count(&path, "shop", "held"), before, "no entries were cleared");
+    }
+
+    #[test]
+    fn a_refused_filter_on_an_empty_collection_stops_the_migration_too() {
+        // The hole the up-front parse closes, on its own. A rebuild is handed
+        // this index no document, so it never parses the filter: without the
+        // check the migration completes, marks the index rebuilt and writes
+        // schema 4, and the definition this build cannot read is then carried
+        // by a schema 4 database for good -- which is what ADR-181 relies on
+        // not happening when it calls the condition transient.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "empty").unwrap();
+            engine
+                .create_index_with(
+                    "shop",
+                    "empty",
+                    vec![crate::meta::IndexField::ascending("x")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("by_size".into()),
+                    None,
+                    Some(doc! {"size": {"$gt": 5}}),
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &[]);
+        store_unparseable_filter(&path, &[("shop", "empty", "by_size")]);
+        assert_eq!(version(&path), Some(3), "premise: a schema 3 database");
+
+        let err = match Engine::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("the open must refuse, though no document is ever indexed"),
+        };
+
+        assert!(
+            matches!(&err, StorageError::UnparseablePartialFilter { refused } if refused.len() == 1),
+            "the wrong error: {err}"
+        );
+        assert_eq!(version(&path), Some(3), "the version is still 3, not 4");
     }
 
     /// The `_id`s an index holds, read from the file.

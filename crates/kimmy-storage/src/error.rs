@@ -27,6 +27,28 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Partial index definitions an earlier build stored that this build
+    /// refuses to parse, found by the schema 3 -> 4 migration before it
+    /// rebuilt anything (ADR-183).
+    ///
+    /// The migration's whole job is to rebuild each partial index to hold what
+    /// `find` with its filter selects, and it cannot know what an index should
+    /// hold from a filter it cannot read. Refusing at open confines the
+    /// condition to schema 3 files, which is what lets ADR-181 call it
+    /// transient and decline a metric for it. Nothing is written: the on-disk
+    /// version is still 3, no index entries were cleared, and the previous
+    /// build still opens this directory.
+    #[error(
+        "this build cannot parse {} stored partial index definition(s), so the schema 3 to 4 \
+         migration cannot know what those indexes should hold. Nothing was changed: the \
+         on-disk version is still 3 and no index entries were cleared. Refused: {}. To \
+         proceed, start this data directory with the previous build, drop each index named \
+         above -- recreating it with a filter this build accepts -- and upgrade again",
+        refused.len(),
+        refused.join("; ")
+    )]
+    UnparseablePartialFilter { refused: Vec<String> },
+
     /// A conditional write found a different version than the caller expected.
     ///
     /// `current` is the stamp the document holds now, or `None` when there is

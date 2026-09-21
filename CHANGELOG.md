@@ -33,6 +33,14 @@ refused.** This release moves the storage schema to 4
   estimate, and the free space the largest needs. Measured on the development
   machine, a partial index over 10 million documents added about 73 seconds
   to that start (7 µs per document per partial index).
+- **The upgrade refuses if this build cannot read a stored partial filter.** It
+  names every such index — database, collection, index and the reason — and
+  changes nothing: the version stays 3, no index entries are cleared, and the
+  previous build still opens the directory. This can only happen for a filter an
+  earlier build accepted and this one does not, such as one holding a
+  `Decimal128`. To proceed, start the directory with the previous build, drop
+  each index named, recreating it with a filter this build accepts, then upgrade
+  again. In a cluster one drop on any member replicates to all.
 - **Disk.** Have free space of at least the largest partial index's size
   (about 80 bytes per entry) plus about 2 GiB.
 - **Downgrade.** An older build refuses a schema 4 database rather than open
