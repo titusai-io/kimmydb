@@ -14,6 +14,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP
+  bridge) counts expiry candidates a TTL index held that its partial filter did
+  not select when the delete re-read the document, and which were therefore not
+  deleted ([ADR-181](docs/decisions.md)). Its rate is how often expiry was
+  deleting documents it should not have. It should fall to near zero once
+  partial-index membership is corrected. A scrape config or a golden list that
+  enumerates series needs the new name.
 - **`kimmy_sync_ddl_relogged_total`** (`kimmy.sync.ddl_relogged` on the OTLP
   bridge) counts schema changes a snapshot restore appended to this node's
   oplog so that it can serve them onward ([ADR-180](docs/decisions.md)). Not
@@ -38,6 +45,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   - moving a collection to its derived id.
   The space was always handed back after the fact, so there is nothing to
   clean up.
+- **TTL expiry no longer deletes documents its index's partial filter does not
+  select** ([ADR-181](docs/decisions.md)). A TTL index with a partial filter
+  could delete documents outside it, in two ways.
+  - The index's membership compared across types, so `{size: {$gt: 5}}` held
+    strings, documents and booleans, and expiry deleted them: one pass over
+    five expired documents deleted four where the filter selects one.
+  - A document moved out of the filter between the pass reading its candidates
+    and the delete was deleted anyway.
+
+  The delete now re-checks the filter, read as `find` reads it, on the
+  document as it stands, beside the date it already re-checked. **Documents
+  already deleted this way are not recovered.** `find`'s own answers do not
+  change: the evaluation of `$exists`, equality and the comparisons moved into
+  a shared place, and a differential over 160,744 cases shows identical
+  results before and after.
+
+  **A pass now resumes where the last one stopped**, instead of starting
+  from the oldest expired document every time. Otherwise the documents the
+  filter now declines, which stay in the index until it is rebuilt, came
+  first on every pass and stopped expiry for that index altogether. **When
+  TTL fires changes for one case:** a document that is already expired when
+  written, and is dated behind where the pass has reached, waits until the
+  pass comes round again. That is at most `ceil(expired candidates / 1,000)`
+  passes of `storage.ttl_interval_secs` each. A TTL index whose stored filter
+  this build cannot parse is skipped, deleting nothing, with a warning that
+  names it.
 - **A member that caught up by snapshot now serves onward the index
   definitions it restored** ([ADR-180](docs/decisions.md)). A snapshot wrote
   each definition as state with no entry behind it, while completing the

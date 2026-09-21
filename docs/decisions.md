@@ -18067,3 +18067,105 @@ array, and a second test gives the receiver an array before it restores.
 **Each asserts its premise before asserting the rebuild**, so a fixture that
 stops being able to tell the two values apart fails as a fixture instead of
 passing as a test.
+
+---
+
+## ADR-181 — Expiry deletes a document only if its index's filter, read as `find` reads it, still selects it
+
+**Decision.** The guarded delete behind TTL expiry already re-reads the document under the writer and checks its date. It now **also checks the index's partial filter**, evaluated as `find` evaluates the same expression (`PartialFilter::selects`), against the document as it stands at that moment. A candidate the filter does not select is left alone, exactly as a candidate whose date has moved on is, and it is counted in a series of its own, `kimmy_ttl_skipped_filter_total`. A TTL index with no partial filter behaves as before.
+
+It is the first of three records on partial filters, and the one that ships alone. It needs no rebuild, no migration, no format change and no coordination state. **It is bigger than "the TTL guard" suggests**, because the guard needs `find`'s semantics inside `kimmy-storage`, and those live in `kimmy-query`. So this record also moves `find`'s evaluation of `$exists`, equality and the four comparisons into `kimmy-core`. That move is described below, with how it was shown to change no answer.
+
+**Why. Expiry trusted index membership, and membership is not the filter.** Two separate failures reach the same line, and both were demonstrated rather than argued:
+
+1. **A race, independent of any matcher.** Expiry reads its candidates from the index in one transaction and deletes each in another. `delete_guarded` exists for exactly that interleaving: its comment names a document *"whose date is bumped in between — a session heartbeat ... would otherwise be deleted while live"*. But the guard re-checked only the date. The partial filter is the other half of what made the document a candidate, and nothing re-checked it. *Demonstrated:* a TTL index on `seen` with the filter `{state: "done"}`. After the scan, a client reopens the document to `{state: "open"}` and keeps its date. Maintenance takes the entry out of the index in that commit, correctly. **The delete still removed the reopened document.**
+2. **Membership that is wrong today.** The index's membership rule (`PartialFilter::matches`) compares across type brackets, so `{size: {$gt: 5}}` holds a string, a document and a boolean. *Demonstrated:* with that filter, `find` selects one of five expired documents, and **one expiry pass deleted four**. This reaches any range-filtered TTL index over a field whose values are of mixed types, which is an ordinary schema. ADR-183 corrects membership. This record stops the deletions before it does.
+
+**Why `find`'s reading of the filter, and not the index's own.** The filter means what `find` with the same expression returns: that is the meaning a client writes and can observe. The index's membership rule is the defect, and the guard must not borrow it. The tests tell the two apart: evaluating the guard with the membership rule keeps the race test green and turns the mixed-type test red.
+
+### `find`'s evaluation moves to `kimmy-core`, and `find` is unchanged
+
+`kimmy-storage` does not depend on `kimmy-query`, deliberately: its manifest says *"No production dependency in this direction"*. The precedent for exactly this need is recorded under *Superseded / reconsidered*: `keyenc` moved to `kimmy-core` because *"kimmy-query needs the comparison semantics; putting both in core avoids query→storage coupling"*. `canonical_cmp` lives there for the same reason. So the operators a partial filter can carry are now evaluated in `kimmy_core::matching`:
+- `exists`;
+- `equals`, including null matching a missing field;
+- `compares`, which checks within a type bracket;
+- `any_element`, the value-or-element rule.
+
+`same_type_group` moves to `kimmy_core::cmp`. **`kimmy-query`'s filter calls these same functions** for `$exists`, `$eq`, `$gt`, `$gte`, `$lt` and `$lte`, and uses the moved `any_element` for every operator that walks array elements. `PartialFilter::selects` calls them too. That makes one definition, not a second implementation agreeing with the first. Two definitions of what one expression selects is how the partial-filter defects happened. ADR-183 points index membership at the same functions.
+
+**This changes the code behind the hottest path in the product, so "the query tests still pass" is not the proof.** Those tests are what let this class of change through. The proof is a differential against the **old** implementation. `crates/kimmy-query/tests/find_differential.rs` writes `find`'s answer for:
+- 47 value shapes, as the field, one level down, and through an array of documents;
+- every operator the move touches, and every one that shares `any_element` (`$ne`, `$in`, `$nin`, `$all`, `$not` and a compound range);
+- every value as an operand;
+- both paths.
+
+Generated on the parent commit and on the move, the two tables are **byte-identical over 160,744 rows**: 43,193 match, 114,143 do not, and 3,408 are refused at parse. The table can see corners. Dropping the null-matches-missing rule changes 225 of its rows, and taking `Symbol` out of the string bracket changes 129. The harness is an ignored test documented as the two-commit procedure, so a reviewer can reproduce it. A second test, run by default, holds `PartialFilter::selects` equal to `find` for every expression the partial language can carry. Its premise is that the membership rule and `find` disagree on 19,339 of its cases, so a `selects` that borrowed the membership rule could not pass.
+
+### This record also makes an existing guard testable for the first time
+
+The date check is not new, and it shipped with one test, which refreshed the document **before** the pass. The index is keyed by that date, so the refreshed document was never a candidate, and the guard never ran. Measured: with the date check removed outright, every test in `kimmy-storage` and in `kimmy-api` passed. That is recorded as its own finding. This record adds a test-only hook between the scan and the deletes (`expiry::hooks`). The date is then checked by a test that refreshes the document **after** the scan, and the filter by one that moves it out of the filter there. The old test keeps what it does show, that a document refreshed before the pass is not a candidate, under a name that says so.
+
+### What it does not do
+
+- It does not expire a document the index **lacks**, where the membership rule under-includes (a whole array, `$exists` on `[]`, a null matching a missing field). That keeps a document longer than asked, which is not data loss. ADR-183's rebuild closes it.
+- It reads the filter **as stored**. A generic `Binary` already stored as an array is honoured as the array, because nothing on a member records what the client sent. ADR-182 stops new conversions. Old ones need the index recreated.
+- It adds no read and no commit. The filter is parsed once per pass per index, and checked on the document the guard already reads, under the writer it already holds.
+
+### The pass resumes where the last one stopped
+
+**The guard alone wedged expiry for good.** It declines a candidate the filter does not select, and leaves that document's index entry where it is. The pass read its candidates from the front of the expired range, up to its budget of `MAX_EXPIRED_PER_PASS`, in an order that does not change between passes. So with more such entries than the budget, **the same declined entries came first on every pass**, and nothing behind them was ever reached. With 1,000 documents the index holds and `find` does not select, and one genuinely expired document dated after them, every pass declined the same 1,000 and deleted nothing. The race half clears itself, because a document moved out of the filter loses its entry in that same write. The membership half does not: those entries stay until ADR-183 rebuilds the index. Below the budget it is still a permanent tax, where N declined documents take N of every pass.
+
+**Decision: the pass resumes from a cursor.** Each pass reads from just after the last entry the pass before it examined, in index order, up to the budget, and remembers where it stopped. A pass that reaches the end of the expired range ends the cycle, and the next starts again from the front.
+- **Bounded:** the budget counts every candidate examined, declined or not.
+- **Progressing:** the cursor moves past a declined entry, so it is examined once a cycle, not first on every pass.
+- **Membership untouched.**
+
+This is the retention pass's tombstone scan again, which resumes where its budget stopped it (ADR-151). It is also ADR-139's lesson applied to declines: a scan that reconsiders the same entries every pass makes no progress.
+
+**The cost: when TTL fires.** A document already expired when it is written, dated behind the cursor, waits until the cycle ends and the next starts from the front. The wait is at most one cycle: `ceil(candidates / MAX_EXPIRED_PER_PASS)` passes, each `storage.ttl_interval_secs` apart. An index with 250,000 expired candidates at the 60-second default can take 250 passes, about four hours, to reach such a document. Someone who observes "my document did not expire for an hour" can compute the answer from those figures.
+
+**The cursor lives in memory**, per node and per index, as the tombstone scan's does. A restart starts from the front, which costs one extra cycle at most. Ownership moving to another node does **not** clear it: the cursor stays in this node's memory, and if ownership comes back, the pass resumes from it, which also costs one cycle at most. Persisting it would cost a write every pass to save at most one cycle. It is saved before the pass's deletes, so a delete that keeps failing cannot pin the scan to itself either. That has a cost when a pass fails: the cursor is already at the last candidate the pass read, so if a pass that read a full budget returns an error at its first candidate, the other 999 wait until the cycle comes round, up to one cycle.
+
+**A drop forgets the cursor, and so does building an index.** Collection and index ids are derived from names, so a cursor a drop left behind was more than a leaked entry: the next collection or index of the same name landed on it, and its first pass started after a position in an index that no longer existed. *Demonstrated:* a recreated collection holding one expired document, dated below where the dropped one's pass had stopped, deleted nothing on its first pass. It is forgotten at **three** sites, not two. Dropping an index forgets its cursor once the drop commits, and dropping a collection forgets its indexes' cursors. **The third is building an index, because an index can go away without a drop:** a peer's later definition of the same name supersedes the one here inside the build's own transaction, under the same derived id (ADR-132), and neither drop path runs. So building an index forgets any cursor under its id. One race is left: a pass running when a drop commits can save its cursor after the drop forgot it. That entry stays until the name is built again, and the build forgets it unless the pass saves after the build, which costs one cycle, as a restart does.
+
+**Two alternatives were rejected:**
+- **Removing the stale entry when the filter declines.** It looks self-healing, but it is unsafe before ADR-183, for three reasons:
+  - it fixes one half of a compensating pair, which is the next section;
+  - expiry runs only on the collection's owner, and an index write carries no oplog entry. So only the owner's index would be trimmed, and the same query would return different rows on different members until each migrates;
+  - maintenance recomputes keys under the old rule and puts the entry back on the document's next write, so it converges on nothing, and each removal costs a commit.
+- **Not counting declines against the budget.** That fixes the wedge by making the pass proportional to the stale entries, every pass, for ever. That is the unbounded work the budget exists to prevent.
+
+### Where two unsound rules cancel, fixing either alone is worse than fixing neither
+
+Partial-index containment (`PartialFilter::implies`, before ADR-183) compares bounds in the canonical order with no type-bracket check. So a query `{k: {$gt: "a"}}` is taken to imply the filter `{k: {$gt: 5}}`, because strings sort above numbers, and the planner answers it from that index. **It returns the right rows only because the membership rule is unsound in the same direction:** the index holds those strings, because membership also compares across brackets.
+
+The two rules cancel. Removing from the index the entries `find` does not select would correct membership alone and **turn a masked bug into wrong query answers**. That is why ADR-183 corrects membership and containment together. **Where two unsound rules cancel, the pair must move together**; this record is the first place the codebase names that trap.
+
+### A filter this build cannot parse
+
+The guard parses the stored filter once per pass. A filter this build refuses **skips its index for that pass**: nothing is deleted, and one warning names the database, the collection and the index. For example, a filter holding a `Decimal128`, stored before parsing refused one. Before this record the pass never parsed the filter, so such an index expired as usual. The skip fails safe.
+- **No series counts it.** The condition is transient: ADR-183's migration re-parses every partial filter, and a permanent series for a pre-1.0 window is a cost carried for ever.
+- `IndexMeta::partial`'s documentation, which said a parse failure could only mean tampering, now names this case.
+
+### A series of its own
+
+A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP bridge), not in `kimmy_ttl_skipped_total`. That series' description names one mechanism, a refresh landing while the pass ran, and widening it would make the description partly false. More importantly, the two mean different things **over time**. Between this record and ADR-183, a filter decline is mostly the membership defect firing: a document the index should never have held, which expiry used to delete. After ADR-183 it is mostly a genuine race. That fall in rate is the one measurement of how much damage was being done. Inside a counter that also carries heartbeat races, it could not be seen. The series' description says it should fall to near zero once membership is correct.
+
+### Tests, and how they break
+
+| Taken out | Fails |
+| --- | --- |
+| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,473 |
+| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473 |
+| the date check | the date test through the hook, **and nothing else**: 1 of 2,473 |
+| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
+| skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
+| forgetting the cursors when a collection is dropped | the dropped-collection test |
+| forgetting the cursor when an index is dropped | the dropped-index test |
+| forgetting the cursor when an index is built | the superseded-index test |
+| null matching a missing field, in the moved `equals` (a control on the differential) | 225 rows of the two-commit differential |
+| `Symbol` in the string bracket, in the moved `same_type_group` (the same) | 129 rows of it |
+
+The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast` on the tree under review, with the three forgetting tests in it: 2,473 tests as `cargo test` counts them, the passed and the failed of its result lines summed, with 18 ignored besides. A run that stops at its first failing binary cannot support "and nothing else".
+
+Each of the three forgetting tests fails at its assertion that the cursor is gone. Each also asserts what the new index's first pass deletes, and those three assertions are a joint proof only, because building the new index forgets a cursor its drop did not. With the forgetting assertions and all three evictions taken out, all three fail as the review found: the recreated collection's first pass deletes nothing, and the recreated and the superseding index's each delete one of their two documents.

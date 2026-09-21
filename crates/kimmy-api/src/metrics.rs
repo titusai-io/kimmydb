@@ -203,6 +203,9 @@ pub struct MetricsSnapshot {
     pub backups: u64,
     pub ttl_expired: u64,
     pub ttl_skipped: u64,
+    /// Expiry candidates declined because the index's partial filter no
+    /// longer selected the document (ADR-181).
+    pub ttl_skipped_filter: u64,
     /// Documents filed under an index's unkeyed run — stored, but with no
     /// key the index could derive, so every scan of that index rechecks
     /// them (ADR-139). One of the engine's readings.
@@ -417,6 +420,7 @@ pub struct Metrics {
     jwks_refresh_failed: AtomicU64,
     ttl_expired: AtomicU64,
     ttl_skipped: AtomicU64,
+    ttl_skipped_filter: AtomicU64,
     /// Set once at startup when the embedding worker runs. `None` — the
     /// renderer then reports zeros — means this node has
     /// `[vector] worker_enabled = false`, which an operator must be able to
@@ -464,6 +468,7 @@ impl Default for Metrics {
             webhook_events: AtomicU64::new(0),
             ttl_expired: AtomicU64::new(0),
             ttl_skipped: AtomicU64::new(0),
+            ttl_skipped_filter: AtomicU64::new(0),
             webhook_active: AtomicU64::new(0),
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
@@ -715,9 +720,10 @@ impl Metrics {
     /// refused because the document was refreshed between the scan and the
     /// write — a steady rise there means TTLs are being reset as fast as the
     /// pass finds them.
-    pub fn record_expiry(&self, expired: u64, skipped: u64) {
+    pub fn record_expiry(&self, expired: u64, skipped: u64, skipped_filter: u64) {
         self.ttl_expired.fetch_add(expired, Ordering::Relaxed);
         self.ttl_skipped.fetch_add(skipped, Ordering::Relaxed);
+        self.ttl_skipped_filter.fetch_add(skipped_filter, Ordering::Relaxed);
     }
 
     /// Count one certificate reload attempt.
@@ -858,6 +864,7 @@ impl Metrics {
             backup_duration_sum_us: self.get(&self.backup_sum_us),
             ttl_expired: self.get(&self.ttl_expired),
             ttl_skipped: self.get(&self.ttl_skipped),
+            ttl_skipped_filter: self.get(&self.ttl_skipped_filter),
             index_unkeyed: readings.index_unkeyed,
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
@@ -1057,6 +1064,9 @@ impl Metrics {
              # HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.\n\
              # TYPE kimmy_ttl_skipped_total counter\n\
              kimmy_ttl_skipped_total {ttl_skipped}\n\
+             # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.\n\
+             # TYPE kimmy_ttl_skipped_filter_total counter\n\
+             kimmy_ttl_skipped_filter_total {ttl_skipped_filter}\n\
              # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
@@ -1205,6 +1215,7 @@ impl Metrics {
             wh_events = self.get(&self.webhook_events),
             ttl_expired = self.get(&self.ttl_expired),
             ttl_skipped = self.get(&self.ttl_skipped),
+            ttl_skipped_filter = self.get(&self.ttl_skipped_filter),
             index_unkeyed = readings.index_unkeyed,
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
@@ -1608,7 +1619,7 @@ mod tests {
         }
 
         m.record_backup(Duration::from_secs(42));
-        m.record_expiry(11, 12);
+        m.record_expiry(11, 12, 93);
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
         m.record_webhook_delivery(false, 0);
@@ -2143,6 +2154,9 @@ kimmy_ttl_expired_total 11
 # HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.
 # TYPE kimmy_ttl_skipped_total counter
 kimmy_ttl_skipped_total 12
+# HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.
+# TYPE kimmy_ttl_skipped_filter_total counter
+kimmy_ttl_skipped_filter_total 93
 # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
@@ -2446,6 +2460,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_backups_total {}\n", s.backups));
         expect(&format!("kimmy_ttl_expired_total {}\n", s.ttl_expired));
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
+        expect(&format!("kimmy_ttl_skipped_filter_total {}\n", s.ttl_skipped_filter));
         expect(&format!("kimmy_index_unkeyed_total {}\n", s.index_unkeyed));
         expect(&format!(
             "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
@@ -2717,10 +2732,11 @@ kimmy_sync_serve_walk_seconds_count 1201
         // the over-count; one scalar for unmeasured CPU; five serve scalars;
         // and the serve walk's 12 buckets, +Inf, sum and count. Since
         // ADR-178, one scalar for embedding skipped for want of a shadow;
-        // since ADR-180, one for schema changes a snapshot restore re-logged.
+        // since ADR-180, one for schema changes a snapshot restore re-logged;
+        // since ADR-181, one for expiry declined by the partial filter.
         assert_eq!(
             samples,
-            106 + 6
+            107 + 6
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT

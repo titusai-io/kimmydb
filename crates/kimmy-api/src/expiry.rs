@@ -97,19 +97,22 @@ pub fn pass(engine: &Engine, me: NodeId, members: &BTreeSet<NodeId>, now_ms: u64
             for index in ttl_indexes(&coll) {
                 match engine.expire_documents(&coll, index, now_ms) {
                     Ok(outcome) => {
-                        if outcome.deleted > 0 || outcome.skipped > 0 {
+                        if outcome.deleted > 0 || outcome.skipped > 0 || outcome.skipped_filter > 0
+                        {
                             info!(
                                 db = %coll.db,
                                 collection = %coll.name,
                                 index = %index.name,
                                 deleted = outcome.deleted,
                                 skipped = outcome.skipped,
+                                skipped_filter = outcome.skipped_filter,
                                 truncated = outcome.truncated,
                                 "expired documents"
                             );
                         }
                         total.deleted += outcome.deleted;
                         total.skipped += outcome.skipped;
+                        total.skipped_filter += outcome.skipped_filter;
                         total.truncated |= outcome.truncated;
                     }
                     // Not fatal. The documents are still there and the next
@@ -156,7 +159,7 @@ pub async fn run(
         // Recorded even though zero-valued calls are common, because summing
         // this across a cluster is how "one document, one delete" stays a
         // measured property rather than a claim in a comment.
-        state.metrics.record_expiry(outcome.deleted, outcome.skipped);
+        state.metrics.record_expiry(outcome.deleted, outcome.skipped, outcome.skipped_filter);
         if outcome.truncated {
             debug!(
                 deleted = outcome.deleted,

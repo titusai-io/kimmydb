@@ -449,6 +449,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.ttl.skipped_filter",
+            "{document}",
+            "Expiry candidates not deleted because the TTL index's partial filter, evaluated as find evaluates it, no longer selected the document.",
+            ttl_skipped_filter
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.webhook.delivered",
             "{batch}",
             "Webhook batches an endpoint accepted.",
