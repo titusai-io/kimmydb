@@ -18274,6 +18274,14 @@ Every partial index is therefore rebuilt, and the migration is **schema 3 → 4*
 - **Unique collisions are reported, not refused.** A migration cannot refuse, and documents accepted while the constraint was misapplied are real. The keys a rebuilt unique index finds shared are reported once the engine exists, exactly as a replicated build's are: counted, warned, and logged as unique-violation entries (ADR-020, ADR-123).
 - **Memory stays bounded.** The clear gathers 50,000 keys at a time inside the transaction; collecting all 7.4 million at once added 675 MiB at 10 million documents. A batched clear and full rebuild at that size added nothing measurable above the load's own peak.
 
+**Synchronous is a constraint, not a preference.** The migration finishes before the node serves anything because nothing else is correct:
+- **A node serving before an index is rebuilt corrupts it further.** Writes maintain the index under the new rule, over entries stored under the old one: `apply_entries` removes the keys the new rule derives from a document's old image, not the entries actually stored. So the index diverges from both rules, which is worse than either applied consistently.
+- **The data is not schema 4 until the last index is rebuilt.** The version states what this build can correctly maintain, and until then it cannot.
+- **A background rebuild was rejected.** It would need each index held off the planner and expiry until its marker is written, while writes keep maintaining it: new coordination state, for a job that runs once per node.
+- **Leaving it to an operator was rejected.** The node would run in the divergent state until someone ran it.
+
+So the cost is paid at the first start, and announced before it is paid. Making it lazy is not an optimisation this record passed over: it is ruled out.
+
 **What the operator sees.** A synchronous rebuild at open looks like a hung node, so:
 - **Before it starts, one line states the whole job:** how many partial indexes, how many documents across them, an estimate for the whole migration from the measured rate, and the free space the largest needs. That figure is sized from the largest collection's document count, an upper bound on its index's entries unless the index is multikey.
 - Then a line per index as it starts ("*n* of *m*").
@@ -18326,3 +18334,4 @@ An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where i
 | reporting a rebuilt unique index's collisions | its own test, and only it |
 | the announcement's staleness check, trusting the counts always | the restored-backup and stale-mark tests |
 | the same check, counting always | the kept-counts test, and only it |
+| the estimate sized per index, from the largest | the estimate test, and only it |

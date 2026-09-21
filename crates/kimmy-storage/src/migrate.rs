@@ -1147,6 +1147,23 @@ mod membership_migration {
     }
 
     #[test]
+    fn the_estimate_is_for_the_whole_migration_and_not_for_one_index() {
+        // What an operator decides whether to wait on: several large indexes
+        // in sequence, not the largest of them.
+        let plan = PartialRebuildPlan {
+            indexes: Vec::new(),
+            documents: 15_000_000,
+            largest_documents: 10_000_000,
+        };
+        assert_eq!(plan.estimate_secs(), 15_000_000 * MICROS_PER_DOCUMENT / 1_000_000);
+        assert_ne!(
+            plan.estimate_secs(),
+            10_000_000 * MICROS_PER_DOCUMENT / 1_000_000,
+            "premise: the total and the largest give different estimates"
+        );
+    }
+
+    #[test]
     fn the_announcement_reads_the_kept_counts_when_they_are_current() {
         let (_dir, path) = fixture();
         set_kept_counts(&path, Some(7));
