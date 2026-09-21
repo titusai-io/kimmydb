@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::error::{Result, StorageError};
+use crate::expiry::ExpiryCursor;
 use crate::meta::{CollectionMeta, DatabaseMeta};
 use crate::tables;
 
@@ -139,6 +140,15 @@ pub struct Engine {
     /// (ADR-151): the last document key it visited, or `None` to start from
     /// the top. The scan visits a bounded number of documents per pass.
     gc_scan_cursor: parking_lot::Mutex<Option<(u64, Vec<u8>)>>,
+    /// Where each TTL index's expiry scan resumes next pass (ADR-181): the
+    /// last `(index key, document key)` it examined, by `(collection id,
+    /// index id)`. Absent to start from the front of the expired range. In
+    /// memory, as `gc_scan_cursor` is: a restart starts from the front, which
+    /// costs one extra cycle, not a wedge. Ownership moving away does not
+    /// clear it, so a cursor is used again if ownership returns, at the same
+    /// cost at most. A drop of the index or its collection forgets it, and so
+    /// does building an index under the name.
+    expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
 }
 
 /// Upper bounds of the writer-wait histogram, in microseconds.
@@ -823,6 +833,7 @@ impl Engine {
             hold_counters: Default::default(),
             serve_counters: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
+            expiry_cursors: Default::default(),
         };
 
         // Here rather than beside the rebuilds above, because it is the one
@@ -963,6 +974,37 @@ impl Engine {
 
     pub(crate) fn set_gc_scan_cursor(&self, cursor: Option<(u64, Vec<u8>)>) {
         *self.gc_scan_cursor.lock() = cursor;
+    }
+
+    /// Where the expiry scan of `(collection, index)` resumes (ADR-181).
+    pub(crate) fn expiry_cursor(&self, at: (u64, u32)) -> Option<ExpiryCursor> {
+        self.expiry_cursors.lock().get(&at).cloned()
+    }
+
+    pub(crate) fn set_expiry_cursor(&self, at: (u64, u32), cursor: Option<ExpiryCursor>) {
+        let mut cursors = self.expiry_cursors.lock();
+        match cursor {
+            Some(cursor) => cursors.insert(at, cursor),
+            None => cursors.remove(&at),
+        };
+    }
+
+    /// Forget where the expiry scans of `collection` resume: of `index` when
+    /// it is given, of every index on it when not (ADR-181).
+    ///
+    /// For where an index or a collection is removed or replaced. Ids are
+    /// derived from names, so a cursor left behind is not only a leak: the
+    /// next index or collection of the same name lands on it, and its first
+    /// pass starts after a position in an index that no longer exists.
+    ///
+    /// Three callers, not two: the collection drop, the index drop, and
+    /// building an index, because an index can also go without a drop. A
+    /// peer's later definition of the name supersedes it inside the build,
+    /// under the same id (ADR-132), and neither drop runs.
+    pub(crate) fn forget_expiry_cursors(&self, collection: CollectionId, index: Option<u32>) {
+        self.expiry_cursors
+            .lock()
+            .retain(|&(c, i), _| c != collection.0 || index.is_some_and(|index| index != i));
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -2854,6 +2896,11 @@ impl Engine {
         txn.commit()?;
         if let Some(entry) = logged {
             self.publish(vec![entry]);
+        }
+        // After the commit, so a pass that reads a cursor from here on finds
+        // the collection gone. A recreation lands on the same ids.
+        for id in &buried {
+            self.forget_expiry_cursors(*id, None);
         }
 
         if let Some(shadow) = &shadow {

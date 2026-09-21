@@ -15,6 +15,7 @@ pub mod hlc;
 pub mod ids;
 pub mod index_meta;
 pub mod keyenc;
+pub mod matching;
 pub mod oplog;
 pub mod partial;
 pub mod path;

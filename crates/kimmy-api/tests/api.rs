@@ -8165,6 +8165,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_backups_total",
         "kimmy_ttl_expired_total",
         "kimmy_ttl_skipped_total",
+        "kimmy_ttl_skipped_filter_total",
         "kimmy_index_unkeyed_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_deliveries_total",

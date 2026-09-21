@@ -172,8 +172,12 @@ impl IndexMeta {
     /// The parsed partial filter, if there is one.
     ///
     /// Parsed on use rather than stored parsed: the document form is what
-    /// serialises, and validation already happened at index creation, so a
-    /// failure here means stored metadata was tampered with.
+    /// serialises. Validation happened at index creation, but under that
+    /// build's rules, so a failure here is either stored metadata that was
+    /// tampered with or a filter an earlier build accepted and this one
+    /// refuses, such as one holding a `Decimal128` from before parsing
+    /// refused it. A caller decides what the index does meanwhile; TTL expiry
+    /// skips it (ADR-181).
     pub fn partial(&self) -> Option<crate::Result<crate::PartialFilter>> {
         self.partial_filter.as_ref().map(crate::PartialFilter::parse)
     }
