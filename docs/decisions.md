@@ -18169,3 +18169,56 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast` on the tree under review, with the three forgetting tests in it: 2,473 tests as `cargo test` counts them, the passed and the failed of its result lines summed, with 18 ignored besides. A run that stops at its first failing binary cannot support "and nothing else".
 
 Each of the three forgetting tests fails at its assertion that the cursor is gone. Each also asserts what the new index's first pass deletes, and those three assertions are a joint proof only, because building the new index forgets a cursor its drop did not. With the forgetting assertions and all three evictions taken out, all three fail as the review found: the recreated collection's first pass deletes nothing, and the recreated and the superseding index's each delete one of their two documents.
+
+---
+
+## ADR-182 — A partial filter is stored with its types, and what that cannot recover
+
+**Decision.** `IndexMeta.partial_filter` is written into collection metadata as **canonical** Extended JSON (`{"$numberLong": "5"}`, `{"$binary": ...}`), not the relaxed form `serde_json` produces by default. **The reader is unchanged.** The encoding (`index_meta::stored_filter`) writes canonical form when the serializer is human-readable, which is the store's JSON, and the plain document otherwise, which is BSON. So a `CreateIndex` body and a snapshot page are byte for byte what they were.
+
+**Why.** Relaxed JSON loses a dynamically typed value's type in two ways:
+- a small `Int64` comes back as an `Int32`, which does not change what the filter selects;
+- a generic-subtype `Binary` comes back as **an array of integers**, which does.
+
+Every member stored the converted filter, and since ADR-180 every member builds from it. So a partial index with a binary in its filter selected the documents holding that array, and not the ones holding the binary: on every member, consistently, and not what the client wrote.
+
+**Compatibility, measured in both directions.** The reader already read canonical Extended JSON back with every type: `$numberLong` as `Int64`, a generic `$binary` as `Binary`, and nested documents and arrays likewise. So:
+- **Upgrade:** a new build reads an old relaxed filter exactly as before. An array stays an array.
+- **Downgrade:** an older build reads a canonical filter correctly, because it has the same reader.
+- **A mixed-version cluster:** the stored form is node-local, and the wire is BSON either way, unchanged. During a roll, a generic-Binary filter is built as a binary on an upgraded member and as an array on an older one. Each member is consistent with itself, and the older one is wrong exactly as before.
+
+### What it cannot recover, and why this record came second
+
+A filter already converted stays converted. The store holds the array, and nothing on a member distinguishes a converted `Binary` from an array a client wrote. The as-sent filter survives only in a `CreateIndex` entry logged before ADR-180, which logged the filter as sent, and only **while retention still holds that entry**. That is a clock, and it is why this record came second in its queue: every day it is not in place, more of those entries age out. ADR-180 stopped new entries carrying the as-sent form, so from ADR-180 until this record nothing retained it at all.
+
+**No automatic recovery.** Rewriting a stored definition from a retained entry would change the definition on the members that still hold that entry and not on the others. That divergence of the definition itself is worse than the conversion. Operators recreate instead. To make that possible, **every open logs an info line for each partial index whose filter holds an array**, anywhere among its operands, a scoped JavaScript value's scope included, saying that it **may have been converted** from a generic `Binary` by an earlier build, and to drop and recreate the index if it was created with a `Binary` value. It says "may", never "is broken", because an array can be exactly what the client wrote. **What it cannot do:** it is written at open, so an operator who does not restart after upgrading never sees it. Silence before a restart does not mean there are none.
+
+### What this does to ADR-180
+
+ADR-180 made every member build, store and log a definition **as stored** (`index::as_stored`), because the store changed the filter. The store no longer changes it, so `as_stored` is now the identity on every filter. It stays as the place that rule is enforced, so a future encoding that lost something would be held to one value again. Four of ADR-180's test premises, one of them a fixture shared by eight tests, asserted before anything else that the store changes the filter, so that they could see the normalisation. **When this record landed, those four premises detected that the thing they were written to observe had stopped happening, which is what they are for.** They did not quietly go on passing on a case that no longer exists: they failed, and said why. Every other premise assertion in this series caught a mistake made while the test was being written. These caught a change made later, for a different reason, in a different record. Each is rewritten around what is true now:
+- the store keeps the filter as sent;
+- the create answers and lists the filter as sent;
+- **every member**, meaning the origin, a peer applying its entry and a member restoring from its snapshot, **indexes the binary document and not the array one**.
+
+That last is this record's user-visible fix, held across replication. It is a stronger claim than the test it replaces made: that one proved the members agreed with each other; this one proves they agree with what the client asked for.
+
+**The class sweep.** One dynamically typed value is stored in collection metadata: `IndexMeta.partial_filter`. The look-alikes:
+- `VectorConfig` is fully typed.
+- `ModifyOutcome.before`/`.after` hold documents but are never stored.
+- The API renders a filter through `document_to_json`, not serde, so client output does not change.
+- Typed integers (`expire_after_secs: i64`, `created`) were always exact.
+- A vector index's snapshot `meta.json` is its own struct with no documents in it.
+
+### Tests, and how they break
+
+| Taken out | Fails |
+| --- | --- |
+| canonical form in the store (relaxed again) | the store test, the fidelity test, the membership test across replication, the API test, and every test built on ADR-180's origin fixture, at its premise |
+| the plain document on the wire (canonical there too) | the byte-identity test for a `CreateIndex` body, **and nothing else**, which is why it exists |
+| the info line's detection | the test that names exactly the filters holding an array, a bound and a scoped code value included, and not a scalar one |
+| the detection's scoped-code arm | the same test |
+| the info line's **emission**, the loop in `Engine::open` | the test that opens twice and reads the line each time, **and nothing else**: 1 of 2,469 tests, measured with `--no-fail-fast` |
+
+Detection and emission are separate rules, and the table used to list only the first. The emission's test was added in review, after removing the loop left every test in the workspace green. The line is the whole remedy this record offers, so it is held to its own test.
+
+A relaxed filter written by an earlier build is read as it was stored, which the compatibility test holds.

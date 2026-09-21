@@ -30,6 +30,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A partial index's filter keeps its types when it is stored**
+  ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
+  in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an
+  array of integers. So an index with a binary in its filter covered the
+  documents holding that array and not the ones holding the binary, on every
+  member. The filter is now stored as sent, and an index created with it
+  covers what it says. Nothing changes on the wire, and an older build reads
+  the new form. **A filter stored by an earlier build is not converted back**,
+  because nothing records whether an array was a converted binary or exactly
+  what was written. Each open now logs every partial index whose filter holds
+  an array, saying it *may* have been converted. If yours was created with a
+  generic `Binary` value, drop and recreate it.
 - **Dropping a large index no longer stalls every write for tens of seconds,
   or needs gigabytes of free disk while it runs.** The storage call that
   cleared an index's entries was slow in the way that matters. For 742,858

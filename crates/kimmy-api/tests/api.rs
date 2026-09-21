@@ -6334,15 +6334,14 @@ async fn an_unsupported_partial_filter_is_refused_at_creation() {
 }
 
 #[tokio::test]
-async fn a_partial_index_is_answered_with_the_filter_it_is_listed_with() {
-    // The metadata stores a generic `Binary` as an array, and the index is
-    // built, maintained and replicated with the filter as stored (ADR-180).
-    // The create answered with the filter as sent, so the client was shown
-    // one definition and every later listing another.
+async fn a_partial_index_is_answered_and_listed_with_the_filter_it_was_sent() {
+    // The metadata used to store a generic `Binary` as an array, and the
+    // create answered with the one while every listing showed the other
+    // (ADR-180, ADR-182). It keeps the type now, so all three agree.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/app/collections", Some(&token), json!({"name":"items"})).await;
-    let sent = json!({"k": {"$binary": {"base64": "AQI=", "subType": "00"}}});
+    let sent = json!({"k": {"$binary": {"base64": "AQI=", "subType": "00"}}, "n": {"$gte": {"$numberLong": "5"}}});
     let created = server
         .post(
             "/v1/db/app/coll/items/indexes",
@@ -6353,8 +6352,8 @@ async fn a_partial_index_is_answered_with_the_filter_it_is_listed_with() {
     assert_eq!(created.status, 200, "{:?}", created.body);
     let listed = server.get("/v1/db/app/coll/items/indexes", Some(&token)).await;
     let listed = &listed.body["indexes"][0]["partialFilterExpression"];
-    assert_ne!(listed, &sent, "premise: the filter is one the metadata encoding changes");
     assert_eq!(&created.body["partialFilterExpression"], listed);
+    assert_eq!(listed["k"], sent["k"], "the binary is listed as a binary");
 }
 
 #[tokio::test]

@@ -751,6 +751,20 @@ impl Engine {
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::rebuild_version_vector_if_stale(&db)?;
         Self::seed_collected_if_untracked(&db)?;
+        // A filter created with a generic `Binary` before ADR-182 was stored
+        // as an array, and nothing records which arrays those were, so every
+        // array is named -- each open, since an operator who never restarts
+        // after upgrading would otherwise never be told.
+        for (db_name, collection, index) in crate::index::partial_filters_holding_an_array(&db)? {
+            info!(
+                db = %db_name,
+                collection = %collection,
+                index = %index,
+                "this partial index's filter holds an array, which may have been converted from \
+                 a generic Binary by a build before ADR-182; if it was created with a Binary \
+                 value, drop and recreate it. An array the client wrote is left as it is"
+            );
+        }
         // After the arrival index, whose end the counts' mark is compared
         // against: a rebuilt index renumbers positions, and the counts are
         // rebuilt with it (ADR-174).
@@ -5037,6 +5051,89 @@ mod tests {
             .await
             .unwrap();
         assert!(written.is_ok(), "{written:?}");
+    }
+}
+
+/// The line every open logs for each partial index whose filter holds an
+/// array (ADR-182).
+///
+/// It is the whole remedy ADR-182 offers for a filter an earlier build
+/// converted, whose original cannot be recovered, so its emission is held
+/// here, and not only the query behind it. That query has its own test, which
+/// calls it directly and would not notice the line going: with the loop
+/// removed from `Engine::open`, every other test in the workspace passes.
+#[cfg(test)]
+mod converted_filters_line {
+    use std::sync::{Arc, Mutex};
+
+    use bson::doc;
+
+    use super::Engine;
+    use crate::meta::{Enforcement, IndexField};
+
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `body` logs on this thread.
+    fn logs_of(body: impl FnOnce()) -> String {
+        let out = Captured(Arc::new(Mutex::new(Vec::new())));
+        let writer = out.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, body);
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn every_open_names_each_partial_index_whose_filter_holds_an_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "t").unwrap();
+            for (name, filter) in
+                [("equals_an_array", doc! {"k": [1, 2]}), ("scalar_only", doc! {"k": 5})]
+            {
+                engine
+                    .create_index_with(
+                        "shop",
+                        "t",
+                        vec![IndexField::ascending(name)],
+                        false,
+                        Enforcement::Local,
+                        Some(name.into()),
+                        None,
+                        Some(filter),
+                    )
+                    .unwrap();
+            }
+        }
+        // Every open, not only the first after the upgrade: an operator who
+        // never restarts would otherwise never be told.
+        for open in ["first", "second"] {
+            let logs = logs_of(|| drop(Engine::open(&path).unwrap()));
+            let named: Vec<&str> = logs
+                .lines()
+                .filter(|l| l.contains("may have been converted from a generic Binary"))
+                .collect();
+            assert_eq!(named.len(), 1, "{open} open: one line, for the one such index:\n{logs}");
+            assert!(
+                named[0].contains("index=equals_an_array") && named[0].contains("collection=t"),
+                "the line names the index and its collection: {}",
+                named[0]
+            );
+        }
     }
 }
 

@@ -639,19 +639,23 @@ pub(crate) enum CreateOrigin {
 }
 
 /// `index` as every member stores it: through the collection metadata's own
-/// encoding, which is not the identity on every definition (ADR-180).
+/// encoding (ADR-180).
 ///
-/// The metadata is stored as JSON, which reads a small `Int64` in a partial
-/// filter back as an `Int32` and a generic `Binary` back as an array. So the
-/// filter a client sent is not the filter any member holds — and **storing
-/// the same definition is not building the same membership**: a build from
-/// the filter as sent selected documents that every later write, maintained
-/// under the stored filter, did not; and a member that took the definition
-/// from a snapshot page, which carries the stored form, built something else
-/// again. `create_index_inner` passes every definition through here before it
-/// compares, builds, stores or logs it, so each member builds, stores and
-/// logs one value. The encoding is idempotent, so a definition already stored
-/// comes back unchanged.
+/// **Since ADR-182 that encoding keeps a filter's types, so this is the
+/// identity on every definition.** It stays the one place
+/// `create_index_inner` routes each definition through before it compares,
+/// builds, stores or logs it, so that if the store ever changes a value
+/// again, every member still builds, stores and logs one value rather than
+/// the one it was sent.
+///
+/// Why it exists: before ADR-182 the metadata was relaxed JSON, which read a
+/// small `Int64` in a partial filter back as an `Int32` and a generic `Binary`
+/// back as an array. The filter a client sent was then not the filter any
+/// member held, and **storing the same definition was not building the same
+/// membership**: a build from the filter as sent selected documents that
+/// every later write, maintained under the stored filter, did not, and a
+/// member that took the definition from a snapshot page built something else
+/// again.
 pub(crate) fn as_stored(index: IndexMeta) -> Result<IndexMeta> {
     Ok(serde_json::from_slice(&serde_json::to_vec(&index)?)?)
 }
@@ -2063,6 +2067,41 @@ impl crate::Engine {
         }
         Ok(Some(walk.outcome))
     }
+}
+
+/// Every partial index whose filter holds an array anywhere among its
+/// operands, as `(database, collection, index)` (ADR-182).
+///
+/// A generic `Binary` in a filter was stored as an array of integers before
+/// ADR-182, and cannot be told apart from an array the client wrote, so this
+/// names them all and claims nothing about which is which.
+pub(crate) fn partial_filters_holding_an_array(
+    db: &redb::Database,
+) -> Result<Vec<(String, String, String)>> {
+    // Every arm `canonical_cmp` descends into, as `holds_decimal128` walks
+    // them: a scoped JavaScript value is compared by its scope, so a Binary
+    // in the scope was stored, and converted, the same way.
+    fn holds_an_array(value: &Bson) -> bool {
+        match value {
+            Bson::Array(_) => true,
+            Bson::Document(inner) => inner.values().any(holds_an_array),
+            Bson::JavaScriptCodeWithScope(code) => code.scope.values().any(holds_an_array),
+            _ => false,
+        }
+    }
+    let txn = db.begin_read()?;
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut out = Vec::new();
+    for row in collections.iter()? {
+        let (_, raw) = row?;
+        let meta: crate::CollectionMeta = serde_json::from_slice(raw.value())?;
+        for index in &meta.indexes {
+            if index.partial_filter.as_ref().is_some_and(|f| f.values().any(holds_an_array)) {
+                out.push((meta.db.clone(), meta.name.clone(), index.name.clone()));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// How many keys [`clear_index_entries`] gathers before removing them.
@@ -4008,6 +4047,52 @@ mod tests {
                 assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod array_filters {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn every_partial_filter_holding_an_array_is_named_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = crate::Engine::open(&path).unwrap();
+        engine.create_collection("shop", "t").unwrap();
+        let create = |name: &str, filter: Option<Document>| {
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![IndexField::ascending(name)],
+                    false,
+                    Enforcement::Local,
+                    Some(name.into()),
+                    None,
+                    filter,
+                )
+                .unwrap();
+        };
+        create("equals_an_array", Some(doc! {"k": [1, 2]}));
+        create("bounded_by_an_array", Some(doc! {"k": {"$gte": [1]}}));
+        // Not reachable over HTTP today, which has no `$code` decoder, but
+        // reachable through the engine, and from HTTP the day one is added.
+        let scoped = bson::JavaScriptCodeWithScope { code: "x".into(), scope: doc! {"a": [1]} };
+        create("scoped_code_holding_an_array", Some(doc! {"k": scoped}));
+        create("scalar", Some(doc! {"k": 5}));
+        create("whole", None);
+        drop(engine);
+
+        let db = redb::Database::create(&path).unwrap();
+        let mut named: Vec<String> =
+            partial_filters_holding_an_array(&db).unwrap().into_iter().map(|(_, _, i)| i).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            ["bounded_by_an_array", "equals_an_array", "scoped_code_holding_an_array"]
+        );
     }
 }
 

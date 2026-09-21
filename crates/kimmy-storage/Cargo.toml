@@ -46,6 +46,9 @@ kimmy-query.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+# Dev-only: a test reads what `Engine::open` logs, since a line an operator
+# is told to act on is behaviour, not decoration.
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "write_path"

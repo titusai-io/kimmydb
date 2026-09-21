@@ -5094,13 +5094,13 @@ mod relog {
     }
 
     /// `A` holds `shop.orders` with an index `by_x` it created, and returns
-    /// the entry it logged for it. Made so that an entry logged as observed,
-    /// or as sent, would differ from any rebuild: the collection already
-    /// holds an array when the index is created, so the origin's own build
-    /// is multikey — while a fresh receiver restores definitions before
-    /// documents, and its build is not; and the partial filter holds an
-    /// `Int64` small enough for the metadata encoding to read back as an
-    /// `Int32`.
+    /// the entry it logged for it. Made so that an entry logged as observed
+    /// would differ from any rebuild: the collection already holds an array
+    /// when the index is created, so the origin's own build is multikey —
+    /// while a fresh receiver restores definitions before documents, and its
+    /// build is not. The partial filter holds an `Int64` small enough that the
+    /// metadata encoding read it back as an `Int32` before ADR-182, and keeps
+    /// it now.
     fn origin_with_an_index(a: &Engine) -> OplogEntry {
         let orders = a.create_collection("shop", "orders").unwrap();
         a.insert(&orders, doc! { "_id": 1, "x": [1, 2], "tier": "gold", "age": 30_i64 }).unwrap();
@@ -5119,15 +5119,17 @@ mod relog {
             .unwrap();
         a.insert(&orders, doc! { "_id": 2, "x": 2, "tier": "gold", "age": 40_i64 }).unwrap();
 
-        // What the fixture has to be able to see. Were either premise to stop
-        // holding, the entry would equal a rebuild whether or not the origin
-        // normalised it, and the tests below would pass without testing that.
+        // What the fixture has to be able to see. Were the multikey premise to
+        // stop holding, the entry would equal a rebuild whether or not the
+        // origin normalised it, and the tests below would pass without testing
+        // that. The filter is stored as sent (ADR-182), so an entry and a
+        // rebuild agree on it by construction.
         assert!(created.multikey, "premise: the origin's build of the index is multikey");
         let standing = a.get_collection("shop", "orders").unwrap();
-        assert_ne!(
+        assert_eq!(
             standing.index("by_x").unwrap().partial_filter.as_ref(),
             Some(&sent),
-            "premise: the filter every member stores is not the one the client sent"
+            "the filter every member stores is the one the client sent"
         );
         let stamp = created.created.expect("a local create stamps the definition");
         let entry = a.oplog_entry(&stamp).unwrap().expect("the origin logged the create");
@@ -5136,12 +5138,13 @@ mod relog {
     }
 
     #[test]
-    fn the_metadata_encoding_of_a_filter_is_idempotent() {
-        // What makes a rebuilt entry exact. The origin logs a definition as
-        // it is stored, and a rebuild logs one a page carried, which was
-        // stored and is logged as stored again: equal only if storing twice
-        // is storing once. Every BSON type a filter can hold, including the
-        // two the encoding changes.
+    fn the_metadata_encoding_keeps_a_filter_as_it_was_sent() {
+        // What makes a rebuilt entry exact: the origin logs a definition as
+        // it is stored, and a rebuild logs one a page carried. Since ADR-182
+        // storing is the identity on a filter, so that holds trivially and
+        // for every type -- including the two the relaxed encoding changed, a
+        // small `Int64` and a generic `Binary`, which ADR-180 worked around by
+        // logging the stored form.
         let filter = doc! {
             "int32": 5_i32, "int64-small": 5_i64, "int64-large": 5_000_000_000_i64,
             "double": 1.0_f64, "string": "s", "bool": true, "null": Bson::Null,
@@ -5173,8 +5176,7 @@ mod relog {
             crate::index::as_stored(definition(f)).unwrap().partial_filter.unwrap()
         };
         let once = store(&filter);
-        assert_ne!(once, filter, "premise: the encoding is not the identity on this filter");
-        assert_eq!(store(&once), once, "storing twice is storing once");
+        assert_eq!(once, filter, "the encoding keeps every type of the filter as sent");
 
         // And `as_stored` is what the store does: the filter an index is
         // created with reads back from the metadata as `as_stored` says.
@@ -5259,13 +5261,15 @@ mod relog {
     }
 
     #[test]
-    fn every_member_builds_the_same_membership_from_a_filter_the_encoding_changes() {
-        // Storing the same definition is not building the same membership. A
-        // generic `Binary` in a partial filter is stored as an array, and a
-        // document selected by the one is not selected by the other: an
-        // origin that built from the filter as sent held it, and a member
-        // that built from the stored form -- a peer applying an entry that
-        // carries it, or a snapshot page, which always did -- did not.
+    fn every_member_indexes_what_a_binary_filter_selects() {
+        // A generic `Binary` in a partial filter used to be stored as an
+        // array, which selects different documents: the index held the
+        // document whose `k` is `[[1, 2]]` and not the one whose `k` is the
+        // binary (ADR-182). ADR-180 made every member build from that stored
+        // form, so they agreed on the wrong membership. The filter is now
+        // stored as sent, and every member -- the origin, a peer applying its
+        // entry, and a member restoring from its snapshot -- holds the binary
+        // document and not the array one.
         let binary = Bson::Binary(bson::Binary {
             subtype: bson::spec::BinarySubtype::Generic,
             bytes: vec![1, 2],
@@ -5291,28 +5295,18 @@ mod relog {
                 Some(sent.clone()),
             )
             .unwrap();
-
-        // The case that diverged: a document present at creation that the
-        // filter as sent selects and the filter as stored does not. Were this
-        // to stop holding, every build would agree whether or not the create
-        // normalised, and the equality below would prove nothing.
         let stored = a.get_collection("shop", "orders").unwrap();
-        let stored = stored.index("by_x").unwrap().partial_filter.clone().unwrap();
-        let first = a.get(&orders, &DocId::Int64(1)).unwrap().unwrap();
-        assert!(
-            kimmy_core::PartialFilter::parse(&sent).unwrap().matches(&first)
-                && !kimmy_core::PartialFilter::parse(&stored).unwrap().matches(&first),
-            "premise: the filter as sent and as stored disagree on a document already here"
-        );
-        assert_eq!(created.partial_filter, Some(stored), "the create answers with what is stored");
+        assert_eq!(stored.index("by_x").unwrap().partial_filter, Some(sent.clone()));
+        assert_eq!(created.partial_filter, Some(sent), "the create answers with what is stored");
 
         let entry = a.oplog_entry(&created.created.unwrap()).unwrap().unwrap();
         r.apply_batch(std::slice::from_ref(&entry)).unwrap();
         transfer(&p, &a).unwrap();
 
-        let built = members(&a, "by_x");
-        assert_eq!(members(&r, "by_x"), built, "a peer that applied the entry");
-        assert_eq!(members(&p, "by_x"), built, "a member that restored it from a snapshot");
+        let binary_only = vec![Bson::Int32(1)];
+        assert_eq!(members(&a, "by_x"), binary_only, "the origin");
+        assert_eq!(members(&r, "by_x"), binary_only, "a peer that applied the entry");
+        assert_eq!(members(&p, "by_x"), binary_only, "a member that restored it from a snapshot");
     }
 
     #[test]
