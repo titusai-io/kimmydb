@@ -220,6 +220,31 @@ fn cmp_numbers(a: &Bson, b: &Bson) -> Ordering {
     cmp_numeric(na, nb)
 }
 
+/// Whether two values are comparable, i.e. in the same canonical type group.
+///
+/// `canonical_cmp` orders every value against every other, which is what a
+/// sort and an index need. A filter's `$gt` does not: a string is not greater
+/// than a number, it is not comparable with one. [`crate::matching`] asks
+/// this before it compares.
+pub(crate) fn same_type_group(a: &Bson, b: &Bson) -> bool {
+    fn group(v: &Bson) -> u8 {
+        match v {
+            Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 1,
+            Bson::String(_) | Bson::Symbol(_) => 2,
+            Bson::Document(_) => 3,
+            Bson::Array(_) => 4,
+            Bson::Binary(_) => 5,
+            Bson::ObjectId(_) => 6,
+            Bson::Boolean(_) => 7,
+            Bson::DateTime(_) => 8,
+            Bson::Timestamp(_) => 9,
+            Bson::Null | Bson::Undefined => 10,
+            _ => 11,
+        }
+    }
+    group(a) == group(b)
+}
+
 /// Whether a value is, or contains, a `Decimal128`.
 ///
 /// The one BSON type this order cannot place: `cmp_numbers` ranks it equal to
