@@ -1289,11 +1289,12 @@ mod membership_migration {
             for (d, c, mut meta) in rows {
                 let mut touched = false;
                 for index in meta.indexes.iter_mut() {
-                    if named.iter().any(|(db, coll, name)| {
-                        *db == d && *coll == c && *name == index.name
-                    }) {
+                    if named
+                        .iter()
+                        .any(|(db, coll, name)| *db == d && *coll == c && *name == index.name)
+                    {
                         index.partial_filter = Some(doc! {"size": {"$gt":
-                            bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]))}});
+                        bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]))}});
                         touched = true;
                     }
                 }

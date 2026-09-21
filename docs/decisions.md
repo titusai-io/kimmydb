@@ -18156,9 +18156,9 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 | Taken out | Fails |
 | --- | --- |
 | the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,473 |
-| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473 |
+| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473. The rule this row mutates no longer exists after ADR-183 (see its retired premises), so this row is a measurement of ADR-181's own tree |
 | the date check | the date test through the hook, **and nothing else**: 1 of 2,473 |
-| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
+| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones. Since ADR-183 its declined entries are written into the index directly, because correct membership no longer produces them; see that record's retired premises |
 | skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
 | forgetting the cursors when a collection is dropped | the dropped-collection test |
 | forgetting the cursor when an index is dropped | the dropped-index test |
@@ -18337,7 +18337,11 @@ An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where i
 - **Unique** is correct after the rebuild, and collisions from the defect window are surfaced.
 - **The planner** is served by containment, re-derived as above.
 
-**Two premises this record retired, and why.** ADR-181's mixed-type expiry test asserted that the index held three documents its filter did not select: that was the defect ADR-181 guarded against, and this record removes it. The test now asserts that the index holds only the one the filter selects, so the others are never candidates. The guard itself stays covered by the race test. The find differential's premise, that the membership rule and `find` disagree, named the rule this record deletes.
+**Three premises this record retired, and why.** ADR-181's mixed-type expiry test asserted that the index held three documents its filter did not select: that was the defect ADR-181 guarded against, and this record removes it. The test now asserts that the index holds only the one the filter selects, so the others are never candidates. The guard itself stays covered by the race test. The find differential's premise, that the membership rule and `find` disagree, named the rule this record deletes.
+
+The third arrived after this record was written, in ADR-181's own review. `declined_candidates_do_not_keep_a_pass_from_what_is_behind_them` built its wedge from a thousand documents the index held and the filter did not select — which is the defect this record removes, so under `find`'s reading inserting them gives the index nothing, and the test failed at its premise. Its fixture now writes those entries into the index directly, which is what a partial index built before this release held, so the test keeps its claim and stops depending on the defect. Measured: with the cursor removed it fails at its assertion rather than at its premise.
+
+**After this record, the state that fixture constructs arises from no production path we can name.** Maintenance derives both sides of an entry from `document_keys`, so a document that stops matching loses its entry in the same write; the only decline left is the race, and a race clears itself. A per-document delete failure does not persist either: an error from a delete ends the pass, and the cursor was already saved past the batch, so no one document is examined first on every pass. A snapshot restore is not a second door: a page carries definitions and documents, never index entries, and the receiver builds membership itself under this build's rule. The cursor stays — ADR-181 settled it, it is cheap, and a pass that examines an entry and leaves it must not re-read that entry first next pass whatever produced it — and its witness constructs the state rather than waiting for a defect to supply it.
 
 ### What this does not close
 - A generic `Binary` that an earlier build stored as an array stays that array (ADR-182). It is now *consistently* the array it was stored as.
@@ -18360,3 +18364,4 @@ An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where i
 | the skip class widened to any one excluded kind | the skip-class differential, with that kind's counterexample |
 | the up-front parse of every stored filter | both refusal tests; the empty-collection one because the open then completes and writes schema 4 |
 | naming every offender rather than only the first | the two-offender refusal test, at its count |
+| the expiry cursor (every pass from the front again) | the multi-pass test, at its assertion, on the reconstructed fixture above |
