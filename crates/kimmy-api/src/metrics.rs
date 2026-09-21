@@ -294,6 +294,7 @@ pub struct MetricsSnapshot {
     pub embed_chunks_embedded: u64,
     pub embed_deferred: u64,
     pub embed_skipped_not_owned: u64,
+    pub embed_skipped_no_shadow: u64,
     pub embed_failures: u64,
     /// Transport failures among `embed_failures`, in the order connect,
     /// timeout, reset, other.
@@ -899,6 +900,10 @@ impl Metrics {
                 .vector_counters
                 .get()
                 .map_or(0, |c| c.skipped_not_owned.load(Ordering::Relaxed)),
+            embed_skipped_no_shadow: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.skipped_no_shadow.load(Ordering::Relaxed)),
             embed_failures: self
                 .vector_counters
                 .get()
@@ -960,6 +965,7 @@ impl Metrics {
                 ),
                 None => (0, 0, 0, 0, 0, [0; 4]),
             };
+        let embed_no_shadow = vc.map_or(0, |c| c.skipped_no_shadow.load(Ordering::Relaxed));
         let [t_connect, t_timeout, t_reset, t_other] = transport;
         // Copied once, so the counters and the histograms below are the same
         // ticks' worth.
@@ -1136,6 +1142,9 @@ impl Metrics {
              # HELP kimmy_embed_skipped_not_owned_total Documents dropped un-embedded because another node owns embedding - the duplicate provider calls this counts replacing is the 3x amplification measured in the August 2026 load test.\n\
              # TYPE kimmy_embed_skipped_not_owned_total counter\n\
              kimmy_embed_skipped_not_owned_total {embed_not_owned}\n\
+             # HELP kimmy_embed_skipped_no_shadow_total Documents and scans skipped because a collection is configured for vectors and its shadow collection is not on this node. Should read 0; rising means a configuration without the collection its vectors are stored in.\n\
+             # TYPE kimmy_embed_skipped_no_shadow_total counter\n\
+             kimmy_embed_skipped_no_shadow_total {embed_no_shadow}\n\
              # HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.\n\
              # TYPE kimmy_embed_failures_total counter\n\
              kimmy_embed_failures_total {embed_failures}\n\
@@ -1218,6 +1227,7 @@ impl Metrics {
             embed_chunks = embed_chunks,
             embed_deferred = embed_deferred,
             embed_not_owned = embed_not_owned,
+            embed_no_shadow = embed_no_shadow,
             embed_failures = embed_failures,
             jwks_ok = self.get(&self.jwks_refresh_ok),
             jwks_fail = self.get(&self.jwks_refresh_failed),
@@ -2213,6 +2223,9 @@ kimmy_embed_deferred_total 0
 # HELP kimmy_embed_skipped_not_owned_total Documents dropped un-embedded because another node owns embedding - the duplicate provider calls this counts replacing is the 3x amplification measured in the August 2026 load test.
 # TYPE kimmy_embed_skipped_not_owned_total counter
 kimmy_embed_skipped_not_owned_total 0
+# HELP kimmy_embed_skipped_no_shadow_total Documents and scans skipped because a collection is configured for vectors and its shadow collection is not on this node. Should read 0; rising means a configuration without the collection its vectors are stored in.
+# TYPE kimmy_embed_skipped_no_shadow_total counter
+kimmy_embed_skipped_no_shadow_total 0
 # HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.
 # TYPE kimmy_embed_failures_total counter
 kimmy_embed_failures_total 0
@@ -2509,6 +2522,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
         expect(&format!("kimmy_embed_deferred_total {}\n", s.embed_deferred));
         expect(&format!("kimmy_embed_skipped_not_owned_total {}\n", s.embed_skipped_not_owned));
+        expect(&format!("kimmy_embed_skipped_no_shadow_total {}\n", s.embed_skipped_no_shadow));
         expect(&format!("kimmy_embed_failures_total {}\n", s.embed_failures));
         expect(&format!("kimmy_embed_provider_requests_total {}\n", s.embed_provider_requests));
         expect(&format!("kimmy_embed_provider_tokens_total {}\n", s.embed_provider_tokens));
@@ -2683,10 +2697,11 @@ kimmy_sync_serve_walk_seconds_count 1201
         // sum and count. Since ADR-176, for each of the twelve holders five
         // components, three phases, two byte counts, the estimate's bound and
         // the over-count; one scalar for unmeasured CPU; five serve scalars;
-        // and the serve walk's 12 buckets, +Inf, sum and count.
+        // and the serve walk's 12 buckets, +Inf, sum and count. Since
+        // ADR-178, one scalar for embedding skipped for want of a shadow.
         assert_eq!(
             samples,
-            104 + 6
+            105 + 6
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT

@@ -8179,6 +8179,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_embed_chunks_total",
         "kimmy_embed_deferred_total",
         "kimmy_embed_skipped_not_owned_total",
+        "kimmy_embed_skipped_no_shadow_total",
         "kimmy_embed_failures_total",
         "kimmy_embed_provider_errors_total",
         "kimmy_embed_provider_errors_total",

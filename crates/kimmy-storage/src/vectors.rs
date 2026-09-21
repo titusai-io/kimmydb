@@ -55,6 +55,26 @@ impl VectorWrite {
     }
 }
 
+/// Where a vector configuration comes from, which decides how the shadow
+/// collection it needs is created if it is missing (ADR-178).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Configured {
+    /// A client's configuration on this member. The shadow is created at a
+    /// stamp minted here and logged, before the configuration's own entry,
+    /// so a peer applying the window creates it from that entry, at that
+    /// stamp, like any collection.
+    Locally,
+    /// A peer's `ConfigureVectors` entry, stamped so. A shadow missing here is
+    /// created **at that stamp, unlogged**, and not at all when this member
+    /// holds a newer tombstone for it. Never at a stamp minted here: a stamp
+    /// later than the shadow's drop outlived the drop, and the shadow it
+    /// created replicated back to the members that had dropped it.
+    FromEntry(kimmy_core::Stamp),
+    /// A snapshot page's definition. The shadow is its own collection on the
+    /// page, restored at its own stamp, and is not created here.
+    FromSnapshot,
+}
+
 impl crate::Engine {
     /// Enable or replace auto-embedding for a collection.
     ///
@@ -67,7 +87,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.configure_vectors_inner(db, collection, config, true)
+        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| false)
     }
 
     /// `log = false` when applying a replicated configuration. See
@@ -77,8 +97,10 @@ impl crate::Engine {
         db: &str,
         collection: &str,
         config: VectorConfig,
-        log: bool,
+        by: Configured,
+        history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<CollectionMeta> {
+        let log = matches!(by, Configured::Locally);
         config.validate().map_err(|e| StorageError::Core(CoreError::InvalidQuery(e)))?;
 
         // A shadow collection holds vectors, not documents; configuring
@@ -91,6 +113,19 @@ impl crate::Engine {
         }
 
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
+        // A configuration of a life of the collection that has since been
+        // dropped and recreated here is history, and is not applied to the
+        // life that stands. Judged on the definition read here, which the
+        // writer's `definition_is` below holds unchanged, and before the shadow
+        // is created, so history mints no shadow either.
+        if history(&meta) {
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorHistory);
+            return Ok(meta);
+        }
 
         // A dimension change is safe exactly when the server can rebuild the
         // vectors itself: the embedding worker treats every ConfigureVectors
@@ -113,11 +148,79 @@ impl crate::Engine {
             ))));
         }
 
+        // The shadow is created in the same transaction as the configuration
+        // it serves, so neither is ever durable without the other: minted
+        // before the configuration's own commit, one that turned out history,
+        // or whose collection was dropped in between, left a shadow whose
+        // creation replicated; minted after it, a crash between the two left
+        // a configuration the embedding worker skips for want of a shadow.
+        // What a dropped shadow of this name left behind is purged first,
+        // outside the writer, as any creation's is.
         let shadow = vector_meta::shadow_name(collection);
-        self.create_system_collection(db, &shadow)?;
+        let shadow_missing = match self.get_collection(db, &shadow) {
+            Ok(_) => false,
+            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => true,
+            Err(e) => return Err(e),
+        };
+        if shadow_missing {
+            self.purge_dropped_collection(CollectionId::derive(db, &shadow))?;
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
+        }
 
         meta.vector = Some(config.clone());
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorsWriting);
+        // The shadow first, so a local creation is logged before the
+        // configuration, the order a peer applying the window meets them in.
+        let created = match by {
+            Configured::Locally => Some(self.create_collection_in_txn(
+                &txn,
+                db,
+                &shadow,
+                true,
+                None,
+                &|_| false,
+                self.next_stamp(),
+            )),
+            Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
+                &txn,
+                db,
+                &shadow,
+                false,
+                Some(stamp.hlc),
+                &|dropped| stamp < dropped,
+                stamp,
+            )),
+            Configured::FromSnapshot => None,
+        };
+        let shadow_entry = match created {
+            Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
+            Some(Ok(crate::engine::InTxn::Exists)) => {
+                // Made by a concurrent configuration of this collection since
+                // it was found missing: the shadow this one wanted.
+                #[cfg(test)]
+                if shadow_missing {
+                    crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::SystemCreate);
+                }
+                None
+            }
+            // A peer's configuration older than the shadow's drop here: the
+            // configuration still applies, and the drop that came after it
+            // stands.
+            Some(Ok(crate::engine::InTxn::History)) | None => None,
+            Some(Err(e)) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorConfiguration);
+            return self.configure_vectors_inner(db, collection, config, by, history);
+        }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -137,8 +240,11 @@ impl crate::Engine {
             None
         };
         txn.commit()?;
-        if let Some(entry) = logged {
-            self.publish(vec![entry]);
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorsCommitted);
+        let published: Vec<_> = shadow_entry.into_iter().chain(logged).collect();
+        if !published.is_empty() {
+            self.publish(published);
         }
 
         info!(db, collection, shadow = %shadow, "configured auto-embedding");
@@ -150,7 +256,7 @@ impl crate::Engine {
     /// Keeping them by default means re-enabling with the same settings does
     /// not force a full re-embed, which for a remote provider is a real cost.
     pub fn disable_vectors(&self, db: &str, collection: &str, drop_vectors: bool) -> Result<bool> {
-        self.disable_vectors_inner(db, collection, drop_vectors, true)
+        self.disable_vectors_inner(db, collection, drop_vectors, true, &|_| false)
     }
 
     pub(crate) fn disable_vectors_inner(
@@ -159,14 +265,31 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
         log: bool,
+        history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
+        let read = meta.clone();
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
+        // As `configure_vectors_inner`: turning vectors off for a life that
+        // has since been dropped and recreated here is history.
+        if history(&meta) {
+            return Ok(false);
+        }
         if meta.vector.is_none() {
             return Ok(false);
         }
 
         meta.vector = None;
         let txn = self.begin_write(WriterHolder::Ddl)?;
+        // The definition written back was read before the writer
+        // (`Engine::definition_is`).
+        if !crate::Engine::definition_is(&txn, &read)? {
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorRemoval);
+            return self.disable_vectors_inner(db, collection, drop_vectors, log, history);
+        }
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
