@@ -10,7 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.33.0 - 2026-09-21
+
+**A minor, for one additive series; nothing breaks.**
+`kimmy_embed_skipped_no_shadow_total` is new on `/metrics` and on the OTLP
+bridge ([ADR-178](docs/decisions.md)), which a scrape config or a golden list
+that enumerates series needs. No existing series, label or type changes, and
+nothing on the wire, on disk, in configuration or in packaging changes.
+
+**Otherwise this release is one defect, found ten times: a replicated change
+judged before it held the single writer.** Nine of the ten fixes are that
+shape. A member read a collection, an index definition or a tombstone through
+a read transaction, took the writer, and then acted on an answer another apply
+had made stale in between — writing a document into a collection buried
+meanwhile or into the one recreated after it, dropping a collection recreated
+since, bringing back a collection or a vector shadow dropped elsewhere, or
+losing one of two schema changes made at once. Each is now judged again under
+the writer ([ADR-178](docs/decisions.md),
+[ADR-179](docs/decisions.md)). None of them was visible to a client: both
+applies succeeded and the window was witnessed, so replication did not bring
+the divergence back.
+
+**The tenth is about time rather than order.** A sync round's deadline no
+longer encloses this node's own apply, so a slow local apply stops being
+counted as a failure of a peer that answered at once; and what an apply
+refused, declined or skipped is now counted by the commit that makes it final
+([ADR-177](docs/decisions.md)).
 
 ### Added
 
