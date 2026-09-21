@@ -17650,14 +17650,17 @@ rather than watches one function.
 **appends the originating entry for it**, at the **origin's own stamp**, in the
 same transaction that writes the state. It does not mint an entry of its own.
 
-Five cases, every one of which the page already carries the stamp for:
+Four cases, and the line between what this record closes and what it does not
+turns out to be a principled one: **a page can carry a thing, and this record
+re-logs it; a page cannot carry an absence in a form that names what is gone,
+and that is the next record's problem.** Creations relay here. Removals do
+not.
 
-| Restored | Entry appended | Stamp from |
+| Restored | Entry appended | Body rebuilt from |
 | --- | --- | --- |
-| A collection | `CreateCollection` | `CollectionState.created` |
-| A collection tombstone ([ADR-162](#adr-162--a-whole-database-snapshot-page-carries-the-senders-drops-so-it-can-convey-absence)) | `DropCollection` | `dropped_collections` |
-| An index definition | `CreateIndex` | `IndexMeta.created` |
-| A vector configuration | `ConfigureVectors` | the configuration's stamp |
+| A collection | `CreateCollection` | `CollectionState.db`, `.name`, `.created` |
+| An index definition | `CreateIndex` | `CollectionState` + `IndexMeta`, at `IndexMeta.created` |
+| A vector configuration | `ConfigureVectors` | `CollectionState.vector`, at the configuration's stamp |
 | **A vector shadow** | **none, deliberately** | — |
 
 The shadow is the case that looks missing and is not. A shadow creation entry
@@ -17745,25 +17748,29 @@ untouched, because no entry is minted under this node's stamp anywhere in it.
 
 Appending entries *below* the member's own servable vector invites an obvious
 worry: that it drags the member's serve-from horizon backwards, so it starts
-advertising a window it cannot serve — this defect wearing a different hat. It
-does not, for two independent reasons.
+advertising a window it cannot serve — this defect wearing a different hat.
 
-**The horizon is a retention record, not a scan.** `can_serve_peer_holding`
-asks `lacks_collected`, which compares the peer's coverage against
-`OPLOG_COLLECTED` — *"per origin, the highest `Hlc` retention has removed from
-the oplog"* — written only by the garbage collector. Nothing derives the
-horizon from the oldest entry present, so adding entries cannot move it.
+**The argument that settles it is monotonicity, and it does not depend on how
+the horizon is computed.** An entry added at an old stamp can turn a window
+this member could not serve into one it can. It cannot turn a servable window
+into an unservable one. Appending only ever *narrows* the gap between what a
+member advertises and what it can actually serve, which is the whole purpose
+of this record. A change that can only narrow that gap cannot reintroduce a
+defect that consists of the gap being open.
 
-**And appending is monotone in the right direction anyway.** An entry added at
-an old stamp can turn a window this member could not serve into one it can. It
-cannot turn a servable window into an unservable one. So the gap between what
-a member advertises and what it can actually serve only ever narrows here —
-which is the whole point of the record.
+**Corroborated in the code as it stands today.** `can_serve_peer_holding` asks
+`lacks_collected`, which compares the peer's coverage against `OPLOG_COLLECTED`
+— *"per origin, the highest `Hlc` retention has removed from the oplog"* —
+written only by the garbage collector. Nothing derives the horizon from the
+oldest entry present, so adding entries cannot move it. That is a fact about
+this implementation; the paragraph above is the reason it would still be safe
+if someone rewrote the horizon calculation.
 
 **Order does not matter either.** The oplog is a redb table keyed by
 `codec::oplog_key(stamp)`, so it is sorted by stamp however it was filled.
 There is no monotonic-append requirement to satisfy and no ordering constraint
-on the several entries one page restores.
+on the several entries one page restores. Recorded so the next reader does not
+re-derive it.
 
 ### The one real hazard: an entry already held must not be overwritten
 
@@ -17782,20 +17789,79 @@ stamped as the origin's, and overwrite the origin's own entry on every member
 that already holds it — turning a node-local observation into replicated
 history, which is exactly what `multikey` is defined not to be.
 
-So the append must **leave an entry already present exactly as it is**, and
-reconstruct only where the key is absent. The dedup constraint above is
-usually read as "do not append twice"; this is the sharper form of it: do not
-*rewrite*. A test that restores a snapshot onto a member that already holds
-the originating entry, and asserts the entry's bytes are unchanged, is the one
-that catches this — and it is not the same test as the one that counts
-appends.
+**"Do not rewrite" is necessary and not sufficient.** Leaving a present entry
+untouched protects a member that already holds it. It does nothing for the
+**reconstructing** member, where the key is absent by definition: that member
+builds the entry from its own page, holds it, and serves it onward — which is
+the entire purpose of this record. A peer that never held the entry receives
+the rebuilt one and the rewrite rule never fires there either, because its key
+is absent too. The corruption propagates along exactly the path the fix opens.
+
+**And the damage is not the value of the flag.** `multikey` is one-way and
+converges, so an early `true` is merely conservative. What breaks is that
+**the stamp stops determining the entry.** Two members reconstructing the same
+stamp at different moments would produce different bytes, so `(origin, stamp)
+→ entry` is no longer a function — and the dedup this record relies on, along
+with every comparison and checksum keyed on a stamp, assumes that it is.
+
+**So the rule is: a reconstructed body carries node-local fields at their
+origin value, never the page's.** `multikey` goes in as its creation-time
+value, `false`, and each member's own write path sets it from the documents
+that member actually holds — which is what the field's own documentation says
+it is for. Reconstruction is then **deterministic across members**, which is
+the property that makes the dedup sound. Both rules apply: normalisation makes
+reconstruction correct, and "do not rewrite" is the guard for anything that
+still manages to differ.
+
+The test is a member that already holds the originating entry, restoring a
+snapshot, asserting the entry's bytes are unchanged. It is not the test that
+counts appends, and a fix passing every dedup test would still fail it.
+
+**The sweep.** `multikey` was found first; it is not sound to assume it is
+alone. Every field of every body this record reconstructs, twenty-five across
+three bodies:
+
+| Body | Fields | Node-local |
+| --- | --- | --- |
+| `CollectionRef` (`CreateCollection`) | 2 | none |
+| `IndexCreate` (`CreateIndex`) | 3 + 9 in `IndexMeta` | **`multikey`** |
+| `VectorSet` (`ConfigureVectors`) | 3 + 8 in `VectorConfig`/`ProviderConfig` | none |
+
+**One field, out of twenty-five, and all twenty-five were checked.** The three
+that read as node-local and are not are worth naming, because each would be a
+reasonable thing to flag and each is safe:
+
+- **`IndexMeta.enforcement`** — *"how `unique` is enforced once the node has
+  peers"* reads like something that varies per node. It does not: it is chosen
+  at creation, travels with the definition, and is assigned in exactly one
+  place outside a constructor, which is a test.
+- **`VectorSet`'s missing `drop_vectors`** — whether stored vectors are
+  discarded *is* a local choice, and it is already deliberately absent from
+  the replicated body: *"a local reclamation choice"*. The precedent for this
+  whole section already existed one field over.
+- **`ProviderConfig::OpenAi.api_key_env`** — reads like a credential, is the
+  *name* of an environment variable. *"The key itself is never stored in
+  collection metadata."*
+
+`IndexMeta.id` is safe by construction rather than by inspection: it is
+derived from `name`, with ADR-031's reasoning recorded on the field.
 
 ### What this does NOT close
 
-**This is not the whole fix, and must not be read as one.** It closes five of
-the seven relay cases above. Two remain, and a third case in the same family
-that the sweep found separately:
+**This is not the whole fix, and must not be read as one.** It closes four of
+the seven relay cases. Three remain, and they are the three removals:
 
+- **A collection drop**, which was in this record's scope until the field
+  sweep took it out. A `DropCollection` body is `CollectionRef { db, name }`,
+  and the page conveys a drop as `dropped_collections: Vec<(CollectionId,
+  Stamp)>` — an id and a stamp, no name. `CollectionId::derive` is an FNV-1a
+  hash of `db\0name`, so the id cannot be inverted, and the receiver's own
+  `COLLECTIONS_DROPPED` table is `u64 → stamp` and stores no name either. A
+  member that never held the collection therefore cannot name what it is
+  dropping, and cannot build the entry. It is reconstructible only where the
+  member already holds the live definition — which is the branch a member
+  restoring a whole-database snapshot does not take. **The same shape as the
+  document delete below**, reached from a different direction.
 - **An index drop** and **a vector configuration turned off.**
   `CollectionState` carries `indexes` and `vector` — presence only. There is
   no index tombstone on the page and no record that a configuration was turned

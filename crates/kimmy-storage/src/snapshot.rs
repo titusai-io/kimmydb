@@ -5035,3 +5035,53 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod relog_feasibility {
+    use super::*;
+    use bson::doc;
+
+    fn engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+    }
+
+    /// A `DropCollection` body is `CollectionRef { db, name }`. Can a member
+    /// that restored the drop from a whole-database page name the collection?
+    #[test]
+    fn a_restored_drop_carries_no_name_to_rebuild_its_entry_from() {
+        let (a, _da) = engine();
+        let (p, _dp) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "keep").unwrap();
+
+        // P is fresh: it never held `shop.orders`.
+        let mut progress = SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            assert!(
+                page.collections.iter().all(|c| c.name != "orders"),
+                "a dropped collection is not among the page's live definitions"
+            );
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+
+        // P holds the tombstone, by id.
+        assert!(
+            p.collection_dropped_at(ca.id).unwrap().is_some(),
+            "P restored the drop, so it holds the tombstone"
+        );
+        // But nothing on P can turn that id back into `("shop", "orders")`.
+        assert!(
+            p.collection_by_id(ca.id).unwrap().is_none(),
+            "and holds no definition to read the name from"
+        );
+        assert_eq!(
+            kimmy_core::CollectionId::derive("shop", "orders"),
+            ca.id,
+            "the id is a hash of db and name, so it cannot be inverted"
+        );
+    }
+}
