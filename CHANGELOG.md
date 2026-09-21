@@ -15,6 +15,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 **Upgrading rebuilds every partial index at startup, and a downgrade is
 refused.** This release moves the storage schema to 4
 ([ADR-183](docs/decisions.md)).
+- **Before upgrading on Kubernetes, give the first start time to finish.**
+  Nothing listens until the open completes, so under the manifest in
+  [operations.md](docs/operations.md), whose liveness probe allows about 30
+  seconds, a longer open is killed and started again. The rebuild resumes
+  from the last finished index, so an index that takes longer than the probe
+  allows never finishes: the node restarts for ever while looking as if it is
+  progressing. Add a `startupProbe`, or raise the liveness allowance, to at
+  least twice the expected open: about 46 seconds per 10 million entries in
+  the retained oplog (the writes of `storage.oplog_retention_secs`, 24 hours
+  by default), plus 7 µs per document per partial index. For example, 10
+  million retained entries and one partial index over 10 million documents is
+  about 2 minutes, so allow 4: `periodSeconds: 10` with
+  `failureThreshold: 24`.
 - **Startup.** The first start rebuilds each partial index before the node
   serves anything, logging the whole job up front: indexes, documents, an
   estimate, and the free space the largest needs. Measured on the development
@@ -24,8 +37,14 @@ refused.** This release moves the storage schema to 4
   (about 80 bytes per entry) plus about 2 GiB.
 - **Downgrade.** An older build refuses a schema 4 database rather than open
   it and corrupt its partial indexes.
-  - To roll back **one member**, wipe its data directory and start the older
-    build: it catches up from its peers.
+  - To roll back **one member**, wipe its data directory, start the older
+    build, and **keep clients off it until it has caught up from its peers**.
+    Until then it answers reads from a store that starts empty, so a document
+    it has not pulled yet reads as not found rather than as an error, and
+    nothing reports that it is behind: `/readyz` does not, and
+    `kimmy_replication_lag_seconds` reads 0 from a fresh start. So it is
+    returned to service by hand, once its document counts match a member
+    that stayed up.
   - To roll back **the whole cluster**, restore a backup taken before the
     upgrade.
 

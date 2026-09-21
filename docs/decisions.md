@@ -18303,6 +18303,12 @@ So the cost is paid at the first start, and announced before it is paid. Making 
 - A line every 100,000 documents.
 - A line per index with its duration and entries when it ends.
 
+**Before upgrading on Kubernetes, the first start needs time to finish.** The HTTP listener binds only once `Engine::open` has returned, and the migration runs inside it. The manifest in the operations guide gives liveness about 30 seconds (three failures, ten seconds apart), and a longer open is killed and started again. The per-index markers make that the worst shape: every index shorter than the allowance completes, and one longer than it never does, so the node restarts for ever while its log shows progress. The operator therefore adds a `startupProbe`, or raises the liveness allowance, to at least twice the expected open:
+- an ordinary open, measured at 46 s for a database whose oplog retains 10 million entries (the retention window's writes);
+- plus the rebuild, 7 µs per document per partial index.
+
+For 10 million retained entries and one partial index over 10 million documents that is about 2 minutes, so the allowance is 4 (`periodSeconds: 10`, `failureThreshold: 24`). The real fix is binding before the open, so that liveness answers while the open progresses and readiness says what it is doing. That is filed as its own design, because a listener with no engine needs defined behaviour.
+
 **Where the figures come from.** Each collection's size is its kept live count (ADR-174), one row. Counting instead, ten million documents and 7.4 million entries, took 48 s just to announce the job. But the migration runs before `Engine::open` rebuilds stale counts, and a database restored from a backup carries none. Trusted then, the line would say there was nothing to do. So the counts are read only when their mark matches the store, the same test that decides whether they are rebuilt; otherwise each collection's records are counted and that one open pays for it.
 
 **Headroom, measured.** A one-transaction rebuild needs free space **inside the database file** equal to the index's own size, because the old entries' pages stay allocated until the commit. Allocation grew by 55, 166 and 555 MiB for indexes of 55, 166 and 553 MiB, which is about 80 bytes per entry for that shape.
@@ -18321,7 +18327,7 @@ So the cost is paid at the first start, and announced before it is paid. Making 
 ### Downgrade is refused, and what rolling back means
 
 An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where it expects 3) instead of opening it and re-corrupting every partial index on each write. A node that does not start is found in seconds. A node that starts and quietly degrades its indexes is found weeks later from a wrong answer.
-- **Rolling back one member** needs no backup. Wipe its data directory and start the older build: it catches up from its peers by the ordinary whole-database snapshot.
+- **Rolling back one member** needs no backup, and it needs **keeping out of service until it has caught up**. Wipe its data directory and start the older build: it catches up from its peers by the ordinary whole-database snapshot. Until then it answers reads from a store that starts empty, so a document it has not pulled yet reads as not found, not as an error. Nothing reports that it is behind: `/readyz` does not know about catching up, and `kimmy_replication_lag_seconds` reads 0 from a fresh start. So it goes back into service by hand, once its document counts match a member that stayed up. Readiness that covers catching up is filed separately, and it is not simple: discovery on Kubernetes resolves only ready pods, so a readiness gate on peers would deadlock a whole-cluster cold start.
 - **Rolling back the whole cluster** leaves no un-upgraded peer to catch up from, so it needs a backup taken before the upgrade.
 
 ### The consumers
