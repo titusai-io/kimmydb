@@ -22,6 +22,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A sync round whose own apply takes longer than 30 s is no longer counted as
+  a failure of the peer** ([ADR-177](docs/decisions.md)). The round's deadline
+  enclosed this node's apply, which runs to completion regardless, so a slow
+  local apply against a peer that had answered at once raised
+  `kimmy_sync_failures_total` and backed the healthy peer off. The deadline now
+  charges only the time spent outside this node's applies; a slow peer still
+  fails the round. And what an apply refused, declined or skipped is counted
+  by the commit that makes it final, so a pulled or pushed window that fails
+  counts in `kimmy_sync_ddl_refused_total`, `kimmy_sync_ddl_declined_total` and
+  `kimmy_sync_entries_skipped_total` what it would have counted up to where it
+  stopped, and what it did not reach is counted by the next delivery. Both
+  used to count nothing for a window that failed: a decline, a refusal a later
+  commit had covered, and everything in a window that failed after its last
+  commit went uncounted.
 - **A dropped vector shadow collection stays dropped, and a shadow commits
   with its configuration** ([ADR-178](docs/decisions.md)). A client's
   configuration creates and logs the shadow before the configuration, as

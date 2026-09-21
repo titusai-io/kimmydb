@@ -17266,6 +17266,173 @@ They do not exist in any other build and are reachable from no other crate.
 
 ---
 
+## ADR-177 — A sync round's deadline is the peer's time, and what an apply counted is counted when it commits
+
+> **Refines [ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords)**
+> to match its own reasoning. It does not overturn it: a round that fails is
+> still counted, still skipped for the divergence check, and still backs the
+> peer off.
+
+**Decision.** A sync round is bounded by `REQUEST_TIMEOUT` (30 s) on the time
+it spends **outside this node's own applies**. Each apply of a window, and of
+a snapshot page, adds its duration to the round's deadline: the whole apply,
+the wait for the single writer included, which `kimmy_sync_pull_seconds`
+reads as `phase="wait"` beside `phase="apply"`. A snapshot page's apply is
+observed by no series. **[ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped)'s page budget is unchanged**: it
+stays wall time, applies included. And the counts an apply produces (definitions
+refused and declined, entries skipped for an unknown collection or beyond the
+advertised vector) are recorded as the apply commits, in the `PeerStalls` slot
+the round's pull timing already uses (ADR-175), and taken by the replication
+loop whatever the round returned.
+
+**Why.** Observed in round 0370's teardown: two members' rounds against a
+third timed out while *applying* drop units (apply 60–71 s, writer wait under
+1 s), while the peer had served each window in 0.1 ms. Each round was counted
+in `kimmy_sync_failures_total`, and the healthy peer was backed off. Reading
+the code showed why, and two further consequences:
+
+- The whole round, local apply included, sat inside one
+  `tokio::time::timeout`. The apply is synchronous inside the round's poll, so
+  the timeout could never cut it short: it ran to completion and committed,
+  and the round failed at the next await after it. It was cancellation-safe
+  only because nothing inside the apply awaits.
+- ADR-157's failure path, and `REQUEST_TIMEOUT`'s own purpose, are about a
+  peer that is slow or unreachable. A local apply's duration says nothing
+  about the peer. Charging it to the peer backs off a healthy member exactly
+  when this node is already behind.
+- The report's refused, declined and skipped counts were taken from the
+  round's `SyncOutcome` on success only. A round that failed after its apply
+  committed lost them, and `kimmy_sync_ddl_refused_total` is a divergence
+  signal (ADR-123), not a statistic.
+
+**What still bounds a round in wall time.** The deadline no longer does, so
+the bound is stated here. An entries round applies one window, so it takes at
+most that apply plus 30 s of exchange, which is what it took before: the apply
+was never cut short. A snapshot round applies pages while its page budget
+lasts, and **that budget stays wall time, apply included** (ADR-152): moved on
+by apply time like the deadline, pages that were slow to apply would each buy
+the next, and a slow snapshot would run to its end in one round. And across
+rounds, ADR-157's tick starts another pull from a peer only when the pull
+before it, apply included, would fit in the tick's remaining budget, so a
+slow apply ends that contact. The sequential contact loop is held by one round
+for one window's apply, or one page budget, beyond the exchange, as before.
+
+**Each delivery counts its decisions once, at the step that makes them final,
+whatever error follows.** This is ADR-123's per-delivery rule, kept: a
+decision is counted by every delivery that makes it, so a repair's replay of a
+window, or two deliveries of one window at once (a push applied while this
+node pulls), each count theirs. What changes is the failed delivery: **it
+counts what a successful one would have counted up to where it stopped.** A
+batch's decisions are not all made final by the same commit, and an error can
+fall between them. The next ordinary delivery from the peer starts above what
+this node witnesses, so a decision a commit covered is not in it, and one no
+commit covered is, and is decided and counted there. Counted at success only,
+a failed delivery lost what its commits had covered; counted at the error
+wholesale, it counted twice what the next delivery decides again. So
+`Engine::apply_peer_batch_into` leaves in the outcome, on success and on error
+alike, what a commit made final, and the caller records it: the pull round,
+and the served arm that applies a push, which hands it to its push hook
+before it answers the pusher with the fault:
+
+- **A declined drop** is final when its tombstone commits, as it is declined.
+  The next delivery is a replay, which is not counted.
+- **A refused definition** writes nothing. It is final once the witnessed
+  vector on disk covers its stamp: at the batch's last commit, which carries
+  the window's coverage, or earlier, at any commit that raised its origin past
+  it. An applied definition appends its own entry, and a run commits the
+  documents it wrote, before each schema change; either can cover a refusal
+  from the same origin that precedes it. After an error, the batch reads the
+  witnessed vector and counts the refusals it covers, which is what its
+  success would have counted over the same entries.
+- **An entry deferred beyond the advertised vector, and the entry for an
+  unknown collection the batch stopped at**, are final with the batch's last
+  commit, which records the window as ending before them. They are served
+  again whatever happens, by design (ADR-148), so each delivery whose last
+  commit lands counts them once, as ADR-123 counts per delivery.
+
+A failure before any covering commit leaves the decision to the next
+delivery, which decides and counts it then. A pull or a push that fails after
+its last commit (reporting what the run applied can fail after it commits)
+counts what it would have counted had it succeeded.
+
+**A pull whose apply fails is not timed.** `kimmy_sync_pull_seconds` is
+observed from the pull timing handed over once the apply has returned, and a
+failed apply returns first. Observed, its `apply` would add a partial apply's
+time to `kimmy_sync_pulled_entries_total`'s window of entries it did not all
+apply, and the per-entry cost that ratio reads (ADR-175) would be wrong. Its
+failure is counted in `kimmy_sync_failures_total`.
+
+And `kimmy_sync_repair_rounds_total` counts a round that repaired: a pull that
+failed is not a completed repair round, so it is still read from the round's
+outcome on success.
+
+**What is not changed.** A peer that is slow on the wire still fails the round
+at the same deadline, counts and backs off. Nothing about the apply itself
+changes, and no new series is added: an entries window's apply already reads
+in `kimmy_sync_pull_seconds` (ADR-175), split into `phase="wait"` for the
+writer and `phase="apply"` for the rest, and a snapshot page's apply is
+observed by no series. The connect and handshake timeouts are
+untouched.
+
+**Tests.** Against a fake peer over a duplex stream, with a `cfg(test)` hook
+that makes the apply take three times a 200 ms round limit:
+
+- `a_round_whose_own_apply_outlasts_the_deadline_against_a_prompt_peer_succeeds`:
+  succeeds, and the refused definition in its window is counted. With the
+  apply's time charged to the deadline again, it fails `TimedOut`.
+- `what_a_committed_apply_refused_is_counted_when_the_round_then_fails`: the
+  peer stops answering after the window, the round times out, and the refusal
+  is still counted. With the counts taken from the outcome only, it goes red.
+- `a_round_against_a_slow_peer_still_times_out`: the negative. With no deadline
+  at all, it goes red.
+- `an_apply_moves_the_deadline_on_by_its_own_duration_and_no_more`: an apply
+  followed by a peer slow past the limit times out. With apply time counted
+  twice, the slow peer gets through.
+- `a_definition_refused_from_a_snapshot_page_is_counted`: a page's refused
+  definition reaches what the round applied. Without that line, it is lost.
+- `a_decline_in_a_batch_that_errors_is_counted_once`: at the transport, a
+  drop declined in a batch that then errors, then the same drop served again,
+  counts one decline. With the outcome dropped on error, it is never counted.
+- The push route, through the served arm with a push hook, then the pull that
+  follows it: `a_decline_in_a_push_that_fails_is_counted_once_with_its_pulled_replay`,
+  `a_refusal_a_failing_push_covered_is_counted_by_the_push`, and
+  `a_push_that_fails_after_its_last_commit_counts_what_it_refused` (storage's
+  failure injection, which the `test-hooks` feature exposes to this crate's
+  tests only). With the hook called on success only, all three count 0.
+
+The count rule, in storage, with a `cfg(test)` failure injected before or
+after a batch's last commit, then the re-serve a peer makes from what this
+node then witnesses. Each runs with no failure (the control: no double count)
+and with each failure, and asserts the total across both deliveries:
+
+- `a_refusal_is_counted_once_across_a_failed_delivery_and_its_re_serve`.
+- `a_refusal_covered_by_a_later_definition_is_counted_once_across_a_failed_delivery`.
+- `a_decline_is_counted_once_across_a_failed_delivery_and_its_re_serve`.
+- `a_stop_at_an_unknown_collection_is_counted_by_each_delivery_whose_last_commit_lands`:
+  once per delivery, and not by one that failed before its last commit.
+
+Red, with the error path changed alone: counting nothing on error (the code
+before this) turns all four red; counting declines only turns every one but
+the decline test red; counting everything on error turns the plain refusal and
+the unknown collection red (counted twice); counting refusals only when the
+last commit landed turns the covered refusal red.
+
+- `peers::a_round_that_fails_after_its_apply_still_reports_what_the_apply_refused`:
+  at the loop, against a real `serve`, a refused definition in a round that
+  fails after its apply (a `cfg(test)` hook keyed by peer address) reaches the
+  round report, once. With the loop reading counts from a successful outcome
+  only, it never does.
+- `slow_snapshot_pages_still_end_the_round_at_its_page_budget`: pages that each
+  take 300 ms against a 500 ms page budget end the round before the snapshot
+  does, left to resume. With the page budget moved on by apply time, the round
+  applies every page.
+
+**Recorded, not changed.** The apply's CPU between its yielding storage calls
+still runs on the runtime worker (ADR-153's concern), so a 70 s apply occupies
+that tick's sequential contact loop for its whole length.
+
+---
+
 ## ADR-178 — A vector shadow is created at the stamp of the change that needs it, and only a client's configuration logs its creation
 
 **Decision.** How a missing vector shadow collection is created depends on

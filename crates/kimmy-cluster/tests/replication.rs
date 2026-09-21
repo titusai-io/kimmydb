@@ -2803,6 +2803,31 @@ fn drain_loop(
     (tokio::spawn(replicate(Arc::clone(&from.engine), config)), rx)
 }
 
+/// [`drain_loop`], with `peer` already a member, so the loop's first tick
+/// contacts it whichever arm of the loop wins the first race, and a long
+/// interval needs no second tick to find it.
+fn drain_loop_knowing(
+    from: &Node,
+    peer: &Node,
+    interval: Duration,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::UnboundedReceiver<kimmy_cluster::RoundReport>)
+{
+    use kimmy_cluster::{Members, ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let members = Members::default();
+    members.insert_for_test(peer.addr, peer.engine.node_id());
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![peer.addr])], SECRET.into(), from.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(10);
+    config.members = Some(members);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    (tokio::spawn(replicate(Arc::clone(&from.engine), config)), rx)
+}
+
 /// ADR-157's own measure. A member five batches behind catches up inside one
 /// tick, rather than one batch per tick with the member idle in between: a
 /// tick keeps pulling from a peer while the pull before it came back at the
@@ -2813,10 +2838,18 @@ fn drain_loop(
 /// Counted in *contacts* rather than in seconds: a contact is a peer per
 /// tick, and `divergence_checks + divergence_skips` is exactly one per
 /// contact (ADR-145), so the report says how many ticks the peer was
-/// contacted on without the test timing anything. Reverting
-/// `draining.push_back(contact)` in `peers.rs` — the arm that sends a
-/// truncated peer round the queue again — puts it back at one batch per
-/// contact, and this reads five.
+/// contacted on without the test timing anything. Removing the arm that sends
+/// a truncated peer round the queue again (`AfterPull::Again` in `peers.rs`)
+/// puts it back at one batch per contact, and this reads five contacts.
+/// Deleting only its `draining.push_back(contact)` drops the unfinished
+/// contact instead, which counts no check and no skip, so the ticks are
+/// counted too, and that reads five ticks.
+///
+/// The claim is contacts, so the runner's speed is kept out of it. The tick's
+/// budget is its interval (ADR-157), and at 2 s a slow runner spent it before
+/// the fifth pull and took a second contact. At 20 s no runner does, and the
+/// peer is a member before the first tick, so that tick drains the backlog: one
+/// contact. Reverted, a tick every 20 s reads five inside the deadline.
 #[tokio::test]
 async fn a_peer_five_batches_behind_is_drained_inside_one_tick() {
     use kimmy_cluster::protocol::MAX_BATCH;
@@ -2828,9 +2861,9 @@ async fn a_peer_five_batches_behind_is_drained_inside_one_tick() {
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     seed(&a, &ca, entries);
 
-    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut contacts = 0usize;
+    let (looping, mut rx) = drain_loop_knowing(&b, &a, Duration::from_secs(20));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let (mut contacts, mut ticks) = (0usize, 0usize);
     while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
@@ -2838,13 +2871,17 @@ async fn a_peer_five_batches_behind_is_drained_inside_one_tick() {
             .expect("the loop must keep reporting");
         assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
         contacts += report.divergence_checks + report.divergence_skips;
+        ticks += 1;
     }
     looping.abort();
 
-    assert!(
-        contacts <= 2,
-        "five batches must drain in one tick's contact, or two if the first tick found no \
-         peer yet; took {contacts}"
+    // Both, because the two ways back to one batch per tick read differently:
+    // a truncated contact that ends counts a skip, one that is dropped
+    // unfinished counts nothing and only the tick count sees it.
+    assert_eq!(
+        (contacts, ticks),
+        (1, 1),
+        "five batches must drain in one tick's contact; took {contacts} contacts over {ticks} ticks"
     );
 }
 

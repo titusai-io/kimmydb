@@ -362,17 +362,25 @@ where
                 // before hanging up, as a refused batch size is above: without
                 // it the pusher reads only a closed connection, and the reason
                 // is in this node's log alone.
-                let outcome =
-                    match engine.apply_peer_batch(&versions, &entries, scanned_to, exhausted) {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            let reason = format!("the pushed window could not be applied: {e}");
-                            let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
-                            return Err(ProtocolError::Malformed(reason));
-                        }
-                    };
+                let mut outcome = SyncOutcome::default();
+                let applied = engine.apply_peer_batch_into(
+                    &versions,
+                    &entries,
+                    scanned_to,
+                    exhausted,
+                    &mut outcome,
+                );
+                // Whether or not the window then failed: the outcome holds
+                // only what a commit made final, as a pulled window's does,
+                // and what none did is delivered again and counted then
+                // (ADR-177).
                 if let Some(hook) = on_pushed {
                     hook(&outcome);
+                }
+                if let Err(e) = applied {
+                    let reason = format!("the pushed window could not be applied: {e}");
+                    let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
+                    return Err(ProtocolError::Malformed(reason));
                 }
                 write_frame(
                     &mut stream,
@@ -707,10 +715,11 @@ async fn dial(
 }
 
 /// The body of [`sync_once`], over a connection [`dial`] opened: one round,
-/// bounded by [`REQUEST_TIMEOUT`].
+/// bounded by [`REQUEST_TIMEOUT`] on the time it spends outside this node's
+/// own applies (ADR-177).
 async fn sync_over<S>(
     engine: &Engine,
-    mut stream: S,
+    stream: S,
     peer: SocketAddr,
     their_node: kimmy_core::NodeId,
     probe: Option<DivergenceProbe>,
@@ -719,22 +728,45 @@ async fn sync_over<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // What a snapshot pull checks between pages (ADR-152): the round's own
-    // deadline, less the reserve, so the round ends on a page boundary
-    // rather than wherever the timeout below cuts it.
-    let snapshot_deadline = Instant::now() + REQUEST_TIMEOUT - SNAPSHOT_PAGE_RESERVE;
-    tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        sync_round(engine, &mut stream, peer, their_node, probe, stalls, snapshot_deadline),
+    sync_over_within(engine, stream, peer, their_node, probe, stalls, REQUEST_TIMEOUT).await
+}
+
+/// [`sync_over`] with `limit` for [`REQUEST_TIMEOUT`], for a test that cannot
+/// wait thirty seconds.
+async fn sync_over_within<S>(
+    engine: &Engine,
+    mut stream: S,
+    peer: SocketAddr,
+    their_node: kimmy_core::NodeId,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+    limit: Duration,
+) -> Result<SyncOutcome, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let clock = RoundClock::default();
+    // What a snapshot pull checks between pages (ADR-152): the round's limit
+    // less the reserve, in wall time, applies included. It is what ends a
+    // snapshot round on a page boundary, and what bounds one round's hold on
+    // the tick; the deadline below, which excludes this node's applies
+    // (ADR-177), judges only the peer and would not.
+    let snapshot_deadline = Instant::now() + limit.saturating_sub(SNAPSHOT_PAGE_RESERVE);
+    within_exchange_budget(
+        limit,
+        &clock,
+        sync_round(engine, &mut stream, peer, their_node, probe, stalls, snapshot_deadline, &clock),
     )
     .await
-    .map_err(|_| ProtocolError::TimedOut("sync round".into()))?
+    .ok_or_else(|| ProtocolError::TimedOut("sync round".into()))?
 }
 
 /// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
-/// the timeout around it and hands it `snapshot_deadline`, the instant past
-/// which a snapshot pull asks for no more pages this round (ADR-152). Separate
-/// so a test can hand it a deadline of its own.
+/// the peer's deadline around it (ADR-177), hands it `snapshot_deadline`, the
+/// wall-time instant past which a snapshot pull asks for no more pages this
+/// round (ADR-152), and the `clock` its applies are timed on. Separate so a
+/// test can hand it a deadline of its own.
+#[allow(clippy::too_many_arguments)]
 async fn sync_round<S>(
     engine: &Engine,
     stream: &mut S,
@@ -743,6 +775,7 @@ async fn sync_round<S>(
     probe: Option<DivergenceProbe>,
     stalls: &mut PeerStalls,
     snapshot_deadline: Instant,
+    clock: &RoundClock,
 ) -> Result<SyncOutcome, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -995,9 +1028,30 @@ where
                 .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
             let applying = std::time::Instant::now();
-            let outcome = engine
-                .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
-                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            let mut outcome = SyncOutcome::default();
+            let applied = engine.apply_peer_batch_into(
+                &theirs,
+                &entries,
+                scanned_to,
+                exhausted,
+                &mut outcome,
+            );
+            #[cfg(test)]
+            std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
+            clock.applied_for(applying.elapsed());
+            // Recorded whether or not the batch then errored: the outcome
+            // holds only what a commit made final, and what none did is
+            // served again and counted then (ADR-177).
+            let counted = &mut stalls.applied;
+            counted.ddl_refused += outcome.ddl_refused;
+            counted.ddl_declined += outcome.ddl_declined;
+            counted.unknown_collection += outcome.unknown_collection;
+            counted.deferred += outcome.deferred;
+            applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            #[cfg(test)]
+            if test_hooks::fails_after_apply(peer) {
+                return Err(ProtocolError::Malformed("a failure injected after the apply".into()));
+            }
             let pull = kimmy_storage::PullTiming {
                 serve: served,
                 wait: outcome.writer_wait,
@@ -1103,9 +1157,17 @@ where
             if repair.is_none() && !stalls.snapshot_resumes(their_node, None) {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
             }
-            let pulled =
-                pull_snapshot(engine, stream, peer, their_node, scope, stalls, snapshot_deadline)
-                    .await?;
+            let pulled = pull_snapshot(
+                engine,
+                stream,
+                peer,
+                their_node,
+                scope,
+                stalls,
+                snapshot_deadline,
+                clock,
+            )
+            .await?;
             window_exhausted = pulled.complete;
             if let Some((collection, _)) = repair
                 && pulled.complete
@@ -1405,6 +1467,67 @@ pub struct PeerStalls {
     /// left behind indistinguishable from none having been stored, and
     /// hide exactly the violation this invariant is written down to catch.
     pulled: Option<kimmy_storage::PullTiming>,
+    /// What the rounds since this was last taken applied and counted, taken
+    /// with [`PeerStalls::take_applied`] under the same invariant as
+    /// `pulled`: recorded as each apply commits, so a round that fails after
+    /// its apply still reports what the apply refused, declined and skipped
+    /// (ADR-177).
+    applied: AppliedCounts,
+}
+
+/// The counts a committed apply produced that a round's report carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AppliedCounts {
+    pub ddl_refused: usize,
+    pub ddl_declined: usize,
+    pub unknown_collection: usize,
+    pub deferred: usize,
+}
+
+/// Local apply time a round's deadline does not charge the peer for
+/// (ADR-177). A round is bounded because a peer can be slow or silent; this
+/// node's own apply, however long it takes, says nothing about the peer.
+#[derive(Default)]
+struct RoundClock {
+    applying_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl RoundClock {
+    fn applied_for(&self, took: Duration) {
+        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        self.applying_nanos.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn applying(&self) -> Duration {
+        Duration::from_nanos(self.applying_nanos.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Run `round` with `limit` on the time it spends outside this node's own
+/// applies: the deadline moves on by however long each apply took. The apply
+/// is synchronous inside the round's poll, so a plain timeout could not cut
+/// it short anyway; it only failed the round at the next await after it,
+/// and counted a slow local apply as a failure of a peer that had answered
+/// at once.
+async fn within_exchange_budget<F: std::future::Future>(
+    limit: Duration,
+    clock: &RoundClock,
+    round: F,
+) -> Option<F::Output> {
+    let started = tokio::time::Instant::now();
+    tokio::pin!(round);
+    loop {
+        let deadline = started + limit + clock.applying();
+        tokio::select! {
+            biased;
+            out = &mut round => return Some(out),
+            () = tokio::time::sleep_until(deadline) => {
+                if tokio::time::Instant::now() >= started + limit + clock.applying() {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// Where one origin's held span resumes against one peer (ADR-172).
@@ -1556,6 +1679,12 @@ impl PeerStalls {
     /// succeed (ADR-175).
     pub fn take_pull(&mut self) -> Option<kimmy_storage::PullTiming> {
         self.pulled.take()
+    }
+
+    /// What the applies since this was last taken refused, declined and
+    /// skipped, whether or not their rounds went on to succeed (ADR-177).
+    pub fn take_applied(&mut self) -> AppliedCounts {
+        std::mem::take(&mut self.applied)
     }
 
     /// The held spans to name to `peer` on this pull (ADR-172), from `current`,
@@ -2156,6 +2285,7 @@ fn served_beyond_scope(page: &SnapshotPage, id: CollectionId) -> bool {
 /// ([`PeerStalls::snapshot_advanced`]), so a slow-but-moving snapshot is
 /// never abandoned as stalled; [`REPAIR_ATTEMPTS`] counts rounds that
 /// applied nothing.
+#[allow(clippy::too_many_arguments)]
 async fn pull_snapshot<S>(
     engine: &Engine,
     stream: &mut S,
@@ -2164,6 +2294,7 @@ async fn pull_snapshot<S>(
     scope: Option<CollectionId>,
     stalls: &mut PeerStalls,
     deadline: Instant,
+    clock: &RoundClock,
 ) -> Result<SnapshotPulled, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2214,7 +2345,11 @@ where
         // this is the point a cancelled round resumes from.
         let progress = stalls.snapshot_progress(node, scope);
         let before = progress.pages();
+        let applying = std::time::Instant::now();
         let applied = engine.apply_snapshot_page(node, progress, &page);
+        #[cfg(test)]
+        std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
+        clock.applied_for(applying.elapsed());
         let advanced = progress.pages() > before;
         let complete = progress.is_complete();
         let (total_pages, total_documents) = (progress.pages(), progress.documents());
@@ -2228,6 +2363,7 @@ where
         // Counted where a refusal reached through the oplog is, so the
         // metric and the round report do not depend on the route (ADR-123).
         outcome.ddl_refused += applied.ddl_refused;
+        stalls.applied.ddl_refused += applied.ddl_refused;
         superseded += applied.superseded;
         // A page restores a vector configuration without its shadow, which
         // is its own collection (ADR-178): a scoped snapshot of a configured
@@ -2259,6 +2395,11 @@ where
             );
             return Ok(SnapshotPulled { outcome, complete: true });
         }
+        // The page budget stays wall time, apply included (ADR-152): it is what
+        // bounds how long one round with this peer holds the tick's sequential
+        // contact loop. Moved on by apply time like the round's deadline, pages
+        // this node was slow to apply would each buy the next, and a slow
+        // snapshot would run to its end in one round.
         if Instant::now() >= deadline {
             info!(
                 %peer,
@@ -2309,6 +2450,44 @@ where
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
     Ok(their_node)
+}
+
+/// Test-only ways to make a round's own apply slow. `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    /// Rounds against this peer fail right after their window is applied and
+    /// counted. Keyed by the peer's address, so a test's replication loop,
+    /// which runs on the runtime's threads, can set it without touching any
+    /// other test's rounds.
+    pub static FAIL_AFTER_APPLY: std::sync::Mutex<Option<std::net::SocketAddr>> =
+        std::sync::Mutex::new(None);
+
+    pub fn fails_after_apply(peer: std::net::SocketAddr) -> bool {
+        *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) == Some(peer)
+    }
+
+    /// [`FAIL_AFTER_APPLY`] set for `peer` until dropped, so a test that panics
+    /// does not leave it set.
+    pub struct FailingAfterApply(());
+
+    impl FailingAfterApply {
+        pub fn against(peer: std::net::SocketAddr) -> Self {
+            *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
+            Self(())
+        }
+    }
+
+    impl Drop for FailingAfterApply {
+        fn drop(&mut self) {
+            *FAIL_AFTER_APPLY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    thread_local! {
+        /// Slept after a round's window is applied, inside the apply's time.
+        pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
+            const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    }
 }
 
 #[cfg(test)]
@@ -3200,9 +3379,18 @@ mod tests {
         let peer =
             tokio::spawn(fake_peer(peer_end, last_vector.clone(), vec![(None, page1)], false));
         let mut ours = ours;
-        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, spent())
-            .await
-            .unwrap();
+        let outcome = sync_round(
+            &engine,
+            &mut ours,
+            addr,
+            their_node,
+            None,
+            &mut stalls,
+            spent(),
+            &RoundClock::default(),
+        )
+        .await
+        .unwrap();
         drop(ours);
         peer.await.unwrap();
         assert_eq!(outcome.applied, 2, "the page landed: {outcome:?}");
@@ -3230,9 +3418,18 @@ mod tests {
             true,
         ));
         let mut ours = ours;
-        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample())
-            .await
-            .unwrap();
+        let outcome = sync_round(
+            &engine,
+            &mut ours,
+            addr,
+            their_node,
+            None,
+            &mut stalls,
+            ample(),
+            &RoundClock::default(),
+        )
+        .await
+        .unwrap();
         drop(ours);
         peer.await.unwrap();
         assert_eq!(outcome.applied, 2, "{outcome:?}");
@@ -3329,10 +3526,18 @@ mod tests {
             let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
             let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), after, Some(page)));
             let mut ours = ours;
-            let outcome =
-                sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, spent())
-                    .await
-                    .unwrap();
+            let outcome = sync_round(
+                &engine,
+                &mut ours,
+                addr,
+                their_node,
+                None,
+                &mut stalls,
+                spent(),
+                &RoundClock::default(),
+            )
+            .await
+            .unwrap();
             drop(ours);
             peer.await.unwrap();
             assert_eq!(outcome.applied, 1, "round {round}: {outcome:?}");
@@ -3351,9 +3556,18 @@ mod tests {
             Some(last),
         ));
         let mut ours = ours;
-        let outcome = sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample())
-            .await
-            .unwrap();
+        let outcome = sync_round(
+            &engine,
+            &mut ours,
+            addr,
+            their_node,
+            None,
+            &mut stalls,
+            ample(),
+            &RoundClock::default(),
+        )
+        .await
+        .unwrap();
         drop(ours);
         peer.await.unwrap();
         assert!(outcome.repairing && outcome.exhausted, "{outcome:?}");
@@ -3376,8 +3590,17 @@ mod tests {
             let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
             let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), None, None));
             let mut ours = ours;
-            let failed =
-                sync_round(&engine, &mut ours, addr, their_node, None, &mut stalls, ample()).await;
+            let failed = sync_round(
+                &engine,
+                &mut ours,
+                addr,
+                their_node,
+                None,
+                &mut stalls,
+                ample(),
+                &RoundClock::default(),
+            )
+            .await;
             drop(ours);
             peer.await.unwrap();
             assert!(failed.is_err(), "attempt {attempt}: the peer went away");
@@ -3721,5 +3944,544 @@ mod tests {
         }
         assert!(matches!(served, Err(ProtocolError::Malformed(_))), "{served:?}");
         assert!(b.get_collection("shop", "orders").is_err(), "nothing was applied");
+    }
+
+    /// Push `entries` to `b` through the served arm, with a push hook, and hand
+    /// back what the hook was given (summed) and whether the push failed.
+    async fn push_counted(
+        b: &Engine,
+        versions: VersionVector,
+        entries: Vec<OplogEntry>,
+    ) -> (SyncOutcome, bool) {
+        const SECRET: &str = "a-push-count-secret";
+        const BINDING: &[u8] = b"a-push-count-binding";
+        let pusher_dir = tempfile::tempdir().unwrap();
+        let pusher = Engine::open(&pusher_dir.path().join("kimmy.redb")).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(SyncOutcome::default()));
+        let hook: PushHook = Arc::new({
+            let seen = Arc::clone(&seen);
+            move |outcome: &SyncOutcome| {
+                let mut seen = seen.lock().unwrap();
+                seen.ddl_refused += outcome.ddl_refused;
+                seen.ddl_declined += outcome.ddl_declined;
+                seen.unknown_collection += outcome.unknown_collection;
+                seen.deferred += outcome.deferred;
+            }
+        });
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = async { serve_peer(b, theirs, SECRET, BINDING, Some(&hook)).await };
+        let pushing = async {
+            open_handshake(&pusher, &mut ours, SECRET, BINDING).await.unwrap();
+            let scanned_to = entries.last().unwrap().stamp.hlc;
+            let push = Message::Push { entries, scanned_to, exhausted: false, versions };
+            write_frame(&mut ours, &push).await.unwrap();
+            let answer = read_frame(&mut ours).await;
+            drop(ours);
+            answer
+        };
+        let (_, answer) = tokio::join!(serving, pushing);
+        assert!(
+            !kimmy_storage::sync::count_hooks::armed(),
+            "the injected failure was never reached"
+        );
+        let failed = matches!(answer, Ok(Message::Fault(_)));
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        (seen, failed)
+    }
+
+    /// The window a pull re-serves `into` from `from` after a push: above what
+    /// `into` witnesses of each origin.
+    fn re_served(into: &Engine, window: &[OplogEntry]) -> Vec<OplogEntry> {
+        let held = into.witnessed_vector().unwrap();
+        window.iter().filter(|e| e.stamp.hlc > held.get(e.stamp.node)).cloned().collect()
+    }
+
+    /// A drop declined in a push that then fails is counted by the push, once:
+    /// the pulled delivery of the same drop after it is a replay (ADR-177).
+    #[tokio::test]
+    async fn a_decline_in_a_push_that_fails_is_counted_once_with_its_pulled_replay() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
+            .unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let drop =
+            whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
+        let recreate = whole.entries.last().unwrap().clone();
+        let theirs = a.version_vector().unwrap();
+        b.apply_peer_batch(&theirs, std::slice::from_ref(&recreate), recreate.stamp.hlc, false)
+            .unwrap();
+        let mut broken = whole.entries[0].clone();
+        broken.stamp =
+            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.body = Some(vec![0xde, 0xad]);
+        let mut versions = theirs.clone();
+        versions.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+
+        let (pushed, failed) = push_counted(&b, versions, vec![drop.clone(), broken]).await;
+        assert!(failed, "the push fails after the decline");
+        let replay = re_served(&b, std::slice::from_ref(&drop));
+        let pulled = match replay.last() {
+            Some(last) => b.apply_peer_batch(&theirs, &replay, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_declined + pulled.ddl_declined,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
+    }
+
+    /// A refusal a push's own earlier commit covered, in a push that then
+    /// fails, is counted by the push: the pull after it starts above it.
+    #[tokio::test]
+    async fn a_refusal_a_failing_push_covered_is_counted_by_the_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let (_, window) = a_window_with_a_refused_index(&orders, origin);
+        let refused = window[1].clone();
+        // A definition B can apply, after the refusal and from the same origin:
+        // its append raises B's witnessed vector past the refusal.
+        let mut applied = refused.clone();
+        let mut create: kimmy_core::IndexCreate =
+            bson::deserialize_from_slice(applied.body.as_ref().unwrap()).unwrap();
+        create.index.name = "by_a".into();
+        create.index.id = kimmy_core::IndexMeta::derive_id("by_a");
+        create.index.unique = false;
+        create.index.enforcement = kimmy_core::Enforcement::Local;
+        applied.body = Some(bson::serialize_to_vec(&create).unwrap());
+        applied.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 1, 0), origin);
+        let mut broken = applied.clone();
+        broken.stamp = kimmy_core::Stamp::new(Hlc::new(refused.stamp.hlc.wall_ms + 2, 0), origin);
+        broken.body = Some(vec![0xde, 0xad]);
+        let versions = vector(&[(origin, 9_000)]);
+        let window = vec![refused, applied, broken];
+
+        let (pushed, failed) = push_counted(&b, versions.clone(), window.clone()).await;
+        assert!(failed, "the push fails after the covering commit");
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_a").is_some());
+        let again = re_served(&b, &window[..2]);
+        let pulled = match again.last() {
+            Some(last) => b.apply_peer_batch(&versions, &again, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_refused + pulled.ddl_refused,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
+    }
+
+    /// A push whose apply fails after its last commit counts what it refused,
+    /// as the same push succeeding would: nothing of the window is delivered
+    /// again (ADR-177). The failure is injected where reporting a committed
+    /// run can fail, through storage's `test-hooks`.
+    #[tokio::test]
+    async fn a_push_that_fails_after_its_last_commit_counts_what_it_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let (versions, window) = a_window_with_a_refused_index(&orders, origin);
+
+        kimmy_storage::sync::count_hooks::fail_next(
+            kimmy_storage::sync::count_hooks::Fail::AfterLastCommit,
+        );
+        let (pushed, failed) = push_counted(&b, versions.clone(), window.clone()).await;
+        assert!(failed, "the push fails after its last commit");
+        let again = re_served(&b, &window);
+        let pulled = match again.last() {
+            Some(last) => b.apply_peer_batch(&versions, &again, last.stamp.hlc, false).unwrap(),
+            None => SyncOutcome::default(),
+        };
+        assert_eq!(
+            pushed.ddl_refused + pulled.ddl_refused,
+            1,
+            "push {pushed:?}, then pulled {pulled:?}"
+        );
+    }
+
+    /// A window for a round against a fake peer: an insert into `orders`, and
+    /// an index creation this node refuses (coordinated enforcement is
+    /// unsupported), so the apply has a refused definition to count.
+    fn a_window_with_a_refused_index(
+        orders: &kimmy_storage::CollectionMeta,
+        origin: NodeId,
+    ) -> (VersionVector, Vec<OplogEntry>) {
+        let insert = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+            kind: kimmy_core::OpKind::Insert,
+            collection: orders.id,
+            doc_id: Some(kimmy_core::DocId::Int64(1)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+        };
+        let refused = kimmy_core::IndexCreate {
+            db: "shop".into(),
+            collection: "orders".into(),
+            index: kimmy_core::IndexMeta {
+                id: kimmy_core::IndexMeta::derive_id("coordinated"),
+                name: "coordinated".into(),
+                fields: vec![kimmy_core::IndexField { path: "a".into(), descending: false }],
+                unique: true,
+                enforcement: kimmy_core::Enforcement::Coordinated,
+                multikey: false,
+                expire_after_secs: None,
+                partial_filter: None,
+                created: None,
+            },
+        };
+        let create = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(5_000, 0), origin),
+            kind: kimmy_core::OpKind::CreateIndex,
+            collection: orders.id,
+            doc_id: None,
+            body: Some(bson::serialize_to_vec(&refused).unwrap()),
+        };
+        let mut theirs = VersionVector::new();
+        theirs.insert(origin, Hlc::new(5_000, 0));
+        (theirs, vec![insert, create])
+    }
+
+    /// A fake peer that answers at once: its vectors, the window, and, if
+    /// `answer_divergence`, the divergence check the exhausted window asks
+    /// for. Otherwise it holds the connection open and says nothing more.
+    async fn a_prompt_peer(
+        mut stream: tokio::io::DuplexStream,
+        theirs: VersionVector,
+        window: Vec<OplogEntry>,
+        answer_divergence: bool,
+    ) {
+        match read_frame(&mut stream).await.unwrap() {
+            Message::AskVersions { witnessed: true } => {}
+            other => panic!("expected AskVersions, got {other:?}"),
+        }
+        let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+        write_frame(&mut stream, &answer).await.unwrap();
+        match read_frame(&mut stream).await.unwrap() {
+            Message::AskEntries { .. } => {}
+            other => panic!("expected AskEntries, got {other:?}"),
+        }
+        let scanned_to = window.last().unwrap().stamp.hlc;
+        write_frame(
+            &mut stream,
+            &Message::Entries { entries: window, scanned_to, exhausted: true },
+        )
+        .await
+        .unwrap();
+        let Ok(Message::AskDivergence { .. }) = read_frame(&mut stream).await else {
+            return;
+        };
+        if !answer_divergence {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return;
+        }
+        // Well inside the round's budget, and long enough for the runtime's
+        // timer to see the deadline pass while the round waits: an answer in
+        // the same instant would let even a deadline that charged the apply
+        // go unnoticed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let answer = Message::Divergence {
+            collections: Vec::new(),
+            probe_count: None,
+            incarnations: Vec::new(),
+        };
+        let _ = write_frame(&mut stream, &answer).await;
+    }
+
+    /// ADR-177: a round's own apply outlasting the round's deadline, against
+    /// a peer that answered at once, is not the peer failing. The round
+    /// succeeds, and what the apply refused is counted.
+    #[tokio::test]
+    async fn a_round_whose_own_apply_outlasts_the_deadline_against_a_prompt_peer_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let (theirs, window) = a_window_with_a_refused_index(&orders, node(3));
+
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(a_prompt_peer(peer_end, theirs, window, true));
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let limit = Duration::from_millis(200);
+        test_hooks::APPLY_TAKES.with(|t| t.set(limit * 3));
+        let round = sync_over_within(&engine, ours, addr, node(9), None, &mut stalls, limit).await;
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        peer.await.unwrap();
+
+        let outcome = round.expect("the peer answered at once; the apply's time is this node's");
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        assert_eq!(stalls.take_applied().ddl_refused, 1, "the refused definition is counted");
+        assert_eq!(engine.count(&orders).unwrap(), 1);
+    }
+
+    /// ADR-177: what an apply refused is counted when it commits, not only
+    /// when the round goes on to succeed. The peer here stops answering after
+    /// the window, so the round does fail, and must still report the refusal.
+    #[tokio::test]
+    async fn what_a_committed_apply_refused_is_counted_when_the_round_then_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let (theirs, window) = a_window_with_a_refused_index(&orders, node(3));
+
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(a_prompt_peer(peer_end, theirs, window, false));
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let limit = Duration::from_millis(200);
+        let round = sync_over_within(&engine, ours, addr, node(9), None, &mut stalls, limit).await;
+        peer.abort();
+
+        assert!(matches!(round, Err(ProtocolError::TimedOut(_))), "{round:?}");
+        assert_eq!(engine.count(&orders).unwrap(), 1, "the apply committed");
+        assert_eq!(stalls.take_applied().ddl_refused, 1, "and its refusal is counted");
+    }
+
+    /// ADR-177's negative: a peer that is slow is still a failed round. The
+    /// apply's time comes off the deadline, and nothing else does.
+    #[tokio::test]
+    async fn a_round_against_a_slow_peer_still_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        let mut theirs = VersionVector::new();
+        theirs.insert(node(3), Hlc::new(5_000, 0));
+
+        let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let _ = read_frame(&mut peer_end).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            // Asked for entries, and never answers.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let limit = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let round = sync_over_within(&engine, ours, addr, node(9), None, &mut stalls, limit).await;
+        peer.abort();
+
+        assert!(matches!(round, Err(ProtocolError::TimedOut(_))), "{round:?}");
+        assert!(started.elapsed() < limit * 5, "at the deadline: {:?}", started.elapsed());
+        assert_eq!(stalls.take_applied(), AppliedCounts::default(), "nothing was applied");
+    }
+
+    /// ADR-177 keeps a snapshot's page budget on wall time, apply included:
+    /// it is what bounds one round's hold on the tick's sequential contact
+    /// loop (ADR-152, ADR-157). Pages that are slow to apply each spend it;
+    /// they do not each buy the next.
+    #[tokio::test]
+    async fn slow_snapshot_pages_still_end_the_round_at_its_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        const PAGES: u64 = 6;
+
+        let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let _ = read_frame(&mut peer_end).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
+            let mut served = 0;
+            for n in 0..PAGES {
+                let Ok(Message::AskSnapshot { .. }) = read_frame(&mut peer_end).await else {
+                    break;
+                };
+                let wall = 1_000 * (n + 1);
+                let next = (n + 1 < PAGES).then(|| cursor(wall));
+                let page = snapshot_page(origin, &[wall], next, theirs.clone(), n == 0);
+                if write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.is_err() {
+                    break;
+                }
+                served += 1;
+            }
+            served
+        });
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::from_millis(300)));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let clock = RoundClock::default();
+        let round = within_exchange_budget(
+            Duration::from_secs(30),
+            &clock,
+            sync_round(&engine, &mut ours, addr, node(9), None, &mut stalls, deadline, &clock),
+        )
+        .await;
+        test_hooks::APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        drop(ours);
+        let served = peer.await.unwrap();
+
+        assert!(served < PAGES, "{served} of {PAGES} pages in one round: {round:?}");
+        let outcome = round.expect("inside the round's deadline").unwrap();
+        assert!(!outcome.exhausted, "left to resume, not run to its end: {outcome:?}");
+        assert!(stalls.snapshot_resumes(node(9), None), "resumed next round from its cursor");
+    }
+
+    /// A definition a snapshot page carries that this node refuses is counted
+    /// where one reached through the oplog is: in what the round applied,
+    /// which the loop reports whatever the round returned (ADR-177).
+    #[tokio::test]
+    async fn a_definition_refused_from_a_snapshot_page_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        let mut page = snapshot_page(origin, &[1_000], None, theirs.clone(), true);
+        page.collections[0].indexes.push(kimmy_core::IndexMeta {
+            id: kimmy_core::IndexMeta::derive_id("coordinated"),
+            name: "coordinated".into(),
+            fields: vec![kimmy_core::IndexField { path: "a".into(), descending: false }],
+            unique: true,
+            enforcement: kimmy_core::Enforcement::Coordinated,
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter: None,
+            created: Some(kimmy_core::Stamp::new(Hlc::new(500, 0), origin)),
+        });
+
+        let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let _ = read_frame(&mut peer_end).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
+            let _ = read_frame(&mut peer_end).await;
+            write_frame(&mut peer_end, &Message::Snapshot(Box::new(page))).await.unwrap();
+            if let Ok(Message::AskDivergence { .. }) = read_frame(&mut peer_end).await {
+                let answer = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                };
+                let _ = write_frame(&mut peer_end, &answer).await;
+            }
+        });
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let clock = RoundClock::default();
+        let round =
+            sync_round(&engine, &mut ours, addr, node(9), None, &mut stalls, ample(), &clock).await;
+        drop(ours);
+        let _ = peer.await;
+        round.expect("the page applies");
+        assert_eq!(stalls.take_applied().ddl_refused, 1, "the refused definition is counted");
+    }
+
+    /// The deadline moves on by exactly the time applies took, not more: an
+    /// apply buys its own duration and no slack for a peer that is slow after
+    /// it. Counted twice, the extension let such a peer through.
+    #[tokio::test]
+    async fn an_apply_moves_the_deadline_on_by_its_own_duration_and_no_more() {
+        let limit = Duration::from_millis(200);
+        let apply = Duration::from_millis(300);
+        let clock = RoundClock::default();
+        let started = std::time::Instant::now();
+        // Apply, then a peer that answers 300 ms later: 600 ms in all, past the
+        // 500 ms a 200 ms limit and a 300 ms apply allow, and inside 800 ms.
+        let round = within_exchange_budget(limit, &clock, async {
+            let applying = std::time::Instant::now();
+            std::thread::sleep(apply);
+            clock.applied_for(applying.elapsed());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .await;
+        assert!(round.is_none(), "a peer slow past the limit, apply aside, times out");
+        let took = started.elapsed();
+        assert!(
+            took >= limit + apply && took < limit + apply * 2,
+            "at the limit plus the apply: {took:?}"
+        );
+        assert!(clock.applying() >= apply && clock.applying() < apply + Duration::from_millis(50));
+    }
+
+    /// A drop declined in a batch that then errors is counted by the round
+    /// that declined it, once: its tombstone is durable, so the window served
+    /// again carries a replay, which is not counted (ADR-177).
+    #[tokio::test]
+    async fn a_decline_in_a_batch_that_errors_is_counted_once() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        // B holds the collection only: the first index never reached it, so
+        // B has no tombstone of the name when the recreation supersedes it.
+        let theirs = a.version_vector().unwrap();
+        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
+            .unwrap();
+        a.drop_index("shop", "orders", "by_a").unwrap();
+        a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let drop =
+            whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
+        let recreate = whole.entries.last().unwrap().clone();
+        // B holds the recreation, so the older drop is declined there.
+        b.apply_peer_batch(&theirs, std::slice::from_ref(&recreate), recreate.stamp.hlc, false)
+            .unwrap();
+        // An entry that cannot be applied, after the drop in the same batch.
+        let mut broken = whole.entries[0].clone();
+        broken.stamp =
+            kimmy_core::Stamp::new(Hlc::new(drop.stamp.hlc.wall_ms + 1, 0), drop.stamp.node);
+        broken.body = Some(vec![0xde, 0xad]);
+
+        async fn serve_once(
+            mut stream: tokio::io::DuplexStream,
+            theirs: VersionVector,
+            window: Vec<OplogEntry>,
+        ) {
+            let _ = read_frame(&mut stream).await;
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+            let scanned_to = window.last().unwrap().stamp.hlc;
+            let entries = Message::Entries { entries: window, scanned_to, exhausted: false };
+            write_frame(&mut stream, &entries).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+        }
+        // B has witnessed everything A wrote; A advertises further, so B asks.
+        let mut theirs = theirs;
+        theirs.insert(a.node_id(), Hlc::new(drop.stamp.hlc.wall_ms + 10_000, 0));
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        let mut declined = 0;
+        for window in [vec![drop.clone(), broken], vec![drop]] {
+            let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(serve_once(peer_end, theirs.clone(), window));
+            let _ = sync_over_within(
+                &b,
+                ours,
+                addr,
+                node(9),
+                None,
+                &mut stalls,
+                Duration::from_secs(5),
+            )
+            .await;
+            let _ = peer.await;
+            declined += stalls.take_applied().ddl_declined;
+        }
+        assert_eq!(declined, 1, "the decline, counted by the batch that declined it");
     }
 }
