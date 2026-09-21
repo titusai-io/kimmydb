@@ -17644,33 +17644,33 @@ rather than watches one function.
 
 ---
 
-## ADR-180 — A snapshot restore appends the entry behind each schema change it restores
+## ADR-180 — A snapshot restore appends the entry behind each index definition it restores, and that entry is the definition as every member stores it
 
-**Decision.** When a snapshot page restores a schema change, the receiver
-**appends the originating entry for it**, at the **origin's own stamp**, in the
-same transaction that writes the state. It does not mint an entry of its own.
+**Decision.** When a snapshot page restores an index definition that carries
+its creation stamp, the receiver **rebuilds the `CreateIndex` entry the origin
+logged for it and appends it**, at the **origin's own stamp**, in the
+transaction that settles the definition. Nothing is minted. The entry is
+appended only if nothing is already held under that stamp.
 
-Four cases, and the line between what this record closes and what it does not
-turns out to be a principled one: **a page can carry a thing, and this record
-re-logs it; a page cannot carry an absence in a form that names what is gone,
-and that is the next record's problem.** Creations relay here. Removals do
-not.
+And, because a rebuilt entry can only be the origin's entry if the two are
+built from the same thing, **a `CreateIndex` entry now carries the definition
+as every member stores it, and nothing a member observed.** This changes what
+the **entries path** logs as well as what the snapshot path appends. A local
+create now logs `multikey: false` and the partial filter as the metadata
+store holds it. Before, it logged the `multikey` its own backfill saw and the
+filter as the client sent it. No receiver reads either difference. The section
+below on what an entry carries gives the reasons.
 
-| Restored | Entry appended | Body rebuilt from |
+Of the seven relay cases the sweep found, **this record closes one**: an index
+definition. The others need what a page does not carry, and they are listed at
+the end with the reason for each.
+
+| Restored | Entry appended | Why, or why not |
 | --- | --- | --- |
-| A collection | `CreateCollection` | `CollectionState.db`, `.name`, `.created` |
-| An index definition | `CreateIndex` | `CollectionState` + `IndexMeta`, at `IndexMeta.created` |
-| A vector configuration | `ConfigureVectors` | `CollectionState.vector`, at the configuration's stamp |
-| **A vector shadow** | **none, deliberately** | — |
-
-The shadow is the case that looks missing and is not. A shadow creation entry
-is exactly what
-[ADR-178](#adr-178--a-vector-shadow-is-created-at-the-stamp-of-the-change-that-needs-it-and-only-a-clients-configuration-logs-its-creation)
-forbids: a member applying a peer's configuration mints the shadow at the
-configuration's stamp, **unlogged**. Appending the `ConfigureVectors` entry is
-therefore sufficient and is the only correct move — a member receiving it
-mints its own shadow through ADR-178's path, which is what it already does for
-a configuration that arrives through the oplog.
+| **An index definition** | **`CreateIndex`, at `IndexMeta.created`** | the page carries the full origin stamp, node included, and it survives any number of hops |
+| A collection | none yet | `CollectionState.created` is an `Hlc` with no node. The only node a receiver holds is its sender's, which is the origin at one hop and not at two |
+| A vector configuration | none yet | `CollectionState.vector` is the configuration alone, with no stamp at all |
+| A vector shadow | none, deliberately | ADR-178 forbids a shadow creation entry; the configuration's entry is what makes a member mint its own |
 
 **Why. A restore leaves the member advertising a window it cannot serve.**
 [ADR-169](#adr-169--an-entry-held-as-state-is-released-when-it-arrives-in-a-contiguous-window)
@@ -17678,9 +17678,11 @@ fixes the meaning of the servable vector: *"this node can serve a contiguous
 window containing this"*. Completing a snapshot grants the receiver the
 sender's coverage ([ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped),
 ADR-162), and the restore writes schema as state with no entry behind it. The
-member's vector then covers stamps it has no entry for, so a peer pulling from
-it is served a window with the schema change silently absent. Nothing errors
-and nothing is counted.
+member's vector then covers stamps it has no entry for. A peer pulling from it
+is served a window with the schema change silently missing, witnesses past
+it, and is never served it again. Nothing errors and nothing is counted. A
+unique index missing on one member lets that member accept duplicates its
+peers refuse.
 
 This is ADR-162's own defect one hop further out. That record named the
 mechanism exactly — *"completing a whole-database snapshot absorbs the
@@ -17688,15 +17690,16 @@ sender's first-page vector... so no peer will ever serve that entry to the
 receiver afterwards either"* — and closed it for the member that takes the
 snapshot. It was never carried to that member's own peers.
 
-**Measured, not argued.** Seven cases across the five schema kinds — the two
-vector ones counted as turning on, the shadow, and turning off — driven
-through real rounds (`sync_once`), with the serving member's oplog aged out so
-the middle member can only catch up by snapshot. **All seven fail** to reach a
-member relayed through it. The same seven with the oplog left intact, so the
-middle member catches up by entries instead, **all pass** — so the topology is
-sound and the snapshot hop is the whole difference.
-Two controls locate it: **documents do relay**, because the restore
-reconstructs a `Replace` at the document's own stamp and appends it, and the
+**Measured, not argued.** There are seven cases across the five schema kinds,
+counting the two vector ones as turning on, the shadow, and turning off. Each
+was driven through real rounds (`sync_once`), with the serving member's oplog
+aged out so that the middle member can only catch up by snapshot. **All seven
+fail** to reach a member relayed through it. The same seven with the oplog
+left intact, so that the middle member catches up by entries instead, **all
+pass**. So the topology is sound, and the snapshot hop is the whole
+difference.
+Two controls locate it. **Documents do relay**, because the restore
+reconstructs a `Replace` at the document's own stamp and appends it. And the
 restoring member itself holds every schema change correctly. The defect is not
 in what a restore applies. It is that the member cannot pass on what it
 correctly holds.
@@ -17714,35 +17717,60 @@ bound."*
 
 The prohibition is on **a new entry under this node's stamp**. What it
 protects is convergence: an entry stamped here is new to every peer, so it
-travels back and is minted again. An entry at the **origin's** stamp is not
-new to anybody — it is byte-identical to the one the origin appended, so a
-peer that holds it supersedes it and a peer that does not applies it once.
+travels back and is minted again. An entry at the **origin's** stamp is new to
+nobody. It is the origin's own entry, so a peer that holds it already has it,
+and a peer that does not applies it once.
 
-And that is not a new behaviour being introduced here. It is what the entries
-path already does, and what the sync round's own comment relies on:
-*"Replicated DDL that applies is not among them: `apply_ddl` appends the
-originating entry."* The snapshot path is the one path that materialises
-schema without doing it. This record makes the snapshot path do what the
-entries path and the document path both already do; ADR-178's rule is
-untouched, because no entry is minted under this node's stamp anywhere in it.
+It is not a new behaviour. The entries path already does it, and the sync
+round's own comment relies on it: *"Replicated DDL that applies is not among
+them: `apply_ddl` appends the originating entry."* The snapshot path is the
+one path that materialised schema without doing it. A restored definition now
+goes through `CreateOrigin::Restored(stamp)`, which is decided exactly as
+`Replicated(Some(stamp))` and appends in the same transaction. ADR-178's rule
+is untouched, because nothing in it mints an entry under this node's stamp.
 
-### Three things that must hold
+The entries path also appends a creation of a definition it **already holds**:
+`apply_ddl` appends whenever the create applies, and a definition standing
+here unchanged counts as applying. A restore does the same. A definition
+already standing under the page's stamp with no entry behind it gets the
+entry. It can be in that state because retention collected the entry, or
+because a restore before this record never wrote one. The writer is taken to
+ask; a page with nothing to append aborts, so it costs no commit. A
+definition standing with **no** stamp that adopts the page's commits the
+stamp and the entry together.
 
-1. **The append commits with the restore, or not at all.** The entry and the
-   state it describes go into one transaction. Appending after the restore
-   commits leaves a window in which the member advertises coverage it cannot
-   serve — which is this defect, briefly, rather than permanently. This is the
-   same shape as ADR-178's "a configuration and its shadow commit together",
-   and it is the failure that looks fine in the happy path.
-2. **The append goes through the entries path's own dedup.** A re-served entry
-   arriving later from the origin, or from another peer, must supersede rather
-   than append a second time. ADR-123 and ADR-141 both turned on re-served-entry
-   behaviour and neither may be reopened.
-3. **No amplification across hops.** A third member catching up from the
-   restoring one by snapshot re-logs at the **origin's** stamp again, never the
-   restoring member's. A chain of snapshot hops therefore mints nothing and
-   converges to one entry per change. Proven at two hops, not one — one hop
-   cannot distinguish "at the origin's stamp" from "at the sender's".
+A definition on the page with **no** creation stamp (from a build before
+ADR-132) appends nothing. There is no stamp to append at, and one invented
+here would be minting.
+
+### Three things that must hold, and the tests that hold them
+
+1. **The append commits with the restore, or not at all.** The entry is
+   appended in the transaction that builds, or settles, the definition. An
+   append after the restore commits would leave a window in which the member
+   holds the index without the entry, and a failure in that window would leave
+   the defect in place permanently. *Test:* a failure injected at the append
+   leaves neither the definition nor the entry; the retry leaves both.
+   Moving the append into a second transaction turns it red.
+2. **The append goes through the entries path's dedup.** A key already held
+   is left alone (next section). An entry the origin serves again after the
+   restore is the entries path's ordinary re-delivery. *Test:* restoring twice,
+   then applying the origin's entry through `apply_batch`, leaves one entry,
+   counted once.
+3. **No amplification across hops.** A third member catching up by snapshot
+   from the restoring one re-logs at the **origin's** stamp again, never at its
+   sender's. So a chain of snapshot hops mints nothing and converges to one
+   entry per change. *Test:* A → P → Q, each by snapshot, leaves Q holding A's
+   entry in A's bytes, and a member relayed through Q learns the index.
+   Re-logging at the sender's stamp passes the one-hop test and fails this
+   one, which is why the proof is at two hops.
+
+The entry goes in under `Position::Hold`, as a snapshot document does. What a
+restore writes is state, arriving outside any window, and the coverage a
+snapshot grants is recorded once, when it completes; the grant releases the
+mark. *Test:* after the first page of a two-page snapshot the entry is held
+and the vector covers nothing of its origin; after the last, the vector covers
+it and no mark remains. Appending under `Raise` turns it red.
 
 ### What appending old stamps does not move
 
@@ -17772,145 +17800,208 @@ There is no monotonic-append requirement to satisfy and no ordering constraint
 on the several entries one page restores. Recorded so the next reader does not
 re-derive it.
 
-### The one real hazard: an entry already held must not be overwritten
+### What an entry carries: the definition as stored, and nothing observed
 
-`append_oplog_at` writes before it checks: `oplog.insert(key, encoded)` returns
-the previous value, and the new bytes are already in place by the time
-`existed` is consulted. For a re-delivery through the entries path that is
-harmless, because the entry is byte-identical to the one already there.
+A rebuilt entry is useful only if it **is** the origin's entry. If two members
+can build different bytes under one stamp, `(origin, stamp) → entry` is no
+longer a function, and every comparison keyed on a stamp stops meaning
+anything. The dedup this record relies on is one of those comparisons. A
+rebuild starts from the definition a page carries, which is the one the sender
+**stores**, as it stands later. The origin logged the definition as its
+create saw it. **Wherever those two can differ, the entry could not be
+rebuilt.** The sweep below found two places where they do. Both were
+pre-existing inconsistencies that this work exposed rather than introduced:
 
-**A reconstructed entry is not guaranteed to be.** A `CreateIndex` body is
-`IndexCreate { db, collection, index: IndexMeta }`, and the page carries the
-`IndexMeta` **as it stands now**, not as the origin logged it. `IndexMeta`
-carries `multikey`, which is documented as *"a node-local observation"* set on
-the write path after creation and never cleared. Rebuilding the entry from the
-page would therefore embed the *sending* member's local flag into an entry
-stamped as the origin's, and overwrite the origin's own entry on every member
-that already holds it — turning a node-local observation into replicated
-history, which is exactly what `multikey` is defined not to be.
+- **`multikey` is a node-local observation written into a replicated body.**
+  Its own documentation says so: *"a node-local observation that converges
+  because the data does; while nodes disagree, each plans correctly over the
+  documents it holds."* A local create set it from its backfill **before**
+  logging the entry. So an index created over documents that already held
+  arrays was logged `true`, and one created before any did was logged
+  `false`. Nothing on a page, and nothing on a later definition, says which.
+  Worse, a rebuild does not read the page's flag at all. The receiver's own
+  build sets it from the receiver's documents. So without a fixed value, the
+  bytes under one stamp would depend on which member rebuilt them.
+- **The partial filter's representation.** Collection metadata is stored as
+  relaxed Extended JSON. On the way back, an `Int64` that fits in 32 bits
+  becomes an `Int32`, and a generic-subtype `Binary` becomes an array of
+  integers. So the filter a client sent is not the filter **any** member
+  stores, the origin included, and an entry logged as sent named a filter no
+  member holds.
 
-**"Do not rewrite" is necessary and not sufficient.** Leaving a present entry
-untouched protects a member that already holds it. It does nothing for the
-**reconstructing** member, where the key is absent by definition: that member
-builds the entry from its own page, holds it, and serves it onward — which is
-the entire purpose of this record. A peer that never held the entry receives
-the rebuilt one and the rewrite rule never fires there either, because its key
-is absent too. The corruption propagates along exactly the path the fix opens.
+**So the entry is the definition as stored, with `multikey: false`**, at the
+origin and in a rebuild alike: `index::logged_definition` passes the
+definition through the metadata encoding and clears the flag. The encoding is
+idempotent — a filter stored once is stored unchanged again, which a test
+pins across every BSON type — so a rebuild from a stored definition equals the
+origin's entry.
 
-**And the damage is not the value of the flag.** `multikey` is one-way and
-converges, so an early `true` is merely conservative. What breaks is that
-**the stamp stops determining the entry.** Two members reconstructing the same
-stamp at different moments would produce different bytes, so `(origin, stamp)
-→ entry` is no longer a function — and the dedup this record relies on, along
-with every comparison and checksum keyed on a stamp, assumes that it is.
+**Nothing a receiver does changes.** The enumeration behind that claim: the
+one production reader of a `CreateIndex` body is `sync::apply_ddl` →
+`apply_remote_index`. It reads `db`, `collection`, and seven fields of the
+definition: `name`, `created`, `fields`, `unique`, `enforcement`,
+`expire_after_secs` and `partial_filter`. It reads neither `multikey` nor
+`id`. Every other reader of an entry's body filters DDL out first: change
+streams render document kinds only, webhooks deliver only what `wanted`
+accepts, the embedding worker skips an entry with no document id, the vector
+cache listens for `DropCollection` and `ConfigureVectors`, and rewind passes
+schema kinds over before reading a body. Serving, backup and the codec carry
+the body as bytes. The search found every one of the seven fields read, which
+is its control. And a test applies one entry, logged `multikey: true` and then
+`false`, to one member holding arrays and to one that does not. The first ends
+multikey and the second does not, whatever the entry said. The filter is
+stored through the same encoding whichever form arrives.
 
-**So the rule is: a reconstructed body carries node-local fields at their
-origin value, never the page's.** `multikey` goes in as its creation-time
-value, `false`, and each member's own write path sets it from the documents
-that member actually holds — which is what the field's own documentation says
-it is for. Reconstruction is then **deterministic across members**, which is
-the property that makes the dedup sound. Both rules apply: normalisation makes
-reconstruction correct, and "do not rewrite" is the guard for anything that
-still manages to differ.
+**The historical residue, and the guard for it.** Entries logged before this
+record can still differ from any rebuild: an index created over arrays is
+logged `multikey: true`, and a filter with a small `Int64` or a generic
+`Binary` is logged as sent. For those, and for anything else that still
+manages to differ, **a restore never writes over a held entry.**
+`append_oplog_at` writes and then asks whether the key was taken, which is
+harmless for a re-delivery of the origin's own bytes. `engine::relog` asks
+first. *Test:* a member holding an entry logged with `multikey: true` restores
+a snapshot, and the entry's bytes are unchanged. The test asserts that the
+fixture holds `true`, and that a rebuild would differ, before it asserts
+anything else. Built from a current entry, the fixture would make the guard
+unobservable, and the test would go on passing without testing it. A member
+that never held such an entry receives the rebuilt one. For those old stamps,
+two members can hold different bytes under one stamp. Neither difference is
+read by anything, and from this record on it cannot arise.
 
-The test is a member that already holds the originating entry, restoring a
-snapshot, asserting the entry's bytes are unchanged. It is not the test that
-counts appends, and a fix passing every dedup test would still fail it.
+### The sweep
 
-**The sweep.** `multikey` was found first; it is not sound to assume it is
-alone. Every field of every body this record reconstructs, twenty-five across
-three bodies:
+Every field that decides an entry's bytes. There are seventeen: the five of
+the `OplogEntry` envelope, and the twelve of the body, which are three in
+`IndexCreate` and nine in `IndexMeta`.
 
-| Body | Fields | Node-local |
+| Where | Fields | Unstable across members or over time |
 | --- | --- | --- |
-| `CollectionRef` (`CreateCollection`) | 2 | none |
-| `IndexCreate` (`CreateIndex`) | 3 + 9 in `IndexMeta` | **`multikey`** |
-| `VectorSet` (`ConfigureVectors`) | 3 + 8 in `VectorConfig`/`ProviderConfig` | none |
+| `OplogEntry` | `stamp`, `kind`, `collection`, `doc_id`, `body` | none |
+| `IndexCreate` | `db`, `collection`, `index` | none |
+| `IndexMeta` | `id`, `name`, `fields`, `unique`, `enforcement`, `multikey`, `expire_after_secs`, `partial_filter`, `created` | **`multikey`** (node-local) and **`partial_filter`** (representation); `created` absent on a pre-ADR-132 definition, which is not rebuilt |
 
-**One field, out of twenty-five, and all twenty-five were checked.** The three
-that read as node-local and are not are worth naming, because each would be a
-reasonable thing to flag and each is safe:
+**Two out of seventeen, and all seventeen were checked.** The look-alikes are
+worth naming, because each is a reasonable thing to flag and each is safe:
 
 - **`IndexMeta.enforcement`** — *"how `unique` is enforced once the node has
   peers"* reads like something that varies per node. It does not: it is chosen
   at creation, travels with the definition, and is assigned in exactly one
   place outside a constructor, which is a test.
-- **`VectorSet`'s missing `drop_vectors`** — whether stored vectors are
-  discarded *is* a local choice, and it is already deliberately absent from
-  the replicated body: *"a local reclamation choice"*. The precedent for this
-  whole section already existed one field over.
-- **`ProviderConfig::OpenAi.api_key_env`** — reads like a credential, is the
-  *name* of an environment variable. *"The key itself is never stored in
-  collection metadata."*
+- **`IndexMeta.expire_after_secs`** is an integer crossing the same two
+  boundaries as the filter, and it survives both exactly. Its type is fixed
+  by the struct (`i64`, chosen for exactly this), not carried by the value, so
+  the JSON reader cannot pick a narrower one. Only the filter is a document
+  whose values carry their own types.
+- **`IndexMeta.created`** is a `u64` of milliseconds, typed, and exact
+  through both boundaries for the same reason.
+- **`IndexMeta.id`** is derived from `name` (ADR-031), so every member agrees
+  on it by construction. No receiver reads it either.
+- **`OplogEntry.collection`** is a `CollectionId` derived from `db` and
+  `name`, and so is the same wherever it is computed.
 
-`IndexMeta.id` is safe by construction rather than by inspection: it is
-derived from `name`, with ADR-031's reasoning recorded on the field.
+The two bodies this record no longer rebuilds were swept for node-local fields
+when the record covered them. `CollectionRef` has none, and `VectorSet` has
+none; its omission of `drop_vectors` is the precedent for this section. They
+were **not** swept for representation, and a `VectorConfig` is stored through
+the same metadata encoding. That question has to be asked of them before
+they are rebuilt.
 
 ### What this does NOT close
 
-**This is not the whole fix, and must not be read as one.** It closes four of
-the seven relay cases. Three remain, and they are the three removals:
+**This is one case of seven, and it must not be read as the fix.**
 
-- **A collection drop**, which was in this record's scope until the field
-  sweep took it out. A `DropCollection` body is `CollectionRef { db, name }`,
-  and the page conveys a drop as `dropped_collections: Vec<(CollectionId,
-  Stamp)>` — an id and a stamp, no name. `CollectionId::derive` is an FNV-1a
-  hash of `db\0name`, so the id cannot be inverted, and the receiver's own
-  `COLLECTIONS_DROPPED` table is `u64 → stamp` and stores no name either. A
-  member that never held the collection therefore cannot name what it is
-  dropping, and cannot build the entry. It is reconstructible only where the
-  member already holds the live definition — which is the branch a member
-  restoring a whole-database snapshot does not take. **The same shape as the
-  document delete below**, reached from a different direction.
+- **A collection creation and a vector configuration**, which were in this
+  record's scope until checking what each can be rebuilt from took them out.
+  An `OplogEntry` needs a full `Stamp { hlc, node }`. `CollectionState.created`
+  is an `Hlc`: when, never who. `CollectionMeta.vector` is a bare
+  `VectorConfig` with no stamp anywhere, and `Configured::FromSnapshot`
+  carries none. The only node a receiver can supply is its sender's. That is
+  right at one hop and wrong at two, where it would attribute the origin's
+  change to the member in the middle — the failure a one-hop test cannot
+  see. Both need the page to carry the origin stamp, a format change with
+  compatibility in both directions, and that is its own record. **The shadow
+  follows the configuration**: once a configuration's entry relays, a member
+  receiving it mints its own shadow through ADR-178's path.
+- **A collection drop.** A `DropCollection` body is `CollectionRef { db,
+  name }`. The page conveys a drop as `dropped_collections: Vec<(CollectionId,
+  Stamp)>`, an id and a stamp with no name. `CollectionId::derive` is an
+  FNV-1a hash of `db\0name`, so the id cannot be inverted, and the receiver's
+  own `COLLECTIONS_DROPPED` table is `u64 → stamp` and stores no name
+  either. A member that never held the collection cannot name what it is
+  dropping.
 - **An index drop** and **a vector configuration turned off.**
-  `CollectionState` carries `indexes` and `vector` — presence only. There is
+  `CollectionState` carries `indexes` and `vector` as presence only. There is
   no index tombstone on the page and no record that a configuration was turned
   off, so absence is not expressible and there is no stamp to append an entry
-  at. Closing these means extending the page to convey absence, which is
-  structurally the move ADR-162 made for collections, and is its own record.
+  at. Closing these means extending the page to convey absence, structurally
+  the move ADR-162 made for collections, and it is its own record.
 - **A document delete**, for a different reason, and not a format one.
   [ADR-167](#adr-167--a-document-delete-travels-in-a-snapshot-by-key-to-a-receiver-that-holds-the-document)
   has the receiver recover the `_id` from **its own copy** of the document,
-  because nobody else has one: `DocRecord::tombstone` carries an empty body,
+  because nobody else has one. `DocRecord::tombstone` carries an empty body,
   so the `_id` is destroyed at delete time on every member, and the key cannot
-  yield it — `keyenc` is order-preserving and one-way, and `Int32(1)`,
+  yield it: `keyenc` is order-preserving and one-way, and `Int32(1)`,
   `Int64(1)` and `Double(1.0)` encode to identical bytes. A member restoring a
-  snapshot never held the document, so there is nothing to recover from and no
-  entry can be built. No page field fixes this, because no member has the
-  fact. It needs either the tombstone to retain the `_id` at delete time — a
-  storage change, and not retroactive — or a delete-by-key entry shape. Its
-  own record either way.
+  snapshot never held the document, so there is nothing to recover from. It
+  needs either the tombstone to keep the `_id` at delete time (a storage
+  change, and not retroactive) or a delete-by-key entry shape. Its own record
+  either way. Unlike the schema cases it is detected: ADR-133's count probe
+  sees the extra document.
 
 ### Observability
 
-A restore that re-logs is a path an operator currently cannot see, and the
-reason this defect went unnoticed is that it moves no number at all. So it
-gets one:
+A restore that re-logs is a path an operator could not see, and the reason
+this defect went unnoticed is that it moved no number at all. So it gets one:
 
-- `kimmy_sync_ddl_relogged_total` — *"Schema changes a snapshot restore
+- `kimmy_sync_ddl_relogged_total`: *"Schema changes a snapshot restore
   appended to this node's oplog so that it can serve them onward."*
 - `kimmy.sync.ddl_relogged` on the OTLP bridge, unit `{change}`, as every
   counter is.
 
 It goes in the `sync` namespace rather than a `snapshot` one of its own, beside
 `kimmy.sync.ddl_declined` and `kimmy.sync.ddl_refused`. Those two plus this one
-are the whole account of what becomes of a replicated schema change — declined,
-refused, re-logged — and the adjacency teaches the distinction faster than a
-help string can. A namespace holding one series would be speculative generality.
+are the whole account of what becomes of a replicated schema change —
+declined, refused, re-logged — and the adjacency teaches the distinction faster
+than a help string can. A namespace holding one series would be speculative
+generality.
 
-It reads 0 on a member that has never taken a snapshot, and rises once per
-schema change restored. It is not an error count: a non-zero value is the fix
-working. What it makes visible is the case nobody could previously ask about —
-whether a member ever joined past its peers' retention horizon and then served
-a third.
+**Counted by the engine, after the commit that makes each entry durable, and
+read into `StorageReadings`** as `kimmy_index_unkeyed_total` is. It is not
+carried on `SnapshotApplied` into the round's `SyncOutcome` as `ddl_refused`
+is. `apply_snapshot_page` can return an error after a page's definitions
+have committed, and a count carried on a result that is never returned would
+be lost. That is ADR-177's rule, *what an apply counted is counted when it
+commits*, applied to a count that has no batch to ride in.
+
+It reads 0 on a member that has never taken a snapshot, and rises by one for
+each index definition a snapshot restores without the entry already held.
+It is not an error count: a non-zero value is the fix working. What it makes
+visible is the case nobody could previously ask about — whether a member ever
+joined past its peers' retention horizon and then served a third.
 
 ### How it can be broken
 
-Removing the append turns the five relay cases red while every control stays
-green, which is the pair that matters: the controls prove the topology
-converges without the snapshot hop, so a failure is the hop and not the test.
-Appending at this node's stamp rather than the origin's passes a one-hop test
-and fails a two-hop one, which is why the amplification proof is at two hops.
-Appending in a second transaction after the restore passes every steady-state
-test and fails only a test that looks between the two commits — so that test
-is the one to write first.
+Each rule has a test that fails when the rule is taken out, and each test was
+run against the mutation that removes it:
+
+| Taken out | Fails |
+| --- | --- |
+| the re-log itself (a restore as before this record) | the relay reproduction through real rounds, the two-hop relay, and eight of the thirteen storage tests; the control, with the snapshot hop removed, passes |
+| appending in the definition's own transaction (a second transaction after it) | the injected-failure test, and only it |
+| `Position::Hold` (appending under `Raise`) | the coverage-until-granted test, and only it |
+| the don't-rewrite guard | the bytes-unchanged test, at its bytes assertion, and the dedup test |
+| the origin's stamp (the sender's instead) | the two-hop tests, and **not** the one-hop ones |
+| `multikey: false` in the entry | every test built on the origin fixture, at its premise, and the receiver-side rebuild test |
+| the filter as stored (as sent instead) | the six tests that compare a rebuilt entry with the origin's |
+| the re-log for a definition already held | the held-without-its-entry test |
+| the re-log when a stamp is adopted | the held-without-a-stamp test |
+
+One of them first passed for the wrong reason. The rebuild tests were written
+against a page whose definition was multikey. They passed with `multikey` left
+as observed, because a rebuild never reads the page's flag: the receiver's own
+build sets it, and a fresh receiver restores definitions before documents, so
+its build sees no arrays. The fixture now creates the origin's index over an
+array, and a second test gives the receiver an array before it restores.
+**Each asserts its premise before asserting the rebuild**, so a fixture that
+stops being able to tell the two values apart fails as a fixture instead of
+passing as a test.
