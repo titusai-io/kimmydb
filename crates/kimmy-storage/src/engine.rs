@@ -996,6 +996,11 @@ impl Engine {
     /// derived from names, so a cursor left behind is not only a leak: the
     /// next index or collection of the same name lands on it, and its first
     /// pass starts after a position in an index that no longer exists.
+    ///
+    /// Three callers, not two: the collection drop, the index drop, and
+    /// building an index, because an index can also go without a drop. A
+    /// peer's later definition of the name supersedes it inside the build,
+    /// under the same id (ADR-132), and neither drop runs.
     pub(crate) fn forget_expiry_cursors(&self, collection: CollectionId, index: Option<u32>) {
         self.expiry_cursors
             .lock()

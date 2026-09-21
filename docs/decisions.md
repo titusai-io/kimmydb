@@ -18126,7 +18126,7 @@ This is the retention pass's tombstone scan again, which resumes where its budge
 
 **The cursor lives in memory**, per node and per index, as the tombstone scan's does. A restart starts from the front, which costs one extra cycle at most. Ownership moving to another node does **not** clear it: the cursor stays in this node's memory, and if ownership comes back, the pass resumes from it, which also costs one cycle at most. Persisting it would cost a write every pass to save at most one cycle. It is saved before the pass's deletes, so a delete that keeps failing cannot pin the scan to itself either. That has a cost when a pass fails: the cursor is already at the last candidate the pass read, so if a pass that read a full budget returns an error at its first candidate, the other 999 wait until the cycle comes round, up to one cycle.
 
-**A drop forgets the cursor, and so does building an index.** Collection and index ids are derived from names, so a cursor a drop left behind was more than a leaked entry: the next collection or index of the same name landed on it, and its first pass started after a position in an index that no longer existed. *Demonstrated:* a recreated collection holding one expired document, dated below where the dropped one's pass had stopped, deleted nothing on its first pass. Dropping an index forgets its cursor once the drop commits, and dropping a collection forgets its indexes' cursors. Building an index forgets any cursor under its id, which also covers a definition replaced by a peer's of the same name with no drop at all (ADR-132). One race is left: a pass running when a drop commits can save its cursor after the drop forgot it. Building the recreation forgets that one too, unless the pass saves after the build, and that costs one cycle, as a restart does.
+**A drop forgets the cursor, and so does building an index.** Collection and index ids are derived from names, so a cursor a drop left behind was more than a leaked entry: the next collection or index of the same name landed on it, and its first pass started after a position in an index that no longer existed. *Demonstrated:* a recreated collection holding one expired document, dated below where the dropped one's pass had stopped, deleted nothing on its first pass. It is forgotten at **three** sites, not two. Dropping an index forgets its cursor once the drop commits, and dropping a collection forgets its indexes' cursors. **The third is building an index, because an index can go away without a drop:** a peer's later definition of the same name supersedes the one here inside the build's own transaction, under the same derived id (ADR-132), and neither drop path runs. So building an index forgets any cursor under its id. One race is left: a pass running when a drop commits can save its cursor after the drop forgot it. That entry stays until the name is built again, and the build forgets it unless the pass saves after the build, which costs one cycle, as a restart does.
 
 **Two alternatives were rejected:**
 - **Removing the stale entry when the filter declines.** It looks self-healing, but it is unsafe before ADR-183, for three reasons:
@@ -18155,9 +18155,9 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 
 | Taken out | Fails |
 | --- | --- |
-| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,470 |
-| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,470 |
-| the date check | the date test through the hook, **and nothing else**: 1 of 2,470 |
+| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,473 |
+| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473 |
+| the date check | the date test through the hook, **and nothing else**: 1 of 2,473 |
 | the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
 | skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
 | forgetting the cursors when a collection is dropped | the dropped-collection test |
@@ -18166,6 +18166,6 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 | null matching a missing field, in the moved `equals` (a control on the differential) | 225 rows of the two-commit differential |
 | `Symbol` in the string bracket, in the moved `same_type_group` (the same) | 129 rows of it |
 
-The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast`, 2,470 tests, on the tree under review. A run that stops at its first failing binary cannot support "and nothing else".
+The first three rows name what fails and, by the same measurement, what does not, so they were measured across the whole workspace with `cargo test --workspace --no-fail-fast` on the tree under review, with the three forgetting tests in it: 2,473 tests as `cargo test` counts them, the passed and the failed of its result lines summed, with 18 ignored besides. A run that stops at its first failing binary cannot support "and nothing else".
 
 Each of the three forgetting tests fails at its assertion that the cursor is gone. Each also asserts what the new index's first pass deletes, and those three assertions are a joint proof only, because building the new index forgets a cursor its drop did not. With the forgetting assertions and all three evictions taken out, all three fail as the review found: the recreated collection's first pass deletes nothing, and the recreated and the superseding index's each delete one of their two documents.
