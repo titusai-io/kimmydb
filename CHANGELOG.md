@@ -199,8 +199,21 @@ refused.** This release moves the storage schema to 4
   collection abort the process, on every member that applied it. Before this
   release the store turned a `NaN` into `null`, so both sides of the comparison
   matched by accident and 0.33.0 is unaffected. The check now compares the
-  stored encodings, which is reflexive for every value, and the retry is bounded
-  and returns an error naming the collection instead of exhausting the stack.
+  stored encodings, which is reflexive for every value. The retry is a loop
+  rather than a self-call, so it cannot exhaust a stack, and it gives up after
+  10,000 attempts — a number no contention reaches, since concurrent schema
+  changes to one collection queue behind each other and the last of 64 can lose
+  63 races with nothing wrong. A client that reaches it gets a `500`
+  `storage failure`; the server log names the collection.
+
+  **Creating the same `NaN`-filtered index twice is no longer a conflict.** The
+  check that decides whether an index already under the name is the one asked
+  for made the same comparison, and refused the identical definition as "a
+  different `partialFilterExpression`". Two members that created it
+  independently replaced one index with the other, rebuilding it, instead of
+  agreeing on its creation stamp. Filters are now compared as the store holds
+  them. Key order still does not count, as before; **`0.0` and `-0.0` now do**,
+  because the store holds them as two values.
 - **Dropping a large index no longer stalls every write for tens of seconds,
   or needs gigabytes of free disk while it runs.** The storage call that
   cleared an index's entries was slow in the way that matters. For 742,858
