@@ -272,7 +272,8 @@ enum Command {
         /// timestamp. `0` is the absolute-deadline pattern.
         #[arg(long)]
         expire_after_seconds: Option<u64>,
-        /// Index only the documents matching this filter, as JSON.
+        /// Index only the documents matching this filter, as JSON. A document
+        /// the filter cannot decide is held too, and re-checked on each scan.
         #[arg(long)]
         partial: Option<String>,
     },

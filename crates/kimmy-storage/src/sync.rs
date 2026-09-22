@@ -4617,6 +4617,52 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_document_moving_in_and_out_of_the_undecidable_state_is_refiled_on_the_peer() {
+        // The old-image unfile on the replicated path. A peer applying a
+        // document's moves into, out of and back into the undecidable run must
+        // hold it where the origin does after each one — a stale sentinel entry
+        // is a candidate for every query for ever.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index_with(
+            "shop",
+            "orders",
+            vec![field("a")],
+            false,
+            Default::default(),
+            Some("a_gt5".into()),
+            None,
+            Some(bson::doc! { "k": { "$gt": 5 } }),
+        )
+        .unwrap();
+        pull(&b, &a);
+        let runs = |e: &Engine| {
+            let coll = e.get_collection("shop", "orders").unwrap();
+            let id = coll.index("a_gt5").expect("the index is held").id;
+            (e.undecidable_count(&coll, id).unwrap(), e.unkeyed_count(&coll, id).unwrap())
+        };
+        let dec = bson::Bson::Decimal128("1".parse().unwrap());
+        let coll = a.get_collection("shop", "orders").unwrap();
+        a.insert(&coll, bson::doc! { "_id": 1_i64, "k": dec.clone(), "a": 1 }).unwrap();
+        pull(&b, &a);
+        assert_eq!(runs(&b), (1, 0), "in: the peer holds it in the undecidable run");
+
+        for (k, held) in [(bson::Bson::Int32(9), 0), (bson::Bson::Int32(1), 0), (dec, 1)] {
+            a.replace(
+                &coll,
+                &DocId::Int64(1),
+                bson::doc! { "_id": 1_i64, "k": k.clone(), "a": 1 },
+                false,
+            )
+            .unwrap();
+            pull(&b, &a);
+            assert_eq!(runs(&a), (held, 0), "the origin, at k = {k}");
+            assert_eq!(runs(&b), runs(&a), "the peer holds it where the origin does, at k = {k}");
+        }
+    }
+
+    #[test]
     fn a_nested_key_order_is_part_of_the_filter() {
         // `find` compares an embedded document field by field, in order, so these
         // two filters select different documents — and the definition check

@@ -115,7 +115,11 @@ pub fn describe_collection(
 
     let mut indexes = Vec::with_capacity(meta.indexes.len());
     for index in &meta.indexes {
-        indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
+        indexes.push(index_to_json(
+            index,
+            state.engine.unkeyed_count(&meta, index.id)?,
+            state.engine.undecidable_count(&meta, index.id)?,
+        ));
     }
 
     Ok(json!({

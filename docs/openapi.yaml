@@ -3397,6 +3397,18 @@ components:
             for an index that keys every document it holds. A number above 0
             is the cost of leaving such documents under the index; the index
             listing's `unkeyed` reports the same set by size.
+        undecidableCandidates:
+          type: integer
+          description: |
+            Of `indexEntriesRead`, the entries read from the index's
+            undecidable run: documents a partial index holds because its filter
+            could not decide them — a `Decimal128` at a filtered path, which
+            the canonical order ranks equal to every number — and which every
+            scan of that index reads and rechecks (ADR-185). Present whenever
+            `indexEntriesRead` is, and 0 for an index with none. Separate from
+            `unkeyedCandidates`: that one counts documents the index could not
+            key, which is a fault to fix, and this one is expected. The index
+            listing's `undecidable` reports the same set by size.
 
     ViolationGroup:
       type: object
@@ -3419,7 +3431,7 @@ components:
 
     Index:
       type: object
-      required: [name, fields, unique, enforcement, multikey, unkeyed]
+      required: [name, fields, unique, enforcement, multikey, unkeyed, undecidable]
       properties:
         name: { type: string }
         fields:
@@ -3452,6 +3464,23 @@ components:
             collection's owner — reshape those documents, or split the index
             — visible here without access to the server's logs, where each
             one was also warned about by id.
+        undecidable:
+          type: integer
+          description: |
+            Documents the index holds because its partial filter could not
+            decide them. The canonical order ranks a Decimal128 equal to every
+            number, so a filter compared against one gives an answer that is
+            *an* answer rather than *the* answer — and the index holds the
+            document anyway, for each scan to recheck against the full filter,
+            rather than deciding membership on a comparison that is not an
+            order.
+
+            Expected rather than a fault, which is what distinguishes it from
+            `unkeyed`: nothing is wrong with these documents or with the index,
+            and on a field holding money it may be most of the collection. What
+            it costs is the recheck on every scan, which is why the standing
+            number is here. A unique index enforces nothing on them, and a TTL
+            index never expires them, because the filter does not select them.
         expireAfterSeconds:
           type: integer
           description: Present only on a TTL index.

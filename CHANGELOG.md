@@ -80,6 +80,30 @@ refused.** This release moves the storage schema to 4
   rise is the fix below doing its job. A scrape config or a golden list that
   enumerates series needs the new name.
 
+- **`kimmy_index_undecidable_total`** (`kimmy.index.undecidable` on the OTLP
+  bridge) counts documents an index holds because its partial filter could not
+  decide them ([ADR-185](docs/decisions.md)). **Expected, not a fault**: it
+  rises whenever a document holding a `Decimal128` at a filtered path is
+  written, needs no action, and is logged at debug rather than warning. It is a
+  **separate series** from `kimmy_index_unkeyed_total`, which counts documents
+  an index could not key at all — that one is worth an alert, and keeping them
+  apart is what stops this one diluting it. A scrape config or a golden list
+  that enumerates series needs the new name.
+
+  **A `Decimal128` at an *indexed* path is a different case, and is not a
+  miss.** The order cannot rank one, so no index can key such a document: it goes
+  in the index's unkeyed run and every scan rechecks it, which is why it is found
+  rather than lost. That is `unkeyed` on the listing, and it predates this
+  release.
+- **`undecidable` on every index** in the listing, `describe` and
+  `createIndex`: how many documents the index holds because its partial filter
+  could not decide them ([ADR-185](docs/decisions.md)). **Always present**, and
+  `0` on an index with none, beside `unkeyed`, which keeps meaning documents
+  the index could not key. A typed client that declares an index's fields needs
+  the new one. `explain` reports the same run per query as
+  **`undecidableCandidates`**, beside `unkeyedCandidates`, so the re-check an
+  owner is told to watch is visible where they would look for it.
+
 - **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP
   bridge, `kimmy.task.retries.<task>`) counts the times a supervised background
   task retried its work in place after a transient failure
@@ -153,10 +177,10 @@ refused.** This release moves the storage schema to 4
   the error type by an exhaustive match with no wildcard, so a variant added
   later does not compile until it has been classified.
 
-- **A partial index now holds exactly what `find` with its filter returns,
-  and is used only for a query whose every match it holds — with one exception,
-  a document value that is a `Decimal128`**
-  ([ADR-183](docs/decisions.md)). Membership had its own rule, which differed
+- **A partial index now holds what `find` with its filter returns,
+  and is used only for a query whose every match it holds**
+  ([ADR-183](docs/decisions.md), and [ADR-185](docs/decisions.md) for the
+  `Decimal128` exception, which is closed below). Membership had its own rule, which differed
   from `find` in three ways:
   - it never matched a whole array, so `{k: [1, 2]}` did not hold a document
     whose `k` is `[1, 2]`;
@@ -171,13 +195,46 @@ refused.** This release moves the storage schema to 4
   at startup (above), and duplicates the rebuild finds in a unique one are
   reported as a replicated build's are, not refused.
 
-  **The exception, which is not new and is not fixed here:** a document whose
-  indexed value is a `Decimal128` can still be missed. The canonical order ranks
-  a `Decimal128` equal to every number — the documented contract — which makes
-  equality non-transitive, and the containment check assumes it is transitive.
-  The same is true of the previous release. It is recorded as its own finding,
-  because closing it means giving up index use for some queries under a contract
-  that has not been reopened.
+- **A query answered from a partial index no longer misses a document holding a
+  `Decimal128`** ([ADR-185](docs/decisions.md)). The canonical order ranks a
+  `Decimal128` equal to *every* number, because there is nothing exact to
+  compare it with. So a stored `Decimal128` satisfies `{k: 7}` and fails
+  `{k: {$gt: 5}}`, and an index filtered on `{k: {$gt: 5}}` did not hold it —
+  while the planner would still answer `{k: 7}` from that index, because
+  `7 > 5` for every number. **The document was returned by a collection scan
+  and missed by the indexed query, silently.** A reviewer's differential found
+  825 (filter, query) pairs that lost documents this way, every one of them
+  involving a stored `Decimal128`.
+
+  Such a document is now **held by the index** — in a run of its own, which
+  every scan re-checks against the full filter — even when the filter does not
+  select it. Index membership is a superset of what `find` selects, exact except for
+  values the order cannot rank. This costs no index use: the planner chooses
+  the same indexes it did before.
+
+  **Nothing you write changes.** A `Decimal128` is still refused as a filter
+  operand, an index bound, a sort key and an expression literal, so only a
+  stored document value reaches this case. A **unique** partial index does not
+  enforce anything on such a document and does not refuse it, because a partial
+  unique constraint applies to the documents its filter selects. A **TTL**
+  index never expires one.
+
+  **It costs index size**, and the listing's `undecidable` figure and the new
+  counter, both [above](#added), say how much. This was pre-existing — 0.33.0
+  and earlier behave the same way — and is fixed by the same schema 3 → 4
+  rebuild [above](#unreleased), with no separate migration.
+- **`count`, a sorted `find` and a write's `explain` no longer see a document
+  an index cannot key twice.** A query range with an open low end — `$lt` or
+  `$lte` on an ascending field, `$gt` or `$gte` on a descending one — walked
+  the index's unkeyed run again after the scan had already read it, so a
+  document filed there was counted twice, returned twice by a sorted `find`,
+  and reported twice among `explain`'s entries read. Plain `find`,
+  `aggregate`, `update` and `delete` de-duplicate, and were right. This is
+  pre-existing, since documents an index cannot key were first filed rather
+  than refused ([ADR-139](docs/decisions.md)); the partial-index fix above
+  would have made it common. Every query range now starts above the index's
+  sentinel runs ([ADR-185](docs/decisions.md)).
+
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
   in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an

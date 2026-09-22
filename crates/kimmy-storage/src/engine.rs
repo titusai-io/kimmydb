@@ -70,6 +70,17 @@ pub struct Engine {
     /// the standing number per index as `unkeyed` on the listing, and this is
     /// the rate, for the metrics endpoint.
     unkeyed_writes: std::sync::atomic::AtomicU64,
+    /// Documents an index holds because its partial filter could not decide
+    /// them, since start ([ADR-185](../../../docs/decisions.md)).
+    ///
+    /// **A series of its own rather than a label on `unkeyed_writes`**, and
+    /// deliberately: that one counts a fault an operator can fix, and an alert
+    /// on it means "someone's documents are not being indexed properly". Adding
+    /// a reason label would have kept the name and quietly changed what the
+    /// unlabelled series counts, so every existing alert on it would start
+    /// firing on ordinary Decimal128 writes. Two names, two meanings, and the
+    /// old one means today what it meant yesterday.
+    undecidable_writes: std::sync::atomic::AtomicU64,
     /// Entries a snapshot restore appended behind the schema it restored, so
     /// that this node can serve them onward (ADR-180), since start. Counted
     /// after the commit that made each one durable, here rather than on the
@@ -874,6 +885,7 @@ impl Engine {
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
+            undecidable_writes: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
@@ -1121,6 +1133,12 @@ impl Engine {
         self.unkeyed_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many documents an index has held because its partial filter could
+    /// not decide them since start (ADR-185).
+    pub fn undecidable_writes(&self) -> u64 {
+        self.undecidable_writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many schema changes a snapshot restore has appended to this node's
     /// oplog since start, so that it can serve them onward (ADR-180).
     pub fn ddl_relogged(&self) -> u64 {
@@ -1156,6 +1174,10 @@ impl Engine {
 
     pub(crate) fn count_unkeyed(&self, n: u64) {
         self.unkeyed_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_undecidable(&self, n: u64) {
+        self.undecidable_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// What has to follow the commit of an entry a snapshot restore appended

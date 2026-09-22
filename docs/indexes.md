@@ -222,7 +222,11 @@ database, collection, index and document id, and counted in
 `kimmy_index_unkeyed_total`. The index listing, `describe` and `createIndex`
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
-the entries a query read from the run. Zero is the index doing its whole
+the entries a query read from the run. **That figure means this reason and no
+other**: a document the index holds because a partial filter could not *decide*
+it is counted by `undecidable` instead, and the two are worth telling apart
+because this one is a fault and that one is not
+([below](#a-decimal128-at-a-filtered-path)). Zero is the index doing its whole
 job. Anything else is the cost of leaving such documents under the index:
 every scan of it rechecks all of them. The fix is the collection owner's, and
 needs no access to the server — reshape the documents, or split the compound
@@ -496,8 +500,9 @@ whose key carries a second component.
 
 ## Partial indexes — indexing only some documents
 
-An index with a `partialFilterExpression` holds **only the documents matching
-it**. Smaller index, and a unique constraint that applies to a subset.
+An index with a `partialFilterExpression` holds **the documents matching it**,
+and nothing else — with one exception, [below](#a-decimal128-at-a-filtered-path).
+Smaller index, and a unique constraint that applies to a subset.
 
 ```json
 { "fields": [{ "path": "email" }],
@@ -572,6 +577,43 @@ Bounds compare by strictness, and the edges matter:
 missing field, so it cannot imply the field exists — answering it from a
 presence-filtered index would silently drop every document missing the field.
 `explain` will report `collectionScan` for it, and that is correct.
+
+### A Decimal128 at a filtered path
+
+**The one case where a partial index holds a document its filter does not
+select.** The canonical order ranks a `Decimal128` equal to *every* number
+([key-encoding.md](key-encoding.md)) — there is nothing exact to compare it
+with — so a stored `Decimal128` satisfies `{k: 7}` and `{k: {$gte: 6}}` and
+fails `{k: {$gt: 5}}`. Comparison with one is not an order, and a filter's
+answer about such a document is *an* answer rather than *the* answer.
+
+So the index holds it anyway, in a run of its own beside the unkeyed run, and
+every scan re-checks it against the full filter. Without that, an index with `{k: {$gt: 5}}` would be
+used for the query `{k: 7}` — the planner can prove that containment — and
+would miss a document holding `Decimal128("1")` that `find` returns, silently
+([ADR-185](decisions.md)).
+
+This is the documented behaviour, not a fault:
+
+- **It costs index size**, and the listing, `describe` and `createIndex` report
+  it as its own `undecidable` figure — **not** folded into `unkeyed`, which keeps
+  meaning "documents the index could not key". Both are always present, so
+  `undecidable: 0` is what an index with none reads. The rate since start is
+  `kimmy_index_undecidable_total`, again separate from
+  `kimmy_index_unkeyed_total`: that one is worth an alert, this one is not.
+- **Nothing is logged at warning.** A filing here is expected, and raising it
+  to the level of a real fault is how an operator learns to ignore both.
+- **A unique index does not enforce anything on it**, because the filter does
+  not select it and a partial unique constraint applies to the subset the
+  filter selects. Writing such a document is an ordinary write, not a
+  collision and not a refusal.
+- **A TTL index never expires it**, for the same reason: the filter does not
+  select it, and expiry reads only keyed entries.
+
+The values a *caller* supplies are unaffected: a `Decimal128` is refused as a
+filter operand, an index bound, a sort key and an expression literal, exactly
+because the order cannot rank it. Only a stored document value reaches this
+case.
 
 ### Other behaviours
 

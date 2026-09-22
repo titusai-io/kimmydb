@@ -490,6 +490,14 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.index.undecidable",
+            "{document}",
+            "Documents an index holds because its partial filter could not decide them; every \
+             scan re-checks them (ADR-185).",
+            index_undecidable
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.ttl.skipped",
             "{document}",
             "Expiry candidates refused because the document was refreshed first.",
@@ -1509,6 +1517,59 @@ mod tests {
                 "`{name}` is not an instrument on the bridge"
             );
         }
+    }
+
+    #[test]
+    fn no_two_bridge_instruments_read_the_same_field() {
+        // The bridge is a list of `observe!(kind, "kimmy.x.y", unit, help,
+        // field)` calls, and **nothing checked which field each one reads**.
+        // `kimmy.index.undecidable` reading `index_unkeyed` would publish one
+        // figure under two names, on the surface alerting is built from, and
+        // every existing test would pass: the coverage test below matches names
+        // only, and the snapshot that might have caught it renders
+        // `StorageReadings::default()`, where every field is zero.
+        //
+        // **Distinctness rather than name agreement**, because agreement is not
+        // the rule: `kimmy.webhook.subscriptions.active` reads `webhook_active`
+        // and four others abbreviate likewise, all correctly. Requiring the name
+        // to match would need a list of those five — the literal list beside a
+        // derivation that this round has removed three times. Two instruments
+        // reading one field is the actual defect, and it needs no list.
+        //
+        // Only calls whose last argument is a bare field are judged; several
+        // legitimately compute, and a closure is a departure rather than a typo.
+        let source = include_str!("logging.rs");
+        let mut by_field: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (at, _) in source.match_indices("observe!(") {
+            let Some(end) = source[at..].find(");") else { continue };
+            let call = &source[at..at + end];
+            let Some(name_start) = call.find("\"kimmy.") else { continue };
+            let after = &call[name_start + 1..];
+            let Some(name_end) = after.find('"') else { continue };
+            let name = after[..name_end].to_string();
+            let last = call.rsplit(',').next().unwrap_or_default().trim().trim_end_matches(',');
+            let bare = !last.is_empty()
+                && last.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if bare {
+                by_field.entry(last.to_string()).or_default().push(name);
+            }
+        }
+        assert!(
+            by_field.len() > 20,
+            "premise: bare-field instruments were found ({})",
+            by_field.len()
+        );
+        let shared: Vec<String> = by_field
+            .iter()
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(field, names)| format!("{field} is read by {}", names.join(" and ")))
+            .collect();
+        assert!(
+            shared.is_empty(),
+            "these bridge instruments read one field under more than one name, so a figure is \
+             published as something it is not:\n  {}",
+            shared.join("\n  ")
+        );
     }
 
     #[test]
