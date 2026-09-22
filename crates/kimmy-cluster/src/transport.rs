@@ -178,6 +178,8 @@ pub async fn serve_with(
         // and a panic in one connection must not take the listener down. The
         // TLS handshake happens inside the task for the same reason — it is
         // the first thing an attacker can make slow.
+        // UNSUPERVISED: one task per inbound connection, and a panic in one connection must
+        // not stop the node -- which is the rule the comment above already states.
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,

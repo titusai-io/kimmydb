@@ -19,11 +19,18 @@ use std::time::Duration;
 
 /// Run this binary again, as a child, with one scenario selected.
 fn probe(scenario: &str, test_name: &str) -> std::process::Output {
-    Command::new(std::env::current_exe().expect("this test binary"))
-        .args(["--exact", test_name, "--nocapture"])
-        .env("KIMMY_TASK_PROBE", scenario)
-        .output()
-        .expect("re-running this test binary")
+    probe_with(scenario, test_name, &[])
+}
+
+/// [`probe`], with extra environment — for `KIMMY_TEST_KILL_TASK`, which is read
+/// once per process, so each scenario that uses it needs a process of its own.
+fn probe_with(scenario: &str, test_name: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+    command.args(["--exact", test_name, "--nocapture"]).env("KIMMY_TASK_PROBE", scenario);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("re-running this test binary")
 }
 
 fn scenario() -> Option<String> {
@@ -103,7 +110,8 @@ fn a_task_that_judges_its_own_return_unexpected_exits_70() {
 fn a_task_that_judges_its_own_return_expected_does_not_exit() {
     // The other arm of the judged shape, and the one that matters: a task with a
     // legitimate terminal condition must be able to reach it without stopping
-    // the node. Two of the membership tasks do exactly that.
+    // the node. The membership receiver is the one that does: it ends when the
+    // loop it feeds has gone, which is ordinary.
     if scenario().as_deref() == Some("expected") {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -266,6 +274,134 @@ fn the_same_task_ending_with_no_shutdown_announced_does_exit() {
 }
 
 #[tokio::test]
+async fn aborting_a_supervised_handle_stops_the_work() {
+    // The node's drain aborts every supervised handle. That handle is the
+    // *supervisor*, and aborting it drops the inner `JoinHandle` -- which does
+    // not cancel the inner task, it detaches it. So the work kept running,
+    // unsupervised, until the runtime went away: a panic in it after that point
+    // was nobody's, and the process ended 0 with no report.
+    //
+    // Measured by an independent review of this PR on real SIGTERMs: 5 of 10
+    // runs had supervisors that never logged "stopping a background task for
+    // shutdown" because they had been aborted before they could.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ticks);
+    let shutdown = kimmy_task::Shutdown::new();
+    let handle = kimmy_task::supervise("probe_abort", shutdown, async move {
+        loop {
+            counted.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let before = ticks.load(Ordering::Relaxed);
+    assert!(before > 5, "premise: the work is running ({before} ticks)");
+
+    handle.abort();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let after = ticks.load(Ordering::Relaxed);
+    assert!(
+        after <= before + 1,
+        "aborting a supervised handle must stop the work, not detach it: {before} ticks at the \
+         abort, {after} after 150ms more"
+    );
+}
+
+#[test]
+fn a_handle_dropped_outside_shutdown_says_so() {
+    // The other half of the guard. Stopping the work silently would be an
+    // improvement on detaching it silently and still leave a supervised task
+    // disappearing with nothing said, so the notice is asserted rather than
+    // assumed -- and it is the only observable effect the guard has, which is
+    // why this test installs a subscriber where the others read an exit status.
+    if scenario().as_deref() == Some("dropped") {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle =
+                kimmy_task::supervise("probe_dropped", kimmy_task::Shutdown::new(), async {
+                    std::future::pending::<()>().await;
+                });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            handle.abort();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        return;
+    }
+
+    let out = probe("dropped", "a_handle_dropped_outside_shutdown_says_so");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "a deliberate abort is not a death: {stderr}");
+    assert!(
+        stderr.contains("dropped outside shutdown"),
+        "an abort outside shutdown is said out loud, not inferred from silence: {stderr}"
+    );
+    assert!(stderr.contains("probe_dropped"), "and it names the task: {stderr}");
+}
+
+#[test]
+fn the_test_switch_reaches_a_judged_task_and_a_one_shot() {
+    // `KIMMY_TEST_KILL_TASK` only ever wrapped `supervise`. `supervise_judged`
+    // and `supervise_oneshot` did not go through `with_test_kill` at all, so
+    // `membership_inbound:panic`, `membership_timer:panic` and
+    // `membership_announce:return` announced themselves at WARN and then did
+    // nothing — three of the fifteen names the WARN offers, silently inert.
+    //
+    // Both shapes here, under the names they are used with, because the two
+    // failed for the same reason and a fix to one is no evidence about the
+    // other. A switch-induced return is a death even for a shape whose own
+    // returns are expected, or the one-shot would swallow it.
+    for (scenario, task, how, shape) in [
+        ("kill_judged", "membership_inbound", "panic", "supervise_judged"),
+        ("kill_oneshot", "membership_timer", "return", "supervise_oneshot"),
+    ] {
+        if scenario_is(scenario) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                kimmy_task::arm_test_kills();
+                if scenario == "kill_judged" {
+                    kimmy_task::supervise_judged(
+                        "membership_inbound",
+                        kimmy_task::Shutdown::new(),
+                        async { std::future::pending::<kimmy_task::Ended>().await },
+                    );
+                } else {
+                    kimmy_task::supervise_oneshot(
+                        "membership_timer",
+                        kimmy_task::Shutdown::new(),
+                        async { std::future::pending::<()>().await },
+                    );
+                }
+                // The grace after arming, and then some.
+                tokio::time::sleep(Duration::from_secs(8)).await;
+            });
+            return;
+        }
+
+        let out = probe_with(
+            scenario,
+            "the_test_switch_reaches_a_judged_task_and_a_one_shot",
+            &[("KIMMY_TEST_KILL_TASK", &format!("{task}:{how}"))],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(70),
+            "{shape} must honour the switch the WARN offers ({task}:{how}); stderr: {stderr}"
+        );
+        assert!(stderr.contains(task), "and name the task: {stderr}");
+    }
+}
+
+fn scenario_is(want: &str) -> bool {
+    scenario().as_deref() == Some(want)
+}
+
+#[tokio::test]
 async fn a_transient_failure_is_retried_in_place_and_counted() {
     // The third class, and the one with no exit to assert: a transient `Err` is
     // retried for ever and never returned, so the task stays alive and
@@ -354,6 +490,52 @@ async fn a_failing_worker_is_retried_rather_than_abandoned() {
         count_for("ttl_expiry") - before >= 3,
         "and each retry is counted, so a permanently failing worker shows up as a rising count \
          rather than as silence"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_quiet_stretch_resets_the_backoff() {
+    // The backoff doubled to its maximum and stayed there for the life of the
+    // process. A task that failed a few times an hour ago then waited the full
+    // two minutes for an unrelated transient error -- and the error that
+    // recovers on the first retry is exactly the one most likely to be waited
+    // out for two minutes for nothing.
+    //
+    // On tokio's clock, paused, so the waits are the assertion rather than a
+    // race: `sleep` advances time when the runtime is idle.
+    let shutdown = kimmy_task::Shutdown::new();
+    let mut retry = kimmy_task::Retry::new(
+        "retention_collector",
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    );
+
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let at = tokio::time::Instant::now();
+        assert!(retry.after("a transient failure", &shutdown).await);
+        waits.push(tokio::time::Instant::now() - at);
+    }
+    assert_eq!(
+        waits,
+        vec![Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)],
+        "premise: the backoff doubles while the failures keep coming"
+    );
+
+    // Quiet for longer than four times the wait it had reached. Three failures
+    // leave the *next* wait at 8s, so the stretch to beat is 32s -- and 17s,
+    // which is four times the last wait actually taken, is not enough. The
+    // first version of this test used that and failed, which is the assertion
+    // doing its job: the rule is about the wait ahead, not the one behind.
+    tokio::time::sleep(Duration::from_secs(4 * 8 + 1)).await;
+
+    let at = tokio::time::Instant::now();
+    assert!(retry.after("a transient failure much later", &shutdown).await);
+    assert_eq!(
+        tokio::time::Instant::now() - at,
+        Duration::from_secs(1),
+        "after a quiet stretch the next failure waits the first backoff again, not the eight \
+         seconds the schedule had climbed to"
     );
 }
 

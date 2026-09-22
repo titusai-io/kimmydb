@@ -3,11 +3,15 @@
 //!
 //! # Every exit is named in the log
 //!
-//! A node has two ways out of `node::run`: a signal, which logs `shutdown
-//! signal received, draining` and then `shutdown complete`, and an error,
-//! which now logs on the way out too. Nothing in this process exits any other
-//! way — there is no `process::exit`, no abort hook, and no `panic = "abort"`
-//! — with one exception: a panic that unwinds out of `main` exits 101 with
+//! A node has three ways out of `node::run`: a signal, which logs `shutdown
+//! signal received, draining` and then `shutdown complete`; an error, which
+//! logs on the way out too; and **a supervised background task dying, which
+//! writes a `task_died` marker and calls `process::exit(70)`**
+//! ([ADR-184](../../../docs/decisions.md)) — that one is named here because
+//! this module used to say there was no `process::exit` at all, which stopped
+//! being true when supervision arrived. There is still no abort hook and no
+//! `panic = "abort"`, and one further exception: a panic that unwinds out of
+//! `main` exits 101 with
 //! its message on stderr and writes no marker, so the next start reports it
 //! as unclean, which is the truth. Otherwise a log that ends without one of
 //! those lines and resumes at the startup banner is a process that was ended

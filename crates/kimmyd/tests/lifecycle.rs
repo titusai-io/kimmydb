@@ -351,13 +351,18 @@ async fn a_task_that_dies_exits_and_the_next_start_names_it(
 
     let mut first =
         Run::spawn_with(dir.path(), label, &[("KIMMY_TEST_KILL_TASK", &format!("{task}:{kill}"))]);
-    first.wait_ready(&client).await;
-    assert!(
-        first.log().contains("a test switch is set"),
-        "the switch must announce itself on every start where it is set: {}",
-        first.log()
-    );
 
+    // **Nothing is waited for here, deliberately.** This used to call
+    // `wait_ready`, which raced the switch: the kill fires a fixed grace after
+    // the node starts serving, and on a loaded machine the harness's first
+    // `/healthz` could land after the process had already exited 70 — so the
+    // test failed with "exited (70) before it became healthy", which is the
+    // thing it is trying to prove. Both of these failed that way in one of a
+    // reviewer's two full runs.
+    //
+    // Everything readiness was standing in for is asserted from the finished
+    // log below, where there is no race left to lose: the node got as far as
+    // serving, the switch announced itself, and only then did the death happen.
     let status = first.wait_exit();
     assert_eq!(
         status.code(),
@@ -365,6 +370,15 @@ async fn a_task_that_dies_exits_and_the_next_start_names_it(
         "a supervised death exits 70, distinct from a configuration error's 1: {status:?}"
     );
     let log = first.log();
+    assert!(
+        log.contains("serving HTTP"),
+        "the node must have reached serving before the switch fired, which is the switch's own \
+         contract: {log}"
+    );
+    assert!(
+        log.contains("a test switch is set"),
+        "the switch must announce itself on every start where it is set: {log}"
+    );
     assert!(log.contains("stopping the process so it is restarted"), "{log}");
     assert!(log.contains(task), "the log names the task: {log}");
 
@@ -414,11 +428,97 @@ async fn a_background_task_that_returns_exits_the_process() {
 }
 
 #[tokio::test]
+async fn a_test_switch_that_will_do_nothing_says_so() {
+    // The switch used to be announced only when it *parsed*: a typo in the
+    // value, or a task name that matches nothing, produced no line at all. A
+    // test that thought it had armed a kill then watched a node shut down
+    // normally with no clue why, which is a worse failure than the switch not
+    // existing.
+    for (value, expect) in [
+        ("embedding_worker", "malformed"),
+        ("embeding_worker:panic", "matches no task"),
+        ("membership_inbound:explode", "malformed"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+        let mut node = Run::spawn_with(dir.path(), "inert", &[("KIMMY_TEST_KILL_TASK", value)]);
+        node.wait_ready(&client).await;
+        let log = node.log();
+        node.signal("TERM");
+        let status = node.wait_exit();
+
+        assert!(
+            log.contains(expect),
+            "a switch set to {value:?} will do nothing, and the start must say which: {log}"
+        );
+        assert!(log.contains(value), "and quote it back: {log}");
+        assert!(
+            status.success(),
+            "a switch that does nothing must not stop the node either: {status:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_task_asked_to_fail_retries_in_place_and_the_node_stays_up() {
+    // The third of `KIMMY_TEST_KILL_TASK`'s three shapes, end to end, and the
+    // one that had never worked: `:error` announced itself at WARN on every
+    // start and then did nothing at all. Twice over, in fact -- nothing read
+    // `Kill::Error` at all, and the obvious place to read it (the top of the
+    // retry loop) is never reached again, because the embedding worker's `run`
+    // does not return while it is working.
+    //
+    // Through a real node rather than at unit level, because the claim is about
+    // the one task in the node that retries, and it is on by default
+    // (`vector.worker_enabled`). The node staying up is half the assertion: a
+    // transient error must not be a death.
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut node =
+        Run::spawn_with(dir.path(), "retry", &[("KIMMY_TEST_KILL_TASK", "embedding_worker:error")]);
+    node.wait_ready(&client).await;
+
+    // Arming happens when the node starts serving, and the switch waits
+    // TEST_KILL_GRACE after that, so the line is a few seconds away.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let log = node.log();
+        if log.contains("will retry in place") {
+            assert!(log.contains("embedding_worker"), "the retry names the task it is for: {log}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the switch asked the embedding worker to fail once and nothing retried: {log}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Still serving: the failure was retried in place, not returned.
+    node.wait_ready(&client).await;
+    assert!(
+        !node.log().contains("stopping the process so it is restarted"),
+        "a transient failure is not a death: {}",
+        node.log()
+    );
+
+    node.signal("TERM");
+    let status = node.wait_exit();
+    assert!(status.success(), "and the node still shuts down cleanly: {status:?}");
+}
+
+#[tokio::test]
 async fn a_graceful_shutdown_is_not_a_task_death() {
-    // The control for the whole change. Shutdown aborts every supervised task,
-    // so without the announcement being set *before* the first abort each of
-    // them would look like a death and the drain would end in exit 70 instead of
-    // a clean stop.
+    // The end-to-end control: a drain is a clean exit and leaves a `shutdown`
+    // marker, not a `task_died` one.
+    //
+    // **It is not the test that holds the announcement open**, though it was
+    // written as one. The drain aborts each supervised handle, and an aborted
+    // supervisor is cancelled before it classifies anything, so this stays green
+    // however the shutdown checks behave — measured, by blinding all three of
+    // them. `a_task_that_ends_by_itself_during_shutdown_does_not_exit` in
+    // kimmy-task is the one that fails when they go.
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
 

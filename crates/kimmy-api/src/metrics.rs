@@ -971,7 +971,7 @@ impl Metrics {
         // One line per declared task, always, including the ones at 0: the rule
         // for this page is that no series is conditional, so the label set comes
         // from the declared task list rather than from what has happened to
-        // retry (`kimmy_task::declare`).
+        // retry (`kimmy_task::TASKS`).
         let task_retries = kimmy_task::retries()
             .into_iter()
             .map(|(task, n)| format!("kimmy_task_retries_total{{task=\"{task}\"}} {n}\n"))

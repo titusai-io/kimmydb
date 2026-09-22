@@ -278,7 +278,10 @@ pub async fn run(
     // `run` does not cover it: if this task dies, `run` goes on looping and
     // foca simply stops hearing anything, so the member set freezes exactly as
     // if membership had died (ADR-184).
-    let inbound = kimmy_task::supervise_judged("membership_inbound", shutdown.clone(), {
+    // The handles are kept only to name them. Nothing aborts these: the loop
+    // below never ends, and each supervisor stops its own work when shutdown
+    // begins.
+    let _inbound = kimmy_task::supervise_judged("membership_inbound", shutdown.clone(), {
         let socket = Arc::clone(&socket);
         let tx = tx.clone();
         let secret = secret.clone();
@@ -339,7 +342,7 @@ pub async fn run(
     // within seconds by stopping the test binary with an exit code. A panic is
     // still fatal: an announcement lost to one is a node that never introduces
     // itself to a seed.
-    let announcing = kimmy_task::supervise_oneshot("membership_announce", shutdown.clone(), {
+    let _announcing = kimmy_task::supervise_oneshot("membership_announce", shutdown.clone(), {
         let tx = tx.clone();
         async move {
             let mut seeds = seeds;
@@ -394,11 +397,19 @@ pub async fn run(
         }
     }
 
-    // The loop is over, so the children feed nothing. Ended deliberately rather
-    // than left to notice: a child that outlives this loop returns when its
-    // channel closes, and a return nobody asked for is a death.
-    inbound.abort();
-    announcing.abort();
+    // **Unreachable, and that is the point.** `run` holds `tx` for its whole
+    // body -- the timer arm above clones it -- so `rx.recv()` cannot return
+    // `None` and this loop cannot end. `run` is itself the supervised
+    // `membership` task, and a task that never returns is exactly what
+    // `supervise` wants.
+    //
+    // Two aborts used to sit here, on `inbound` and `announcing`, with a comment
+    // explaining that a child outliving this loop would return and be read as a
+    // death. Nothing reached them. They are gone rather than kept as reassuring
+    // dead code, and the children are stopped by their own supervisors when
+    // shutdown begins -- which is only true since the supervisors started
+    // stopping their work instead of detaching it (ADR-184).
+    unreachable!("the membership loop holds a sender, so its channel never closes")
 }
 
 /// A stream of addresses to introduce ourselves to.

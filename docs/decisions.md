@@ -18394,27 +18394,27 @@ Worst first, what each loss meant while nothing noticed: a dead **session invali
 
 ### The inventory, and how it is kept honest
 
-Derived from the spawn sites rather than from a list: every `.rs` under `crates/`, read only as far as its own test module, matching `tokio::spawn`, `spawn_blocking` and `std::thread::spawn`. Twenty-one sites, of which fifteen are supervised.
+Derived from the spawn sites rather than from a list: every `.rs` under `crates/`, read as far as its own **module-level** test module, matching any call to something named `spawn`, `spawn_local` or `spawn_blocking`. **Eleven** such calls exist in production code, and every one carries a `// UNSUPERVISED:` reason at the call site, because the fifteen supervised tasks do not spawn for themselves — they go through `supervise`, `supervise_judged` or `supervise_oneshot`, whose own spawns are four of the eleven. The other seven are: two child processes in the CLI, one task per inbound connection, one `spawn_blocking` inside a request, and node.rs's three — the JWT reminder, the shutdown watcher, and the per-peer push in a `JoinSet` the round awaits.
 
-Reading the spawn sites tells you where a task starts, not what its ending means, and **two of fifteen classifications were wrong until they were run** — both listed below as judged tasks.
+Reading the spawn sites tells you where a task starts, not what its ending means, and **two of fifteen classifications were wrong until they were run** — the membership receiver, which is judged, and the seed announcer, which is a one-shot. Both are in the table below.
 
-| Task | Shape | A panic | A return |
-|---|---|---|---|
-| session invalidator | endless | revoked tokens keep working (**security**) | the same; it consumes the oplog and has no terminal condition |
-| retention collector | endless | the oplog and tombstones grow until the disk fills | the same |
-| TTL expiry | endless | owned collections never expire | the same |
-| replicate | endless | this node stops pulling | the same |
-| embedding worker | endless, retrying | owned collections stop getting vectors | a storage error is transient and retried; a clean return is a death, since it should never finish |
-| webhook dispatcher | endless | no deliveries for owned subscriptions | the same; its one early return is now a startup failure, below |
-| SWIM membership | endless | the member view freezes | the same |
-| replication server | endless | no peer can pull from this node | the same; its TLS failure is now a startup failure, below |
-| stall probe | endless | `kimmy_runtime_stall_seconds` reads 0 for ever — a signal that cannot fail | the same |
-| vector index invalidator | endless | a dropped collection keeps its graph resident and its snapshot on disk | the same |
-| cert reloader | endless | a renewed certificate is never picked up | the same |
-| JWKS refresher | endless | a rotated signing key is never fetched | the same |
-| **membership receiver** | **judged** | foca stops hearing anything and the member set freezes | `Expected("the membership loop it feeds has gone")`, or `Unexpected("the membership socket could not be read")` |
-| **membership announcer** | one-shot | a node never introduces itself to a seed | expected: it drains the seed feed and ends, and also ends when the receiver is gone |
-| membership timer | one-shot | a *lost* timer, which foca does not tolerate — it tolerates delay | expected: firing once is the whole job |
+| Task | Shape | A panic | A return | At shutdown |
+|---|---|---|---|---|
+| session invalidator | endless | revoked tokens keep working (**security**) | the same; it consumes the oplog and has no terminal condition | stopped; its cache is rebuilt by reading |
+| retention collector | endless | the oplog and tombstones grow until the disk fills | the same | stopped mid-pass; a pass is a transaction, so the next start finds the same garbage |
+| TTL expiry | endless | owned collections never expire | the same | stopped mid-pass; each delete is its own commit and the rest stay due |
+| replicate | endless | this node stops pulling | the same | stopped; anti-entropy resumes from version vectors |
+| embedding worker | endless, retrying | owned collections stop getting vectors | a storage error is transient and retried; a clean return is a death, since it should never finish | stopped; its position is durable and work is re-delivered |
+| webhook dispatcher | endless | no deliveries for owned subscriptions | the same; its one early return is now a startup failure, below | stopped; progress is recorded only after an endpoint accepts, so a delivery is repeated rather than lost |
+| SWIM membership | endless | the member view freezes | the same | stopped; its loop cannot end on its own (it holds a sender) |
+| replication server | endless | no peer can pull from this node | the same; its TLS failure is now a startup failure, below | stopped; a peer retries |
+| stall probe | endless | `kimmy_runtime_stall_seconds` reads 0 for ever — a signal that cannot fail | the same | stopped; it holds nothing |
+| vector index invalidator | endless | a dropped collection keeps its graph resident and its snapshot on disk | the same | stopped between entries; it holds nothing |
+| cert reloader | endless | a renewed certificate is never picked up | the same | stopped; the certificate in use is already in the acceptor |
+| JWKS refresher | endless | a rotated signing key is never fetched | the same | stopped; an aborted fetch installs nothing |
+| **membership receiver** | **judged** | foca stops hearing anything and the member set freezes | `Expected("the membership loop it feeds has gone")`, or `Unexpected("the membership socket could not be read")` | stopped; **nothing it does needs to finish** — the loop it feeds is going too |
+| **membership announcer** | one-shot | a node never introduces itself to a seed | expected: it drains the seed feed and ends, and also ends when the receiver is gone | stopped; **nothing it does needs to finish** — a seed introduction not made is one the next start makes |
+| membership timer | one-shot | a *lost* timer, which foca does not tolerate — it tolerates delay | expected: firing once is the whole job | stopped; **a lost timer costs nothing during a drain**, which is the one case foca's intolerance of loss does not matter |
 
 **A judged task declares its own ending**, so those two reasons are the claim to check rather than a detail: a task that called its death ordinary would be supervised and still silent. The receiver's pair is the shape — one terminal condition that is ordinary, one that is not — and nothing outside the task can tell them apart, because both are just a return.
 
@@ -18422,7 +18422,17 @@ Reading the spawn sites tells you where a task starts, not what its ending means
 
 **Deliberately not supervised**, because a panic in them must *not* stop the node: one task per inbound connection, whose own comment already states the rule; `spawn_blocking` inside a request, which is that request's work; the supervisor itself; and two one-shots whose ending is the point — the previous-JWT-secret reminder, which warns once, and the shutdown watcher, whose return *is* shutdown.
 
-**`every_long_lived_task_is_spawned_through_the_supervisor`** fails if a production spawn is neither supervised nor named in `NOT_SUPERVISED` with its reason, and **`every_supervised_name_is_in_the_task_list_and_every_entry_is_used`** fails if the names and `kimmy_task::TASKS` drift apart. The inventory is a property, not a snapshot.
+**`every_long_lived_task_is_spawned_through_the_supervisor`** fails on any call to something *named* `spawn`, `spawn_local` or `spawn_blocking` in production code that does not carry `// UNSUPERVISED: <reason>` at the call site. **`every_supervised_name_is_in_the_task_list_and_every_entry_is_used`** fails if the supervise calls and `kimmy_task::TASKS` drift apart in either direction, and if a supervised name is not a string literal it can read.
+
+**Both were much weaker than this record first claimed, and the claim is worth keeping as a warning.** The first version said the lint matched `spawn_blocking` and that "the inventory is a property, not a snapshot". Neither was true:
+
+- It matched three literal path prefixes, so an independent review got **15 of 20 spawn forms past it** — `use tokio::spawn; spawn(..)`, `task::spawn`, a `JoinSet`'s `.spawn`, `Handle::current().spawn`, `spawn_local`, `thread::Builder::new().spawn`, a call split across lines, one inside a macro, `tokio::spawn (` with a space, the turbofish, a crate alias, and a long-lived `spawn_blocking`, which it claimed to cover and did not.
+- Its exemptions were **whole files**, and one of them was `kimmyd/src/node.rs`, where twelve of the fifteen tasks start. A plain `tokio::spawn` spliced into that file passed in silence.
+- `production_sources` cut each file at the first line whose *trimmed* text began `#[cfg(test)]`, which includes every indented one on a hook or a helper. `engine.rs` was read as far as line 625 of about 3,700, and thirteen files lost roughly ten thousand lines between them — unread, so unjudged.
+
+So it is loud by default now: every `spawn`-shaped call is flagged, exemptions are per call site with a reason, and the cut stops only at an unindented `#[cfg(test)]`. **17 of the 18 forms the review reported are flagged**, and the premise assertions include one that reads `engine.rs` and requires more than 3,000 lines, so the cut cannot quietly go back to eating files.
+
+**What still gets past it**, recorded rather than implied: the spawn function referred to by something other than its own name — passed by name into a macro or another function (`go!(tokio::spawn, ..)`), or renamed on import (`use tokio::spawn as go;`). Renaming the *crate* does not help, because the function's name is what is matched. Closing that needs a real parse rather than a text rule, and the honest position is that this lint catches every ordinary way of writing a spawn and none of the deliberate disguises.
 
 ### Telling a shutdown apart from a death
 
@@ -18430,13 +18440,17 @@ Every helper takes a `Shutdown`, announced **before** any step that could make a
 
 The announcement is made inside a wrapper around the signal, used by both serve paths, so there is no route from the signal to a drained server that skips it. It is also made before the aborts on the path where *serving itself failed* and no signal ever arrived; without that, aborting a supervised handle during an error exit would look like a cancellation and stop the process.
 
-**A cancellation is a clean stop, not a death.** Only our own `abort` cancels a handle, and every such call site is one of three things: the shutdown sequence in `node.rs`, `membership::run` ending its three children, or the supervisor's own shutdown branch. A cancellation arriving outside shutdown is logged at `INFO` with the task name, so a future stray `abort` on a supervised handle is never silent — that would be a death in costume.
+**A cancellation is a clean stop, not a death**, and the enumeration of who cancels what was wrong twice over in the first version of this record.
+
+There are **two** places, not three. The `node.rs` drain aborts **ten** supervised handles — the cert reloader, the JWKS refresher, the session invalidator, the vector index invalidator, the stall probe, the embedding worker, the retention collector, expiry, every cluster task, and the webhook dispatcher — and the supervisor's own shutdown branch stops its work. The third, `membership::run` ending its children, **was unreachable**: `run` holds a sender for its whole body, so its channel never closes, so its loop never ends and the two aborts after it never ran. They have been removed rather than kept as reassuring dead code.
+
+And the ten that *are* reached did not do what this paragraph said. Aborting a supervised handle aborts the **supervisor**, which dropped the inner `JoinHandle` — and dropping a `JoinHandle` detaches a task rather than cancelling it. So every shutdown left the real work running until the runtime went away: measured at unit level as **23 ticks at the abort and 79 after another 150 ms**, and on real SIGTERMs as 5 of 10 runs whose supervisors never logged that they were stopping. `StopOnDrop` now aborts the inner handle when the supervisor goes away, and a drop outside shutdown is logged at `INFO` with the task name, so a stray `abort` is never silent — that would be a death in costume.
 
 ### The exit path, reusable
 
 A structured `error!` naming the task and cause first, because the steps after it can fail. Then the marker, through the mechanism the node already had: `Exit::TaskDied` with `task` and `cause` on the record, which the next start's `announce` reports at `WARN` — the only place an operator reliably reads why the process restarted itself. Then **status 70**, `EX_SOFTWARE`, distinct from the 1 a configuration error gives: nothing consumes it, since compose and Kubernetes restart on any non-zero, so its only job is to tell whoever reads it that the node stopped itself rather than failing to start.
 
-`process::exit` runs no destructors, so the engine is not closed cleanly. That is survivable — redb repairs an unclean file on the next open — but it means this is deliberately an unclean stop, and `announce`'s unclean warning fires beside the marker that distinguishes it.
+`process::exit` runs no destructors, so the engine is not closed cleanly. That is survivable — redb repairs an unclean file on the next open — but it means this is deliberately an unclean stop. **The next start does not call it unclean**, though: a `task_died` marker is a marker, so `announce` takes the arm that names the task and the cause, and the "did not shut down cleanly" warning is for a run that left no marker at all. That distinction is the point of writing the marker before exiting, and `a_panicking_background_task_exits_the_process` asserts the absence of the clean-end line rather than the presence of an unclean one.
 
 **A panic hook in addition to the supervisor's own `JoinError`, not instead of it.** The supervisor sees a panic only in a task it supervises. The hook catches one in a per-connection task, in `spawn_blocking`, and on the main thread, and it is the only place with the location at panic time. The default hook is kept and called after, so a backtrace an operator asked for still appears.
 
@@ -18455,7 +18469,7 @@ Neither was a recorded decision. Both had the intent in a code comment and the o
 
 ### Retry-forever is a dead task in costume, and what sees it
 
-A task retrying a permanent error is alive, logs each attempt, and does no work — which supervision cannot distinguish from working, by design, because the rule is that a transient error never returns. **`kimmy_task_retries_total{task}`** (`kimmy.task.retries` on the OTLP bridge) is the writer's own account of it: every task has a sample from the first scrape, at 0. A rising count is the node recovering by itself; a count that keeps rising while the work does not progress is the case this series cannot resolve alone, and `operations.md` says to read it beside that task's progress age.
+A task retrying a permanent error is alive, logs each attempt, and does no work — which supervision cannot distinguish from working, by design, because the rule is that a transient error never returns. **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP bridge, `kimmy.task.retries.<task>`, by the convention `logging.rs` states) is the writer's own account of it: every task has a sample from the first scrape, at 0. A rising count is the node recovering by itself; a count that keeps rising while the work does not progress is the case this series cannot resolve alone, and the thing to read beside it is that task's own progress — for which **there is no series yet**: a per-task progress age arrives with the gauge-freshness work, and `operations.md` says so rather than pointing at a metric that does not exist.
 
 The retry **policy and the loop** both live in `kimmy_task::Retry` — the counter, the log line, the backoff schedule, and `forever`, which runs the work until it succeeds or shutdown begins.
 
@@ -18466,40 +18480,54 @@ The `AsyncFnMut` form really is not expressible, and that part of the original r
 ### Tests, and how they break
 
 Each row was broken **alone**, on the tree this record ships with, and the red
-test names below are the runner's. Two rows are not reds and say so: a table
-where every line fires is a table written from intentions.
+test names below are the runner's, read with its message rather than only its
+exit status. Two rows are not reds and say so: a table where every line fires is
+a table written from intentions.
 
 | Taken out | What fails |
 |---|---|
 | the exit on the no-reporter path, `70` → `0` | `a_panicking_task_exits_70_with_no_reporter_installed`, `a_task_that_judges_its_own_return_unexpected_exits_70` |
 | the reporter's exit in `kimmyd`, which is the path a real node takes | `a_panicking_background_task_exits_the_process`, `a_background_task_that_returns_exits_the_process` |
-| the second shutdown check, in all three supervisors | `a_task_that_ends_by_itself_during_shutdown_does_not_exit` |
+| **the abort-on-drop guard**, so an aborted supervisor detaches its work again | `aborting_a_supervised_handle_stops_the_work` — "24 ticks at the abort, 92 after 150ms more" — and `a_handle_dropped_outside_shutdown_says_so` |
+| **the notice when a handle is dropped outside shutdown** | `a_handle_dropped_outside_shutdown_says_so` |
+| the shutdown re-check, now in `classify` and shared by all three shapes | `a_task_that_ends_by_itself_during_shutdown_does_not_exit` |
 | `send_replace` in `begin`, back to `send` | `a_transient_failure_is_retried_in_place_and_counted`, `the_same_task_ending_with_no_shutdown_announced_does_exit` |
 | the membership receiver's `Expected`, flipped to `Unexpected` | the `kimmy-cluster` membership binary stops mid-run with status 70 |
 | the classifier's `Unexpected`, treated as an expected ending | `a_task_that_judges_its_own_return_unexpected_exits_70` |
 | the panic's message, discarded instead of read off the `JoinError` | `a_panicking_task_exits_70_with_no_reporter_installed` |
-| the stderr line on the no-reporter path | three of the eight `exits` tests, which then see status 70 and no explanation |
+| the stderr line on the no-reporter path | five of the twelve `exits` tests, which then see status 70 and no explanation |
 | `Retry::forever`'s `Err` arm, returning instead of retrying | `a_failing_worker_is_retried_rather_than_abandoned` — "1 attempts" |
-| an unsupervised `tokio::spawn` in a production file | `every_long_lived_task_is_spawned_through_the_supervisor` |
-| a supervised name absent from `TASKS` | `every_supervised_name_is_in_the_task_list_and_every_entry_is_used` |
+| **`Retry`'s backoff reset** | `a_quiet_stretch_resets_the_backoff` — "left: 8s" against the first backoff's 1s |
+| **`with_test_kill`'s `Err(kill)`**, so a switch-induced return is not a death | `the_test_switch_reaches_a_judged_task_and_a_one_shot` — the one-shot swallows it and exits 0 |
+| **the `Kill::Error` race in `Retry::forever`** | `a_task_asked_to_fail_retries_in_place_and_the_node_stays_up` — nothing retried |
+| **the warning for a switch value that will do nothing** | `a_test_switch_that_will_do_nothing_says_so` |
+| an unsupervised spawn, in **17 of the 18 forms** a review reported | `every_long_lived_task_is_spawned_through_the_supervisor` |
+| **a supervised name that is not a string literal** | `every_supervised_name_is_in_the_task_list_and_every_entry_is_used`, naming the call site |
+| a supervised name absent from `TASKS` | the same test |
 | **both `shutdown.begin()` calls in the node** | **nothing** — below |
 | **treating a cancellation as a death again** | **nothing** — below |
 
+Two of those are the review's own findings held open as regressions: the
+abort-on-drop guard, and `with_test_kill`'s `Err(kill)`. Each was a live defect
+before this round, so each row is a defect that has already happened once.
+
 **The node's own announcement is not covered end to end, and the reason is worth
 stating rather than papering over.** Removing both `shutdown.begin()` calls
-leaves every drain test green. That is not a missing test: the drain aborts each
-supervised handle, and aborting a supervisor cancels the supervisor — its
-classification with it — so nothing is left to misread the ending. The
-announcement is what keeps that true for a task that ends *by itself* during a
-drain, which the unit control covers, and what stops `Retry` retrying through
-one.
+leaves all nine drain tests green — re-measured after the abort-on-drop guard
+changed what a drain does. That is not a missing test: the drain aborts each
+supervised handle, and aborting a supervisor cancels the supervisor with its
+classification, so nothing is left to misread the ending. What the announcement
+does is keep that true for a task that ends *by itself* during a drain, which the
+unit control covers; stop `Retry` retrying through a drain; and keep the guard's
+"dropped outside shutdown" notice from firing on every ordinary shutdown.
 
-**The cancellation arm is unreachable by construction, not by omission.**
-Nothing outside holds the inner handle, and the only `abort` on it is in the
-shutdown branch, which returns before it could observe the cancellation. It is
-kept because it stops being unreachable the moment anything hands that handle
-out, and because folding it in with `Ok(())` would make such a change a silent
-exit 70. Its comment says so, in place of the history it used to claim.
+**The cancellation arm is unreachable by construction, not by omission**, and it
+stayed unreachable when `StopOnDrop` arrived. Nothing outside holds the inner
+handle; the only `abort` on it is in the guard's `Drop`, which runs as the
+supervisor is going away and never awaits the handle afterwards. It is kept
+because it stops being unreachable the moment anything hands that handle out,
+and because folding it in with `Ok(())` would make such a change a silent exit
+70.
 
 **Three of these tests could not see their own claims when first written**, which
 is the more useful half of the exercise:

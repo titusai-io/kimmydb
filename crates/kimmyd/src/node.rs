@@ -70,6 +70,8 @@ fn remind_to_remove_previous_secret(ttl_secs: u64) {
         "a previous JWT signing secret is configured; every token it signed will have expired \
          one token lifetime from now, so remove KIMMY_JWT_PREVIOUS_SECRET after that"
     );
+    // UNSUPERVISED: a reminder that warns once and stops. Its ending is the point, and a
+    // panic in it must not stop a node that is otherwise serving.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
         warn!(
@@ -365,11 +367,24 @@ async fn start_and_serve(config: Config) -> Result<()> {
             }
             let federation = kimmy_api::Federation::new(verifier);
             state.set_federation(Arc::clone(&federation));
+            // Built here, not inside the task, and for the same reason as the
+            // webhook client and the cluster's TLS: it is a builder failure, not
+            // a network one, so it cannot be retried and will not come right.
+            // Inside the task it used to warn once and return, leaving every
+            // federated token refused for the life of the process while the node
+            // went on serving -- and under supervision that return is a death,
+            // so the same misconfiguration became a restart loop instead. Built
+            // before anything is spawned, it fails the start, which is what a
+            // node that cannot do a duty it was configured for should do.
+            //
+            // Only when OIDC is configured: this arm is that condition.
+            let http = jwks_client().context("building the HTTP client for OIDC key refresh")?;
             Some(spawn_jwks_refresher(
                 federation,
                 Duration::from_secs(config.auth.oidc.refresh_interval_secs),
                 Arc::clone(&state),
                 shutdown.clone(),
+                http,
             ))
         }
     };
@@ -904,19 +919,9 @@ fn spawn_jwks_refresher(
     interval: Duration,
     state: kimmy_api::SharedState,
     shutdown: kimmy_task::Shutdown,
+    http: reqwest::Client,
 ) -> tokio::task::JoinHandle<()> {
     kimmy_task::supervise("jwks_refresher", shutdown.clone(), async move {
-        let http = match jwks_client() {
-            Ok(http) => http,
-            Err(e) => {
-                // Nothing to retry: this is a builder failure, not a network
-                // one. Federated tokens are refused for the life of the
-                // process, which is worth one loud line rather than a task
-                // that spins.
-                warn!(error = %e, "could not build the HTTP client for OIDC key refresh");
-                return;
-            }
-        };
         let issuer = federation.issuer();
 
         loop {
@@ -1165,6 +1170,8 @@ async fn serve(
     std_listener.set_nonblocking(true).context("configuring the listener")?;
 
     let handle = axum_server::Handle::new();
+    // UNSUPERVISED: the shutdown watcher, whose return *is* shutdown. It must be free to
+    // finish during the drain, which is exactly what a supervisor would cut short.
     tokio::spawn({
         let handle = handle.clone();
         let shutdown = shutdown.clone();
@@ -1406,6 +1413,8 @@ fn ddl_confirmer(
                 let engine = Arc::clone(&engine);
                 let secret = secret.clone();
                 let entry = entry.clone();
+                // UNSUPERVISED: one push per peer in a JoinSet this round awaits. It is
+                // this round's work, not background work, and the round reports it.
                 pushes.spawn(async move {
                     let pushed = tokio::time::timeout(
                         deadline,
@@ -1563,8 +1572,6 @@ fn bootstrap_users(engine: &Engine, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Resolve on SIGINT or SIGTERM. SIGTERM matters most — it is what Docker and
-/// Kubernetes send, and ignoring it means a hard kill after the grace period.
 /// Wait for the shutdown signal, then announce it **before** returning.
 ///
 /// The announcement has to happen before anything drains, because every
@@ -1576,6 +1583,10 @@ async fn announced(shutdown: kimmy_task::Shutdown) {
     shutdown.begin();
 }
 
+/// Resolve on SIGINT or SIGTERM.
+///
+/// SIGTERM matters most — it is what Docker and Kubernetes send, and ignoring it
+/// means a hard kill after the grace period.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

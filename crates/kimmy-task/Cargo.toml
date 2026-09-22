@@ -14,3 +14,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# For the one test that asserts a log line rather than an exit status: the
+# dropped-handle notice has no other observable effect, by design.
+tracing-subscriber.workspace = true

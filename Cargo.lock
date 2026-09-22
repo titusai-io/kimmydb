@@ -2598,6 +2598,7 @@ version = "0.33.0"
 dependencies = [
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

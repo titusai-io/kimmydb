@@ -80,6 +80,15 @@ refused.** This release moves the storage schema to 4
   rise is the fix below doing its job. A scrape config or a golden list that
   enumerates series needs the new name.
 
+- **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP
+  bridge, `kimmy.task.retries.<task>`) counts the times a supervised background
+  task retried its work in place after a transient failure
+  ([ADR-184](docs/decisions.md)). Every supervised task has a sample from the
+  first scrape, at 0. A rising count is the node recovering by itself and needs
+  no action; a count that **keeps** rising while that task's work does not
+  progress is a task retrying something permanent — alive, and doing nothing. A
+  scrape config or a golden list that enumerates series needs the new name.
+
 ### Fixed
 
 - **The licence-boundary check now sees every crate it is meant to guard.**
@@ -123,16 +132,6 @@ refused.** This release moves the storage schema to 4
   stops starting after this upgrade and the log names one of them, that condition
   was already true and was not being reported.
 
-### Added
-
-- **`kimmy_task_retries_total{task}`** (`kimmy.task.retries` on the OTLP bridge)
-  counts the times a supervised background task retried its work in place after a
-  transient failure ([ADR-184](docs/decisions.md)). Every supervised task has a
-  sample from the first scrape, at 0. A rising count is the node recovering by
-  itself and needs no action; a count that **keeps** rising while that task's
-  work does not progress is a task retrying something permanent — alive, and
-  doing nothing. A scrape config or a golden list that enumerates series needs
-  the new name.
 
 - **A replicated index definition this build refuses for its operator no longer
   fails the whole replication round.** `sync::settle` decided which errors are

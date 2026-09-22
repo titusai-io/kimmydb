@@ -20,7 +20,7 @@
 //! be fatal — one per inbound connection, one per request — are simply not
 //! supervised.
 //!
-//! # The three shapes
+//! # The four shapes
 //!
 //! - [`supervise`] — a loop that should never end. Any return is a death.
 //! - [`Retry`] — the policy a supervised task uses inside its own loop when its
@@ -92,17 +92,17 @@ pub fn on_death(reporter: Box<dyn OnDeath>) -> bool {
     ON_DEATH.set(reporter).is_ok()
 }
 
-/// End the process because `task` died.
-///
-/// Public because the same exit path serves every restart-worthy state, not
-/// only a dead task: the poisoned-engine detector is meant to call this rather
-/// than grow an exit of its own.
 /// The exit status for a restart-worthy state the process found in itself.
 ///
 /// `EX_SOFTWARE`, and distinct from the 1 a configuration error gives. The
 /// daemon uses the same number where it installs its own reporter.
 pub const EXIT_RESTART_WORTHY: i32 = 70;
 
+/// End the process because `task` reached a restart-worthy state.
+///
+/// Public because the same exit path serves every such state, not only a dead
+/// task: the poisoned-engine detector is meant to call this rather than grow an
+/// exit of its own.
 pub fn exit_because(task: &'static str, cause: Death, detail: &str) -> ! {
     match ON_DEATH.get() {
         Some(reporter) => reporter.exit(task, cause, detail),
@@ -211,7 +211,8 @@ fn count_retry(task: &'static str) {
 /// exposition's standing rule is that no series is conditional, because one that
 /// can be absent is one a dashboard can lose — and a registration would leave it
 /// absent in any process that had not run startup, the `/metrics` render's own
-/// tests included. And **it is what `every_supervised_task_is_declared` checks
+/// tests included. And **it is what
+/// `every_supervised_name_is_in_the_task_list_and_every_entry_is_used` checks
 /// the `supervise` calls against**, so a task added without a name here, or a
 /// name here that nothing supervises, fails rather than drifting.
 ///
@@ -303,7 +304,21 @@ fn requested_kill() -> Option<(String, Kill)> {
 /// warning. The raw value rather than a re-rendering of it, so an operator who
 /// sees the line can match it against what is in their environment.
 pub fn test_kill_requested() -> Option<String> {
-    requested_kill().map(|_| std::env::var("KIMMY_TEST_KILL_TASK").unwrap_or_default())
+    // Whenever it is **set**, not only when it parses. A value with a typo in
+    // it used to be announced by nothing at all: the parse failed, this
+    // returned `None`, and a test that thought it had armed a kill watched a
+    // node shut down normally and had to work out why. A switch that does
+    // nothing has to say so.
+    let raw = std::env::var("KIMMY_TEST_KILL_TASK").ok()?;
+    Some(match requested_kill() {
+        None => format!(
+            "{raw} -- malformed, so nothing will happen; expected <task>:<panic|return|error>"
+        ),
+        Some((task, _)) if !TASKS.contains(&task.as_str()) => format!(
+            "{raw} -- matches no task, so nothing will happen; the names are kimmy_task::TASKS"
+        ),
+        Some(_) => raw,
+    })
 }
 
 /// How long after arming `KIMMY_TEST_KILL_TASK` waits, so the node is serving
@@ -333,17 +348,27 @@ pub fn kill_for(task: &str) -> Option<Kill> {
 /// Polled rather than signalled: this exists only under test, and a poll costs a
 /// wakeup a second in a process that is not being tested at all.
 async fn awaiting_test_kill(task: &'static str) -> Kill {
-    let how = loop {
-        match kill_for(task) {
-            Some(Kill::Panic) => break Kill::Panic,
-            Some(Kill::Return) => break Kill::Return,
-            // The retrying shape reads this itself; ending the task here would
-            // test the wrong thing.
-            Some(Kill::Error) | None => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-    };
+    // **Decided once, and only by the task it names.** The switch comes from
+    // the environment and cannot change while the process runs, so every other
+    // task can settle this at startup and never wake again. It used to poll
+    // every 50ms, for every supervised task, for the life of a node that was
+    // not being tested at all -- fifteen timers, three hundred wakeups a
+    // second, shipped.
+    let Some((wanted, how)) = requested_kill() else { return never().await };
+    if wanted != task {
+        return never().await;
+    }
+    // The retrying shape reads this one itself; ending the task here would test
+    // the wrong thing.
+    if how == Kill::Error {
+        return never().await;
+    }
+    // `ARMED` is the one thing that still has to be waited for: tasks start
+    // before the node serves, and the switch must not fire during startup. A
+    // poll here costs nothing, because only the named task reaches it.
+    while !ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     // The grace comes *after* the switch is seen, not before the loop: nothing
     // is armed when a task starts, so a grace there is skipped entirely and the
     // death races the node's first `/healthz`. A test cannot then assert the
@@ -351,6 +376,27 @@ async fn awaiting_test_kill(task: &'static str) -> Kill {
     // exited -- and "after startup" has to mean after the node is actually up.
     tokio::time::sleep(TEST_KILL_GRACE).await;
     how
+}
+
+/// Wait until this task is asked to fail once, if it ever is.
+///
+/// The `Kill::Error` counterpart of [`awaiting_test_kill`], and separate because
+/// the two end differently: that one ends the task, this one makes one attempt
+/// fail so the retry is the thing under test.
+async fn awaiting_test_error(task: &'static str) {
+    let Some((wanted, Kill::Error)) = requested_kill() else { return never().await };
+    if wanted != task {
+        return never().await;
+    }
+    while !ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(TEST_KILL_GRACE).await;
+}
+
+/// A future that never resolves, for a task the switch does not name.
+async fn never<T>() -> T {
+    std::future::pending().await
 }
 
 /// The work, plus the test switch, **inside** the supervised task.
@@ -361,15 +407,18 @@ async fn awaiting_test_kill(task: &'static str) -> Kill {
 /// have panicked the supervisor instead, which nothing classifies and which
 /// therefore would not have exited at all: the test would have proved the
 /// opposite of what it claimed.
-async fn with_test_kill<F: Future<Output = ()>>(name: &'static str, work: F) {
+async fn with_test_kill<T, F: Future<Output = T>>(name: &'static str, work: F) -> Result<T, Kill> {
     tokio::select! {
-        () = work => {}
+        v = work => Ok(v),
         how = awaiting_test_kill(name) => {
-            // Anything but a panic returns, and a return of this task is what
-            // the supervisor then judges.
             if how == Kill::Panic {
                 panic!("KIMMY_TEST_KILL_TASK asked {name} to panic");
             }
+            // A `Err(kill)` rather than a value: a switch-induced return must be
+            // a death even for a task whose own returns are expected, or
+            // `supervise_oneshot` and `supervise_judged` would swallow it and
+            // the switch would do nothing the WARN promised.
+            Err(how)
         }
     }
 }
@@ -394,72 +443,152 @@ fn panic_detail(e: tokio::task::JoinError) -> String {
     }
 }
 
-/// Supervise a task that should never end.
+/// Stop the work when the supervisor stops.
+///
+/// **The reason this type exists.** A supervised handle is the *supervisor's*
+/// handle, and the node's drain aborts ten of them. Aborting the supervisor
+/// dropped the inner `JoinHandle`, and dropping a `JoinHandle` does not cancel
+/// the task — it **detaches** it. So every shutdown left the real work running,
+/// unsupervised, until the runtime went away; a panic in it after that point
+/// was nobody's, and the process could end with status 0 and no report. An
+/// independent review measured it on real SIGTERMs: 5 of 10 runs had
+/// supervisors that never logged "stopping a background task for shutdown",
+/// because they had been aborted before they could.
+struct StopOnDrop<T> {
+    task: &'static str,
+    handle: JoinHandle<T>,
+    shutdown: Shutdown,
+}
+
+impl<T> Drop for StopOnDrop<T> {
+    fn drop(&mut self) {
+        // Finished work needs no aborting, and saying anything about it would
+        // make the line below fire on every ordinary ending.
+        if self.handle.is_finished() {
+            return;
+        }
+        self.handle.abort();
+        if !self.shutdown.has_begun() {
+            // Outside shutdown this means something aborted a supervised handle
+            // deliberately. That is now honest — the work really stops — but it
+            // is still a task disappearing without a death, so it is said out
+            // loud rather than inferred from its silence.
+            info!(
+                task = self.task,
+                "a supervised task's handle was dropped outside shutdown, so its work was \
+                 stopped with it"
+            );
+        }
+    }
+}
+
+/// What a supervised task's return means to its supervisor.
+enum Return {
+    /// Nothing to say: the work was meant to finish.
+    Expected,
+    /// Finished for a reason worth logging.
+    Finished(&'static str),
+    /// A return that should not have happened.
+    Fatal(Death, String),
+}
+
+/// The one place a supervised ending is classified.
+///
+/// Shared by all three supervisors so that the shutdown re-check exists **once**
+/// and one test covers every shape. It was written out three times, and only
+/// `supervise`'s copy was ever tested: two of the three could have lost the
+/// re-check without anything failing.
+fn classify<T>(
+    name: &'static str,
+    shutdown: &Shutdown,
+    ended: Result<Result<T, Kill>, tokio::task::JoinError>,
+    judge: impl FnOnce(T) -> Return,
+) {
+    // The second check. `select!` picks a ready branch at random, so without
+    // this a task returning as shutdown begins is a coin flip between a clean
+    // stop and a spurious exit.
+    if shutdown.has_begun() {
+        info!(task = name, "a background task ended as shutdown began");
+        return;
+    }
+    match ended {
+        Ok(Ok(value)) => match judge(value) {
+            Return::Expected => {}
+            Return::Finished(why) => {
+                info!(task = name, reason = why, "a background task finished");
+            }
+            Return::Fatal(cause, detail) => exit_because(name, cause, &detail),
+        },
+        // The test switch asked for it, and it is a death whatever this task's
+        // own returns mean.
+        Ok(Err(_)) => {
+            exit_because(name, Death::Returned, "KIMMY_TEST_KILL_TASK asked this task to return")
+        }
+        Err(e) if e.is_panic() => exit_because(name, Death::Panicked, &panic_detail(e)),
+        // Cancelled: the inner handle. Only `StopOnDrop` aborts it, and that
+        // path does not await the handle afterwards, so this stays hard to
+        // reach — kept because folding it in with a clean return would make a
+        // future stray abort a silent exit 70.
+        Err(_) => {
+            info!(
+                task = name,
+                "a supervised background task was cancelled outside shutdown, so something \
+                 aborted its handle deliberately"
+            );
+        }
+    }
+}
+
+/// The body every supervisor shares: run the work in a task of its own, stop it
+/// if this supervisor goes away, and classify how it ended.
 ///
 /// The work runs in a task of its own so that a panic arrives here as a
 /// `JoinError` carrying its message, which is how the panic text reaches the
 /// structured log rather than only stderr.
+async fn supervised<T, F, J>(name: &'static str, shutdown: Shutdown, work: F, judge: J)
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+    J: FnOnce(T) -> Return,
+{
+    let mut running = StopOnDrop {
+        task: name,
+        // UNSUPERVISED: the supervised task itself. This is the spawn every other one goes
+        // through, and `StopOnDrop` plus `classify` below are its supervision.
+        handle: tokio::spawn(with_test_kill(name, work)),
+        shutdown: shutdown.clone(),
+    };
+    tokio::select! {
+        _ = shutdown.reached() => {
+            info!(task = name, "stopping a background task for shutdown");
+            // `running` drops here and stops the work.
+        }
+        ended = &mut running.handle => classify(name, &shutdown, ended, judge),
+    }
+}
+
+/// Supervise a task that should never end: any return is a death.
 pub fn supervise<F>(name: &'static str, shutdown: Shutdown, work: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
-        let mut running = tokio::spawn(with_test_kill(name, work));
-        tokio::select! {
-            _ = shutdown.reached() => {
-                info!(task = name, "stopping a background task for shutdown");
-                running.abort();
-            }
-            ended = &mut running => {
-                // The second check. `select!` picks a ready branch at random,
-                // so without this a task returning as shutdown begins is a coin
-                // flip between a clean stop and a spurious exit.
-                if shutdown.has_begun() {
-                    info!(task = name, "a background task ended as shutdown began");
-                    return;
-                }
-                match ended {
-                    Ok(()) => exit_because(name, Death::Returned, "the task returned"),
-                    Err(e) if e.is_panic() => {
-                        exit_because(name, Death::Panicked, &panic_detail(e))
-                    }
-                    // Cancelled: the inner handle, not this one. **No test
-                    // reaches this arm, and that is a fact about the code
-                    // rather than a gap in the tests** — nothing outside holds
-                    // the inner handle, and the only `abort` on it is in the
-                    // shutdown branch above, which returns immediately after
-                    // and so never observes the cancellation. An abort of the
-                    // supervisor cancels the supervisor, classification and
-                    // all.
-                    //
-                    // Kept because it is the arm that stops being unreachable
-                    // the moment anything hands the inner handle out, and
-                    // because the alternative — folding it in with `Ok(())` —
-                    // would make that change a silent exit 70. Logged, not
-                    // passed over: a cancellation arriving here means an
-                    // assumption in this comment has stopped holding.
-                    Err(_) => {
-                        info!(
-                            task = name,
-                            "a supervised background task was cancelled outside shutdown, so \
-                             something aborted its handle deliberately"
-                        );
-                    }
-                }
-            }
-        }
-    })
+    // UNSUPERVISED: the supervisor task. Its body is `supervised`, which is the supervision.
+    tokio::spawn(supervised(name, shutdown, work, |()| {
+        Return::Fatal(Death::Returned, "the task returned".into())
+    }))
 }
 
 /// The retry policy for a supervised task whose errors are transient, used from
 /// inside the task's own loop.
 ///
-/// The policy lives here — the counter, the log line and the backoff schedule —
-/// and the loop stays at the call site. A higher-order version taking the work
-/// as an async closure was tried first and rejected: the embedding worker's
-/// `run` takes `&mut self`, so the closure's future borrows it, and proving that
-/// future `Send` through a generic bound is not expressible on stable. A
-/// two-line loop at the call site costs less than the abstraction did.
+/// The policy lives here, and so does the loop, in [`Retry::forever`]. It was at
+/// the call site first, on the grounds that two lines cost less than the
+/// abstraction — and the whole workspace suite then passed with that loop's
+/// `Err` arm returning instead of retrying, because no test reaches a call site.
+/// The `AsyncFnMut` form really is not expressible on stable (the worker's `run`
+/// takes `&mut self`, so the returned future borrows it and no generic bound
+/// proves it `Send`); a higher-ranked bound over a boxed future is, at one
+/// allocation per failure.
 ///
 /// **Every error handed here is treated as transient.** A task whose failure is
 /// permanent does not belong in this shape: ADR-184 hoists those two into
@@ -467,8 +596,31 @@ where
 pub struct Retry {
     task: &'static str,
     backoff: std::time::Duration,
+    first: std::time::Duration,
     max: std::time::Duration,
+    /// When the last failure was handed here, so a quiet stretch can reset the
+    /// backoff.
+    last_failure: Option<tokio::time::Instant>,
 }
+
+/// How long a task must go without failing before its backoff starts over, as a
+/// multiple of the wait it had reached.
+///
+/// **Without this the backoff never came down.** It doubles to the maximum and
+/// stays there for the life of the process, so a task that failed a few times
+/// on Monday waits the full two minutes for an unrelated transient error on
+/// Friday — and the error that recovers on the first retry is exactly the error
+/// most likely to be waited out for two minutes for no reason.
+///
+/// Time rather than a successful attempt, because `Retry` never sees success:
+/// the only task that retries is the embedding worker, whose `run` does not
+/// return `Ok` while it is working. What it can see is that nothing has failed
+/// for a while, which is the same information from the other side.
+///
+/// Four, so the stretch is comfortably longer than the wait it is judging —
+/// a task erroring every backoff period is still in trouble and keeps its long
+/// wait, while one that has been quiet for four of them has recovered.
+const BACKOFF_RESET_AFTER: u32 = 4;
 
 impl Retry {
     pub fn new(
@@ -476,7 +628,13 @@ impl Retry {
         first_backoff: std::time::Duration,
         max_backoff: std::time::Duration,
     ) -> Self {
-        Retry { task, backoff: first_backoff, max: max_backoff }
+        Retry {
+            task,
+            backoff: first_backoff,
+            first: first_backoff,
+            max: max_backoff,
+            last_failure: None,
+        }
     }
 
     /// Run `step` until it succeeds or shutdown begins, retrying every error.
@@ -504,8 +662,35 @@ impl Retry {
     ) where
         E: std::fmt::Display,
     {
+        // The test switch's third shape, which only a retrying task can honour:
+        // fail the work once and let the retry happen. `with_test_kill`
+        // deliberately leaves `Kill::Error` alone, because ending the task
+        // there would test the opposite of the rule this loop exists for.
+        //
+        // **Raced against the step, not checked between steps.** Checking at
+        // the top of the loop was the first version and it did nothing at all
+        // for the one task that retries: the embedding worker's `run` does not
+        // return while it is working, so the loop never came back round to
+        // look. `KIMMY_TEST_KILL_TASK=embedding_worker:error` announced itself
+        // at WARN on every start and then had no effect whatsoever.
+        //
+        // Once, as `Kill::Error`'s own documentation says: the point is that a
+        // failure is retried and the task lives on, so a switch that failed
+        // every attempt for ever would prove the task never works again.
+        let mut injected = false;
         loop {
-            match step(worker).await {
+            let outcome: Result<(), String> = if injected {
+                step(worker).await.map_err(|e| e.to_string())
+            } else {
+                tokio::select! {
+                    v = step(worker) => v.map_err(|e| e.to_string()),
+                    () = awaiting_test_error(self.task) => {
+                        injected = true;
+                        Err("KIMMY_TEST_KILL_TASK asked for one failure".to_string())
+                    }
+                }
+            };
+            match outcome {
                 // Success means the work finished, and this work should not:
                 // returning hands that judgement to `supervise`, which calls a
                 // return a death.
@@ -528,6 +713,21 @@ impl Retry {
         if shutdown.has_begun() {
             return false;
         }
+        // A quiet stretch starts the schedule over (see `BACKOFF_RESET_AFTER`).
+        let now = tokio::time::Instant::now();
+        if let Some(last) = self.last_failure
+            && now.duration_since(last) > self.backoff * BACKOFF_RESET_AFTER
+            && self.backoff > self.first
+        {
+            info!(
+                task = self.task,
+                quiet_secs = now.duration_since(last).as_secs(),
+                "a background task has been failing again after a quiet stretch, so its retry \
+                 backoff starts over rather than staying at the maximum it had reached"
+            );
+            self.backoff = self.first;
+        }
+        self.last_failure = Some(now);
         count_retry(self.task);
         warn!(
             task = self.task,
@@ -565,40 +765,11 @@ pub fn supervise_judged<F>(name: &'static str, shutdown: Shutdown, work: F) -> J
 where
     F: Future<Output = Ended> + Send + 'static,
 {
-    tokio::spawn(async move {
-        let mut running = tokio::spawn(work);
-        tokio::select! {
-            _ = shutdown.reached() => {
-                info!(task = name, "stopping a background task for shutdown");
-                running.abort();
-            }
-            ended = &mut running => {
-                if shutdown.has_begun() {
-                    info!(task = name, "a background task ended as shutdown began");
-                    return;
-                }
-                match ended {
-                    Ok(Ended::Expected(why)) => {
-                        info!(task = name, reason = why, "a background task finished");
-                    }
-                    Ok(Ended::Unexpected(why)) => exit_because(name, Death::Returned, why),
-                    Err(e) if e.is_panic() => {
-                        exit_because(name, Death::Panicked, &panic_detail(e))
-                    }
-                    // Cancelled. Unreachable for the same reason as in
-                    // `supervise`, and kept for the same one: see the note
-                    // there.
-                    Err(_) => {
-                        info!(
-                            task = name,
-                            "a supervised background task was cancelled outside shutdown, so \
-                             something aborted its handle deliberately"
-                        );
-                    }
-                }
-            }
-        }
-    })
+    // UNSUPERVISED: the supervisor task, as in `supervise`.
+    tokio::spawn(supervised(name, shutdown, work, |ended| match ended {
+        Ended::Expected(why) => Return::Finished(why),
+        Ended::Unexpected(why) => Return::Fatal(Death::Returned, why.into()),
+    }))
 }
 
 /// Supervise work that ends on purpose: completion is expected, a panic is a
@@ -612,20 +783,6 @@ pub fn supervise_oneshot<F>(name: &'static str, shutdown: Shutdown, work: F) -> 
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
-        match tokio::spawn(work).await {
-            Ok(()) => {}
-            Err(e) if e.is_panic() => {
-                if shutdown.has_begun() {
-                    return;
-                }
-                exit_because(name, Death::Panicked, &panic_detail(e));
-            }
-            // Cancelled. Only our own `abort` does that, and it is never
-            // silent: see the note in `supervise`.
-            Err(_) => {
-                info!(task = name, "a one-shot background task was cancelled");
-            }
-        }
-    })
+    // UNSUPERVISED: the supervisor task, as in `supervise`.
+    tokio::spawn(supervised(name, shutdown, work, |()| Return::Expected))
 }
