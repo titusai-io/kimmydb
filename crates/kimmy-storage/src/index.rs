@@ -2425,6 +2425,53 @@ mod tests {
         assert_eq!(coll.indexes.len(), N, "and every one of them landed");
     }
 
+    #[test]
+    fn concurrent_drops_on_one_collection_all_succeed() {
+        // The drop's loop, under the contention the create's test above puts on
+        // its own: a bound cut to two attempts left every test green, because
+        // only the create path had a concurrent test.
+        const N: usize = 64;
+        let (engine, _, _dir) = engine();
+        for i in 0..N {
+            engine
+                .create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending(format!("f{i}"))],
+                    false,
+                    Some(format!("idx{i}")),
+                )
+                .unwrap();
+        }
+        let engine = std::sync::Arc::new(engine);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let engine = std::sync::Arc::clone(&engine);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine.drop_index("app", "docs", &format!("idx{i}"))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> =
+            handles.into_iter().map(|h| h.join().expect("no thread panics")).collect();
+        let errors: Vec<String> =
+            outcomes.iter().filter_map(|o| o.as_ref().err().map(|e| e.to_string())).collect();
+        assert!(
+            errors.is_empty(),
+            "{} of {N} concurrent drops on one collection failed: {:?}",
+            errors.len(),
+            &errors[..errors.len().min(3)]
+        );
+        assert!(outcomes.iter().all(|o| matches!(o, Ok(true))), "each dropped the index it named");
+        assert!(
+            engine.get_collection("app", "docs").unwrap().indexes.is_empty(),
+            "and none is left"
+        );
+    }
+
     // **The bound, forced, at every site that retries.** Once the comparison is
     // reflexive nothing in the product can make the definition check fail for
     // ever, so without the hook the bound would be code guarding against
