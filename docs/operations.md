@@ -365,7 +365,8 @@ spec:
           # periodSeconds x failureThreshold, and leave margin: the cost per
           # document grows with the store, so the estimate is a bound, not a
           # rate -- measured up to 10 million documents per index and
-          # extrapolated above that, which is where you most need the margin. These values are for 10 million retained entries and one
+          # extrapolated above that, which is where you most need the margin.
+          # These values are for 10 million retained entries and one
           # partial index over 10 million documents: 46 s + 80 s = 126 s, so
           # twice is 252 s and 300 s is set here. Compute yours.
           startupProbe:

@@ -45,7 +45,8 @@ refused.** This release moves the storage schema to 4
   interrupted migration the version is already 4, which neither build will open,
   and the message says so. This can only happen for a filter an
   earlier build accepted and this one does not, such as one holding a
-  `Decimal128`. To proceed, start the directory with the previous build, drop
+  `Decimal128`. **Below schema 4**, to proceed: start the directory with the
+  previous build, drop
   each index named, recreating it with a filter this build accepts, then upgrade
   again. In a cluster one drop on any member replicates to all.
 - **Disk.** Have free space of at least the largest partial index's size
@@ -80,6 +81,26 @@ refused.** This release moves the storage schema to 4
   enumerates series needs the new name.
 
 ### Fixed
+
+- **A replicated index definition this build refuses for its operator no longer
+  fails the whole replication round.** `sync::settle` decided which errors are
+  refusals of the request from a hand-written list of three, and the
+  partial-filter parser returns a fourth — `UnsupportedOperator`, which is a
+  different variant from `Unsupported`. So a definition carrying an operator
+  this build does not know failed the round instead of being skipped, and failed
+  again on every retry; a snapshot page carrying one failed as a whole, so the
+  member could not catch up from that peer at all. It is now skipped, counted in
+  `kimmy_sync_ddl_refused_total` and warned, as the designed path always did for
+  other refusals — the refusal class set out in
+  [ADR-123](docs/decisions.md), whose rule is unchanged: this only makes the
+  code match it.
+
+  **Latent until now:** no release before this one accepts an operator that a
+  released build refuses, so there is no path between them. It would have opened
+  the first time a release grew the partial-filter language, during the roll, on
+  every member not yet upgraded. Which errors are refusals is now decided beside
+  the error type by an exhaustive match with no wildcard, so a variant added
+  later does not compile until it has been classified.
 
 - **A partial index now holds exactly what `find` with its filter returns,
   and is used only for a query whose every match it holds — with one exception,

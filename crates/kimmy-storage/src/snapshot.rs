@@ -2087,6 +2087,51 @@ mod tests {
         assert!(b.get(&cb, &DocId::String("a-1".into())).unwrap().is_some());
     }
 
+    #[test]
+    fn a_snapshot_index_refused_for_its_operator_is_skipped_and_the_documents_restore() {
+        // The same class as the test above, through the variant that used to
+        // escape it. `PartialFilter::parse` refuses an unknown operator with
+        // `UnsupportedOperator`, not `Unsupported`, and `settle` carried a list
+        // of three variants that did not name it -- so the `?` on
+        // `settle(created)` in `restore_collection` propagated, the whole page
+        // failed, and the member could not catch up from that peer at all.
+        //
+        // The page is doctored rather than created, because no door of this
+        // build stores such a filter: it is what a page from a build whose
+        // parser accepted the operator would carry.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("size")], false, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1", "size": 10 }).unwrap();
+        b.create_collection("shop", "orders").unwrap();
+
+        let filter = doc! {"size": {"$sameShapeAs": 5}};
+        assert!(
+            matches!(
+                kimmy_core::PartialFilter::parse(&filter),
+                Err(kimmy_core::Error::UnsupportedOperator(_))
+            ),
+            "premise: refused for its operator, not as an invalid query"
+        );
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            for index in &mut state.indexes {
+                index.partial_filter = Some(filter.clone());
+            }
+        }
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .expect("a refused index must not fail the page");
+
+        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "the documents restore: {outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(cb.index("size_1").is_none(), "a definition this build cannot apply");
+        assert!(b.get(&cb, &DocId::String("a-1".into())).unwrap().is_some());
+    }
+
     /// Rewrite an index's creation stamp in place, so a test can put the
     /// receiver's definition in a known order against the snapshot's without
     /// racing the wall clock.

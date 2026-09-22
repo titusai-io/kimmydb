@@ -1432,21 +1432,25 @@ enum DdlOutcome {
 /// the definition was refused *because* the documents that arrived once it
 /// was gone are already here — and the drop still lands.
 ///
-/// Deliberately narrow, in both directions. Only `CollectionNotFound` is
-/// gone, and only `InvalidQuery`, `IndexExists` and `Unsupported` are
-/// refusals: refusals of the *request*, decided by this node's state. A
-/// storage error — redb, I/O, a record that will not decode — is a failure of
-/// the *node*, may well succeed on retry, and still fails the round, because
-/// a round that quietly skips what it cannot understand is how corruption
-/// becomes convergence.
+/// Deliberately narrow, in both directions. Only `CollectionNotFound` is gone,
+/// and which errors are refusals of the *request* is decided by
+/// `kimmy_core::Error::is_a_request_refusal`, beside the enum, as an exhaustive
+/// match with no wildcard. It lived here as a list of three variants, and the
+/// partial-filter parser returns a fourth that the list did not name, so a
+/// definition this build refuses for its operator failed the whole round rather
+/// than being skipped. A list cannot see a variant it does not name; a match
+/// that will not compile until the variant is classified can.
+///
+/// A storage error that is not a `Core` one — redb, I/O, a record that will not
+/// decode — is a failure of the *node*, may well succeed on retry, and still
+/// fails the round, because a round that quietly skips what it cannot
+/// understand is how corruption becomes convergence.
 pub(crate) fn settle<T>(result: Result<T>) -> Result<Ddl<T>> {
     use kimmy_core::Error as Core;
     match result {
         Ok(value) => Ok(Ddl::Applied(value)),
         Err(crate::StorageError::Core(Core::CollectionNotFound { .. })) => Ok(Ddl::Gone),
-        Err(crate::StorageError::Core(
-            e @ (Core::InvalidQuery(_) | Core::IndexExists { .. } | Core::Unsupported(_)),
-        )) => Ok(Ddl::Refused(e)),
+        Err(crate::StorageError::Core(e)) if e.is_a_request_refusal() => Ok(Ddl::Refused(e)),
         Err(e) => Err(e),
     }
 }
@@ -4680,6 +4684,50 @@ mod tests {
         let txn = db.begin_write().unwrap();
         Engine::put_collection_meta(&txn, &meta).unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_definition_refused_for_its_operator_is_refused_rather_than_failing_the_round() {
+        // The mixed-version case. A later release grows the partial-filter
+        // language, an upgraded member creates an index with a new operator, and
+        // the entry reaches a member whose parser does not know it.
+        // `PartialFilter::parse` refuses that filter with `UnsupportedOperator`,
+        // which is a different variant from `Unsupported`: `settle` carried a
+        // hand-written list of three variants that did not name it, so the whole
+        // round failed on that entry, and failed again on every retry, instead
+        // of skipping the one index as designed.
+        //
+        // The entry is built by hand because no door of this build stores such a
+        // filter -- `create_index_inner` parses for every origin. That is the
+        // case: the entry comes from a build whose parser accepted it.
+        let node = kimmy_core::NodeId::from_bytes([7; 16]);
+        let stamp = Stamp::new(Hlc::new(1_000, 0), node);
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let mut index = definition("by_shape", vec![field("size")], false, Some(stamp));
+        let filter = doc! {"size": {"$sameShapeAs": 5}};
+        // Premise: refused *for its operator*. Without this the test would pass
+        // just as well on a filter refused as `InvalidQuery`, which was always
+        // on settle's list and so proves nothing about this defect.
+        assert!(
+            matches!(
+                kimmy_core::PartialFilter::parse(&filter),
+                Err(kimmy_core::Error::UnsupportedOperator(_))
+            ),
+            "premise: this build refuses that filter for its operator: {:?}",
+            kimmy_core::PartialFilter::parse(&filter)
+        );
+        index.partial_filter = Some(filter);
+        let entry = create_index_entry(id, "shop", "orders", index, stamp);
+
+        let (m, _dm) = engine();
+        m.create_collection("shop", "orders").unwrap();
+        let outcome = m.apply_batch(&[entry]).expect("the round completes rather than failing");
+
+        assert_eq!(outcome.ddl_refused, 1, "the one index is skipped and counted: {outcome:?}");
+        assert!(
+            m.get_collection("shop", "orders").unwrap().index("by_shape").is_none(),
+            "and it is not built"
+        );
     }
 
     #[test]
