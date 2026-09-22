@@ -255,8 +255,8 @@ pub(crate) fn live_count(txn: &redb::ReadTransaction, id: kimmy_core::Collection
 /// — which removes oplog rows and leaves the arrival index alone — moves it
 /// back. A store written behind a build that keeps the counts matches neither.
 pub(crate) fn mark_of(
-    arrival: &Table<'_, u64, &'static [u8]>,
-    oplog: &Table<'_, &'static [u8], &'static [u8]>,
+    arrival: &impl ReadableTable<u64, &'static [u8]>,
+    oplog: &impl ReadableTable<&'static [u8], &'static [u8]>,
 ) -> Result<Vec<u8>> {
     let next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
     let mut mark = next.to_be_bytes().to_vec();
@@ -264,6 +264,18 @@ pub(crate) fn mark_of(
         mark.extend_from_slice(key.value());
     }
     Ok(mark)
+}
+
+/// Whether the kept counts match the store, read without writing: the test
+/// [`rebuild_if_stale`] makes before it walks.
+///
+/// For a reader that runs before `Engine::open` has rebuilt them — the schema
+/// 4 migration's announcement (ADR-183) — and must not trust a table a restore
+/// left empty.
+pub(crate) fn counts_are_current(txn: &redb::ReadTransaction) -> Result<bool> {
+    let mark = mark_of(&txn.open_table(tables::OPLOG_ARRIVAL)?, &txn.open_table(tables::OPLOG)?)?;
+    let through = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
+    Ok(through.get(THROUGH)?.is_some_and(|m| m.value() == mark.as_slice()))
 }
 
 /// Record, in the transaction of the write that moved it, that the counts are

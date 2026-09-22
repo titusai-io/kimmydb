@@ -18155,10 +18155,10 @@ A candidate declined by the filter is counted in **`kimmy_ttl_skipped_filter_tot
 
 | Taken out | Fails |
 | --- | --- |
-| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,473 |
-| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473 |
+| the filter check | the race test, the mixed-type test and the multi-pass test: 3 of 2,473. As of ADR-183 it reddens 2, the race test and the multi-pass test: the mixed-type test stops seeing it, because that record rewrote it so the index holds only what the filter selects |
+| `find`'s reading (the membership rule instead) | the mixed-type test and the multi-pass test, and **not** the race test: 2 of 2,473. The rule this row mutates no longer exists after ADR-183 (see its retired premises), so this row is a measurement of ADR-181's own tree |
 | the date check | the date test through the hook, **and nothing else**: 1 of 2,473 |
-| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones |
+| the cursor (every pass from the front again) | the multi-pass test, which wedges: no pass reaches the document behind the declined ones. Since ADR-183 its declined entries are written into the index directly, because correct membership no longer produces them; see that record's retired premises |
 | skipping an index whose filter does not parse (failing the pass instead) | the unparseable-filter test |
 | forgetting the cursors when a collection is dropped | the dropped-collection test |
 | forgetting the cursor when an index is dropped | the dropped-index test |
@@ -18222,3 +18222,160 @@ That last is this record's user-visible fix, held across replication. It is a st
 Detection and emission are separate rules, and the table used to list only the first. The emission's test was added in review, after removing the loop left every test in the workspace green. The line is the whole remedy this record offers, so it is held to its own test.
 
 A relaxed filter written by an earlier build is read as it was stored, which the compatibility test holds.
+
+---
+
+## ADR-183 — A partial filter selects exactly what `find` with the same expression returns
+
+**Decision.** A partial index holds exactly the documents `find` with its filter would return. Membership is `PartialFilter::selects`, built on `kimmy_core::matching`, the code `find` itself evaluates these operators with (ADR-181). The second rule index maintenance used, `PartialFilter::matches`, is removed. Containment (`implies`, `covered_by`) is re-derived against that one rule. Every partial index is **rebuilt once**, at open, by a storage migration from schema 3 to **schema 4**.
+
+**Why. The partial matcher and `find` were two languages with one syntax, and containment is a proof about one predicate applied to the other.** A differential over 19 value shapes, 15 filters and 21 queries, run through the planner's own `containment_predicates` and `covered_by`, found:
+- **18 uses where the planner used a partial index that missed documents the query returns.** The causes:
+  - whole-array equality: `{k: [1, 2]}` never held `{k: [1, 2]}`;
+  - `$exists` on `[]`;
+  - containment across type brackets: `{$gt: 5}` was judged to contain `{k: [1, 2]}`, because arrays sort above numbers.
+- **33 over-inclusions**, all from comparisons across type brackets: `{$gt: 5}` held strings, documents, dates, booleans and binaries. Expiry deleted them until ADR-181. A unique index enforced on them.
+- **8 under-inclusions.** One of them, `{k: null}` not holding a missing field, was never a wrong-results path, because `containment_predicates` drops a null operand. It still mattered for TTL and unique.
+
+**Which way the semantics go, and why.** A partial filter selects what `find` with the same expression returns. That means whole-array and element equality, comparisons within a type bracket, `$exists` true on an empty array, and a null equality matching a missing field. The argument is internal to KimmyDB:
+- **One expression means one set.** A client writes the same syntax in `find` and in `partialFilterExpression`, and `find`'s meaning is the one every client already observes. Partial membership was observable only through these defects.
+- **Containment is a proof about two predicates, and it is sound only if they are one predicate.** With one evaluator, membership agrees with `find` by construction, and what is left to prove is that `implies` is sound for it.
+
+That this coincides with MongoDB's rule is incidental.
+
+### Containment, re-derived
+
+A document satisfies a query predicate through some value, or array element, `w`, and the filter predicate is guaranteed only if it holds on that same `w`. It is judged by `find`'s single-value test (`PartialOp::holds_on_value`), **without** looking inside `w`. `find` descends one level, so when `w` is itself an element of an array, `w`'s own elements are not among what the filter is tested on. So:
+- `Eq(v)` implies `o` if `o` holds on `v`.
+- A bound implies a bound only within one type bracket: `same_type_group`, the definition `find` uses, in `kimmy_core::cmp` since ADR-181.
+- `Eq(null)` implies only `Eq(null)`, because it is satisfied by absence.
+
+That one definition of a type bracket serves `find`, membership and containment alike is the same rule that made ADR-181 move the operators' evaluation: two definitions of one thing were the bug each time.
+
+**Proved, not argued — with one type excluded, named below.** `implication_is_sound_for_what_find_selects` asserts, for every pair of operators over a corpus of every type bracket (692 implied pairs), that a document the query selects is one the index holds. The test it replaces used only integers and could not have failed.
+
+**The exclusion: a document value that is a `Decimal128`.** Soundness here rests on implication being transitive through a single value, and equality with a `Decimal128` is not transitive — `canonical_cmp` ranks one equal to every number, which is the settled contract (`docs/http-api.md`, `docs/key-encoding.md`), so `Eq(5)` and `Eq(6)` both hold on it while neither implies the other. A differential run during review found 825 losing (filter, query) pairs on this branch, every one of them involving a `Decimal128` document value. Its control was 3,840 losing pairs holding no `Decimal128` **on `main`** — the defects this record fixes — of which this branch leaves **none**. So the control says the differential can see a loss when there is one, and that the 825 are what is left rather than what was always there. The defect predates this record and is identical on `main`; it is filed as `kimmydb-a-partial-index-is-used-for-a-query-that-matches-a-document-holding-a-decimal128-the-index-does-not-hold-because-equality-with-a-decimal128-is-not-transitive`. It is **not** fixed here, because a fix trades index use for soundness under a settled contract and needs a record of its own. The corpus is deliberately left without a `Decimal128` rather than given one that asserts the loss, which would read as the loss being intended. Each of the three rules above, removed on its own, fails the test with a concrete counterexample:
+- `Lte(null)` implying `Lt(5)`;
+- `Eq(5)` implying `Gt(null)`;
+- `Eq(null)` implying `Exists`, with an empty document lost.
+
+Through the planner itself, `no_filter_is_used_for_a_query_it_does_not_contain` sweeps the differential's corpus, and the 18 cases stay as named regressions.
+
+### Existing indexes: a migration, and the first schema bump that moves no bytes
+
+The new rule does not change what an existing index **contains**, because entries are stored. It changes what the index is **maintained under**: `apply_entries` removes the keys the current rule derives from the old image, not the entries actually stored. So without a rebuild:
+- a document whose membership grows joins only when it is next written;
+- a document whose membership shrinks keeps a stale entry forever.
+
+Every partial index is therefore rebuilt, and the migration is **schema 3 → 4**. Schemas 2 and 3 renumbered collection and index ids: they moved bytes. **Schema 4 leaves the layout byte-identical** and changes what a partial index's entries mean. An older build would parse every byte and then maintain the index under its own rule, re-corrupting it on every write. That is precisely what the version check exists to prevent, in its own words: *"guessing at a layout we do not know would corrupt it"*. So this record widens what the number guards: **"this build can correctly maintain this data", not only "this build can parse it".** A change that alters what stored data means to the code maintaining it needs a bump even when no byte moves. The RBAC record's "no schema bump" was a change that needed no migration at all, and it stays right under the widened rule.
+
+**How it runs.**
+- **A stored filter this build cannot parse refuses the whole migration, before anything is written.** The rebuild derives each index's membership from its filter, so an index whose filter this build refuses has no membership this build can build. Every partial index in the file is parsed up front, in every database, whether or not its collection holds a document and whether or not an interrupted run already marked it rebuilt: an index on an empty collection is handed no document, so the rebuild alone would never parse its filter and would mark it done. Every offender is named at once — database, collection, index, and the parse error — with the remedy: start the directory with the previous build, drop each index named, recreating it with a filter this build accepts, and upgrade again. In a cluster one drop on any member replicates to all. Nothing is written, so the on-disk version is whatever it was — 1, 2 or 3 for a source that has not started migrating, and 4 for a run resuming after an interrupt — and no entries were cleared. The message names the version it found, and the remedy it gives depends on it: below 4 the previous build still opens the directory, so the index can be dropped there and the upgrade retried; at 4 neither build can open it, because that one refuses the schema and this one refuses the definition, so the path is wipe-and-resync or a restore. That second case needs an interrupted migration *and* a filter this build refuses, so it is close to unreachable — but it is not "use the previous build". **This is what makes ADR-181's "transient" true.** That record declined a series for a filter it cannot parse *because* this migration re-parses every partial filter; skipping here instead would leave the definition in a schema 4 database for good, and the condition would be permanent. A TTL pass skips such an index because refusing would stop every other index's expiry on a gate that recurs for ever; an upgrade refuses because refusing costs nothing irreversible and is the moment an operator should deal with a definition this build cannot read. `create_index_inner` already refuses the same filter from every other door, so this is the migration agreeing with the rest of the build.
+- **One transaction per index.** Its entries are cleared by key, never with `retain_in`: see the fix recorded with `index::clear_index_entries`, without which the clear alone was ten times the rebuild. It is then rebuilt from every document, and its `multikey` flag is raised if the new membership makes it so. That raise is one-way, like every other one: a rebuilt index that has newly taken in an array, and says it has not, would let the planner read both ends of a range and lose rows. Its marker goes into a node-local table, in that same commit.
+- **Crash-safe, and the version goes down with the *first* index.** A crash rolls back the index in progress; the next open redoes that index and **not** the ones already marked. Schema 4 is written in the same commit as the first index's marker, and the marker table is deleted in a last commit of its own, so **a half-migrated file is schema 4 with markers still present** and its markers, not its version, are what says a rebuild is owed.
+
+  This ordering is the fix for a defect an independent review found by running it, and it is worth stating plainly because the first design looked safer than it was. Writing the version only at the end left a half-migrated file at schema 3, which the **previous build opens**. It then maintains the indexes this migration had not yet rebuilt under the old rule, so entries the new rule does not hold stay; a later run of the new build marks the rest done and stamps schema 4 over them for good. Measured on real binaries: a query answered from such an index returned no rows for a document it should have matched, reading zero index entries, and a unique index refused a key that was free. TTL survived it, because ADR-181 re-checks the filter before it deletes; query results and unique enforcement have no such re-check. Stamping the version with the first index means an older build refuses the file instead — the refusal it already had for a schema it does not know — and a rollback is the wipe and resync below rather than a silent half-state.
+
+  The alternative, stamping each marker with something an older build would notice, was rejected: a marker keyed by name-derived ids is precisely what a drop and recreate on the older build hands to the next index of that name (see the record on a name-derived id), whether or not the stamp moves. Writing the version early removes the class instead of detecting it.
+- **Nothing reads a half-rebuilt index**, and this is structural. The migration runs in `migrate::run` on the raw redb `Database`, inside `Engine::open`, before the `Engine` value is constructed. Another process cannot open the file meanwhile: redb refuses a second opener, measured as *"Database already open. Cannot acquire lock."* If the migration ever moves after the engine is constructed, this stops being true, and the planner and expiry must then be held off each index until its marker is written.
+- **Unique collisions are reported, not refused, and the report outlives an interrupt.** A migration cannot refuse a *document*, and documents accepted while the constraint was misapplied are real (ADR-020, ADR-123). A *definition* it cannot read is the bullet above: that is a fact about the index, not about data a member accepted. The keys a rebuilt unique index finds shared are reported once the engine exists, exactly as a replicated build's are: counted, warned, and logged as unique-violation entries.
+
+  **Where they live in between.** Reporting needs an engine, and the migration runs before one exists, so the keys are written into `partial_rebuilt_unique_violations` in the same commit as that index's marker and read back by every open — not only an open that migrates, because the marker table is gone once the migration finishes and a crash after the last index would otherwise leave a record nothing looks at again. They are deleted only after every one has been reported. **A constraint this creates:** a later build that changes `UniqueViolation`'s serialised shape must still read the old shape, because a row written by the previous build can be pending when it starts. A row that will not decode fails the open, with a message naming the table, which is the loud direction — but it is a failure to *start*, so the compatibility is not optional. Carried in memory instead, an interrupt between the rebuild's commit and the report lost the finding entirely: both duplicates stayed in the rebuilt index, nothing counted, logged or recorded them, and the index stayed marked done so no later run looked.
+
+  **Reporting is therefore at-least-once, and that is the choice.** A crash between the report and the delete repeats it on the next open, which review measured: a second `UniqueViolation` oplog entry, the counter bumped again in the new process, a second change-stream `uniqueViolation` event — and `live_unique_violations` still reading 1, with nothing replicated, because the duplicate is a report rather than a fact about the data. A duplicated warning is recoverable by reading it twice; a lost one is not recoverable at all.
+- **Memory stays bounded.** The clear gathers 50,000 keys at a time inside the transaction; collecting all 7.4 million at once added 675 MiB at 10 million documents. A batched clear and full rebuild at that size added nothing measurable above the load's own peak.
+
+**Synchronous is a constraint, not a preference.** The migration finishes before the node serves anything because nothing else is correct:
+- **A node serving before an index is rebuilt corrupts it further.** Writes maintain the index under the new rule, over entries stored under the old one: `apply_entries` removes the keys the new rule derives from a document's old image, not the entries actually stored. So the index diverges from both rules, which is worse than either applied consistently.
+- **The data is not schema 4 until the last index is rebuilt.** The version states what this build can correctly maintain, and until then it cannot.
+- **A background rebuild was rejected.** It would need each index held off the planner and expiry until its marker is written, while writes keep maintaining it: new coordination state, for a job that runs once per node.
+- **Leaving it to an operator was rejected.** The node would run in the divergent state until someone ran it.
+
+So the cost is paid at the first start, and announced before it is paid. Making it lazy is not an optimisation this record passed over: it is ruled out.
+
+**Considered, proven, not taken: skipping the indexes whose membership cannot differ.**
+- **The class.** A filter whose every predicate is an equality on an operand that is **neither null nor an array**. `canonical_cmp` returns `Equal` only within one `type_rank`, and arrays rank alone. So a non-array operand can never equal a whole array, which is the one thing `find` tests that the old rule did not. Both rules resolve paths with the same `path::resolve`.
+- **Everything else depends on the data:**
+  - an equality with null differs on a missing field;
+  - an equality with an array differs on a whole-array match;
+  - `$exists: true` differs on a path that resolves only to empty arrays;
+  - every bound differs on a value of another type bracket.
+- **Proved.** `a_filter_of_equalities_on_operands_neither_null_nor_array_selects_the_same_under_both_rules` runs the old rule, kept verbatim, against `selects`. Its 482 documents span every type bracket, at `k` and `k.a`: bare, in arrays, nested an array deeper, and through arrays of documents. 2,310 filters in the class, single and conjoined, agree on all 1,113,420 (filter, document) pairs. That agreement is evidence only because of the control: the same corpus separates every excluded kind, and widening the class to any one of them fails with a named counterexample:
+  - `{k: null}` on `{}`;
+  - `{k: []}` on `{k: []}`;
+  - `{k: {$exists: true}}` on `{k: []}`;
+  - `{k: {$gt: null}}` on `{k: {}}`.
+- **Why not taken.** The migration's whole audience is databases that predate this release. Schema 3 exists only if a build before this one created it, and every database after starts at 4 and never migrates. So the 12-minute case at 100 million documents occurs in no deployment that will ever run this migration. How much real use the class covers could not have been measured either, since there is no filter population yet. The one partial-index idiom the documentation teaches, `{email: {$exists: true}}`, is outside it.
+- **The reason expires.** It is a fact about where the product stands now, not a property of the design. A later migration that rebuilds every partial index, for an audience that includes databases created after launch, should take the class. The proof is done, and it runs with the suite.
+
+**What the operator sees.** A synchronous rebuild at open looks like a hung node, so:
+- **Before it starts, one line states the whole job:** how many partial indexes, how many documents across them, an estimate for the whole migration from the measured rate, and the free space the largest needs. That figure is sized from the largest collection's document count, an upper bound on its index's entries unless the index is multikey.
+- Then a line per index as it starts ("*n* of *m*").
+- A line every 100,000 documents.
+- A line per index with its duration and entries when it ends.
+
+**Before upgrading on Kubernetes, the first start needs time to finish.** The HTTP listener binds only once `Engine::open` has returned, and the migration runs inside it. The manifest in the operations guide gives liveness about 30 seconds (three failures, ten seconds apart), and a longer open is killed and started again. The per-index markers make that the worst shape: every index shorter than the allowance completes, and one longer than it never does, so the node restarts for ever while its log shows progress. The operator therefore adds a `startupProbe`, or raises the liveness allowance, to at least twice the expected open:
+- an ordinary open, measured at 46 s for a database whose oplog retains 10 million entries (the retention window's writes);
+- plus the rebuild, 8 µs per document per partial index, which is `MICROS_PER_DOCUMENT` in the code rather than a second figure that can drift from it.
+
+For 10 million retained entries and one partial index over 10 million documents that is 46 s plus 80 s, about 2 minutes, so twice it is 252 s and the allowance is **5** (`periodSeconds: 10`, `failureThreshold: 30`). The allowance is set from the code's own constant and left with margin over it — at `failureThreshold: 24` the budget was 240 s against a 252 s requirement, so the manifest would have killed the node part-way through the very migration it exists to allow for. The real fix is binding before the open, so that liveness answers while the open progresses and readiness says what it is doing. That is filed as its own design, because a listener with no engine needs defined behaviour.
+
+**Where the figures come from.** Each collection's size is its kept live count (ADR-174), one row. Counting instead, ten million documents and 7.4 million entries, took 48 s just to announce the job. But the migration runs before `Engine::open` rebuilds stale counts, and a database restored from a backup carries none. Trusted then, the line would say there was nothing to do. So the counts are read only when their mark matches the store, the same test that decides whether they are rebuilt; otherwise each collection's records are counted and that one open pays for it.
+
+**Headroom, measured.** A one-transaction rebuild needs free space **inside the database file** equal to the index's own size, because the old entries' pages stay allocated until the commit. Allocation grew by 55, 166 and 555 MiB for indexes of 55, 166 and 553 MiB, which is about 80 bytes per entry for that shape.
+- When the file's slack covers the need, the file does not grow.
+- When it does not, redb extends the file by its growth step: it fills the trailing region and, if needed, adds a full region. At 3 million documents a 166 MiB need took the file from 4,096 to 6,199 MiB.
+- Indexes rebuild one at a time, and a committed rebuild's freed pages serve the next. So **the need is the largest single partial index plus redb's step (about 2 GiB here), not the sum.**
+- Short of it, the open fails, and a failed open is a node that does not start. The next open repairs the file automatically and tries again. The up-front line gives the figure.
+
+**Cost, measured.** On the development machine, in a release build, one partial index over a collection of 10 million documents (7.43 million entries):
+- The open that migrates took **118 s**. An ordinary open of the same file straight afterwards took **46 s**. So the rebuild's own cost is **about 73 s**, some 7.3 µs per document per partial index. It scales with each partial index's collection size, summed over the partial indexes.
+- **The per-document cost is not constant, and the estimate is a bound rather than a rate.** The same harness at 2 million documents took 5.4 s of rebuild, some 2.7 µs each: the cost per document grows with the working set, as a larger store spills out of the page cache. `MICROS_PER_DOCUMENT` is 8, which covers both sizes measured; past ten million documents it is an extrapolation, which is why the line calls itself an estimate.
+- The 46 s is not this record's. It is the walk every open already makes at that size (ADR-153's version vector), paid on every start, migrating or not.
+- The announcement took 22 ms from the kept counts.
+- The file did not grow: its 869 MiB of slack covered the 553 MiB the index needed.
+- At this rate, a partial index over 100 million documents is about 12 minutes of the first start, and a node with several such indexes pays each in turn.
+
+### Downgrade is refused, and what rolling back means
+
+An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where it expects 3) instead of opening it and re-corrupting every partial index on each write. **A file whose migration was interrupted is schema 4 too**, by the ordering above, so it is refused on the same path: there is no state in which an older build opens a database some of whose partial indexes this build has rebuilt. A node that does not start is found in seconds. A node that starts and quietly degrades its indexes is found weeks later from a wrong answer.
+- **Rolling back one member** needs no backup, and it needs **keeping out of service until it has caught up**. Wipe its data directory and start the older build: it catches up from its peers by the ordinary whole-database snapshot. Until then it answers reads from a store that starts empty, so a document it has not pulled yet reads as not found, not as an error. Nothing reports that it is behind: `/readyz` does not know about catching up, and `kimmy_replication_lag_seconds` reads 0 from a fresh start. So it goes back into service by hand, once its document counts match a member that stayed up. Readiness that covers catching up is filed separately, and it is not simple: discovery on Kubernetes resolves only ready pods, so a readiness gate on peers would deadlock a whole-cluster cold start.
+- **Rolling back the whole cluster** leaves no un-upgraded peer to catch up from, so it needs a backup taken before the upgrade.
+
+### The consumers
+- **Creation backfill and maintenance** both go through `document_keys`, which asks `selects`. A local create, a peer's entry and a snapshot restore all build the same membership (ADR-180), and now it is the right one.
+- **TTL expiry** keeps ADR-181's re-check: with correct membership it declines only races. `kimmy_ttl_skipped_filter_total` should fall to near zero after this record.
+- **Unique** is correct after the rebuild, and collisions from the defect window are surfaced.
+- **The planner** is served by containment, re-derived as above.
+
+**Three premises this record retired, and why.** ADR-181's mixed-type expiry test asserted that the index held three documents its filter did not select: that was the defect ADR-181 guarded against, and this record removes it. The test now asserts that the index holds only the one the filter selects, so the others are never candidates. The guard itself stays covered by the race test. The find differential's premise, that the membership rule and `find` disagree, named the rule this record deletes.
+
+The third arrived after this record was written, in ADR-181's own review. `declined_candidates_do_not_keep_a_pass_from_what_is_behind_them` built its wedge from a thousand documents the index held and the filter did not select — which is the defect this record removes, so under `find`'s reading inserting them gives the index nothing, and the test failed at its premise. Its fixture now writes those entries into the index directly, which is what a partial index built before this release held, so the test keeps its claim and stops depending on the defect. Measured: with the cursor removed it fails at its assertion rather than at its premise.
+
+**After this record, the state that fixture constructs arises from no production path we can name — and this claim was made once before and was false.** An independent review falsified it by finding a path, and it holds now only because that path was closed: a migration interrupted part-way left the file at schema 3, the previous build opened it and went on maintaining the not-yet-rebuilt indexes under the old rule, and a later run stamped schema 4 over the result. That is exactly a partial index holding what its filter does not select, in a schema 4 database, reached without any defect in the rules. It is closed by writing the version in the first index's commit, above, which makes such a file schema 4 and so refused by the older build. The claim below therefore holds *because of* that ordering, not independently of it. Maintenance derives both sides of an entry from `document_keys`, so a document that stops matching loses its entry in the same write; the only decline left is the race, and a race clears itself. A per-document delete failure does not persist either: an error from a delete ends the pass, and the cursor was already saved past the batch, so no one document is examined first on every pass. A snapshot restore is not a second door: a page carries definitions and documents, never index entries, and the receiver builds membership itself under this build's rule. The cursor stays — ADR-181 settled it, it is cheap, and a pass that examines an entry and leaves it must not re-read that entry first next pass whatever produced it — and its witness constructs the state rather than waiting for a defect to supply it.
+
+### What this does not close
+- A generic `Binary` that an earlier build stored as an array stays that array (ADR-182). It is now *consistently* the array it was stored as.
+- The liveness endpoint that cannot fail is filed separately.
+
+### Tests, and how they break
+
+| Taken out | Fails |
+| --- | --- |
+| the bracket check on bounds | the soundness property, with `Lte(null) ⇒ Lt(5)` |
+| the bracket check on an equality's value | the soundness property, with `Eq(5) ⇒ Gt(null)` |
+| `Eq(null)` implying only itself | the soundness property, with `Eq(null) ⇒ Exists` |
+| the rebuild (only the version written) | all four migration tests |
+| the per-index marker | the interrupted-migration test, and only it |
+| the `multikey` raise | its own test, and only it |
+| reporting a rebuilt unique index's collisions | both unique-collision tests, the interrupted one included: the report loop is the only reader of the recorded rows |
+| the announcement's staleness check, trusting the counts always | the restored-backup and stale-mark tests |
+| the same check, counting always | the kept-counts test, and only it |
+| the estimate sized per index, from the largest | the estimate test, and only it |
+| the skip class widened to any one excluded kind | the skip-class differential, with that kind's counterexample |
+| the up-front parse of every stored filter | both refusal tests; the empty-collection one because the open then completes and writes schema 4 |
+| naming every offender rather than only the first | the two-offender refusal test, at its count |
+| the expiry cursor (every pass from the front again) | the multi-pass test, at its assertion, on the reconstructed fixture above |
+| the version written at the end, not with the first index | two, measured across kimmy-storage's 686: the interrupted-migration test, which then finds schema 3 where an older build would open a half-rebuilt file, and the resume-refusal test, which reaches the resume through the version |
+| recording a rebuild's collisions in the same commit as the index's marker | both unique-collision tests, 2 of the same 686: the interrupted one reports nothing on the next open, and the uninterrupted one loses its report too |
+| the documented startup probe's budget, put back to `failureThreshold: 24` | the manifest guard, which computes the example's open from `MICROS_PER_DOCUMENT` and finds 240 s allowed against 252 s needed |

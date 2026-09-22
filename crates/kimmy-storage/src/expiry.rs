@@ -541,14 +541,65 @@ mod tests {
         assert!(engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
     }
 
+    /// Entries in `index` for the documents of `coll` that `declined` names,
+    /// keyed by their date exactly as the index keys them, and returning how
+    /// many were written: the state a partial index built before ADR-183 held.
+    ///
+    /// Constructed, rather than obtained by inserting documents, because
+    /// ADR-183 removed the route the old fixture took. Membership is now
+    /// `find`'s, so a document the filter declines is given no entry, and no
+    /// sequence of writes produces an index holding what its filter does not
+    /// select. What the pass does when it *meets* such an entry is what this
+    /// fixture is for, and until that release every partial index over a
+    /// mixed-type field held them.
+    fn hold_the_entries_a_pre_adr_183_index_held(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        index: &IndexMeta,
+        declined: &dyn Fn(&Document) -> bool,
+    ) -> usize {
+        use redb::ReadableTable;
+
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        let mut held = 0;
+        {
+            let mut entries = txn.open_table(crate::tables::INDEX_ENTRIES).unwrap();
+            let docs = txn.open_table(crate::tables::DOCS).unwrap();
+            for row in docs.range(crate::engine::doc_range(coll.id)).unwrap() {
+                let (key, value) = row.unwrap();
+                let doc = crate::codec::decode_doc_record(value.value())
+                    .unwrap()
+                    .document()
+                    .unwrap()
+                    .unwrap();
+                if !declined(&doc) {
+                    continue;
+                }
+                let at = path::resolve(&doc, "seen")
+                    .into_iter()
+                    .next()
+                    .and_then(|v| match v {
+                        Bson::DateTime(dt) => Some(dt.timestamp_millis()),
+                        _ => None,
+                    })
+                    .expect("the fixture dates every document at seen");
+                let k = date_key(at, false).unwrap();
+                entries.insert((coll.id.0, index.id, k.as_slice(), key.value().1), ()).unwrap();
+                held += 1;
+            }
+        }
+        txn.commit().unwrap();
+        held
+    }
+
     #[test]
     fn declined_candidates_do_not_keep_a_pass_from_what_is_behind_them() {
-        // The review's shape (ADR-181). More documents than one pass
-        // examines, which the index holds and `find` does not select, all
-        // expired, and one genuinely expired document dated after them. When
-        // every pass started from the front, each declined the same entries
-        // first and none reached the last one: TTL for the index made no
-        // progress again.
+        // The review's shape (ADR-181). More entries than one pass examines,
+        // which the index holds and `find` does not select, all expired, and
+        // one genuinely expired document dated after them. When every pass
+        // started from the front, each declined the same entries first and none
+        // reached the last one: TTL for the index made no progress again.
         let (engine, _, _dir) = engine();
         let (coll, index) = with_filtered_ttl(&engine, doc! {"size": {"$gt": 5}});
         let stale = MAX_EXPIRED_PER_PASS as i64;
@@ -556,6 +607,16 @@ mod tests {
             (0..stale).map(|i| doc! {"_id": i, "size": "large", "seen": dt(i)}).collect();
         docs.push(doc! {"_id": stale, "size": 10, "seen": dt(stale + 1_000)});
         engine.insert_many(&coll, docs).unwrap();
+        // Written in, not indexed in: `{size: {$gt: 5}}` does not select a
+        // string, so under ADR-183 the index holds none of them of its own
+        // accord. This is the third premise ADR-183 retired.
+        let held = hold_the_entries_a_pre_adr_183_index_held(&engine, &coll, &index, &|doc| {
+            doc.get_str("size").is_ok()
+        });
+        assert_eq!(
+            held, stale as usize,
+            "premise: the index holds every document the filter declines"
+        );
         let now = 10_000_000;
 
         let first = engine.expire_documents(&coll, &index, now).unwrap();
@@ -700,9 +761,11 @@ mod tests {
     #[test]
     fn a_range_filter_expires_only_what_find_selects() {
         // `{size: {$gt: 5}}` as `find` reads it selects a number above five.
-        // The index's membership rule compares across type brackets, so it
-        // also holds a string, a document and a boolean -- and expiry deleted
-        // all four (ADR-181).
+        // Membership used to compare across type brackets, so the index also
+        // held a string, a document and a boolean, and expiry deleted all
+        // four; ADR-181 made the delete re-check the filter. Since ADR-183 the
+        // index holds only what the filter selects, so the other three are
+        // never candidates at all.
         let (engine, _, _dir) = engine();
         let filter = doc! {"size": {"$gt": 5}};
         let (coll, index) = with_filtered_ttl(&engine, filter.clone());
@@ -713,21 +776,20 @@ mod tests {
                 .insert(&coll, doc! {"_id": id as i64, "size": size.clone(), "seen": dt(0)})
                 .unwrap();
         }
-
-        // The fixture has to be the case that deletes wrongly: documents the
-        // index holds that the filter does not select.
-        let parsed = kimmy_core::PartialFilter::parse(&filter).unwrap();
-        let wrongly_held = sizes[2..]
-            .iter()
-            .map(|size| doc! {"size": size.clone()})
-            .filter(|d| parsed.matches(d) && !parsed.selects(d))
-            .count();
-        assert_eq!(wrongly_held, 3, "premise: the index holds three the filter does not select");
+        let held = crate::index::scan_range(
+            engine.db(),
+            coll.id,
+            index.id,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap();
+        assert_eq!(held.len(), 1, "the index holds only the number above five");
 
         let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
 
-        assert_eq!(out.deleted, 1, "{out:?}");
-        assert_eq!(out.skipped_filter, 3, "{out:?}");
+        assert_eq!((out.deleted, out.skipped_filter), (1, 0), "{out:?}");
         let left: Vec<i64> = (0..5)
             .filter(|id| engine.get(&coll, &kimmy_core::DocId::Int64(*id)).unwrap().is_some())
             .collect();
