@@ -1,10 +1,16 @@
-# A test that never returns fails here, after five minutes, rather than holding
+# A test that never returns fails here, after ten minutes, rather than holding
 # CI until the job's own six-hour limit. The case it exists for is a retry
 # bound removed: each definition write-back's forced test then loops for ever
-# (ADR-182). The slowest test in the suite takes about fifty seconds on a loaded
-# machine, so five minutes is a hang and not a slow test.
+# (ADR-182).
+#
+# Ten minutes, from CI rather than from a local run: the slowest test on the
+# runners is `kimmy-cluster::replication`'s
+# `a_drain_deeper_than_the_ceiling_spills_to_the_next_tick_without_a_warning` at
+# **108.5 s**, where the slowest locally is about fifty. A limit measured on the
+# faster machine would fail a slow test on the slower one, which is the way this
+# guard would earn its removal.
 [profile.default]
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # The write-lock hold decomposition's tests read this thread's CPU time and
 # assert how much of a hold was on the CPU and how much off it (ADR-176). Run
