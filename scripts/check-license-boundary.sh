@@ -33,7 +33,52 @@ cd "$(dirname "$0")/.."
 
 # Every crate that takes the workspace license (`license.workspace = true` in
 # its Cargo.toml). `kimmy-client` is the one that does not.
-AGPL='^(kimmy-core|kimmy-storage|kimmy-query|kimmy-vector|kimmy-auth|kimmy-cluster|kimmy-mcp|kimmy-api|kimmyd|kimmy-cli) '
+#
+# **Derived, not written out.** This was a literal list, while the sentence above
+# it described a derivation -- and the two had drifted: `kimmy-egress` and
+# `kimmy-fuzz-harness` both take the workspace license and neither was named, so
+# the boundary could not see them at all. A list cannot see a crate it does not
+# name, and the crate it will not name is whichever is added after it was
+# written.
+#
+# The members come from `[workspace] members` rather than from a `crates/*` glob,
+# because a glob is the same drift one level up: it cannot see a member kept
+# anywhere else. `cargo metadata` would be equally authoritative, but every other
+# script here uses only sed and awk, and this needs no JSON parser to read a list
+# that is already a list.
+members=$(
+  awk '/^members = \[/,/^\]/' Cargo.toml |
+    sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}$/\1/p'
+)
+if [ -z "$members" ]; then
+  echo "could not read [workspace] members from Cargo.toml" >&2
+  exit 1
+fi
+
+names=''
+for member in $members; do
+  # Globs are expanded, so a `crates/*` style entry still resolves; a literal
+  # path expands to itself.
+  for dir in $member; do
+    manifest="$dir/Cargo.toml"
+    if [ ! -f "$manifest" ]; then
+      echo "workspace member $dir has no Cargo.toml" >&2
+      exit 1
+    fi
+    grep -q '^license\.workspace = true' "$manifest" || continue
+    names="$names$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -1)
+"
+  done
+done
+
+names=$(printf '%s' "$names" | sed '/^$/d' | sort -u)
+# A derivation that produces nothing would make every check below vacuous, which
+# is the failure this whole change is about: it would report success loudly.
+if [ -z "$names" ]; then
+  echo "found no crate under the workspace license; the derivation is broken" >&2
+  exit 1
+fi
+AGPL="^($(printf '%s' "$names" | tr '\n' '|' | sed 's/|$//')) "
 
 found=$(
   cargo tree -p kimmy-client -e normal --prefix none 2>/dev/null |

@@ -82,6 +82,19 @@ refused.** This release moves the storage schema to 4
 
 ### Fixed
 
+- **The licence-boundary check now sees every crate it is meant to guard.**
+  `scripts/check-license-boundary.sh` fails the build if the Apache-2.0
+  `kimmy-client` takes a normal dependency on a crate under the workspace's
+  AGPL-3.0-only licence — the separation [LICENSING.md](LICENSING.md) promises.
+  It decided which crates those are from a list written out inside the script,
+  and that list had drifted from the workspace: `kimmy-egress` and
+  `kimmy-fuzz-harness` were both missing, so a dependency on either would have
+  been reported as no dependency at all. The list is now derived from
+  `[workspace] members` and each member's own manifest, so a crate added later
+  is covered without anyone remembering, and the check fails loudly rather than
+  passing quietly if that derivation ever yields nothing. No crate in this
+  release crossed the boundary; nothing shipped wrong.
+
 - **A replicated index definition this build refuses for its operator no longer
   fails the whole replication round.** `sync::settle` decided which errors are
   refusals of the request from a hand-written list of three, and the
