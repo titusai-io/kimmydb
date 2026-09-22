@@ -5,6 +5,7 @@ mod config;
 mod lifecycle;
 mod logging;
 mod node;
+mod supervision;
 
 use anyhow::{Context, Result};
 use clap::Parser;

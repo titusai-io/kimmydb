@@ -70,6 +70,8 @@ fn remind_to_remove_previous_secret(ttl_secs: u64) {
         "a previous JWT signing secret is configured; every token it signed will have expired \
          one token lifetime from now, so remove KIMMY_JWT_PREVIOUS_SECRET after that"
     );
+    // UNSUPERVISED: a reminder that warns once and stops. Its ending is the point, and a
+    // panic in it must not stop a node that is otherwise serving.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
         warn!(
@@ -111,6 +113,17 @@ pub async fn run(config: Config) -> Result<()> {
     outcome
 }
 
+/// How long the embedding worker waits before retrying a storage error, and the
+/// ceiling that wait doubles up to (ADR-184).
+///
+/// Short enough that a transient failure costs a few seconds of embedding, long
+/// enough that a permanent one does not spin. The ceiling matters more than the
+/// floor: a worker retrying for ever at a two-minute cadence leaves
+/// `kimmy_task_retries_total` rising slowly, which is what the age series in the
+/// follow-up reads as "no progress".
+const EMBEDDING_RETRY_FIRST: Duration = Duration::from_secs(1);
+const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
+
 async fn start_and_serve(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -150,6 +163,32 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // After the banner, so the line an operator is sent to look for sits
     // under the identity of the run that is reporting it.
     lifecycle::announce(&config.storage.data_dir, &previous);
+
+    // Before the first task is spawned: a supervised death needs somewhere to
+    // record itself, and a panic anywhere needs to reach the structured log
+    // rather than bare stderr (ADR-184).
+    if !crate::supervision::install(config.storage.data_dir.clone()) {
+        anyhow::bail!("the supervision hooks were installed twice; this is a programming error");
+    }
+    // Announced at the signal, before anything drains, so that a supervised
+    // task ending during the drain is a stop rather than a death.
+    let shutdown = kimmy_task::Shutdown::new();
+
+    // A test switch that stops a background task on purpose. It is in the
+    // shipped binary so that the tests drive the binary that ships, so every
+    // start where it is set says so — it must not be able to sit on unnoticed in
+    // a deployment.
+    if let Some(what) = kimmy_task::test_kill_requested() {
+        // The line says what is set, and the value says what it will do -- which
+        // may be nothing. The prefix used to promise "will stop a background
+        // task ... and this node will then exit" and then append "-- malformed,
+        // so nothing will happen", contradicting itself in one line.
+        warn!(
+            KIMMY_TEST_KILL_TASK = %what,
+            "a test switch is set that acts on a background task on purpose; unset \
+             KIMMY_TEST_KILL_TASK outside a test"
+        );
+    }
 
     if config.auth.insecure_no_auth {
         warn!("authentication is DISABLED; every request runs with full privileges");
@@ -332,16 +371,31 @@ async fn start_and_serve(config: Config) -> Result<()> {
             }
             let federation = kimmy_api::Federation::new(verifier);
             state.set_federation(Arc::clone(&federation));
+            // Built here, not inside the task, and for the same reason as the
+            // webhook client and the cluster's TLS: it is a builder failure, not
+            // a network one, so it cannot be retried and will not come right.
+            // Inside the task it used to warn once and return, leaving every
+            // federated token refused for the life of the process while the node
+            // went on serving -- and under supervision that return is a death,
+            // so the same misconfiguration became a restart loop instead. Built
+            // before anything is spawned, it fails the start, which is what a
+            // node that cannot do a duty it was configured for should do.
+            //
+            // Only when OIDC is configured: this arm is that condition.
+            let http = jwks_client().context("building the HTTP client for OIDC key refresh")?;
             Some(spawn_jwks_refresher(
                 federation,
                 Duration::from_secs(config.auth.oidc.refresh_interval_secs),
                 Arc::clone(&state),
+                shutdown.clone(),
+                http,
             ))
         }
     };
 
-    let gc_handle = spawn_collector(Arc::clone(&engine), &config);
-    let cluster = spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config).await?;
+    let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
+    let cluster =
+        spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone()).await?;
 
     // The routes see the live member set only once the cluster is up, which is
     // after the router was built — hence a late hand-off rather than a
@@ -373,8 +427,13 @@ async fn start_and_serve(config: Config) -> Result<()> {
         // With no member set, the union is just `me` and one node owns
         // everything (ADR-051).
         let me = engine.node_id();
-        tokio::spawn(async move {
-            kimmy_api::dispatch::run(state, egress, me, members, limits).await;
+        // Built here, not inside the task: a client that will not build is a
+        // startup failure, because there is no configuration that turns webhook
+        // delivery off and a subscription can be created at runtime (ADR-184).
+        let client =
+            kimmy_api::dispatch::client(&egress).context("building the webhook delivery client")?;
+        kimmy_task::supervise("webhook_dispatcher", shutdown.clone(), async move {
+            kimmy_api::dispatch::run(state, egress, me, members, limits, client).await;
         })
     };
 
@@ -385,7 +444,7 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // peer's 5 s handshake timeout or a member marked down.
     let stall_probe = {
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        kimmy_task::supervise("stall_probe", shutdown.clone(), async move {
             let period = std::time::Duration::from_millis(250);
             loop {
                 let t = std::time::Instant::now();
@@ -414,9 +473,11 @@ async fn start_and_serve(config: Config) -> Result<()> {
                 );
                 None
             }
-            Some(interval) => Some(tokio::spawn(async move {
-                kimmy_api::expiry::run(state, me, members, interval).await;
-            })),
+            Some(interval) => {
+                Some(kimmy_task::supervise("ttl_expiry", shutdown.clone(), async move {
+                    kimmy_api::expiry::run(state, me, members, interval).await;
+                }))
+            }
         }
     };
 
@@ -424,15 +485,22 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // ordinary oplog consumer, which is also what makes revoking on one node
     // take effect on every node: a replicated write to `__users` publishes on
     // the node that applied it (ADR-052).
-    let sessions_handle =
-        tokio::spawn(kimmy_api::sessions::invalidator(&engine, state.sessions.clone()));
+    let sessions_handle = kimmy_task::supervise(
+        "session_invalidator",
+        shutdown.clone(),
+        kimmy_api::sessions::invalidator(&engine, state.sessions.clone()),
+    );
 
     // The same shape, one cache over. Dropping a collection forgets its vector
     // index on the member that took the request; a drop that arrives by
     // replication is applied by the sync path, which runs no route, so without
     // this consumer that member keeps the graph resident and its snapshot on
     // disk for a collection that no longer exists.
-    let vector_index_handle = tokio::spawn(kimmy_api::vectors::invalidator(&state));
+    let vector_index_handle = kimmy_task::supervise(
+        "vector_index_invalidator",
+        shutdown.clone(),
+        kimmy_api::vectors::invalidator(&state),
+    );
 
     // Snapshots left by a drop this node was not running for are reached by
     // neither the routes nor the consumer: nothing opens a snapshot directory
@@ -485,8 +553,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
         let batching = config.vector.batch.settings();
-        Some(tokio::spawn({
+        Some(kimmy_task::supervise("embedding_worker", shutdown.clone(), {
             let engine = Arc::clone(&engine);
+            let retrying = shutdown.clone();
             async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
@@ -500,9 +569,25 @@ async fn start_and_serve(config: Config) -> Result<()> {
                     None => true,
                 }));
                 worker.set_counters(worker_counters);
-                if let Err(e) = worker.run().await {
-                    warn!(error = %e, "embedding worker stopped");
-                }
+                // Every error `run` returns is a storage error, which is
+                // transient: it used to return here, and node.rs logged
+                // "embedding worker stopped" while embedding stayed stopped
+                // until the next restart (ADR-184). Retried in place instead,
+                // and `kimmy_task_retries_total{task="embedding_worker"}`
+                // counts the attempts so a permanent failure is visible as a
+                // rising count rather than as silence.
+                let mut retry = kimmy_task::Retry::new(
+                    "embedding_worker",
+                    EMBEDDING_RETRY_FIRST,
+                    EMBEDDING_RETRY_MAX,
+                );
+                // The loop lives in `Retry::forever` rather than here. Written
+                // out at this call site first, and the whole workspace suite
+                // passed with its `Err` arm returning instead of retrying —
+                // so the one rule this is about had no test anywhere. Returning
+                // from `forever` is a death, which is what should happen if
+                // this worker ever finishes.
+                retry.forever(&retrying, &mut worker, |w| Box::pin(w.run())).await;
             }
         }))
     } else {
@@ -525,6 +610,7 @@ async fn start_and_serve(config: Config) -> Result<()> {
             cert.to_path_buf(),
             key.to_path_buf(),
             Arc::clone(&state),
+            shutdown.clone(),
         )),
         _ => None,
     };
@@ -557,7 +643,17 @@ async fn start_and_serve(config: Config) -> Result<()> {
         }
     }
 
-    serve(listener, app, tls).await.context("serving")?;
+    // From here the node is serving, which is the earliest the test switch may
+    // act: armed later than startup so it can never turn a start into a crash
+    // loop, and can never be mistaken for a startup failure.
+    kimmy_task::arm_test_kills();
+    let served = serve(listener, app, tls, shutdown.clone()).await;
+    // Before the aborts below, and before returning an error: from here on a
+    // supervised task ending is a stop, not a death. `serve` has already
+    // announced it on the signal path; this covers the path where serving
+    // itself failed, where no signal ever arrived.
+    shutdown.begin();
+    served.context("serving")?;
 
     // Nothing to drain: it holds no state beyond the mtimes it last saw, and
     // the certificate in use is already in the acceptor.
@@ -654,8 +750,9 @@ fn spawn_cert_reloader(
     cert: std::path::PathBuf,
     key: std::path::PathBuf,
     metrics: kimmy_api::SharedState,
+    shutdown: kimmy_task::Shutdown,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    kimmy_task::supervise("cert_reloader", shutdown.clone(), async move {
         // The baseline is taken now, so the first tick compares against what
         // was actually loaded rather than reloading once for no reason.
         let mut seen = stamps(&cert, &key).await;
@@ -825,19 +922,10 @@ fn spawn_jwks_refresher(
     federation: Arc<kimmy_api::Federation>,
     interval: Duration,
     state: kimmy_api::SharedState,
+    shutdown: kimmy_task::Shutdown,
+    http: reqwest::Client,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let http = match jwks_client() {
-            Ok(http) => http,
-            Err(e) => {
-                // Nothing to retry: this is a builder failure, not a network
-                // one. Federated tokens are refused for the life of the
-                // process, which is worth one loud line rather than a task
-                // that spins.
-                warn!(error = %e, "could not build the HTTP client for OIDC key refresh");
-                return;
-            }
-        };
+    kimmy_task::supervise("jwks_refresher", shutdown.clone(), async move {
         let issuer = federation.issuer();
 
         loop {
@@ -1067,11 +1155,12 @@ async fn serve(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     tls: Option<RustlsConfig>,
+    shutdown: kimmy_task::Shutdown,
 ) -> Result<()> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let Some(tls) = tls else {
-        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
+        axum::serve(listener, service).with_graceful_shutdown(announced(shutdown.clone())).await?;
         return Ok(());
     };
 
@@ -1085,10 +1174,13 @@ async fn serve(
     std_listener.set_nonblocking(true).context("configuring the listener")?;
 
     let handle = axum_server::Handle::new();
+    // UNSUPERVISED: the shutdown watcher, whose return *is* shutdown. It must be free to
+    // finish during the drain, which is exactly what a supervisor would cut short.
     tokio::spawn({
         let handle = handle.clone();
+        let shutdown = shutdown.clone();
         async move {
-            shutdown_signal().await;
+            announced(shutdown).await;
             handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
         }
     });
@@ -1124,6 +1216,7 @@ async fn spawn_cluster(
     engine: Arc<Engine>,
     state: kimmy_api::SharedState,
     config: &Config,
+    shutdown: kimmy_task::Shutdown,
 ) -> Result<Cluster> {
     if !config.cluster.enabled {
         return Ok(Cluster { tasks: Vec::new(), members: None });
@@ -1152,12 +1245,27 @@ async fn spawn_cluster(
                 .record_entries_skipped(outcome.unknown_collection as u64, outcome.deferred as u64);
         }
     });
-    let serving = tokio::spawn(kimmy_cluster::serve_with(
-        Arc::clone(&engine),
-        listener,
-        secret.clone(),
-        Some(on_pushed),
-    ));
+    // Built before the node commits to serving. `serve_with` used to build it
+    // and return on failure, which made a fatal condition fatal to that task
+    // only: the node went on serving while no peer could pull from it. With
+    // clustering enabled the encryption is always on and has no switch
+    // (ADR-040), so a TLS that will not start is a startup failure (ADR-184).
+    let cluster_tls = Arc::new(
+        kimmy_cluster::tls::ClusterTls::new()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("starting cluster TLS, which cluster.enabled requires")?,
+    );
+    let serving = kimmy_task::supervise(
+        "replication_server",
+        shutdown.clone(),
+        kimmy_cluster::serve_with(
+            Arc::clone(&engine),
+            listener,
+            secret.clone(),
+            Some(on_pushed),
+            cluster_tls,
+        ),
+    );
 
     // SWIM shares the port with replication: UDP for probes and membership,
     // TCP for oplog transfer. Bound here for the same reason as the listener —
@@ -1176,14 +1284,19 @@ async fn spawn_cluster(
         // The same secret the replication handshake uses: membership is
         // authenticated too, so an unauthenticated node cannot join the member
         // set that webhook ownership is computed over (ADR-053).
-        cluster_tasks.push(tokio::spawn(kimmy_cluster::membership::run(
-            socket,
-            advertised(local),
-            engine.node_id(),
-            secret.clone(),
-            live.clone(),
-            feed,
-        )));
+        cluster_tasks.push(kimmy_task::supervise(
+            "membership",
+            shutdown.clone(),
+            kimmy_cluster::membership::run(
+                socket,
+                advertised(local),
+                engine.node_id(),
+                secret.clone(),
+                live.clone(),
+                feed,
+                shutdown.clone(),
+            ),
+        ));
         members = Some(live);
         announce = Some(tx);
     } else {
@@ -1213,54 +1326,58 @@ async fn spawn_cluster(
         }
     }
 
-    let replicating = tokio::spawn(kimmy_cluster::replicate(
-        engine,
-        kimmy_cluster::ReplicationConfig {
-            seeds: config.cluster.seeds.clone(),
-            secret,
-            local,
-            sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
-            discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
-            fanout: config.cluster.fanout,
-            announce,
-            // Cloned: the replication loop and the webhook dispatcher both
-            // read the same live set, and `Members` is a shared handle.
-            members: members.clone(),
-            tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
-            // A stale rejoiner is a fact about a peer's vector, which only the
-            // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
-            on_peer_staleness: Some(std::sync::Arc::new({
-                let state = state.clone();
-                move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
-            })),
-            // What the loop saw that lag cannot say: rounds that failed,
-            // peers backed off, schema changes refused. Pushed after every
-            // tick, reached peers or not, because a tick in which every
-            // round failed is the one that leaves the lag gauge at its last
-            // value and the cluster looking healthy (ADR-123). Two of its
-            // fields say whether the divergence check ran at all, so that
-            // gauge's 0 can be told apart from silence (ADR-135).
-            //
-            // Handed over whole rather than unpacked into arguments here:
-            // this closure is the only caller of `record_sync_round` and no
-            // test covers it, so a pair of same-typed positional arguments
-            // transposed on this line would compile, pass every gate, and
-            // report one series under another's name until somebody read a
-            // dashboard closely. There is nothing here to get in the wrong
-            // order (ADR-135).
-            on_round: Some(std::sync::Arc::new({
-                let state = state.clone();
-                move |report: kimmy_cluster::RoundReport| {
-                    state.metrics.record_sync_round(&report);
-                }
-            })),
-            // The replication loop is the only place a peer's version vector
-            // exists, so lag is pushed from there into the gauge (ADR-046).
-            on_lag: Some(std::sync::Arc::new(move |ms| {
-                state.metrics.set_replication_lag_ms(ms);
-            })),
-        },
-    ));
+    let replicating = kimmy_task::supervise(
+        "replication",
+        shutdown.clone(),
+        kimmy_cluster::replicate(
+            engine,
+            kimmy_cluster::ReplicationConfig {
+                seeds: config.cluster.seeds.clone(),
+                secret,
+                local,
+                sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
+                discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
+                fanout: config.cluster.fanout,
+                announce,
+                // Cloned: the replication loop and the webhook dispatcher both
+                // read the same live set, and `Members` is a shared handle.
+                members: members.clone(),
+                tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
+                // A stale rejoiner is a fact about a peer's vector, which only the
+                // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
+                on_peer_staleness: Some(std::sync::Arc::new({
+                    let state = state.clone();
+                    move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
+                })),
+                // What the loop saw that lag cannot say: rounds that failed,
+                // peers backed off, schema changes refused. Pushed after every
+                // tick, reached peers or not, because a tick in which every
+                // round failed is the one that leaves the lag gauge at its last
+                // value and the cluster looking healthy (ADR-123). Two of its
+                // fields say whether the divergence check ran at all, so that
+                // gauge's 0 can be told apart from silence (ADR-135).
+                //
+                // Handed over whole rather than unpacked into arguments here:
+                // this closure is the only caller of `record_sync_round` and no
+                // test covers it, so a pair of same-typed positional arguments
+                // transposed on this line would compile, pass every gate, and
+                // report one series under another's name until somebody read a
+                // dashboard closely. There is nothing here to get in the wrong
+                // order (ADR-135).
+                on_round: Some(std::sync::Arc::new({
+                    let state = state.clone();
+                    move |report: kimmy_cluster::RoundReport| {
+                        state.metrics.record_sync_round(&report);
+                    }
+                })),
+                // The replication loop is the only place a peer's version vector
+                // exists, so lag is pushed from there into the gauge (ADR-046).
+                on_lag: Some(std::sync::Arc::new(move |ms| {
+                    state.metrics.set_replication_lag_ms(ms);
+                })),
+            },
+        ),
+    );
     cluster_tasks.push(replicating);
 
     info!(
@@ -1300,6 +1417,10 @@ fn ddl_confirmer(
                 let engine = Arc::clone(&engine);
                 let secret = secret.clone();
                 let entry = entry.clone();
+                // UNSUPERVISED: one push per peer in a JoinSet this round awaits. It is
+                // this round's work rather than background work, so a panic in one
+                // must not stop the node -- the round below logs it and carries on,
+                // and anti-entropy carries the entry.
                 pushes.spawn(async move {
                     let pushed = tokio::time::timeout(
                         deadline,
@@ -1316,7 +1437,23 @@ fn ddl_confirmer(
             }
             let mut found = kimmy_api::DdlConfirmation::default();
             while let Some(joined) = pushes.join_next().await {
-                let Ok((addr, node, result)) = joined else { continue };
+                // A panicked or cancelled push used to land here and be dropped,
+                // so the peer was left out of the confirmation with nothing said:
+                // the round looked as if it had simply not been asked. The
+                // behaviour is unchanged -- one failed push does not fail the
+                // round, and anti-entropy carries the entry -- but it is no longer
+                // silent.
+                let (addr, node, result) = match joined {
+                    Ok(pushed) => pushed,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "a schema-change push task ended without answering, so that member is \
+                             not in this confirmation; anti-entropy will carry the change"
+                        );
+                        continue;
+                    }
+                };
                 match result {
                     Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
                         info!(
@@ -1381,7 +1518,11 @@ fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
 }
 
 /// Start the retention collector, unless it is disabled.
-fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::JoinHandle<()>> {
+fn spawn_collector(
+    engine: Arc<Engine>,
+    config: &Config,
+    shutdown: kimmy_task::Shutdown,
+) -> Option<tokio::task::JoinHandle<()>> {
     if config.storage.gc_interval_secs == 0 {
         warn!("retention collection is disabled; the oplog and tombstones will grow without bound");
         return None;
@@ -1393,7 +1534,7 @@ fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::
         config.storage.tombstone_retention_secs,
     );
 
-    Some(tokio::spawn(async move {
+    Some(kimmy_task::supervise("retention_collector", shutdown.clone(), async move {
         // A sleep of the whole interval *after* each pass, not a ticker. A
         // pass that overruns the interval must not be followed by the next
         // one at once: a ticker's default catches up on every missed tick
@@ -1453,8 +1594,21 @@ fn bootstrap_users(engine: &Engine, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Resolve on SIGINT or SIGTERM. SIGTERM matters most — it is what Docker and
-/// Kubernetes send, and ignoring it means a hard kill after the grace period.
+/// Wait for the shutdown signal, then announce it **before** returning.
+///
+/// The announcement has to happen before anything drains, because every
+/// supervised task reads it to tell a stop from a death. Putting it here rather
+/// than after `serve` returns makes the ordering structural: there is no path
+/// from the signal to a drained server that skips it.
+async fn announced(shutdown: kimmy_task::Shutdown) {
+    shutdown_signal().await;
+    shutdown.begin();
+}
+
+/// Resolve on SIGINT or SIGTERM.
+///
+/// SIGTERM matters most — it is what Docker and Kubernetes send, and ignoring it
+/// means a hard kill after the grace period.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1727,7 +1881,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = serve(listener, app, tls).await;
+            // Nothing shuts this down: the test drops it when it is finished.
+            let _ = serve(listener, app, tls, kimmy_task::Shutdown::new()).await;
         });
         addr
     }

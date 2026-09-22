@@ -3840,8 +3840,11 @@ async fn listen_with(
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let tls = std::sync::Arc::new(
+        kimmy_cluster::tls::ClusterTls::new().expect("cluster TLS for the test listener"),
+    );
     let serving =
-        tokio::spawn(serve_with(Arc::clone(engine), listener, SECRET.to_string(), Some(hook)));
+        tokio::spawn(serve_with(Arc::clone(engine), listener, SECRET.to_string(), Some(hook), tls));
     (addr, serving)
 }
 

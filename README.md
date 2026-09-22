@@ -330,6 +330,7 @@ Where the build departs from what was planned — and why — is tracked in
 | `kimmy-vector` | Embedding providers, oplog-driven worker, HNSW, index selection, search |
 | `kimmy-auth` | Users, Argon2id, JWT, RBAC evaluation |
 | `kimmy-cluster` | SWIM membership, discovery, the replication protocol, anti-entropy |
+| `kimmy-task` | Supervision for long-lived background tasks: one that dies stops the process instead of stopping alone |
 | `kimmy-mcp` | MCP tools and resources — calls the same executor the REST routes do, so authorization cannot diverge |
 | `kimmy-api` | axum router, REST handlers, change-stream WebSocket, and the executor both edges share |
 | `kimmyd` | The server binary |

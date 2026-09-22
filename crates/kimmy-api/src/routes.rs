@@ -813,6 +813,8 @@ async fn backup(
 
     let engine = std::sync::Arc::clone(&state.engine);
     let dir = crate::backup::spill_dir(&engine);
+    // UNSUPERVISED: this request's own work, awaited by this request -- the caller sees the
+    // failure, so nothing is left running unwatched.
     let spilled = tokio::task::spawn_blocking(move || crate::backup::spill(&engine, &dir))
         .await
         .map_err(backup_task_failed)?;

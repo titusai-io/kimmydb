@@ -2319,10 +2319,13 @@ async fn offer_browser(url: &str) {
 fn open_in_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
+        // UNSUPERVISED: a child process, not a task -- `Command::spawn` shares only the
+        // name, and the CLI is not the node.
         std::process::Command::new("open").arg(url).spawn().is_ok()
     }
     #[cfg(target_os = "linux")]
     {
+        // UNSUPERVISED: a child process, not a task, as above.
         std::process::Command::new("xdg-open").arg(url).spawn().is_ok()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
