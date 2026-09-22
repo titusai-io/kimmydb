@@ -140,7 +140,7 @@ fn a_task_stopped_for_shutdown_does_not_exit() {
     // **It is not the control for the announcement, though it was written as
     // one.** `abort()` cancels the *supervisor*, so nothing is left to classify
     // the ending and the exit-0 here holds however the shutdown checks behave —
-    // blinding all three of them leaves this green. What it does cover is that
+    // blinding the re-check leaves this green. What it does cover is that
     // the ordinary drain path is quiet. The control is
     // `a_task_that_ends_by_itself_during_shutdown_does_not_exit` below.
     if scenario().as_deref() == Some("shutdown") {
@@ -189,7 +189,7 @@ fn a_task_that_ends_by_itself_during_shutdown_does_not_exit() {
     // `a_task_stopped_for_shutdown_does_not_exit` above -- which, on its own,
     // cannot see it. `abort()` cancels the *supervisor*, so nothing classifies
     // anything and the exit-0 there holds however the shutdown checks behave.
-    // Verified: blinding all three of them leaves that test, and the end-to-end
+    // Verified: blinding the re-check leaves that test, and the end-to-end
     // drain test, green.
     //
     // Here the work returns by itself *as* shutdown begins. A return is a death
@@ -491,6 +491,149 @@ async fn a_failing_worker_is_retried_rather_than_abandoned() {
         "and each retry is counted, so a permanently failing worker shows up as a rising count \
          rather than as silence"
     );
+}
+
+#[test]
+fn an_ordinary_ending_says_nothing_about_a_dropped_handle() {
+    // `StopOnDrop::drop` returns early when the handle has finished. Without
+    // that, every ordinary ending would log "dropped outside shutdown" as the
+    // guard fell out of scope — a line that means "something aborted a
+    // supervised handle" appearing on work that simply completed, which is how a
+    // real one gets ignored. Nothing held that early return.
+    if scenario().as_deref() == Some("ordinary") {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let shutdown = kimmy_task::Shutdown::new();
+            kimmy_task::supervise_oneshot("probe_oneshot", shutdown.clone(), async {});
+            kimmy_task::supervise_judged("probe_judged_end", shutdown, async {
+                kimmy_task::Ended::Expected("the probe finishes on purpose")
+            });
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        return;
+    }
+
+    let out = probe("ordinary", "an_ordinary_ending_says_nothing_about_a_dropped_handle");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "neither ending is a death: {stderr}");
+    assert!(
+        !stderr.contains("dropped outside shutdown"),
+        "work that finished was not aborted, and saying so would make the real notice noise: \
+         {stderr}"
+    );
+    // And the premise: the process did run the probes, so the absence above is
+    // an absence of the line rather than of the work.
+    assert!(
+        stderr.contains("a background task finished"),
+        "premise: the judged task ran: {stderr}"
+    );
+}
+
+#[test]
+fn every_shape_reads_the_shutdown_announcement() {
+    // One test per shape, because the re-check lives in `classify` and a shape
+    // later routed around `supervised` would lose it in silence. `supervise`'s
+    // arm is `a_task_that_ends_by_itself_during_shutdown_does_not_exit` above;
+    // these are the other two, in the same racing form and for the same reason:
+    // `select!` picks among ready branches at random, so one round is a 50% test.
+    const ROUNDS: usize = 30;
+    for shape in ["judged", "oneshot"] {
+        if scenario().as_deref() == Some(shape) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                for _ in 0..ROUNDS {
+                    let shutdown = kimmy_task::Shutdown::new();
+                    let watched = shutdown.clone();
+                    if shape == "judged" {
+                        kimmy_task::supervise_judged("probe_shape", shutdown.clone(), async move {
+                            ends_when_shutdown_begins(watched).await;
+                            // An *Unexpected* ending, so only the announcement
+                            // can keep this from being a death.
+                            kimmy_task::Ended::Unexpected("the probe calls its own return a death")
+                        });
+                    } else {
+                        // A one-shot's own return is expected, so the switch it
+                        // needs the announcement for is a *panic* as shutdown
+                        // begins.
+                        kimmy_task::supervise_oneshot(
+                            "probe_shape",
+                            shutdown.clone(),
+                            async move {
+                                ends_when_shutdown_begins(watched).await;
+                                panic!("the probe panics as shutdown begins");
+                            },
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    shutdown.begin();
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+            });
+            return;
+        }
+
+        let out = probe(shape, "every_shape_reads_the_shutdown_announcement");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the {shape} shape must read the announcement too; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stretch_short_of_the_threshold_does_not_reset_the_backoff() {
+    // The reset pinned from below. A test that only proves it *does* reset
+    // passes just as well for a reset that fires on every failure, which would
+    // throw the backoff away entirely and hammer whatever is failing.
+    let shutdown = kimmy_task::Shutdown::new();
+    let mut retry = kimmy_task::Retry::new(
+        "retention_collector",
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    );
+    for _ in 0..3 {
+        assert!(retry.after("a transient failure", &shutdown).await);
+    }
+    // The next wait has reached 8s, so the threshold is 32s. Wait less.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let at = tokio::time::Instant::now();
+    assert!(retry.after("still failing", &shutdown).await);
+    assert_eq!(
+        tokio::time::Instant::now() - at,
+        Duration::from_secs(8),
+        "a quiet stretch shorter than the threshold keeps the schedule where it was: a task \
+         failing every twenty seconds is still in trouble"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unset_switch_never_fires() {
+    // With `KIMMY_TEST_KILL_TASK` unset, `awaiting_test_kill` returns a future
+    // that never completes before it reaches any sleep, so a node nobody is
+    // testing has no timer per task. **The no-wakeup half of that is structural**
+    // -- an early return, visible by reading it -- and what a test can hold is
+    // the half that matters: nothing fires, however much time passes. Paused
+    // time, so "an hour" costs nothing.
+    // **Armed, deliberately.** Without this the test proves nothing about the
+    // switch: it was held up by `ARMED` being false, so replacing the unset
+    // branch with one that fires left it green. Arming is safe here because the
+    // environment variable is unset in this process, which is the condition
+    // under test.
+    kimmy_task::arm_test_kills();
+    let shutdown = kimmy_task::Shutdown::new();
+    let handle = kimmy_task::supervise("probe_unset", shutdown, async {
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
+    assert!(
+        !handle.is_finished(),
+        "an unset switch must never end a task, whatever the clock does — and this process is \
+         still here, which is the other half of it"
+    );
+    handle.abort();
 }
 
 #[tokio::test(start_paused = true)]

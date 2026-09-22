@@ -125,13 +125,13 @@ refused.** This release moves the storage schema to 4
   turned a crafted request into a way to stop your node, and a test holds that
   open.
 
-  **Two failures that were silent are now startup failures.** A webhook delivery
-  client that will not build, and cluster TLS that will not start, each used to
-  log once and leave the node serving without that duty — webhooks undelivered,
-  or no peer able to pull from this node. Both now fail the start. If a node
-  stops starting after this upgrade and the log names one of them, that condition
-  was already true and was not being reported.
-
+  **Three failures that were silent are now startup failures.** A webhook
+  delivery client that will not build, cluster TLS that will not start, and the
+  HTTP client for OIDC key refresh, each used to log once and leave the node
+  serving without that duty — webhooks undelivered, no peer able to pull from
+  this node, or every federated token refused until someone restarted. All three
+  now fail the start. If a node stops starting after this upgrade and the log
+  names one of them, that condition was already true and was not being reported.
 
 - **A replicated index definition this build refuses for its operator no longer
   fails the whole replication round.** `sync::settle` decided which errors are

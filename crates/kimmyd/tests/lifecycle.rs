@@ -337,9 +337,10 @@ async fn a_port_line_the_harness_cannot_read_fails_at_once() {
 /// notice: a test that called the supervisor directly would prove the classifier
 /// and nothing about the node.
 ///
-/// `KIMMY_TEST_KILL_TASK` is armed only once the node is serving, so
-/// `wait_ready` completing first is part of the claim — the switch cannot turn a
-/// start into a crash loop.
+/// `KIMMY_TEST_KILL_TASK` is armed only once the node is serving, so a start
+/// cannot become a crash loop. **That is read from the finished log, not from a
+/// readiness check**: waiting for `/healthz` first raced the kill and failed as
+/// "exited (70) before it became healthy", which is the thing this proves.
 async fn a_task_that_dies_exits_and_the_next_start_names_it(
     label: &str,
     kill: &str,
@@ -438,6 +439,11 @@ async fn a_test_switch_that_will_do_nothing_says_so() {
         ("embedding_worker", "malformed"),
         ("embeding_worker:panic", "matches no task"),
         ("membership_inbound:explode", "malformed"),
+        // `error` asks for a retry, which only a retrying task can give.
+        ("session_invalidator:error", "error mode only acts on a retrying task"),
+        // A real task, on a node that does not run it: this harness starts a
+        // single node, so nothing gossips membership.
+        ("membership_inbound:panic", "did not start"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let client = reqwest::Client::new();
@@ -484,8 +490,15 @@ async fn a_task_asked_to_fail_retries_in_place_and_the_node_stays_up() {
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
     loop {
         let log = node.log();
-        if log.contains("will retry in place") {
-            assert!(log.contains("embedding_worker"), "the retry names the task it is for: {log}");
+        // **The task field on the retry's own line**, not merely somewhere in the
+        // log. The switch's startup WARN quotes its own value, so a check against
+        // the whole log passed for a retry by any other task — it could not have
+        // told the difference.
+        if let Some(line) = log.lines().find(|l| l.contains("will retry in place")) {
+            assert!(
+                line.contains("embedding_worker"),
+                "the retry line must name the task it is for, and this one does not: {line}"
+            );
             break;
         }
         assert!(
@@ -516,7 +529,7 @@ async fn a_graceful_shutdown_is_not_a_task_death() {
     // **It is not the test that holds the announcement open**, though it was
     // written as one. The drain aborts each supervised handle, and an aborted
     // supervisor is cancelled before it classifies anything, so this stays green
-    // however the shutdown checks behave — measured, by blinding all three of
+    // however the re-check behaves — measured, by blinding it
     // them. `a_task_that_ends_by_itself_during_shutdown_does_not_exit` in
     // kimmy-task is the one that fails when they go.
     let dir = tempfile::tempdir().unwrap();

@@ -179,10 +179,14 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // start where it is set says so — it must not be able to sit on unnoticed in
     // a deployment.
     if let Some(what) = kimmy_task::test_kill_requested() {
+        // The line says what is set, and the value says what it will do -- which
+        // may be nothing. The prefix used to promise "will stop a background
+        // task ... and this node will then exit" and then append "-- malformed,
+        // so nothing will happen", contradicting itself in one line.
         warn!(
             KIMMY_TEST_KILL_TASK = %what,
-            "a test switch is set that will stop a background task on purpose, and this node \
-             will then exit; unset KIMMY_TEST_KILL_TASK outside a test"
+            "a test switch is set that acts on a background task on purpose; unset \
+             KIMMY_TEST_KILL_TASK outside a test"
         );
     }
 
@@ -1414,7 +1418,9 @@ fn ddl_confirmer(
                 let secret = secret.clone();
                 let entry = entry.clone();
                 // UNSUPERVISED: one push per peer in a JoinSet this round awaits. It is
-                // this round's work, not background work, and the round reports it.
+                // this round's work rather than background work, so a panic in one
+                // must not stop the node -- the round below logs it and carries on,
+                // and anti-entropy carries the entry.
                 pushes.spawn(async move {
                     let pushed = tokio::time::timeout(
                         deadline,
@@ -1431,7 +1437,23 @@ fn ddl_confirmer(
             }
             let mut found = kimmy_api::DdlConfirmation::default();
             while let Some(joined) = pushes.join_next().await {
-                let Ok((addr, node, result)) = joined else { continue };
+                // A panicked or cancelled push used to land here and be dropped,
+                // so the peer was left out of the confirmation with nothing said:
+                // the round looked as if it had simply not been asked. The
+                // behaviour is unchanged -- one failed push does not fail the
+                // round, and anti-entropy carries the entry -- but it is no longer
+                // silent.
+                let (addr, node, result) = match joined {
+                    Ok(pushed) => pushed,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "a schema-change push task ended without answering, so that member is \
+                             not in this confirmation; anti-entropy will carry the change"
+                        );
+                        continue;
+                    }
+                };
                 match result {
                     Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
                         info!(

@@ -18442,9 +18442,9 @@ The announcement is made inside a wrapper around the signal, used by both serve 
 
 **A cancellation is a clean stop, not a death**, and the enumeration of who cancels what was wrong twice over in the first version of this record.
 
-There are **two** places, not three. The `node.rs` drain aborts **ten** supervised handles — the cert reloader, the JWKS refresher, the session invalidator, the vector index invalidator, the stall probe, the embedding worker, the retention collector, expiry, every cluster task, and the webhook dispatcher — and the supervisor's own shutdown branch stops its work. The third, `membership::run` ending its children, **was unreachable**: `run` holds a sender for its whole body, so its channel never closes, so its loop never ends and the two aborts after it never ran. They have been removed rather than kept as reassuring dead code.
+There are **two** places, not three. The `node.rs` drain aborts **up to twelve** supervised handles — nine named ones (the cert reloader, the JWKS refresher, the session invalidator, the vector index invalidator, the stall probe, the embedding worker, the retention collector, expiry and the webhook dispatcher) plus the cluster's three, which are there only when clustering is on — and the supervisor's own shutdown branch stops its work. The third, `membership::run` ending its children, **was unreachable**: `run` holds a sender for its whole body, so its channel never closes, so its loop never ends and the two aborts after it never ran. They have been removed rather than kept as reassuring dead code.
 
-And the ten that *are* reached did not do what this paragraph said. Aborting a supervised handle aborts the **supervisor**, which dropped the inner `JoinHandle` — and dropping a `JoinHandle` detaches a task rather than cancelling it. So every shutdown left the real work running until the runtime went away: measured at unit level as **23 ticks at the abort and 79 after another 150 ms**, and on real SIGTERMs as 5 of 10 runs whose supervisors never logged that they were stopping. `StopOnDrop` now aborts the inner handle when the supervisor goes away, and a drop outside shutdown is logged at `INFO` with the task name, so a stray `abort` is never silent — that would be a death in costume.
+And the ten that *are* reached did not do what this paragraph said. Aborting a supervised handle aborts the **supervisor**, which dropped the inner `JoinHandle` — and dropping a `JoinHandle` detaches a task rather than cancelling it. So every shutdown left the real work running until the runtime went away: measured at unit level as **24 ticks at the abort and 92 after another 150 ms**, and on real SIGTERMs as 5 of 10 runs whose supervisors never logged that they were stopping. `StopOnDrop` now aborts the inner handle when the supervisor goes away, and a drop outside shutdown is logged at `INFO` with the task name, so a stray `abort` is never silent — that would be a death in costume.
 
 ### The exit path, reusable
 
@@ -18458,7 +18458,7 @@ A structured `error!` naming the task and cause first, because the steps after i
 
 **With no reporter installed** — a test binary, or a second binary added later — a death still logs and still exits 70, on **stderr as well as through `tracing`**. That is not belt and braces: a process with no subscriber sends the structured line nowhere, and a test binary was vanishing with status 70 and no explanation at all until the stderr line was added.
 
-### Two permanent failures become startup failures
+### Three permanent failures become startup failures
 
 Not additive, and the one behaviour change here that is not.
 
@@ -18490,26 +18490,39 @@ a table written from intentions.
 | the reporter's exit in `kimmyd`, which is the path a real node takes | `a_panicking_background_task_exits_the_process`, `a_background_task_that_returns_exits_the_process` |
 | **the abort-on-drop guard**, so an aborted supervisor detaches its work again | `aborting_a_supervised_handle_stops_the_work` — "24 ticks at the abort, 92 after 150ms more" — and `a_handle_dropped_outside_shutdown_says_so` |
 | **the notice when a handle is dropped outside shutdown** | `a_handle_dropped_outside_shutdown_says_so` |
-| the shutdown re-check, now in `classify` and shared by all three shapes | `a_task_that_ends_by_itself_during_shutdown_does_not_exit` |
+| the shutdown re-check, now in `classify` and shared by all three shapes | `a_task_that_ends_by_itself_during_shutdown_does_not_exit` and `every_shape_reads_the_shutdown_announcement`, which covers the judged and one-shot shapes |
 | `send_replace` in `begin`, back to `send` | `a_transient_failure_is_retried_in_place_and_counted`, `the_same_task_ending_with_no_shutdown_announced_does_exit` |
 | the membership receiver's `Expected`, flipped to `Unexpected` | the `kimmy-cluster` membership binary stops mid-run with status 70 |
 | the classifier's `Unexpected`, treated as an expected ending | `a_task_that_judges_its_own_return_unexpected_exits_70` |
 | the panic's message, discarded instead of read off the `JoinError` | `a_panicking_task_exits_70_with_no_reporter_installed` |
-| the stderr line on the no-reporter path | five of the twelve `exits` tests, which then see status 70 and no explanation |
+| the stderr line on the no-reporter path | four of the sixteen `exits` tests, which then see status 70 and no explanation |
+| **`StopOnDrop`'s `is_finished` early return** | `an_ordinary_ending_says_nothing_about_a_dropped_handle` — work that simply finished would be reported as aborted |
+| **`BACKOFF_RESET_AFTER`'s threshold**, so the backoff resets on every failure | `a_stretch_short_of_the_threshold_does_not_reset_the_backoff` and `a_quiet_stretch_resets_the_backoff` |
+| **the unset-switch early return**, so an unset switch can fire | the `exits` binary stops with status 70 |
+| **a `RETRYING` entry nothing retries** | `every_retrying_task_is_declared` |
+| **the error-mode warning** | `a_test_switch_that_will_do_nothing_says_so` |
+| **the never-started warning** | the same test |
+| **the local-helper skip's two guards**, so a local `fn spawn_blocking` disables the rule | `the_spawn_matcher_sees_every_ordinary_spelling` |
+| **the walk's per-file premise**, by cutting files at the first `#[cfg(test)]` again | `every_long_lived_task_is_spawned_through_the_supervisor`, naming `transport.rs` and the line it stopped short of |
+| a spawn in any of the six regions a line-cut used to hide | the same test, for each region |
 | `Retry::forever`'s `Err` arm, returning instead of retrying | `a_failing_worker_is_retried_rather_than_abandoned` — "1 attempts" |
 | **`Retry`'s backoff reset** | `a_quiet_stretch_resets_the_backoff` — "left: 8s" against the first backoff's 1s |
 | **`with_test_kill`'s `Err(kill)`**, so a switch-induced return is not a death | `the_test_switch_reaches_a_judged_task_and_a_one_shot` — the one-shot swallows it and exits 0 |
 | **the `Kill::Error` race in `Retry::forever`** | `a_task_asked_to_fail_retries_in_place_and_the_node_stays_up` — nothing retried |
 | **the warning for a switch value that will do nothing** | `a_test_switch_that_will_do_nothing_says_so` |
-| an unsupervised spawn, in **17 of the 18 forms** a review reported | `every_long_lived_task_is_spawned_through_the_supervisor` |
+| an unsupervised spawn, in any of **22 spellings** | `the_spawn_matcher_sees_every_ordinary_spelling` for the match, `every_long_lived_task_is_spawned_through_the_supervisor` for a real file |
 | **a supervised name that is not a string literal** | `every_supervised_name_is_in_the_task_list_and_every_entry_is_used`, naming the call site |
 | a supervised name absent from `TASKS` | the same test |
 | **both `shutdown.begin()` calls in the node** | **nothing** — below |
 | **treating a cancellation as a death again** | **nothing** — below |
 
-Two of those are the review's own findings held open as regressions: the
-abort-on-drop guard, and `with_test_kill`'s `Err(kill)`. Each was a live defect
-before this round, so each row is a defect that has already happened once.
+**Most of those rows are findings, not inventions.** The abort-on-drop guard,
+`with_test_kill`'s `Err(kill)`, the `Kill::Error` race, the error-mode and
+never-started warnings, the local-helper skip's guards and the walk's per-file
+premise were each a live defect in this branch before a review found it — two
+reviews, the second of which found that the first fix still hid about 1,230 lines
+of production code. So each is a defect that has already happened once, which is
+the only kind worth a row.
 
 **The node's own announcement is not covered end to end, and the reason is worth
 stating rather than papering over.** Removing both `shutdown.begin()` calls

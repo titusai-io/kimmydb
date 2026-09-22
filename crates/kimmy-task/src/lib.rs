@@ -219,6 +219,28 @@ fn count_retry(task: &'static str) {
 /// Three of these are spawned inside `membership::run` rather than by the
 /// daemon: supervising that loop does not cover its children, because it goes on
 /// running when they die.
+/// The tasks that retry, so `KIMMY_TEST_KILL_TASK`'s `error` mode can act on
+/// them.
+///
+/// **One of fifteen.** `:error` asks for a transient failure and a retry, which
+/// only a task with a retry loop can honour — so for the other fourteen it does
+/// nothing at all, and used to do it silently. `every_retrying_task_is_declared`
+/// checks this against the `Retry::new` call sites, so it cannot drift.
+pub const RETRYING: &[&str] = &["embedding_worker"];
+
+/// Every task name that has actually been supervised in this process.
+///
+/// Recorded so that a switch naming a task this node never started can say so
+/// rather than looking like a switch that failed. A node with vectors disabled
+/// starts no embedding worker, and `embedding_worker:panic` on it is a test that
+/// waits for nothing.
+static STARTED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// The task names supervised so far, in this process.
+pub fn started() -> Vec<&'static str> {
+    STARTED.lock().expect("the started list is never held across a panic").clone()
+}
+
 pub const TASKS: &[&str] = &[
     "cert_reloader",
     "embedding_worker",
@@ -317,6 +339,12 @@ pub fn test_kill_requested() -> Option<String> {
         Some((task, _)) if !TASKS.contains(&task.as_str()) => format!(
             "{raw} -- matches no task, so nothing will happen; the names are kimmy_task::TASKS"
         ),
+        // `error` asks for a transient failure and a retry, which only a task
+        // with a retry loop can honour.
+        Some((task, Kill::Error)) if !RETRYING.contains(&task.as_str()) => format!(
+            "{raw} -- error mode only acts on a retrying task, so nothing will happen; the \
+             retrying tasks are kimmy_task::RETRYING"
+        ),
         Some(_) => raw,
     })
 }
@@ -333,6 +361,21 @@ static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// crash loop and cannot be confused with a startup failure.
 pub fn arm_test_kills() {
     ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Startup is over, so what this node runs is now known. A switch naming a
+    // task that never started here would otherwise wait for ever and look like a
+    // switch that failed: a node with `vector.worker_enabled = false` starts no
+    // embedding worker, and a single node starts none of the membership tasks.
+    if let Some((task, _)) = requested_kill()
+        && TASKS.contains(&task.as_str())
+        && !started().contains(&task.as_str())
+    {
+        warn!(
+            KIMMY_TEST_KILL_TASK = %task,
+            started = ?started(),
+            "the test switch names a task this node did not start, so nothing will happen; it is \
+             not configured on this node"
+        );
+    }
 }
 
 /// What `KIMMY_TEST_KILL_TASK` asks of this task, once armed.
@@ -551,6 +594,7 @@ where
     F: Future<Output = T> + Send + 'static,
     J: FnOnce(T) -> Return,
 {
+    STARTED.lock().expect("the started list is never held across a panic").push(name);
     let mut running = StopOnDrop {
         task: name,
         // UNSUPERVISED: the supervised task itself. This is the spawn every other one goes
@@ -684,6 +728,12 @@ impl Retry {
             } else {
                 tokio::select! {
                     v = step(worker) => v.map_err(|e| e.to_string()),
+                    // **This cancels the attempt rather than making the work
+                    // return an error of its own**, so what it exercises is this
+                    // loop's `Err` arm -- the retry, the count, the backoff --
+                    // and not the worker's own error path. Worth saying, because
+                    // a test that read it the other way would think it had
+                    // covered the worker.
                     () = awaiting_test_error(self.task) => {
                         injected = true;
                         Err("KIMMY_TEST_KILL_TASK asked for one failure".to_string())
