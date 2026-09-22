@@ -691,6 +691,57 @@ impl std::ops::Deref for WriteTxn<'_> {
     }
 }
 
+/// Test-only ways to make the definition check answer as it does in the field.
+///
+/// The bound exists for a check that can fail for ever, and the input that made
+/// that happen is fixed — so without a way to force the failure, the bound would
+/// be untestable code guarding against something nothing can now produce.
+#[cfg(test)]
+pub(crate) mod definition_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEVER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make every definition check on this thread answer "changed".
+    pub(crate) fn never_matches(on: bool) {
+        NEVER.with(|n| n.set(on));
+    }
+
+    pub(crate) fn never() -> bool {
+        NEVER.with(|n| n.get())
+    }
+
+    /// Run `change` with every definition check on this thread answering
+    /// "changed", and require the error the bound gives, naming
+    /// `collection` (`db.name`) and the attempts it made.
+    ///
+    /// The hook is reset on every way out, a panic included, so one test
+    /// cannot leave it set for the next on the same thread.
+    pub(crate) fn assert_exhausted<T>(collection: &str, change: impl FnOnce() -> crate::Result<T>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                never_matches(false);
+            }
+        }
+        never_matches(true);
+        let reset = Reset;
+        let outcome = change();
+        drop(reset);
+        let Err(err) = outcome else {
+            panic!("a check that never passes must end in the bound's error, and this succeeded");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(collection), "the error names {collection}: {msg}");
+        assert!(
+            msg.contains(&format!("after {} attempts", crate::Engine::MAX_DEFINITION_RETRIES)),
+            "and is the bound's, after every attempt it allows: {msg}"
+        );
+    }
+}
+
 impl Engine {
     /// Open or create the database at `path`.
     ///
@@ -3313,15 +3364,60 @@ impl Engine {
     /// back to decide again from what stands; nothing can change it after
     /// that. [`crate::index::mark_multikey`] re-reads through the transaction
     /// for the same reason.
+    /// How many times a definition write-back may lose its race before the
+    /// attempt is an error rather than another try.
+    ///
+    /// **Ten thousand, which no contention reaches.** The retry is a loop now,
+    /// so it cannot overflow a stack, and the bound's only remaining job is to
+    /// stop a check that can *never* pass — a bug, not a busy node. An earlier
+    /// version bounded it at sixteen on the reasoning that "a real race is
+    /// resolved in one or two attempts", and that reasoning was wrong: K
+    /// concurrent schema changes on one collection queue at the writer gate, so
+    /// the last of them loses K−1 races with nothing wrong at all. A review
+    /// measured it — seventeen threads already produced errors, and thirty-two
+    /// parallel index creates returned eight to ten HTTP 500s a round.
+    pub(crate) const MAX_DEFINITION_RETRIES: u32 = 10_000;
+
+    /// The error a caller gets instead of retrying for ever.
+    pub(crate) fn retries_exhausted_error(db: &str, collection: &str) -> crate::StorageError {
+        crate::StorageError::Transaction(format!(
+            "the definition of {db}.{collection} still did not match what was read after {} \
+             attempts to write it back, so the attempt was abandoned. That is a bug in this \
+             build, or contention beyond anything expected",
+            Self::MAX_DEFINITION_RETRIES
+        ))
+    }
+
     pub(crate) fn definition_is(
         txn: &redb::WriteTransaction,
         read: &CollectionMeta,
     ) -> Result<bool> {
+        #[cfg(test)]
+        if definition_hooks::never() {
+            return Ok(false);
+        }
         let collections = txn.open_table(tables::COLLECTIONS)?;
-        Ok(match collections.get((read.db.as_str(), read.name.as_str()))? {
-            Some(standing) => serde_json::from_slice::<CollectionMeta>(standing.value())? == *read,
-            None => false,
-        })
+        let Some(standing) = collections.get((read.db.as_str(), read.name.as_str()))? else {
+            return Ok(false);
+        };
+        // **Compared as encodings, not as trees.** `==` on a `CollectionMeta`
+        // descends into a partial filter's `Document`, and `Bson`'s equality is
+        // `f64`'s: `NaN != NaN`, so a filter holding one made this answer `false`
+        // for a definition that had not changed at all -- and every caller
+        // retried, by calling itself then, so the node overflowed its stack and
+        // aborted. `IndexMeta::differences` made the same comparison on the
+        // filter alone, and is fixed the same way.
+        //
+        // Until ADR-182 the store held relaxed JSON, where a NaN serialises to
+        // `null`, so both sides came back `Null` and the check passed **by
+        // accident of a lossy encoding**. Preserving the type exposed the
+        // comparison; the comparison was always the defect.
+        //
+        // Both sides go through the same encoder, so this is reflexive for every
+        // value -- including one no `PartialEq` can compare with itself -- and it
+        // does not depend on the bytes a past build happened to write.
+        let decoded = serde_json::from_slice::<CollectionMeta>(standing.value())?;
+        Ok(serde_json::to_vec(&decoded)? == serde_json::to_vec(read)?)
     }
 
     pub(crate) fn put_collection_meta(

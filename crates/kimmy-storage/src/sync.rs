@@ -4408,6 +4408,215 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_filter_the_order_cannot_compare_does_not_crash_the_peer() {
+        // The reason this was a High and not a Medium: a replicated DDL takes the
+        // same write-back path, so one client creating a NaN-filtered index could
+        // abort **every** member, and each would abort again on the same entry
+        // after restarting. The crash was reproduced locally first; this is the
+        // half that makes it everyone's.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index_with(
+            "shop",
+            "orders",
+            vec![field("z")],
+            false,
+            Default::default(),
+            Some("z_nan".into()),
+            None,
+            Some(bson::doc! { "k": f64::NAN }),
+        )
+        .unwrap();
+
+        // B learns the NaN-filtered definition, and then a second change on the
+        // same collection: the drop is what used to abort, on whichever member
+        // applied it.
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("z_nan").is_some(),
+            "the peer holds the definition"
+        );
+
+        assert!(a.drop_index("shop", "orders", "z_nan").unwrap());
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("z_nan").is_none(),
+            "and the peer applies the drop rather than aborting on it"
+        );
+    }
+
+    #[test]
+    fn a_peer_holding_a_nan_filter_applies_a_drop_minted_where_the_index_never_was() {
+        // The peer's own path, alone. In the test above the origin holds the
+        // NaN definition too, so with the comparison reverted it fails at the
+        // origin's local drop before the peer applies anything. Here only the
+        // peer holds it: the drop is minted on a member that never had the
+        // index (ADR-141), so the one write-back that compares a NaN filter is
+        // the peer applying the replicated drop.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.apply_batch(&a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries).unwrap();
+        b.create_index_with(
+            "shop",
+            "orders",
+            vec![field("z")],
+            false,
+            Default::default(),
+            Some("z_nan".into()),
+            None,
+            Some(bson::doc! { "k": f64::NAN }),
+        )
+        .unwrap();
+        // The drop must be stamped after the creation it removes, or it is
+        // history to the peer and declined without reaching the write-back.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(!a.drop_index("shop", "orders", "z_nan").unwrap(), "the origin never held it");
+        assert!(
+            a.get_collection("shop", "orders").unwrap().indexes.is_empty(),
+            "and holds no filter the comparison could meet"
+        );
+        pull(&b, &a);
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("z_nan").is_none(),
+            "the peer applies the drop rather than failing on its own definition"
+        );
+    }
+
+    #[test]
+    fn an_identical_nan_definition_created_twice_is_one_index_not_a_conflict() {
+        // `IndexMeta::differences`, the idempotence check, compared filters
+        // with `Document`'s `==`, which is `f64`'s. The same NaN-filtered
+        // index asked for twice was refused as "a different
+        // partialFilterExpression".
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let create = |filter: bson::Document| {
+            a.create_index_with(
+                "shop",
+                "orders",
+                vec![field("z")],
+                false,
+                Default::default(),
+                Some("z_nan".into()),
+                None,
+                Some(filter),
+            )
+        };
+        let first = create(bson::doc! { "k": f64::NAN }).expect("the first create");
+        let again = create(bson::doc! { "k": f64::NAN }).expect("the same definition again");
+        assert_eq!(again.created, first.created, "idempotent: nothing moved");
+        // So the test can see a conflict at all.
+        let err = create(bson::doc! { "k": 1.5 }).expect_err("a different filter under the name");
+        assert!(err.to_string().contains("partialFilterExpression"), "{err}");
+    }
+
+    #[test]
+    fn a_nan_definition_arriving_again_at_its_own_stamp_is_the_one_held() {
+        // The replicated half of the same comparison. A re-delivery of the
+        // creation this member holds, or a snapshot page restoring it, carries
+        // the stamp it is held at — so a comparison that called it a different
+        // definition sent it to the conflict arm, where a stamp that does not
+        // win is history: `Older`, which also skips the restore's relog
+        // (ADR-180).
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let nan = || Some(bson::doc! { "k": f64::NAN });
+        let held = a
+            .create_index_with(
+                "shop",
+                "orders",
+                vec![field("z")],
+                false,
+                Default::default(),
+                Some("z_nan".into()),
+                None,
+                nan(),
+            )
+            .unwrap();
+        let at = held.created.expect("a local create is stamped");
+        for origin in [
+            crate::index::CreateOrigin::Replicated(Some(at)),
+            crate::index::CreateOrigin::Restored(at),
+        ] {
+            let (created, _) = a
+                .create_index_inner(
+                    "shop",
+                    "orders",
+                    vec![field("z")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("z_nan".into()),
+                    None,
+                    nan(),
+                    origin,
+                    &|_, _| false,
+                )
+                .unwrap();
+            match created {
+                crate::index::IndexCreated::Built(index) => {
+                    assert_eq!(index.created, Some(at), "{origin:?}: the definition held")
+                }
+                crate::index::IndexCreated::Older => {
+                    panic!("{origin:?} of the definition held, at its own stamp, read as history")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_members_creating_one_identical_nan_definition_merge_rather_than_supersede() {
+        // Two members that create the same definition independently settle it
+        // by the stamp merge: one index, the later stamp, nothing rebuilt. A
+        // comparison that called a NaN filter different from itself settled it
+        // as a conflict instead — the earlier member's entries cleared and
+        // rebuilt, a drop recorded under the winner's stamp, and a warning that
+        // a peer's definition had replaced its own.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let create = |e: &Engine| {
+            e.create_collection("shop", "orders").unwrap();
+            e.create_index_with(
+                "shop",
+                "orders",
+                vec![field("z")],
+                false,
+                Default::default(),
+                Some("z_nan".into()),
+                None,
+                Some(bson::doc! { "k": f64::NAN }),
+            )
+            .unwrap()
+            .created
+            .unwrap()
+        };
+        let first = create(&a);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = create(&b);
+        assert!(first < second, "the fixture needs two independent creations, A's first");
+
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        let collection = kimmy_core::CollectionId::derive("shop", "orders");
+        for (member, e) in [("A", &a), ("B", &b)] {
+            let held = e.get_collection("shop", "orders").unwrap();
+            assert_eq!(held.index("z_nan").unwrap().created, Some(second), "{member}: the later");
+            assert_eq!(
+                e.index_dropped_at(collection, kimmy_core::IndexMeta::derive_id("z_nan")).unwrap(),
+                None,
+                "{member}: settled by the merge, so no drop was recorded to replace an index"
+            );
+        }
+    }
+
+    #[test]
     fn a_replicated_document_moving_in_and_out_of_the_undecidable_state_is_refiled_on_the_peer() {
         // The old-image unfile on the replicated path. A peer applying a
         // document's moves into, out of and back into the undecidable run must
