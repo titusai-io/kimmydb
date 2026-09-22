@@ -79,7 +79,10 @@ fn a_task_that_judges_its_own_return_unexpected_exits_70() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(70), "stderr: {stderr}");
     assert!(stderr.contains("probe_judged"), "{stderr}");
-    assert!(stderr.contains("the probe calls its own return a death"), "the reason is the task's own words: {stderr}");
+    assert!(
+        stderr.contains("the probe calls its own return a death"),
+        "the reason is the task's own words: {stderr}"
+    );
 }
 
 #[test]

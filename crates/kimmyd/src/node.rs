@@ -376,8 +376,7 @@ async fn start_and_serve(config: Config) -> Result<()> {
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
     let cluster =
-        spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone())
-            .await?;
+        spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone()).await?;
 
     // The routes see the live member set only once the cluster is up, which is
     // after the router was built — hence a late hand-off rather than a
@@ -412,8 +411,8 @@ async fn start_and_serve(config: Config) -> Result<()> {
         // Built here, not inside the task: a client that will not build is a
         // startup failure, because there is no configuration that turns webhook
         // delivery off and a subscription can be created at runtime (ADR-184).
-        let client = kimmy_api::dispatch::client(&egress)
-            .context("building the webhook delivery client")?;
+        let client =
+            kimmy_api::dispatch::client(&egress).context("building the webhook delivery client")?;
         kimmy_task::supervise("webhook_dispatcher", shutdown.clone(), async move {
             kimmy_api::dispatch::run(state, egress, me, members, limits, client).await;
         })
@@ -455,9 +454,11 @@ async fn start_and_serve(config: Config) -> Result<()> {
                 );
                 None
             }
-            Some(interval) => Some(kimmy_task::supervise("ttl_expiry", shutdown.clone(), async move {
-                kimmy_api::expiry::run(state, me, members, interval).await;
-            })),
+            Some(interval) => {
+                Some(kimmy_task::supervise("ttl_expiry", shutdown.clone(), async move {
+                    kimmy_api::expiry::run(state, me, members, interval).await;
+                }))
+            }
         }
     };
 
@@ -465,15 +466,22 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // ordinary oplog consumer, which is also what makes revoking on one node
     // take effect on every node: a replicated write to `__users` publishes on
     // the node that applied it (ADR-052).
-    let sessions_handle =
-        kimmy_task::supervise("session_invalidator", shutdown.clone(), kimmy_api::sessions::invalidator(&engine, state.sessions.clone()));
+    let sessions_handle = kimmy_task::supervise(
+        "session_invalidator",
+        shutdown.clone(),
+        kimmy_api::sessions::invalidator(&engine, state.sessions.clone()),
+    );
 
     // The same shape, one cache over. Dropping a collection forgets its vector
     // index on the member that took the request; a drop that arrives by
     // replication is applied by the sync path, which runs no route, so without
     // this consumer that member keeps the graph resident and its snapshot on
     // disk for a collection that no longer exists.
-    let vector_index_handle = kimmy_task::supervise("vector_index_invalidator", shutdown.clone(), kimmy_api::vectors::invalidator(&state));
+    let vector_index_handle = kimmy_task::supervise(
+        "vector_index_invalidator",
+        shutdown.clone(),
+        kimmy_api::vectors::invalidator(&state),
+    );
 
     // Snapshots left by a drop this node was not running for are reached by
     // neither the routes nor the consumer: nothing opens a snapshot directory
@@ -1148,9 +1156,7 @@ async fn serve(
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let Some(tls) = tls else {
-        axum::serve(listener, service)
-            .with_graceful_shutdown(announced(shutdown.clone()))
-            .await?;
+        axum::serve(listener, service).with_graceful_shutdown(announced(shutdown.clone())).await?;
         return Ok(());
     };
 
@@ -1272,15 +1278,19 @@ async fn spawn_cluster(
         // The same secret the replication handshake uses: membership is
         // authenticated too, so an unauthenticated node cannot join the member
         // set that webhook ownership is computed over (ADR-053).
-        cluster_tasks.push(kimmy_task::supervise("membership", shutdown.clone(), kimmy_cluster::membership::run(
-            socket,
-            advertised(local),
-            engine.node_id(),
-            secret.clone(),
-            live.clone(),
-            feed,
+        cluster_tasks.push(kimmy_task::supervise(
+            "membership",
             shutdown.clone(),
-        )));
+            kimmy_cluster::membership::run(
+                socket,
+                advertised(local),
+                engine.node_id(),
+                secret.clone(),
+                live.clone(),
+                feed,
+                shutdown.clone(),
+            ),
+        ));
         members = Some(live);
         announce = Some(tx);
     } else {
@@ -1310,54 +1320,58 @@ async fn spawn_cluster(
         }
     }
 
-    let replicating = kimmy_task::supervise("replication", shutdown.clone(), kimmy_cluster::replicate(
-        engine,
-        kimmy_cluster::ReplicationConfig {
-            seeds: config.cluster.seeds.clone(),
-            secret,
-            local,
-            sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
-            discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
-            fanout: config.cluster.fanout,
-            announce,
-            // Cloned: the replication loop and the webhook dispatcher both
-            // read the same live set, and `Members` is a shared handle.
-            members: members.clone(),
-            tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
-            // A stale rejoiner is a fact about a peer's vector, which only the
-            // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
-            on_peer_staleness: Some(std::sync::Arc::new({
-                let state = state.clone();
-                move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
-            })),
-            // What the loop saw that lag cannot say: rounds that failed,
-            // peers backed off, schema changes refused. Pushed after every
-            // tick, reached peers or not, because a tick in which every
-            // round failed is the one that leaves the lag gauge at its last
-            // value and the cluster looking healthy (ADR-123). Two of its
-            // fields say whether the divergence check ran at all, so that
-            // gauge's 0 can be told apart from silence (ADR-135).
-            //
-            // Handed over whole rather than unpacked into arguments here:
-            // this closure is the only caller of `record_sync_round` and no
-            // test covers it, so a pair of same-typed positional arguments
-            // transposed on this line would compile, pass every gate, and
-            // report one series under another's name until somebody read a
-            // dashboard closely. There is nothing here to get in the wrong
-            // order (ADR-135).
-            on_round: Some(std::sync::Arc::new({
-                let state = state.clone();
-                move |report: kimmy_cluster::RoundReport| {
-                    state.metrics.record_sync_round(&report);
-                }
-            })),
-            // The replication loop is the only place a peer's version vector
-            // exists, so lag is pushed from there into the gauge (ADR-046).
-            on_lag: Some(std::sync::Arc::new(move |ms| {
-                state.metrics.set_replication_lag_ms(ms);
-            })),
-        },
-    ));
+    let replicating = kimmy_task::supervise(
+        "replication",
+        shutdown.clone(),
+        kimmy_cluster::replicate(
+            engine,
+            kimmy_cluster::ReplicationConfig {
+                seeds: config.cluster.seeds.clone(),
+                secret,
+                local,
+                sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
+                discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
+                fanout: config.cluster.fanout,
+                announce,
+                // Cloned: the replication loop and the webhook dispatcher both
+                // read the same live set, and `Members` is a shared handle.
+                members: members.clone(),
+                tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
+                // A stale rejoiner is a fact about a peer's vector, which only the
+                // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
+                on_peer_staleness: Some(std::sync::Arc::new({
+                    let state = state.clone();
+                    move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
+                })),
+                // What the loop saw that lag cannot say: rounds that failed,
+                // peers backed off, schema changes refused. Pushed after every
+                // tick, reached peers or not, because a tick in which every
+                // round failed is the one that leaves the lag gauge at its last
+                // value and the cluster looking healthy (ADR-123). Two of its
+                // fields say whether the divergence check ran at all, so that
+                // gauge's 0 can be told apart from silence (ADR-135).
+                //
+                // Handed over whole rather than unpacked into arguments here:
+                // this closure is the only caller of `record_sync_round` and no
+                // test covers it, so a pair of same-typed positional arguments
+                // transposed on this line would compile, pass every gate, and
+                // report one series under another's name until somebody read a
+                // dashboard closely. There is nothing here to get in the wrong
+                // order (ADR-135).
+                on_round: Some(std::sync::Arc::new({
+                    let state = state.clone();
+                    move |report: kimmy_cluster::RoundReport| {
+                        state.metrics.record_sync_round(&report);
+                    }
+                })),
+                // The replication loop is the only place a peer's version vector
+                // exists, so lag is pushed from there into the gauge (ADR-046).
+                on_lag: Some(std::sync::Arc::new(move |ms| {
+                    state.metrics.set_replication_lag_ms(ms);
+                })),
+            },
+        ),
+    );
     cluster_tasks.push(replicating);
 
     info!(

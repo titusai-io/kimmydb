@@ -56,9 +56,7 @@ fn production_sources() -> Vec<(PathBuf, String)> {
                     let l = l.trim_start();
                     l.starts_with("#[cfg(test)]") || l.starts_with("mod tests")
                 })
-                .map(|line| {
-                    body.lines().take(line).map(|l| format!("{l}\n")).collect::<String>()
-                })
+                .map(|line| body.lines().take(line).map(|l| format!("{l}\n")).collect::<String>())
                 .unwrap_or(body);
             (path, cut)
         })
@@ -164,6 +162,24 @@ fn every_supervised_name_is_in_the_task_list_and_every_entry_is_used() {
         "kimmy_task::TASKS and the supervise calls have drifted, so \
          kimmy_task_retries_total{{task}} is missing a label or carries one nothing writes.\n  \
          supervised but not in TASKS: {missing:?}\n  in TASKS but nothing supervises: {unused:?}"
+    );
+
+    // And the OTLP bridge, which carries one instrument per task by the
+    // convention that file states. Without this the bridge could fall behind
+    // the task list silently: `/metrics` would grow a series the bridge does
+    // not publish, and the bridge's own guard matches on the series *stem*, so
+    // fourteen of fifteen instruments would satisfy it.
+    let bridge = std::fs::read_to_string(root().join("crates/kimmyd/src/logging.rs"))
+        .expect("the bridge's source");
+    let unbridged: Vec<&String> = declared
+        .iter()
+        .filter(|task| !bridge.contains(&format!("\"kimmy.task.retries.{task}\", \"{task}\"")))
+        .collect();
+    assert!(
+        unbridged.is_empty(),
+        "these tasks are in kimmy_task::TASKS and have no instrument on the OTLP bridge, so \
+         their retries reach /metrics and nothing else. OTLP is a standing requirement: add a \
+         `task_retries!` line for each in `logging.rs`:\n  {unbridged:?}"
     );
 }
 

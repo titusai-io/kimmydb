@@ -130,9 +130,8 @@ pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 /// serving, so a failure there is a startup error rather than a task that
 /// returns (ADR-184).
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
-    let tls = Arc::new(
-        crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"),
-    );
+    let tls =
+        Arc::new(crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"));
     serve_with(engine, listener, secret, None, tls).await
 }
 

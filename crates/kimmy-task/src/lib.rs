@@ -243,8 +243,10 @@ pub const TASKS: &[&str] = &[
 /// that rises while nothing else changes is a task retrying for ever, which does
 /// no work while looking alive — read it beside that task's progress age.
 pub fn retries() -> Vec<(&'static str, u64)> {
-    let observed =
-        RETRIES.get().map(|c| c.lock().expect("not held across a panic").clone()).unwrap_or_default();
+    let observed = RETRIES
+        .get()
+        .map(|c| c.lock().expect("not held across a panic").clone())
+        .unwrap_or_default();
     let mut out: Vec<(&'static str, u64)> = TASKS
         .iter()
         .map(|task| {
@@ -362,12 +364,13 @@ async fn awaiting_test_kill(task: &'static str) -> Kill {
 async fn with_test_kill<F: Future<Output = ()>>(name: &'static str, work: F) {
     tokio::select! {
         () = work => {}
-        how = awaiting_test_kill(name) => match how {
-            Kill::Panic => panic!("KIMMY_TEST_KILL_TASK asked {name} to panic"),
-            // Returning here is a return of the task, which is what the
-            // supervisor then judges.
-            _ => {}
-        },
+        how = awaiting_test_kill(name) => {
+            // Anything but a panic returns, and a return of this task is what
+            // the supervisor then judges.
+            if how == Kill::Panic {
+                panic!("KIMMY_TEST_KILL_TASK asked {name} to panic");
+            }
+        }
     }
 }
 

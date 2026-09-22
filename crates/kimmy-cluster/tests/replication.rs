@@ -3843,13 +3843,8 @@ async fn listen_with(
     let tls = std::sync::Arc::new(
         kimmy_cluster::tls::ClusterTls::new().expect("cluster TLS for the test listener"),
     );
-    let serving = tokio::spawn(serve_with(
-        Arc::clone(engine),
-        listener,
-        SECRET.to_string(),
-        Some(hook),
-        tls,
-    ));
+    let serving =
+        tokio::spawn(serve_with(Arc::clone(engine), listener, SECRET.to_string(), Some(hook), tls));
     (addr, serving)
 }
 

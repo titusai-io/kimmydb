@@ -3,9 +3,9 @@
 mod cli;
 mod config;
 mod lifecycle;
-mod supervision;
 mod logging;
 mod node;
+mod supervision;
 
 use anyhow::{Context, Result};
 use clap::Parser;
