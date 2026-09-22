@@ -269,8 +269,20 @@ refused.** This release moves the storage schema to 4
   different `partialFilterExpression`". Two members that created it
   independently replaced one index with the other, rebuilding it, instead of
   agreeing on its creation stamp. Filters are now compared as the store holds
-  them. Key order still does not count, as before; **`0.0` and `-0.0` now do**,
-  because the store holds them as two values.
+  them, and **`0.0` and `-0.0` now count as two values**, because the store holds
+  them as two.
+
+  **A filter's nested key order is now part of its definition, as `find` reads
+  it.** `find` compares an embedded document field by field, in order, so
+  `{k: {a: 1, b: 2}}` and `{k: {b: 2, a: 1}}` select different documents — but
+  the check above ignored key order at every depth. Re-creating an index with a
+  nested order swapped answered `200` and **kept the old filter**, and two
+  members creating it with the two orders each kept their own for good, holding
+  different documents under one index, with no warning. That re-create is now a
+  `409`, and two members settle on the later definition as any two rival
+  definitions do. Order at the **top level** still does not count: a filter is
+  a conjunction of its fields. This is pre-existing — 0.33.0 behaves the same
+  way.
 - **Dropping a large index no longer stalls every write for tens of seconds,
   or needs gigabytes of free disk while it runs.** The storage call that
   cleared an index's entries was slow in the way that matters. For 742,858

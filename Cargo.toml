@@ -83,7 +83,9 @@ serde = { version = "1", features = ["derive"] }
 # them: `{"$set": {"a": 1}, "$inc": {"a": 5}}` applied as `$inc` then `$set`,
 # a stored document's fields reordered, a sort document's keys reordered. The
 # parsers all iterate the BSON document in order and were right; the boundary
-# was throwing the order away (ADR-120).
+# was throwing the order away (ADR-120). An index definition is compared by the
+# same encoding, so without it two partial filters differing only in a nested
+# key order would read as one definition (ADR-182).
 serde_json = { version = "1", features = ["preserve_order"] }
 # Encodes a `Vec<u8>` as BSON binary rather than as an array of int32s, which is
 # what serde does by default and what made every replicated document twelve times
