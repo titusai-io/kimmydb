@@ -865,6 +865,27 @@ mod tests {
     }
 
     #[test]
+    fn a_vector_configuration_whose_check_never_passes_is_an_error_not_an_abort() {
+        // The bound, forced, at this site: see the note above
+        // `a_definition_check_that_never_passes_is_an_error_not_an_abort`.
+        let (engine, _dir) = engine();
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            engine.configure_vectors("app", "docs", config(8))
+        });
+        assert!(engine.get_collection("app", "docs").unwrap().vector.is_none(), "nothing set");
+    }
+
+    #[test]
+    fn a_vector_removal_whose_check_never_passes_is_an_error_not_an_abort() {
+        let (engine, _dir) = engine();
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            engine.disable_vectors("app", "docs", true)
+        });
+        assert!(engine.get_collection("app", "docs").unwrap().vector.is_some(), "still set");
+    }
+
+    #[test]
     fn enabling_vectors_creates_the_shadow_collection() {
         let (engine, _dir) = engine();
         engine.configure_vectors("app", "docs", config(8)).unwrap();

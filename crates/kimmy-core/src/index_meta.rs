@@ -124,14 +124,20 @@ pub mod stored_filter {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(filter: &Option<Document>, s: S) -> Result<S::Ok, S::Error> {
-        if s.is_human_readable() {
-            filter
-                .as_ref()
-                .map(|filter| Bson::Document(filter.clone()).into_canonical_extjson())
-                .serialize(s)
-        } else {
-            filter.serialize(s)
-        }
+        if s.is_human_readable() { canonical(filter).serialize(s) } else { filter.serialize(s) }
+    }
+
+    /// `filter` as the collection metadata stores it: canonical Extended JSON.
+    ///
+    /// Also what two filters are compared by ([`super::IndexMeta::differences`]).
+    /// Every number is a string in this form, so the comparison is reflexive
+    /// for every value, `NaN` included, where `Bson`'s own `==` is `f64`'s.
+    /// Two filters are then the same exactly when the store holds the same
+    /// value for both — up to key order, which `Document`'s equality never
+    /// counted either. The one pair that compared equal as `Bson` and differs
+    /// here is `0.0` against `-0.0`: the store holds them as different values.
+    pub fn canonical(filter: &Option<Document>) -> Option<serde_json::Value> {
+        filter.as_ref().map(|filter| Bson::Document(filter.clone()).into_canonical_extjson())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Document>, D::Error> {
@@ -281,7 +287,14 @@ impl IndexMeta {
         if self.expire_after_secs != other.expire_after_secs {
             differs.push("expireAfterSeconds");
         }
-        if self.partial_filter != other.partial_filter {
+        // By the encoding the store writes, not by `Document`'s `==`, which is
+        // `f64`'s and so not reflexive: a filter holding `NaN` differed from
+        // itself, and the identical definition created twice was refused as a
+        // conflict — and between two members settled by supersede rather than
+        // by the stamp merge an identical definition gets.
+        if stored_filter::canonical(&self.partial_filter)
+            != stored_filter::canonical(&other.partial_filter)
+        {
             differs.push("partialFilterExpression");
         }
         differs
@@ -383,5 +396,49 @@ mod stored_filter_tests {
             created: now.created,
         };
         assert_eq!(bson::serialize_to_vec(&now).unwrap(), bson::serialize_to_vec(&before).unwrap());
+    }
+    #[test]
+    fn a_filter_is_the_same_definition_as_itself_whatever_it_holds() {
+        // `differences` is the idempotence check, and it compared filters with
+        // `Document`'s `==`, which is `f64`'s: `NaN != NaN`, so the identical
+        // definition created twice was refused as a conflict. Now compared by
+        // the encoding the store writes.
+        for filter in [
+            doc! { "k": f64::NAN },
+            doc! { "k": { "$gte": f64::NAN } },
+            doc! { "k": [1, f64::NAN] },
+            doc! { "k": { "inner": f64::NAN } },
+            doc! { "k": f64::INFINITY, "j": f64::NEG_INFINITY },
+            filter(),
+        ] {
+            let (a, b) = (index(Some(filter.clone())), index(Some(filter.clone())));
+            assert!(a.differences(&b).is_empty(), "{filter} differs from itself");
+        }
+    }
+
+    #[test]
+    fn filters_the_store_holds_as_different_values_are_different_definitions() {
+        // The other direction, so a comparison that answered "the same" for
+        // every pair could not pass the test above.
+        let differs = |a: &Document, b: &Document| {
+            index(Some(a.clone())).differences(&index(Some(b.clone())))
+        };
+        for (a, b) in [
+            (doc! { "k": f64::NAN }, doc! { "k": 1.5 }),
+            // What a build before ADR-182 stored for a `NaN`.
+            (doc! { "k": f64::NAN }, doc! { "k": Bson::Null }),
+            (doc! { "k": 5_i32 }, doc! { "k": 5_i64 }),
+            // The one pair `Bson`'s `==` called equal: the store holds two values.
+            (doc! { "k": 0.0 }, doc! { "k": -0.0 }),
+        ] {
+            assert_eq!(differs(&a, &b), ["partialFilterExpression"], "{a} against {b}");
+        }
+        assert_eq!(
+            index(Some(doc! { "k": 1 })).differences(&index(None)),
+            ["partialFilterExpression"],
+            "a partial index against a full one"
+        );
+        // Key order is not a difference, as it was not before.
+        assert!(differs(&doc! { "a": 1, "b": 2 }, &doc! { "b": 2, "a": 1 }).is_empty());
     }
 }

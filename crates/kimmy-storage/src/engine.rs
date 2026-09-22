@@ -701,6 +701,34 @@ pub(crate) mod definition_hooks {
     pub(crate) fn never() -> bool {
         NEVER.with(|n| n.get())
     }
+
+    /// Run `change` with every definition check on this thread answering
+    /// "changed", and require the error the bound gives, naming
+    /// `collection` (`db.name`) and the attempts it made.
+    ///
+    /// The hook is reset on every way out, a panic included, so one test
+    /// cannot leave it set for the next on the same thread.
+    pub(crate) fn assert_exhausted<T>(collection: &str, change: impl FnOnce() -> crate::Result<T>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                never_matches(false);
+            }
+        }
+        never_matches(true);
+        let reset = Reset;
+        let outcome = change();
+        drop(reset);
+        let Err(err) = outcome else {
+            panic!("a check that never passes must end in the bound's error, and this succeeded");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(collection), "the error names {collection}: {msg}");
+        assert!(
+            msg.contains(&format!("after {} attempts", crate::Engine::MAX_DEFINITION_RETRIES)),
+            "and is the bound's, after every attempt it allows: {msg}"
+        );
+    }
 }
 
 impl Engine {
@@ -3354,7 +3382,9 @@ impl Engine {
         // descends into a partial filter's `Document`, and `Bson`'s equality is
         // `f64`'s: `NaN != NaN`, so a filter holding one made this answer `false`
         // for a definition that had not changed at all -- and every caller
-        // retries, by recursion, so the node overflowed its stack and aborted.
+        // retried, by calling itself then, so the node overflowed its stack and
+        // aborted. `IndexMeta::differences` made the same comparison on the
+        // filter alone, and is fixed the same way.
         //
         // Until ADR-182 the store held relaxed JSON, where a NaN serialises to
         // `null`, so both sides came back `Null` and the check passed **by

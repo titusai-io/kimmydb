@@ -2425,33 +2425,105 @@ mod tests {
         assert_eq!(coll.indexes.len(), N, "and every one of them landed");
     }
 
+    // **The bound, forced, at every site that retries.** Once the comparison is
+    // reflexive nothing in the product can make the definition check fail for
+    // ever, so without the hook the bound would be code guarding against
+    // something unreachable — and an unbounded retry would look just as green.
+    // One test per site that loses a race and goes round again, each set up to
+    // reach that site and no other: a review found that removing the bound at
+    // six of seven left the suite green, because one test reached one site.
+
     #[test]
     fn a_definition_check_that_never_passes_is_an_error_not_an_abort() {
-        // The bound, forced. Once the comparison is reflexive nothing in the
-        // product can make that check fail for ever, so without this hook the
-        // bound would be code guarding against something unreachable — and an
-        // unbounded retry would look just as green.
+        // A fresh index: the build's own transaction.
         let (engine, _, _dir) = engine();
-        crate::engine::definition_hooks::never_matches(true);
-        let outcome = engine.create_index_with(
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            engine.create_index("app", "docs", vec![IndexField::ascending("z")], false, None)
+        });
+        assert!(engine.get_collection("app", "docs").unwrap().indexes.is_empty(), "nothing built");
+    }
+
+    /// An index `z` on `app.docs`, and the stamp it was created at.
+    fn held_index(engine: &Engine) -> Stamp {
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("z")], false, None)
+            .unwrap()
+            .created
+            .expect("a local create is stamped")
+    }
+
+    /// `z` again, arriving from elsewhere as `origin`.
+    fn arriving(
+        engine: &Engine,
+        origin: CreateOrigin,
+    ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
+        engine.create_index_inner(
             "app",
             "docs",
             vec![IndexField::ascending("z")],
             false,
-            Default::default(),
-            Some("z".into()),
+            Enforcement::Local,
             None,
             None,
-        );
-        crate::engine::definition_hooks::never_matches(false);
+            None,
+            origin,
+            &|_, _| false,
+        )
+    }
 
-        let err = outcome.expect_err("a check that never passes must not be retried for ever");
-        let msg = err.to_string();
-        assert!(msg.contains("app.docs"), "the error names the collection: {msg}");
-        assert!(
-            msg.contains(&crate::Engine::MAX_DEFINITION_RETRIES.to_string()),
-            "and how many attempts it made: {msg}"
+    #[test]
+    fn a_stamp_merge_whose_check_never_passes_is_an_error_not_an_abort() {
+        // The same definition from a peer, created later: the merge's own
+        // transaction, which moves the creation stamp forward.
+        let (engine, _, _dir) = engine();
+        let held = held_index(&engine);
+        let later = Stamp::new(
+            kimmy_core::Hlc::new(u64::MAX / 2, 0),
+            kimmy_core::NodeId::from_bytes([9; 16]),
         );
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            arriving(&engine, CreateOrigin::Replicated(Some(later)))
+        });
+        let coll = engine.get_collection("app", "docs").unwrap();
+        assert_eq!(coll.index("z_1").unwrap().created, Some(held), "the stamp did not move");
+    }
+
+    #[test]
+    fn a_restore_of_a_held_definition_whose_check_never_passes_is_an_error_not_an_abort() {
+        // A snapshot page restoring the definition held, at its own stamp:
+        // nothing to settle, and the relog's own transaction (ADR-180).
+        let (engine, _, _dir) = engine();
+        let held = held_index(&engine);
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            arriving(&engine, CreateOrigin::Restored(held))
+        });
+        let coll = engine.get_collection("app", "docs").unwrap();
+        assert_eq!(coll.index("z_1").unwrap().created, Some(held), "the definition held stands");
+    }
+
+    #[test]
+    fn a_drop_of_an_index_not_held_whose_check_never_passes_is_an_error_not_an_abort() {
+        // The drop that records a tombstone for an index this member does not
+        // hold (ADR-141).
+        let (engine, coll, _dir) = engine();
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            engine.drop_index("app", "docs", "absent")
+        });
+        assert_eq!(
+            engine.index_dropped_at(coll.id, IndexMeta::derive_id("absent")).unwrap(),
+            None,
+            "nothing recorded"
+        );
+    }
+
+    #[test]
+    fn a_drop_of_an_index_held_whose_check_never_passes_is_an_error_not_an_abort() {
+        let (engine, _, _dir) = engine();
+        held_index(&engine);
+        crate::engine::definition_hooks::assert_exhausted("app.docs", || {
+            engine.drop_index("app", "docs", "z_1")
+        });
+        assert!(engine.get_collection("app", "docs").unwrap().index("z_1").is_some(), "still held");
     }
 
     #[test]
