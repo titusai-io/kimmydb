@@ -968,6 +968,15 @@ impl Metrics {
     pub fn render_with_at(&self, readings: &StorageReadings, now: Instant) -> String {
         // Read once: the worker's atomics move as it runs, and a render that
         // straddled an increment would show mismatched document/chunk pairs.
+        // One line per declared task, always, including the ones at 0: the rule
+        // for this page is that no series is conditional, so the label set comes
+        // from the declared task list rather than from what has happened to
+        // retry (`kimmy_task::declare`).
+        let task_retries = kimmy_task::retries()
+            .into_iter()
+            .map(|(task, n)| format!("kimmy_task_retries_total{{task=\"{task}\"}} {n}\n"))
+            .collect::<String>();
+
         let vc = self.vector_counters.get();
         let (embed_docs, embed_chunks, embed_deferred, embed_not_owned, embed_failures, transport) =
             match vc {
@@ -1032,6 +1041,9 @@ impl Metrics {
              # HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
+             # HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. Read it beside that task's progress age rather than alone.\n\
+             # TYPE kimmy_task_retries_total counter\n\
+             {task_retries}\
              # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.\n\
              # TYPE kimmy_runtime_stall_seconds gauge\n\
              kimmy_runtime_stall_seconds {stall}\n\

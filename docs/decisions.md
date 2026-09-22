@@ -18379,3 +18379,99 @@ The third arrived after this record was written, in ADR-181's own review. `decli
 | the version written at the end, not with the first index | two, measured across kimmy-storage's 686: the interrupted-migration test, which then finds schema 3 where an older build would open a half-rebuilt file, and the resume-refusal test, which reaches the resume through the version |
 | recording a rebuild's collisions in the same commit as the index's marker | both unique-collision tests, 2 of the same 686: the interrupted one reports nothing on the next open, and the uninterrupted one loses its report too |
 | the documented startup probe's budget, put back to `failureThreshold: 24` | the manifest guard, which computes the example's open from `MICROS_PER_DOCUMENT` and finds 240 s allowed against 252 s needed |
+
+## ADR-184 — A background task that dies stops the process
+
+**Decision.** Every long-lived background task is spawned through one supervisor. A **panic, or a return that should not have happened, ends the process** with status 70, after recording in the exit marker which task died and how. A **transient error is retried in place**, with backoff, for ever. The exclusions — one task per inbound connection, one per request — are named in code with their reasons, and a lint fails if a production spawn is neither supervised nor named.
+
+**The defect.** The release profile unwinds rather than aborting, and `start_and_serve` held a `JoinHandle` for every background task without awaiting any of them until shutdown. So a panicking task ended alone, with one plain-text line on stderr outside the structured log, and stayed ended until someone restarted the node. Some tasks ended without panicking at all: the embedding worker returned `Err` on any storage error but a lost position, and node.rs logged `embedding worker stopped` while embedding stayed stopped.
+
+Worst first, what each loss meant while nothing noticed: a dead **session invalidator** lets a revoked token keep working on this node until its TTL expires, which is a security defect rather than an availability one; a dead **retention collector** grows the oplog until the disk fills; a dead **stall probe** leaves `kimmy_runtime_stall_seconds` reading 0 — "no stall" — for ever.
+
+**Exiting rather than failing liveness**, for the reason R1 settled: compose consumes no health signal, so a node that fails liveness there is restarted by nothing. Exiting is the only restart that works in every deployment this ships into.
+
+**Not `panic = "abort"`.** That would make a panic anywhere fatal, including inside a request handler, which turns a crafted request into a remote kill switch. Supervision is per task and by name so that the tasks which must *not* be fatal simply are not supervised. `no_profile_makes_a_panic_abort_the_process` holds that open.
+
+### The inventory, and how it is kept honest
+
+Derived from the spawn sites rather than from a list: every `.rs` under `crates/`, read only as far as its own test module, matching `tokio::spawn`, `spawn_blocking` and `std::thread::spawn`. Twenty-one sites, of which fifteen are supervised.
+
+Reading the spawn sites tells you where a task starts, not what its ending means, and **two of fifteen classifications were wrong until they were run** — both listed below as judged tasks.
+
+| Task | Shape | A panic | A return |
+|---|---|---|---|
+| session invalidator | endless | revoked tokens keep working (**security**) | the same; it consumes the oplog and has no terminal condition |
+| retention collector | endless | the oplog and tombstones grow until the disk fills | the same |
+| TTL expiry | endless | owned collections never expire | the same |
+| replicate | endless | this node stops pulling | the same |
+| embedding worker | endless, retrying | owned collections stop getting vectors | a storage error is transient and retried; a clean return is a death, since it should never finish |
+| webhook dispatcher | endless | no deliveries for owned subscriptions | the same; its one early return is now a startup failure, below |
+| SWIM membership | endless | the member view freezes | the same |
+| replication server | endless | no peer can pull from this node | the same; its TLS failure is now a startup failure, below |
+| stall probe | endless | `kimmy_runtime_stall_seconds` reads 0 for ever — a signal that cannot fail | the same |
+| vector index invalidator | endless | a dropped collection keeps its graph resident and its snapshot on disk | the same |
+| cert reloader | endless | a renewed certificate is never picked up | the same |
+| JWKS refresher | endless | a rotated signing key is never fetched | the same |
+| **membership receiver** | **judged** | foca stops hearing anything and the member set freezes | `Expected("the membership loop it feeds has gone")`, or `Unexpected("the membership socket could not be read")` |
+| **membership announcer** | one-shot | a node never introduces itself to a seed | expected: it drains the seed feed and ends, and also ends when the receiver is gone |
+| membership timer | one-shot | a *lost* timer, which foca does not tolerate — it tolerates delay | expected: firing once is the whole job |
+
+**A judged task declares its own ending**, so those two reasons are the claim to check rather than a detail: a task that called its death ordinary would be supervised and still silent. The receiver's pair is the shape — one terminal condition that is ordinary, one that is not — and nothing outside the task can tell them apart, because both are just a return.
+
+**Supervising a parent does not cover its children.** `membership::run` spawns three tasks of its own. If the receiver dies, `run` goes on looping and stays alive, so the member set freezes exactly as if membership had died. That is the one place in the inventory where the parent's supervision is not enough, and it is why the three are supervised in their own right.
+
+**Deliberately not supervised**, because a panic in them must *not* stop the node: one task per inbound connection, whose own comment already states the rule; `spawn_blocking` inside a request, which is that request's work; the supervisor itself; and two one-shots whose ending is the point — the previous-JWT-secret reminder, which warns once, and the shutdown watcher, whose return *is* shutdown.
+
+**`every_long_lived_task_is_spawned_through_the_supervisor`** fails if a production spawn is neither supervised nor named in `NOT_SUPERVISED` with its reason, and **`every_supervised_name_is_in_the_task_list_and_every_entry_is_used`** fails if the names and `kimmy_task::TASKS` drift apart. The inventory is a property, not a snapshot.
+
+### Telling a shutdown apart from a death
+
+Every helper takes a `Shutdown`, announced **before** any step that could make a task return, and each helper checks it twice: once as a `select!` branch, and again after the task's own branch wins. The second check is load-bearing — `select!` picks a ready branch at random, so without it a task returning at the moment shutdown begins is a coin flip between a clean stop and a spurious exit.
+
+The announcement is made inside a wrapper around the signal, used by both serve paths, so there is no route from the signal to a drained server that skips it. It is also made before the aborts on the path where *serving itself failed* and no signal ever arrived; without that, aborting a supervised handle during an error exit would look like a cancellation and stop the process.
+
+**A cancellation is a clean stop, not a death.** Only our own `abort` cancels a handle, and every such call site is one of three things: the shutdown sequence in `node.rs`, `membership::run` ending its three children, or the supervisor's own shutdown branch. A cancellation arriving outside shutdown is logged at `INFO` with the task name, so a future stray `abort` on a supervised handle is never silent — that would be a death in costume.
+
+### The exit path, reusable
+
+A structured `error!` naming the task and cause first, because the steps after it can fail. Then the marker, through the mechanism the node already had: `Exit::TaskDied` with `task` and `cause` on the record, which the next start's `announce` reports at `WARN` — the only place an operator reliably reads why the process restarted itself. Then **status 70**, `EX_SOFTWARE`, distinct from the 1 a configuration error gives: nothing consumes it, since compose and Kubernetes restart on any non-zero, so its only job is to tell whoever reads it that the node stopped itself rather than failing to start.
+
+`process::exit` runs no destructors, so the engine is not closed cleanly. That is survivable — redb repairs an unclean file on the next open — but it means this is deliberately an unclean stop, and `announce`'s unclean warning fires beside the marker that distinguishes it.
+
+**A panic hook in addition to the supervisor's own `JoinError`, not instead of it.** The supervisor sees a panic only in a task it supervises. The hook catches one in a per-connection task, in `spawn_blocking`, and on the main thread, and it is the only place with the location at panic time. The default hook is kept and called after, so a backtrace an operator asked for still appears.
+
+`exit_because` is public because the same path serves every restart-worthy state: the poisoned-engine detector is meant to call it rather than grow an exit of its own.
+
+**With no reporter installed** — a test binary, or a second binary added later — a death still logs and still exits 70, on **stderr as well as through `tracing`**. That is not belt and braces: a process with no subscriber sends the structured line nowhere, and a test binary was vanishing with status 70 and no explanation at all until the stderr line was added.
+
+### Two permanent failures become startup failures
+
+Not additive, and the one behaviour change here that is not.
+
+- The **webhook dispatcher** built its delivery client inside the task and returned if it would not build, logging "no client, no deliveries — loudly". An error line at startup followed by silence for ever is not loud. The client is built before the task is spawned, so a failure fails `node::run`. **There is no configuration that turns webhook delivery off**: a subscription is created at runtime through the API, and the configuration's own validation refuses a zero payload cap on the grounds that a node "may deliver webhooks". So the duty is mandatory on every node.
+- The **replication server** built its TLS inside the task and returned on failure, with the comment "Fatal rather than a fall back to plaintext". It was fatal to that task only: the node went on serving while no peer could pull from it. The TLS is built before the node commits to serving, so a failure fails startup — and it is mandatory exactly when `cluster.enabled` is set, which is also when ADR-040's encryption is "always on, with no switch".
+
+Neither was a recorded decision. Both had the intent in a code comment and the opposite in the code, and this record makes the code match its own comments.
+
+### Retry-forever is a dead task in costume, and what sees it
+
+A task retrying a permanent error is alive, logs each attempt, and does no work — which supervision cannot distinguish from working, by design, because the rule is that a transient error never returns. **`kimmy_task_retries_total{task}`** (`kimmy.task.retries` on the OTLP bridge) is the writer's own account of it: every task has a sample from the first scrape, at 0. A rising count is the node recovering by itself; a count that keeps rising while the work does not progress is the case this series cannot resolve alone, and `operations.md` says to read it beside that task's progress age.
+
+The retry **policy** lives in `kimmy_task::Retry` — the counter, the log line, the backoff schedule — and the loop stays at the call site. A higher-order version taking the work as an async closure was written first and rejected on a compiler fact: the embedding worker's `run` takes `&mut self`, so the closure's future borrows it, and proving that future `Send` through a generic bound is not expressible on stable. Because the rule is then enforced at the call site rather than by the helper, a mutation row holds it.
+
+### Tests, and how they break
+
+| Taken out | Fails |
+|---|---|
+| the exit in the death path | both end-to-end death tests, and the two subprocess exit tests |
+| the second shutdown check after `select!` | the graceful-shutdown control |
+| announcing shutdown before the aborts | the same control |
+| `send_replace` in `begin`, back to `send` | the retry control, which then asks to be retried after shutdown has begun |
+| the judged receiver's `Expected` flipped to `Unexpected` | the membership tests, which stop the binary with status 70 |
+| the judged receiver's `Unexpected` flipped to `Expected` | the judged-death subprocess test |
+| treating a cancellation as a death again | the membership tests |
+| the embedding worker's loop returning `Err` instead of retrying | the retry control |
+| the panic message taken from `JoinError` | the panic test's assertion on the marker's cause |
+| the stderr line on the no-reporter path | the no-reporter test, which then sees status 70 and no explanation |
+| the spawn lint | its own control, an unsupervised spawn in a production file |
+| the name-list lint | its own two controls, a renamed task and a spurious entry |

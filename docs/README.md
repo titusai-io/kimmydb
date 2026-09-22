@@ -198,6 +198,7 @@ kimmydb/
 │   ├── kimmy-auth/      Argon2id, JWT, OIDC verification, RBAC, user store
 │   ├── kimmy-api/       axum router, WebSocket, JSON boundary
 │   ├── kimmy-cluster/   discovery, SWIM membership, replication transport
+│   ├── kimmy-task/      supervision for long-lived background tasks
 │   ├── kimmy-vector/    embeddings, HNSW, index cache, search
 │   ├── kimmy-mcp/       MCP server
 │   ├── kimmyd/          the server binary

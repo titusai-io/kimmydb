@@ -114,6 +114,7 @@ graph TB
 | `kimmy-auth` | Password hashing, tokens, the authorization decision | Know about HTTP |
 | `kimmy-api` | Routing, JSON⇄BSON, WebSocket, status codes, and the shared executor both edges call | Contain business logic beyond composing storage and query |
 | `kimmy-cluster` | Discovery, the wire protocol, anti-entropy replication, SWIM membership | Decide what wins — that is `kimmy-storage` |
+| `kimmy-task` | Supervise a long-lived task: a panic or an unexpected return stops the process, a transient error is retried in place ([ADR-184](decisions.md)) | Decide what stopping *means* — the daemon installs that, because the exit marker is its own |
 | `kimmy-vector` | Embedding providers, the worker, HNSW, index selection, search | Sit on the write path |
 | `kimmy-mcp` | MCP tools and resources | Re-implement authorization — it calls `kimmy_api::exec`, where the check lives |
 | `kimmyd` | Configuration, wiring, lifecycle | — |
