@@ -558,6 +558,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         process_resident_bytes: 9,
         process_resident_peak_bytes: 10,
         index_unkeyed: 11,
+        index_undecidable: 0,
         sync_ddl_relogged: 16,
         writer_wait: kimmy_storage::WriterWaitSnapshot::default(),
         writer_wait_timeouts: 12,

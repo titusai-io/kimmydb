@@ -442,6 +442,14 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.index.undecidable",
+            "{document}",
+            "Documents an index holds because its partial filter could not decide them; every \
+             scan re-checks them (ADR-185).",
+            index_undecidable
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.ttl.skipped",
             "{document}",
             "Expiry candidates refused because the document was refreshed first.",

@@ -18227,6 +18227,13 @@ A relaxed filter written by an earlier build is read as it was stored, which the
 
 ## ADR-183 — A partial filter selects exactly what `find` with the same expression returns
 
+> **Narrowed by [ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide).**
+> An index also holds the documents whose membership the filter *cannot
+> decide*, because the canonical order ranks a `Decimal128` equal to every
+> number. Membership is a superset of the selection, exact except for values
+> the order cannot rank. Everything below holds unchanged for every value it
+> can rank, which is every value but that one.
+
 **Decision.** A partial index holds exactly the documents `find` with its filter would return. Membership is `PartialFilter::selects`, built on `kimmy_core::matching`, the code `find` itself evaluates these operators with (ADR-181). The second rule index maintenance used, `PartialFilter::matches`, is removed. Containment (`implies`, `covered_by`) is re-derived against that one rule. Every partial index is **rebuilt once**, at open, by a storage migration from schema 3 to **schema 4**.
 
 **Why. The partial matcher and `find` were two languages with one syntax, and containment is a proof about one predicate applied to the other.** A differential over 19 value shapes, 15 filters and 21 queries, run through the planner's own `containment_predicates` and `covered_by`, found:
@@ -18379,3 +18386,90 @@ The third arrived after this record was written, in ADR-181's own review. `decli
 | the version written at the end, not with the first index | two, measured across kimmy-storage's 686: the interrupted-migration test, which then finds schema 3 where an older build would open a half-rebuilt file, and the resume-refusal test, which reaches the resume through the version |
 | recording a rebuild's collisions in the same commit as the index's marker | both unique-collision tests, 2 of the same 686: the interrupted one reports nothing on the next open, and the uninterrupted one loses its report too |
 | the documented startup probe's budget, put back to `failureThreshold: 24` | the manifest guard, which computes the example's open from `MICROS_PER_DOCUMENT` and finds 240 s allowed against 252 s needed |
+
+---
+
+## ADR-185 — A partial index holds the documents its filter cannot decide
+
+**Decision.** A partial index holds every document its filter selects, **plus every document holding a `Decimal128` at one of the filter's paths**. The extra documents go in the index's unkeyed run, which every scan re-checks against the full filter. Membership is therefore a superset of `find`'s selection, exact except for values the canonical order cannot rank. This narrows [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns) by name and changes nothing else about it.
+
+**This is a return to the documented architecture rather than a reversal of it.** [indexes.md](indexes.md) has always opened with the rule everything follows from: *"An index answers **which documents might match**. Only the filter decides membership"*, and *"every candidate an index produces is re-checked against the full filter"*. A candidate set that over-produces is exactly what that describes. ADR-183's "membership is `find`'s selection" was the stricter claim — true, useful, and one value short.
+
+### The defect
+
+The canonical order ranks a `Decimal128` equal to **every** number ([http-api.md](http-api.md), [key-encoding.md](key-encoding.md)), because it has nothing exact to compare with. So equality is not transitive, and containment reasoning that assumes it is will prove the wrong thing. A stored `Decimal128("1")`:
+
+- satisfies `{k: 7}`, `{k: {$gte: 6}}` and `{k: {$lte: 0}}`;
+- fails `{k: {$gt: 5}}` and `{k: {$lt: 9}}`.
+
+An index on `name` with the partial filter `{k: {$gt: 5}}` therefore does not hold it — and the planner will answer `{name: "d", k: 7}` from that index, because `Eq(7) ⇒ Gt(5)` holds for every number. The document is returned by `find` and missed by the indexed query. Silent wrong results, no error, no log line.
+
+Found by an independent review of #363 and **pre-existing**: main `f2d06d6` behaved identically, and ADR-183 neither caused it nor fixed it.
+
+### Why membership and not `implies`
+
+`PartialFilter::implies` is still not transitive for a `Decimal128`, and this record deliberately leaves it alone. Fixing it there was measured first, through the reviewer's differential — 442 partial filters × 1,412 queries × 432 documents driven through `plan::choose` and checked against `filter::matches`:
+
+| Rule | Index uses | Declined | Losing pairs |
+|---|---|---|---|
+| before | 14,698 | — | 825 |
+| containment must also hold for one value Equal to every number | 12,626 | 2,072 (14.1%) | **69 — still wrong** |
+| …plus witnesses for a decimal inside an array | 12,498 | 2,200 (15.0%) | **8 — still wrong** |
+| …plus witnesses from both bounds' numeric leaves | 12,490 | 2,208 (15.0%) | **9 — still wrong** |
+| decline any implication touching a number at all | 4,826 | 9,872 (**67.2%**) | 0 |
+| **this decision** | **14,698** | **0** | **0** |
+
+**Quantifying over witnesses does not converge.** Each refinement left a residue the next did not shrink — 69, then 8, then 9 — because array comparison is element-wise, so the breaking document pairs a `Decimal128` with an element drawn from *neither* bound: `{k: [Decimal128(1), 1]}` defeats `{k: {$gte: [1, 2]}}` used for `{k: {$gt: [5]}}`. The only sound rule of that family is the blunt one, and it declines two thirds of all index use.
+
+Widening membership costs no index use at all. Its price is index size, and a measured one: of 432 documents, **27** are held that the filter does not select — exactly the 27 that were being lost.
+
+**Revisiting the canonical order was not taken.** It is the root cause, and it reopens a contract two documents state and the whole key encoding is built on.
+
+### What "a path the filter constrains" means
+
+Exactly the filter's predicate paths, resolved as `find` resolves them. This needs no judgement because the language is small: `PartialFilter::parse` refuses anything but a conjunction of per-field predicates — no `$or`, no `$nor`, no `$elemMatch` — and its own error says why: *"so containment stays decidable"*. There is no disjunction to distribute and no element scope to decide.
+
+The test is `holds_decimal128` over the values the path resolves to, which searches the whole value. That is **wider than the minimum**, and deliberately: `{k: {a: Decimal128(1)}}` counts for a filter on `k` even though a document is never ranked against a number. Widening costs index size and a re-check; narrowing costs correctness, and the narrow version would need the same non-finite reasoning this record already rejected.
+
+### Its own `DocumentKeys` variant, not a flag
+
+`DocumentKeys::Undecidable` sits beside `Keyed` and `Unkeyed`, so every match site has to say which it means. The distinction is not cosmetic, and the first sketch of this record got it wrong in a way worth recording:
+
+**`unique_keys` refuses on the `Unkeyed` variant, before anything is filed.** Routing an undecidable document through `Unkeyed` therefore does not merely file it — it **refuses the insert**, of a document the filter does not even select. Measured, not assumed: today a document the filter does not select yields `Ok([])` from `unique_keys` and no enforcement; one it selects and cannot key yields the refusal.
+
+| Reason a document is unkeyed | What it means |
+|---|---|
+| the index **cannot key** it — arrays at two indexed paths, too many keys | a fault an operator can fix; a local refusal on a unique index; `WARN` per document; `kimmy_index_unkeyed_total` |
+| its **membership cannot be decided** | documented behaviour of a `Decimal128`; never a refusal; no uniqueness check; `DEBUG`; `kimmy_index_undecidable_total` |
+
+**A unique constraint applies to the subset the filter selects**, which is what makes "never enforced" right rather than a concession — [indexes.md](indexes.md) already described a partial unique index that way.
+
+### The two series, and why not one with a label
+
+`kimmy_index_unkeyed_total` counts a fault. Adding a `reason` label to it would have kept the name and quietly changed what the unlabelled series counts, so every existing alert on it would start firing on ordinary `Decimal128` writes — the exact dilution this record is trying to avoid. Two names, two meanings, and the old one means today what it meant yesterday. `kimmy_index_undecidable_total` is bridged as `kimmy.index.undecidable`.
+
+**No per-document `WARN`.** The filing is expected. Raising it to the level of the real fault is how an operator learns to ignore the real fault.
+
+### TTL is unaffected, and already guarded
+
+`expired_range` builds its bounds from dates and reads keyed entries only; the unkeyed run sorts below either bound. So an undecidable document is never an expiry candidate — correct, since the filter does not select it, and deleting it would be precisely the [ADR-181](#adr-181--expiry-deletes-a-document-only-if-its-indexs-filter-read-as-find-reads-it-still-selects-it) bug. That is `expiry_never_reads_the_unkeyed_run`, which already existed. ADR-181's re-check is unchanged and still guards the rest.
+
+### The version, and the release order
+
+**This folds into the unreleased schema 3 → 4 rebuild, and only if it merges before a release carrying schema 4.** Schema 4 is unreleased — 0.33.0 is schema 3 — so no deployed database holds entries under the old membership rule, and the 3 → 4 rebuild builds this one directly. One rebuild, no compatibility shim. **If a release containing schema 4 ships first, this needs schema 5 and a rebuild of its own**, because entries would then mean something different from what a deployed database already holds.
+
+The rebuild's log line names the widened rule, so an operator watching the migration reads what the index will hold.
+
+### Tests, and how they break
+
+| Taken out | What fails |
+|---|---|
+| the filing rule — `undecidable_path` always answers `None` | `a_chosen_partial_index_holds_every_document_find_returns`, with **825** losing (filter, query) pairs: the reviewer's number, reproduced in-tree |
+| the `Undecidable` arm in `unique_keys`, routed to the refusal instead | `a_unique_partial_index_does_not_refuse_a_document_it_cannot_decide` |
+| the separate counter, folded back into `unkeyed_writes` | the same test, on the two assertions that separate the series |
+| the backfill's arm | `a_backfill_holds_the_documents_the_filter_cannot_decide` |
+| agreement between `document_keys` and the modelled membership | `a_partial_index_holds_exactly_what_the_filter_decides_or_cannot` |
+
+`a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s.
+
+The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` stated the rule as "outside the filter means absent", which stopped being the whole truth. It is renamed and widened rather than left to contradict the code.

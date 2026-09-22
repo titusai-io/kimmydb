@@ -992,12 +992,16 @@ mod tests {
 /// ADR-183: a partial index is used only for a query whose every match it
 /// holds, judged through the planner's own `containment_predicates`.
 ///
-/// **Except for a document value that is a `Decimal128`**, where the canonical
-/// order's ranking of one as equal to every number makes equality
-/// non-transitive and so makes `implies` unsound. Known, filed as its own
-/// finding, and not fixed here: see `PartialFilter::implies` in `kimmy-core`
-/// for the mechanism and ADR-183 for why a fix needs its own record. The
-/// corpora below hold no `Decimal128` for that reason.
+/// `implies` is **still** not transitive for a `Decimal128` document value, and
+/// ADR-185 did not change that: the canonical order ranks one equal to every
+/// number, so `Eq(5)` and `Eq(6)` both hold on one while neither implies the
+/// other. What ADR-185 changed is what the index *holds* — a document the
+/// filter cannot decide is held for the scan to re-check — so the end-to-end
+/// property is sound even though this one is not. The corpora below hold no
+/// `Decimal128` because these cases are about implication alone;
+/// `partial_containment.rs` is where a `Decimal128` belongs, and it asserts the
+/// property that matters: every document `find` returns is one the chosen index
+/// holds.
 #[cfg(test)]
 mod containment_is_sound {
     use super::*;

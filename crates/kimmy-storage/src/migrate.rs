@@ -387,8 +387,9 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
             largest_collection_documents = plan.largest_documents,
             largest_needs_free_mib = plan.largest_needs_mib(),
             plus_growth_step_mib = REDB_GROWTH_STEP_MIB,
-            "rebuilding every partial index so its membership is what find selects (ADR-183), \
-             before this node serves anything; each index is rebuilt in one transaction and \
+            "rebuilding every partial index so its membership is what find selects, plus the documents \
+             the filter cannot decide because a Decimal128 ranks equal to every number \
+             (ADR-183, ADR-185), before this node serves anything; each index is rebuilt in one transaction and \
              needs about its own size free inside the database file, up to the figure for the \
              largest -- and if the file's slack does not cover it, redb extends the file by its \
              growth step, so allow the two added together"
@@ -430,6 +431,15 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
                             entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
                             built += 1;
                         }
+                    }
+                    // The 3 -> 4 rebuild is where option-2 membership is
+                    // built for an existing database (ADR-185): a document the
+                    // filter cannot decide goes into the unkeyed run here,
+                    // exactly as a later write would file it.
+                    crate::index::DocumentKeys::Undecidable { .. } => {
+                        entries
+                            .insert((meta.id.0, index.id, crate::index::UNKEYED, doc_key), ())?;
+                        built += 1;
                     }
                     crate::index::DocumentKeys::Unkeyed { multikey: many, .. } => {
                         multikey |= many;
@@ -1138,7 +1148,8 @@ mod tests {
 }
 
 /// ADR-183: the schema 3 -> 4 migration rebuilds every partial index so its
-/// membership is what `find` selects.
+/// membership is what `find` selects — and, since ADR-185, the documents whose
+/// membership the filter cannot decide.
 #[cfg(test)]
 mod membership_migration {
     use std::cmp::Ordering;

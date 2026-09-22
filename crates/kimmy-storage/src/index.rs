@@ -54,6 +54,24 @@ pub(crate) enum DocumentKeys {
     /// `multikey` is still reported: a document with arrays at two indexed
     /// paths held arrays, and the flag is a one-way observation of that.
     Unkeyed { reason: String, multikey: bool },
+    /// Membership cannot be decided, because the canonical order cannot rank
+    /// the value the partial filter would be tested against. Filed under
+    /// [`UNKEYED`] for re-check; **never enforced; never a refusal**
+    /// ([ADR-185](../../../docs/decisions.md)).
+    ///
+    /// The distinction from [`Self::Unkeyed`] is the whole of ADR-185 and is
+    /// not cosmetic. That one is a fault an operator can fix — reshape the
+    /// document, or split the index — and it is refused outright on a local
+    /// write against a unique index. This one is the documented behaviour of a
+    /// `Decimal128`, which the canonical order ranks equal to every number, so
+    /// the filter's answer is genuinely unknown rather than wrong. Refusing it
+    /// would refuse an ordinary insert of a document the filter does not even
+    /// select, and warning about it would teach an operator to ignore the
+    /// warning that matters.
+    ///
+    /// A separate variant rather than a flag on `Unkeyed`, so that every match
+    /// site has to say which it means.
+    Undecidable { reason: String },
 }
 
 /// Compute every index key a document contributes, refusing a document the
@@ -71,6 +89,10 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
         DocumentKeys::Unkeyed { reason, .. } => {
             Err(StorageError::Core(CoreError::InvalidQuery(reason)))
         }
+        // Not a refusal: the index *can* key this document, it simply may not
+        // hold it, and the answer is unknown (ADR-185). No keys, because a
+        // document the filter does not select contributes none.
+        DocumentKeys::Undecidable { .. } => Ok(Vec::new()),
     }
 }
 
@@ -95,9 +117,11 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
 /// The only error left is a partial filter that will not parse, which is a
 /// fact about the definition rather than the document.
 pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<DocumentKeys> {
-    // A partial index holds only the documents its filter selects, as `find`
-    // reads the filter (ADR-183) -- the rule containment is proven against,
-    // and the one TTL expiry re-checks before it deletes. Returning
+    // A partial index holds the documents its filter selects, as `find` reads
+    // the filter (ADR-183), **plus those it cannot decide** (ADR-185) -- so
+    // membership is a superset of the selection, exact except for values the
+    // canonical order cannot rank. That is the rule containment is proven
+    // against, and the one TTL expiry re-checks before it deletes. Returning
     // no keys here is what makes membership fall out of the ordinary
     // maintenance path: entering the filter adds entries, leaving it removes
     // them, because `apply_entries` derives both sides from this function.
@@ -106,10 +130,29 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
     // the multikey flag — an array it holds is not in the index, so it cannot
     // make an index range unsound. Nor is such a document ever unkeyed: it is
     // not in the index at all.
-    if let Some(filter) = index.partial()
-        && !filter?.selects(doc)
-    {
-        return Ok(DocumentKeys::Keyed { keys: Vec::new(), multikey: false });
+    if let Some(filter) = index.partial() {
+        let filter = filter?;
+        if !filter.selects(doc) {
+            // ADR-185: "does not select it" is only an answer when the
+            // comparison behind it can be trusted. A `Decimal128` at one of
+            // the filter's paths ranks equal to every number, so the index
+            // holds the document and the scan re-checks it, rather than
+            // deciding membership on a comparison that is not an order.
+            //
+            // No `multikey` either way: the document is not selected, so no
+            // array it holds is in the index, and the flag would make a range
+            // over this index unsound for a document it does not hold.
+            if let Some(path) = filter.undecidable_path(doc) {
+                return Ok(DocumentKeys::Undecidable {
+                    reason: format!(
+                        "{path} holds a Decimal128, which the canonical order ranks equal to \
+                         every number, so this index's partial filter cannot decide whether the \
+                         document belongs"
+                    ),
+                });
+            }
+            return Ok(DocumentKeys::Keyed { keys: Vec::new(), multikey: false });
+        }
     }
 
     // Per field, the set of values this document offers.
@@ -201,6 +244,15 @@ fn unique_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
         DocumentKeys::Unkeyed { reason, .. } => Err(StorageError::Core(CoreError::InvalidQuery(
             format!("{reason}; a unique index must be able to key every document it covers"),
         ))),
+        // **Never a refusal** (ADR-185). A unique constraint applies to the
+        // documents the filter selects, and this is one the filter does not
+        // select -- so there is nothing to enforce and no client to tell.
+        // Refusing here would reject an ordinary insert of a document that is
+        // not in the index's subset at all, which is how the first sketch of
+        // ADR-185 broke: `Unkeyed` is refused by this function before anything
+        // is ever filed, so routing membership through it turned a widened
+        // index into a rejected write.
+        DocumentKeys::Undecidable { .. } => Ok(Vec::new()),
     }
 }
 
@@ -385,7 +437,9 @@ fn apply_entries(
                         table.remove((coll.id.0, index.id, key.as_slice(), doc_key))?;
                     }
                 }
-                DocumentKeys::Unkeyed { .. } => {
+                // Both unkeyed shapes are filed in the same run, so both are
+                // unfiled from it the same way.
+                DocumentKeys::Unkeyed { .. } | DocumentKeys::Undecidable { .. } => {
                     table.remove((coll.id.0, index.id, UNKEYED, doc_key))?;
                 }
             }
@@ -401,6 +455,27 @@ fn apply_entries(
                 DocumentKeys::Unkeyed { reason, multikey } => {
                     table.insert((coll.id.0, index.id, UNKEYED, doc_key), ())?;
                     (multikey, Some(reason))
+                }
+                DocumentKeys::Undecidable { reason } => {
+                    table.insert((coll.id.0, index.id, UNKEYED, doc_key), ())?;
+                    // Counted, and at DEBUG rather than WARN: this filing is
+                    // the documented behaviour of a Decimal128 under a partial
+                    // filter, not a fault anyone can fix (ADR-185). A warning
+                    // per document would be indistinguishable from the one
+                    // above, which *is* a fault, and the way to make an
+                    // operator ignore that one is to raise it for something
+                    // ordinary.
+                    engine.count_undecidable(1);
+                    tracing::debug!(
+                        db = %coll.db,
+                        collection = %coll.name,
+                        index = %index.name,
+                        id = %id_of(new),
+                        reason = %reason,
+                        "a partial filter cannot decide this document, so the index holds it for \
+                         the scan to re-check, counted in kimmy_index_undecidable_total"
+                    );
+                    (false, None)
                 }
             };
             if multikey && !index.multikey {
@@ -1192,7 +1267,7 @@ impl crate::Engine {
         // the flag's only chance to see them — for a replicated unique index,
         // the keys the existing documents already share, and how many documents
         // were filed unkeyed.
-        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize)> {
+        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize, usize)> {
             let docs = txn.open_table(tables::DOCS)?;
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             // What a unique index has filed so far. Locally only the keys
@@ -1205,6 +1280,7 @@ impl crate::Engine {
                 Default::default();
             let mut observed_multikey = false;
             let mut unkeyed = 0usize;
+            let mut undecidable = 0usize;
 
             for entry in docs.range(crate::engine::doc_range(meta.id))? {
                 let (raw_key, raw_value) = entry?;
@@ -1214,6 +1290,15 @@ impl crate::Engine {
 
                 let (keys, multikey) = match document_keys(index, &doc)? {
                     DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
+                    // Filed, and **not** a refusal even for a local unique
+                    // index (ADR-185): the filter does not select it, so the
+                    // constraint does not reach it. Counted separately, since
+                    // it is not the operator problem the arm below is.
+                    DocumentKeys::Undecidable { .. } => {
+                        entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
+                        undecidable += 1;
+                        continue;
+                    }
                     DocumentKeys::Unkeyed { reason, multikey } => {
                         // A unique index must be able to key every document
                         // it covers, and a client creating one is there to be
@@ -1266,13 +1351,13 @@ impl crate::Engine {
                 .map(|(key, holders)| UniqueViolation { index: index.name.clone(), key, holders })
                 .collect();
             violations.sort_by(|a, b| a.key.cmp(&b.key));
-            Ok((observed_multikey, violations, unkeyed))
+            Ok((observed_multikey, violations, unkeyed, undecidable))
         };
 
-        let (violations, unkeyed) = match build(&index) {
-            Ok((observed, violations, unkeyed)) => {
+        let (violations, unkeyed, undecidable) = match build(&index) {
+            Ok((observed, violations, unkeyed, undecidable)) => {
                 index.multikey = observed;
-                (violations, unkeyed)
+                (violations, unkeyed, undecidable)
             }
             Err(e) => {
                 txn.abort()?;
@@ -1326,6 +1411,19 @@ impl crate::Engine {
                 differs = %loser.differences(&index).join(", "),
                 "replaced an index with a peer's definition of the same name, created later; \
                  the members now agree on the later definition"
+            );
+        }
+        if undecidable > 0 {
+            // Once per build, and at DEBUG: unlike the arm below, this is a
+            // documented outcome rather than a fault (ADR-185).
+            self.count_undecidable(undecidable as u64);
+            tracing::debug!(
+                db,
+                collection,
+                index = %index.name,
+                documents = undecidable,
+                "built an index over documents its partial filter cannot decide; it holds them \
+                 for the scan to re-check, counted in kimmy_index_undecidable_total"
             );
         }
         if unkeyed > 0 {
@@ -1791,6 +1889,8 @@ where
     fn first_entry_for(&self, doc: &Document, key: &[u8]) -> Result<bool> {
         // `document_keys` returns them sorted, so the first in range is the
         // least.
+        // Unkeyed either way (ADR-185), and an unkeyed entry holds no key a
+        // range can reach.
         let DocumentKeys::Keyed { keys, .. } = document_keys(self.index, doc)? else {
             return Ok(false);
         };
@@ -2356,19 +2456,89 @@ mod tests {
     }
 
     #[test]
-    fn a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent() {
-        // Whatever shape a document has, a partial index that does not
-        // select it holds nothing for it — not even an unkeyed entry, which
-        // would make it a candidate for a query it cannot match.
+    fn a_document_the_filter_decides_against_is_absent_but_one_it_cannot_decide_is_held() {
+        // Renamed and widened by ADR-185. The old name --
+        // `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` --
+        // stated the rule as "outside the filter means absent", which stopped
+        // being the whole truth: it is absent when the filter's answer can be
+        // trusted, and held for re-check when it cannot.
         let mut idx = index(vec![IndexField::ascending("a"), IndexField::ascending("b")], false);
         idx.partial_filter = Some(doc! { "kind": "keep" });
+
+        // Decided against: nothing is held for it, not even an unkeyed entry,
+        // which would make it a candidate for a query it cannot match.
         let outside = doc! { "kind": "drop", "a": [1, 2], "b": [3, 4] };
         assert_eq!(
             document_keys(&idx, &outside).unwrap(),
             DocumentKeys::Keyed { keys: Vec::new(), multikey: false }
         );
+
+        // Selected, and unkeyable for its own reason: still unkeyed.
         let inside = doc! { "kind": "keep", "a": [1, 2], "b": [3, 4] };
         assert!(matches!(document_keys(&idx, &inside).unwrap(), DocumentKeys::Unkeyed { .. }));
+
+        // Undecidable: the filter says "no" on a comparison that is not an
+        // order, so the index holds it and the scan re-checks it (ADR-185).
+        let mut ranked = index(vec![IndexField::ascending("a")], false);
+        ranked.partial_filter = Some(doc! { "k": { "$gt": 5 } });
+        let decimal = doc! { "k": Bson::Decimal128("1".parse().unwrap()), "a": 1 };
+        assert!(
+            !kimmy_core::PartialFilter::parse(&doc! { "k": { "$gt": 5 } })
+                .unwrap()
+                .selects(&decimal),
+            "premise: the filter does not select it, so this is the not-selected path"
+        );
+        match document_keys(&ranked, &decimal).unwrap() {
+            DocumentKeys::Undecidable { reason } => {
+                assert!(reason.contains("Decimal128"), "{reason}");
+                assert!(reason.contains('k'), "it names the path: {reason}");
+            }
+            other => panic!("a Decimal128 at a filtered path is undecidable, got {other:?}"),
+        }
+
+        // And a plain number at the same path is decided, not held: the
+        // widening reaches the values the order cannot rank and nothing else.
+        let plain = doc! { "k": 1, "a": 1 };
+        assert_eq!(
+            document_keys(&ranked, &plain).unwrap(),
+            DocumentKeys::Keyed { keys: Vec::new(), multikey: false },
+            "1 is below the bound and the order can say so, so the index holds nothing for it"
+        );
+    }
+
+    #[test]
+    fn a_partial_index_holds_exactly_what_the_filter_decides_or_cannot() {
+        // The pin for `partial_containment.rs` in kimmy-query, which models
+        // membership as `selects(d) || undecidable_path(d).is_some()` because
+        // it cannot reach this function. If `document_keys` ever stops
+        // agreeing with that pair, the differential would be proving a rule
+        // the storage layer does not implement -- a test passing about
+        // something nobody ships.
+        let mut idx = index(vec![IndexField::ascending("a")], false);
+        let filter_doc = doc! { "k": { "$gt": 5 } };
+        idx.partial_filter = Some(filter_doc.clone());
+        let filter = kimmy_core::PartialFilter::parse(&filter_doc).unwrap();
+
+        let dec = Bson::Decimal128("1".parse().unwrap());
+        let docs = [
+            doc! { "k": 9, "a": 1 },
+            doc! { "k": 1, "a": 1 },
+            doc! { "k": dec.clone(), "a": 1 },
+            doc! { "k": [dec.clone(), 2], "a": 1 },
+            doc! { "a": 1 },
+            doc! { "k": "x", "a": 1 },
+        ];
+        let mut held = 0;
+        for d in &docs {
+            let modelled = filter.selects(d) || filter.undecidable_path(d).is_some();
+            let actual = !matches!(
+                document_keys(&idx, d).unwrap(),
+                DocumentKeys::Keyed { ref keys, .. } if keys.is_empty()
+            );
+            assert_eq!(modelled, actual, "membership disagrees for {d}");
+            held += usize::from(actual);
+        }
+        assert_eq!(held, 3, "premise: some are held and some are not ({docs:?})");
     }
 
     #[test]
@@ -3880,6 +4050,108 @@ mod tests {
             agree(&engine, &coll, doc! { "a": 1, "b": 3 });
             agree(&engine, &coll, doc! { "a": 2 });
             agree(&engine, &coll, doc! { "b": { "$in": [3, 4] }, "a": 1 });
+        }
+
+        #[test]
+        fn a_backfill_holds_the_documents_the_filter_cannot_decide() {
+            // The other order: the documents first, the definition second.
+            // The backfill has its own refusal for a local unique index, and
+            // ADR-185 must not trip it -- creating the index over a
+            // Decimal128 the filter does not select is an ordinary create.
+            let (engine, _, _dir) = engine();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let dec = Bson::Decimal128("1".parse().unwrap());
+            engine.insert(&coll, doc! { "_id": 1i64, "k": dec.clone(), "a": 1 }).unwrap();
+            engine.insert(&coll, doc! { "_id": 2i64, "k": 9, "a": 2 }).unwrap();
+            engine.insert(&coll, doc! { "_id": 3i64, "k": 1, "a": 3 }).unwrap();
+
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a")],
+                    true,
+                    Default::default(),
+                    Some("a_gt5".into()),
+                    None,
+                    Some(doc! { "k": { "$gt": 5 } }),
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let id = index_id(&coll, "a_gt5");
+            assert_eq!(
+                engine.unkeyed_count(&coll, id).unwrap(),
+                1,
+                "the Decimal128 document is held for re-check; the 9 is keyed and the 1 is \
+                 decided against"
+            );
+            assert_eq!(engine.undecidable_writes(), 1);
+            assert_eq!(engine.unkeyed_writes(), 0, "not the operator-facing series");
+        }
+
+        #[test]
+        fn a_unique_partial_index_does_not_refuse_a_document_it_cannot_decide() {
+            // ADR-185, and the reason the new state is its own variant rather
+            // than a flag on `Unkeyed`. A unique constraint applies to the
+            // documents the filter selects; this is one the filter does not
+            // select, so there is nothing to enforce and nothing to refuse.
+            //
+            // The first sketch of ADR-185 filed these through
+            // `DocumentKeys::Unkeyed`, and `unique_keys` refuses on that
+            // variant *before* anything is filed -- so a widened index would
+            // have turned an ordinary insert into a rejected write. This test
+            // is that mistake, held open.
+            let (engine, _, _dir) = engine();
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a")],
+                    true,
+                    Default::default(),
+                    Some("a_gt5".into()),
+                    None,
+                    Some(doc! { "k": { "$gt": 5 } }),
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+
+            let dec = Bson::Decimal128("1".parse().unwrap());
+            engine.insert(&coll, doc! { "_id": 1i64, "k": dec.clone(), "a": 1 }).unwrap();
+            assert!(
+                engine.get(&coll, &DocId::Int64(1)).unwrap().is_some(),
+                "the write is accepted: a unique index does not reach a document its filter \
+                 does not select"
+            );
+
+            // A second document with the same `a`, also undecidable. Under a
+            // unique index this must still be accepted: neither is in the
+            // constraint's subset, so they cannot collide within it.
+            engine.insert(&coll, doc! { "_id": 2i64, "k": dec.clone(), "a": 1 }).unwrap();
+            assert!(engine.get(&coll, &DocId::Int64(2)).unwrap().is_some(), "and so is the second");
+
+            let id = index_id(&coll, "a_gt5");
+            assert_eq!(
+                engine.unkeyed_count(&coll, id).unwrap(),
+                2,
+                "both are held, in the unkeyed run, for the scan to re-check"
+            );
+            assert_eq!(
+                engine.undecidable_writes(),
+                2,
+                "counted as undecidable, which is the series an operator can ignore"
+            );
+            assert_eq!(
+                engine.unkeyed_writes(),
+                0,
+                "and not as unkeyed, which is the series that means someone's documents are not \
+                 being indexed properly"
+            );
+
+            // The constraint still bites inside the subset it covers.
+            engine.insert(&coll, doc! { "_id": 3i64, "k": 9, "a": 7 }).unwrap();
+            let err = engine.insert(&coll, doc! { "_id": 4i64, "k": 9, "a": 7 }).unwrap_err();
+            assert!(err.to_string().contains("already holds this value"), "{err}");
         }
 
         #[test]

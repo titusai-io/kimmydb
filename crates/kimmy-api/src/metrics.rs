@@ -86,6 +86,7 @@ pub struct StorageReadings {
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
+    pub index_undecidable: u64,
     /// Schema changes a snapshot restore appended to the oplog since start
     /// (`Engine::ddl_relogged`, ADR-180). A reading rather than a counter
     /// here: the engine counts each once its commit lands, which a round's
@@ -210,6 +211,7 @@ pub struct MetricsSnapshot {
     /// key the index could derive, so every scan of that index rechecks
     /// them (ADR-139). One of the engine's readings.
     pub index_unkeyed: u64,
+    pub index_undecidable: u64,
     /// Writes that gave up waiting for the writer, and the longest hold in
     /// microseconds (ADR-151); the wait histogram itself is not bridged.
     pub write_lock_wait_timeouts: u64,
@@ -866,6 +868,7 @@ impl Metrics {
             ttl_skipped: self.get(&self.ttl_skipped),
             ttl_skipped_filter: self.get(&self.ttl_skipped_filter),
             index_unkeyed: readings.index_unkeyed,
+            index_undecidable: readings.index_undecidable,
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
@@ -1070,6 +1073,9 @@ impl Metrics {
              # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
+             # HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.\n\
+             # TYPE kimmy_index_undecidable_total counter\n\
+             kimmy_index_undecidable_total {index_undecidable}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
              # TYPE kimmy_webhook_deliveries_total counter\n\
              kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
@@ -1217,6 +1223,7 @@ impl Metrics {
             ttl_skipped = self.get(&self.ttl_skipped),
             ttl_skipped_filter = self.get(&self.ttl_skipped_filter),
             index_unkeyed = readings.index_unkeyed,
+            index_undecidable = readings.index_undecidable,
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
@@ -1724,6 +1731,7 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
+            index_undecidable: 4,
             sync_ddl_relogged: 91,
             writer_wait: kimmy_storage::WriterWaitSnapshot {
                 buckets: [1, 2, 0, 0, 3, 0, 0, 1],
@@ -2160,6 +2168,9 @@ kimmy_ttl_skipped_filter_total 93
 # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
+# HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.
+# TYPE kimmy_index_undecidable_total counter
+kimmy_index_undecidable_total 4
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
 # TYPE kimmy_webhook_deliveries_total counter
 kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2
@@ -2733,7 +2744,9 @@ kimmy_sync_serve_walk_seconds_count 1201
         // and the serve walk's 12 buckets, +Inf, sum and count. Since
         // ADR-178, one scalar for embedding skipped for want of a shadow;
         // since ADR-180, one for schema changes a snapshot restore re-logged;
-        // since ADR-181, one for expiry declined by the partial filter.
+        // since ADR-181, one for expiry declined by the partial filter; and
+        // since ADR-185, one for documents an index holds because its partial
+        // filter could not decide them.
         assert_eq!(
             samples,
             107 + 6
@@ -2743,7 +2756,10 @@ kimmy_sync_serve_walk_seconds_count 1201
                 + 12 * kimmy_storage::WriterHolder::COUNT
                 + 1
                 + 5
-                + 15,
+                + 15
+                // ADR-185: one for documents an index holds because its
+                // partial filter could not decide them.
+                + 1,
             "expected one sample per series: {out}"
         );
     }

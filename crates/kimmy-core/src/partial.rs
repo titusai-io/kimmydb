@@ -121,17 +121,26 @@ impl PartialOp {
     /// - **`{k: null}` matches a missing field**, so it implies nothing about
     ///   presence and no bound: only itself.
     ///
-    /// **Unsound for a document value that is a `Decimal128`, knowingly.** This
-    /// reasons through a single value `w`, which assumes equality is transitive.
-    /// `canonical_cmp` ranks a `Decimal128` equal to every number — the settled
-    /// contract in `docs/http-api.md` and `docs/key-encoding.md` — so `Eq(5)` and
-    /// `Eq(6)` both hold on one while neither implies the other, and a query can
-    /// be judged contained by a filter whose index does not hold the document.
-    /// Filed as the finding whose slug ends `-because-equality-with-a-decimal128-is-not-transitive`
-    /// (recorded in full in ADR-183); not fixed here, because a fix
-    /// trades index use for soundness under a contract that has not been
-    /// reopened. The soundness property's corpus therefore holds no
-    /// `Decimal128`.
+    /// **Not transitive for a document value that is a `Decimal128`, and that
+    /// is answered elsewhere.** This reasons through a single value `w`, which
+    /// assumes equality is transitive. `canonical_cmp` ranks a `Decimal128`
+    /// equal to every number — the settled contract in `docs/http-api.md` and
+    /// `docs/key-encoding.md` — so `Eq(5)` and `Eq(6)` both hold on one while
+    /// neither implies the other, and a query can be judged contained by a
+    /// filter that does not *select* the document.
+    ///
+    /// [ADR-185](../../../docs/decisions.md) left this function alone and
+    /// widened membership instead: an index also holds the documents its
+    /// filter cannot decide (see [`Self::undecidable_path`]), so being
+    /// contained by a filter that does not select a document no longer means
+    /// the index lacks it. Making `implies` itself sound was measured and
+    /// rejected — quantifying over witnesses does not converge, and the rule
+    /// that is sound declines 67% of index uses.
+    ///
+    /// The soundness property below still holds no `Decimal128`, because it is
+    /// about implication alone and implication is still not transitive. The
+    /// end-to-end property, which is the one that matters and which does hold,
+    /// is `partial_containment.rs` in `kimmy-query`.
     pub fn implies(&self, other: &PartialOp) -> bool {
         use crate::cmp::same_type_group;
         let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);
@@ -233,6 +242,36 @@ impl PartialFilter {
     /// judged against the one while `find` answered by the other.
     pub fn selects(&self, doc: &Document) -> bool {
         self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
+    }
+
+    /// The first path at which this filter's answer for `doc` cannot be
+    /// trusted, because a value there holds a `Decimal128`.
+    ///
+    /// [ADR-185](../../../docs/decisions.md). The canonical order ranks a
+    /// `Decimal128` equal to every number, so `selects` returns an answer that
+    /// is *an* answer rather than *the* answer: the same value satisfies
+    /// `{$eq: 5}` and `{$eq: 6}` and fails `{$gt: 5}`. A document like that is
+    /// held by the index anyway, for the scan to re-check, because a
+    /// membership decision made on an untrustworthy comparison is how a
+    /// partial index came to miss documents `find` returns.
+    ///
+    /// **Read through the same resolution as [`Self::selects`]**, so the two
+    /// cannot disagree about which values a path offers.
+    ///
+    /// Deliberately wider than the minimum: `holds_decimal128` searches the
+    /// whole value, so `{k: {a: Decimal128(1)}}` counts for a filter on `k`
+    /// even though a document is never ranked against a number. Widening costs
+    /// index size and a re-check; narrowing costs correctness, and the narrow
+    /// version would have to reason about where inside a value a comparison
+    /// actually reaches — which is the reasoning ADR-185 rejected as not
+    /// finite.
+    pub fn undecidable_path(&self, doc: &Document) -> Option<&str> {
+        self.predicates.iter().find_map(|(field, _)| {
+            path::resolve(doc, field)
+                .iter()
+                .any(|v| crate::cmp::holds_decimal128(v))
+                .then_some(field.as_str())
+        })
     }
 
     /// Whether a query carrying `query` is provably contained by this filter.

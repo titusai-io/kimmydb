@@ -116,9 +116,9 @@ refused.** This release moves the storage schema to 4
   later does not compile until it has been classified.
 
 - **A partial index now holds exactly what `find` with its filter returns,
-  and is used only for a query whose every match it holds — with one exception,
-  a document value that is a `Decimal128`**
-  ([ADR-183](docs/decisions.md)). Membership had its own rule, which differed
+  and is used only for a query whose every match it holds**
+  ([ADR-183](docs/decisions.md), and [ADR-185](docs/decisions.md) for the
+  `Decimal128` exception, which is closed below). Membership had its own rule, which differed
   from `find` in three ways:
   - it never matched a whole array, so `{k: [1, 2]}` did not hold a document
     whose `k` is `[1, 2]`;
@@ -132,6 +132,46 @@ refused.** This release moves the storage schema to 4
   was enforced on the wrong documents. Existing partial indexes are rebuilt
   at startup (above), and duplicates the rebuild finds in a unique one are
   reported as a replicated build's are, not refused.
+
+- **A query answered from a partial index no longer misses a document holding a
+  `Decimal128`** ([ADR-185](docs/decisions.md)). The canonical order ranks a
+  `Decimal128` equal to *every* number, because there is nothing exact to
+  compare it with. So a stored `Decimal128` satisfies `{k: 7}` and fails
+  `{k: {$gt: 5}}`, and an index filtered on `{k: {$gt: 5}}` did not hold it —
+  while the planner would still answer `{k: 7}` from that index, because
+  `7 > 5` for every number. **The document was returned by a collection scan
+  and missed by the indexed query, silently.** A reviewer's differential found
+  825 (filter, query) pairs that lost documents this way, every one of them
+  involving a stored `Decimal128`.
+
+  Such a document is now **held by the index** — in the unkeyed run, which every
+  scan re-checks against the full filter — even when the filter does not select
+  it. Index membership is a superset of what `find` selects, exact except for
+  values the order cannot rank. This costs no index use: the planner chooses
+  the same indexes it did before.
+
+  **Nothing you write changes.** A `Decimal128` is still refused as a filter
+  operand, an index bound, a sort key and an expression literal, so only a
+  stored document value reaches this case. A **unique** partial index does not
+  enforce anything on such a document and does not refuse it, because a partial
+  unique constraint applies to the documents its filter selects. A **TTL**
+  index never expires one.
+
+  **It costs index size**, and the new counter below says how much. This was
+  pre-existing — 0.33.0 and earlier behave the same way — and is fixed by the
+  same schema 3 → 4 rebuild [above](#unreleased), with no separate migration.
+
+### Added
+
+- **`kimmy_index_undecidable_total`** (`kimmy.index.undecidable` on the OTLP
+  bridge) counts documents an index holds because its partial filter could not
+  decide them ([ADR-185](docs/decisions.md)). **Expected, not a fault**: it
+  rises whenever a document holding a `Decimal128` at a filtered path is
+  written, needs no action, and is logged at debug rather than warning. It is a
+  **separate series** from `kimmy_index_unkeyed_total`, which counts documents
+  an index could not key at all — that one is worth an alert, and keeping them
+  apart is what stops this one diluting it. A scrape config or a golden list
+  that enumerates series needs the new name.
 
   **The exception, which is not new and is not fixed here:** a document whose
   indexed value is a `Decimal128` can still be missed. The canonical order ranks
