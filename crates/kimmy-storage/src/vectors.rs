@@ -100,6 +100,8 @@ impl crate::Engine {
         by: Configured,
         history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<CollectionMeta> {
+        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
+        let _retry = crate::Engine::retry_guard();
         let log = matches!(by, Configured::Locally);
         config.validate().map_err(|e| StorageError::Core(CoreError::InvalidQuery(e)))?;
 
@@ -216,6 +218,10 @@ impl crate::Engine {
             }
         };
         if !crate::Engine::definition_is(&txn, &read)? {
+            if crate::Engine::retries_exhausted() {
+                txn.abort()?;
+                return Err(crate::Engine::retries_exhausted_error(db, collection));
+            }
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorConfiguration);
@@ -267,6 +273,8 @@ impl crate::Engine {
         log: bool,
         history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<bool> {
+        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
+        let _retry = crate::Engine::retry_guard();
         let mut meta = self.get_collection(db, collection)?;
         let read = meta.clone();
         #[cfg(test)]
@@ -285,6 +293,10 @@ impl crate::Engine {
         // The definition written back was read before the writer
         // (`Engine::definition_is`).
         if !crate::Engine::definition_is(&txn, &read)? {
+            if crate::Engine::retries_exhausted() {
+                txn.abort()?;
+                return Err(crate::Engine::retries_exhausted_error(db, collection));
+            }
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorRemoval);
@@ -810,6 +822,32 @@ mod tests {
             query_prefix: None,
             chunk: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_filter_the_order_cannot_compare_does_not_crash_a_vector_change() {
+        // The other pair of callers of the definition write-back. A NaN in any
+        // partial filter on this collection made `configure_vectors` and
+        // `disable_vectors` abort the node, exactly as a drop or a create did:
+        // the check compared metadata with `==`, `NaN != NaN`, and the retry was
+        // a self-call with nothing counting it.
+        let (engine, _dir) = engine();
+        engine
+            .create_index_with(
+                "app",
+                "docs",
+                vec![kimmy_core::IndexField::ascending("z")],
+                false,
+                Default::default(),
+                Some("z_nan".into()),
+                None,
+                Some(bson::doc! { "k": f64::NAN }),
+            )
+            .unwrap();
+
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        assert!(engine.vector_collection("app", "docs").unwrap().is_some());
+        assert!(engine.disable_vectors("app", "docs", true).unwrap());
     }
 
     #[test]

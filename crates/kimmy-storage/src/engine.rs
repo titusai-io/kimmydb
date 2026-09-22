@@ -680,6 +680,43 @@ impl std::ops::Deref for WriteTxn<'_> {
     }
 }
 
+thread_local! {
+    /// See [`Engine::retry_guard`].
+    static RETRY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only ways to make the definition check answer as it does in the field.
+///
+/// The bound exists for a check that can fail for ever, and the input that made
+/// that happen is fixed — so without a way to force the failure, the bound would
+/// be untestable code guarding against something nothing can now produce.
+#[cfg(test)]
+pub(crate) mod definition_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEVER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make every definition check on this thread answer "changed".
+    pub(crate) fn never_matches(on: bool) {
+        NEVER.with(|n| n.set(on));
+    }
+
+    pub(crate) fn never() -> bool {
+        NEVER.with(|n| n.get())
+    }
+}
+
+/// Decrements the definition write-back retry depth when it goes out of scope.
+pub(crate) struct RetryGuard;
+
+impl Drop for RetryGuard {
+    fn drop(&mut self) {
+        RETRY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 impl Engine {
     /// Open or create the database at `path`.
     ///
@@ -3291,15 +3328,74 @@ impl Engine {
     /// back to decide again from what stands; nothing can change it after
     /// that. [`crate::index::mark_multikey`] re-reads through the transaction
     /// for the same reason.
+    /// How many times a definition write-back may lose its race before the
+    /// attempt is an error rather than another try.
+    ///
+    /// **A bound, because the check it guards can fail for ever.** Each caller of
+    /// [`Self::definition_is`] retried by calling itself again, with nothing
+    /// counting the attempts: a check that never passes therefore exhausted the
+    /// stack and aborted the process. A NaN in a partial filter was the input
+    /// that did it — `NaN != NaN`, so the comparison could not pass — and that
+    /// comparison is fixed above, but the shape was the defect. A real race is
+    /// resolved in one or two attempts; sixteen means something is wrong that
+    /// retrying will not mend.
+    pub(crate) const MAX_DEFINITION_RETRIES: u32 = 16;
+
+    /// The retry depth of the definition write-back on this thread.
+    ///
+    /// A thread-local rather than a parameter threaded through four functions and
+    /// twenty-four call sites: the retry is a synchronous self-call on one
+    /// thread, so the depth is exactly this counter, and the guard's `Drop` makes
+    /// it right on every path out.
+    pub(crate) fn retry_guard() -> RetryGuard {
+        RETRY_DEPTH.with(|d| d.set(d.get() + 1));
+        RetryGuard
+    }
+
+    /// Whether this thread has already retried a definition write-back as often
+    /// as [`Self::MAX_DEFINITION_RETRIES`] allows.
+    pub(crate) fn retries_exhausted() -> bool {
+        RETRY_DEPTH.with(|d| d.get()) >= Self::MAX_DEFINITION_RETRIES
+    }
+
+    /// The error a caller gets instead of an aborted process.
+    pub(crate) fn retries_exhausted_error(db: &str, collection: &str) -> crate::StorageError {
+        crate::StorageError::Transaction(format!(
+            "the definition of {db}.{collection} still did not match what was read after {} \
+             attempts to write it back, so the attempt was abandoned rather than retried again; \
+             this is a bug in this build rather than anything a client did",
+            Self::MAX_DEFINITION_RETRIES
+        ))
+    }
+
     pub(crate) fn definition_is(
         txn: &redb::WriteTransaction,
         read: &CollectionMeta,
     ) -> Result<bool> {
+        #[cfg(test)]
+        if definition_hooks::never() {
+            return Ok(false);
+        }
         let collections = txn.open_table(tables::COLLECTIONS)?;
-        Ok(match collections.get((read.db.as_str(), read.name.as_str()))? {
-            Some(standing) => serde_json::from_slice::<CollectionMeta>(standing.value())? == *read,
-            None => false,
-        })
+        let Some(standing) = collections.get((read.db.as_str(), read.name.as_str()))? else {
+            return Ok(false);
+        };
+        // **Compared as encodings, not as trees.** `==` on a `CollectionMeta`
+        // descends into a partial filter's `Document`, and `Bson`'s equality is
+        // `f64`'s: `NaN != NaN`, so a filter holding one made this answer `false`
+        // for a definition that had not changed at all -- and every caller
+        // retries, by recursion, so the node overflowed its stack and aborted.
+        //
+        // Until ADR-182 the store held relaxed JSON, where a NaN serialises to
+        // `null`, so both sides came back `Null` and the check passed **by
+        // accident of a lossy encoding**. Preserving the type exposed the
+        // comparison; the comparison was always the defect.
+        //
+        // Both sides go through the same encoder, so this is reflexive for every
+        // value -- including one no `PartialEq` can compare with itself -- and it
+        // does not depend on the bytes a past build happened to write.
+        let decoded = serde_json::from_slice::<CollectionMeta>(standing.value())?;
+        Ok(serde_json::to_vec(&decoded)? == serde_json::to_vec(read)?)
     }
 
     pub(crate) fn put_collection_meta(

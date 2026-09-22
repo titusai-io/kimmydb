@@ -848,6 +848,8 @@ impl crate::Engine {
         origin: CreateOrigin,
         history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> bool,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
+        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
+        let _retry = crate::Engine::retry_guard();
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
@@ -995,6 +997,12 @@ impl crate::Engine {
                         if let CreateOrigin::Restored(created) = origin {
                             let txn = self.begin_write(WriterHolder::Ddl)?;
                             if !crate::Engine::definition_is(&txn, &read)? {
+                                if crate::Engine::retries_exhausted() {
+                                    txn.abort()?;
+                                    return Err(crate::Engine::retries_exhausted_error(
+                                        db, collection,
+                                    ));
+                                }
                                 txn.abort()?;
                                 #[cfg(test)]
                                 crate::sync::race_hooks::absorbed(
@@ -1043,6 +1051,10 @@ impl crate::Engine {
                     // computes again and does not move.
                     let txn = self.begin_write(WriterHolder::Ddl)?;
                     if !crate::Engine::definition_is(&txn, &read)? {
+                        if crate::Engine::retries_exhausted() {
+                            txn.abort()?;
+                            return Err(crate::Engine::retries_exhausted_error(db, collection));
+                        }
                         txn.abort()?;
                         #[cfg(test)]
                         crate::sync::race_hooks::absorbed(
@@ -1133,6 +1145,10 @@ impl crate::Engine {
         // Everything above decided from a definition read before the writer;
         // one that has changed since is decided again (`definition_is`).
         if !crate::Engine::definition_is(&txn, &read)? {
+            if crate::Engine::retries_exhausted() {
+                txn.abort()?;
+                return Err(crate::Engine::retries_exhausted_error(db, collection));
+            }
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexCreation);
@@ -1391,6 +1407,8 @@ impl crate::Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Dropped> {
+        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
+        let _retry = crate::Engine::retry_guard();
         if replicated.is_none() {
             // A name a create would have refused mints no tombstone: there is
             // no index it could ever name, and the caller is there to be told.
@@ -1428,6 +1446,10 @@ impl crate::Engine {
             // "Not here" was read before the writer; an index created since is
             // one this drop may have to remove (`Engine::definition_is`).
             if !crate::Engine::definition_is(&txn, &read)? {
+                if crate::Engine::retries_exhausted() {
+                    txn.abort()?;
+                    return Err(crate::Engine::retries_exhausted_error(db, collection));
+                }
                 txn.abort()?;
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
@@ -1457,6 +1479,10 @@ impl crate::Engine {
         // The definition written back below was read before the writer
         // (`Engine::definition_is`).
         if !crate::Engine::definition_is(&txn, &read)? {
+            if crate::Engine::retries_exhausted() {
+                txn.abort()?;
+                return Err(crate::Engine::retries_exhausted_error(db, collection));
+            }
             txn.abort()?;
             #[cfg(test)]
             crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
@@ -2299,6 +2325,86 @@ mod tests {
         let (d1, d2) = (keys(&desc, doc! { "a": 1 }), keys(&desc, doc! { "a": 2 }));
         assert!(a1[0] < a2[0]);
         assert!(d2[0] < d1[0], "descending must reverse");
+    }
+
+    #[test]
+    fn a_filter_the_order_cannot_compare_does_not_crash_the_next_index_change() {
+        // A partial filter holding NaN made **every** later index change on that
+        // collection abort the node: `tokio-rt-worker has overflowed its stack`,
+        // exit 134. Any client that may create an index could do it, and a
+        // replicated DDL takes the same path.
+        //
+        // Two defects met. `definition_is` compared collection metadata with
+        // `==`, which descends into the filter's `Document`, and `NaN != NaN` —
+        // so the "is this still the definition I read?" check could never pass.
+        // Every caller then retried by calling itself again, with nothing
+        // counting the attempts.
+        //
+        // Three changes on one collection, because each takes a different one of
+        // those callers: a drop, another create, and a vector configuration.
+        let nan = || Some(doc! { "k": f64::NAN });
+        let (engine, _, _dir) = engine();
+        for name in ["z_nan", "second"] {
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending(if name == "z_nan" { "z" } else { "y" })],
+                    false,
+                    Default::default(),
+                    Some(name.into()),
+                    None,
+                    nan(),
+                )
+                .unwrap();
+        }
+        assert!(engine.drop_index("app", "docs", "z_nan").unwrap(), "the drop lands");
+        // And a third create *after* the drop, which is the write-back path the
+        // drop leaves behind.
+        engine
+            .create_index_with(
+                "app",
+                "docs",
+                vec![IndexField::ascending("w")],
+                false,
+                Default::default(),
+                Some("third".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let names: Vec<&str> = coll.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["second", "third"], "{names:?}");
+    }
+
+    #[test]
+    fn a_definition_check_that_never_passes_is_an_error_not_an_abort() {
+        // The bound, forced. Once the comparison is reflexive nothing in the
+        // product can make that check fail for ever, so without this hook the
+        // bound would be code guarding against something unreachable — and an
+        // unbounded retry would look just as green.
+        let (engine, _, _dir) = engine();
+        crate::engine::definition_hooks::never_matches(true);
+        let outcome = engine.create_index_with(
+            "app",
+            "docs",
+            vec![IndexField::ascending("z")],
+            false,
+            Default::default(),
+            Some("z".into()),
+            None,
+            None,
+        );
+        crate::engine::definition_hooks::never_matches(false);
+
+        let err = outcome.expect_err("a check that never passes must not be retried for ever");
+        let msg = err.to_string();
+        assert!(msg.contains("app.docs"), "the error names the collection: {msg}");
+        assert!(
+            msg.contains(&crate::Engine::MAX_DEFINITION_RETRIES.to_string()),
+            "and how many attempts it made: {msg}"
+        );
     }
 
     #[test]

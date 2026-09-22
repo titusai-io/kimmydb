@@ -152,6 +152,17 @@ refused.** This release moves the storage schema to 4
   what was written. Each open now logs every partial index whose filter holds
   an array, saying it *may* have been converted. If yours was created with a
   generic `Binary` value, drop and recreate it.
+
+  **A filter holding `NaN` no longer crashes the node.** Keeping the type
+  exposed a comparison that was never reflexive: the "is this still the
+  definition I read?" check compared collection metadata with `==`, and
+  `NaN != NaN`, so it could never pass — and each caller retried by calling
+  itself, so a partial filter holding `NaN` made the next index change on that
+  collection abort the process, on every member that applied it. Before this
+  release the store turned a `NaN` into `null`, so both sides of the comparison
+  matched by accident and 0.33.0 is unaffected. The check now compares the
+  stored encodings, which is reflexive for every value, and the retry is bounded
+  and returns an error naming the collection instead of exhausting the stack.
 - **Dropping a large index no longer stalls every write for tens of seconds,
   or needs gigabytes of free disk while it runs.** The storage call that
   cleared an index's entries was slow in the way that matters. For 742,858

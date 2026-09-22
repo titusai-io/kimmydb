@@ -18193,6 +18193,29 @@ A filter already converted stays converted. The store holds the array, and nothi
 
 **No automatic recovery.** Rewriting a stored definition from a retained entry would change the definition on the members that still hold that entry and not on the others. That divergence of the definition itself is worse than the conversion. Operators recreate instead. To make that possible, **every open logs an info line for each partial index whose filter holds an array**, anywhere among its operands, a scoped JavaScript value's scope included, saying that it **may have been converted** from a generic `Binary` by an earlier build, and to drop and recreate the index if it was created with a `Binary` value. It says "may", never "is broken", because an array can be exactly what the client wrote. **What it cannot do:** it is written at open, so an operator who does not restart after upgrading never sees it. Silence before a restart does not mean there are none.
 
+### What preserving the type exposed: a check that could never pass
+
+**This record's own change crashed the node**, and the story is worth keeping because the defect was not in the change.
+
+A partial filter holding `NaN` — `{"k": {"$numberDouble": "NaN"}}` — made **every later index change on that collection abort the process**: `tokio-rt-worker has overflowed its stack`, exit 134. A drop, another create, a vector configuration; locally and on every peer that applied the replicated entry, which would then abort again on the same entry after restarting. Any client permitted to create an index could do it.
+
+`Engine::definition_is` answers "is the definition I read still the one standing?", and it compared the two with `==`. That descends into the filter's `Document`, and `Bson`'s equality is `f64`'s: **`NaN != NaN`**, so the answer was "changed" for a definition that had not changed at all. Each caller then retried by calling itself again, with nothing counting the attempts, so the stack ran out.
+
+**Until this record, the store held relaxed JSON, where a `NaN` serialises to `null`.** Both sides of the comparison came from the store, so both came back `Null`, and the check passed — *by accident of a lossy encoding*. v0.33.0 is unaffected for that reason and no other. Preserving the type, which is what this record is for, removed the accident and left the comparison as it always was: not reflexive.
+
+**Two fixes, because two things were wrong**, and the mutation rows show each is load-bearing on its own:
+
+| Reverted | What happens |
+|---|---|
+| the comparison, back to `==` on the decoded tree | the three NaN tests fail — **cleanly**, because the bound now turns a runaway retry into an error |
+| the bound, keeping the comparison | `a_definition_check_that_never_passes_is_an_error_not_an_abort` overflows the stack and aborts |
+
+So the comparison is now on the **encodings** of both sides, through the same encoder: reflexive for every value, including one no `PartialEq` can compare with itself, and independent of the bytes a past build happened to write. And the retry is bounded at sixteen, after which the caller gets an error naming the collection instead of a dead process.
+
+**The class, swept both ways.** A grep for `==` on stored or user-valued metadata used as a landed-check finds one other candidate, `engine.rs`'s version-vector comparison, which holds HLC integers and is an early return rather than a retry trigger — safe. Retry-by-recursion cannot be grepped for reliably, so it was enumerated by reading every function in `kimmy-storage` that calls itself: exactly four, the ones above, all now bounded. Naming which method found what matters, because a derivation cannot see what it does not know to look for.
+
+The unbounded recursion was already recorded as a known shape, *recorded and not queued*. A `NaN` is what made it fatal, and that is the argument for fixing a shape when you find it rather than filing it.
+
 ### What this does to ADR-180
 
 ADR-180 made every member build, store and log a definition **as stored** (`index::as_stored`), because the store changed the filter. The store no longer changes it, so `as_stored` is now the identity on every filter. It stays as the place that rule is enforced, so a future encoding that lost something would be held to one value again. Four of ADR-180's test premises, one of them a fixture shared by eight tests, asserted before anything else that the store changes the filter, so that they could see the normalisation. **When this record landed, those four premises detected that the thing they were written to observe had stopped happening, which is what they are for.** They did not quietly go on passing on a case that no longer exists: they failed, and said why. Every other premise assertion in this series caught a mistake made while the test was being written. These caught a change made later, for a different reason, in a different record. Each is rewritten around what is true now:

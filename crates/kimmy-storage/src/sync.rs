@@ -4408,6 +4408,49 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_filter_the_order_cannot_compare_does_not_crash_the_peer() {
+        // The reason this was a High and not a Medium: a replicated DDL takes the
+        // same write-back path, so one client creating a NaN-filtered index could
+        // abort **every** member, and each would abort again on the same entry
+        // after restarting. The crash was reproduced locally first; this is the
+        // half that makes it everyone's.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index_with(
+            "shop",
+            "orders",
+            vec![field("z")],
+            false,
+            Default::default(),
+            Some("z_nan".into()),
+            None,
+            Some(bson::doc! { "k": f64::NAN }),
+        )
+        .unwrap();
+
+        // B learns the NaN-filtered definition, and then a second change on the
+        // same collection: the drop is what used to abort, on whichever member
+        // applied it.
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("z_nan").is_some(),
+            "the peer holds the definition"
+        );
+
+        assert!(a.drop_index("shop", "orders", "z_nan").unwrap());
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("z_nan").is_none(),
+            "and the peer applies the drop rather than aborting on it"
+        );
+    }
+
+    #[test]
     fn two_members_creating_one_identical_definition_converge_on_one_creation_stamp() {
         // The stamp has to converge, not only the definition. After ADR-132
         // it is the sole arbiter of whether a replayed drop applies, so two
