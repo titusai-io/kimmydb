@@ -760,6 +760,111 @@ fn rows_without_a_header(markdown: &str) -> Vec<usize> {
     found
 }
 
+/// Every test that reads a documentation file lives in this crate.
+///
+/// The workflow's documentation-only path runs `cargo nextest run -p kimmy-api`
+/// and nothing else (`.github/workflows/ci.yml`). That is the whole set of
+/// doc-reading targets only while this holds, so a target in another crate that
+/// read a file matching CI's own `\.md$|^docs/` would not run on the changes
+/// that can break it -- re-opening the gap one crate along. A read in another
+/// crate's `src`, `build.rs` or `benches` counts for the same reason: the
+/// content is compiled in, and a documentation-only change neither rebuilds nor
+/// exercises it.
+///
+/// Three ways of reaching documentation are recognised, which are the ways this
+/// workspace reaches it:
+/// - `include_str!` or `include_bytes!` of a path holding `docs/` or ending
+///   `.md`, which is a compile-time read: the file's content is baked into the
+///   binary, so the target fails to *compile* if the file goes;
+/// - `join("../..")`, the idiom a whole-repository walk starts from. Bare,
+///   because from the root a walk can reach any documentation file;
+/// - `join("../../`...`)` naming a documentation path directly.
+///
+/// Reaching above the crate for something that is not documentation is not a
+/// match, and three places do it: `../../crates`, `../../Cargo.toml` and
+/// `../../fuzz/corpus`.
+///
+/// **What this does not see.** A walk that reaches the repository root some
+/// other way -- an environment variable, `current_dir` and its ancestors, a
+/// path assembled from pieces rather than written as one literal -- is invisible
+/// to a rule that reads source text. If one is ever written, this test will not
+/// name it, and the workflow's documentation-only path has to be widened by
+/// hand. The rule is a tripwire on the idioms in use, not a proof.
+#[test]
+fn documentation_tests_live_in_this_crate() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a readable directory") {
+            let path = entry.expect("a directory entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "target" {
+                    walk(&path, out);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    // Canonical, so that a walked path does not carry this crate's own name in
+    // a `kimmy-api/../..` prefix -- which is what the premise below caught when
+    // the root was left as written.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the repository root");
+    let this_crate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("this crate's directory");
+    let mut sources = Vec::new();
+    walk(&root, &mut sources);
+
+    // Premise: the walk reached other crates' sources, and this crate's own are
+    // the ones excluded. Without this a walk that found nothing would pass.
+    let outside: Vec<&std::path::PathBuf> = sources
+        .iter()
+        .filter(|p| !p.canonicalize().expect("a readable file").starts_with(&this_crate))
+        .collect();
+    assert!(outside.len() >= 50, "premise: other crates' sources were read ({})", outside.len());
+    let leaked: Vec<String> = outside
+        .iter()
+        .filter(|p| p.to_string_lossy().contains("kimmy-api"))
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(leaked.is_empty(), "premise: this crate is excluded, but: {leaked:#?}");
+    for must in ["kimmy-storage", "kimmyd", "kimmy-core", "kimmy-cluster"] {
+        assert!(
+            outside.iter().any(|p| p.to_string_lossy().contains(must)),
+            "premise: {must}'s sources were read"
+        );
+    }
+
+    let mut offenders = Vec::new();
+    for path in outside {
+        let body = std::fs::read_to_string(path).expect("a readable source file");
+        for (n, line) in body.lines().enumerate() {
+            let names_a_doc = line.contains("docs/") || line.contains(".md");
+            let compiled_in =
+                (line.contains("include_str!") || line.contains("include_bytes!")) && names_a_doc;
+            let from_the_root = line.contains(r#"join("../..")"#);
+            let above_to_a_doc = line.contains(r#"join("../../"#) && names_a_doc;
+            if compiled_in || from_the_root || above_to_a_doc {
+                let shown = path.strip_prefix(&root).unwrap_or(path).display();
+                offenders.push(format!("{shown}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these read a documentation file from outside kimmy-api, so CI's \
+         documentation-only path -- `cargo nextest run -p kimmy-api` -- would not run them on \
+         the changes that can break them. Move the test into kimmy-api, or widen that step and \
+         this rule together:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
 /// The documented Kubernetes manifest allows more than twice the open its own
 /// example describes, computed from the code's rate rather than from a second
 /// copy of it.

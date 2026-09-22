@@ -114,7 +114,7 @@ jobs:
             echo "Something outside the documentation changed; running the full gate."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Documentation only; the required jobs will report without compiling."
+            echo "Documentation only; fmt and clippy will report without compiling, and the test job will run the tests that read documentation files."
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -199,17 +199,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       RUSTFLAGS: -D warnings
     steps:
-      # Gated step by step on there being code to test, as on the `lint` job.
+      # Not gated on there being code, unlike the `lint` job: a
+      # documentation-only change has tests of its own to run, below. Some test
+      # targets read documentation files -- which ones, and how many, changes as
+      # tests are added -- so on exactly the changes that can break them this
+      # job used to run nothing at all and report green.
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.docs_only != 'true'
 
       - name: Install Rust
-        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       # Save only from main — see the note on the `lint` job above.
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.docs_only != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -223,7 +224,6 @@ jobs:
       # runs them with `cargo test --doc`, against the same build artifacts.
       # Pinned to a release of the installer rather than its floating tag.
       - name: Install nextest
-        if: needs.changes.outputs.docs_only != 'true'
         uses: taiki-e/install-action@v2.87.12
         with:
           tool: nextest
@@ -234,11 +234,32 @@ jobs:
           KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
         run: cargo nextest run --workspace
 
+      # Every test that reads a documentation file lives in `kimmy-api`, which
+      # `documentation_tests_live_in_this_crate` holds true, so this is the
+      # whole set of them and there is no list here to fall out of date. The
+      # crate rather than those targets by name: a list of target names is the
+      # hand-maintained guard that produced this gap, since nothing makes
+      # whoever adds a doc-reading test edit this file. It would already have
+      # been stale -- the link checker joined the set the day it merged.
+      #
+      # Cost, on this runner: this step took 333 s where the whole-workspace
+      # step above takes about 14 minutes, so the fast path still saves about
+      # half. (On the development machine the same three figures were 94 s for
+      # the crate, 73 s for the targets by name, and 492 s for the workspace;
+      # a two-core runner is some 3.5x slower, so compare against the CI
+      # numbers, not those.)
+      #
+      # Doctests are not run below on this path: there are none in the
+      # workspace, and none of them would read a documentation file.
+      - name: Test the documentation
+        if: needs.changes.outputs.docs_only == 'true'
+        run: cargo nextest run -p kimmy-api
+
       # A test that spawns `kimmyd` and fails keeps each node's stdout and
       # stderr here (crates/kimmyd/tests/node_logs). The runner is gone by the
       # time anyone reads a failure, so this is the only copy.
       - uses: actions/upload-artifact@v7
-        if: failure() && needs.changes.outputs.docs_only != 'true'
+        if: failure()
         with:
           name: node-logs-test
           path: ${{ runner.temp }}/node-logs
