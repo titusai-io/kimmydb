@@ -46,10 +46,37 @@ cd "$(dirname "$0")/.."
 # anywhere else. `cargo metadata` would be equally authoritative, but every other
 # script here uses only sed and awk, and this needs no JSON parser to read a list
 # that is already a list.
-members=$(
-  awk '/^members = \[/,/^\]/' Cargo.toml |
-    sed -n 's/^[[:space:]]*"\(.*\)",\{0,1\}$/\1/p'
+# The lines between `members = [` and its `]`, so a line can be judged rather
+# than just matched: a pattern that only matches what it understands drops what
+# it does not, and dropping a member is exactly the failure being fixed here.
+members_lines=$(
+  awk '/^members = \[/ { inside = 1; next } inside && /^\]/ { exit } inside { print }' Cargo.toml
 )
+
+members=''
+while IFS= read -r line; do
+  # A line with no quote holds no entry: blank, or a comment of its own.
+  case "$line" in
+  *'"'*) ;;
+  *) continue ;;
+  esac
+  # An entry, with an optional comma and an optional trailing comment. Anything
+  # else holding a quote is unparsed rather than skipped.
+  entry=$(
+    printf '%s\n' "$line" |
+      sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1/p'
+  )
+  if [ -z "$entry" ]; then
+    echo "cannot parse this [workspace] members line, so a member could be missed:" >&2
+    echo "  $line" >&2
+    exit 1
+  fi
+  members="$members$entry
+"
+done <<MEMBERS
+$members_lines
+MEMBERS
+
 if [ -z "$members" ]; then
   echo "could not read [workspace] members from Cargo.toml" >&2
   exit 1
@@ -65,9 +92,28 @@ for member in $members; do
       echo "workspace member $dir has no Cargo.toml" >&2
       exit 1
     fi
-    grep -q '^license\.workspace = true' "$manifest" || continue
-    names="$names$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -1)
+    name=$(sed -n 's/^name = "\([^"]*\)"/\1/p' "$manifest" | head -1)
+    if [ -z "$name" ]; then
+      echo "workspace member $dir has no package name in its Cargo.toml" >&2
+      exit 1
+    fi
+    # Three outcomes, and the third is an error rather than an exclusion. Both
+    # spellings of inheriting the workspace licence count -- `license.workspace`
+    # and `license = { workspace = true }` are the same TOML, and recognising
+    # only the first would silently class the crate as not AGPL.
+    if grep -qE '^license[[:space:]]*\.[[:space:]]*workspace[[:space:]]*=[[:space:]]*true' \
+      "$manifest" ||
+      grep -qE '^license[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true' \
+        "$manifest"; then
+      names="$names$name
 "
+    elif grep -qE '^license[[:space:]]*=[[:space:]]*"' "$manifest"; then
+      : # Its own licence string, so not the workspace's.
+    else
+      echo "cannot tell which licence $manifest takes, so $name cannot be classified:" >&2
+      grep -n '^license' "$manifest" >&2 || echo "  it states no licence" >&2
+      exit 1
+    fi
   done
 done
 
