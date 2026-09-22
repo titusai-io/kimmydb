@@ -39,7 +39,7 @@ const MAX_KEYS_PER_DOCUMENT: usize = 1_000;
 /// second time, after it had already been walked as the prepended range. The
 /// document came back twice: `count` over-counted, a sorted `find` returned the
 /// same `_id` twice, and `explain` over-reported entries read. Every range a
-/// query asks for now starts at [`ABOVE_UNKEYED`] instead, which makes the claim
+/// query asks for now starts at [`ABOVE_SENTINELS`] instead, which makes the claim
 /// true rather than merely stated.
 ///
 /// A document is unkeyable when the index cannot derive a finite, exact set
@@ -2251,7 +2251,7 @@ impl crate::Engine {
         // an empty lower bound, which is the unkeyed key itself, so it used to
         // walk that run again — and the multikey de-duplication skips empty
         // keys, so nothing caught the repeat. Raising every query range to
-        // `ABOVE_UNKEYED` fixes each walk at once rather than each walk
+        // `ABOVE_SENTINELS` fixes each walk at once rather than each walk
         // separately, and it fixes the case that predates ADR-185 too: a
         // document no index can key was already being counted twice.
         ranges.extend(scan.ranges.iter().map(|(lower, upper)| {

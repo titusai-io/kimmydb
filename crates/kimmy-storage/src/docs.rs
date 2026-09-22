@@ -1332,7 +1332,7 @@ impl Engine {
                 let keys = match index::document_keys(index, &doc)? {
                     index::DocumentKeys::Keyed { keys, .. } => keys,
                     // And one the filter cannot decide holds none either
-                    // (ADR-185): it is in the unkeyed run, sharing no key.
+                    // (ADR-185): it is in the undecidable run, sharing no key.
                     index::DocumentKeys::Unkeyed { .. }
                     | index::DocumentKeys::Undecidable { .. } => Vec::new(),
                 };

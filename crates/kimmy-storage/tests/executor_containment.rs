@@ -25,7 +25,7 @@
 use bson::{Bson, Document, doc};
 use kimmy_storage::{CandidateOrder, CollectionMeta, Engine, IndexField, IndexScan};
 
-/// Values that put a document in the unkeyed run, and values that do not.
+/// Values that put a document in a sentinel run, and values that do not.
 ///
 /// The `Decimal128`s are ADR-185's case — the order cannot rank one against a
 /// number, so the filter cannot decide the document. `NaN` and the infinities

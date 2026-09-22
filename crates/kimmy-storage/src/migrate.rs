@@ -434,7 +434,7 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
                     }
                     // The 3 -> 4 rebuild is where option-2 membership is
                     // built for an existing database (ADR-185): a document the
-                    // filter cannot decide goes into the unkeyed run here,
+                    // filter cannot decide goes into the undecidable run here,
                     // exactly as a later write would file it.
                     crate::index::DocumentKeys::Undecidable { .. } => {
                         // The 3 -> 4 rebuild writes the new sentinel directly.
@@ -1624,6 +1624,65 @@ mod membership_migration {
             0,
             "and under the reason that is true of it, not the other one"
         );
+    }
+
+    #[test]
+    fn an_interrupted_rebuild_files_the_documents_its_filters_cannot_decide_when_it_resumes() {
+        // The same carrier through the resume. Two partial indexes, the run
+        // stopped after the first commits: the second is rebuilt on the next
+        // open, from the markers, and must file the undecidable document as the
+        // first did — and the first must not be redone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            for (name, field) in [("by_x", "x"), ("by_y", "y")] {
+                engine
+                    .create_index_with(
+                        "shop",
+                        "orders",
+                        vec![crate::meta::IndexField::ascending(field)],
+                        false,
+                        crate::meta::Enforcement::Local,
+                        Some(name.into()),
+                        None,
+                        Some(doc! {"size": {"$gt": 5}}),
+                    )
+                    .unwrap();
+            }
+            let coll = engine.get_collection("shop", "orders").unwrap();
+            engine
+                .insert_many(
+                    &coll,
+                    vec![
+                        doc! {"_id": 1_i64, "size": 1, "x": 1, "y": 1},
+                        doc! {"_id": 2_i64, "size": 10, "x": 2, "y": 2},
+                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3, "y": 3},
+                    ],
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &[]);
+
+        hooks::fail_at_index(2);
+        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
+        assert!(
+            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "premise: the second index is still owed"
+        );
+
+        let engine = Engine::open(&path).unwrap();
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        for name in ["by_x", "by_y"] {
+            let id = coll.index(name).unwrap().id;
+            assert_eq!(
+                engine.undecidable_count(&coll, id).unwrap(),
+                1,
+                "{name}: the document its filter cannot decide, filed by the run that built it"
+            );
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "{name}: and only there");
+        }
     }
 
     #[test]

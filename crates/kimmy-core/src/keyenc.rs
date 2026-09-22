@@ -264,25 +264,6 @@ fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    /// No document ever encodes to an empty key — which is what lets the empty
-    /// key be the sentinel for the unkeyed run, and what lets a query's range
-    /// start one byte above it.
-    ///
-    /// **What breaking this actually costs, measured rather than assumed.** The
-    /// obvious fear is a lost document: `ABOVE_UNKEYED` raises every query range
-    /// to `[0x00]` so the unkeyed run is walked once, so a real key that encoded
-    /// empty would sit below every range. It is **not** lost, and that was worth
-    /// checking instead of asserting — a document filed at the empty key makes
-    /// `has_unkeyed` true, so the unkeyed range is prepended and the document is
-    /// visited there and rechecked against the full filter. Making the empty
-    /// string encode empty leaves `executor_containment.rs` green, in both
-    /// deliveries.
-    ///
-    /// What it costs is quieter: that document would be found by a recheck on
-    /// **every** scan of the index rather than by its key, and it would be
-    /// counted as unkeyable when it is nothing of the kind. So this test guards
-    /// an assumption about cost and honesty, not about correctness, and says so
-    /// rather than claiming a red it cannot produce.
     /// The values both key-encoding premises are asserted over.
     ///
     /// One list, so a value added for either premise is covered by both: they are
@@ -361,6 +342,23 @@ mod tests {
     }
 
     #[test]
+    /// No document ever encodes to an empty key — which is what lets the empty
+    /// key be the sentinel for the unkeyed run.
+    ///
+    /// **What breaking this actually costs, measured rather than assumed.** The
+    /// obvious fear is a lost document: every query range starts at
+    /// `LEAST_KEY_TAG`, so a real key that encoded empty would sit below every
+    /// range. It is **not** lost — a document filed at the empty key is in the
+    /// unkeyed run, which is prepended whenever it holds anything, so the
+    /// document is visited there and rechecked against the full filter. Making
+    /// the empty string encode empty leaves `executor_containment.rs` green, in
+    /// both deliveries.
+    ///
+    /// What it costs is quieter: that document would be found by a recheck on
+    /// **every** scan of the index rather than by its key, and it would be
+    /// counted as unkeyable when it is nothing of the kind. So this test guards
+    /// an assumption about cost and honesty, not about correctness, and says so
+    /// rather than claiming a red it cannot produce.
     fn no_value_encodes_to_an_empty_key() {
         let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
         let values = corpus();
