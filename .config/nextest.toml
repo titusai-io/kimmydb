@@ -1,3 +1,11 @@
+# A test that never returns fails here, after five minutes, rather than holding
+# CI until the job's own six-hour limit. The case it exists for is a retry
+# bound removed: each definition write-back's forced test then loops for ever
+# (ADR-182). The slowest test in the suite takes about fifty seconds on a loaded
+# machine, so five minutes is a hang and not a slow test.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The write-lock hold decomposition's tests read this thread's CPU time and
 # assert how much of a hold was on the CPU and how much off it (ADR-176). Run
 # beside the rest of the workspace's tests, the machine's other threads decide

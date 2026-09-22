@@ -143,7 +143,9 @@ pub mod stored_filter {
     /// part of the value: `find` compares an embedded document field by field,
     /// in order, so `{k: {a: 1, b: 2}}` and `{k: {b: 2, a: 1}}` select different
     /// documents and are two definitions. An operator document holds exactly
-    /// one operator, so it has no order of its own to lose. `Document`'s `==`
+    /// one operator — `PartialFilter::parse` refuses `{size: {$gte: 1, $lt: 5}}`
+    /// with "takes one operator", and every definition is parsed before it is
+    /// compared — so it has no order of its own to lose. `Document`'s `==`
     /// ignored order at every depth, and a re-create with a nested order
     /// swapped kept the old filter.
     ///
@@ -501,5 +503,9 @@ mod stored_filter_tests {
                 "{a} against {b}: the top level is a conjunction"
             );
         }
+        // What leaves an operator document nothing to sort: it cannot hold two.
+        let two = doc! { "size": { "$gte": 1, "$lt": 5 } };
+        let refused = crate::PartialFilter::parse(&two).expect_err("two operators on one field");
+        assert!(refused.to_string().contains("takes one operator"), "{refused}");
     }
 }

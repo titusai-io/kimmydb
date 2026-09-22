@@ -864,6 +864,84 @@ mod tests {
         assert!(engine.disable_vectors("app", "docs", true).unwrap());
     }
 
+    /// Run `change(i)` for `0..n` on `n` threads released together, and require
+    /// every one to succeed.
+    fn all_at_once<T: Send + 'static>(
+        engine: &std::sync::Arc<Engine>,
+        n: usize,
+        change: impl Fn(&Engine, usize) -> Result<T> + Send + Sync + 'static,
+    ) {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let change = std::sync::Arc::new(change);
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (engine, barrier, change) = (
+                    std::sync::Arc::clone(engine),
+                    std::sync::Arc::clone(&barrier),
+                    std::sync::Arc::clone(&change),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    change(&engine, i).map(|_| ())
+                })
+            })
+            .collect();
+        let errors: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("no thread panics").err().map(|e| e.to_string()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{} of {n} concurrent changes on one collection failed, which is the bound firing on \
+             contention rather than on a bug: {:?}",
+            errors.len(),
+            &errors[..errors.len().min(3)]
+        );
+    }
+
+    #[test]
+    fn concurrent_vector_configurations_on_one_collection_all_succeed() {
+        // The configuration's loop under contention, which nothing had put it
+        // under: cutting it to two attempts left every test green. Each thread
+        // configures its own field list, so every one changes the definition
+        // and is a race the others can lose.
+        let (engine, _dir) = engine();
+        let engine = std::sync::Arc::new(engine);
+        all_at_once(&engine, 64, |engine, i| {
+            engine.configure_vectors(
+                "app",
+                "docs",
+                VectorConfig { fields: vec![format!("body{i}")], ..config(8) },
+            )
+        });
+    }
+
+    #[test]
+    fn a_vector_removal_racing_configurations_succeeds() {
+        // The removal's loop, likewise. Removals cannot contend with each other
+        // — once one lands the rest find nothing to remove and return — so one
+        // removal races 63 configurations of its collection, each of which it
+        // can lose to. Several rounds, because how often it loses is the
+        // scheduler's choice.
+        let (engine, _dir) = engine();
+        let engine = std::sync::Arc::new(engine);
+        for round in 0..8 {
+            all_at_once(&engine, 64, move |engine, i| {
+                if i == 0 {
+                    engine.disable_vectors("app", "docs", false).map(|_| ())
+                } else {
+                    engine
+                        .configure_vectors(
+                            "app",
+                            "docs",
+                            VectorConfig { fields: vec![format!("body{round}_{i}")], ..config(8) },
+                        )
+                        .map(|_| ())
+                }
+            });
+        }
+    }
+
     #[test]
     fn a_vector_configuration_whose_check_never_passes_is_an_error_not_an_abort() {
         // The bound, forced, at this site: see the note above
