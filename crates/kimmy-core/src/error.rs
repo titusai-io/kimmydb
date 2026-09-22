@@ -79,6 +79,66 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether this refuses the *request* rather than reporting a failure of
+    /// the *node*, which is the distinction replication settles a definition on
+    /// (`kimmy_storage::sync::settle`).
+    ///
+    /// A refusal is a fact about what was asked, so the entry is skipped,
+    /// counted and warned, and the round goes on. A failure of the node may
+    /// succeed on retry, so it fails the round — because a round that quietly
+    /// skips what it cannot understand is how corruption becomes convergence.
+    ///
+    /// **Exhaustive on purpose, with no wildcard.** `settle` used to carry a
+    /// hand-written list of three variants, and `PartialFilter::parse` returns a
+    /// fourth: `UnsupportedOperator`, which is not `Unsupported`. A definition a
+    /// peer sent that this build refuses for its operator therefore failed the
+    /// whole round, on every retry, instead of being skipped — latent until the
+    /// first release that grows the partial-filter language, when the members
+    /// not yet upgraded in a roll would each stall on it. A list cannot see a
+    /// variant it does not name, so this is a match that will not compile until
+    /// a new variant is classified.
+    ///
+    /// Every `false` below is the behaviour before this method existed, kept
+    /// deliberately: widening any of them changes what replication skips and
+    /// needs its own argument, not a drive-by.
+    pub fn is_a_request_refusal(&self) -> bool {
+        match self {
+            // What was asked is not something this build can honour, and
+            // retrying cannot change that.
+            Error::InvalidQuery(_)
+            | Error::UnsupportedOperator(_)
+            | Error::Unsupported(_)
+            | Error::IndexExists { .. } => true,
+
+            // This node's own state answers the request differently, and
+            // `settle` reads `CollectionNotFound` before asking here, as the
+            // collection being gone is neither a refusal nor a failure.
+            Error::CollectionNotFound { .. }
+            | Error::DatabaseNotFound(_)
+            | Error::CollectionExists { .. }
+            | Error::DocumentNotFound(_) => false,
+
+            // A conflict about data rather than about a definition. Reported
+            // rather than refused, on the path that reports it (ADR-020).
+            Error::DuplicateKey(_) | Error::UniqueViolation { .. } => false,
+
+            // Malformed input on a path replication does not carry, so the
+            // question does not arise; failing the round is the safe answer if
+            // it ever does.
+            Error::InvalidDocumentId { .. }
+            | Error::InvalidName { .. }
+            | Error::InvalidUpdate(_)
+            | Error::ResumeTokenExpired
+            | Error::MalformedResumeToken
+            | Error::MalformedCursor
+            | Error::MalformedStamp => false,
+
+            // A value that will not decode or encode. Indistinguishable here
+            // from corruption, which must never be skipped quietly.
+            Error::Bson(_) | Error::Serialization(_) => false,
+        }
+    }
+
     /// Names are used verbatim in on-disk keys and URL paths, so they are
     /// validated once, here, rather than defensively at every call site.
     pub fn validate_name(name: &str) -> Result<()> {

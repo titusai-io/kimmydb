@@ -81,6 +81,24 @@ refused.** This release moves the storage schema to 4
 
 ### Fixed
 
+- **A replicated index definition this build refuses for its operator no longer
+  fails the whole replication round.** `sync::settle` decided which errors are
+  refusals of the request from a hand-written list of three, and the
+  partial-filter parser returns a fourth — `UnsupportedOperator`, which is a
+  different variant from `Unsupported`. So a definition carrying an operator
+  this build does not know failed the round instead of being skipped, and failed
+  again on every retry; a snapshot page carrying one failed as a whole, so the
+  member could not catch up from that peer at all. It is now skipped, counted in
+  `kimmy_sync_ddl_refused_total` and warned, as the designed path always did for
+  other refusals.
+
+  **Latent until now:** no release before this one accepts an operator that a
+  released build refuses, so there is no path between them. It would have opened
+  the first time a release grew the partial-filter language, during the roll, on
+  every member not yet upgraded. Which errors are refusals is now decided beside
+  the error type by an exhaustive match with no wildcard, so a variant added
+  later does not compile until it has been classified.
+
 - **A partial index now holds exactly what `find` with its filter returns,
   and is used only for a query whose every match it holds — with one exception,
   a document value that is a `Decimal128`**
