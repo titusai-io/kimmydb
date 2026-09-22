@@ -680,11 +680,6 @@ impl std::ops::Deref for WriteTxn<'_> {
     }
 }
 
-thread_local! {
-    /// See [`Engine::retry_guard`].
-    static RETRY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 /// Test-only ways to make the definition check answer as it does in the field.
 ///
 /// The bound exists for a check that can fail for ever, and the input that made
@@ -705,15 +700,6 @@ pub(crate) mod definition_hooks {
 
     pub(crate) fn never() -> bool {
         NEVER.with(|n| n.get())
-    }
-}
-
-/// Decrements the definition write-back retry depth when it goes out of scope.
-pub(crate) struct RetryGuard;
-
-impl Drop for RetryGuard {
-    fn drop(&mut self) {
-        RETRY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
@@ -3331,39 +3317,23 @@ impl Engine {
     /// How many times a definition write-back may lose its race before the
     /// attempt is an error rather than another try.
     ///
-    /// **A bound, because the check it guards can fail for ever.** Each caller of
-    /// [`Self::definition_is`] retried by calling itself again, with nothing
-    /// counting the attempts: a check that never passes therefore exhausted the
-    /// stack and aborted the process. A NaN in a partial filter was the input
-    /// that did it — `NaN != NaN`, so the comparison could not pass — and that
-    /// comparison is fixed above, but the shape was the defect. A real race is
-    /// resolved in one or two attempts; sixteen means something is wrong that
-    /// retrying will not mend.
-    pub(crate) const MAX_DEFINITION_RETRIES: u32 = 16;
+    /// **Ten thousand, which no contention reaches.** The retry is a loop now,
+    /// so it cannot overflow a stack, and the bound's only remaining job is to
+    /// stop a check that can *never* pass — a bug, not a busy node. An earlier
+    /// version bounded it at sixteen on the reasoning that "a real race is
+    /// resolved in one or two attempts", and that reasoning was wrong: K
+    /// concurrent schema changes on one collection queue at the writer gate, so
+    /// the last of them loses K−1 races with nothing wrong at all. A review
+    /// measured it — seventeen threads already produced errors, and thirty-two
+    /// parallel index creates returned eight to ten HTTP 500s a round.
+    pub(crate) const MAX_DEFINITION_RETRIES: u32 = 10_000;
 
-    /// The retry depth of the definition write-back on this thread.
-    ///
-    /// A thread-local rather than a parameter threaded through four functions and
-    /// twenty-four call sites: the retry is a synchronous self-call on one
-    /// thread, so the depth is exactly this counter, and the guard's `Drop` makes
-    /// it right on every path out.
-    pub(crate) fn retry_guard() -> RetryGuard {
-        RETRY_DEPTH.with(|d| d.set(d.get() + 1));
-        RetryGuard
-    }
-
-    /// Whether this thread has already retried a definition write-back as often
-    /// as [`Self::MAX_DEFINITION_RETRIES`] allows.
-    pub(crate) fn retries_exhausted() -> bool {
-        RETRY_DEPTH.with(|d| d.get()) >= Self::MAX_DEFINITION_RETRIES
-    }
-
-    /// The error a caller gets instead of an aborted process.
+    /// The error a caller gets instead of retrying for ever.
     pub(crate) fn retries_exhausted_error(db: &str, collection: &str) -> crate::StorageError {
         crate::StorageError::Transaction(format!(
             "the definition of {db}.{collection} still did not match what was read after {} \
-             attempts to write it back, so the attempt was abandoned rather than retried again; \
-             this is a bug in this build rather than anything a client did",
+             attempts to write it back, so the attempt was abandoned. That is a bug in this \
+             build, or contention beyond anything expected",
             Self::MAX_DEFINITION_RETRIES
         ))
     }

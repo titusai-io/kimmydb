@@ -839,528 +839,523 @@ impl crate::Engine {
         &self,
         db: &str,
         collection: &str,
-        fields: Vec<IndexField>,
+        mut fields: Vec<IndexField>,
         unique: bool,
         enforcement: Enforcement,
-        name: Option<String>,
+        mut requested_name: Option<String>,
         expire_after_secs: Option<i64>,
-        partial_filter: Option<bson::Document>,
+        mut partial_filter: Option<bson::Document>,
         origin: CreateOrigin,
         history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> bool,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
-        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
-        let _retry = crate::Engine::retry_guard();
-        if fields.is_empty() {
-            return Err(StorageError::Core(CoreError::InvalidQuery(
-                "an index needs at least one field".into(),
-            )));
-        }
-        // Parsed now and discarded: the point is to refuse an unsupported
-        // shape *here*, with an operator watching, rather than at query time
-        // where the only symptom would be a plan that quietly stopped
-        // applying.
-        if let Some(filter) = &partial_filter {
-            kimmy_core::PartialFilter::parse(filter).map_err(StorageError::Core)?;
-        }
-        if let Some(secs) = expire_after_secs {
-            if secs < 0 {
-                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                    "expireAfterSeconds cannot be negative, found {secs}"
-                ))));
+        // **A loop, not a self-call.** Every retry passes the same arguments, so
+        // a lost race is a `continue`. It was a self-call, which made an
+        // unbounded retry a stack overflow — and a bound low enough to protect
+        // the stack (sixteen) fired under ordinary concurrent DDL, because K
+        // changes to one collection queue at the writer gate and the last loses
+        // K−1 races with nothing wrong at all. A loop cannot overflow, so the
+        // bound below is only there to stop a check that can never pass.
+        for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
+            if fields.is_empty() {
+                return Err(StorageError::Core(CoreError::InvalidQuery(
+                    "an index needs at least one field".into(),
+                )));
             }
-            // A compound TTL index has no meaning: expiry reads one date, and
-            // there would be no rule for which field that is. Mongo refuses it
-            // too, and refusing is better than silently reading the first.
-            if fields.len() != 1 {
-                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                    "a TTL index takes exactly one field, found {}",
-                    fields.len()
-                ))));
+            // Parsed now and discarded: the point is to refuse an unsupported
+            // shape *here*, with an operator watching, rather than at query time
+            // where the only symptom would be a plan that quietly stopped
+            // applying.
+            if let Some(filter) = &partial_filter {
+                kimmy_core::PartialFilter::parse(filter).map_err(StorageError::Core)?;
             }
-        }
-        if enforcement == Enforcement::Coordinated {
-            return Err(StorageError::Core(CoreError::Unsupported(
-                "coordinated unique enforcement is reserved and not implemented; it needs \
+            if let Some(secs) = expire_after_secs {
+                if secs < 0 {
+                    return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                        "expireAfterSeconds cannot be negative, found {secs}"
+                    ))));
+                }
+                // A compound TTL index has no meaning: expiry reads one date, and
+                // there would be no rule for which field that is. Mongo refuses it
+                // too, and refusing is better than silently reading the first.
+                if fields.len() != 1 {
+                    return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                        "a TTL index takes exactly one field, found {}",
+                        fields.len()
+                    ))));
+                }
+            }
+            if enforcement == Enforcement::Coordinated {
+                return Err(StorageError::Core(CoreError::Unsupported(
+                    "coordinated unique enforcement is reserved and not implemented; it needs \
                  value-ownership routing, which trades availability for the guarantee. Use \
                  \"local\" enforcement, whose cross-node limits are documented"
-                    .into(),
-            )));
-        }
-
-        let mut meta = self.get_collection(db, collection)?;
-        let read = meta.clone();
-        #[cfg(test)]
-        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexCreation);
-        let name = name.unwrap_or_else(|| IndexMeta::default_name(&fields));
-
-        // A local create takes the stamp of the entry it is about to mint, so
-        // that the definition every peer receives and the one stored here name
-        // the same moment. Minted once the transaction below holds the
-        // writer, not here (ADR-148): the backfill between here and there
-        // can take a while, and a stamp minted before it sorts below every
-        // entry other transactions commit meanwhile, which a peer reading
-        // this node's vector and window in that interval witnesses past
-        // without ever being served the index.
-        let mut stamp = match origin {
-            CreateOrigin::Local => None,
-            CreateOrigin::Replicated(created) => created,
-            CreateOrigin::Restored(created) => Some(created),
-        };
-
-        // Derived from the name so every node agrees, which is what lets an
-        // index definition replicate at all.
-        let id = IndexMeta::derive_id(&name);
-        // As stored, before anything is decided or built from it: a local
-        // create, a peer's entry and a snapshot page then all build the
-        // membership every later write maintains (ADR-180).
-        let mut index = as_stored(IndexMeta {
-            id,
-            name,
-            fields,
-            unique,
-            enforcement,
-            multikey: false,
-            expire_after_secs,
-            partial_filter,
-            created: stamp,
-        })?;
-
-        // The name may already be taken. Idempotent when the definition
-        // matches, a conflict when it does not — silently keeping the old
-        // shape under a reused name would be worse than either. The TTL is
-        // part of the definition: re-creating the same index with a different
-        // `expireAfterSeconds` must not quietly return the old policy and
-        // leave documents living longer than asked.
-        //
-        // Cloned rather than borrowed, because both outcomes below write to
-        // `meta` — the stamp merge in place, the supersede by removing it.
-        let superseded = match meta.index(&index.name).cloned() {
-            None => None,
-            Some(existing) => {
-                let differs = existing.differences(&index);
-                if differs.is_empty() {
-                    // The same definition, created independently on two
-                    // members — and the creation stamp has to converge too,
-                    // not only the definition. After ADR-132 the stamp is the
-                    // sole arbiter of whether a replayed `DropIndex` applies,
-                    // so two members holding one definition under two stamps
-                    // answer the same drop differently and stay split: both
-                    // have witnessed the other's create, so nothing re-serves
-                    // it, and the drop is `Applied` on each, so no counter
-                    // moves and the lag gauge reads 0.
-                    //
-                    // It merges **forward**, by the comparison the conflict
-                    // arm uses, because that is what `created` means: the
-                    // incarnation standing under the name. Both members hold
-                    // an index that has existed continuously since the later
-                    // creation, and a drop stamped before it was aimed at
-                    // neither. The earlier stamp would converge just as well
-                    // and would let a drop older than the incarnation delete
-                    // it — the very residual the arm above exists to close,
-                    // reached through the merge instead. (It would also move
-                    // `created` backwards, which is true and is not the
-                    // reason: a declined drop leaves a tombstone, and
-                    // `apply_remote_index` turns away a creation older than
-                    // that before reaching here, so nothing old enough to
-                    // reopen a declined drop arrives at the merge at all.)
-                    //
-                    // The originating entry is appended onward as it always
-                    // was, so every member computes the same maximum whatever
-                    // order the creations reach it in.
-                    let merged = match (origin, existing.created, index.created) {
-                        // A local create mints a fresh stamp and returns here
-                        // without logging, so adopting it would be a decision
-                        // no peer ever hears of — the divergence this merge
-                        // exists to close, from the other side.
-                        (CreateOrigin::Local, _, _) => None,
-                        (_, Some(held), Some(arriving)) if arriving.wins_over(&held) => {
-                            Some(arriving)
-                        }
-                        // An index stored without a stamp learns one from the
-                        // peer that has it: that is the definition's true
-                        // creation, and adopting it ends the ambiguity rather
-                        // than inventing an answer for it.
-                        (_, None, Some(arriving)) => Some(arriving),
-                        _ => None,
-                    };
-                    let Some(merged) = merged else {
-                        // Nothing to settle — but a restored definition this
-                        // node already holds still has its entry appended if
-                        // it is not here, as the entries path appends a
-                        // creation of a definition it already holds (ADR-180).
-                        // The writer is taken to ask: a page with nothing to
-                        // append costs no commit, but it does cost the
-                        // acquisition, so a restore can now meet `WriterBusy`
-                        // here — once per definition already held, on the
-                        // first page only, where the page's documents take the
-                        // writer anyway.
-                        if let CreateOrigin::Restored(created) = origin {
-                            let txn = self.begin_write(WriterHolder::Ddl)?;
-                            if !crate::Engine::definition_is(&txn, &read)? {
-                                if crate::Engine::retries_exhausted() {
-                                    txn.abort()?;
-                                    return Err(crate::Engine::retries_exhausted_error(
-                                        db, collection,
-                                    ));
-                                }
-                                txn.abort()?;
-                                #[cfg(test)]
-                                crate::sync::race_hooks::absorbed(
-                                    crate::sync::race_hooks::Race::IndexCreation,
-                                );
-                                return self.create_index_inner(
-                                    db,
-                                    collection,
-                                    index.fields,
-                                    unique,
-                                    enforcement,
-                                    Some(index.name),
-                                    expire_after_secs,
-                                    index.partial_filter,
-                                    origin,
-                                    history,
-                                );
-                            }
-                            if history(&read, self.index_dropped_at(meta.id, id)?) {
-                                txn.abort()?;
-                                return Ok((IndexCreated::Older, Vec::new()));
-                            }
-                            let body = logged_definition(db, collection, &index);
-                            match relog_restored(&txn, meta.id, &body, created)? {
-                                Some(entry) => {
-                                    txn.commit()?;
-                                    self.relogged(entry);
-                                }
-                                None => txn.abort()?,
-                            }
-                        }
-                        return Ok((IndexCreated::Built(existing), Vec::new()));
-                    };
-                    let mut settled = existing;
-                    settled.created = Some(merged);
-                    meta.indexes
-                        .iter_mut()
-                        .find(|i| i.name == settled.name)
-                        .expect("the index was found on this meta a moment ago")
-                        .created = Some(merged);
-                    // Its own transaction, as every `_inner` on this path has
-                    // (ADR-119) — and safe to separate from the batch because
-                    // the merged stamp is derived from the arriving entry
-                    // alone and only moves forward: a batch that fails after
-                    // this commit leaves a value the same entry, re-delivered,
-                    // computes again and does not move.
-                    let txn = self.begin_write(WriterHolder::Ddl)?;
-                    if !crate::Engine::definition_is(&txn, &read)? {
-                        if crate::Engine::retries_exhausted() {
-                            txn.abort()?;
-                            return Err(crate::Engine::retries_exhausted_error(db, collection));
-                        }
-                        txn.abort()?;
-                        #[cfg(test)]
-                        crate::sync::race_hooks::absorbed(
-                            crate::sync::race_hooks::Race::IndexCreation,
-                        );
-                        return self.create_index_inner(
-                            db,
-                            collection,
-                            index.fields,
-                            unique,
-                            enforcement,
-                            Some(index.name),
-                            expire_after_secs,
-                            index.partial_filter,
-                            origin,
-                            history,
-                        );
-                    }
-                    if history(&read, self.index_dropped_at(meta.id, id)?) {
-                        txn.abort()?;
-                        return Ok((IndexCreated::Older, Vec::new()));
-                    }
-                    crate::Engine::put_collection_meta(&txn, &meta)?;
-                    // A restored definition's entry, with the stamp it settles
-                    // on, in the stamp's own commit (ADR-180).
-                    let relogged = match origin {
-                        CreateOrigin::Restored(created) => relog_restored(
-                            &txn,
-                            meta.id,
-                            &logged_definition(db, collection, &index),
-                            created,
-                        )?,
-                        CreateOrigin::Local | CreateOrigin::Replicated(_) => None,
-                    };
-                    txn.commit()?;
-                    if let Some(entry) = relogged {
-                        self.relogged(entry);
-                    }
-                    return Ok((IndexCreated::Built(settled), Vec::new()));
-                }
-                match (origin, existing.created, index.created) {
-                    // Two members created one name with different definitions
-                    // while they could not see each other. Neither is wrong,
-                    // and neither can be kept without the cluster holding two
-                    // schemas for ever — so the later stamp wins, which is
-                    // how two concurrent writes to one document already
-                    // settle (ADR-020, ADR-132). The loser is removed in the
-                    // transaction that builds the winner, below.
-                    (
-                        CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
-                        Some(held),
-                        Some(arriving),
-                    ) if arriving.wins_over(&held) => Some(existing),
-                    (CreateOrigin::Replicated(_) | CreateOrigin::Restored(_), Some(_), Some(_)) => {
-                        // The definition here is the later one. The arrival is
-                        // history: nothing to do, and the caller must not
-                        // append it onward.
-                        return Ok((IndexCreated::Older, Vec::new()));
-                    }
-                    // A local create, or a rival with no creation stamp to
-                    // compare — the second reads as older than everything,
-                    // and dropping this node's index for it would be
-                    // resolving a conflict by guessing. Refused, counted and
-                    // named, exactly as ADR-123 left it.
-                    _ => {
-                        return Err(StorageError::Core(CoreError::IndexExists {
-                            db: db.to_string(),
-                            collection: collection.to_string(),
-                            index: index.name,
-                            differs: differs.join(", "),
-                        }));
-                    }
-                }
+                        .into(),
+                )));
             }
-        };
 
-        // Only a genuine hash collision can reach this: an index of the same
-        // *name* was resolved just above, and it derives the same id.
-        if let Some(other) = meta.index_by_id(id).filter(|other| other.name != index.name) {
-            return Err(StorageError::Corrupt(format!(
-                "index id for {:?} collides with existing index {:?} on {db}.{collection}; \
-                 rename one of them",
-                index.name, other.name
-            )));
-        }
-
-        let txn = self.begin_write(WriterHolder::IndexBuild)?;
-        // Everything above decided from a definition read before the writer;
-        // one that has changed since is decided again (`definition_is`).
-        if !crate::Engine::definition_is(&txn, &read)? {
-            if crate::Engine::retries_exhausted() {
-                txn.abort()?;
-                return Err(crate::Engine::retries_exhausted_error(db, collection));
-            }
-            txn.abort()?;
+            let mut meta = self.get_collection(db, collection)?;
+            let read = meta.clone();
             #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexCreation);
-            return self.create_index_inner(
-                db,
-                collection,
-                index.fields,
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexCreation);
+            // `requested_name` rather than a shadow of `name`: a lost race
+            // reassigns it before looping, and a shadow would swallow that.
+            let name = requested_name.clone().unwrap_or_else(|| IndexMeta::default_name(&fields));
+
+            // A local create takes the stamp of the entry it is about to mint, so
+            // that the definition every peer receives and the one stored here name
+            // the same moment. Minted once the transaction below holds the
+            // writer, not here (ADR-148): the backfill between here and there
+            // can take a while, and a stamp minted before it sorts below every
+            // entry other transactions commit meanwhile, which a peer reading
+            // this node's vector and window in that interval witnesses past
+            // without ever being served the index.
+            let mut stamp = match origin {
+                CreateOrigin::Local => None,
+                CreateOrigin::Replicated(created) => created,
+                CreateOrigin::Restored(created) => Some(created),
+            };
+
+            // Derived from the name so every node agrees, which is what lets an
+            // index definition replicate at all.
+            let id = IndexMeta::derive_id(&name);
+            // As stored, before anything is decided or built from it: a local
+            // create, a peer's entry and a snapshot page then all build the
+            // membership every later write maintains (ADR-180).
+            let mut index = as_stored(IndexMeta {
+                id,
+                name,
+                fields,
                 unique,
                 enforcement,
-                Some(index.name),
+                multikey: false,
                 expire_after_secs,
-                index.partial_filter,
-                origin,
-                history,
-            );
-        }
-        if history(&read, self.index_dropped_at(meta.id, id)?) {
-            txn.abort()?;
-            #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexHistory);
-            return Ok((IndexCreated::Older, Vec::new()));
-        }
-        if matches!(origin, CreateOrigin::Local) {
-            let minted = self.next_stamp();
-            stamp = Some(minted);
-            index.created = Some(minted);
-        }
+                partial_filter,
+                created: stamp,
+            })?;
 
-        // The loser of a concurrent creation goes in the same transaction as
-        // the winner's build, so a definition this node's documents cannot be
-        // built under aborts back to the index it already had rather than
-        // leaving the name empty on this member alone.
-        if let Some(loser) = &superseded {
-            {
-                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
-                clear_index_entries(&mut entries, index_id_range(meta.id, loser.id))?;
-            }
-            // Under the *winner's* stamp. The upper bound is the load-bearing
-            // half: anything above it would make the winner's own re-delivery
-            // read as history — a creation at exactly the tombstone's stamp is
-            // not — and the definition could never be rebuilt after a later
-            // drop. Below it the loser's replay would still be turned away by
-            // the comparison above, so recording the winner's stamp is the
-            // tighter of two correct answers rather than the only one.
-            crate::Engine::record_index_drop_in_txn(
-                &txn,
-                meta.id,
-                loser.id,
-                stamp.expect("a superseding create carries a stamp: it is what won the comparison"),
-            )?;
-            meta.indexes.retain(|i| i.name != index.name);
-        }
-
-        // Scoped in a closure so every table borrow ends before the abort or
-        // commit below, which need to move the transaction. Returns whether the
-        // existing documents already make the index multikey — the backfill is
-        // the flag's only chance to see them — for a replicated unique index,
-        // the keys the existing documents already share, and how many documents
-        // were filed unkeyed.
-        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize)> {
-            let docs = txn.open_table(tables::DOCS)?;
-            let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
-            // What a unique index has filed so far. Locally only the keys
-            // matter, since the first repeat is a refusal; a replicated build
-            // also keeps who holds each key, in scan order, because that is
-            // what it reports — one document key per key more than the local
-            // build pays, and only on the path that needs it.
-            let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
-            let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
-                Default::default();
-            let mut observed_multikey = false;
-            let mut unkeyed = 0usize;
-
-            for entry in docs.range(crate::engine::doc_range(meta.id))? {
-                let (raw_key, raw_value) = entry?;
-                let record = crate::codec::decode_doc_record(raw_value.value())?;
-                let Some(doc) = record.document()? else { continue };
-                let (_, doc_key) = raw_key.value();
-
-                let (keys, multikey) = match document_keys(index, &doc)? {
-                    DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
-                    DocumentKeys::Unkeyed { reason, multikey } => {
-                        // A unique index must be able to key every document
-                        // it covers, and a client creating one is there to be
-                        // told (ADR-020). Replicated, the definition exists on
-                        // a peer and cannot be refused without diverging: it
-                        // is built with the document filed unkeyed, as
-                        // `maintain_remote` files one that arrives later.
-                        if index.unique && matches!(origin, CreateOrigin::Local) {
-                            return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                                "{reason}; a unique index must be able to key every document \
-                                 it covers, so it cannot be created"
-                            ))));
+            // The name may already be taken. Idempotent when the definition
+            // matches, a conflict when it does not — silently keeping the old
+            // shape under a reused name would be worse than either. The TTL is
+            // part of the definition: re-creating the same index with a different
+            // `expireAfterSeconds` must not quietly return the old policy and
+            // leave documents living longer than asked.
+            //
+            // Cloned rather than borrowed, because both outcomes below write to
+            // `meta` — the stamp merge in place, the supersede by removing it.
+            let superseded = match meta.index(&index.name).cloned() {
+                None => None,
+                Some(existing) => {
+                    let differs = existing.differences(&index);
+                    if differs.is_empty() {
+                        // The same definition, created independently on two
+                        // members — and the creation stamp has to converge too,
+                        // not only the definition. After ADR-132 the stamp is the
+                        // sole arbiter of whether a replayed `DropIndex` applies,
+                        // so two members holding one definition under two stamps
+                        // answer the same drop differently and stay split: both
+                        // have witnessed the other's create, so nothing re-serves
+                        // it, and the drop is `Applied` on each, so no counter
+                        // moves and the lag gauge reads 0.
+                        //
+                        // It merges **forward**, by the comparison the conflict
+                        // arm uses, because that is what `created` means: the
+                        // incarnation standing under the name. Both members hold
+                        // an index that has existed continuously since the later
+                        // creation, and a drop stamped before it was aimed at
+                        // neither. The earlier stamp would converge just as well
+                        // and would let a drop older than the incarnation delete
+                        // it — the very residual the arm above exists to close,
+                        // reached through the merge instead. (It would also move
+                        // `created` backwards, which is true and is not the
+                        // reason: a declined drop leaves a tombstone, and
+                        // `apply_remote_index` turns away a creation older than
+                        // that before reaching here, so nothing old enough to
+                        // reopen a declined drop arrives at the merge at all.)
+                        //
+                        // The originating entry is appended onward as it always
+                        // was, so every member computes the same maximum whatever
+                        // order the creations reach it in.
+                        let merged = match (origin, existing.created, index.created) {
+                            // A local create mints a fresh stamp and returns here
+                            // without logging, so adopting it would be a decision
+                            // no peer ever hears of — the divergence this merge
+                            // exists to close, from the other side.
+                            (CreateOrigin::Local, _, _) => None,
+                            (_, Some(held), Some(arriving)) if arriving.wins_over(&held) => {
+                                Some(arriving)
+                            }
+                            // An index stored without a stamp learns one from the
+                            // peer that has it: that is the definition's true
+                            // creation, and adopting it ends the ambiguity rather
+                            // than inventing an answer for it.
+                            (_, None, Some(arriving)) => Some(arriving),
+                            _ => None,
+                        };
+                        let Some(merged) = merged else {
+                            // Nothing to settle — but a restored definition this
+                            // node already holds still has its entry appended if
+                            // it is not here, as the entries path appends a
+                            // creation of a definition it already holds (ADR-180).
+                            // The writer is taken to ask: a page with nothing to
+                            // append costs no commit, but it does cost the
+                            // acquisition, so a restore can now meet `WriterBusy`
+                            // here — once per definition already held, on the
+                            // first page only, where the page's documents take the
+                            // writer anyway.
+                            if let CreateOrigin::Restored(created) = origin {
+                                let txn = self.begin_write(WriterHolder::Ddl)?;
+                                if !crate::Engine::definition_is(&txn, &read)? {
+                                    txn.abort()?;
+                                    #[cfg(test)]
+                                    crate::sync::race_hooks::absorbed(
+                                        crate::sync::race_hooks::Race::IndexCreation,
+                                    );
+                                    // The retry's arguments, which this attempt rebuilt from what it
+                                    // read. A loop rather than a self-call, so they are assigned
+                                    // rather than passed.
+                                    fields = index.fields;
+                                    requested_name = Some(index.name);
+                                    partial_filter = index.partial_filter;
+                                    continue;
+                                }
+                                if history(&read, self.index_dropped_at(meta.id, id)?) {
+                                    txn.abort()?;
+                                    return Ok((IndexCreated::Older, Vec::new()));
+                                }
+                                let body = logged_definition(db, collection, &index);
+                                match relog_restored(&txn, meta.id, &body, created)? {
+                                    Some(entry) => {
+                                        txn.commit()?;
+                                        self.relogged(entry);
+                                    }
+                                    None => txn.abort()?,
+                                }
+                            }
+                            return Ok((IndexCreated::Built(existing), Vec::new()));
+                        };
+                        let mut settled = existing;
+                        settled.created = Some(merged);
+                        meta.indexes
+                            .iter_mut()
+                            .find(|i| i.name == settled.name)
+                            .expect("the index was found on this meta a moment ago")
+                            .created = Some(merged);
+                        // Its own transaction, as every `_inner` on this path has
+                        // (ADR-119) — and safe to separate from the batch because
+                        // the merged stamp is derived from the arriving entry
+                        // alone and only moves forward: a batch that fails after
+                        // this commit leaves a value the same entry, re-delivered,
+                        // computes again and does not move.
+                        let txn = self.begin_write(WriterHolder::Ddl)?;
+                        if !crate::Engine::definition_is(&txn, &read)? {
+                            txn.abort()?;
+                            #[cfg(test)]
+                            crate::sync::race_hooks::absorbed(
+                                crate::sync::race_hooks::Race::IndexCreation,
+                            );
+                            // The retry's arguments, which this attempt rebuilt from what it
+                            // read. A loop rather than a self-call, so they are assigned
+                            // rather than passed.
+                            fields = index.fields;
+                            requested_name = Some(index.name);
+                            partial_filter = index.partial_filter;
+                            continue;
                         }
-                        entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
-                        observed_multikey |= multikey;
-                        unkeyed += 1;
-                        continue;
+                        if history(&read, self.index_dropped_at(meta.id, id)?) {
+                            txn.abort()?;
+                            return Ok((IndexCreated::Older, Vec::new()));
+                        }
+                        crate::Engine::put_collection_meta(&txn, &meta)?;
+                        // A restored definition's entry, with the stamp it settles
+                        // on, in the stamp's own commit (ADR-180).
+                        let relogged = match origin {
+                            CreateOrigin::Restored(created) => relog_restored(
+                                &txn,
+                                meta.id,
+                                &logged_definition(db, collection, &index),
+                                created,
+                            )?,
+                            CreateOrigin::Local | CreateOrigin::Replicated(_) => None,
+                        };
+                        txn.commit()?;
+                        if let Some(entry) = relogged {
+                            self.relogged(entry);
+                        }
+                        return Ok((IndexCreated::Built(settled), Vec::new()));
                     }
-                };
-                observed_multikey |= multikey;
-                for key in keys {
-                    if index.unique && matches!(origin, CreateOrigin::Local) {
-                        // A unique index over data that already violates it
-                        // must not be created *locally* — it would report a
-                        // constraint it does not actually hold.
-                        if !seen_unique.insert(key.clone()) {
-                            return Err(StorageError::Core(CoreError::UniqueViolation {
-                                index: index.name.clone(),
-                                detail: "existing documents already violate it, so it cannot \
-                                         be created"
-                                    .into(),
+                    match (origin, existing.created, index.created) {
+                        // Two members created one name with different definitions
+                        // while they could not see each other. Neither is wrong,
+                        // and neither can be kept without the cluster holding two
+                        // schemas for ever — so the later stamp wins, which is
+                        // how two concurrent writes to one document already
+                        // settle (ADR-020, ADR-132). The loser is removed in the
+                        // transaction that builds the winner, below.
+                        (
+                            CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
+                            Some(held),
+                            Some(arriving),
+                        ) if arriving.wins_over(&held) => Some(existing),
+                        (
+                            CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
+                            Some(_),
+                            Some(_),
+                        ) => {
+                            // The definition here is the later one. The arrival is
+                            // history: nothing to do, and the caller must not
+                            // append it onward.
+                            return Ok((IndexCreated::Older, Vec::new()));
+                        }
+                        // A local create, or a rival with no creation stamp to
+                        // compare — the second reads as older than everything,
+                        // and dropping this node's index for it would be
+                        // resolving a conflict by guessing. Refused, counted and
+                        // named, exactly as ADR-123 left it.
+                        _ => {
+                            return Err(StorageError::Core(CoreError::IndexExists {
+                                db: db.to_string(),
+                                collection: collection.to_string(),
+                                index: index.name,
+                                differs: differs.join(", "),
                             }));
                         }
-                    } else if index.unique {
-                        // Replicated, the build goes on and the collision is
-                        // reported; see the doc comment on this function.
-                        holders_by_key.entry(key.clone()).or_default().push(doc_key.to_vec());
                     }
-                    entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
                 }
+            };
+
+            // Only a genuine hash collision can reach this: an index of the same
+            // *name* was resolved just above, and it derives the same id.
+            if let Some(other) = meta.index_by_id(id).filter(|other| other.name != index.name) {
+                return Err(StorageError::Corrupt(format!(
+                    "index id for {:?} collides with existing index {:?} on {db}.{collection}; \
+                 rename one of them",
+                    index.name, other.name
+                )));
             }
 
-            // One violation per shared key, naming every holder, in the order
-            // the scan met them — so the last holder is the document that
-            // revealed the collision, which is what the report names as the
-            // one that was merged.
-            let mut violations: Vec<UniqueViolation> = holders_by_key
-                .into_iter()
-                .filter(|(_, holders)| holders.len() > 1)
-                .map(|(key, holders)| UniqueViolation { index: index.name.clone(), key, holders })
-                .collect();
-            violations.sort_by(|a, b| a.key.cmp(&b.key));
-            Ok((observed_multikey, violations, unkeyed))
-        };
-
-        let (violations, unkeyed) = match build(&index) {
-            Ok((observed, violations, unkeyed)) => {
-                index.multikey = observed;
-                (violations, unkeyed)
-            }
-            Err(e) => {
+            let txn = self.begin_write(WriterHolder::IndexBuild)?;
+            // Everything above decided from a definition read before the writer;
+            // one that has changed since is decided again (`definition_is`).
+            if !crate::Engine::definition_is(&txn, &read)? {
                 txn.abort()?;
-                return Err(e);
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexCreation);
+                // The retry's arguments, which this attempt rebuilt from what it
+                // read. A loop rather than a self-call, so they are assigned
+                // rather than passed.
+                fields = index.fields;
+                requested_name = Some(index.name);
+                partial_filter = index.partial_filter;
+                continue;
             }
-        };
+            if history(&read, self.index_dropped_at(meta.id, id)?) {
+                txn.abort()?;
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexHistory);
+                return Ok((IndexCreated::Older, Vec::new()));
+            }
+            if matches!(origin, CreateOrigin::Local) {
+                let minted = self.next_stamp();
+                stamp = Some(minted);
+                index.created = Some(minted);
+            }
 
-        meta.indexes.push(index.clone());
-        crate::Engine::put_collection_meta(&txn, &meta)?;
+            // The loser of a concurrent creation goes in the same transaction as
+            // the winner's build, so a definition this node's documents cannot be
+            // built under aborts back to the index it already had rather than
+            // leaving the name empty on this member alone.
+            if let Some(loser) = &superseded {
+                {
+                    let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                    clear_index_entries(&mut entries, index_id_range(meta.id, loser.id))?;
+                }
+                // Under the *winner's* stamp. The upper bound is the load-bearing
+                // half: anything above it would make the winner's own re-delivery
+                // read as history — a creation at exactly the tombstone's stamp is
+                // not — and the definition could never be rebuilt after a later
+                // drop. Below it the loser's replay would still be turned away by
+                // the comparison above, so recording the winner's stamp is the
+                // tighter of two correct answers rather than the only one.
+                crate::Engine::record_index_drop_in_txn(
+                    &txn,
+                    meta.id,
+                    loser.id,
+                    stamp.expect(
+                        "a superseding create carries a stamp: it is what won the comparison",
+                    ),
+                )?;
+                meta.indexes.retain(|i| i.name != index.name);
+            }
 
-        let logged = match origin {
-            CreateOrigin::Local => {
-                let entry = crate::engine::ddl_entry(
-                    stamp.expect("a local create mints its stamp above"),
-                    kimmy_core::OpKind::CreateIndex,
+            // Scoped in a closure so every table borrow ends before the abort or
+            // commit below, which need to move the transaction. Returns whether the
+            // existing documents already make the index multikey — the backfill is
+            // the flag's only chance to see them — for a replicated unique index,
+            // the keys the existing documents already share, and how many documents
+            // were filed unkeyed.
+            let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize)> {
+                let docs = txn.open_table(tables::DOCS)?;
+                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                // What a unique index has filed so far. Locally only the keys
+                // matter, since the first repeat is a refusal; a replicated build
+                // also keeps who holds each key, in scan order, because that is
+                // what it reports — one document key per key more than the local
+                // build pays, and only on the path that needs it.
+                let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
+                let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+                    Default::default();
+                let mut observed_multikey = false;
+                let mut unkeyed = 0usize;
+
+                for entry in docs.range(crate::engine::doc_range(meta.id))? {
+                    let (raw_key, raw_value) = entry?;
+                    let record = crate::codec::decode_doc_record(raw_value.value())?;
+                    let Some(doc) = record.document()? else { continue };
+                    let (_, doc_key) = raw_key.value();
+
+                    let (keys, multikey) = match document_keys(index, &doc)? {
+                        DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
+                        DocumentKeys::Unkeyed { reason, multikey } => {
+                            // A unique index must be able to key every document
+                            // it covers, and a client creating one is there to be
+                            // told (ADR-020). Replicated, the definition exists on
+                            // a peer and cannot be refused without diverging: it
+                            // is built with the document filed unkeyed, as
+                            // `maintain_remote` files one that arrives later.
+                            if index.unique && matches!(origin, CreateOrigin::Local) {
+                                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                                    "{reason}; a unique index must be able to key every document \
+                                 it covers, so it cannot be created"
+                                ))));
+                            }
+                            entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
+                            observed_multikey |= multikey;
+                            unkeyed += 1;
+                            continue;
+                        }
+                    };
+                    observed_multikey |= multikey;
+                    for key in keys {
+                        if index.unique && matches!(origin, CreateOrigin::Local) {
+                            // A unique index over data that already violates it
+                            // must not be created *locally* — it would report a
+                            // constraint it does not actually hold.
+                            if !seen_unique.insert(key.clone()) {
+                                return Err(StorageError::Core(CoreError::UniqueViolation {
+                                    index: index.name.clone(),
+                                    detail: "existing documents already violate it, so it cannot \
+                                         be created"
+                                        .into(),
+                                }));
+                            }
+                        } else if index.unique {
+                            // Replicated, the build goes on and the collision is
+                            // reported; see the doc comment on this function.
+                            holders_by_key.entry(key.clone()).or_default().push(doc_key.to_vec());
+                        }
+                        entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
+                    }
+                }
+
+                // One violation per shared key, naming every holder, in the order
+                // the scan met them — so the last holder is the document that
+                // revealed the collision, which is what the report names as the
+                // one that was merged.
+                let mut violations: Vec<UniqueViolation> = holders_by_key
+                    .into_iter()
+                    .filter(|(_, holders)| holders.len() > 1)
+                    .map(|(key, holders)| UniqueViolation {
+                        index: index.name.clone(),
+                        key,
+                        holders,
+                    })
+                    .collect();
+                violations.sort_by(|a, b| a.key.cmp(&b.key));
+                Ok((observed_multikey, violations, unkeyed))
+            };
+
+            let (violations, unkeyed) = match build(&index) {
+                Ok((observed, violations, unkeyed)) => {
+                    index.multikey = observed;
+                    (violations, unkeyed)
+                }
+                Err(e) => {
+                    txn.abort()?;
+                    return Err(e);
+                }
+            };
+
+            meta.indexes.push(index.clone());
+            crate::Engine::put_collection_meta(&txn, &meta)?;
+
+            let logged = match origin {
+                CreateOrigin::Local => {
+                    let entry = crate::engine::ddl_entry(
+                        stamp.expect("a local create mints its stamp above"),
+                        kimmy_core::OpKind::CreateIndex,
+                        meta.id,
+                        &logged_definition(db, collection, &index),
+                    )?;
+                    crate::engine::append_oplog(&txn, &entry)?;
+                    Some(entry)
+                }
+                CreateOrigin::Replicated(_) => None,
+                // In the transaction that builds the definition, so the entry and
+                // the state it describes commit together or not at all (ADR-180).
+                CreateOrigin::Restored(created) => relog_restored(
+                    &txn,
                     meta.id,
                     &logged_definition(db, collection, &index),
-                )?;
-                crate::engine::append_oplog(&txn, &entry)?;
-                Some(entry)
+                    created,
+                )?,
+            };
+            txn.commit()?;
+            if let Some(entry) = logged {
+                match origin {
+                    CreateOrigin::Restored(_) => self.relogged(entry),
+                    CreateOrigin::Local | CreateOrigin::Replicated(_) => self.publish(vec![entry]),
+                }
             }
-            CreateOrigin::Replicated(_) => None,
-            // In the transaction that builds the definition, so the entry and
-            // the state it describes commit together or not at all (ADR-180).
-            CreateOrigin::Restored(created) => {
-                relog_restored(&txn, meta.id, &logged_definition(db, collection, &index), created)?
-            }
-        };
-        txn.commit()?;
-        if let Some(entry) = logged {
-            match origin {
-                CreateOrigin::Restored(_) => self.relogged(entry),
-                CreateOrigin::Local | CreateOrigin::Replicated(_) => self.publish(vec![entry]),
-            }
-        }
-        // Built just now, so nothing an expiry pass remembered under this id
-        // is a position in it: a superseded definition's cursor, which no drop
-        // forgot, or one a pass saved after the drop that preceded this.
-        self.forget_expiry_cursors(meta.id, Some(index.id));
+            // Built just now, so nothing an expiry pass remembered under this id
+            // is a position in it: a superseded definition's cursor, which no drop
+            // forgot, or one a pass saved after the drop that preceded this.
+            self.forget_expiry_cursors(meta.id, Some(index.id));
 
-        if let Some(loser) = &superseded {
-            // The operator's signal, and the only one: an index they created
-            // here has been replaced by a peer's definition of the same name.
-            // Not counted on `/metrics` — this is the conflict rule working,
-            // the way two concurrent document writes resolving is, and
-            // neither is a divergence to alert on (ADR-132).
-            tracing::warn!(
-                db,
-                collection,
-                index = %index.name,
-                differs = %loser.differences(&index).join(", "),
-                "replaced an index with a peer's definition of the same name, created later; \
-                 the members now agree on the later definition"
-            );
+            if let Some(loser) = &superseded {
+                // The operator's signal, and the only one: an index they created
+                // here has been replaced by a peer's definition of the same name.
+                // Not counted on `/metrics` — this is the conflict rule working,
+                // the way two concurrent document writes resolving is, and
+                // neither is a divergence to alert on (ADR-132).
+                tracing::warn!(
+                    db,
+                    collection,
+                    index = %index.name,
+                    differs = %loser.differences(&index).join(", "),
+                    "replaced an index with a peer's definition of the same name, created later; \
+                     the members now agree on the later definition"
+                );
+            }
+            if unkeyed > 0 {
+                // Once per build rather than once per document: a backfill can
+                // meet thousands, and the number is the message. The counter
+                // moves by the same number, after the commit that made it true.
+                self.count_unkeyed(unkeyed as u64);
+                tracing::warn!(
+                    db,
+                    collection,
+                    index = %index.name,
+                    unique,
+                    documents = unkeyed,
+                    "built an index over documents it cannot key; they are filed unkeyed and \
+                     rechecked on every scan of it, counted in kimmy_index_unkeyed_total"
+                );
+            }
+            tracing::info!(db, collection, index = %index.name, unique, "created index");
+            return Ok((IndexCreated::Built(index), violations));
         }
-        if unkeyed > 0 {
-            // Once per build rather than once per document: a backfill can
-            // meet thousands, and the number is the message. The counter
-            // moves by the same number, after the commit that made it true.
-            self.count_unkeyed(unkeyed as u64);
-            tracing::warn!(
-                db,
-                collection,
-                index = %index.name,
-                unique,
-                documents = unkeyed,
-                "built an index over documents it cannot key; they are filed unkeyed and \
-                 rechecked on every scan of it, counted in kimmy_index_unkeyed_total"
-            );
-        }
-        tracing::info!(db, collection, index = %index.name, unique, "created index");
-        Ok((IndexCreated::Built(index), violations))
+        // Unreachable under contention: see `MAX_DEFINITION_RETRIES`.
+        Err(crate::Engine::retries_exhausted_error(db, collection))
     }
 
     /// Drop an index and every entry it holds. `true` when this member held
@@ -1407,137 +1402,140 @@ impl crate::Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Dropped> {
-        // Bounds the retry below (`Engine::MAX_DEFINITION_RETRIES`).
-        let _retry = crate::Engine::retry_guard();
-        if replicated.is_none() {
-            // A name a create would have refused mints no tombstone: there is
-            // no index it could ever name, and the caller is there to be told.
-            CoreError::validate_name(name).map_err(StorageError::Core)?;
-        }
-        let mut meta = self.get_collection(db, collection)?;
-        let read = meta.clone();
-        #[cfg(test)]
-        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexDrop);
-        // Derived from the name rather than read from the definition, so the
-        // key agrees with what a `CreateIndex` replay will compute whether or
-        // not the index is here.
-        let index_id = IndexMeta::derive_id(name);
-        let log = replicated.is_none();
-        // A local drop's stamp is minted under the writer, in whichever of
-        // the two transactions below the drop lands in (ADR-148).
-        let drop_entry = |stamp: Stamp| {
-            crate::engine::ddl_entry(
-                stamp,
-                kimmy_core::OpKind::DropIndex,
-                meta.id,
-                &kimmy_core::IndexDrop {
-                    db: db.to_string(),
-                    collection: collection.to_string(),
-                    index: name.to_string(),
-                },
-            )
-        };
+        // **A loop, not a self-call.** Every retry passes the same arguments, so
+        // a lost race is a `continue`. It was a self-call, which made an
+        // unbounded retry a stack overflow — and a bound low enough to protect
+        // the stack (sixteen) fired under ordinary concurrent DDL, because K
+        // changes to one collection queue at the writer gate and the last loses
+        // K−1 races with nothing wrong at all. A loop cannot overflow, so the
+        // bound below is only there to stop a check that can never pass.
+        for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
+            if replicated.is_none() {
+                // A name a create would have refused mints no tombstone: there is
+                // no index it could ever name, and the caller is there to be told.
+                CoreError::validate_name(name).map_err(StorageError::Core)?;
+            }
+            let mut meta = self.get_collection(db, collection)?;
+            let read = meta.clone();
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexDrop);
+            // Derived from the name rather than read from the definition, so the
+            // key agrees with what a `CreateIndex` replay will compute whether or
+            // not the index is here.
+            let index_id = IndexMeta::derive_id(name);
+            let log = replicated.is_none();
+            // A local drop's stamp is minted under the writer, in whichever of
+            // the two transactions below the drop lands in (ADR-148).
+            let drop_entry = |stamp: Stamp| {
+                crate::engine::ddl_entry(
+                    stamp,
+                    kimmy_core::OpKind::DropIndex,
+                    meta.id,
+                    &kimmy_core::IndexDrop {
+                        db: db.to_string(),
+                        collection: collection.to_string(),
+                        index: name.to_string(),
+                    },
+                )
+            };
 
-        let Some(index) = meta.index(name).cloned() else {
-            // Not here, but the drop still happened: the tombstone and the
-            // entry go in one transaction, as they do below, so there is no
-            // instant in which the drop is recorded and not yet replicable.
-            let txn = self.begin_write(WriterHolder::Ddl)?;
-            // "Not here" was read before the writer; an index created since is
-            // one this drop may have to remove (`Engine::definition_is`).
-            if !crate::Engine::definition_is(&txn, &read)? {
-                if crate::Engine::retries_exhausted() {
+            let Some(index) = meta.index(name).cloned() else {
+                // Not here, but the drop still happened: the tombstone and the
+                // entry go in one transaction, as they do below, so there is no
+                // instant in which the drop is recorded and not yet replicable.
+                let txn = self.begin_write(WriterHolder::Ddl)?;
+                // "Not here" was read before the writer; an index created since is
+                // one this drop may have to remove (`Engine::definition_is`).
+                if !crate::Engine::definition_is(&txn, &read)? {
                     txn.abort()?;
-                    return Err(crate::Engine::retries_exhausted_error(db, collection));
+                    #[cfg(test)]
+                    crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
+                    continue;
                 }
+                if let Some(stamp) = replicated {
+                    crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+                    txn.commit()?;
+                    return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
+                }
+                let stamp = self.next_stamp();
+                crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+                let entry = drop_entry(stamp)?;
+                crate::engine::append_oplog(&txn, &entry)?;
+                txn.commit()?;
+                self.publish(vec![entry]);
+                tracing::info!(
+                    db,
+                    collection,
+                    index = name,
+                    "recorded a drop for an index this member does not hold; the drop replicates"
+                );
+                return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
+            };
+
+            let txn = self.begin_write(WriterHolder::Drop)?;
+            // The definition written back below was read before the writer
+            // (`Engine::definition_is`).
+            if !crate::Engine::definition_is(&txn, &read)? {
                 txn.abort()?;
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
-                return self.drop_index_inner(db, collection, name, replicated);
+                continue;
             }
-            if let Some(stamp) = replicated {
+            // The incarnation rule the `DropIndex` arm applies before calling,
+            // judged again here: an index of this name created after the drop can
+            // land between that check and the writer (ADR-132).
+            if let Some(stamp) = replicated
+                && index.created.is_some_and(|created| stamp < created)
+            {
+                let replay = {
+                    let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+                    dropped
+                        .get((meta.id.0, index_id))?
+                        .map(|seen| crate::codec::decode_oplog_key(seen.value()))
+                        .transpose()?
+                        .is_some_and(|seen| seen >= stamp)
+                };
                 crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
                 txn.commit()?;
-                return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
+                #[cfg(test)]
+                crate::sync::race_hooks::absorbed(
+                    crate::sync::race_hooks::Race::ReplicatedIndexDrop,
+                );
+                return Ok(Dropped { stamp: Some(stamp), removed: false, declined: Some(replay) });
             }
-            let stamp = self.next_stamp();
+            let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+            {
+                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                clear_index_entries(&mut entries, index_id_range(meta.id, index.id))?;
+            }
+            // Entries are removed above, in this same transaction, which is what
+            // makes it safe for an index later recreated under the same name to
+            // receive the same derived id — it cannot inherit anything.
+            meta.indexes.retain(|i| i.name != name);
+            crate::Engine::put_collection_meta(&txn, &meta)?;
+            // Same transaction as the removal, so there is no instant in which the
+            // index is gone with no record that it was dropped.
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
-            let entry = drop_entry(stamp)?;
-            crate::engine::append_oplog(&txn, &entry)?;
-            txn.commit()?;
-            self.publish(vec![entry]);
-            tracing::info!(
-                db,
-                collection,
-                index = name,
-                "recorded a drop for an index this member does not hold; the drop replicates"
-            );
-            return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
-        };
 
-        let txn = self.begin_write(WriterHolder::Drop)?;
-        // The definition written back below was read before the writer
-        // (`Engine::definition_is`).
-        if !crate::Engine::definition_is(&txn, &read)? {
-            if crate::Engine::retries_exhausted() {
-                txn.abort()?;
-                return Err(crate::Engine::retries_exhausted_error(db, collection));
-            }
-            txn.abort()?;
-            #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexDrop);
-            return self.drop_index_inner(db, collection, name, replicated);
-        }
-        // The incarnation rule the `DropIndex` arm applies before calling,
-        // judged again here: an index of this name created after the drop can
-        // land between that check and the writer (ADR-132).
-        if let Some(stamp) = replicated
-            && index.created.is_some_and(|created| stamp < created)
-        {
-            let replay = {
-                let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
-                dropped
-                    .get((meta.id.0, index_id))?
-                    .map(|seen| crate::codec::decode_oplog_key(seen.value()))
-                    .transpose()?
-                    .is_some_and(|seen| seen >= stamp)
+            let logged = if log {
+                let entry = drop_entry(stamp)?;
+                crate::engine::append_oplog(&txn, &entry)?;
+                Some(entry)
+            } else {
+                None
             };
-            crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
             txn.commit()?;
-            #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::ReplicatedIndexDrop);
-            return Ok(Dropped { stamp: Some(stamp), removed: false, declined: Some(replay) });
-        }
-        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
-        {
-            let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
-            clear_index_entries(&mut entries, index_id_range(meta.id, index.id))?;
-        }
-        // Entries are removed above, in this same transaction, which is what
-        // makes it safe for an index later recreated under the same name to
-        // receive the same derived id — it cannot inherit anything.
-        meta.indexes.retain(|i| i.name != name);
-        crate::Engine::put_collection_meta(&txn, &meta)?;
-        // Same transaction as the removal, so there is no instant in which the
-        // index is gone with no record that it was dropped.
-        crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+            if let Some(entry) = logged {
+                self.publish(vec![entry]);
+            }
+            // An index recreated under the name receives the same derived id.
+            self.forget_expiry_cursors(meta.id, Some(index.id));
 
-        let logged = if log {
-            let entry = drop_entry(stamp)?;
-            crate::engine::append_oplog(&txn, &entry)?;
-            Some(entry)
-        } else {
-            None
-        };
-        txn.commit()?;
-        if let Some(entry) = logged {
-            self.publish(vec![entry]);
+            tracing::info!(db, collection, index = name, "dropped index");
+            return Ok(Dropped { stamp: Some(stamp), removed: true, declined: None });
         }
-        // An index recreated under the name receives the same derived id.
-        self.forget_expiry_cursors(meta.id, Some(index.id));
-
-        tracing::info!(db, collection, index = name, "dropped index");
-        Ok(Dropped { stamp: Some(stamp), removed: true, declined: None })
+        // Unreachable under contention: see `MAX_DEFINITION_RETRIES`.
+        Err(crate::Engine::retries_exhausted_error(db, collection))
     }
 
     pub fn list_indexes(&self, db: &str, collection: &str) -> Result<Vec<IndexMeta>> {
@@ -2376,6 +2374,55 @@ mod tests {
         let coll = engine.get_collection("app", "docs").unwrap();
         let names: Vec<&str> = coll.indexes.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["second", "third"], "{names:?}");
+    }
+
+    #[test]
+    fn concurrent_schema_changes_on_one_collection_all_succeed() {
+        // **The bound must not fire under contention**, and an earlier version of
+        // it did. K schema changes to one collection queue at the writer gate, so
+        // the last of them loses K−1 races with nothing wrong at all — a bound of
+        // sixteen therefore started refusing ordinary work at seventeen threads.
+        // A review measured it: 4 errors of 85 at N=17, 237 of 320 at N=64, and
+        // eight to ten HTTP 500s a round from thirty-two parallel index creates.
+        //
+        // The retry is a loop now, so it cannot overflow a stack, and the bound
+        // is high enough that only a check which can never pass reaches it. This
+        // is the reviewer's shape: N threads released together, each creating a
+        // distinctly named index on one collection.
+        const N: usize = 64;
+        let (engine, _, _dir) = engine();
+        let engine = std::sync::Arc::new(engine);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let engine = std::sync::Arc::clone(&engine);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                engine.create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending(&format!("f{i}"))],
+                    false,
+                    Some(format!("idx{i}")),
+                )
+            }));
+        }
+
+        let errors: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("no thread panics").err().map(|e| e.to_string()))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{} of {N} concurrent schema changes on one collection failed, which is the bound \
+             firing on contention rather than on a bug: {:?}",
+            errors.len(),
+            &errors[..errors.len().min(3)]
+        );
+        let coll = engine.get_collection("app", "docs").unwrap();
+        assert_eq!(coll.indexes.len(), N, "and every one of them landed");
     }
 
     #[test]
