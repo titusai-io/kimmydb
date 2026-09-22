@@ -80,6 +80,15 @@ refused.** This release moves the storage schema to 4
   rise is the fix below doing its job. A scrape config or a golden list that
   enumerates series needs the new name.
 
+- **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP
+  bridge, `kimmy.task.retries.<task>`) counts the times a supervised background
+  task retried its work in place after a transient failure
+  ([ADR-184](docs/decisions.md)). Every supervised task has a sample from the
+  first scrape, at 0. A rising count is the node recovering by itself and needs
+  no action; a count that **keeps** rising while that task's work does not
+  progress is a task retrying something permanent — alive, and doing nothing. A
+  scrape config or a golden list that enumerates series needs the new name.
+
 ### Fixed
 
 - **The licence-boundary check now sees every crate it is meant to guard.**
@@ -94,6 +103,35 @@ refused.** This release moves the storage schema to 4
   is covered without anyone remembering, and the check fails loudly rather than
   passing quietly if that derivation ever yields nothing. No crate in this
   release crossed the boundary; nothing shipped wrong.
+- **A background task that dies now stops the node, instead of dying silently**
+  ([ADR-184](docs/decisions.md)). Release builds unwind rather than aborting, and
+  every long-lived task's handle was held without being watched until shutdown.
+  So a task that panicked, or returned an error, was gone until someone
+  restarted the process — and nothing said so. The worst of those is the session
+  invalidator: **while it was dead, a token revoked on this node kept working
+  until it expired.** A dead retention collector grew the oplog until the disk
+  filled; a dead stall probe left `kimmy_runtime_stall_seconds` reading 0, "no
+  stall", for ever.
+
+  Every such task is now supervised. A panic, or a return that should not have
+  happened, **exits the process with status 70** after recording which task died
+  and how; the next start reports it at `WARN`, naming the task. Restart it the
+  way you already restart a node — compose and Kubernetes both do it on any
+  non-zero exit — and it comes back. A transient error is retried in place with
+  backoff and never returned, which is what used to stop embedding for good.
+
+  **A panic in a request handler still does not stop the node.** Supervision is
+  per task and by name for exactly that reason: `panic = "abort"` would have
+  turned a crafted request into a way to stop your node, and a test holds that
+  open.
+
+  **Three failures that were silent are now startup failures.** A webhook
+  delivery client that will not build, cluster TLS that will not start, and the
+  HTTP client for OIDC key refresh, each used to log once and leave the node
+  serving without that duty — webhooks undelivered, no peer able to pull from
+  this node, or every federated token refused until someone restarted. All three
+  now fail the start. If a node stops starting after this upgrade and the log
+  names one of them, that condition was already true and was not being reported.
 
 - **A replicated index definition this build refuses for its operator no longer
   fails the whole replication round.** `sync::settle` decided which errors are

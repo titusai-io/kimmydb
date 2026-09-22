@@ -365,6 +365,54 @@ impl TelemetryGuard {
             "HTTP requests handled.",
             requests
         );
+        // One instrument per supervised task rather than one carrying a `task`
+        // attribute, for the reason the holder family above gives: that is how
+        // every labelled series on this bridge is carried, and a dashboard
+        // reading both surfaces should not have to learn a second convention.
+        //
+        // The name and the task it reads are written on the same line, so they
+        // cannot drift apart; that they match `kimmy_task::TASKS` is held by
+        // `every_supervised_name_is_in_the_task_list_and_every_entry_is_used`,
+        // which reads this file too -- otherwise the bridge could fall behind
+        // the task list without anything saying so.
+        macro_rules! task_retries {
+            ($name:literal, $task:literal) => {{
+                let _ = meter
+                    .u64_observable_counter($name)
+                    .with_unit("{retry}")
+                    .with_description(concat!(
+                        "Times the ",
+                        $task,
+                        " task retried its work in place after a transient failure. A count that \
+                         keeps rising while its work does not progress is a task retrying \
+                         something permanent."
+                    ))
+                    .with_callback(move |observer| {
+                        let n = kimmy_task::retries()
+                            .into_iter()
+                            .find(|(task, _)| *task == $task)
+                            .map_or(0, |(_, n)| n);
+                        observer.observe(n, &[]);
+                    })
+                    .build();
+            }};
+        }
+        task_retries!("kimmy.task.retries.cert_reloader", "cert_reloader");
+        task_retries!("kimmy.task.retries.embedding_worker", "embedding_worker");
+        task_retries!("kimmy.task.retries.jwks_refresher", "jwks_refresher");
+        task_retries!("kimmy.task.retries.membership", "membership");
+        task_retries!("kimmy.task.retries.membership_announce", "membership_announce");
+        task_retries!("kimmy.task.retries.membership_inbound", "membership_inbound");
+        task_retries!("kimmy.task.retries.membership_timer", "membership_timer");
+        task_retries!("kimmy.task.retries.replication", "replication");
+        task_retries!("kimmy.task.retries.replication_server", "replication_server");
+        task_retries!("kimmy.task.retries.retention_collector", "retention_collector");
+        task_retries!("kimmy.task.retries.session_invalidator", "session_invalidator");
+        task_retries!("kimmy.task.retries.stall_probe", "stall_probe");
+        task_retries!("kimmy.task.retries.ttl_expiry", "ttl_expiry");
+        task_retries!("kimmy.task.retries.vector_index_invalidator", "vector_index_invalidator");
+        task_retries!("kimmy.task.retries.webhook_dispatcher", "webhook_dispatcher");
+
         observe!(
             u64_observable_counter,
             "kimmy.responses.2xx",

@@ -1342,6 +1342,29 @@ apt layer, which is why it is `mode=min`.
 
 ---
 
+## The `KIMMY_TEST_*` environment, which the shipped binary reads
+
+Four variables change how a test drives a real node. They are read from the
+**environment only, never from the configuration file**, and they exist in the
+binary that ships — deliberately, because a test that drove a
+differently-compiled binary would not be testing the one anyone runs.
+
+None of them was written down before `KIMMY_TEST_KILL_TASK` needed a home, which
+is why this section exists: a switch in a shipped binary that is documented
+nowhere is one nobody can audit for.
+
+| Variable | What it does |
+|---|---|
+| `KIMMY_TEST_KILL_TASK` | `<task>:<panic\|return\|error>`. Stops the named supervised background task on purpose, so a test can assert that the node exits 70 and that the next start names the task ([ADR-184](decisions.md)). **Every start where it is set logs a `WARN` naming it**, so it cannot sit on unnoticed in a deployment, and it does nothing until the node is serving — so it can never turn a start into a crash loop or be mistaken for a startup failure. The task names are `kimmy_task::TASKS` |
+| `KIMMY_TEST_PATIENCE_SECS` | How long a harness waits for a node to answer `/healthz`. Raised on CI, where a two-core runner booting three daemons has timed out at the default |
+| `KIMMY_TEST_NODE_LOGS` | A directory each spawned node's stdout and stderr is kept in, so a failure on a runner that is gone can still be read |
+| `KIMMY_TEST_NODE_SECRET_FOR_POLICY` | A cluster secret a policy test supplies, rather than generating one it cannot predict |
+
+**`KIMMY_TEST_KILL_TASK` is the only one that changes what the node does** rather
+than how a test watches it, which is why it announces itself. The exposure it
+adds is a switch available to whoever can already set this process's environment;
+it is not reachable over the network.
+
 ## Gaps
 
 Honest list of what is not covered. Worth reading next to
@@ -1359,6 +1382,8 @@ a test stays true.
 | Multi-node tests are pairwise and short-lived | 19 integration tests over real sockets and real UDP cover convergence, the handshake, snapshot resync and SWIM. What they do not cover: topologies larger than a pair, partitions healing, or a cluster under sustained write load. Those were driven **by hand** on three daemons and in containers ([verified by hand](#verified-by-hand)), which is not the same as being in the suite |
 | No concurrent-writer stress test | Two tests write concurrently — `resuming_under_continuous_writes_has_no_gaps_and_no_duplicates` and `a_backup_is_consistent_while_writes_continue` — but neither is a stress test, and redb allows one writer, so contention behaviour is unmeasured |
 | Property tests use default case counts | 256 unless overridden; the critical ones raise it explicitly |
+| **The node's shutdown announcement is covered at unit level only** | `kimmy_task::Shutdown` is what stops a task's ending during a drain being read as a death, and `a_task_that_ends_by_itself_during_shutdown_does_not_exit` pins it. Removing *both* `shutdown.begin()` calls from `node.rs` leaves every end-to-end drain test green, because the drain aborts each supervised handle and aborting a supervisor cancels its classification too — so no live task currently ends by itself mid-drain. Measured, not assumed ([ADR-184](decisions.md)) |
+| **The spawn lint does not see a spawn under another name** | `every_long_lived_task_is_spawned_through_the_supervisor` flags any call to something named `spawn`, `spawn_local` or `spawn_blocking`, which covers every ordinary way of writing one — 17 of the 18 forms an independent review used, including the turbofish, a split line, a `JoinSet`, and a crate alias. What escapes it is the function referred to by another name: passed by name into a macro or another function (`go!(tokio::spawn, ..)`), or renamed on import (`use tokio::spawn as go;`). Closing that needs a parse rather than a text rule ([ADR-184](decisions.md)) |
 | **The login limit is not proven to run *before* Argon2** | It is the reason the limit exists ([ADR-038](decisions.md)) and the only difference a moved check makes is latency, which no deterministic test can assert. Defended by structure and a comment, not by a test. Closing it honestly needs a counter on the authentication path |
 
 ---

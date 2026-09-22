@@ -968,6 +968,15 @@ impl Metrics {
     pub fn render_with_at(&self, readings: &StorageReadings, now: Instant) -> String {
         // Read once: the worker's atomics move as it runs, and a render that
         // straddled an increment would show mismatched document/chunk pairs.
+        // One line per declared task, always, including the ones at 0: the rule
+        // for this page is that no series is conditional, so the label set comes
+        // from the declared task list rather than from what has happened to
+        // retry (`kimmy_task::TASKS`).
+        let task_retries = kimmy_task::retries()
+            .into_iter()
+            .map(|(task, n)| format!("kimmy_task_retries_total{{task=\"{task}\"}} {n}\n"))
+            .collect::<String>();
+
         let vc = self.vector_counters.get();
         let (embed_docs, embed_chunks, embed_deferred, embed_not_owned, embed_failures, transport) =
             match vc {
@@ -1032,6 +1041,9 @@ impl Metrics {
              # HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
+             # HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. Read it beside that task's progress age rather than alone.\n\
+             # TYPE kimmy_task_retries_total counter\n\
+             {task_retries}\
              # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.\n\
              # TYPE kimmy_runtime_stall_seconds gauge\n\
              kimmy_runtime_stall_seconds {stall}\n\
@@ -2122,6 +2134,23 @@ kimmy_up 1
 # HELP kimmy_uptime_seconds Seconds since this process started serving.
 # TYPE kimmy_uptime_seconds gauge
 kimmy_uptime_seconds 0
+# HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. Read it beside that task's progress age rather than alone.
+# TYPE kimmy_task_retries_total counter
+kimmy_task_retries_total{task=\"cert_reloader\"} 0
+kimmy_task_retries_total{task=\"embedding_worker\"} 0
+kimmy_task_retries_total{task=\"jwks_refresher\"} 0
+kimmy_task_retries_total{task=\"membership\"} 0
+kimmy_task_retries_total{task=\"membership_announce\"} 0
+kimmy_task_retries_total{task=\"membership_inbound\"} 0
+kimmy_task_retries_total{task=\"membership_timer\"} 0
+kimmy_task_retries_total{task=\"replication\"} 0
+kimmy_task_retries_total{task=\"replication_server\"} 0
+kimmy_task_retries_total{task=\"retention_collector\"} 0
+kimmy_task_retries_total{task=\"session_invalidator\"} 0
+kimmy_task_retries_total{task=\"stall_probe\"} 0
+kimmy_task_retries_total{task=\"ttl_expiry\"} 0
+kimmy_task_retries_total{task=\"vector_index_invalidator\"} 0
+kimmy_task_retries_total{task=\"webhook_dispatcher\"} 0
 # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.
 # TYPE kimmy_runtime_stall_seconds gauge
 kimmy_runtime_stall_seconds 0
@@ -2733,7 +2762,8 @@ kimmy_sync_serve_walk_seconds_count 1201
         // and the serve walk's 12 buckets, +Inf, sum and count. Since
         // ADR-178, one scalar for embedding skipped for want of a shadow;
         // since ADR-180, one for schema changes a snapshot restore re-logged;
-        // since ADR-181, one for expiry declined by the partial filter.
+        // since ADR-181, one for expiry declined by the partial filter; and
+        // since ADR-184, one retry counter per supervised task.
         assert_eq!(
             samples,
             107 + 6
@@ -2743,7 +2773,11 @@ kimmy_sync_serve_walk_seconds_count 1201
                 + 12 * kimmy_storage::WriterHolder::COUNT
                 + 1
                 + 5
-                + 15,
+                + 15
+                // Since ADR-184, one per supervised task: the label set is
+                // `kimmy_task::TASKS`, so this counts the tasks rather than a
+                // number written twice.
+                + kimmy_task::TASKS.len(),
             "expected one sample per series: {out}"
         );
     }
