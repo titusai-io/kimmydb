@@ -284,7 +284,10 @@ fn current_indexes(
 /// Produced only by [`maintain_remote`]. A local write is *rejected* on
 /// violation, so there is nothing to report; a replicated one cannot be
 /// rejected without abandoning convergence, so it is recorded instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Serialisable because a migration's rebuild records what it found in the
+/// same commit as the index's marker, to be reported once there is an engine
+/// (ADR-183): an interrupt between the two used to lose them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UniqueViolation {
     pub index: String,
     /// Encoded index key that now has more than one holder.

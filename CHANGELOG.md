@@ -24,15 +24,17 @@ refused.** This release moves the storage schema to 4
   progressing. Add a `startupProbe`, or raise the liveness allowance, to at
   least twice the expected open: about 46 seconds per 10 million entries in
   the retained oplog (the writes of `storage.oplog_retention_secs`, 24 hours
-  by default), plus 7 µs per document per partial index. For example, 10
+  by default), plus 8 µs per document per partial index. For example, 10
   million retained entries and one partial index over 10 million documents is
-  about 2 minutes, so allow 4: `periodSeconds: 10` with
-  `failureThreshold: 24`.
+  46 s + 80 s = about 2 minutes, so twice is 252 s: allow 5, with
+  `failureThreshold: 30`.
 - **Startup.** The first start rebuilds each partial index before the node
   serves anything, logging the whole job up front: indexes, documents, an
   estimate, and the free space the largest needs. Measured on the development
   machine, a partial index over 10 million documents added about 73 seconds
-  to that start (7 µs per document per partial index).
+  to that start (7.3 µs per document per partial index measured there; the
+  estimate the node prints uses 8, and the cost per document grows with the
+  store, so treat it as a bound rather than a rate).
 - **The upgrade refuses if this build cannot read a stored partial filter.** It
   names every such index — database, collection, index and the reason — and
   changes nothing: the version stays 3, no index entries are cleared, and the

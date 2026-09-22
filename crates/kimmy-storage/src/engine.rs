@@ -863,6 +863,12 @@ impl Engine {
         for (meta, violations) in &unreported {
             engine.report_index_backfill_violations(meta, violations)?;
         }
+        // Only now, and only if every one of them was reported: they are held in
+        // the store precisely so that a crash before this point does not lose
+        // them, so deleting them any earlier would defeat that.
+        if !unreported.is_empty() {
+            crate::migrate::forget_reported_violations(engine.db())?;
+        }
 
         Ok(engine)
     }

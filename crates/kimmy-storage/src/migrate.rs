@@ -48,12 +48,39 @@ pub(crate) type Unreported = Vec<(CollectionMeta, Vec<crate::index::UniqueViolat
 
 /// Bring a database up to [`SCHEMA_VERSION`], or refuse if it cannot be.
 pub(crate) fn run(db: &Database) -> Result<Unreported> {
+    step(db)?;
+    // Read from the store, not carried out of the loop: this run's recorded
+    // collisions and any an earlier interrupted run left unreported.
+    persisted_violations(db)
+}
+
+/// Take the database to [`SCHEMA_VERSION`], or refuse if it cannot be.
+fn step(db: &Database) -> Result<()> {
     let found = stored_version(db)?;
+
+    // Before anything is written, on every path that migrates -- including a
+    // schema 1 or 2 source, whose id-deriving steps run before the rebuild, and
+    // a schema 4 file whose rebuild was interrupted. Any later and the claim the
+    // refusal makes, that nothing was changed and the previous build still opens
+    // this directory, would already be false.
+    let resuming = found == Some(SCHEMA_VERSION) && partial_rebuild_owed(db)?;
+    if matches!(found, Some(1..SCHEMA_VERSION)) || resuming {
+        refuse_unparseable_partial_filters(db, found.expect("a version was read"))?;
+    }
 
     match found {
         // A fresh database: nothing to migrate, just stamp it.
-        None => write_version(db, SCHEMA_VERSION).map(|()| Vec::new()),
-        Some(SCHEMA_VERSION) => Ok(Vec::new()),
+        None => write_version(db, SCHEMA_VERSION),
+        // Schema 4 with markers still present is a migration interrupted
+        // part-way, not a finished one: the version is written in the first
+        // index's commit precisely so that an older build refuses a file in
+        // this state, and the markers say which indexes are still owed. The
+        // last commit deletes them, so their absence is what "finished" means.
+        Some(SCHEMA_VERSION) if partial_rebuild_owed(db)? => {
+            info!("resuming an interrupted storage schema 3 -> 4 migration (partial indexes)");
+            rebuild_partial_indexes(db)
+        }
+        Some(SCHEMA_VERSION) => Ok(()),
         // Migrations run in sequence, so a schema 1 database steps through 2
         // rather than needing its own path to the latest. The last step
         // writes the version itself, with its own bookkeeping.
@@ -91,10 +118,109 @@ pub(crate) fn run(db: &Database) -> Result<Unreported> {
 const PARTIAL_REBUILT: redb::TableDefinition<(u64, u32), ()> =
     redb::TableDefinition::new("partial_rebuilt_under_find");
 
-/// The measured cost of a rebuild, per document per index, on the machine the
-/// migration was written on (ADR-183): about 73 s for 10 million documents. What the
-/// up-front estimate is made from, and no more exact than that.
-const MICROS_PER_DOCUMENT: u64 = 8;
+/// What a rebuild of a unique partial index found, by `(collection, index)`,
+/// written in the same commit as that index's marker and deleted only once it
+/// has been reported (ADR-183).
+///
+/// In the store rather than carried back in memory. Reporting needs an engine,
+/// which does not exist until after the migration returns, so a crash in
+/// between used to lose the finding entirely: both duplicates stayed, and
+/// nothing counted, logged or recorded them. The invariant is that a marked
+/// index's collisions are never lost, which means the record has to be as
+/// durable as the marker and committed with it.
+const PARTIAL_REBUILT_VIOLATIONS: redb::TableDefinition<(u64, u32), &[u8]> =
+    redb::TableDefinition::new("partial_rebuilt_unique_violations");
+
+/// One index's collisions, with the collection they belong to by name, because
+/// an id is not enough to find the metadata a report needs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecordedViolations {
+    db: String,
+    collection: String,
+    violations: Vec<crate::index::UniqueViolation>,
+}
+
+/// Every recorded collision not yet reported, resolved against the collection
+/// metadata as it now stands.
+///
+/// Read on every open, not only on one that migrates: the marker table is gone
+/// once the migration finishes, so a crash after the last index and before the
+/// report would otherwise leave a recorded collision that nothing ever looks
+/// at again.
+fn persisted_violations(db: &Database) -> Result<Unreported> {
+    let txn = db.begin_read()?;
+    let recorded = match txn.open_table(PARTIAL_REBUILT_VIOLATIONS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut out = Vec::new();
+    for row in recorded.iter()? {
+        let (_, value) = row?;
+        let held: RecordedViolations = serde_json::from_slice(value.value())?;
+        // Gone since, or replaced: there is nothing to report a collision
+        // against, and the entries went with it.
+        let Some(raw) = collections.get((held.db.as_str(), held.collection.as_str()))? else {
+            continue;
+        };
+        out.push((serde_json::from_slice::<CollectionMeta>(raw.value())?, held.violations));
+    }
+    Ok(out)
+}
+
+/// Forget the recorded collisions, once they have been reported.
+///
+/// Separate from the migration's own last commit, and later than it: until the
+/// engine exists they cannot be reported, so deleting them with the markers
+/// would be deleting them unread. Reporting is therefore at least once -- a
+/// crash between the report and this leaves them to be reported again on the
+/// next open, which is the side to err on.
+pub(crate) fn forget_reported_violations(db: &Database) -> Result<()> {
+    let txn = db.begin_write()?;
+    match txn.delete_table(PARTIAL_REBUILT_VIOLATIONS) {
+        Ok(_) => {}
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Whether the marker table is still there, which is what an interrupted
+/// migration leaves behind.
+///
+/// Its absence is the only thing that means finished, and that is why the last
+/// commit deletes it. A migration that found no partial index never creates it.
+fn partial_rebuild_owed(db: &Database) -> Result<bool> {
+    let txn = db.begin_read()?;
+    match txn.open_table(PARTIAL_REBUILT) {
+        Ok(_) => Ok(true),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The cost of a rebuild, per document per index, that the up-front estimate is
+/// made from (ADR-183).
+///
+/// **Not linear in the document count, which is why this is a bound and not a
+/// rate.** Measured on the machine the migration was written on: 73 s for 10
+/// million documents, some 7.3 µs each, and 5.4 s for 2 million, some 2.7 µs
+/// each. The per-document cost grows with the working set, because a larger
+/// store spills out of the page cache. 8 covers both sizes measured; above ten
+/// million documents it is an extrapolation, and the announcement's estimate
+/// says "estimate" for that reason. The documentation quotes this same number,
+/// and the manifest in the operations guide allows more than twice the estimate
+/// this produces, so the two cannot drift into a probe that kills the node
+/// during its own documented example.
+pub const MICROS_PER_DOCUMENT: u64 = 8;
+
+/// redb's growth step, which is what the file extends by when its slack does
+/// not cover a rebuild (ADR-183): a rebuild needing 166 MiB took the file from
+/// 4,096 to 6,199 MiB. Reported beside the largest index's own size, because
+/// the space to have free is the two added together, not either alone.
+const REDB_GROWTH_STEP_MIB: u64 = 2048;
 
 /// The measured size of an index entry on disk, including the tree's own
 /// overhead (ADR-183): 553 MiB for 7.43 million entries. A rebuild needs about
@@ -147,6 +273,9 @@ impl PartialRebuildPlan {
 /// would also leave a node running for weeks with a collection refusing every
 /// write, explained by one line at a start nobody reads again.
 ///
+/// It runs before any write on every path that migrates, the id-deriving steps
+/// of a schema 1 or 2 source included, so nothing has changed when it refuses.
+///
 /// **Every partial index in the file is parsed**, in every database, whether or
 /// not its collection holds a document and whether or not an interrupted
 /// migration already marked it rebuilt: an index on an empty collection is
@@ -154,7 +283,7 @@ impl PartialRebuildPlan {
 /// and would mark it done. **Every offender is named at once**, so one pass
 /// with the previous build fixes them all rather than finding the next on the
 /// next upgrade attempt.
-fn refuse_unparseable_partial_filters(db: &Database) -> Result<()> {
+fn refuse_unparseable_partial_filters(db: &Database, found: u8) -> Result<()> {
     let txn = db.begin_read()?;
     let collections = txn.open_table(tables::COLLECTIONS)?;
     let mut refused = Vec::new();
@@ -170,7 +299,7 @@ fn refuse_unparseable_partial_filters(db: &Database) -> Result<()> {
     if refused.is_empty() {
         return Ok(());
     }
-    Err(StorageError::UnparseablePartialFilter { refused })
+    Err(StorageError::UnparseablePartialFilter { found, refused })
 }
 
 /// Every partial index not yet rebuilt, with what the announcement states.
@@ -234,8 +363,7 @@ pub(crate) fn partial_rebuild_plan(db: &Database) -> Result<PartialRebuildPlan> 
 /// keys two or more of them share are returned for the engine to report as a
 /// replicated build's are (ADR-020, ADR-123): a migration cannot refuse, and
 /// documents accepted while the constraint was misapplied are real.
-fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
-    refuse_unparseable_partial_filters(db)?;
+fn rebuild_partial_indexes(db: &Database) -> Result<()> {
     let plan = partial_rebuild_plan(db)?;
     let total = plan.indexes.len();
     if total > 0 {
@@ -245,13 +373,14 @@ fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
             estimate_secs = plan.estimate_secs(),
             largest_collection_documents = plan.largest_documents,
             largest_needs_free_mib = plan.largest_needs_mib(),
+            plus_growth_step_mib = REDB_GROWTH_STEP_MIB,
             "rebuilding every partial index so its membership is what find selects (ADR-183), \
              before this node serves anything; each index is rebuilt in one transaction and \
              needs about its own size free inside the database file, up to the figure for the \
-             largest"
+             largest -- and if the file's slack does not cover it, redb extends the file by its \
+             growth step, so allow the two added together"
         );
     }
-    let mut unreported = Vec::new();
     for (n, (meta, index, documents)) in plan.indexes.iter().enumerate() {
         let started = std::time::Instant::now();
         info!(
@@ -336,6 +465,32 @@ fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
             }
         }
         txn.open_table(PARTIAL_REBUILT)?.insert((meta.id.0, index.id), ())?;
+        // What this index's rebuild found, in the same commit as its marker.
+        // Reporting needs an engine and so happens after the migration returns;
+        // recorded here, an interrupt in between leaves them to be reported on
+        // the next open instead of losing them.
+        if !violations.is_empty() {
+            let recorded = RecordedViolations {
+                db: standing.db.clone(),
+                collection: standing.name.clone(),
+                violations: violations.clone(),
+            };
+            txn.open_table(PARTIAL_REBUILT_VIOLATIONS)?
+                .insert((meta.id.0, index.id), serde_json::to_vec(&recorded)?.as_slice())?;
+        }
+        // The version, in the same commit as the first index's marker rather
+        // than at the end. Until this change a half-migrated file was still
+        // schema 3, so the previous build opened it and maintained the indexes
+        // it had not rebuilt under the old rule: entries the new rule does not
+        // hold stayed, and a later run marked the rest done and stamped 4 over
+        // them for good. A query answered from such an index misses rows and a
+        // unique one refuses a key that is free. Stamping it here means an
+        // older build refuses the file instead, and a rollback is the wipe and
+        // resync the operations guide documents.
+        if n == 0 {
+            txn.open_table(tables::META)?
+                .insert(tables::META_FORMAT_VERSION, [SCHEMA_VERSION].as_slice())?;
+        }
         #[cfg(test)]
         if hooks::fails_at(n + 1) {
             drop(txn);
@@ -350,12 +505,11 @@ fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "rebuilt a partial index"
         );
-        if !violations.is_empty() {
-            unreported.push((standing, violations));
-        }
     }
-    // The version and the end of the bookkeeping in one commit: a crash
-    // before it leaves schema 3 and the markers, and the next open finishes.
+    // The end of the bookkeeping. The version is already 4 if any index was
+    // rebuilt in this run or an earlier one; it is written here too, for the
+    // database that has no partial index to rebuild at all, where the loop
+    // above never ran.
     let txn = db.begin_write()?;
     match txn.delete_table(PARTIAL_REBUILT) {
         Ok(_) => {}
@@ -365,7 +519,7 @@ fn rebuild_partial_indexes(db: &Database) -> Result<Unreported> {
     txn.open_table(tables::META)?
         .insert(tables::META_FORMAT_VERSION, [SCHEMA_VERSION].as_slice())?;
     txn.commit()?;
-    Ok(unreported)
+    Ok(())
 }
 
 /// Test-only points in the membership migration.
@@ -701,7 +855,7 @@ mod tests {
     ///
     /// Builds the old layout from the new one rather than checking in a binary
     /// fixture, so the test keeps working as the rest of the format evolves.
-    fn rewind_to_schema_1(path: &std::path::Path, assignments: &[(&str, &str, u64)]) {
+    pub(super) fn rewind_to_schema_1(path: &std::path::Path, assignments: &[(&str, &str, u64)]) {
         let db = Database::create(path).unwrap();
 
         let mut remap = HashMap::new();
@@ -1384,7 +1538,7 @@ mod membership_migration {
             Ok(_) => panic!("the open must refuse a filter it cannot parse"),
         };
 
-        let StorageError::UnparseablePartialFilter { refused } = &err else {
+        let StorageError::UnparseablePartialFilter { refused, .. } = &err else {
             panic!("the wrong error: {err}");
         };
         // Both offenders in one refusal, so one pass with the previous build
@@ -1406,6 +1560,61 @@ mod membership_migration {
         // the entries a rebuild would have cleared are where they were.
         assert_eq!(version(&path), Some(3), "the version is still 3");
         assert_eq!(entry_count(&path, "shop", "held"), before, "no entries were cleared");
+    }
+
+    #[test]
+    fn a_refused_filter_is_found_on_a_resume_too() {
+        // An interrupted migration leaves schema 4 with markers, and resumes
+        // through them rather than through the version. The refusal has to run
+        // on that path as well, before the rebuild goes any further.
+        let (_dir, path) = fixture();
+        hooks::fail_at_index(2);
+        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
+        assert_eq!(version(&path), Some(SCHEMA_VERSION), "premise: schema 4 already");
+        assert!(
+            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "premise: with an index still owed"
+        );
+        store_unparseable_filter(&path, &[("shop", "t", "by_range")]);
+
+        let err = match Engine::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("the resume must refuse a filter it cannot parse"),
+        };
+
+        assert!(
+            matches!(&err, StorageError::UnparseablePartialFilter { found, refused }
+                if *found == SCHEMA_VERSION && refused.len() == 1),
+            "the wrong error: {err}"
+        );
+        assert!(
+            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "and the rebuild went no further: the index is still owed"
+        );
+    }
+
+    #[test]
+    fn a_refused_filter_stops_a_schema_1_source_before_its_ids_are_derived() {
+        // A schema 1 source steps through the id-deriving migrations before the
+        // rebuild. The refusal runs before those, so the claim it makes -- that
+        // nothing was changed and the previous build still opens this directory
+        // -- is true, and the version it names is the one actually on disk.
+        let (_dir, path) = fixture();
+        drop(Engine::open(&path).unwrap());
+        store_unparseable_filter(&path, &[("shop", "t", "by_range")]);
+        super::tests::rewind_to_schema_1(&path, &[("shop", "t", 7)]);
+        assert_eq!(version(&path), Some(1), "premise: a schema 1 database");
+
+        let err = match Engine::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("the open must refuse before deriving anything"),
+        };
+
+        assert!(
+            matches!(&err, StorageError::UnparseablePartialFilter { found, .. } if *found == 1),
+            "the message must name the version on disk, not 3: {err}"
+        );
+        assert_eq!(version(&path), Some(1), "nothing was written");
     }
 
     #[test]
@@ -1444,7 +1653,7 @@ mod membership_migration {
         };
 
         assert!(
-            matches!(&err, StorageError::UnparseablePartialFilter { refused } if refused.len() == 1),
+            matches!(&err, StorageError::UnparseablePartialFilter { refused, .. } if refused.len() == 1),
             "the wrong error: {err}"
         );
         assert_eq!(version(&path), Some(3), "the version is still 3, not 4");
@@ -1648,16 +1857,32 @@ mod membership_migration {
         hooks::fail_at_index(2);
         assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
 
-        assert_eq!(version(&path), Some(3), "still schema 3");
+        // Schema 4 already, with the markers still there. The version goes down
+        // in the first index's commit so that a file in this state -- one index
+        // rebuilt, one still holding what the old rule selected -- is refused by
+        // the previous build rather than opened and maintained under that rule.
+        assert_eq!(version(&path), Some(SCHEMA_VERSION), "the version went down with index 1");
+        assert!(
+            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "the markers say the migration is not finished"
+        );
         assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]), "the first index committed");
         assert_eq!(members(&path, "by_range"), BTreeSet::from([4, 5]), "the second rolled back");
         let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
         let pending: Vec<&str> = plan.indexes.iter().map(|(_, i, _)| i.name.as_str()).collect();
         assert_eq!(pending, ["by_range"], "only the unfinished index is left to do");
 
+        // Reopening resumes from the markers, finishes, and clears them. The
+        // version was already 4, so the resume is reached through the marker
+        // table rather than through the version.
         drop(Engine::open(&path).unwrap());
         assert_eq!(members(&path, "by_range"), BTreeSet::from([4]));
+        assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]), "and index 1 not redone");
         assert_eq!(version(&path), Some(SCHEMA_VERSION));
+        assert!(
+            !partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "the markers are gone, which is what finished means"
+        );
     }
 
     #[test]
@@ -1710,6 +1935,79 @@ mod membership_migration {
         assert!(index.multikey, "the rebuild took in an array, and says so");
         drop(engine);
         assert_eq!(members(&path, "tagged"), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn collisions_a_rebuild_found_survive_an_interrupt_and_are_reported_on_the_next_open() {
+        // The rebuild finds the shared key, and the migration is interrupted
+        // before it finishes. Reporting needs an engine, which does not exist
+        // until the migration returns, so until this was recorded in the same
+        // commit as the index's marker the finding was simply lost: both
+        // duplicates stayed in the rebuilt index, and nothing counted, logged
+        // or recorded them. The index stays marked done, so no later run looks
+        // again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            engine
+                .insert_many(
+                    &t,
+                    vec![
+                        doc! {"_id": 1_i64, "k": [1, 2], "email": "a", "size": 10},
+                        doc! {"_id": 2_i64, "k": [1, 2], "email": "a", "size": 10},
+                    ],
+                )
+                .unwrap();
+            // The unique one first, so it is the index that commits, and a
+            // second partial index after it, so there is something to fail on.
+            for (name, unique, filter) in [
+                ("email_once", true, doc! {"k": [1, 2]}),
+                ("by_range", false, doc! {"size": {"$gt": 5}}),
+            ] {
+                engine
+                    .create_index_with(
+                        "shop",
+                        "t",
+                        vec![crate::meta::IndexField::ascending(if unique {
+                            "email"
+                        } else {
+                            "size"
+                        })],
+                        false,
+                        crate::meta::Enforcement::Local,
+                        Some(name.into()),
+                        None,
+                        Some(filter),
+                    )
+                    .unwrap();
+            }
+        }
+        as_schema_3(&path, &["email_once"]);
+        assert!(members(&path, "email_once").is_empty(), "premise: neither was a member");
+
+        hooks::fail_at_index(2);
+        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
+        assert_eq!(
+            members(&path, "email_once"),
+            BTreeSet::from([1, 2]),
+            "premise: the unique index committed, holding both duplicates"
+        );
+        assert!(
+            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
+            "premise: the migration is unfinished, and email_once is marked done"
+        );
+
+        // The next open resumes, and reports what the interrupted run found.
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(engine.unique_violations(), 1, "the collision survived the interrupt");
+        drop(engine);
+        assert_eq!(version(&path), Some(SCHEMA_VERSION));
+
+        // Reported once, not for ever: the record is forgotten afterwards.
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(engine.unique_violations(), 0, "already reported, so not reported again");
     }
 
     #[test]

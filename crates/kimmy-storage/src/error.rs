@@ -41,13 +41,13 @@ pub enum StorageError {
     #[error(
         "this build cannot parse {} stored partial index definition(s), so the schema 3 to 4 \
          migration cannot know what those indexes should hold. Nothing was changed: the \
-         on-disk version is still 3 and no index entries were cleared. Refused: {}. To \
+         on-disk version is still {found} and no index entries were cleared. Refused: {}. To \
          proceed, start this data directory with the previous build, drop each index named \
          above -- recreating it with a filter this build accepts -- and upgrade again",
         refused.len(),
         refused.join("; ")
     )]
-    UnparseablePartialFilter { refused: Vec<String> },
+    UnparseablePartialFilter { found: u8, refused: Vec<String> },
 
     /// A conditional write found a different version than the caller expected.
     ///

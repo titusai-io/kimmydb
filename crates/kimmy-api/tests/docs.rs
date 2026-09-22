@@ -760,6 +760,55 @@ fn rows_without_a_header(markdown: &str) -> Vec<usize> {
     found
 }
 
+/// The documented Kubernetes manifest allows more than twice the open its own
+/// example describes, computed from the code's rate rather than from a second
+/// copy of it.
+///
+/// The startup probe exists so that a first start which rebuilds partial
+/// indexes is not killed part-way (ADR-183). It is therefore the one figure in
+/// the guide that must not drift from the code: when the constant said 8 µs and
+/// the guide said 7, the manifest's own example needed 252 s against the 240 s
+/// it allowed, so following the guide exactly would have killed the node during
+/// the migration the manifest exists to allow for -- the failure it is there to
+/// prevent, written into it.
+#[test]
+fn the_documented_startup_probe_allows_the_open_it_describes() {
+    let field = |name: &str| -> u64 {
+        let at = OPERATIONS.find("startupProbe:").expect("the manifest has a startup probe");
+        let rest = &OPERATIONS[at..];
+        let line = rest
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("the startup probe sets {name}"));
+        line.split(':').nth(1).expect("a value").trim().parse().expect("a number")
+    };
+    let budget = field("periodSeconds") * field("failureThreshold");
+
+    // The example the manifest's own comment describes: ten million retained
+    // oplog entries, and one partial index over ten million documents.
+    const EXAMPLE_DOCUMENTS: u64 = 10_000_000;
+    const EXAMPLE_OPLOG_SECS: u64 = 46;
+    let rebuild = EXAMPLE_DOCUMENTS * kimmy_storage::migrate::MICROS_PER_DOCUMENT / 1_000_000;
+    let open = EXAMPLE_OPLOG_SECS + rebuild;
+
+    assert!(
+        budget >= 2 * open,
+        "the manifest allows {budget} s, and its own example needs {open} s ({EXAMPLE_OPLOG_SECS} \
+         s of oplog walk plus {rebuild} s of rebuild at {} µs per document), so the guide's rule \
+         of at least twice the expected open needs {} s. Following the guide would kill the node \
+         part-way through the migration the probe exists for.",
+        kimmy_storage::migrate::MICROS_PER_DOCUMENT,
+        2 * open
+    );
+
+    // And the comment quotes the code's figure, so the prose cannot drift back.
+    let quoted = format!("{} us per", kimmy_storage::migrate::MICROS_PER_DOCUMENT);
+    assert!(
+        OPERATIONS.contains(&quoted),
+        "the manifest's comment does not quote the code's {quoted:?}"
+    );
+}
+
 /// Every Markdown file under the repository root, relative to it, outside
 /// build output and hidden directories.
 fn markdown_files() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
