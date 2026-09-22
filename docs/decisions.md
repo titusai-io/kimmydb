@@ -18419,6 +18419,15 @@ Found by an independent review of #363 and **pre-existing**: main `f2d06d6` beha
 | decline any implication touching a number at all | 4,826 | 9,872 (**67.2%**) | 0 |
 | **this decision** | **14,698** | **0** | **0** |
 
+**Which of those a reader can reproduce, and which they cannot.** Rows 1 and 6 —
+before and after — are the tree's own: `a_chosen_partial_index_holds_every_document_find_returns`
+asserts row 6, and reverting the filing rule produces row 1's 825 exactly. **Rows
+2 to 5 were one-time design measurements** taken against patched trees that were
+never committed, and there is no harness in the repository that reproduces them.
+They are kept because they are the argument for not fixing `implies`, and a reader
+who wants to check them has to rebuild the patches from the descriptions. Saying
+so is better than a table that looks uniformly reproducible and is not.
+
 **Quantifying over witnesses does not converge.** Each refinement left a residue the next did not shrink — 69, then 8, then 9 — because array comparison is element-wise, so the breaking document pairs a `Decimal128` with an element drawn from *neither* bound: `{k: [Decimal128(1), 1]}` defeats `{k: {$gte: [1, 2]}}` used for `{k: {$gt: [5]}}`. The only sound rule of that family is the blunt one, and it declines two thirds of all index use.
 
 Widening membership costs no index use at all. Its price is index size, and a measured one: of 432 documents, **27** are held that the filter does not select — exactly the 27 that were being lost.
@@ -18430,6 +18439,24 @@ Widening membership costs no index use at all. Its price is index size, and a me
 Exactly the filter's predicate paths, resolved as `find` resolves them. This needs no judgement because the language is small: `PartialFilter::parse` refuses anything but a conjunction of per-field predicates — no `$or`, no `$nor`, no `$elemMatch` — and its own error says why: *"so containment stays decidable"*. There is no disjunction to distribute and no element scope to decide.
 
 The test is `holds_decimal128` over the values the path resolves to, which searches the whole value. That is **wider than the minimum**, and deliberately: `{k: {a: Decimal128(1)}}` counts for a filter on `k` even though a document is never ranked against a number. Widening costs index size and a re-check; narrowing costs correctness, and the narrow version would need the same non-finite reasoning this record already rejected.
+
+### `is_empty()` had been standing in for "this is a sentinel run"
+
+Worth a section of its own, because it is the find of this change and it was
+invisible to every test that models membership.
+
+The unkeyed run's key is the empty slice, so three places asked `key.is_empty()`
+when they meant "is this a sentinel run?": the multikey de-duplication, which
+skips such entries, and two counters that attribute them. That reads correctly
+while there is exactly one sentinel. Adding a second at `[0x00]` made all three
+silently wrong, and the worst of them **skipped a run it should have let
+through** — so documents in it vanished from every answer, trading ADR-185's
+over-count for an under-count.
+
+There is now one `is_sentinel(key)` predicate whose doc comment says *ask this,
+never `is_empty()`*. An executor differential caught it as a "missing" failure;
+`partial_containment.rs`, which models membership without running the executor,
+could not have.
 
 ### Its own `DocumentKeys` variant, not a flag
 
@@ -18459,6 +18486,14 @@ The test is `holds_decimal128` over the values the path resolves to, which searc
 **This folds into the unreleased schema 3 → 4 rebuild, and only if it merges before a release carrying schema 4.** Schema 4 is unreleased — 0.33.0 is schema 3 — so no deployed database holds entries under the old membership rule, and the 3 → 4 rebuild builds this one directly. One rebuild, no compatibility shim. **If a release containing schema 4 ships first, this needs schema 5 and a rebuild of its own**, because entries would then mean something different from what a deployed database already holds.
 
 The rebuild's log line names the widened rule, so an operator watching the migration reads what the index will hold.
+
+**One case the rebuild cannot reach.** A database taken to schema 4 by an
+unreleased build *before* this record keeps the old membership: it is already at
+4, so nothing rebuilds it, and its partial indexes hold only what their filters
+selected until something recreates them or the directory is wiped. That is a
+development database by definition, since 4 is unreleased — the lab cluster runs
+0.33.0 and is at schema 3, so it migrates and is unaffected. Recreate the partial
+indexes on such a database, or start it again from empty.
 
 ### Tests, and how they break
 

@@ -222,7 +222,11 @@ database, collection, index and document id, and counted in
 `kimmy_index_unkeyed_total`. The index listing, `describe` and `createIndex`
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
-the entries a query read from the run. Zero is the index doing its whole
+the entries a query read from the run. **That figure means this reason and no
+other**: a document the index holds because a partial filter could not *decide*
+it is counted by `undecidable` instead, and the two are worth telling apart
+because this one is a fault and that one is not
+([below](#a-decimal128-at-a-filtered-path)). Zero is the index doing its whole
 job. Anything else is the cost of leaving such documents under the index:
 every scan of it rechecks all of them. The fix is the collection owner's, and
 needs no access to the server — reshape the documents, or split the compound
@@ -591,10 +595,12 @@ would miss a document holding `Decimal128("1")` that `find` returns, silently
 
 This is the documented behaviour, not a fault:
 
-- **It costs index size**, counted in `kimmy_index_undecidable_total` and
-  included in the `unkeyed` figure the index listing reports. It is a
-  *different* series from `kimmy_index_unkeyed_total`, which counts documents
-  an index could not key — that one is worth an alert, this one is not.
+- **It costs index size**, and the listing, `describe` and `createIndex` report
+  it as its own `undecidable` figure — **not** folded into `unkeyed`, which keeps
+  meaning "documents the index could not key". Both are always present, so
+  `undecidable: 0` is what an index with none reads. The rate since start is
+  `kimmy_index_undecidable_total`, again separate from
+  `kimmy_index_unkeyed_total`: that one is worth an alert, this one is not.
 - **Nothing is logged at warning.** A filing here is expected, and raising it
   to the level of a real fault is how an operator learns to ignore both.
 - **A unique index does not enforce anything on it**, because the filter does

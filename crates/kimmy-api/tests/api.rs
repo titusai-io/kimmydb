@@ -11171,3 +11171,67 @@ async fn a_write_that_cannot_get_the_writer_in_time_is_a_503_timeout() {
         written.body
     );
 }
+
+#[tokio::test]
+async fn an_index_carries_every_field_the_specification_requires() {
+    // `docs/openapi.yaml` lists the Index schema's `required` fields, and
+    // nothing compared that list with what the server actually sends. So a field
+    // could be added to the list and never rendered, or dropped from the
+    // response and still promised — which is the same literal-list-beside-the-
+    // truth drift this round has now fixed in three other places.
+    //
+    // A client reads `required` and stops checking for absence. That is the whole
+    // value of the word, and it is worth a test rather than a convention.
+    let spec: serde_json::Value =
+        serde_norway::from_str(include_str!("../../../docs/openapi.yaml"))
+            .expect("docs/openapi.yaml is valid YAML");
+    let required: Vec<String> = spec["components"]["schemas"]["Index"]["required"]
+        .as_array()
+        .expect("the Index schema declares required fields")
+        .iter()
+        .map(|v| v.as_str().expect("a field name").to_string())
+        .collect();
+    assert!(
+        required.contains(&"unkeyed".to_string()) && required.contains(&"undecidable".to_string()),
+        "premise: the list read is the Index schema's ({required:?})"
+    );
+
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    // A partial index, so the two sentinel figures are both meaningful, and one
+    // document the filter cannot decide so `undecidable` is not merely present.
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({ "_id": "a", "note": "x", "k": { "$numberDecimal": "1" } }),
+        )
+        .await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({
+                "fields": [{ "path": "note" }],
+                "partialFilterExpression": { "k": { "$gt": 5 } },
+            }),
+        )
+        .await;
+    let listed = server.get("/v1/db/shop/coll/orders/indexes", Some(&token)).await;
+    let listing = listed.body["indexes"][0].clone();
+
+    for (what, body) in [("createIndex", &created.body), ("the listing", &listing)] {
+        for field in &required {
+            assert!(
+                body.get(field).is_some(),
+                "{what} does not carry {field:?}, which docs/openapi.yaml marks required: {body}"
+            );
+        }
+    }
+    assert_eq!(
+        listing["undecidable"], 1,
+        "and the figure is the real one, not a zero that would pass whatever it counted: {listing}"
+    );
+    assert_eq!(listing["unkeyed"], 0, "the other reason is separate: {listing}");
+}

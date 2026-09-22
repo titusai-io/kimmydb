@@ -80,6 +80,22 @@ refused.** This release moves the storage schema to 4
   rise is the fix below doing its job. A scrape config or a golden list that
   enumerates series needs the new name.
 
+- **`kimmy_index_undecidable_total`** (`kimmy.index.undecidable` on the OTLP
+  bridge) counts documents an index holds because its partial filter could not
+  decide them ([ADR-185](docs/decisions.md)). **Expected, not a fault**: it
+  rises whenever a document holding a `Decimal128` at a filtered path is
+  written, needs no action, and is logged at debug rather than warning. It is a
+  **separate series** from `kimmy_index_unkeyed_total`, which counts documents
+  an index could not key at all — that one is worth an alert, and keeping them
+  apart is what stops this one diluting it. A scrape config or a golden list
+  that enumerates series needs the new name.
+
+  **A `Decimal128` at an *indexed* path is a different case, and is not a
+  miss.** The order cannot rank one, so no index can key such a document: it goes
+  in the index's unkeyed run and every scan rechecks it, which is why it is found
+  rather than lost. That is `unkeyed` on the listing, and it predates this
+  release.
+
 ### Fixed
 
 - **The licence-boundary check now sees every crate it is meant to guard.**
@@ -115,7 +131,7 @@ refused.** This release moves the storage schema to 4
   the error type by an exhaustive match with no wildcard, so a variant added
   later does not compile until it has been classified.
 
-- **A partial index now holds exactly what `find` with its filter returns,
+- **A partial index now holds what `find` with its filter returns,
   and is used only for a query whose every match it holds**
   ([ADR-183](docs/decisions.md), and [ADR-185](docs/decisions.md) for the
   `Decimal128` exception, which is closed below). Membership had its own rule, which differed
@@ -161,25 +177,6 @@ refused.** This release moves the storage schema to 4
   pre-existing — 0.33.0 and earlier behave the same way — and is fixed by the
   same schema 3 → 4 rebuild [above](#unreleased), with no separate migration.
 
-### Added
-
-- **`kimmy_index_undecidable_total`** (`kimmy.index.undecidable` on the OTLP
-  bridge) counts documents an index holds because its partial filter could not
-  decide them ([ADR-185](docs/decisions.md)). **Expected, not a fault**: it
-  rises whenever a document holding a `Decimal128` at a filtered path is
-  written, needs no action, and is logged at debug rather than warning. It is a
-  **separate series** from `kimmy_index_unkeyed_total`, which counts documents
-  an index could not key at all — that one is worth an alert, and keeping them
-  apart is what stops this one diluting it. A scrape config or a golden list
-  that enumerates series needs the new name.
-
-  **The exception, which is not new and is not fixed here:** a document whose
-  indexed value is a `Decimal128` can still be missed. The canonical order ranks
-  a `Decimal128` equal to every number — the documented contract — which makes
-  equality non-transitive, and the containment check assumes it is transitive.
-  The same is true of the previous release. It is recorded as its own finding,
-  because closing it means giving up index use for some queries under a contract
-  that has not been reopened.
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
   in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an

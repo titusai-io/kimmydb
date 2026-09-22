@@ -24,6 +24,14 @@ use crate::error::{Error, Result};
 // Type tags. These match the ranks in `cmp::type_rank` so that cross-type
 // ordering falls out of the leading byte alone.
 const TAG_MIN_KEY: u8 = 0x01;
+
+/// The lowest byte any real encoded key can begin with.
+///
+/// Exported so that the storage layer can place its sentinel runs **below every
+/// real key** without repeating a literal that would then be able to drift away
+/// from this table. `kimmy-storage`'s `UNKEYED` and `UNDECIDABLE` runs sit below
+/// this, and a query's range starts at it.
+pub const LEAST_KEY_TAG: u8 = TAG_MIN_KEY;
 const TAG_NULL: u8 = 0x10;
 const TAG_NUMBER: u8 = 0x20;
 const TAG_STRING: u8 = 0x30;
@@ -256,6 +264,156 @@ fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    /// No document ever encodes to an empty key — which is what lets the empty
+    /// key be the sentinel for the unkeyed run, and what lets a query's range
+    /// start one byte above it.
+    ///
+    /// **What breaking this actually costs, measured rather than assumed.** The
+    /// obvious fear is a lost document: `ABOVE_UNKEYED` raises every query range
+    /// to `[0x00]` so the unkeyed run is walked once, so a real key that encoded
+    /// empty would sit below every range. It is **not** lost, and that was worth
+    /// checking instead of asserting — a document filed at the empty key makes
+    /// `has_unkeyed` true, so the unkeyed range is prepended and the document is
+    /// visited there and rechecked against the full filter. Making the empty
+    /// string encode empty leaves `executor_containment.rs` green, in both
+    /// deliveries.
+    ///
+    /// What it costs is quieter: that document would be found by a recheck on
+    /// **every** scan of the index rather than by its key, and it would be
+    /// counted as unkeyable when it is nothing of the kind. So this test guards
+    /// an assumption about cost and honesty, not about correctness, and says so
+    /// rather than claiming a red it cannot produce.
+    /// The values both key-encoding premises are asserted over.
+    ///
+    /// One list, so a value added for either premise is covered by both: they are
+    /// two halves of one assumption, that no real key can reach a sentinel run.
+    fn corpus() -> Vec<Bson> {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let mut out = vec![
+            Bson::MinKey,
+            Bson::MaxKey,
+            Bson::Null,
+            Bson::Undefined,
+            Bson::Boolean(false),
+            Bson::Int32(0),
+            Bson::Int64(0),
+            Bson::Double(0.0),
+            Bson::Double(-0.0),
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::INFINITY),
+            Bson::Double(f64::NEG_INFINITY),
+            Bson::String(String::new()),
+            Bson::Document(bson::Document::new()),
+            Bson::Array(vec![]),
+            Bson::Array(vec![Bson::Array(vec![])]),
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: Vec::new(),
+            }),
+            Bson::Timestamp(bson::Timestamp { time: 0, increment: 0 }),
+            Bson::DateTime(bson::DateTime::from_millis(0)),
+        ];
+        // A decimal is in the corpus so each test says what it does with a value
+        // the encoder refuses, rather than omitting it and leaving the reader to
+        // wonder whether it was considered.
+        out.push(dec("1"));
+        out
+    }
+
+    #[test]
+    fn every_real_key_sorts_above_every_sentinel() {
+        // `kimmy-storage` files documents it **cannot key** under the empty key,
+        // and documents whose membership its filter **cannot decide** under
+        // `[0x00]` — both below every real key, so each run is walked exactly
+        // once by its own prepended range while a query's ranges start at
+        // `LEAST_KEY_TAG`.
+        //
+        // All of that rests on one fact, and the fact lives here rather than
+        // there: no real key begins below `LEAST_KEY_TAG`. A tag added below it
+        // would put real documents *into* a sentinel run — rechecked on every
+        // scan, and reported to an operator as a fault the index has.
+        //
+        // This is the test the second sentinel made necessary. Before it, the
+        // boundary was `[0x00]`, which was above every sentinel until `[0x00]`
+        // became one.
+        let sentinels: [&[u8]; 2] = [&[], &[0x00]];
+        for value in corpus() {
+            if encode_compound_ordered(&[(value.clone(), false)]).is_err() {
+                continue;
+            }
+            for descending in [false, true] {
+                let key = encode_compound_ordered(&[(value.clone(), descending)]).unwrap();
+                for sentinel in sentinels {
+                    assert!(
+                        key.as_slice() > sentinel,
+                        "{value:?} (descending: {descending}) encodes to {key:?}, which does not \
+                         sort above the sentinel {sentinel:?}, so it would land in that run"
+                    );
+                }
+                assert!(
+                    key[0] >= LEAST_KEY_TAG,
+                    "{value:?} begins with {:#04x}, below LEAST_KEY_TAG, and every query range \
+                     starts at that tag — so this key would be outside all of them",
+                    key[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_value_encodes_to_an_empty_key() {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let values = corpus();
+        // The empty ones are the interesting ones: an empty string, an empty
+        // document, an empty array and empty binary are the values a reader
+        // would guess might encode to nothing at all.
+        for value in &values {
+            // A value the encoder refuses has no key at all, which is the
+            // separate assertion below; this one is about values that do encode.
+            if encode_compound_ordered(&[(value.clone(), false)]).is_err() {
+                continue;
+            }
+            for descending in [false, true] {
+                let one = encode_compound_ordered(&[(value.clone(), descending)])
+                    .expect("a value that encoded once encodes in both directions");
+                assert!(
+                    !one.is_empty(),
+                    "{value:?} (descending: {descending}) encodes to an empty key, which is the \
+                     unkeyed run's sentinel — it would be filed there and dropped from every \
+                     query range"
+                );
+                // And in compound form, where an empty component could vanish
+                // between two others.
+                let compound = encode_compound_ordered(&[
+                    (value.clone(), descending),
+                    (value.clone(), !descending),
+                ])
+                .expect("every value here encodes");
+                assert!(!compound.is_empty(), "{value:?} compounds to an empty key");
+                assert!(
+                    compound.len() > one.len(),
+                    "a second component must add bytes, or one of them contributed none: \
+                     {value:?}"
+                );
+            }
+        }
+        assert!(values.len() > 15, "premise: the corpus is the corpus ({})", values.len());
+
+        // **A `Decimal128` is refused, not encoded to nothing**, and the
+        // difference matters: both would leave the document out of every real
+        // key, but a refusal is reported and files the document in the unkeyed
+        // run on purpose, while an empty key would put it there silently and
+        // then hide it from every query range. That refusal is why a decimal at
+        // an *indexed* path is unkeyable at all.
+        for descending in [false, true] {
+            let refused = encode_compound_ordered(&[(dec("1"), descending)]);
+            assert!(
+                refused.is_err(),
+                "a Decimal128 must be refused as an index key, not encoded: {refused:?}"
+            );
+        }
+    }
+
     use std::cmp::Ordering;
 
     use bson::{Bson, doc};

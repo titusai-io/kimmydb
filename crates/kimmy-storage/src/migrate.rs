@@ -437,8 +437,14 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
                     // filter cannot decide goes into the unkeyed run here,
                     // exactly as a later write would file it.
                     crate::index::DocumentKeys::Undecidable { .. } => {
-                        entries
-                            .insert((meta.id.0, index.id, crate::index::UNKEYED, doc_key), ())?;
+                        // The 3 -> 4 rebuild writes the new sentinel directly.
+                        // Still no schema 5: 4 is unreleased, so no deployed
+                        // database holds these entries under the old key
+                        // (ADR-185).
+                        entries.insert(
+                            (meta.id.0, index.id, crate::index::UNDECIDABLE, doc_key),
+                            (),
+                        )?;
                         built += 1;
                     }
                     crate::index::DocumentKeys::Unkeyed { multikey: many, .. } => {
@@ -1548,6 +1554,76 @@ mod membership_migration {
             &[("shop", "held", "by_size"), ("shop", "empty", "by_size")],
         );
         (dir, path)
+    }
+
+    /// A schema 3 database holding a partial index and three documents: one the
+    /// filter decides against, one it selects, and one it cannot decide.
+    ///
+    /// A function rather than a block, because the engine has to be dropped
+    /// before the file can be reopened — and a block did not do it.
+    fn schema_3_with_an_undecidable_document() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            engine
+                .create_index_with(
+                    "shop",
+                    "orders",
+                    vec![crate::meta::IndexField::ascending("x")],
+                    false,
+                    crate::meta::Enforcement::Local,
+                    Some("by_size".into()),
+                    None,
+                    Some(doc! {"size": {"$gt": 5}}),
+                )
+                .unwrap();
+            let coll = engine.get_collection("shop", "orders").unwrap();
+            engine
+                .insert_many(
+                    &coll,
+                    vec![
+                        doc! {"_id": 1_i64, "size": 1, "x": 1},
+                        doc! {"_id": 2_i64, "size": 10, "x": 2},
+                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3},
+                    ],
+                )
+                .unwrap();
+        }
+        as_schema_3(&path, &[]);
+        (dir, path)
+    }
+
+    #[test]
+    fn the_rebuild_files_a_document_its_filter_cannot_decide() {
+        // **The carrier nothing held.** The 3 -> 4 rebuild has its own
+        // `Undecidable` arm, and it is the path *every existing database* takes
+        // to ADR-185's membership: a live node never re-files these documents,
+        // the migration does. Deleting that arm left the whole suite green.
+        let (_dir, path) = schema_3_with_an_undecidable_document();
+        assert_eq!(version(&path), Some(3), "premise: a schema 3 database");
+
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(
+            stored_version(engine.db()).unwrap(),
+            Some(4),
+            "the open migrated it — read through the open engine, since the file cannot be \
+             opened twice"
+        );
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let id = coll.index("by_size").unwrap().id;
+        assert_eq!(
+            engine.undecidable_count(&coll, id).unwrap(),
+            1,
+            "the rebuild must file the document its filter cannot decide, or every database that \
+             migrates loses it from this index until something rewrites it"
+        );
+        assert_eq!(
+            engine.unkeyed_count(&coll, id).unwrap(),
+            0,
+            "and under the reason that is true of it, not the other one"
+        );
     }
 
     #[test]

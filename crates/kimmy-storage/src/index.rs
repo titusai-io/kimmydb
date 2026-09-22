@@ -29,9 +29,18 @@ const MAX_KEYS_PER_DOCUMENT: usize = 1_000;
 /// Empty on purpose. Every real key begins with a type tag byte
 /// (`kimmy_core::keyenc`), so no document ever produces an empty key, and an
 /// empty slice sorts before every non-empty one — so the unkeyed run of an
-/// index sits at the front of its entries, disjoint from every range a query
-/// can ask for. That is what lets it live in `INDEX_ENTRIES` beside the real
-/// keys: a drop, a backup and a migration cover it with no code of their own.
+/// index sits at the front of its entries. That is what lets it live in
+/// `INDEX_ENTRIES` beside the real keys: a drop, a backup and a migration cover
+/// it with no code of their own.
+///
+/// **It is not disjoint from every range a query can ask for**, which this
+/// comment used to claim. A range with an unbounded lower end encodes that end
+/// as the empty key — the unkeyed run itself — so such a range walked the run a
+/// second time, after it had already been walked as the prepended range. The
+/// document came back twice: `count` over-counted, a sorted `find` returned the
+/// same `_id` twice, and `explain` over-reported entries read. Every range a
+/// query asks for now starts at [`ABOVE_UNKEYED`] instead, which makes the claim
+/// true rather than merely stated.
 ///
 /// A document is unkeyable when the index cannot derive a finite, exact set
 /// of keys for it: arrays at two of a compound index's paths, more than
@@ -43,6 +52,46 @@ const MAX_KEYS_PER_DOCUMENT: usize = 1_000;
 /// a document another member had legally accepted impossible to replicate
 /// ([ADR-139](../../../docs/decisions.md)).
 pub(crate) const UNKEYED: &[u8] = &[];
+
+/// The index key under which a document whose **membership cannot be decided**
+/// is filed ([ADR-185](../../../docs/decisions.md)).
+///
+/// A second sentinel run, one byte above [`UNKEYED`] and still below every real
+/// key. Two runs rather than one because the two reasons mean different things to
+/// an operator: `UNKEYED` is a fault to fix — the index cannot key the document —
+/// while this is the documented behaviour of a value the canonical order cannot
+/// rank, and on a money field it may be most of the collection. A single run made
+/// the per-index `unkeyed` figure report one as the other, which contradicted
+/// every place that figure is documented.
+///
+/// The reason is not stored in the entry, so it has to be the key: reading it
+/// back from the document would make a listing load every document it counts.
+pub(crate) const UNDECIDABLE: &[u8] = &[0x00];
+
+/// Where every query's range starts: strictly above every sentinel run.
+///
+/// **Derived from the key encoding, not written out.** A literal here could drift
+/// from the tag table it depends on, and a second sentinel run has already
+/// caught this once: raising a range to `[0x00]` was correct while that was above
+/// every sentinel, and became a repeat of the ADR-139 double-visit the moment
+/// `UNDECIDABLE` moved in at that byte.
+pub(crate) const ABOVE_SENTINELS: &[u8] = &[kimmy_core::keyenc::LEAST_KEY_TAG];
+
+/// Every sentinel run, in key order.
+pub(crate) const SENTINELS: [&[u8]; 2] = [UNKEYED, UNDECIDABLE];
+
+/// Whether `key` is a sentinel run rather than a real index key.
+///
+/// **Ask this, never `key.is_empty()`.** Emptiness meant "sentinel" while there
+/// was one sentinel, and three places relied on it: the multikey
+/// de-duplication skipped such entries, and two counters attributed them. Adding
+/// `UNDECIDABLE` at `[0x00]` made every one of those silently wrong — the
+/// de-duplication skipped a run it should have let through, so documents in it
+/// vanished from every answer, which an executor differential caught and a
+/// membership model could not.
+pub(crate) fn is_sentinel(key: &[u8]) -> bool {
+    SENTINELS.contains(&key)
+}
 
 /// What an index derives from one document.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,10 +486,14 @@ fn apply_entries(
                         table.remove((coll.id.0, index.id, key.as_slice(), doc_key))?;
                     }
                 }
-                // Both unkeyed shapes are filed in the same run, so both are
-                // unfiled from it the same way.
-                DocumentKeys::Unkeyed { .. } | DocumentKeys::Undecidable { .. } => {
+                DocumentKeys::Unkeyed { .. } => {
                     table.remove((coll.id.0, index.id, UNKEYED, doc_key))?;
+                }
+                // Its own run since ADR-185, so unfiled from that one. Removing
+                // it from `UNKEYED` instead would leave the entry standing, and
+                // a stale sentinel entry is a candidate for every query for ever.
+                DocumentKeys::Undecidable { .. } => {
+                    table.remove((coll.id.0, index.id, UNDECIDABLE, doc_key))?;
                 }
             }
         }
@@ -457,7 +510,7 @@ fn apply_entries(
                     (multikey, Some(reason))
                 }
                 DocumentKeys::Undecidable { reason } => {
-                    table.insert((coll.id.0, index.id, UNKEYED, doc_key), ())?;
+                    table.insert((coll.id.0, index.id, UNDECIDABLE, doc_key), ())?;
                     // Counted, and at DEBUG rather than WARN: this filing is
                     // the documented behaviour of a Decimal128 under a partial
                     // filter, not a fault anyone can fix (ADR-185). A warning
@@ -654,7 +707,12 @@ where
         out.push(doc_key.to_vec());
     }
     if unkeyed == Unkeyed::Include {
-        out.extend(holders_of(table, coll, index_id, UNKEYED)?);
+        // **Both sentinel runs.** Each holds documents that are candidates for
+        // every query and are rechecked in full; including only one of them
+        // would lose the other's documents from this answer (ADR-185).
+        for sentinel in SENTINELS {
+            out.extend(holders_of(table, coll, index_id, sentinel)?);
+        }
     }
     out.sort();
     out.dedup();
@@ -666,18 +724,18 @@ where
 /// One seek: the unkeyed run sits at the front of the index's entries, so
 /// the first entry at or after `(collection, index, UNKEYED)` either is one
 /// or proves there are none.
-fn has_unkeyed<T>(table: &T, coll: CollectionId, index_id: u32) -> Result<bool>
+fn has_entries_at<T>(table: &T, coll: CollectionId, index_id: u32, key: &[u8]) -> Result<bool>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>,
 {
     use std::ops::Bound;
-    let start = Bound::Included((coll.0, index_id, UNKEYED, [].as_slice()));
+    let start = Bound::Included((coll.0, index_id, key, [].as_slice()));
     let mut range = table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))?;
     Ok(match range.next() {
         Some(entry) => {
             let (found, _) = entry?;
             let (c, i, k, _) = found.value();
-            c == coll.0 && i == index_id && k.is_empty()
+            c == coll.0 && i == index_id && k == key
         }
         None => false,
     })
@@ -1295,7 +1353,7 @@ impl crate::Engine {
                     // constraint does not reach it. Counted separately, since
                     // it is not the operator problem the arm below is.
                     DocumentKeys::Undecidable { .. } => {
-                        entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
+                        entries.insert((meta.id.0, index.id, UNDECIDABLE, doc_key), ())?;
                         undecidable += 1;
                         continue;
                     }
@@ -1677,16 +1735,34 @@ impl crate::Engine {
         Ok(out)
     }
 
-    /// How many documents an index holds that it could not key.
+    /// How many documents an index holds that it **could not key**.
     ///
-    /// The size of the run every scan of the index rechecks in full, which is
-    /// what a client reading `unkeyed` on the index listing wants to know:
-    /// zero is an index doing its whole job, anything else is a set of
-    /// documents to reshape or an index to split.
+    /// What a client reading `unkeyed` on the index listing wants to know: zero
+    /// is an index doing its whole job, anything else is a set of documents to
+    /// reshape or an index to split.
+    ///
+    /// **This counts that reason and no other.** For a while it counted both
+    /// sentinel runs, so a collection whose filter could not decide a
+    /// `Decimal128` reported `unkeyed: 2` while `kimmy_index_unkeyed_total` read
+    /// 0 — and every place this figure is documented says "could not key".
+    /// [`Self::undecidable_count`] is the other reason, and an owner needs both:
+    /// on a money field the second may be most of the collection.
     pub fn unkeyed_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let table = txn.open_table(tables::INDEX_ENTRIES)?;
         Ok(holders_of(&table, coll.id, index_id, UNKEYED)?.len() as u64)
+    }
+
+    /// How many documents an index holds because its partial filter **could not
+    /// decide** them ([ADR-185](../../../docs/decisions.md)).
+    ///
+    /// Standing, unlike `kimmy_index_undecidable_total`, which is a rate since
+    /// start: an owner asking "how much of this index is being rechecked on every
+    /// scan?" needs the number now, not how it got there.
+    pub fn undecidable_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        Ok(holders_of(&table, coll.id, index_id, UNDECIDABLE)?.len() as u64)
     }
 
     /// Candidates for a range that is only sound while the index is **not**
@@ -1817,6 +1893,12 @@ pub struct IndexScanOutcome {
     /// whatever range it asked for. What `explain` reports as
     /// `unkeyedCandidates`, and the cost of leaving such documents in place.
     pub unkeyed: usize,
+    /// Of `entries`, the ones read from the index's **undecidable** run: a
+    /// document its partial filter could not decide, held for the re-check
+    /// ([ADR-185](../../../docs/decisions.md)). Separate from `unkeyed`, because
+    /// that one means the index could not key the document — a fault to fix —
+    /// and this one is expected.
+    pub undecidable: usize,
 }
 
 /// The tables one scan reads from, and the visitor it feeds.
@@ -1867,11 +1949,13 @@ where
         }
     }
 
-    /// One entry read, and whether it came from the unkeyed run.
+    /// One entry read, and which sentinel run it came from, if any.
     fn read(&mut self, key: &[u8]) {
         self.outcome.entries += 1;
-        if key.is_empty() {
+        if key == UNKEYED {
             self.outcome.unkeyed += 1;
+        } else if key == UNDECIDABLE {
+            self.outcome.undecidable += 1;
         }
     }
 
@@ -1920,7 +2004,7 @@ where
                 let Some((stamp, doc)) = self.load(doc_key)? else {
                     continue;
                 };
-                if multikey && !k.is_empty() && !self.first_entry_for(&doc, k)? {
+                if multikey && !is_sentinel(k) && !self.first_entry_for(&doc, k)? {
                     continue;
                 }
                 if !(self.visit)(doc_key, stamp, doc)? {
@@ -1993,8 +2077,10 @@ where
                         return Ok(None);
                     }
                     outcome.entries += 1;
-                    if k.is_empty() {
+                    if k == UNKEYED {
                         outcome.unkeyed += 1;
+                    } else if k == UNDECIDABLE {
+                        outcome.undecidable += 1;
                     }
                     Ok(Some(doc_key.to_vec()))
                 }
@@ -2148,11 +2234,30 @@ impl crate::Engine {
         if scan.ranges.is_empty() {
             return Ok(Some(IndexScanOutcome::default()));
         }
-        let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(scan.ranges.len() + 1);
-        if has_unkeyed(&entries, coll.id, scan.index_id)? {
-            ranges.push((UNKEYED.to_vec(), UNKEYED.to_vec()));
+        let mut ranges: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(scan.ranges.len() + SENTINELS.len());
+        // **Each sentinel run is walked once, and only if it holds anything.**
+        // Both are candidates for every query: an unkeyable document because the
+        // index has no key for it, and an undecidable one because the filter
+        // could not say whether it belongs. Each is rechecked against the full
+        // filter like any other candidate.
+        for sentinel in SENTINELS {
+            if has_entries_at(&entries, coll.id, scan.index_id, sentinel)? {
+                ranges.push((sentinel.to_vec(), sentinel.to_vec()));
+            }
         }
-        ranges.extend_from_slice(scan.ranges);
+        // **The unkeyed run is walked once, by the range above, and by no
+        // other.** A query range with an unbounded lower end arrives here with
+        // an empty lower bound, which is the unkeyed key itself, so it used to
+        // walk that run again — and the multikey de-duplication skips empty
+        // keys, so nothing caught the repeat. Raising every query range to
+        // `ABOVE_UNKEYED` fixes each walk at once rather than each walk
+        // separately, and it fixes the case that predates ADR-185 too: a
+        // document no index can key was already being counted twice.
+        ranges.extend(scan.ranges.iter().map(|(lower, upper)| {
+            let lower = if lower.is_empty() { ABOVE_SENTINELS.to_vec() } else { lower.clone() };
+            (lower, upper.clone())
+        }));
         let mut walk = Walk {
             coll: coll.id,
             index: &index,
@@ -3236,6 +3341,50 @@ mod tests {
     }
 
     #[test]
+    fn repro_an_unkeyed_document_is_visited_twice() {
+        // REPRO: expected to fail today. An index on `name` with a partial
+        // filter on `k`, and one document the filter cannot decide, so it is in
+        // the unkeyed run. A one-sided range with an open low end starts at the
+        // empty key -- which *is* the unkeyed run -- so the walk visits it once
+        // for the prepended range and again for the real one.
+        let (engine, _, _dir) = engine();
+        engine
+            .create_index_with(
+                "app",
+                "docs",
+                vec![IndexField::ascending("name")],
+                false,
+                Default::default(),
+                Some("name_1".into()),
+                None,
+                Some(doc! { "k": { "$gt": 5 } }),
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine
+            .insert(
+                &coll,
+                doc! { "_id": 1i64, "k": Bson::Decimal128("1".parse().unwrap()), "name": "a" },
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let index = coll.index("name_1").unwrap();
+        assert_eq!(
+            engine.undecidable_count(&coll, index.id).unwrap(),
+            1,
+            "it is in the undecidable run"
+        );
+
+        // `{name: {$lt: "z"}, k: 7}`: `k: 7` is what makes the planner choose
+        // this index (`Eq(7)` implies `Gt(5)`), and `name < "z"` is the one-sided
+        // range whose open low end starts at the unkeyed run.
+        let filter = kimmy_query::filter::parse(&doc! { "name": { "$lt": "z" }, "k": 7 }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes).expect("the index is used");
+        let (ids, _) = walk(&engine, &coll, &plan, CandidateOrder::Any, |_| true, usize::MAX);
+        assert_eq!(ids, vec![1i64], "the document is a candidate once, not twice: {ids:?}");
+    }
+
+    #[test]
     fn an_exact_probe_stopped_after_one_reads_one_entry() {
         // The shape that used to cost the most for the least: an unselective
         // equality with `limit: 1` gathered every candidate key under the
@@ -4053,6 +4202,70 @@ mod tests {
         }
 
         #[test]
+        fn a_document_moving_in_and_out_of_the_undecidable_state_is_refiled() {
+            // **The old-image unfile, which nothing held.** `apply_entries`
+            // removes the previous image from whichever run held it before
+            // filing the new one. Dropping that for `Undecidable` left every
+            // test green — and the stale sentinel entry it leaves behind is a
+            // candidate for every query for ever, which is how the same document
+            // came back twice from an index that holds it once.
+            let (engine, _, _dir) = engine();
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a")],
+                    false,
+                    Default::default(),
+                    Some("a_gt5".into()),
+                    None,
+                    Some(doc! { "k": { "$gt": 5 } }),
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let id = index_id(&coll, "a_gt5");
+            let dec = Bson::Decimal128("1".parse().unwrap());
+
+            // In: undecidable.
+            engine.insert(&coll, doc! { "_id": 1i64, "k": dec.clone(), "a": 1 }).unwrap();
+            assert_eq!(engine.undecidable_count(&coll, id).unwrap(), 1);
+
+            // Out, to a value the filter selects: keyed, and **gone from the
+            // undecidable run**.
+            engine
+                .replace(&coll, &DocId::Int64(1), doc! { "_id": 1i64, "k": 9, "a": 1 }, false)
+                .unwrap();
+            assert_eq!(
+                engine.undecidable_count(&coll, id).unwrap(),
+                0,
+                "the old image must be unfiled, or the entry outlives the state that put it there"
+            );
+            assert_eq!(
+                engine.unkeyed_count(&coll, id).unwrap(),
+                0,
+                "and not moved to the other run"
+            );
+
+            // Out again, to a value the filter decides against: held by neither
+            // run, and by no key.
+            engine
+                .replace(&coll, &DocId::Int64(1), doc! { "_id": 1i64, "k": 1, "a": 1 }, false)
+                .unwrap();
+            assert_eq!(engine.undecidable_count(&coll, id).unwrap(), 0);
+            assert_eq!(entries_for(&engine, &coll, id).len(), 0, "the index holds nothing for it");
+
+            // And back in.
+            engine
+                .replace(&coll, &DocId::Int64(1), doc! { "_id": 1i64, "k": dec, "a": 1 }, false)
+                .unwrap();
+            assert_eq!(engine.undecidable_count(&coll, id).unwrap(), 1, "refiled on the way back");
+
+            // A delete leaves neither run holding it.
+            engine.delete(&coll, &DocId::Int64(1)).unwrap();
+            assert_eq!(engine.undecidable_count(&coll, id).unwrap(), 0);
+        }
+
+        #[test]
         fn a_backfill_holds_the_documents_the_filter_cannot_decide() {
             // The other order: the documents first, the definition second.
             // The backfill has its own refusal for a local unique index, and
@@ -4080,11 +4293,12 @@ mod tests {
             let coll = engine.get_collection("app", "docs").unwrap();
             let id = index_id(&coll, "a_gt5");
             assert_eq!(
-                engine.unkeyed_count(&coll, id).unwrap(),
+                engine.undecidable_count(&coll, id).unwrap(),
                 1,
                 "the Decimal128 document is held for re-check; the 9 is keyed and the 1 is \
                  decided against"
             );
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0);
             assert_eq!(engine.undecidable_writes(), 1);
             assert_eq!(engine.unkeyed_writes(), 0, "not the operator-facing series");
         }
@@ -4132,9 +4346,14 @@ mod tests {
 
             let id = index_id(&coll, "a_gt5");
             assert_eq!(
-                engine.unkeyed_count(&coll, id).unwrap(),
+                engine.undecidable_count(&coll, id).unwrap(),
                 2,
-                "both are held, in the unkeyed run, for the scan to re-check"
+                "both are held, in the undecidable run, for the scan to re-check"
+            );
+            assert_eq!(
+                engine.unkeyed_count(&coll, id).unwrap(),
+                0,
+                "and not in the run that means the index could not key them"
             );
             assert_eq!(
                 engine.undecidable_writes(),

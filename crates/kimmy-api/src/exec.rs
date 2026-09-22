@@ -1576,7 +1576,8 @@ fn create_index_stamped(
     // most wants beside `multikey`, and the listing reports the same field.
     let meta = state.engine.get_collection(db, coll)?;
     let unkeyed = state.engine.unkeyed_count(&meta, index.id)?;
-    Ok((index_to_json(&index, unkeyed), index.created))
+    let undecidable = state.engine.undecidable_count(&meta, index.id)?;
+    Ok((index_to_json(&index, unkeyed, undecidable), index.created))
 }
 
 /// Confirm a schema change this node just minted on every live member
@@ -1628,7 +1629,11 @@ pub fn list_indexes(
     let meta = state.engine.get_collection(db, coll)?;
     let mut indexes = Vec::with_capacity(meta.indexes.len());
     for index in &meta.indexes {
-        indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
+        indexes.push(index_to_json(
+            index,
+            state.engine.unkeyed_count(&meta, index.id)?,
+            state.engine.undecidable_count(&meta, index.id)?,
+        ));
     }
     Ok(json!({ "indexes": indexes }))
 }
@@ -1727,9 +1732,15 @@ fn drop_index_stamped(
     Ok((json!({ "dropped": dropped.removed }), dropped.stamp))
 }
 
-/// `unkeyed` is how many documents the index holds that it could not key —
-/// read from the index, since the definition does not carry it.
-pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64) -> Value {
+/// `unkeyed` is how many documents the index holds that it could not key, and
+/// `undecidable` how many it holds because its partial filter could not decide
+/// them — both read from the index, since the definition carries neither.
+///
+/// **Two figures rather than one.** They were one for a while, and it made
+/// `unkeyed` mean something other than what every place it is documented says:
+/// a collection with a `Decimal128` at a filtered path reported `unkeyed: 2`
+/// while `kimmy_index_unkeyed_total` read 0 (ADR-185).
+pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64, undecidable: u64) -> Value {
     let mut out = json!({
         "name": index.name,
         "fields": index.fields.iter().map(|f| json!({
@@ -1750,7 +1761,20 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64) -> Value {
         // its whole job; anything else names work for the collection's owner,
         // who can see it here without access to the server's logs.
         "unkeyed": unkeyed,
+        // Documents the index holds because its partial filter could not decide
+        // them: a `Decimal128` at a filtered path ranks equal to every number, so
+        // the filter's answer is not an answer and the index holds the document
+        // for the scan to re-check (ADR-185). Every scan pays for these, so an
+        // owner needs the standing number — on a money field it may be most of
+        // the collection.
+        //
+        // **Always present, like `unkeyed` beside it.** Rendering it only when
+        // non-zero would be a second convention in one object: a client would
+        // have to know that absent means zero, and a typed client would break the
+        // first time it appeared.
+        "undecidable": undecidable,
     });
+
     // Added only when set, so listing ordinary indexes does not suggest every
     // one of them carries an expiry policy that happens to be null.
     if let Some(secs) = index.expire_after_secs {

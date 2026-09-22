@@ -1070,7 +1070,7 @@ impl Metrics {
              # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.\n\
              # TYPE kimmy_ttl_skipped_filter_total counter\n\
              kimmy_ttl_skipped_filter_total {ttl_skipped_filter}\n\
-             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.\n\
+             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
              # HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.\n\
@@ -1731,7 +1731,11 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
-            index_undecidable: 4,
+            // 37 rather than a small number: the golden is asserted
+            // byte-for-byte, and a value shared with another series (4 was also
+            // `kimmy_responses_total{class="5xx"}`) lets an assertion that names
+            // this one match the wrong line.
+            index_undecidable: 37,
             sync_ddl_relogged: 91,
             writer_wait: kimmy_storage::WriterWaitSnapshot {
                 buckets: [1, 2, 0, 0, 3, 0, 0, 1],
@@ -2165,12 +2169,12 @@ kimmy_ttl_skipped_total 12
 # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.
 # TYPE kimmy_ttl_skipped_filter_total counter
 kimmy_ttl_skipped_filter_total 93
-# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.
+# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
 # HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.
 # TYPE kimmy_index_undecidable_total counter
-kimmy_index_undecidable_total 4
+kimmy_index_undecidable_total 37
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
 # TYPE kimmy_webhook_deliveries_total counter
 kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2

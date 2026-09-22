@@ -63,7 +63,9 @@ pub struct IndexMeta {
     /// at creation.
     #[serde(default)]
     pub expire_after_secs: Option<i64>,
-    /// Index only the documents matching this filter.
+    /// Index only the documents matching this filter — and those it cannot
+    /// decide, which the index holds for the scan to re-check
+    /// ([ADR-185](../../../docs/decisions.md)).
     ///
     /// `None` indexes everything. `Some(_)` makes it a **partial** index, and
     /// the planner may then use it only for a query provably contained by the

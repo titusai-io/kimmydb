@@ -239,7 +239,10 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
                         && !holds(partial, d)
                         && seen.insert((pdoc.to_string(), qdoc.to_string()))
                     {
-                        lost.push(format!("index {pdoc} used for {qdoc} (on {on}) misses {d}"));
+                        // `{:?}` for the document, not `{}`: a `Decimal128`
+                        // renders as a bare `1` in Display, which is exactly the
+                        // value the reader needs to see is a decimal.
+                        lost.push(format!("index {pdoc} used for {qdoc} (on {on}) misses {d:?}"));
                     }
                 }
             }

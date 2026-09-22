@@ -2,8 +2,10 @@
 //!
 //! # Why it is bounded rather than general
 //!
-//! A partial index holds only the documents matching its filter, so the
-//! planner may use it **only for a query provably contained by that filter**.
+//! A partial index holds the documents matching its filter — and, since
+//! [ADR-185](../../../docs/decisions.md), those it cannot decide, which is a
+//! superset rather than an exception to the rule below. The planner may use such
+//! an index **only for a query provably contained by that filter**.
 //! Get that wrong and results silently lose documents — the same failure this
 //! codebase already met with multikey, and the one it is least able to notice.
 //!

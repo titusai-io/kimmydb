@@ -44,7 +44,9 @@ a quorum; a store that accepts writes on every member cannot.
 **What closes it.** Nothing needs to: a client that wants the refusal back
 polices document shape itself, or splits the compound index into single-field
 indexes, which key every shape. The `unkeyed` field on the index listing and
-`unkeyedCandidates` on `explain` say when it matters.
+`unkeyedCandidates` on `explain` say when it matters — and they count *this*
+reason only, not a document a partial filter could not decide, which the listing
+reports separately as `undecidable` ([ADR-185](decisions.md)).
 
 ---
 
