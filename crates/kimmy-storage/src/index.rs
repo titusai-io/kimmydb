@@ -2403,7 +2403,7 @@ mod tests {
                 engine.create_index(
                     "app",
                     "docs",
-                    vec![IndexField::ascending(&format!("f{i}"))],
+                    vec![IndexField::ascending(format!("f{i}"))],
                     false,
                     Some(format!("idx{i}")),
                 )
