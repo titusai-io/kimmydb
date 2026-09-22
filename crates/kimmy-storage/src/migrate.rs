@@ -61,8 +61,10 @@ fn step(db: &Database) -> Result<()> {
     // Before anything is written, on every path that migrates -- including a
     // schema 1 or 2 source, whose id-deriving steps run before the rebuild, and
     // a schema 4 file whose rebuild was interrupted. Any later and the claim the
-    // refusal makes, that nothing was changed and the previous build still opens
-    // this directory, would already be false.
+    // refusal makes, that nothing was changed, would already be false. (What an
+    // operator can then do depends on the version it found -- the previous build
+    // opens a schema 1, 2 or 3 directory, and no build opens a half-migrated
+    // one; the message says which.)
     let resuming = found == Some(SCHEMA_VERSION) && partial_rebuild_owed(db)?;
     if matches!(found, Some(1..SCHEMA_VERSION)) || resuming {
         refuse_unparseable_partial_filters(db, found.expect("a version was read"))?;

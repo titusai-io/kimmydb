@@ -45,7 +45,8 @@ refused.** This release moves the storage schema to 4
   interrupted migration the version is already 4, which neither build will open,
   and the message says so. This can only happen for a filter an
   earlier build accepted and this one does not, such as one holding a
-  `Decimal128`. To proceed, start the directory with the previous build, drop
+  `Decimal128`. **Below schema 4**, to proceed: start the directory with the
+  previous build, drop
   each index named, recreating it with a filter this build accepts, then upgrade
   again. In a cluster one drop on any member replicates to all.
 - **Disk.** Have free space of at least the largest partial index's size

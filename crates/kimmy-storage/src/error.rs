@@ -36,8 +36,14 @@ pub enum StorageError {
     /// hold from a filter it cannot read. Refusing at open confines the
     /// condition to schema 3 files, which is what lets ADR-181 call it
     /// transient and decline a metric for it. Nothing is written: the on-disk
-    /// version is still 3, no index entries were cleared, and the previous
-    /// build still opens this directory.
+    /// version is left as it was and no index entries were cleared.
+    ///
+    /// **What an operator can do depends on that version**, which is why the
+    /// message asks `unparseable_filter_remedy` rather than stating one. Below
+    /// schema 4 the previous build still opens the directory, so the index can
+    /// be dropped there and the upgrade retried. At schema 4 -- a refusal while
+    /// resuming an interrupted migration -- neither build opens it: that one
+    /// refuses the schema and this one refuses the definition.
     #[error(
         "this build cannot parse {} stored partial index definition(s), so the schema 3 to 4 \
          migration cannot know what those indexes should hold. This attempt changed nothing: \
