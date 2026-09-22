@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/kimmy-core",
+    "crates/kimmy-task",
     "crates/kimmy-storage",
     "crates/kimmy-query",
     "crates/kimmy-egress",
@@ -35,6 +36,7 @@ authors = ["Titus AI LLC <licensing@titusai.io>"]
 [workspace.dependencies]
 # Internal crates
 kimmy-core = { path = "crates/kimmy-core" }
+kimmy-task = { path = "crates/kimmy-task" }
 kimmy-storage = { path = "crates/kimmy-storage" }
 kimmy-query = { path = "crates/kimmy-query" }
 kimmy-egress = { path = "crates/kimmy-egress" }

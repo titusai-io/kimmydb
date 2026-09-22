@@ -1,0 +1,16 @@
+[package]
+name = "kimmy-task"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Supervision for the KimmyDB node's long-lived background tasks: a task that dies stops the process instead of stopping alone"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

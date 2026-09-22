@@ -2390,6 +2390,7 @@ dependencies = [
  "kimmy-egress",
  "kimmy-query",
  "kimmy-storage",
+ "kimmy-task",
  "kimmy-vector",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
@@ -2477,6 +2478,7 @@ dependencies = [
  "hmac 0.13.0",
  "kimmy-core",
  "kimmy-storage",
+ "kimmy-task",
  "parking_lot",
  "postcard",
  "rand 0.10.2",
@@ -2591,6 +2593,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kimmy-task"
+version = "0.33.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kimmy-vector"
 version = "0.33.0"
 dependencies = [
@@ -2627,6 +2637,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-mcp",
  "kimmy-storage",
+ "kimmy-task",
  "kimmy-vector",
  "mimalloc",
  "opentelemetry",
