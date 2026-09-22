@@ -91,7 +91,9 @@ refused.** This release moves the storage schema to 4
   again on every retry; a snapshot page carrying one failed as a whole, so the
   member could not catch up from that peer at all. It is now skipped, counted in
   `kimmy_sync_ddl_refused_total` and warned, as the designed path always did for
-  other refusals.
+  other refusals — the refusal class set out in
+  [ADR-123](docs/decisions.md), whose rule is unchanged: this only makes the
+  code match it.
 
   **Latent until now:** no release before this one accepts an operator that a
   released build refuses, so there is no path between them. It would have opened
