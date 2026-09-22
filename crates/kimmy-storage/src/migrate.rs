@@ -158,9 +158,20 @@ fn persisted_violations(db: &Database) -> Result<Unreported> {
     let mut out = Vec::new();
     for row in recorded.iter()? {
         let (_, value) = row?;
-        let held: RecordedViolations = serde_json::from_slice(value.value())?;
+        let held: RecordedViolations = serde_json::from_slice(value.value()).map_err(|e| {
+            StorageError::Corrupt(format!(
+                "a pending row of the recorded-collision table \
+                 (partial_rebuilt_unique_violations) will not decode, so this open cannot \
+                 report a collision an earlier rebuild found: {e}"
+            ))
+        })?;
         // Gone since, or replaced: there is nothing to report a collision
-        // against, and the entries went with it.
+        // against, and the entries went with it. Such a row lingers, because the
+        // forget below runs only when something was reported -- so a file whose
+        // only pending rows name dropped collections keeps them. Unreachable in
+        // practice: it needs the collection dropped between the rebuild's commit
+        // and the next open, in the window before the engine exists. Named here
+        // rather than guarded, since the cost is one dead row.
         let Some(raw) = collections.get((held.db.as_str(), held.collection.as_str()))? else {
             continue;
         };
@@ -1614,7 +1625,29 @@ mod membership_migration {
             matches!(&err, StorageError::UnparseablePartialFilter { found, .. } if *found == 1),
             "the message must name the version on disk, not 3: {err}"
         );
-        assert_eq!(version(&path), Some(1), "nothing was written");
+        // Not the version alone: the id-deriving steps do not write the version
+        // byte, so a refusal that ran *after* them would leave it at 1 and this
+        // test would pass while the bytes had already moved. The collection must
+        // still be under the counter id the rewind gave it, which is what
+        // `derive_collection_ids` would have rewritten along with every document
+        // key and index entry belonging to it.
+        assert_eq!(version(&path), Some(1), "the version was not written");
+        assert_eq!(
+            stored_collection_id(&path, "shop", "t"),
+            7,
+            "the collection is still under its counter id, so no byte was moved"
+        );
+    }
+
+    /// The id a collection is stored under, read from the file.
+    fn stored_collection_id(path: &std::path::Path, db_name: &str, coll: &str) -> u64 {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let collections = txn.open_table(tables::COLLECTIONS).unwrap();
+        let meta: CollectionMeta =
+            serde_json::from_slice(collections.get((db_name, coll)).unwrap().unwrap().value())
+                .unwrap();
+        meta.id.0
     }
 
     #[test]

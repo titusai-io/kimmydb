@@ -120,6 +120,18 @@ impl PartialOp {
     ///   the planner answered it from an index that holds neither.
     /// - **`{k: null}` matches a missing field**, so it implies nothing about
     ///   presence and no bound: only itself.
+    ///
+    /// **Unsound for a document value that is a `Decimal128`, knowingly.** This
+    /// reasons through a single value `w`, which assumes equality is transitive.
+    /// `canonical_cmp` ranks a `Decimal128` equal to every number — the settled
+    /// contract in `docs/http-api.md` and `docs/key-encoding.md` — so `Eq(5)` and
+    /// `Eq(6)` both hold on one while neither implies the other, and a query can
+    /// be judged contained by a filter whose index does not hold the document.
+    /// Filed as the finding whose slug ends `-because-equality-with-a-decimal128-is-not-transitive`
+    /// (recorded in full in ADR-183); not fixed here, because a fix
+    /// trades index use for soundness under a contract that has not been
+    /// reopened. The soundness property's corpus therefore holds no
+    /// `Decimal128`.
     pub fn implies(&self, other: &PartialOp) -> bool {
         use crate::cmp::same_type_group;
         let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);

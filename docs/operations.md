@@ -364,7 +364,8 @@ spec:
           # uses. Allow at least twice your expected open as
           # periodSeconds x failureThreshold, and leave margin: the cost per
           # document grows with the store, so the estimate is a bound, not a
-          # rate. These values are for 10 million retained entries and one
+          # rate -- measured up to 10 million documents per index and
+          # extrapolated above that, which is where you most need the margin. These values are for 10 million retained entries and one
           # partial index over 10 million documents: 46 s + 80 s = 126 s, so
           # twice is 252 s and 300 s is set here. Compute yours.
           startupProbe:
@@ -1701,7 +1702,7 @@ through each one rather than needing its own path to the latest.
 | 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
 | 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns ([ADR-183](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule |
 
-Both are idempotent and run before the node serves anything.
+All three are idempotent and run before the node serves anything.
 
 > **Back up the data directory before a version-crossing upgrade.** The
 > migration is transactional per step, but a rollback to the older build is not

@@ -34,11 +34,16 @@ refused.** This release moves the storage schema to 4
   machine, a partial index over 10 million documents added about 73 seconds
   to that start (7.3 µs per document per partial index measured there; the
   estimate the node prints uses 8, and the cost per document grows with the
-  store, so treat it as a bound rather than a rate).
+  store, so treat it as a bound rather than a rate. It is measured up to ten
+  million documents per index and extrapolated above that, which is where a
+  probe budget most needs the headroom).
 - **The upgrade refuses if this build cannot read a stored partial filter.** It
   names every such index — database, collection, index and the reason — and
-  changes nothing: the version stays 3, no index entries are cleared, and the
-  previous build still opens the directory. This can only happen for a filter an
+  changes nothing: the on-disk version is left as it was and no index entries
+  are cleared. Below schema 4 the previous build still opens the directory, so
+  the index can be dropped there; if the refusal happens while resuming an
+  interrupted migration the version is already 4, which neither build will open,
+  and the message says so. This can only happen for a filter an
   earlier build accepted and this one does not, such as one holding a
   `Decimal128`. To proceed, start the directory with the previous build, drop
   each index named, recreating it with a filter this build accepts, then upgrade
@@ -77,7 +82,8 @@ refused.** This release moves the storage schema to 4
 ### Fixed
 
 - **A partial index now holds exactly what `find` with its filter returns,
-  and is used only for a query whose every match it holds**
+  and is used only for a query whose every match it holds — with one exception,
+  a document value that is a `Decimal128`**
   ([ADR-183](docs/decisions.md)). Membership had its own rule, which differed
   from `find` in three ways:
   - it never matched a whole array, so `{k: [1, 2]}` did not hold a document
@@ -92,6 +98,14 @@ refused.** This release moves the storage schema to 4
   was enforced on the wrong documents. Existing partial indexes are rebuilt
   at startup (above), and duplicates the rebuild finds in a unique one are
   reported as a replicated build's are, not refused.
+
+  **The exception, which is not new and is not fixed here:** a document whose
+  indexed value is a `Decimal128` can still be missed. The canonical order ranks
+  a `Decimal128` equal to every number — the documented contract — which makes
+  equality non-transitive, and the containment check assumes it is transitive.
+  The same is true of the previous release. It is recorded as its own finding,
+  because closing it means giving up index use for some queries under a contract
+  that has not been reopened.
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
   in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an

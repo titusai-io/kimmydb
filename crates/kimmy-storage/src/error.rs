@@ -40,12 +40,12 @@ pub enum StorageError {
     /// build still opens this directory.
     #[error(
         "this build cannot parse {} stored partial index definition(s), so the schema 3 to 4 \
-         migration cannot know what those indexes should hold. Nothing was changed: the \
-         on-disk version is still {found} and no index entries were cleared. Refused: {}. To \
-         proceed, start this data directory with the previous build, drop each index named \
-         above -- recreating it with a filter this build accepts -- and upgrade again",
+         migration cannot know what those indexes should hold. This attempt changed nothing: \
+         the on-disk version is still {found} and no index entries were cleared. Refused: {}. \
+         {}",
         refused.len(),
-        refused.join("; ")
+        refused.join("; "),
+        unparseable_filter_remedy(*found)
     )]
     UnparseablePartialFilter { found: u8, refused: Vec<String> },
 
@@ -67,6 +67,28 @@ pub enum StorageError {
         waited.as_millis()
     )]
     WriterBusy { waited: std::time::Duration },
+}
+
+/// What an operator can actually do about a stored partial filter this build
+/// refuses, which depends on the version the file is at.
+///
+/// Below schema 4 the previous build still opens the directory, so the index can
+/// be dropped there and the upgrade retried. At schema 4 it cannot: that build
+/// refuses the schema and this one refuses the definition, so no build can serve
+/// the directory until the definition is gone. That state needs a migration to
+/// have been interrupted *and* a filter this build refuses, so it is close to
+/// unreachable -- but saying "use the previous build" there would be advice that
+/// cannot be followed.
+fn unparseable_filter_remedy(found: u8) -> &'static str {
+    if found < 4 {
+        "To proceed, start this data directory with the previous build, drop each index named \
+         above -- recreating it with a filter this build accepts -- and upgrade again"
+    } else {
+        "This directory cannot be opened by either build until that definition is gone: the \
+         previous build refuses schema 4, and this one refuses the definition. Wipe the data \
+         directory and let the member catch up from its peers, or restore a backup taken \
+         before the upgrade"
+    }
 }
 
 // redb splits failures across several error types that all mean "the storage

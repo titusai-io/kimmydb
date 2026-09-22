@@ -773,10 +773,16 @@ fn rows_without_a_header(markdown: &str) -> Vec<usize> {
 /// prevent, written into it.
 #[test]
 fn the_documented_startup_probe_allows_the_open_it_describes() {
+    // Scoped to the startup probe's own block, which ends where the next probe
+    // begins. Searching from `startupProbe:` to the end of the file would read
+    // the liveness or readiness probe's fields if the startup probe ever lost
+    // one, and silently grade the wrong numbers.
+    let at = OPERATIONS.find("startupProbe:").expect("the manifest has a startup probe");
+    let after = &OPERATIONS[at..];
+    let block = &after[..after.find("livenessProbe:").unwrap_or(after.len())];
+    assert!(block.contains("failureThreshold:"), "the startup probe's block was not found");
     let field = |name: &str| -> u64 {
-        let at = OPERATIONS.find("startupProbe:").expect("the manifest has a startup probe");
-        let rest = &OPERATIONS[at..];
-        let line = rest
+        let line = block
             .lines()
             .find(|l| l.trim_start().starts_with(&format!("{name}:")))
             .unwrap_or_else(|| panic!("the startup probe sets {name}"));
@@ -785,7 +791,11 @@ fn the_documented_startup_probe_allows_the_open_it_describes() {
     let budget = field("periodSeconds") * field("failureThreshold");
 
     // The example the manifest's own comment describes: ten million retained
-    // oplog entries, and one partial index over ten million documents.
+    // oplog entries, and one partial index over ten million documents. Both
+    // figures are hardcoded here, deliberately: the 46 s oplog walk is a
+    // measurement that lives only in prose, and the example's size is the
+    // comment's own choice. Only the per-document rate is taken from the code,
+    // because that is the one the code can change under the guide.
     const EXAMPLE_DOCUMENTS: u64 = 10_000_000;
     const EXAMPLE_OPLOG_SECS: u64 = 46;
     let rebuild = EXAMPLE_DOCUMENTS * kimmy_storage::migrate::MICROS_PER_DOCUMENT / 1_000_000;
@@ -802,10 +812,15 @@ fn the_documented_startup_probe_allows_the_open_it_describes() {
     );
 
     // And the comment quotes the code's figure, so the prose cannot drift back.
+    // As a whole token: a bare `contains` would accept "18 us per" as a match
+    // for 8, which is the direction that hides a drift rather than reporting it.
     let quoted = format!("{} us per", kimmy_storage::migrate::MICROS_PER_DOCUMENT);
+    let quoted_as_a_token = OPERATIONS.match_indices(&quoted).any(|(i, _)| {
+        i == 0 || !OPERATIONS[..i].chars().next_back().is_some_and(|c| c.is_ascii_digit())
+    });
     assert!(
-        OPERATIONS.contains(&quoted),
-        "the manifest's comment does not quote the code's {quoted:?}"
+        quoted_as_a_token,
+        "the manifest's comment does not quote the code's {quoted:?} as its own number"
     );
 }
 
