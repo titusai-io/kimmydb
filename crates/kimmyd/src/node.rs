@@ -562,18 +562,13 @@ async fn start_and_serve(config: Config) -> Result<()> {
                     EMBEDDING_RETRY_FIRST,
                     EMBEDDING_RETRY_MAX,
                 );
-                loop {
-                    match worker.run().await {
-                        // A return, which `supervise` treats as a death: this
-                        // worker should never finish.
-                        Ok(()) => return,
-                        Err(e) => {
-                            if !retry.after(e, &retrying).await {
-                                return;
-                            }
-                        }
-                    }
-                }
+                // The loop lives in `Retry::forever` rather than here. Written
+                // out at this call site first, and the whole workspace suite
+                // passed with its `Err` arm returning instead of retrying —
+                // so the one rule this is about had no test anywhere. Returning
+                // from `forever` is a death, which is what should happen if
+                // this worker ever finishes.
+                retry.forever(&retrying, &mut worker, |w| Box::pin(w.run())).await;
             }
         }))
     } else {

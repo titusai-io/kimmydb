@@ -423,18 +423,21 @@ where
                     Err(e) if e.is_panic() => {
                         exit_because(name, Death::Panicked, &panic_detail(e))
                     }
-                    // Cancelled, which only our own `abort` does: a parent
-                    // ending its children, or the shutdown path. A deliberate
-                    // stop is not a death, and treating it as one made a task
-                    // whose parent had finished kill the process -- which is how
-                    // `membership_inbound` stopped a test binary with status 70
-                    // when the loop it feeds returned.
-                    // Cancelled, and *not* during shutdown -- the check above
-                    // returned already if it were. Only our own `abort` cancels
-                    // a handle, so this is a parent ending its children; ADR-184
-                    // enumerates every such call site. Logged rather than
-                    // passed over, because a stray `abort` on a supervised
-                    // handle would otherwise be a death in costume.
+                    // Cancelled: the inner handle, not this one. **No test
+                    // reaches this arm, and that is a fact about the code
+                    // rather than a gap in the tests** — nothing outside holds
+                    // the inner handle, and the only `abort` on it is in the
+                    // shutdown branch above, which returns immediately after
+                    // and so never observes the cancellation. An abort of the
+                    // supervisor cancels the supervisor, classification and
+                    // all.
+                    //
+                    // Kept because it is the arm that stops being unreachable
+                    // the moment anything hands the inner handle out, and
+                    // because the alternative — folding it in with `Ok(())` —
+                    // would make that change a silent exit 70. Logged, not
+                    // passed over: a cancellation arriving here means an
+                    // assumption in this comment has stopped holding.
                     Err(_) => {
                         info!(
                             task = name,
@@ -474,6 +477,46 @@ impl Retry {
         max_backoff: std::time::Duration,
     ) -> Self {
         Retry { task, backoff: first_backoff, max: max_backoff }
+    }
+
+    /// Run `step` until it succeeds or shutdown begins, retrying every error.
+    ///
+    /// **This exists because the rule is not testable at the call site.** With
+    /// the loop written out in `node.rs`, the whole workspace suite passed with
+    /// its `Err` arm returning instead of retrying — measured, not assumed — so
+    /// the one rule this type is for had no test anywhere. Here a fake worker
+    /// reaches it.
+    ///
+    /// The `AsyncFnMut` form really is not expressible: the worker's `run` takes
+    /// `&mut self`, so the returned future borrows it, and no generic bound on
+    /// stable proves that future `Send`. A higher-ranked bound over a boxed
+    /// future does, at one allocation per attempt — which is per *failure*, so
+    /// it costs nothing on the path that matters.
+    pub async fn forever<W, E>(
+        &mut self,
+        shutdown: &Shutdown,
+        worker: &mut W,
+        mut step: impl for<'a> FnMut(
+            &'a mut W,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<(), E>> + Send + 'a>,
+        >,
+    ) where
+        E: std::fmt::Display,
+    {
+        loop {
+            match step(worker).await {
+                // Success means the work finished, and this work should not:
+                // returning hands that judgement to `supervise`, which calls a
+                // return a death.
+                Ok(()) => return,
+                Err(e) => {
+                    if !self.after(e, shutdown).await {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// Count the failure, log it, and wait before the next attempt.
@@ -542,12 +585,9 @@ where
                     Err(e) if e.is_panic() => {
                         exit_because(name, Death::Panicked, &panic_detail(e))
                     }
-                    // Cancelled, and *not* during shutdown -- the check above
-                    // returned already if it were. Only our own `abort` cancels
-                    // a handle, so this is a parent ending its children; ADR-184
-                    // enumerates every such call site. Logged rather than
-                    // passed over, because a stray `abort` on a supervised
-                    // handle would otherwise be a death in costume.
+                    // Cancelled. Unreachable for the same reason as in
+                    // `supervise`, and kept for the same one: see the note
+                    // there.
                     Err(_) => {
                         info!(
                             task = name,

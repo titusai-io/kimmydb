@@ -18457,21 +18457,61 @@ Neither was a recorded decision. Both had the intent in a code comment and the o
 
 A task retrying a permanent error is alive, logs each attempt, and does no work — which supervision cannot distinguish from working, by design, because the rule is that a transient error never returns. **`kimmy_task_retries_total{task}`** (`kimmy.task.retries` on the OTLP bridge) is the writer's own account of it: every task has a sample from the first scrape, at 0. A rising count is the node recovering by itself; a count that keeps rising while the work does not progress is the case this series cannot resolve alone, and `operations.md` says to read it beside that task's progress age.
 
-The retry **policy** lives in `kimmy_task::Retry` — the counter, the log line, the backoff schedule — and the loop stays at the call site. A higher-order version taking the work as an async closure was written first and rejected on a compiler fact: the embedding worker's `run` takes `&mut self`, so the closure's future borrows it, and proving that future `Send` through a generic bound is not expressible on stable. Because the rule is then enforced at the call site rather than by the helper, a mutation row holds it.
+The retry **policy and the loop** both live in `kimmy_task::Retry` — the counter, the log line, the backoff schedule, and `forever`, which runs the work until it succeeds or shutdown begins.
+
+The loop was at the call site first, on the grounds that a two-line loop cost less than the abstraction. **That was wrong, and the mutation is what showed it: the whole workspace suite passed with the embedding worker's `Err` arm returning instead of retrying.** The one rule this type exists for — a transient error never returns — was documented, reviewed, and guarded by nothing, because the only place it was expressed was a call site no test reaches. `a_failing_worker_is_retried_rather_than_abandoned` reaches `forever` with a fake worker whose every attempt fails, and goes red on that mutation naming the count it got: one attempt.
+
+The `AsyncFnMut` form really is not expressible, and that part of the original reasoning holds: the worker's `run` takes `&mut self`, so the returned future borrows it, and no generic bound on stable proves that future `Send`. A **higher-ranked bound over a boxed future** does — `impl for<'a> FnMut(&'a mut W) -> Pin<Box<dyn Future<…> + Send + 'a>>` — at one allocation per attempt, which is per *failure* and so costs nothing on the path that matters. The first write-up of this decision said the higher-order version was impossible rather than that one spelling of it was; the difference mattered, because it was the sentence that justified leaving the rule untestable.
 
 ### Tests, and how they break
 
-| Taken out | Fails |
+Each row was broken **alone**, on the tree this record ships with, and the red
+test names below are the runner's. Two rows are not reds and say so: a table
+where every line fires is a table written from intentions.
+
+| Taken out | What fails |
 |---|---|
-| the exit in the death path | both end-to-end death tests, and the two subprocess exit tests |
-| the second shutdown check after `select!` | the graceful-shutdown control |
-| announcing shutdown before the aborts | the same control |
-| `send_replace` in `begin`, back to `send` | the retry control, which then asks to be retried after shutdown has begun |
-| the judged receiver's `Expected` flipped to `Unexpected` | the membership tests, which stop the binary with status 70 |
-| the judged receiver's `Unexpected` flipped to `Expected` | the judged-death subprocess test |
-| treating a cancellation as a death again | the membership tests |
-| the embedding worker's loop returning `Err` instead of retrying | the retry control |
-| the panic message taken from `JoinError` | the panic test's assertion on the marker's cause |
-| the stderr line on the no-reporter path | the no-reporter test, which then sees status 70 and no explanation |
-| the spawn lint | its own control, an unsupervised spawn in a production file |
-| the name-list lint | its own two controls, a renamed task and a spurious entry |
+| the exit on the no-reporter path, `70` → `0` | `a_panicking_task_exits_70_with_no_reporter_installed`, `a_task_that_judges_its_own_return_unexpected_exits_70` |
+| the reporter's exit in `kimmyd`, which is the path a real node takes | `a_panicking_background_task_exits_the_process`, `a_background_task_that_returns_exits_the_process` |
+| the second shutdown check, in all three supervisors | `a_task_that_ends_by_itself_during_shutdown_does_not_exit` |
+| `send_replace` in `begin`, back to `send` | `a_transient_failure_is_retried_in_place_and_counted`, `the_same_task_ending_with_no_shutdown_announced_does_exit` |
+| the membership receiver's `Expected`, flipped to `Unexpected` | the `kimmy-cluster` membership binary stops mid-run with status 70 |
+| the classifier's `Unexpected`, treated as an expected ending | `a_task_that_judges_its_own_return_unexpected_exits_70` |
+| the panic's message, discarded instead of read off the `JoinError` | `a_panicking_task_exits_70_with_no_reporter_installed` |
+| the stderr line on the no-reporter path | three of the eight `exits` tests, which then see status 70 and no explanation |
+| `Retry::forever`'s `Err` arm, returning instead of retrying | `a_failing_worker_is_retried_rather_than_abandoned` — "1 attempts" |
+| an unsupervised `tokio::spawn` in a production file | `every_long_lived_task_is_spawned_through_the_supervisor` |
+| a supervised name absent from `TASKS` | `every_supervised_name_is_in_the_task_list_and_every_entry_is_used` |
+| **both `shutdown.begin()` calls in the node** | **nothing** — below |
+| **treating a cancellation as a death again** | **nothing** — below |
+
+**The node's own announcement is not covered end to end, and the reason is worth
+stating rather than papering over.** Removing both `shutdown.begin()` calls
+leaves every drain test green. That is not a missing test: the drain aborts each
+supervised handle, and aborting a supervisor cancels the supervisor — its
+classification with it — so nothing is left to misread the ending. The
+announcement is what keeps that true for a task that ends *by itself* during a
+drain, which the unit control covers, and what stops `Retry` retrying through
+one.
+
+**The cancellation arm is unreachable by construction, not by omission.**
+Nothing outside holds the inner handle, and the only `abort` on it is in the
+shutdown branch, which returns before it could observe the cancellation. It is
+kept because it stops being unreachable the moment anything hands that handle
+out, and because folding it in with `Ok(())` would make such a change a silent
+exit 70. Its comment says so, in place of the history it used to claim.
+
+**Three of these tests could not see their own claims when first written**, which
+is the more useful half of the exercise:
+
+- The shutdown control let its task end on a 20ms sleep, so the supervisor's
+  `select!` took the shutdown branch every time — that branch returns before
+  classifying anything — and the test stayed green with all three checks
+  blinded. It ends on a yield now, and repeats thirty times, because `select!`
+  chooses among ready branches at random and one round is a 50% test.
+- The panic-message assertion checked that stderr *contained* the message.
+  Rust's own panic hook prints it there, so it passed with the payload thrown
+  away. It reads the report's whole sentence instead.
+- `a_task_stopped_for_shutdown_does_not_exit` was written as the control for the
+  announcement and is not one, for the reason above. Its comment now says which
+  test is.
