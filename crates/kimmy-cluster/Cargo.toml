@@ -10,6 +10,7 @@ description = "Leaderless gossip membership and oplog anti-entropy for KimmyDB"
 
 [dependencies]
 kimmy-core.workspace = true
+kimmy-task.workspace = true
 kimmy-storage.workspace = true
 serde.workspace = true
 thiserror.workspace = true

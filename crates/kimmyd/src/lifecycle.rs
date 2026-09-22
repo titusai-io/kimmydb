@@ -3,11 +3,15 @@
 //!
 //! # Every exit is named in the log
 //!
-//! A node has two ways out of `node::run`: a signal, which logs `shutdown
-//! signal received, draining` and then `shutdown complete`, and an error,
-//! which now logs on the way out too. Nothing in this process exits any other
-//! way — there is no `process::exit`, no abort hook, and no `panic = "abort"`
-//! — with one exception: a panic that unwinds out of `main` exits 101 with
+//! A node has three ways out of `node::run`: a signal, which logs `shutdown
+//! signal received, draining` and then `shutdown complete`; an error, which
+//! logs on the way out too; and **a supervised background task dying, which
+//! writes a `task_died` marker and calls `process::exit(70)`**
+//! ([ADR-184](../../../docs/decisions.md)) — that one is named here because
+//! this module used to say there was no `process::exit` at all, which stopped
+//! being true when supervision arrived. There is still no abort hook and no
+//! `panic = "abort"`, and one further exception: a panic that unwinds out of
+//! `main` exits 101 with
 //! its message on stderr and writes no marker, so the next start reports it
 //! as unclean, which is the truth. Otherwise a log that ends without one of
 //! those lines and resumes at the startup banner is a process that was ended
@@ -48,14 +52,20 @@ pub enum Exit {
     Error,
     /// `kimmyd restore` wrote the database; there was no run.
     Restore,
+    /// A supervised background task ended when it should not have, so the
+    /// process stopped itself to be restarted (ADR-184). `task` and `cause` on
+    /// the marker name which one and how.
+    #[serde(rename = "task_died")]
+    TaskDied,
 }
 
 impl Exit {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Exit::Shutdown => "shutdown",
             Exit::Error => "error",
             Exit::Restore => "restore",
+            Exit::TaskDied => "task_died",
         }
     }
 }
@@ -76,6 +86,15 @@ pub struct LastExit {
     /// Milliseconds since the Unix epoch, the stamp every other record in
     /// the data directory uses.
     pub at_ms: u64,
+    /// Which supervised task died, for [`Exit::TaskDied`]. Optional on the
+    /// wire and defaulted on read, so a marker written by a build without it
+    /// still parses and an older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// How it died — `panicked` or `returned` — and, after a colon, the panic
+    /// message or the error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 impl LastExit {
@@ -89,6 +108,8 @@ impl LastExit {
             version: kimmy_core::build::VERSION.to_string(),
             commit: kimmy_core::build::COMMIT.to_string(),
             at_ms,
+            task: None,
+            cause: None,
         }
     }
 }
@@ -101,12 +122,29 @@ impl LastExit {
 /// does not exist, which is a run that failed before it could create it and
 /// has already logged why.
 pub fn record_exit(data_dir: &Path, exit: Exit) {
+    write_marker(data_dir, LastExit::now(exit), exit);
+}
+
+/// Record that a supervised background task died, naming it and how (ADR-184).
+///
+/// Separate from [`record_exit`] because this is the one exit whose marker
+/// carries more than the kind: the next start's `announce` names the task, and
+/// that line is the only place an operator reliably reads why the process
+/// restarted itself.
+pub fn record_task_death(data_dir: &Path, task: &str, cause: &str) {
+    let mut last = LastExit::now(Exit::TaskDied);
+    last.task = Some(task.to_string());
+    last.cause = Some(cause.to_string());
+    write_marker(data_dir, last, Exit::TaskDied);
+}
+
+fn write_marker(data_dir: &Path, last: LastExit, exit: Exit) {
     if !data_dir.is_dir() {
         debug!(data_dir = %data_dir.display(), "no data directory to record the exit in");
         return;
     }
     let path = data_dir.join(LAST_EXIT_FILE);
-    let body = match toml::to_string(&LastExit::now(exit)) {
+    let body = match toml::to_string(&last) {
         Ok(body) => body,
         Err(e) => {
             warn!(error = %e, "could not encode the exit marker");
@@ -194,6 +232,20 @@ pub fn announce(data_dir: &Path, previous: &PreviousRun) {
         PreviousRun::FirstStart => {
             debug!(data_dir = %data_dir.display(), "first start in this data directory");
         }
+        // A task death is reported at warning and names the task, because it
+        // is the one clean-marker case that is not a clean exit: the previous
+        // run stopped itself to be restarted, and this line is where an
+        // operator finds out why (ADR-184).
+        PreviousRun::Ended(last) if last.exit == Exit::TaskDied => warn!(
+            exit = last.exit.name(),
+            task = last.task.as_deref().unwrap_or("unknown"),
+            cause = last.cause.as_deref().unwrap_or("unknown"),
+            previous_pid = last.pid,
+            previous_version = %last.version,
+            previous_commit = %last.commit,
+            ended_at_ms = last.at_ms,
+            "the previous run stopped itself because a background task ended"
+        ),
         PreviousRun::Ended(last) => info!(
             exit = last.exit.name(),
             previous_pid = last.pid,

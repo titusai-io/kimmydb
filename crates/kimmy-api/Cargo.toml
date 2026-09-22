@@ -10,6 +10,7 @@ description = "HTTP and WebSocket API surface for KimmyDB"
 
 [dependencies]
 kimmy-core.workspace = true
+kimmy-task.workspace = true
 kimmy-storage.workspace = true
 kimmy-query.workspace = true
 kimmy-auth.workspace = true

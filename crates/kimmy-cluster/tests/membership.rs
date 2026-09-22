@@ -42,6 +42,9 @@ async fn node_with_secret(secret: &str) -> Node {
         secret.to_string(),
         members.clone(),
         feed,
+        // These tests watch membership converge; nothing here shuts down, so
+        // the announcement is never made and a task ending would be a death.
+        kimmy_task::Shutdown::new(),
     ));
     Node { addr, node_id, members, announce, handle }
 }

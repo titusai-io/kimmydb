@@ -112,6 +112,7 @@ exceptions = [
     { crate = "kimmy-api", allow = ["AGPL-3.0-only"] },
     { crate = "kimmyd", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-cli", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-task", allow = ["AGPL-3.0-only"] },
     # A workspace member that ships in nothing: the fuzz harness bodies, built
     # by the PR gate and by `cargo fuzz`. Listed for the same reason as the
     # rest — it carries the workspace license, and this list is by name.
