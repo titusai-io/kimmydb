@@ -305,7 +305,12 @@ kind: Service
 metadata:
   name: kimmy-headless
 spec:
-  clusterIP: None          # headless: resolves to every ready pod IP
+  clusterIP: None          # headless: one A record per pod
+  # Ready or not. Peers find each other through this Service, so if it
+  # published only ready pods, readiness could never wait on anything a peer
+  # provides without deadlocking a whole-cluster cold start: no pod ready, so
+  # none discoverable, so none ever ready.
+  publishNotReadyAddresses: true
   selector: { app: kimmy }
   ports:
     - { name: http,   port: 7878 }
@@ -350,6 +355,23 @@ spec:
               valueFrom: { secretKeyRef: { name: kimmy, key: root-password } }
             - name: KIMMY_CLUSTER_SECRET
               valueFrom: { secretKeyRef: { name: kimmy, key: cluster-secret } }
+          # Nothing listens until the database is open, and liveness does not
+          # run until this succeeds. An open walks the retained oplog, about
+          # 46 s per 10 million entries (the writes of
+          # storage.oplog_retention_secs, 24 h by default); the first start
+          # after an upgrade that rebuilds partial indexes adds 8 us per
+          # document per partial index, the figure the node's own estimate
+          # uses. Allow at least twice your expected open as
+          # periodSeconds x failureThreshold, and leave margin: the cost per
+          # document grows with the store, so the estimate is a bound, not a
+          # rate -- measured up to 10 million documents per index and
+          # extrapolated above that, which is where you most need the margin. These values are for 10 million retained entries and one
+          # partial index over 10 million documents: 46 s + 80 s = 126 s, so
+          # twice is 252 s and 300 s is set here. Compute yours.
+          startupProbe:
+            httpGet: { path: /healthz, port: 7878 }
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet: { path: /healthz, port: 7878 }
           readinessProbe:
@@ -368,8 +390,17 @@ spec:
 > which is what makes the misconfiguration look healthy. The downward-API
 > snippet above is the fix.
 
-A headless Service resolving to every ready pod IP is exactly the seed set a
-SWIM member needs, which is why `k8s:` discovery is a one-liner.
+A headless Service resolving to every pod IP is exactly the seed set a SWIM
+member needs, which is why `k8s:` discovery is a one-liner. It resolves every
+pod, not only the ready ones, because of `publishNotReadyAddresses: true`: a
+Service that published only ready pods would make readiness a precondition of
+being found, and a cluster starting from cold would have no pod ready to find.
+
+**Without the `startupProbe`, a node whose open outlasts the liveness probe
+never starts.** Kubernetes' defaults restart a container after about 30
+seconds of failed liveness checks, and nothing listens until the open
+completes, so an open longer than that is killed and begun again for ever.
+The comment beside the probe gives the arithmetic for your own numbers.
 
 ### Discovery formats
 
@@ -600,7 +631,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_backup_duration_seconds` | Histogram of how long each backup took to produce: the walk of the whole store and its spill to disk, before any of it was sent. Buckets run from 1 s to 3,600 s. It follows the store's size and whether the database file is in page cache, so a backup several times slower than the last one on the same store is usually a cold cache rather than a fault. Its count is `kimmy_backups_total`; on the OTLP bridge its sum is `kimmy.backup.duration_seconds` ([ADR-170](decisions.md)) |
 | `kimmy_ttl_expired_total` | Documents deleted by a TTL index |
 | `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
-| `kimmy_ttl_skipped_filter_total` | Expiry candidates a TTL index held that its partial filter, read as `find` reads it, did not select when the delete re-read the document — so they were **not** deleted ([ADR-181](decisions.md)). Two causes: a document moved out of the filter while the pass ran, and a document the index held that the filter never selected. The second is a defect in partial-index membership, which compares across type brackets: `{size: {$gt: 5}}` holds strings, documents and booleans. Expiry used to delete them. **Should fall to near zero** once partial-index membership agrees with the filter; until then, its rate is the rate at which expiry was deleting documents it should not have. Kept apart from `kimmy_ttl_skipped_total` so that fall can be seen |
+| `kimmy_ttl_skipped_filter_total` | Expiry candidates a TTL index held that its partial filter, read as `find` reads it, did not select when the delete re-read the document — so they were **not** deleted ([ADR-181](decisions.md)). Two causes: a document moved out of the filter while the pass ran, and a document the index held that the filter never selected. The second was a defect in partial-index membership, which compared across type brackets, so `{size: {$gt: 5}}` held strings, documents and booleans and expiry deleted them. That is fixed, and every partial index was rebuilt on the first start of the release carrying [ADR-183](decisions.md), so **on a migrated database only the first cause is left and this should read near zero**. A rate above that on such a database is a genuine race, not the old defect; a rate that stays high is worth reporting. Kept apart from `kimmy_ttl_skipped_total` so that fall can be seen |
 | `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, more than 1,000 keys for one document, a `Decimal128` at an indexed path — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)) |
 | `kimmy_webhook_deliveries_total{outcome}` | Webhook delivery attempts, `delivered` or `failed` |
 | `kimmy_webhook_events_total` | Change events pushed to endpoints |
@@ -1662,19 +1693,28 @@ Refusing on a *newer* schema is the right failure: a build cannot know a layout
 that did not exist when it was written, and guessing corrupts further. Migrating
 an *older* one is equally right — a user with data has no other route forward.
 
-Current schema is **3**. Migrations run in sequence, so an older database steps
+Current schema is **4**. Migrations run in sequence, so an older database steps
 through each one rather than needing its own path to the latest.
 
 | Step | What it does |
 |---|---|
 | 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
 | 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
+| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns ([ADR-183](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule |
 
-Both are idempotent and run before the node serves anything.
+All three are idempotent and run before the node serves anything.
 
 > **Back up the data directory before a version-crossing upgrade.** The
 > migration is transactional per step, but a rollback to the older build is not
-> possible once it has run — the older build will refuse the newer schema.
+> possible once it has run — the older build will refuse the newer schema. **An
+> upgrade interrupted part-way cannot be rolled back either**, and deliberately
+> so: from schema 4 the version is written with the first index rebuilt, so a
+> directory holding a mixture of rebuilt and not-yet-rebuilt partial indexes is
+> refused rather than opened by a build that would maintain the rest under the
+> old rule and leave entries no query can find. To roll a single member back,
+> wipe its data directory and let it catch up from its peers, keeping clients
+> off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
+> back, restore the backup.
 
 ### Rebuild vector indexes after upgrading past 2026-08-15
 

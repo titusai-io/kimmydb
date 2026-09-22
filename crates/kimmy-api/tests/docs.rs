@@ -865,6 +865,70 @@ fn documentation_tests_live_in_this_crate() {
     );
 }
 
+/// The documented Kubernetes manifest allows more than twice the open its own
+/// example describes, computed from the code's rate rather than from a second
+/// copy of it.
+///
+/// The startup probe exists so that a first start which rebuilds partial
+/// indexes is not killed part-way (ADR-183). It is therefore the one figure in
+/// the guide that must not drift from the code: when the constant said 8 µs and
+/// the guide said 7, the manifest's own example needed 252 s against the 240 s
+/// it allowed, so following the guide exactly would have killed the node during
+/// the migration the manifest exists to allow for -- the failure it is there to
+/// prevent, written into it.
+#[test]
+fn the_documented_startup_probe_allows_the_open_it_describes() {
+    // Scoped to the startup probe's own block, which ends where the next probe
+    // begins. Searching from `startupProbe:` to the end of the file would read
+    // the liveness or readiness probe's fields if the startup probe ever lost
+    // one, and silently grade the wrong numbers.
+    let at = OPERATIONS.find("startupProbe:").expect("the manifest has a startup probe");
+    let after = &OPERATIONS[at..];
+    let block = &after[..after.find("livenessProbe:").unwrap_or(after.len())];
+    assert!(block.contains("failureThreshold:"), "the startup probe's block was not found");
+    let field = |name: &str| -> u64 {
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("the startup probe sets {name}"));
+        line.split(':').nth(1).expect("a value").trim().parse().expect("a number")
+    };
+    let budget = field("periodSeconds") * field("failureThreshold");
+
+    // The example the manifest's own comment describes: ten million retained
+    // oplog entries, and one partial index over ten million documents. Both
+    // figures are hardcoded here, deliberately: the 46 s oplog walk is a
+    // measurement that lives only in prose, and the example's size is the
+    // comment's own choice. Only the per-document rate is taken from the code,
+    // because that is the one the code can change under the guide.
+    const EXAMPLE_DOCUMENTS: u64 = 10_000_000;
+    const EXAMPLE_OPLOG_SECS: u64 = 46;
+    let rebuild = EXAMPLE_DOCUMENTS * kimmy_storage::migrate::MICROS_PER_DOCUMENT / 1_000_000;
+    let open = EXAMPLE_OPLOG_SECS + rebuild;
+
+    assert!(
+        budget >= 2 * open,
+        "the manifest allows {budget} s, and its own example needs {open} s ({EXAMPLE_OPLOG_SECS} \
+         s of oplog walk plus {rebuild} s of rebuild at {} µs per document), so the guide's rule \
+         of at least twice the expected open needs {} s. Following the guide would kill the node \
+         part-way through the migration the probe exists for.",
+        kimmy_storage::migrate::MICROS_PER_DOCUMENT,
+        2 * open
+    );
+
+    // And the comment quotes the code's figure, so the prose cannot drift back.
+    // As a whole token: a bare `contains` would accept "18 us per" as a match
+    // for 8, which is the direction that hides a drift rather than reporting it.
+    let quoted = format!("{} us per", kimmy_storage::migrate::MICROS_PER_DOCUMENT);
+    let quoted_as_a_token = OPERATIONS.match_indices(&quoted).any(|(i, _)| {
+        i == 0 || !OPERATIONS[..i].chars().next_back().is_some_and(|c| c.is_ascii_digit())
+    });
+    assert!(
+        quoted_as_a_token,
+        "the manifest's comment does not quote the code's {quoted:?} as its own number"
+    );
+}
+
 /// Every Markdown file under the repository root, relative to it, outside
 /// build output and hidden directories.
 fn markdown_files() -> (std::path::PathBuf, Vec<std::path::PathBuf>) {

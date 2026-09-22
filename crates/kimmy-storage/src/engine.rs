@@ -741,7 +741,7 @@ impl Engine {
 
         // Before anything reads a collection id: schema 1 allocated them from a
         // counter, schema 2 derives them from the name.
-        crate::migrate::run(&db)?;
+        let unreported = crate::migrate::run(&db)?;
 
         // The arrival index is derived from the oplog, so a database written
         // before it existed — or by a build that did not maintain it — is
@@ -856,6 +856,19 @@ impl Engine {
         // this process, which is the ordering it needs — see its own
         // documentation.
         engine.resume_interrupted_drops()?;
+
+        // The collisions a migration's rebuild of a unique partial index found
+        // (ADR-183), reported as a replicated build's are, now that there is
+        // an engine to count them and log their entries.
+        for (meta, violations) in &unreported {
+            engine.report_index_backfill_violations(meta, violations)?;
+        }
+        // Only now, and only if every one of them was reported: they are held in
+        // the store precisely so that a crash before this point does not lose
+        // them, so deleting them any earlier would defeat that.
+        if !unreported.is_empty() {
+            crate::migrate::forget_reported_violations(engine.db())?;
+        }
 
         Ok(engine)
     }

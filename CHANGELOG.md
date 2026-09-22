@@ -12,6 +12,57 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+**Upgrading rebuilds every partial index at startup, and a downgrade is
+refused.** This release moves the storage schema to 4
+([ADR-183](docs/decisions.md)).
+- **Before upgrading on Kubernetes, give the first start time to finish.**
+  Nothing listens until the open completes, so under the manifest in
+  [operations.md](docs/operations.md), whose liveness probe allows about 30
+  seconds, a longer open is killed and started again. The rebuild resumes
+  from the last finished index, so an index that takes longer than the probe
+  allows never finishes: the node restarts for ever while looking as if it is
+  progressing. Add a `startupProbe`, or raise the liveness allowance, to at
+  least twice the expected open: about 46 seconds per 10 million entries in
+  the retained oplog (the writes of `storage.oplog_retention_secs`, 24 hours
+  by default), plus 8 µs per document per partial index. For example, 10
+  million retained entries and one partial index over 10 million documents is
+  46 s + 80 s = about 2 minutes, so twice is 252 s: allow 5, with
+  `failureThreshold: 30`.
+- **Startup.** The first start rebuilds each partial index before the node
+  serves anything, logging the whole job up front: indexes, documents, an
+  estimate, and the free space the largest needs. Measured on the development
+  machine, a partial index over 10 million documents added about 73 seconds
+  to that start (7.3 µs per document per partial index measured there; the
+  estimate the node prints uses 8, and the cost per document grows with the
+  store, so treat it as a bound rather than a rate. It is measured up to ten
+  million documents per index and extrapolated above that, which is where a
+  probe budget most needs the headroom).
+- **The upgrade refuses if this build cannot read a stored partial filter.** It
+  names every such index — database, collection, index and the reason — and
+  changes nothing: the on-disk version is left as it was and no index entries
+  are cleared. Below schema 4 the previous build still opens the directory, so
+  the index can be dropped there; if the refusal happens while resuming an
+  interrupted migration the version is already 4, which neither build will open,
+  and the message says so. This can only happen for a filter an
+  earlier build accepted and this one does not, such as one holding a
+  `Decimal128`. To proceed, start the directory with the previous build, drop
+  each index named, recreating it with a filter this build accepts, then upgrade
+  again. In a cluster one drop on any member replicates to all.
+- **Disk.** Have free space of at least the largest partial index's size
+  (about 80 bytes per entry) plus about 2 GiB.
+- **Downgrade.** An older build refuses a schema 4 database rather than open
+  it and corrupt its partial indexes.
+  - To roll back **one member**, wipe its data directory, start the older
+    build, and **keep clients off it until it has caught up from its peers**.
+    Until then it answers reads from a store that starts empty, so a document
+    it has not pulled yet reads as not found rather than as an error, and
+    nothing reports that it is behind: `/readyz` does not, and
+    `kimmy_replication_lag_seconds` reads 0 from a fresh start. So it is
+    returned to service by hand, once its document counts match a member
+    that stayed up.
+  - To roll back **the whole cluster**, restore a backup taken before the
+    upgrade.
+
 ### Added
 
 - **`kimmy_ttl_skipped_filter_total`** (`kimmy.ttl.skipped_filter` on the OTLP
@@ -30,6 +81,31 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A partial index now holds exactly what `find` with its filter returns,
+  and is used only for a query whose every match it holds — with one exception,
+  a document value that is a `Decimal128`**
+  ([ADR-183](docs/decisions.md)). Membership had its own rule, which differed
+  from `find` in three ways:
+  - it never matched a whole array, so `{k: [1, 2]}` did not hold a document
+    whose `k` is `[1, 2]`;
+  - it did not count an empty array as present;
+  - it compared across types, so `{size: {$gt: 5}}` held strings, documents
+    and booleans.
+
+  And the planner judged a query contained by reasoning across types too. A
+  query answered from a partial index could therefore miss documents a
+  collection scan returns: 18 such cases were found. A unique partial index
+  was enforced on the wrong documents. Existing partial indexes are rebuilt
+  at startup (above), and duplicates the rebuild finds in a unique one are
+  reported as a replicated build's are, not refused.
+
+  **The exception, which is not new and is not fixed here:** a document whose
+  indexed value is a `Decimal128` can still be missed. The canonical order ranks
+  a `Decimal128` equal to every number — the documented contract — which makes
+  equality non-transitive, and the containment check assumes it is transitive.
+  The same is true of the previous release. It is recorded as its own finding,
+  because closing it means giving up index use for some queries under a contract
+  that has not been reopened.
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
   in a `partialFilterExpression` as an `Int32`, and a generic `Binary` as an
