@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.34.0 - 2026-09-22
 
 **Upgrading rebuilds every partial index at startup, and a downgrade is
 refused.** This release moves the storage schema to 4
@@ -112,6 +112,24 @@ refused.** This release moves the storage schema to 4
   no action; a count that **keeps** rising while that task's work does not
   progress is a task retrying something permanent — alive, and doing nothing. A
   scrape config or a golden list that enumerates series needs the new name.
+
+### Changed
+
+- **A node now refuses to start when a configured duty cannot start**: a
+  webhook delivery client that will not build, replication TLS that will not
+  start, or the HTTP client that re-fetches the OIDC provider's JWKS — each
+  used to log once and serve without that duty, so a node that stops starting
+  after this upgrade is reporting a condition that was already true (why, under
+  Fixed, with [ADR-184](docs/decisions.md)).
+- **A background task that dies now stops the process**, with **status 70** and
+  the dead task named at `WARN` on the next start, where the process used to
+  run on without it; restart it the way you already restart a node, which
+  compose and Kubernetes both do on any non-zero exit (same entry under Fixed).
+- **Two partial filters that differ only in a nested key order, or in `0.0`
+  against `-0.0`, are now two index definitions**, so re-creating an index with
+  one where the other stands answers `409` rather than succeeding and keeping
+  the filter already there (why, under Fixed, with
+  [ADR-182](docs/decisions.md)).
 
 ### Fixed
 
@@ -222,7 +240,7 @@ refused.** This release moves the storage schema to 4
   **It costs index size**, and the listing's `undecidable` figure and the new
   counter, both [above](#added), say how much. This was pre-existing — 0.33.0
   and earlier behave the same way — and is fixed by the same schema 3 → 4
-  rebuild [above](#unreleased), with no separate migration.
+  rebuild [above](#0340---2026-09-22), with no separate migration.
 - **`count`, a sorted `find` and a write's `explain` no longer see a document
   an index cannot key twice.** A query range with an open low end — `$lt` or
   `$lte` on an ascending field, `$gt` or `$gte` on a descending one — walked

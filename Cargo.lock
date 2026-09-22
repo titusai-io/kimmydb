@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-api"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-auth"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-cli"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-client"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "axum",
  "bson",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-cluster"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "bson",
  "foca",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-core"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "base64 0.23.1",
  "bson",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-egress"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "reqwest 0.12.28",
  "tokio",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-fuzz-harness"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "arbitrary",
  "base64 0.23.1",
@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-mcp"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "axum",
  "bson",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-query"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "bson",
  "kimmy-core",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-storage"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "bson",
  "criterion",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-task"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-vector"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "async-trait",
  "bson",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "kimmyd"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyhow",
  "axum",
