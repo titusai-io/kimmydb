@@ -124,6 +124,69 @@ if [ -z "$names" ]; then
   echo "found no crate under the workspace license; the derivation is broken" >&2
   exit 1
 fi
+# ---------------------------------------------------------------------------
+# deny.toml's `exceptions` is the same literal list beside the same derivation.
+#
+# `cargo deny` permits the workspace licence per crate, **by name**, and a new
+# AGPL crate that is not on that list fails the licence check. That is exactly
+# the drift this script was rewritten to remove, living in a second file: a new
+# crate was added, the list was not, and `cargo deny` went red on every head of
+# the branch that added it while the pull request still showed mergeable,
+# because it is not a required check.
+#
+# So the two sets must be equal, and a difference in either direction is named.
+# An extra exception matters as much as a missing one: it permits the AGPL for a
+# crate that no longer takes it, which is the list quietly outliving its reason.
+exceptions=$(
+  awk '
+    /^exceptions[[:space:]]*=[[:space:]]*\[/ { inside = 1; next }
+    inside && /^\]/ { inside = 0 }
+    inside {
+      if ($0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) next
+      # `{ crate = "x", allow = [...] }`, and the quote must follow `crate =`.
+      # Taking the *first* quoted string on the line was wrong: with the name
+      # unquoted, that is the licence, so the set gained "AGPL-3.0-only" and the
+      # comparison failed naming a crate nobody had written.
+      if (match($0, /crate[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+        field = substr($0, RSTART, RLENGTH)
+        sub(/^crate[[:space:]]*=[[:space:]]*"/, "", field)
+        sub(/"$/, "", field)
+        print field
+        next
+      }
+      # A line inside the block that parses as nothing would make this set
+      # quietly short, which is the failure being removed.
+      print "cannot parse this deny.toml exceptions line, so a crate could be missed:" > "/dev/stderr"
+      print "  " $0 > "/dev/stderr"
+      bad = 1
+    }
+    END { if (bad) exit 1 }
+  ' deny.toml | sort -u
+) || exit 1
+
+if [ -z "$exceptions" ]; then
+  echo "found no [licenses] exceptions in deny.toml; this comparison would be vacuous" >&2
+  exit 1
+fi
+
+missing=$(comm -23 <(printf '%s\n' "$names") <(printf '%s\n' "$exceptions"))
+stale=$(comm -13 <(printf '%s\n' "$names") <(printf '%s\n' "$exceptions"))
+if [ -n "$missing" ] || [ -n "$stale" ]; then
+  echo "deny.toml's [licenses] exceptions and the crates taking the workspace licence disagree." >&2
+  [ -n "$missing" ] && {
+    echo "  takes the workspace licence and has no exception, so cargo deny will fail:" >&2
+    printf '    %s\n' $missing >&2
+  }
+  [ -n "$stale" ] && {
+    echo "  has an exception and does not take the workspace licence, so the entry outlived its \
+reason:" >&2
+    printf '    %s\n' $stale >&2
+  }
+  exit 1
+fi
+echo "deny.toml's exceptions match the $(printf '%s' "$names" | grep -c .) crates under the \
+workspace licence"
+
 AGPL="^($(printf '%s' "$names" | tr '\n' '|' | sed 's/|$//')) "
 
 found=$(
