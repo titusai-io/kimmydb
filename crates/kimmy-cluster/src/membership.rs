@@ -261,6 +261,7 @@ pub async fn run(
     secret: String,
     members: Members,
     seeds: SeedFeed,
+    shutdown: kimmy_task::Shutdown,
 ) {
     let identity = Member::identified(local, node);
     let config =
@@ -273,8 +274,11 @@ pub async fn run(
     let socket = Arc::new(socket);
     let (tx, mut rx) = mpsc::channel::<Input>(1024);
 
-    // Inbound datagrams.
-    tokio::spawn({
+    // Inbound datagrams. Supervised in its own right, because supervising
+    // `run` does not cover it: if this task dies, `run` goes on looping and
+    // foca simply stops hearing anything, so the member set freezes exactly as
+    // if membership had died (ADR-184).
+    let inbound = kimmy_task::supervise_judged("membership_inbound", shutdown.clone(), {
         let socket = Arc::clone(&socket);
         let tx = tx.clone();
         let secret = secret.clone();
@@ -305,20 +309,37 @@ pub async fn run(
                             continue;
                         };
                         if tx.send(Input::Data(payload.to_vec())).await.is_err() {
-                            return;
+                            // The loop this feeds has gone, so there is nothing
+                            // left to receive for. Ordinary, and not a death:
+                            // it happens whenever `run` ends or is stopped.
+                            return kimmy_task::Ended::Expected(
+                                "the membership loop it feeds has gone",
+                            );
                         }
                     }
                     Err(e) => {
+                        // The socket is the only way membership hears anything,
+                        // so this is a death: without it foca stops receiving
+                        // and the member set freezes at whatever it last knew,
+                        // while `run` goes on looping (ADR-184).
                         warn!(error = %e, "membership socket read failed");
-                        return;
+                        return kimmy_task::Ended::Unexpected(
+                            "the membership socket could not be read",
+                        );
                     }
                 }
             }
         }
     });
 
-    // Discovered addresses to announce ourselves to.
-    tokio::spawn({
+    // Discovered addresses to announce ourselves to. **One-shot, not endless**:
+    // it drains the seed feed and ends, and it also ends when the receiver is
+    // gone. Both are expected, so a return here must not read as a death --
+    // which is not how it was first written, and the membership tests found it
+    // within seconds by stopping the test binary with an exit code. A panic is
+    // still fatal: an announcement lost to one is a node that never introduces
+    // itself to a seed.
+    let announcing = kimmy_task::supervise_oneshot("membership_announce", shutdown.clone(), {
         let tx = tx.clone();
         async move {
             let mut seeds = seeds;
@@ -361,13 +382,23 @@ pub async fn run(
             let tx = tx.clone();
             // Every submitted timer MUST be delivered — foca tolerates delay
             // but not loss — so this is a task per timer rather than a wheel we
-            // could get wrong.
-            tokio::spawn(async move {
+            // could get wrong. And because a *lost* timer is what foca cannot
+            // tolerate, this is the one-shot shape: ending is the normal case
+            // and must not read as a death, while a panic is fatal, since a
+            // timer that unwinds freezes membership as surely as a dead
+            // receiver would (ADR-184).
+            kimmy_task::supervise_oneshot("membership_timer", shutdown.clone(), async move {
                 tokio::time::sleep(after).await;
                 let _ = tx.send(Input::Timer(event)).await;
             });
         }
     }
+
+    // The loop is over, so the children feed nothing. Ended deliberately rather
+    // than left to notice: a child that outlives this loop returns when its
+    // channel closes, and a return nobody asked for is a death.
+    inbound.abort();
+    announcing.abort();
 }
 
 /// A stream of addresses to introduce ourselves to.

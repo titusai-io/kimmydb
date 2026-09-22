@@ -123,34 +123,43 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// one that arrived by pull.
 pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 
-/// Serve peer requests until the listener fails.
+/// Serve peer requests until the listener fails, building the TLS here.
+///
+/// For callers with no startup to fail — the tests, and the in-crate helpers.
+/// The daemon uses [`serve_with`] and builds the TLS before it commits to
+/// serving, so a failure there is a startup error rather than a task that
+/// returns (ADR-184).
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
-    serve_with(engine, listener, secret, None).await
+    let tls = Arc::new(
+        crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"),
+    );
+    serve_with(engine, listener, secret, None, tls).await
 }
 
 /// [`serve`], reporting each pushed batch's outcome to `on_pushed`.
+/// Serve replication, over TLS the caller has already built.
+///
+/// The TLS comes in rather than being built here, because building it can fail
+/// and a failure is fatal: falling back to plaintext would mean an operator who
+/// configured a cluster expecting encrypted replication silently got none
+/// (ADR-040 says the encryption is always on, with no switch). This used to
+/// build it and `return` on failure, which made "fatal" fatal to *this task*
+/// only — the node went on serving while no peer could pull from it, and
+/// nothing watched the task. Built before the node commits to serving, it is a
+/// startup failure instead (ADR-184).
+///
+/// Generated once per process, not per connection: the certificate proves
+/// nothing on its own (see [`crate::tls`]), so reusing it costs nothing, and
+/// generating a keypair per peer would be a denial-of-service lever anyone who
+/// can open a socket could pull.
 pub async fn serve_with(
     engine: Arc<Engine>,
     listener: TcpListener,
     secret: String,
     on_pushed: Option<PushHook>,
+    tls: Arc<crate::tls::ClusterTls>,
 ) {
     let local = listener.local_addr().ok();
-
-    // Generated once per process, not per connection: the certificate proves
-    // nothing on its own (see `crate::tls`), so the only cost of reusing it is
-    // none, and generating a keypair per peer would be a denial-of-service
-    // lever anyone who can open a socket could pull.
-    let tls = match crate::tls::ClusterTls::new() {
-        Ok(tls) => Arc::new(tls),
-        Err(e) => {
-            // Fatal rather than a fall back to plaintext. Falling back would
-            // mean an operator who configured a cluster expecting encrypted
-            // replication silently got none.
-            warn!(error = %e, "cannot start cluster TLS; replication will not serve");
-            return;
-        }
-    };
     info!(bind = ?local, "serving cluster replication over TLS");
 
     loop {

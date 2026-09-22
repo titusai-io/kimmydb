@@ -838,36 +838,44 @@ impl opentelemetry::propagation::Injector for MapInjector<'_> {
 }
 
 /// Run the dispatcher until the process ends.
+/// The delivery client, built before the dispatcher is spawned.
+///
+/// Separate from [`run`] so that a client which will not build is a **startup
+/// failure** rather than a task that returns (ADR-184). It used to be built
+/// inside `run`, which logged and returned — and since nothing watched the
+/// task, the node went on serving with webhooks permanently undelivered. The
+/// comment below already called that "loudly"; an error line at startup
+/// followed by silence for ever is not.
+///
+/// There is no configuration that turns webhook delivery off. A subscription is
+/// created at runtime through the API, and the configuration's own validation
+/// refuses a zero payload cap on the grounds that a node "may deliver
+/// webhooks" — so the duty is mandatory on every node, and a node that cannot
+/// construct its egress protections does not start.
+pub fn client(policy: &EgressPolicy) -> reqwest::Result<reqwest::Client> {
+    // Redirects are refused: a permitted host answering `302` to
+    // `169.254.169.254` would otherwise walk the request through the policy.
+    // And the client resolves through the policy itself, so the addresses the
+    // egress check approves are the addresses the connection uses — two
+    // separate resolutions would give a zero-TTL name a window between them.
+    //
+    // Not `unwrap_or_default()` anywhere up the call: a default client follows
+    // redirects and resolves unchecked, so falling back to it would silently
+    // shed both egress protections.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(crate::egress::CheckedResolver::new(policy.clone())))
+        .build()
+}
+
 pub async fn run(
     state: SharedState,
     policy: EgressPolicy,
     me: NodeId,
     members: Option<kimmy_cluster::Members>,
     limits: Limits,
+    client: reqwest::Client,
 ) {
-    // Redirects are refused: a permitted host answering `302` to
-    // `169.254.169.254` would otherwise walk the request through the policy.
-    // And the client resolves through the policy itself, so the addresses the
-    // egress check approves are the addresses the connection uses — two
-    // separate resolutions would give a zero-TTL name a window between them.
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(Arc::new(crate::egress::CheckedResolver::new(policy.clone())))
-        .build()
-    {
-        Ok(client) => client,
-        // Not `unwrap_or_default()`: a default client follows redirects and
-        // resolves unchecked, so falling back to it would silently shed both
-        // egress protections. No client, no deliveries — loudly.
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "cannot build the webhook delivery client; webhooks will not be delivered"
-            );
-            return;
-        }
-    };
-
     info!("webhook dispatcher started");
     let mut backoff = Backoff::default();
     loop {

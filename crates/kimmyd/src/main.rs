@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod lifecycle;
+mod supervision;
 mod logging;
 mod node;
 

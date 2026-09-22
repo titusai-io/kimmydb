@@ -43,11 +43,21 @@ impl Run {
     /// Start a node on `dir` that binds its own HTTP port: none is chosen
     /// here, so none can be taken before the node binds it.
     fn spawn(dir: &Path, name: &str) -> Run {
-        Run::spawn_on(dir, name, 0)
+        Run::spawn_with(dir, name, &[])
+    }
+
+    /// [`Run::spawn`], with extra environment — for `KIMMY_TEST_KILL_TASK`,
+    /// which stops a named background task once the node is serving (ADR-184).
+    fn spawn_with(dir: &Path, name: &str, env: &[(&str, &str)]) -> Run {
+        Run::spawn_on_with(dir, name, 0, env)
     }
 
     /// [`Run::spawn`] on a port the test names, for a test about that port.
     fn spawn_on(dir: &Path, name: &str, http: u16) -> Run {
+        Run::spawn_on_with(dir, name, http, &[])
+    }
+
+    fn spawn_on_with(dir: &Path, name: &str, http: u16, extra_env: &[(&str, &str)]) -> Run {
         let config = format!(
             r#"
 [server]
@@ -66,7 +76,11 @@ jwt_secret = "{JWT_SECRET}"
         let stdout = dir.join(format!("{name}.stdout.log"));
         let stderr = dir.join(format!("{name}.stderr.log"));
 
-        let child = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kimmyd"));
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command
             .arg("--config")
             .arg(&config_path)
             .env("KIMMY_ROOT_PASSWORD", "harness-root-password")
@@ -313,4 +327,110 @@ async fn a_port_line_the_harness_cannot_read_fails_at_once() {
             started.elapsed()
         );
     }
+}
+
+/// A supervised task that dies stops the process, and the next start says which
+/// task and how (ADR-184).
+///
+/// Driven through a real `kimmyd` and the exit status it actually returns,
+/// because the whole defect was that a task could die and the process not
+/// notice: a test that called the supervisor directly would prove the classifier
+/// and nothing about the node.
+///
+/// `KIMMY_TEST_KILL_TASK` is armed only once the node is serving, so
+/// `wait_ready` completing first is part of the claim — the switch cannot turn a
+/// start into a crash loop.
+async fn a_task_that_dies_exits_and_the_next_start_names_it(
+    label: &str,
+    kill: &str,
+    task: &str,
+    cause: &str,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first =
+        Run::spawn_with(dir.path(), label, &[("KIMMY_TEST_KILL_TASK", &format!("{task}:{kill}"))]);
+    first.wait_ready(&client).await;
+    assert!(
+        first.log().contains("a test switch is set"),
+        "the switch must announce itself on every start where it is set: {}",
+        first.log()
+    );
+
+    let status = first.wait_exit();
+    assert_eq!(
+        status.code(),
+        Some(70),
+        "a supervised death exits 70, distinct from a configuration error's 1: {status:?}"
+    );
+    let log = first.log();
+    assert!(log.contains("stopping the process so it is restarted"), "{log}");
+    assert!(log.contains(task), "the log names the task: {log}");
+
+    let marker = marker(dir.path()).expect("a task death leaves the marker");
+    assert!(marker.contains("exit = \"task_died\""), "{marker}");
+    assert!(marker.contains(task), "the marker names the task: {marker}");
+    assert!(marker.contains(cause), "the marker names the cause: {marker}");
+
+    // The next start is where an operator actually reads why, so that is part of
+    // the claim rather than a separate nicety.
+    let mut second = Run::spawn(dir.path(), &format!("{label}-second"));
+    second.wait_ready(&client).await;
+    let log = second.log();
+    assert!(log.contains("stopped itself because a background task ended"), "{log}");
+    assert!(log.contains(task), "{log}");
+    assert!(log.contains(cause), "{log}");
+    assert!(!log.contains("ended cleanly"), "a death is not a clean end: {log}");
+
+    second.signal("TERM");
+    assert!(second.wait_exit().success());
+}
+
+#[tokio::test]
+async fn a_panicking_background_task_exits_the_process() {
+    // The session invalidator, because it is the one whose death is a security
+    // defect: while it is dead a revoked token keeps working on this node.
+    a_task_that_dies_exits_and_the_next_start_names_it(
+        "panicking",
+        "panic",
+        "session_invalidator",
+        "panicked",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_background_task_that_returns_exits_the_process() {
+    // The stall probe, whose death makes `kimmy_runtime_stall_seconds` read 0 --
+    // "no stall" -- for ever: a signal that cannot fail.
+    a_task_that_dies_exits_and_the_next_start_names_it(
+        "returning",
+        "return",
+        "stall_probe",
+        "returned",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_graceful_shutdown_is_not_a_task_death() {
+    // The control for the whole change. Shutdown aborts every supervised task,
+    // so without the announcement being set *before* the first abort each of
+    // them would look like a death and the drain would end in exit 70 instead of
+    // a clean stop.
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut node = Run::spawn(dir.path(), "graceful");
+    node.wait_ready(&client).await;
+    node.signal("TERM");
+    let status = node.wait_exit();
+
+    assert!(status.success(), "a drain is a clean exit, not a supervised death: {status:?}");
+    let log = node.log();
+    assert!(!log.contains("stopping the process so it is restarted"), "{log}");
+    let marker = marker(dir.path()).expect("a graceful shutdown leaves a marker");
+    assert!(marker.contains("exit = \"shutdown\""), "{marker}");
+    assert!(!marker.contains("task_died"), "{marker}");
 }

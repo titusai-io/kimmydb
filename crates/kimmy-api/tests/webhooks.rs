@@ -215,6 +215,10 @@ async fn the_dispatcher_loop_delivers_without_being_driven() {
         me(),
         None,
         dispatch::Limits::default(),
+        // Built by the caller since ADR-184: a client that will not build is a
+        // startup failure, not a task that returns.
+        dispatch::client(&EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]))
+            .expect("a delivery client for the test"),
     ));
 
     // The first pass runs before the first sleep, so this resolves fast; the
