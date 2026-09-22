@@ -2057,6 +2057,65 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_partial_index_files_the_documents_its_filter_cannot_decide() {
+        // The other way ADR-185's membership reaches a member: not a local
+        // write and not a replicated entry, but a page. It rides on the
+        // backfill in `create_index_inner` and on `apply_remote`, and nothing
+        // in-tree named it, so a restore that filed these documents under the
+        // wrong run — or under no run — would have looked the same.
+        //
+        // B holds a document of its own that the filter cannot decide either,
+        // so the receiver's own documents and the page's both have to land in
+        // the run, which a build that only walked the page would miss.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        let dec = |s: &str| bson::Bson::Decimal128(s.parse().unwrap());
+        a.insert(&ca, doc! { "_id": "a-dec", "note": "n", "k": dec("1") }).unwrap();
+        a.insert(&ca, doc! { "_id": "a-in", "note": "n", "k": 9 }).unwrap();
+        a.insert(&ca, doc! { "_id": "a-out", "note": "n", "k": 1 }).unwrap();
+        a.create_index_with(
+            "shop",
+            "orders",
+            vec![field("note")],
+            false,
+            Default::default(),
+            Some("by_note".into()),
+            None,
+            Some(doc! { "k": { "$gt": 5 } }),
+        )
+        .unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "b-dec", "note": "n", "k": dec("2") }).unwrap();
+
+        let page = a.snapshot_page(None, None).unwrap();
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+            .expect("the page applies");
+        assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.index("by_note").expect("the definition builds here too").clone();
+        assert_eq!(
+            b.undecidable_count(&cb, index.id).unwrap(),
+            2,
+            "the page's decimal and the receiver's own, both held for the re-check"
+        );
+        assert_eq!(b.unkeyed_count(&cb, index.id).unwrap(), 0, "and under the reason that is true");
+        // Which documents, not only how many: the one the filter selects is
+        // keyed, the one it decides against is absent, and the two it cannot
+        // decide are candidates of every scan.
+        let candidates: std::collections::BTreeSet<Vec<u8>> =
+            b.index_candidates(&cb, index.id, &[], &[0xFF]).unwrap().into_iter().collect();
+        let key = |id: &str| crate::index::doc_key_for(&DocId::String(id.into())).unwrap();
+        assert!(candidates.contains(&key("a-dec")), "the page's undecidable document");
+        assert!(candidates.contains(&key("b-dec")), "the receiver's own");
+        assert!(candidates.contains(&key("a-in")), "the document the filter selects");
+        assert!(!candidates.contains(&key("a-out")), "and not the one it decides against");
+    }
+
+    #[test]
     fn a_snapshot_index_this_node_cannot_apply_is_skipped_and_the_documents_restore() {
         // The refusal class ADR-123 keeps, reached through the snapshot
         // route: a definition this build cannot apply — a TTL over two

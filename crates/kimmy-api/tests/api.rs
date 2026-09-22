@@ -11250,3 +11250,89 @@ async fn an_index_carries_every_field_the_specification_requires() {
     );
     assert_eq!(listing["unkeyed"], 0, "the other reason is separate: {listing}");
 }
+
+#[tokio::test]
+async fn explain_reports_the_undecidable_run_it_read() {
+    // ADR-185 tells an owner that an undecidable document is rechecked on every
+    // scan of the index, and `explain` is where they would look for what that
+    // costs a query. The figure was computed and dropped: a query that read two
+    // entries from the undecidable run reported `unkeyedCandidates: 0` and
+    // nothing else, so the cost was invisible exactly where it is documented.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    let docs = "/v1/db/shop/coll/orders/docs";
+    // Two the filter cannot decide, and one it selects, so the run's entries
+    // are neither all of the index nor none of it.
+    for id in ["a", "b"] {
+        server
+            .post(
+                docs,
+                Some(&token),
+                json!({ "_id": id, "note": "n", "k": { "$numberDecimal": "1" } }),
+            )
+            .await;
+    }
+    server.post(docs, Some(&token), json!({ "_id": "c", "note": "n", "k": 9 })).await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({
+                "fields": [{ "path": "note" }],
+                "partialFilterExpression": { "k": { "$gt": 5 } },
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.body["undecidable"], 2,
+        "premise: the backfill filed both: {}",
+        created.body
+    );
+
+    let count = |filter: Value| {
+        let (server, token) = (&server, &token);
+        async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/orders/count",
+                    Some(token),
+                    json!({ "filter": filter, "explain": true }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body
+        }
+    };
+
+    let hit = count(json!({ "note": "n", "k": 7 })).await;
+    assert_eq!(hit["explain"]["strategy"], "index", "{hit}");
+    assert_eq!(
+        hit["explain"]["undecidableCandidates"], 2,
+        "the entries this query read from the undecidable run: {hit}"
+    );
+    assert_eq!(
+        hit["explain"]["unkeyedCandidates"], 0,
+        "and not folded into the run that means a fault: {hit}"
+    );
+    assert_eq!(
+        hit["count"], 2,
+        "the two decimals match `k: 7`, which is why the index has to hold them (ADR-185); the \
+         document with `k: 9` does not: {hit}"
+    );
+
+    // A collection scan reads no index, so it reports neither figure rather
+    // than a zero that would read as an index with an empty run.
+    let scan = count(json!({ "other": 1 })).await;
+    assert_eq!(scan["explain"]["strategy"], "collectionScan", "{scan}");
+    assert!(scan["explain"].get("undecidableCandidates").is_none(), "no index, no run: {scan}");
+
+    // And the field a client reads is the documented one.
+    let spec: serde_json::Value =
+        serde_norway::from_str(include_str!("../../../docs/openapi.yaml"))
+            .expect("docs/openapi.yaml is valid YAML");
+    assert!(
+        spec["components"]["schemas"]["Explain"]["properties"]["undecidableCandidates"].is_object(),
+        "docs/openapi.yaml's Explain schema does not document undecidableCandidates"
+    );
+}

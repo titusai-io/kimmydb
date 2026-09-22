@@ -18680,13 +18680,20 @@ could not have.
 
 The rebuild's log line names the widened rule, so an operator watching the migration reads what the index will hold.
 
-**One case the rebuild cannot reach.** A database taken to schema 4 by an
-unreleased build *before* this record keeps the old membership: it is already at
-4, so nothing rebuilds it, and its partial indexes hold only what their filters
-selected until something recreates them or the directory is wiped. That is a
-development database by definition, since 4 is unreleased — the lab cluster runs
-0.33.0 and is at schema 3, so it migrates and is unaffected. Recreate the partial
+**Two cases the rebuild cannot reach**, both of them development databases by
+definition, since schema 4 is unreleased. The lab cluster runs 0.33.0 and is at
+schema 3, so it migrates and is unaffected by either. Recreate the partial
 indexes on such a database, or start it again from empty.
+
+1. **A database taken to schema 4 before this record** keeps the old membership:
+   it is already at 4, so nothing rebuilds it, and its partial indexes hold only
+   what their filters selected.
+2. **A database migrated by this record's own earlier head**, before the second
+   sentinel run, holds its undecidable documents under `UNKEYED`. Nothing
+   rebuilds it either, and the entry is now stranded rather than merely
+   mislabelled: the unfile on a write looks under `UNDECIDABLE`, so rewriting
+   such a document leaves the old sentinel entry standing, and it is a candidate
+   for every query on that index until the index is recreated.
 
 ### Tests, and how they break
 
@@ -18705,6 +18712,9 @@ indexes on such a database, or start it again from empty.
 | the old image's unfile from the undecidable run | `a_document_moving_in_and_out_of_the_undecidable_state_is_refiled`, and `a_replicated_document_moving_in_and_out_of_the_undecidable_state_is_refiled_on_the_peer` |
 | the snapshot the OTLP bridge reads taking `undecidable` from `index_unkeyed` | `the_snapshot_reads_the_same_atomics_the_render_does` |
 | the bridge's `kimmy.index.undecidable` instrument reading `index_unkeyed` | `no_two_bridge_instruments_read_the_same_field` |
+| `explain` computing the undecidable figure and dropping it, as it did | `explain_reports_the_undecidable_run_it_read` |
+| the backfill's `Undecidable` arm filing nothing | `a_backfill_holds_the_documents_the_filter_cannot_decide`, the snapshot restore test, the executor differential, and the two API tests that read the figure |
+| `apply_entries` filing an undecidable document in neither run | both moves tests, local and replicated, `a_unique_partial_index_does_not_refuse_a_document_it_cannot_decide`, `repro_an_unkeyed_document_is_visited_twice`, and the snapshot restore test |
 
 Every row above was run alone on the final tree, across `kimmy-core`, `kimmy-storage`, `kimmy-query` and `kimmy-api` (and `kimmyd` for the last), and names every test that failed.
 

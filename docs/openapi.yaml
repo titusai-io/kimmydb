@@ -3397,6 +3397,18 @@ components:
             for an index that keys every document it holds. A number above 0
             is the cost of leaving such documents under the index; the index
             listing's `unkeyed` reports the same set by size.
+        undecidableCandidates:
+          type: integer
+          description: |
+            Of `indexEntriesRead`, the entries read from the index's
+            undecidable run: documents a partial index holds because its filter
+            could not decide them — a `Decimal128` at a filtered path, which
+            the canonical order ranks equal to every number — and which every
+            scan of that index reads and rechecks (ADR-185). Present whenever
+            `indexEntriesRead` is, and 0 for an index with none. Separate from
+            `unkeyedCandidates`: that one counts documents the index could not
+            key, which is a fault to fix, and this one is expected. The index
+            listing's `undecidable` reports the same set by size.
 
     ViolationGroup:
       type: object

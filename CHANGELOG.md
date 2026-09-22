@@ -100,7 +100,9 @@ refused.** This release moves the storage schema to 4
   could not decide them ([ADR-185](docs/decisions.md)). **Always present**, and
   `0` on an index with none, beside `unkeyed`, which keeps meaning documents
   the index could not key. A typed client that declares an index's fields needs
-  the new one.
+  the new one. `explain` reports the same run per query as
+  **`undecidableCandidates`**, beside `unkeyedCandidates`, so the re-check an
+  owner is told to watch is visible where they would look for it.
 
 - **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP
   bridge, `kimmy.task.retries.<task>`) counts the times a supervised background

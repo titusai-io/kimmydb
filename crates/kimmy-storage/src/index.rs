@@ -1911,12 +1911,13 @@ struct Walk<'t, F> {
     index: &'t IndexMeta,
     entries: &'t redb::ReadOnlyTable<tables::IndexKey<'static>, ()>,
     docs: &'t redb::ReadOnlyTable<(u64, &'static [u8]), &'static [u8]>,
-    /// The ranges to read, in key order: the index's unkeyed run first, when
-    /// it holds one, then the planner's. The run is one more range whose
-    /// single key is [`UNKEYED`] — its entries are in document-key order and
-    /// hold each document once, exactly the shape of an exact probe — so
-    /// every delivery below merges it as it would one more probe, and reads
-    /// nothing extra when the run is empty.
+    /// The ranges to read, in key order: the index's sentinel runs first —
+    /// [`UNKEYED`], then [`UNDECIDABLE`] — each when it holds anything, and
+    /// then the planner's, which start above both ([`ABOVE_SENTINELS`]). A run
+    /// is one more range whose single key is the sentinel — its entries are in
+    /// document-key order and hold each document once, exactly the shape of an
+    /// exact probe — so every delivery below merges it as it would one more
+    /// probe, and reads nothing extra when the run is empty.
     ranges: &'t [(Vec<u8>, Vec<u8>)],
     outcome: IndexScanOutcome,
     visit: F,
@@ -1968,8 +1969,10 @@ where
     /// only at the smallest one the scan covers. The scan visits the ranges
     /// in key order, so that is exactly the entry it met first.
     ///
-    /// Never asked about an unkeyed entry: a document the index could not
-    /// key is filed once, under [`UNKEYED`], and under no real key.
+    /// Never asked about an entry in a sentinel run: a document the index
+    /// could not key is filed once under [`UNKEYED`], and one its filter could
+    /// not decide once under [`UNDECIDABLE`] — each under no real key, and the
+    /// caller asks [`is_sentinel`] before it asks this.
     fn first_entry_for(&self, doc: &Document, key: &[u8]) -> Result<bool> {
         // `document_keys` returns them sorted, so the first in range is the
         // least.

@@ -672,6 +672,14 @@ pub struct QueryStats {
     /// documents under the index — zero for an index that keys everything
     /// it holds.
     pub unkeyed: Option<usize>,
+    /// Of `index_entries`, the ones read from the index's **undecidable** run:
+    /// documents held because a partial filter could not decide them, which
+    /// every scan of that index reads and rechecks (ADR-185). Reported and read
+    /// exactly as `unkeyed` is, and separate from it for the reason the two
+    /// counters are separate: that one is a fault an owner can fix, this one is
+    /// the documented cost of a `Decimal128` at a filtered path, and an owner
+    /// tuning a query needs to see which of the two they are paying for.
+    pub undecidable: Option<usize>,
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
     /// Reported separately from `index` because the primary key is not one: no
@@ -707,6 +715,9 @@ impl QueryStats {
         }
         if let Some(unkeyed) = self.unkeyed {
             out["unkeyedCandidates"] = json!(unkeyed);
+        }
+        if let Some(undecidable) = self.undecidable {
+            out["undecidableCandidates"] = json!(undecidable);
         }
         out
     }
@@ -846,6 +857,7 @@ where
             probes: pk.keys.len(),
             index_entries: None,
             unkeyed: None,
+            undecidable: None,
             id_lookup: true,
         });
     }
@@ -864,6 +876,7 @@ where
     let mut plan = plan::choose(filter, &meta.indexes);
     let mut entries = None;
     let mut unkeyed = None;
+    let mut undecidable = None;
     if let Some(p) = &plan {
         // Candidates stream out of the index and are rechecked as they come,
         // so stopping stops the read; nothing proportional to the range is
@@ -895,6 +908,7 @@ where
             Some(outcome) => {
                 entries = Some(outcome.entries);
                 unkeyed = Some(outcome.unkeyed);
+                undecidable = Some(outcome.undecidable);
             }
             None => plan = None,
         }
@@ -915,6 +929,7 @@ where
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
         index_entries: entries,
         unkeyed,
+        undecidable,
         id_lookup: false,
     })
 }
@@ -2143,6 +2158,7 @@ mod tests {
             probes,
             index_entries: None,
             unkeyed: None,
+            undecidable: None,
             id_lookup: false,
         }
     }
