@@ -4617,6 +4617,137 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_key_order_is_part_of_the_filter() {
+        // `find` compares an embedded document field by field, in order, so these
+        // two filters select different documents — and the definition check
+        // called them one, answering a re-create with the old filter.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let create = |filter: bson::Document| {
+            a.create_index_with(
+                "shop",
+                "orders",
+                vec![field("z")],
+                false,
+                Default::default(),
+                Some("z".into()),
+                None,
+                Some(filter),
+            )
+        };
+        let held = bson::doc! { "k": { "a": 1, "b": 2 } };
+        let swapped = bson::doc! { "k": { "b": 2, "a": 1 } };
+        let document = bson::doc! { "k": { "a": 1, "b": 2 } };
+        assert_ne!(
+            kimmy_core::PartialFilter::parse(&held).unwrap().selects(&document),
+            kimmy_core::PartialFilter::parse(&swapped).unwrap().selects(&document),
+            "premise: the two filters select different documents"
+        );
+        create(held).expect("the first create");
+        let err = create(swapped).expect_err("a filter selecting other documents is a conflict");
+        assert!(err.to_string().contains("partialFilterExpression"), "{err}");
+    }
+
+    /// `name` on `shop.orders` as `e` holds it: its filter as definitions are
+    /// compared, and how many entries it holds.
+    fn filter_and_entries(e: &Engine, name: &str) -> (Option<String>, usize) {
+        let coll = e.get_collection("shop", "orders").unwrap();
+        let index = coll.index(name).expect("the index is held").clone();
+        let entries = e.index_candidates(&coll, index.id, &[], &[0xFF]).unwrap().len();
+        (kimmy_core::index_meta::stored_filter::compared(&index.partial_filter), entries)
+    }
+
+    /// `z` on `shop.orders`, created on `e` with `filter`, and its stamp.
+    fn create_z(e: &Engine, filter: bson::Document) -> Stamp {
+        e.create_index_with(
+            "shop",
+            "orders",
+            vec![field("z")],
+            false,
+            Default::default(),
+            Some("z".into()),
+            None,
+            Some(filter),
+        )
+        .unwrap()
+        .created
+        .unwrap()
+    }
+
+    #[test]
+    fn two_members_creating_one_index_with_a_nested_order_swapped_settle_on_one_filter() {
+        // The two filters select different documents, so they are two
+        // definitions, and two members holding them must settle on one — the
+        // later, as any two rival definitions do (ADR-132). A check that called
+        // them one stamp-merged them instead, and each member kept its own
+        // filter for good: one entry on A, none on B, with no warning.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let coll = a.get_collection("shop", "orders").unwrap();
+        a.insert(&coll, bson::doc! { "_id": 1_i64, "k": { "a": 1, "b": 2 }, "z": 1 }).unwrap();
+        pull(&b, &a);
+
+        let first = create_z(&a, bson::doc! { "k": { "a": 1, "b": 2 } });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later = bson::doc! { "k": { "b": 2, "a": 1 } };
+        let second = create_z(&b, later.clone());
+        assert!(first < second, "the fixture needs two independent creations, A's first");
+        assert_ne!(
+            filter_and_entries(&a, "z"),
+            filter_and_entries(&b, "z"),
+            "premise: two definitions, and two memberships"
+        );
+
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert_eq!(
+            filter_and_entries(&a, "z"),
+            filter_and_entries(&b, "z"),
+            "one definition and one membership on both members"
+        );
+        assert_eq!(
+            filter_and_entries(&a, "z").0,
+            kimmy_core::index_meta::stored_filter::compared(&Some(later)),
+            "the later one"
+        );
+    }
+
+    #[test]
+    fn two_members_creating_one_index_with_its_top_level_order_swapped_merge() {
+        // The control. The top level is a conjunction, so its order selects
+        // nothing: the same definition, settled by the stamp merge, with
+        // nothing replaced.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let coll = a.get_collection("shop", "orders").unwrap();
+        a.insert(&coll, bson::doc! { "_id": 1_i64, "k": 9, "x": 1, "z": 1 }).unwrap();
+        pull(&b, &a);
+
+        let first = create_z(&a, bson::doc! { "x": { "$exists": true }, "k": { "$gt": 5 } });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = create_z(&b, bson::doc! { "k": { "$gt": 5 }, "x": { "$exists": true } });
+        assert!(first < second, "the fixture needs two independent creations, A's first");
+
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        let collection = kimmy_core::CollectionId::derive("shop", "orders");
+        for (member, e) in [("A", &a), ("B", &b)] {
+            let held = e.get_collection("shop", "orders").unwrap();
+            assert_eq!(held.index("z").unwrap().created, Some(second), "{member}: the later stamp");
+            assert_eq!(
+                e.index_dropped_at(collection, kimmy_core::IndexMeta::derive_id("z")).unwrap(),
+                None,
+                "{member}: merged, so no drop was recorded to replace an index"
+            );
+            assert_eq!(filter_and_entries(e, "z").1, 1, "{member}: and the document is held");
+        }
+    }
+
+    #[test]
     fn two_members_creating_one_identical_definition_converge_on_one_creation_stamp() {
         // The stamp has to converge, not only the definition. After ADR-132
         // it is the sole arbiter of whether a replayed drop applies, so two

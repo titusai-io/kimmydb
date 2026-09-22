@@ -128,16 +128,37 @@ pub mod stored_filter {
     }
 
     /// `filter` as the collection metadata stores it: canonical Extended JSON.
-    ///
-    /// Also what two filters are compared by ([`super::IndexMeta::differences`]).
-    /// Every number is a string in this form, so the comparison is reflexive
-    /// for every value, `NaN` included, where `Bson`'s own `==` is `f64`'s.
-    /// Two filters are then the same exactly when the store holds the same
-    /// value for both — up to key order, which `Document`'s equality never
-    /// counted either. The one pair that compared equal as `Bson` and differs
-    /// here is `0.0` against `-0.0`: the store holds them as different values.
     pub fn canonical(filter: &Option<Document>) -> Option<serde_json::Value> {
         filter.as_ref().map(|filter| Bson::Document(filter.clone()).into_canonical_extjson())
+    }
+
+    /// `filter` as two definitions are compared by
+    /// ([`super::IndexMeta::differences`]): its canonical Extended JSON, with
+    /// the top-level fields in sorted order and everything inside them as
+    /// written.
+    ///
+    /// **Key order counts exactly where `find` counts it.** The top level is a
+    /// conjunction of per-field predicates (`PartialFilter::parse`), so its
+    /// order selects nothing and is sorted away. Inside a field's operand it is
+    /// part of the value: `find` compares an embedded document field by field,
+    /// in order, so `{k: {a: 1, b: 2}}` and `{k: {b: 2, a: 1}}` select different
+    /// documents and are two definitions. An operator document holds exactly
+    /// one operator, so it has no order of its own to lose. `Document`'s `==`
+    /// ignored order at every depth, and a re-create with a nested order
+    /// swapped kept the old filter.
+    ///
+    /// Every number is a string in this form, so the comparison is reflexive
+    /// for every value, `NaN` included, where `Bson`'s own `==` is `f64`'s. The
+    /// one pair `Bson`'s `==` called equal and this does not is `0.0` against
+    /// `-0.0`, which the store holds as two values.
+    pub fn compared(filter: &Option<Document>) -> Option<String> {
+        filter.as_ref().map(|filter| {
+            let mut fields: Vec<(&String, &Bson)> = filter.iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(b.0));
+            let sorted: Document =
+                fields.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            Bson::Document(sorted).into_canonical_extjson().to_string()
+        })
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Document>, D::Error> {
@@ -291,9 +312,10 @@ impl IndexMeta {
         // `f64`'s and so not reflexive: a filter holding `NaN` differed from
         // itself, and the identical definition created twice was refused as a
         // conflict — and between two members settled by supersede rather than
-        // by the stamp merge an identical definition gets.
-        if stored_filter::canonical(&self.partial_filter)
-            != stored_filter::canonical(&other.partial_filter)
+        // by the stamp merge an identical definition gets. And with key order
+        // counted where `find` counts it (`stored_filter::compared`).
+        if stored_filter::compared(&self.partial_filter)
+            != stored_filter::compared(&other.partial_filter)
         {
             differs.push("partialFilterExpression");
         }
@@ -438,7 +460,46 @@ mod stored_filter_tests {
             ["partialFilterExpression"],
             "a partial index against a full one"
         );
-        // Key order is not a difference, as it was not before.
+        // Key order at the top level is not a difference: it is a conjunction.
         assert!(differs(&doc! { "a": 1, "b": 2 }, &doc! { "b": 2, "a": 1 }).is_empty());
+    }
+
+    #[test]
+    fn a_nested_key_order_is_part_of_the_definition() {
+        // Inside a field's operand, order is part of the value, as `find`
+        // compares it; at the top level it is not. Both halves, so neither a
+        // comparison that ignored order everywhere nor one that counted it
+        // everywhere could pass.
+        let differs = |a: Document, b: Document| index(Some(a)).differences(&index(Some(b)));
+        for (a, b) in [
+            (doc! { "k": { "a": 1, "b": 2 } }, doc! { "k": { "b": 2, "a": 1 } }),
+            (
+                doc! { "k": { "$eq": { "a": 1, "b": 2 } } },
+                doc! { "k": { "$eq": { "b": 2, "a": 1 } } },
+            ),
+            (
+                doc! { "k": { "$gte": { "a": 1, "b": 2 } } },
+                doc! { "k": { "$gte": { "b": 2, "a": 1 } } },
+            ),
+            (doc! { "k": [{ "a": 1, "b": 2 }] }, doc! { "k": [{ "b": 2, "a": 1 }] }),
+        ] {
+            assert_eq!(
+                differs(a.clone(), b.clone()),
+                ["partialFilterExpression"],
+                "{a} against {b}"
+            );
+        }
+        for (a, b) in [
+            (doc! { "x": 1, "k": { "a": 1, "b": 2 } }, doc! { "k": { "a": 1, "b": 2 }, "x": 1 }),
+            (
+                doc! { "y": { "$gt": 5 }, "x": { "$exists": true } },
+                doc! { "x": { "$exists": true }, "y": { "$gt": 5 } },
+            ),
+        ] {
+            assert!(
+                differs(a.clone(), b.clone()).is_empty(),
+                "{a} against {b}: the top level is a conjunction"
+            );
+        }
     }
 }
