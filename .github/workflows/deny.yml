@@ -25,6 +25,10 @@ on:
       - "deny.toml"
       - "crates/**/Cargo.toml"
       - ".github/workflows/deny.yml"
+      # The script this workflow runs. Without it a change to the guard is not a
+      # change that runs the guard: the derivation added in this pull request
+      # would first have been exercised by the Monday schedule.
+      - "scripts/check-license-boundary.sh"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -32,6 +36,10 @@ on:
       - "deny.toml"
       - "crates/**/Cargo.toml"
       - ".github/workflows/deny.yml"
+      # The script this workflow runs. Without it a change to the guard is not a
+      # change that runs the guard: the derivation added in this pull request
+      # would first have been exercised by the Monday schedule.
+      - "scripts/check-license-boundary.sh"
   schedule:
     # Monday 06:00 UTC, before the week's first work lands.
     - cron: "0 6 * * 1"

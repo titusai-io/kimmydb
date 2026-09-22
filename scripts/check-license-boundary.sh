@@ -33,7 +33,98 @@ cd "$(dirname "$0")/.."
 
 # Every crate that takes the workspace license (`license.workspace = true` in
 # its Cargo.toml). `kimmy-client` is the one that does not.
-AGPL='^(kimmy-core|kimmy-storage|kimmy-query|kimmy-vector|kimmy-auth|kimmy-cluster|kimmy-mcp|kimmy-api|kimmyd|kimmy-cli) '
+#
+# **Derived, not written out.** This was a literal list, while the sentence above
+# it described a derivation -- and the two had drifted: `kimmy-egress` and
+# `kimmy-fuzz-harness` both take the workspace license and neither was named, so
+# the boundary could not see them at all. A list cannot see a crate it does not
+# name, and the crate it will not name is whichever is added after it was
+# written.
+#
+# The members come from `[workspace] members` rather than from a `crates/*` glob,
+# because a glob is the same drift one level up: it cannot see a member kept
+# anywhere else. `cargo metadata` would be equally authoritative, but every other
+# script here uses only sed and awk, and this needs no JSON parser to read a list
+# that is already a list.
+# The lines between `members = [` and its `]`, so a line can be judged rather
+# than just matched: a pattern that only matches what it understands drops what
+# it does not, and dropping a member is exactly the failure being fixed here.
+members_lines=$(
+  awk '/^members = \[/ { inside = 1; next } inside && /^\]/ { exit } inside { print }' Cargo.toml
+)
+
+members=''
+while IFS= read -r line; do
+  # A line with no quote holds no entry: blank, or a comment of its own.
+  case "$line" in
+  *'"'*) ;;
+  *) continue ;;
+  esac
+  # An entry, with an optional comma and an optional trailing comment. Anything
+  # else holding a quote is unparsed rather than skipped.
+  entry=$(
+    printf '%s\n' "$line" |
+      sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*,\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1/p'
+  )
+  if [ -z "$entry" ]; then
+    echo "cannot parse this [workspace] members line, so a member could be missed:" >&2
+    echo "  $line" >&2
+    exit 1
+  fi
+  members="$members$entry
+"
+done <<MEMBERS
+$members_lines
+MEMBERS
+
+if [ -z "$members" ]; then
+  echo "could not read [workspace] members from Cargo.toml" >&2
+  exit 1
+fi
+
+names=''
+for member in $members; do
+  # Globs are expanded, so a `crates/*` style entry still resolves; a literal
+  # path expands to itself.
+  for dir in $member; do
+    manifest="$dir/Cargo.toml"
+    if [ ! -f "$manifest" ]; then
+      echo "workspace member $dir has no Cargo.toml" >&2
+      exit 1
+    fi
+    name=$(sed -n 's/^name = "\([^"]*\)"/\1/p' "$manifest" | head -1)
+    if [ -z "$name" ]; then
+      echo "workspace member $dir has no package name in its Cargo.toml" >&2
+      exit 1
+    fi
+    # Three outcomes, and the third is an error rather than an exclusion. Both
+    # spellings of inheriting the workspace licence count -- `license.workspace`
+    # and `license = { workspace = true }` are the same TOML, and recognising
+    # only the first would silently class the crate as not AGPL.
+    if grep -qE '^license[[:space:]]*\.[[:space:]]*workspace[[:space:]]*=[[:space:]]*true' \
+      "$manifest" ||
+      grep -qE '^license[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true' \
+        "$manifest"; then
+      names="$names$name
+"
+    elif grep -qE '^license[[:space:]]*=[[:space:]]*"' "$manifest"; then
+      : # Its own licence string, so not the workspace's.
+    else
+      echo "cannot tell which licence $manifest takes, so $name cannot be classified:" >&2
+      grep -n '^license' "$manifest" >&2 || echo "  it states no licence" >&2
+      exit 1
+    fi
+  done
+done
+
+names=$(printf '%s' "$names" | sed '/^$/d' | sort -u)
+# A derivation that produces nothing would make every check below vacuous, which
+# is the failure this whole change is about: it would report success loudly.
+if [ -z "$names" ]; then
+  echo "found no crate under the workspace license; the derivation is broken" >&2
+  exit 1
+fi
+AGPL="^($(printf '%s' "$names" | tr '\n' '|' | sed 's/|$//')) "
 
 found=$(
   cargo tree -p kimmy-client -e normal --prefix none 2>/dev/null |
