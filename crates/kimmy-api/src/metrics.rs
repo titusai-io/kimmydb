@@ -2506,6 +2506,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
         expect(&format!("kimmy_ttl_skipped_filter_total {}\n", s.ttl_skipped_filter));
         expect(&format!("kimmy_index_unkeyed_total {}\n", s.index_unkeyed));
+        expect(&format!("kimmy_index_undecidable_total {}\n", s.index_undecidable));
         expect(&format!(
             "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
             s.webhook_delivered

@@ -18570,7 +18570,7 @@ is the more useful half of the exercise:
 
 ## ADR-185 — A partial index holds the documents its filter cannot decide
 
-**Decision.** A partial index holds every document its filter selects, **plus every document holding a `Decimal128` at one of the filter's paths**. The extra documents go in the index's unkeyed run, which every scan re-checks against the full filter. Membership is therefore a superset of `find`'s selection, exact except for values the canonical order cannot rank. This narrows [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns) by name and changes nothing else about it.
+**Decision.** A partial index holds every document its filter selects, **plus every document holding a `Decimal128` at one of the filter's paths**. The extra documents go in a sentinel run of their own, beside the unkeyed run, and every scan re-checks both against the full filter. Membership is therefore a superset of `find`'s selection, exact except for values the canonical order cannot rank. This narrows [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns) by name and changes nothing else about it.
 
 **This is a return to the documented architecture rather than a reversal of it.** [indexes.md](indexes.md) has always opened with the rule everything follows from: *"An index answers **which documents might match**. Only the filter decides membership"*, and *"every candidate an index produces is re-checked against the full filter"*. A candidate set that over-produces is exactly what that describes. ADR-183's "membership is `find`'s selection" was the stricter claim — true, useful, and one value short.
 
@@ -18619,6 +18619,20 @@ Exactly the filter's predicate paths, resolved as `find` resolves them. This nee
 
 The test is `holds_decimal128` over the values the path resolves to, which searches the whole value. That is **wider than the minimum**, and deliberately: `{k: {a: Decimal128(1)}}` counts for a filter on `k` even though a document is never ranked against a number. Widening costs index size and a re-check; narrowing costs correctness, and the narrow version would need the same non-finite reasoning this record already rejected.
 
+### Its own run, and its own figure
+
+An undecidable document is filed under `UNDECIDABLE`, the key `[0x00]`: a second sentinel run, beside the unkeyed run's empty key and below every real key. **The first version of this record filed it in the unkeyed run**, and a review showed what that cost. The per-index `unkeyed` figure is documented as the documents an index could not key, which is a fault an owner can act on; it then counted both, so after a migration an index read `unkeyed: 2` while `kimmy_index_unkeyed_total` read 0. On a partial filter over a money field it would be most of the collection. So `unkeyed` means "could not key" again, and the listing, `describe` and `createIndex` carry **`undecidable`** beside it. **Both are always present**, and both are in the index schema's `required` list: a field present only when non-zero would be a second convention beside `unkeyed`, one a client has to know reads as 0 when absent, and a typed client breaks the first time it appears. The reason is the key rather than something stored with the entry, because otherwise a listing would load every document it counts.
+
+**This touches the 3 → 4 rebuild, and still needs no schema 5**: the rebuild writes the new sentinel directly, and 4 is unreleased (below).
+
+### A range with an open low end walked a sentinel run twice
+
+The same review found `count`, a sorted `find` and a write's `explain` seeing an undecidable document twice. The sentinel runs are prepended to every scan as ranges of their own. A query range with an unbounded lower end — `$lt` on an ascending field, `$gt` on a descending one — arrived at the walk as the empty key, **which is the unkeyed run's key**, so it walked that run again, and the multikey de-duplication skips sentinel entries, so nothing removed the repeat. Plain `find`, `aggregate`, `update` and `delete` were right, because their deliveries de-duplicate by document.
+
+**It predates this record.** Since [ADR-139](#adr-139--a-document-an-index-cannot-key-is-stored-and-filed-unkeyed-not-refused) a document no index can key was counted twice the same way; this record made the class common. So the class is fixed rather than the instance: every query range is raised to `ABOVE_SENTINELS`, which starts strictly above every sentinel run and fixes all three walk methods at once. It is **derived from `keyenc::LEAST_KEY_TAG`**, not written out, because the second sentinel has already shown what a literal costs: `[0x00]` was a correct boundary until `UNDECIDABLE` moved in at that byte, and then it was this defect again, one run along. Two premises in `keyenc` pin what the boundary rests on — no value encodes to an empty key, and every real key, in both directions, sorts above every sentinel.
+
+**The evidence had a gap, and it is the lesson.** `partial_containment.rs` models membership through `plan::choose` and never runs the executor, so a document delivered twice was invisible to it. `executor_containment.rs` drives the real `visit_index_candidates` in both deliveries — `Any`, which `count` uses, and `ById`, which a sorted `find` and a cursor page use — over four index shapes, two filter depths, six query shapes and a corpus of decimals plain, in arrays and nested, beside `NaN` and the infinities as ordinary doubles. It asserts **nothing twice** and **nothing missing** against a collection-scan oracle, and its own premises, so an empty search cannot pass.
+
 ### `is_empty()` had been standing in for "this is a sentinel run"
 
 Worth a section of its own, because it is the find of this change and it was
@@ -18658,7 +18672,7 @@ could not have.
 
 ### TTL is unaffected, and already guarded
 
-`expired_range` builds its bounds from dates and reads keyed entries only; the unkeyed run sorts below either bound. So an undecidable document is never an expiry candidate — correct, since the filter does not select it, and deleting it would be precisely the [ADR-181](#adr-181--expiry-deletes-a-document-only-if-its-indexs-filter-read-as-find-reads-it-still-selects-it) bug. That is `expiry_never_reads_the_unkeyed_run`, which already existed. ADR-181's re-check is unchanged and still guards the rest.
+`expired_range` builds its bounds from dates and reads keyed entries only; both sentinel runs sort below either bound. So an undecidable document is never an expiry candidate — correct, since the filter does not select it, and deleting it would be precisely the [ADR-181](#adr-181--expiry-deletes-a-document-only-if-its-indexs-filter-read-as-find-reads-it-still-selects-it) bug. That is `expiry_never_reads_the_unkeyed_run`, which already existed. ADR-181's re-check is unchanged and still guards the rest.
 
 ### The version, and the release order
 
@@ -18683,6 +18697,16 @@ indexes on such a database, or start it again from empty.
 | the separate counter, folded back into `unkeyed_writes` | the same test, on the two assertions that separate the series |
 | the backfill's arm | `a_backfill_holds_the_documents_the_filter_cannot_decide` |
 | agreement between `document_keys` and the modelled membership | `a_partial_index_holds_exactly_what_the_filter_decides_or_cannot` |
+| every query range left at its own lower bound, not raised to `ABOVE_SENTINELS` | `the_executor_yields_each_candidate_once_and_loses_none`, as documents yielded more than once, and `repro_an_unkeyed_document_is_visited_twice` |
+| `is_sentinel` put back as `is_empty()` in the multikey de-duplication | the same differential, in the **other** direction: "a collection scan returns [4, 6, 10] and the indexed answer does not" |
+| a type tag below `LEAST_KEY_TAG` (`Null` at `0x00`) | `every_real_key_sorts_above_every_sentinel`, and the tests of order across types |
+| the empty string encoding to the empty key | `no_value_encodes_to_an_empty_key` and `every_real_key_sorts_above_every_sentinel`. The executor differential stays green, as the first of those says it will: such a document lands in the unkeyed run and is still found |
+| the 3 → 4 rebuild's `Undecidable` arm filing nothing | `the_rebuild_files_a_document_its_filter_cannot_decide`, and `an_interrupted_rebuild_files_the_documents_its_filters_cannot_decide_when_it_resumes` |
+| the old image's unfile from the undecidable run | `a_document_moving_in_and_out_of_the_undecidable_state_is_refiled`, and `a_replicated_document_moving_in_and_out_of_the_undecidable_state_is_refiled_on_the_peer` |
+| the snapshot the OTLP bridge reads taking `undecidable` from `index_unkeyed` | `the_snapshot_reads_the_same_atomics_the_render_does` |
+| the bridge's `kimmy.index.undecidable` instrument reading `index_unkeyed` | `no_two_bridge_instruments_read_the_same_field` |
+
+Every row above was run alone on the final tree, across `kimmy-core`, `kimmy-storage`, `kimmy-query` and `kimmy-api` (and `kimmyd` for the last), and names every test that failed.
 
 `a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s.
 

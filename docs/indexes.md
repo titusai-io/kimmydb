@@ -587,8 +587,8 @@ with — so a stored `Decimal128` satisfies `{k: 7}` and `{k: {$gte: 6}}` and
 fails `{k: {$gt: 5}}`. Comparison with one is not an order, and a filter's
 answer about such a document is *an* answer rather than *the* answer.
 
-So the index holds it anyway, in the unkeyed run, and every scan re-checks it
-against the full filter. Without that, an index with `{k: {$gt: 5}}` would be
+So the index holds it anyway, in a run of its own beside the unkeyed run, and
+every scan re-checks it against the full filter. Without that, an index with `{k: {$gt: 5}}` would be
 used for the query `{k: 7}` — the planner can prove that containment — and
 would miss a document holding `Decimal128("1")` that `find` returns, silently
 ([ADR-185](decisions.md)).

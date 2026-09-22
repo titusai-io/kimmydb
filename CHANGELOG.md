@@ -95,6 +95,12 @@ refused.** This release moves the storage schema to 4
   in the index's unkeyed run and every scan rechecks it, which is why it is found
   rather than lost. That is `unkeyed` on the listing, and it predates this
   release.
+- **`undecidable` on every index** in the listing, `describe` and
+  `createIndex`: how many documents the index holds because its partial filter
+  could not decide them ([ADR-185](docs/decisions.md)). **Always present**, and
+  `0` on an index with none, beside `unkeyed`, which keeps meaning documents
+  the index could not key. A typed client that declares an index's fields needs
+  the new one.
 
 - **`kimmy_task_retries_total{task}`** (one instrument per task on the OTLP
   bridge, `kimmy.task.retries.<task>`) counts the times a supervised background
@@ -198,9 +204,9 @@ refused.** This release moves the storage schema to 4
   825 (filter, query) pairs that lost documents this way, every one of them
   involving a stored `Decimal128`.
 
-  Such a document is now **held by the index** — in the unkeyed run, which every
-  scan re-checks against the full filter — even when the filter does not select
-  it. Index membership is a superset of what `find` selects, exact except for
+  Such a document is now **held by the index** — in a run of its own, which
+  every scan re-checks against the full filter — even when the filter does not
+  select it. Index membership is a superset of what `find` selects, exact except for
   values the order cannot rank. This costs no index use: the planner chooses
   the same indexes it did before.
 
@@ -211,9 +217,21 @@ refused.** This release moves the storage schema to 4
   unique constraint applies to the documents its filter selects. A **TTL**
   index never expires one.
 
-  **It costs index size**, and the new counter below says how much. This was
-  pre-existing — 0.33.0 and earlier behave the same way — and is fixed by the
-  same schema 3 → 4 rebuild [above](#unreleased), with no separate migration.
+  **It costs index size**, and the listing's `undecidable` figure and the new
+  counter, both [above](#added), say how much. This was pre-existing — 0.33.0
+  and earlier behave the same way — and is fixed by the same schema 3 → 4
+  rebuild [above](#unreleased), with no separate migration.
+- **`count`, a sorted `find` and a write's `explain` no longer see a document
+  an index cannot key twice.** A query range with an open low end — `$lt` or
+  `$lte` on an ascending field, `$gt` or `$gte` on a descending one — walked
+  the index's unkeyed run again after the scan had already read it, so a
+  document filed there was counted twice, returned twice by a sorted `find`,
+  and reported twice among `explain`'s entries read. Plain `find`,
+  `aggregate`, `update` and `delete` de-duplicate, and were right. This is
+  pre-existing, since documents an index cannot key were first filed rather
+  than refused ([ADR-139](docs/decisions.md)); the partial-index fix above
+  would have made it common. Every query range now starts above the index's
+  sentinel runs ([ADR-185](docs/decisions.md)).
 
 - **A partial index's filter keeps its types when it is stored**
   ([ADR-182](docs/decisions.md)). Collection metadata stored a small `Int64`
