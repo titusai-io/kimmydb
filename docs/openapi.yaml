@@ -18,6 +18,9 @@ info:
   title: KimmyDB HTTP API
   version: 1.0.0
   summary: The client protocol for KimmyDB — HTTP/JSON with WebSocket change streams.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
   description: |
     KimmyDB speaks JSON over HTTP. Change streams are a WebSocket. There is no
     second protocol: the MongoDB wire protocol, gRPC and GraphQL were all
