@@ -10,6 +10,25 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## 0.34.1 - 2026-09-23
+
+**A patch, and nothing in the server's behaviour changes.** It updates two
+dependencies and gives the OpenAPI document the licence the rest of the
+documentation already carries. Nothing on the wire, in configuration, on disk
+or in packaging changes.
+
+### Changed
+
+- **`docs/openapi.yaml` declares Apache-2.0**, the licence
+  [LICENSING.md](LICENSING.md) gives documentation, examples and the
+  conformance suite. It previously declared none, so a client generated from
+  the document had no licence to state.
+- **The MCP server builds against `rmcp` 3.4.0, and the CLI against `clap`
+  4.6.7.** `rmcp` 3.4.0 renames the type describing the server to its clients
+  (`ServerInfo` is now a deprecated alias of `ServerConfig`); the MCP server
+  uses the new name. The tools and resources it exposes, and what it reports
+  about itself, are unchanged.
+
 ## 0.34.0 - 2026-09-22
 
 **Upgrading rebuilds every partial index at startup, and a downgrade is
