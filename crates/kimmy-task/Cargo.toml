@@ -11,6 +11,7 @@ description = "Supervision for the KimmyDB node's long-lived background tasks: a
 [dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

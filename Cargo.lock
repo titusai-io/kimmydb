@@ -2596,6 +2596,7 @@ dependencies = [
 name = "kimmy-task"
 version = "0.34.1"
 dependencies = [
+ "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",
