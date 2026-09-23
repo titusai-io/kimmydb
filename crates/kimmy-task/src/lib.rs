@@ -116,17 +116,24 @@ pub fn exit_because(task: &'static str, cause: Death, detail: &str) -> ! {
         // status 70 and no explanation at all. Found exactly that way, by a
         // membership test binary disappearing mid-run.
         None => {
-            error!(
-                task,
-                cause = cause.name(),
-                detail,
-                "a supervised background task ended and no exit behaviour was installed"
-            );
-            eprintln!(
-                "kimmy-task: the supervised task {task:?} {} ({detail}), and no exit behaviour \
-                 was installed; stopping with {EXIT_RESTART_WORTHY}",
-                cause.name()
-            );
+            // Under `catch_unwind`, and with a write that ignores its error
+            // rather than `eprintln!`, which panics when stderr cannot be
+            // written: nothing in the report may stop the exit after it.
+            let _ = std::panic::catch_unwind(|| {
+                use std::io::Write as _;
+                error!(
+                    task,
+                    cause = cause.name(),
+                    detail,
+                    "a supervised background task ended and no exit behaviour was installed"
+                );
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "kimmy-task: the supervised task {task:?} {} ({detail}), and no exit \
+                     behaviour was installed; stopping with {EXIT_RESTART_WORTHY}",
+                    cause.name()
+                );
+            });
             std::process::exit(EXIT_RESTART_WORTHY);
         }
     }

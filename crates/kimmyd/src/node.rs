@@ -170,6 +170,12 @@ async fn start_and_serve(config: Config) -> Result<()> {
     if !crate::supervision::install(config.storage.data_dir.clone()) {
         anyhow::bail!("the supervision hooks were installed twice; this is a programming error");
     }
+    // And the storage engine's: an I/O error leaves it serving nothing, so the
+    // process stops to be restarted (ADR-188). Installed as soon as there is an
+    // engine; a failure during the open itself fails the start instead.
+    if !crate::supervision::install_storage_reaction(&engine, config.storage.data_dir.clone()) {
+        anyhow::bail!("the storage reaction was installed twice; this is a programming error");
+    }
     // Announced at the signal, before anything drains, so that a supervised
     // task ending during the drain is a stop rather than a death.
     let shutdown = kimmy_task::Shutdown::new();
@@ -178,6 +184,16 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // shipped binary so that the tests drive the binary that ships, so every
     // start where it is set says so — it must not be able to sit on unnoticed in
     // a deployment.
+    // The same for the storage switch, which fails one backend call once the
+    // node is serving (ADR-188).
+    let fail_storage = std::env::var("KIMMY_TEST_FAIL_STORAGE").ok();
+    if let Some(call) = &fail_storage {
+        warn!(
+            KIMMY_TEST_FAIL_STORAGE = %call,
+            "a test switch is set that fails a storage call on purpose, which stops this node; \
+             unset KIMMY_TEST_FAIL_STORAGE outside a test"
+        );
+    }
     if let Some(what) = kimmy_task::test_kill_requested() {
         // The line says what is set, and the value says what it will do -- which
         // may be nothing. The prefix used to promise "will stop a background
@@ -653,6 +669,15 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // act: armed later than startup so it can never turn a start into a crash
     // loop, and can never be mistaken for a startup failure.
     kimmy_task::arm_test_kills();
+    if let Some(call) = &fail_storage
+        && !engine.arm_test_storage_failure(call)
+    {
+        warn!(
+            KIMMY_TEST_FAIL_STORAGE = %call,
+            "the storage test switch names no backend call, so nothing will happen; the names \
+             are read, write, sync_data, set_len and len"
+        );
+    }
     let served = serve(listener, app, tls, shutdown.clone()).await;
     // Before the aborts below, and before returning an error: from here on a
     // supervised task ending is a stop, not a death. `serve` has already

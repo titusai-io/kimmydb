@@ -1344,7 +1344,7 @@ apt layer, which is why it is `mode=min`.
 
 ## The `KIMMY_TEST_*` environment, which the shipped binary reads
 
-Four variables change how a test drives a real node. They are read from the
+Five variables change how a test drives a real node. They are read from the
 **environment only, never from the configuration file**, and they exist in the
 binary that ships — deliberately, because a test that drove a
 differently-compiled binary would not be testing the one anyone runs.
@@ -1356,14 +1356,16 @@ nowhere is one nobody can audit for.
 | Variable | What it does |
 |---|---|
 | `KIMMY_TEST_KILL_TASK` | `<task>:<panic\|return\|error>`. Stops the named supervised background task on purpose, so a test can assert that the node exits 70 and that the next start names the task ([ADR-184](decisions.md)). **Every start where it is set logs a `WARN` naming it**, so it cannot sit on unnoticed in a deployment, and it does nothing until the node is serving — so it can never turn a start into a crash loop or be mistaken for a startup failure. The task names are `kimmy_task::TASKS` |
+| `KIMMY_TEST_FAIL_STORAGE` | `read`, `write`, `sync_data`, `set_len` or `len`. Fails the next storage call of that kind once, with EIO, once the node is serving, so a test can assert that the node exits 70, and that the next start names `storage_failed` and repairs the file ([ADR-188](decisions.md)). **Every start where it is set logs a `WARN` naming it**, and a value that names no call says so |
 | `KIMMY_TEST_PATIENCE_SECS` | How long a harness waits for a node to answer `/healthz`. Raised on CI, where a two-core runner booting three daemons has timed out at the default |
 | `KIMMY_TEST_NODE_LOGS` | A directory each spawned node's stdout and stderr is kept in, so a failure on a runner that is gone can still be read |
 | `KIMMY_TEST_NODE_SECRET_FOR_POLICY` | A cluster secret a policy test supplies, rather than generating one it cannot predict |
 
-**`KIMMY_TEST_KILL_TASK` is the only one that changes what the node does** rather
-than how a test watches it, which is why it announces itself. The exposure it
-adds is a switch available to whoever can already set this process's environment;
-it is not reachable over the network.
+**`KIMMY_TEST_KILL_TASK` and `KIMMY_TEST_FAIL_STORAGE` are the only ones that
+change what the node does** rather than how a test watches it, which is why
+they announce themselves. The exposure they
+add is a switch available to whoever can already set this process's environment;
+neither is reachable over the network.
 
 ## Gaps
 

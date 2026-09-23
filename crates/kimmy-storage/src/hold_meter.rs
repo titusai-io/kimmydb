@@ -642,11 +642,35 @@ pub struct ServeSnapshot {
 #[derive(Debug)]
 pub(crate) struct MeteredBackend {
     inner: redb::backends::FileBackend,
+    /// Where the first I/O error is recorded (ADR-188). Here because every
+    /// byte the engine reads or writes passes through this backend, and it
+    /// sees each error at the call where redb latches it.
+    health: std::sync::Arc<crate::health::StorageHealth>,
 }
 
 impl MeteredBackend {
-    pub(crate) fn new(inner: redb::backends::FileBackend) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: redb::backends::FileBackend,
+        health: std::sync::Arc<crate::health::StorageHealth>,
+    ) -> Self {
+        Self { inner, health }
+    }
+
+    /// `call`, with the test switch's injected error ahead of it and any error
+    /// it returns recorded on the way out.
+    fn checked<T>(
+        &self,
+        name: &'static str,
+        call: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let result = match self.health.injected(name) {
+            Some(error) => Err(error),
+            None => call(),
+        };
+        if let Err(error) = &result {
+            self.health.record(name, error);
+        }
+        result
     }
 }
 
@@ -654,32 +678,32 @@ impl redb::StorageBackend for MeteredBackend {
     fn len(&self) -> std::result::Result<u64, std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::Len);
-        io(Io::Len, 0, || self.inner.len())
+        self.checked("len", || io(Io::Len, 0, || self.inner.len()))
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> std::result::Result<(), std::io::Error> {
         let bytes = out.len();
         #[cfg(test)]
         test_hooks::backend_call(Io::Read);
-        io(Io::Read, bytes, || self.inner.read(offset, out))
+        self.checked("read", || io(Io::Read, bytes, || self.inner.read(offset, out)))
     }
 
     fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::SetLen);
-        io(Io::SetLen, 0, || self.inner.set_len(len))
+        self.checked("set_len", || io(Io::SetLen, 0, || self.inner.set_len(len)))
     }
 
     fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::Sync);
-        io(Io::Sync, 0, || self.inner.sync_data())
+        self.checked("sync_data", || io(Io::Sync, 0, || self.inner.sync_data()))
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::Write);
-        io(Io::Write, data.len(), || self.inner.write(offset, data))
+        self.checked("write", || io(Io::Write, data.len(), || self.inner.write(offset, data)))
     }
 
     fn close(&self) -> std::result::Result<(), std::io::Error> {
