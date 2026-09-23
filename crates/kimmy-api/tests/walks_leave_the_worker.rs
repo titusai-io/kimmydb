@@ -33,7 +33,12 @@ const WALKS: [&str; 7] = [
 /// the data a client stored.
 const BOUNDED: [(&str, usize, &str); 5] = [
     ("webhooks.rs", 1, "the webhook registry: one document per subscription"),
-    ("dispatch.rs", 3, "webhook jobs and delivery progress: subscriptions times members"),
+    (
+        "dispatch.rs",
+        4,
+        "webhook jobs, delivery progress, and the scrape's subscription count: subscriptions \
+         times members",
+    ),
     ("topology.rs", 1, "the node registry: one document per member"),
     ("schema.rs", 1, "sample_documents stops at its limit"),
     ("vectors.rs", 1, "the emptiness check stops at the first live vector"),

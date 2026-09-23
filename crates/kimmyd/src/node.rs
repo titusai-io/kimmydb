@@ -615,6 +615,12 @@ async fn start_and_serve(config: Config) -> Result<()> {
         _ => None,
     };
 
+    // Every background writer has been spawned, so which of them this node
+    // runs is known, and it is fixed before anything can scrape: a
+    // progress-age row that appeared after the first scrape would be a series
+    // a dashboard could lose (ADR-187).
+    state.metrics.fix_progress_writers(&kimmy_task::started());
+
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;

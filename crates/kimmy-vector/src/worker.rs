@@ -449,9 +449,24 @@ pub struct WorkerCounters {
     /// slow provider from a load balancer closing idle connections without
     /// reading logs.
     pub transport: [AtomicU64; 4],
+    /// When the worker last finished a flush that committed, or an idle turn
+    /// with nothing waiting: `kimmy_task_progress_age_seconds{task="embedding_worker"}`
+    /// is the time since this, and the time since the process started before
+    /// the first. **Not** reset by a turn that is retrying a provider or a
+    /// store, so a worker retrying for ever reads as old, like a dead one.
+    last_progress: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 impl WorkerCounters {
+    /// When the worker last made progress; `None` before it first did.
+    pub fn last_progress(&self) -> Option<std::time::Instant> {
+        *self.last_progress.lock()
+    }
+
+    fn progressed(&self) {
+        *self.last_progress.lock() = Some(std::time::Instant::now());
+    }
+
     fn embedded(&self, chunks: usize) {
         self.documents_embedded.fetch_add(1, Ordering::Relaxed);
         self.chunks_embedded.fetch_add(chunks as u64, Ordering::Relaxed);
@@ -691,6 +706,12 @@ impl EmbeddingWorker {
                         self.flush(&mut pending).await?;
                     }
                     self.drain_deferred(now).await;
+                    // An idle turn is progress when nothing is left waiting:
+                    // a quiet node has no batch to complete, and its age must
+                    // not climb for want of writes.
+                    if pending.batches.is_empty() && pending.token.is_none() {
+                        self.counters.progressed();
+                    }
                     continue;
                 }
             };
@@ -837,6 +858,7 @@ impl EmbeddingWorker {
             self.engine.put_consumer_position(CONSUMER, token)?;
         }
         pending.held_since = None;
+        self.counters.progressed();
         Ok(())
     }
 
@@ -2575,6 +2597,32 @@ mod tests {
             Some(last_entry(&engine).stamp),
             "the recorded position must be the entry itself"
         );
+    }
+
+    /// The worker's progress, behind its row of `kimmy_task_progress_age_seconds`
+    /// (ADR-187), is a flush that committed: none before the worker has done
+    /// anything, one once a batch has landed.
+    #[tokio::test]
+    async fn a_committed_flush_is_progress_and_nothing_before_it_is() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        position_at_latest(&engine);
+        let counters = worker.counters();
+        assert_eq!(counters.last_progress(), None, "nothing has run");
+
+        let before = Instant::now();
+        tokio::spawn(async move { worker.run().await });
+        engine.insert(&coll, doc! { "_id": 0i64, "title": "progress" }).unwrap();
+        vectors_land(&engine, 1).await;
+        for _ in 0..200 {
+            if counters.last_progress().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let at = counters.last_progress().expect("the flush that stored the batch is progress");
+        assert!(at >= before, "and it is this run's: {at:?} before {before:?}");
     }
 
     /// A held position must not delay embedding. The deadline the worker

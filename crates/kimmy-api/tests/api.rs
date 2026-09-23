@@ -8167,6 +8167,11 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_task_retries_total",
         "kimmy_task_retries_total",
         "kimmy_task_retries_total",
+        // One per progress writer (ADR-187): no startup has fixed a smaller set.
+        "kimmy_task_progress_age_seconds",
+        "kimmy_task_progress_age_seconds",
+        "kimmy_task_progress_age_seconds",
+        "kimmy_task_progress_age_seconds",
         "kimmy_runtime_stall_seconds",
         "kimmy_requests_total",
         "kimmy_responses_total",

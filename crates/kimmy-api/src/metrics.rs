@@ -113,7 +113,33 @@ pub struct StorageReadings {
     pub held_marks_released: u64,
     /// Entries held as state right now (`Engine::held_marks`, ADR-160).
     pub held_marks: u64,
+    /// Registered webhook subscriptions by state, counted from the registry
+    /// at the read (ADR-187). They were set by the dispatcher at the end of
+    /// each pass, so a dispatcher that had stopped left them at whatever it
+    /// last saw. Counting a small system collection costs one walk; a read
+    /// that fails fails the scrape, as every other reading here does, instead
+    /// of reporting none.
+    pub webhook_active: u64,
+    pub webhook_invalidated: u64,
+    /// Peers this node's SWIM membership currently holds, counted from the
+    /// member set at the read (ADR-187); 0 with clustering off, by
+    /// construction. It was written by the webhook dispatcher's loop, which
+    /// had nothing to do with membership and could stop writing it.
+    pub cluster_members: u64,
 }
+
+/// The background writers behind the page's measured gauges, each with a
+/// progress age (`kimmy_task_progress_age_seconds{task}`, ADR-187), by the name
+/// each is supervised under.
+///
+/// A gauge that can be read at scrape is read at scrape and needs no age. What
+/// is left here are values only a background pass can know: the replication
+/// loop's lag, backoff and divergence figures, the stall probe's lateness, the
+/// dispatcher's backlog, and the embedding worker's work. Every name is a
+/// `kimmy_task::TASKS` entry, which `every_progress_writer_is_a_supervised_task`
+/// holds.
+pub const PROGRESS_WRITERS: [&str; 4] =
+    ["embedding_worker", "replication", "stall_probe", "webhook_dispatcher"];
 
 /// The process's resident memory, read from the kernel.
 ///
@@ -233,6 +259,10 @@ pub struct MetricsSnapshot {
     pub webhook_invalidated: u64,
     pub webhook_backlog_secs: u64,
     pub cluster_members: u64,
+    /// Seconds since each of [`PROGRESS_WRITERS`] last made progress, in that
+    /// order, or since the process started before its first (ADR-187). `None`
+    /// for a writer this node does not run, which has no row.
+    pub task_progress_age_secs: [Option<u64>; PROGRESS_WRITERS.len()],
     /// Milliseconds, since ADR-175; rendered and bridged as seconds.
     pub replication_lag_ms: u64,
     /// Anti-entropy rounds that failed, peers currently backed off, and
@@ -268,7 +298,8 @@ pub struct MetricsSnapshot {
     pub sync_divergence_count_deferred: u64,
     /// Seconds since the last contact whose round ran the check, computed
     /// when this snapshot was taken from the instant the loop last
-    /// reported; 0 before the first (ADR-145, ADR-154). How old the gauge's
+    /// reported; since the process started before the first (ADR-145,
+    /// ADR-154, ADR-187). How old the gauge's
     /// reading is, on a member whose rounds have stopped completing — or
     /// whose loop has stopped ticking, which is why it is computed here and
     /// not carried from the loop's last tick.
@@ -412,10 +443,20 @@ pub struct Metrics {
     webhook_delivered: AtomicU64,
     webhook_failed: AtomicU64,
     webhook_events: AtomicU64,
-    webhook_active: AtomicU64,
-    webhook_invalidated: AtomicU64,
     webhook_backlog_secs: AtomicU64,
-    cluster_members: AtomicU64,
+    /// When the stall probe last woke, when the dispatcher last completed the
+    /// pass that sets the backlog, and when a replication round last
+    /// completed, as the loop's round report carried it; `None` before the
+    /// first (ADR-187). The embedding worker's instant is in its own
+    /// counters, so it is not kept here.
+    stall_probe_progress: parking_lot::Mutex<Option<Instant>>,
+    dispatcher_progress: parking_lot::Mutex<Option<Instant>>,
+    replication_progress: parking_lot::Mutex<Option<Instant>>,
+    /// The writers this node runs, fixed once startup has spawned them
+    /// ([`Self::fix_progress_writers`]); every one of [`PROGRESS_WRITERS`]
+    /// until then, so a render with no startup behind it — a test — has
+    /// every row.
+    progress_writers: OnceLock<Vec<&'static str>>,
     tls_reloads_ok: AtomicU64,
     tls_reloads_failed: AtomicU64,
     jwks_refresh_ok: AtomicU64,
@@ -471,10 +512,11 @@ impl Default for Metrics {
             ttl_expired: AtomicU64::new(0),
             ttl_skipped: AtomicU64::new(0),
             ttl_skipped_filter: AtomicU64::new(0),
-            webhook_active: AtomicU64::new(0),
-            webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
-            cluster_members: AtomicU64::new(0),
+            stall_probe_progress: parking_lot::Mutex::new(None),
+            dispatcher_progress: parking_lot::Mutex::new(None),
+            replication_progress: parking_lot::Mutex::new(None),
+            progress_writers: OnceLock::new(),
             tls_reloads_ok: AtomicU64::new(0),
             tls_reloads_failed: AtomicU64::new(0),
             jwks_refresh_ok: AtomicU64::new(0),
@@ -549,21 +591,26 @@ impl Metrics {
         }
     }
 
-    /// The webhook gauges, set by the dispatcher at the end of each pass.
+    /// The webhook backlog, set by the dispatcher once per pass, and the
+    /// dispatcher's progress with it (ADR-187).
     ///
-    /// Set rather than accumulated: all three describe a state at an instant,
-    /// and the dispatcher already computes them while walking the registry. The
-    /// alternative — recomputing on every `/metrics` scrape — would re-read the
-    /// progress collection once per subscription for a number the dispatcher
-    /// had in hand two seconds earlier.
+    /// Set rather than accumulated: it describes a state at an instant, and
+    /// the dispatcher computes it while walking the registry. Recomputing it
+    /// on every `/metrics` scrape would re-read the progress collection once
+    /// per subscription for a number the dispatcher had in hand two seconds
+    /// earlier. That cost is why this one stays with its writer while the
+    /// subscription counts are read at scrape: an age says how old it is.
     ///
-    /// `backlog_secs` covers only subscriptions **this node owns**. A node that
-    /// has stood down must not report a backlog it is not the one working
-    /// through, or every node in a cluster would alert for the same lag.
-    pub fn set_webhook_gauges(&self, active: u64, invalidated: u64, backlog_secs: u64) {
-        self.webhook_active.store(active, Ordering::Relaxed);
-        self.webhook_invalidated.store(invalidated, Ordering::Relaxed);
+    /// Covers only subscriptions **this node owns**. A node that has stood
+    /// down must not report a backlog it is not the one working through, or
+    /// every node in a cluster would alert for the same lag.
+    ///
+    /// **Called only by a pass that read the registry.** A pass whose read
+    /// failed has no backlog to report, and writing 0 there would be a
+    /// healthy value after a failed read.
+    pub fn set_webhook_backlog(&self, backlog_secs: u64) {
         self.webhook_backlog_secs.store(backlog_secs, Ordering::Relaxed);
+        *self.dispatcher_progress.lock() = Some(Instant::now());
     }
 
     /// Record one request's end-to-end latency.
@@ -658,6 +705,7 @@ impl Metrics {
         self.sync_divergence_count_deferred
             .fetch_add(round.divergence_count_deferred as u64, Ordering::Relaxed);
         *self.sync_divergence_last_check.lock() = round.divergence_last_check;
+        *self.replication_progress.lock() = round.last_completed_round;
         self.record_entries_skipped(
             round.entries_skipped_unknown_collection as u64,
             round.entries_skipped_beyond_advertised as u64,
@@ -690,16 +738,6 @@ impl Metrics {
     /// lands on, for the reason [`Self::record_ddl_refused`] gives.
     pub fn record_ddl_declined(&self, n: u64) {
         self.sync_ddl_declined.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// How many peers this node's SWIM instance currently considers alive.
-    ///
-    /// The observable the cluster harness asserts gossip *formed* with —
-    /// replication converging is not proof, because discovery alone can
-    /// deliver convergence while gossip silently never forms, which is
-    /// exactly what the shipped compose file once did.
-    pub fn set_cluster_members(&self, n: u64) {
-        self.cluster_members.store(n, Ordering::Relaxed);
     }
 
     /// One backup produced, and how long the walk and the spill took
@@ -756,22 +794,61 @@ impl Metrics {
     }
 
     /// `kimmy_sync_divergence_check_age_seconds` as of `now`: seconds since
-    /// the instant the replication loop last reported a check, 0 before the
-    /// first (ADR-145, ADR-154).
+    /// the instant the replication loop last reported a check, and since the
+    /// process started before the first (ADR-145, ADR-154, ADR-187).
     ///
     /// Computed here, at the read, and not stored: a stored age is as old
     /// as the tick that stored it, and the member this was written for had
     /// a tick that did not end for an hour. `now` is a parameter so a test
     /// can read the age ninety seconds after a check without waiting ninety
     /// seconds; every caller outside a test passes `Instant::now()`.
+    ///
+    /// **Never 0 for "not yet".** It read 0 before the first check, which is
+    /// also what a check a moment ago reads, so a member that had never
+    /// checked anything reported the freshest possible reading (ADR-187).
     fn sync_divergence_check_age_secs_at(&self, now: Instant) -> u64 {
-        self.sync_divergence_last_check
-            .lock()
-            .map_or(0, |at| now.saturating_duration_since(at).as_secs())
+        self.age_at(*self.sync_divergence_last_check.lock(), now)
+    }
+
+    /// Seconds from `last` to `now`, or from the process start when there is
+    /// no `last` yet: the one rule every age on this page follows (ADR-187).
+    fn age_at(&self, last: Option<Instant>, now: Instant) -> u64 {
+        now.saturating_duration_since(last.unwrap_or(self.started)).as_secs()
+    }
+
+    /// Fix which of [`PROGRESS_WRITERS`] this node runs, from the tasks
+    /// startup supervised. Called once, after every background task is
+    /// spawned and before the HTTP listener binds, so the label set is the
+    /// same on every scrape; a second call is ignored.
+    ///
+    /// A writer this node does not start has no row, rather than a row that
+    /// climbs for ever or one that reads 0: replication on a node with
+    /// clustering off, or the embedding worker where it is disabled.
+    pub fn fix_progress_writers(&self, started: &[&'static str]) {
+        let writers = PROGRESS_WRITERS.iter().copied().filter(|w| started.contains(w)).collect();
+        let _ = self.progress_writers.set(writers);
+    }
+
+    /// Each writer's progress age as of `now`, in [`PROGRESS_WRITERS`] order,
+    /// `None` for one this node does not run.
+    fn task_progress_ages_at(&self, now: Instant) -> [Option<u64>; PROGRESS_WRITERS.len()] {
+        let runs = |w: &str| self.progress_writers.get().is_none_or(|ws| ws.contains(&w));
+        PROGRESS_WRITERS.map(|writer| {
+            let last = match writer {
+                "embedding_worker" => self.vector_counters.get().and_then(|c| c.last_progress()),
+                "replication" => *self.replication_progress.lock(),
+                "stall_probe" => *self.stall_probe_progress.lock(),
+                "webhook_dispatcher" => *self.dispatcher_progress.lock(),
+                _ => unreachable!("every progress writer has a source"),
+            };
+            runs(writer).then(|| self.age_at(last, now))
+        })
     }
 
     /// Record how late the runtime probe woke up. Keeps the maximum until the
     /// next scrape reads it, so a one-off stall between scrapes is not lost.
+    /// Each wake is the probe's progress (ADR-187): a probe that has stopped
+    /// waking reads 0 here for ever, and only its age says so.
     ///
     /// Fed to both marks: each reader gets the worst stall since *its own* last
     /// read, and neither can consume the other's.
@@ -779,6 +856,7 @@ impl Metrics {
         let us = u64::try_from(late.as_micros()).unwrap_or(u64::MAX);
         self.runtime_stall_us.fetch_max(us, Ordering::Relaxed);
         self.runtime_stall_otlp_us.fetch_max(us, Ordering::Relaxed);
+        *self.stall_probe_progress.lock() = Some(Instant::now());
     }
 
     /// The worst runtime stall since the last call, in seconds.
@@ -872,10 +950,11 @@ impl Metrics {
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
-            webhook_active: self.get(&self.webhook_active),
-            webhook_invalidated: self.get(&self.webhook_invalidated),
+            webhook_active: readings.webhook_active,
+            webhook_invalidated: readings.webhook_invalidated,
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
-            cluster_members: self.get(&self.cluster_members),
+            cluster_members: readings.cluster_members,
+            task_progress_age_secs: self.task_progress_ages_at(now),
             replication_lag_ms: self.get(&self.replication_lag_ms),
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
@@ -979,6 +1058,15 @@ impl Metrics {
             .into_iter()
             .map(|(task, n)| format!("kimmy_task_retries_total{{task=\"{task}\"}} {n}\n"))
             .collect::<String>();
+        // One line per writer this node runs, fixed at startup: a row that
+        // appeared later would be a series a dashboard could lose (ADR-187).
+        let task_progress = PROGRESS_WRITERS
+            .iter()
+            .zip(self.task_progress_ages_at(now))
+            .filter_map(|(task, age)| {
+                age.map(|age| format!("kimmy_task_progress_age_seconds{{task=\"{task}\"}} {age}\n"))
+            })
+            .collect::<String>();
 
         let vc = self.vector_counters.get();
         let (embed_docs, embed_chunks, embed_deferred, embed_not_owned, embed_failures, transport) =
@@ -1044,9 +1132,12 @@ impl Metrics {
              # HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
-             # HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. Read it beside that task's progress age rather than alone.\n\
+             # HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. For the embedding worker, read it beside kimmy_task_progress_age_seconds, which rises through a retry that never succeeds.\n\
              # TYPE kimmy_task_retries_total counter\n\
              {task_retries}\
+             # HELP kimmy_task_progress_age_seconds Seconds since a background writer last completed its work, computed when this page is read: a completed replication round, a stall-probe wake, a dispatcher pass, an embedding flush or idle turn. Since the process started before the first, never 0. Alert on this, and read the gauges a writer sets only while its age is fresh: a dead, stuck or retrying writer leaves them at their last value. A writer this node does not run has no row.\n\
+             # TYPE kimmy_task_progress_age_seconds gauge\n\
+             {task_progress}\
              # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.\n\
              # TYPE kimmy_runtime_stall_seconds gauge\n\
              kimmy_runtime_stall_seconds {stall}\n\
@@ -1095,14 +1186,14 @@ impl Metrics {
              # HELP kimmy_webhook_events_total Change events pushed to endpoints.\n\
              # TYPE kimmy_webhook_events_total counter\n\
              kimmy_webhook_events_total {wh_events}\n\
-             # HELP kimmy_webhook_subscriptions Registered subscriptions, as this node sees the registry.\n\
+             # HELP kimmy_webhook_subscriptions Registered subscriptions by state, counted from this node's registry when this page is read.\n\
              # TYPE kimmy_webhook_subscriptions gauge\n\
              kimmy_webhook_subscriptions{{state=\"active\"}} {wh_active}\n\
              kimmy_webhook_subscriptions{{state=\"invalidated\"}} {wh_invalid}\n\
-             # HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns.\n\
+             # HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns, as of the dispatcher's last pass; kimmy_task_progress_age_seconds says how old that is.\n\
              # TYPE kimmy_webhook_backlog_seconds gauge\n\
              kimmy_webhook_backlog_seconds {wh_backlog}\n\
-             # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.\n\
+             # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive, counted when this page is read. 0 with clustering off.\n\
              # TYPE kimmy_cluster_members gauge\n\
              kimmy_cluster_members {cluster}\n\
              # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round, to the millisecond. Measured after each round against the vector the peer advertised when its pull opened, so it reads 0 once a round's pull reached that vector - including while entries the peer wrote since wait up to cluster.sync_interval_secs for the next round. Non-zero means a round ended with a pull still truncated: a backlog deeper than a tick could drain. 0 when clustering is off.\n\
@@ -1134,7 +1225,7 @@ impl Metrics {
              # TYPE kimmy_sync_divergence_count_probes_total counter\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"compared\"}} {sync_div_compared}\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"deferred\"}} {sync_div_deferred}\n\
-             # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
+             # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
              # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.\n\
@@ -1236,10 +1327,10 @@ impl Metrics {
             ttl_skipped_filter = self.get(&self.ttl_skipped_filter),
             index_unkeyed = readings.index_unkeyed,
             index_undecidable = readings.index_undecidable,
-            wh_active = self.get(&self.webhook_active),
-            wh_invalid = self.get(&self.webhook_invalidated),
+            wh_active = readings.webhook_active,
+            wh_invalid = readings.webhook_invalidated,
             wh_backlog = self.get(&self.webhook_backlog_secs),
-            cluster = self.get(&self.cluster_members),
+            cluster = readings.cluster_members,
             lag = self.get(&self.replication_lag_ms) as f64 / 1e3,
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
@@ -1642,8 +1733,9 @@ mod tests {
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
         m.record_webhook_delivery(false, 0);
-        m.set_webhook_gauges(15, 16, 17);
-        m.set_cluster_members(18);
+        // The subscription counts (15, 16) and the member count (18) are
+        // readings now (ADR-187), in `distinct_readings`.
+        m.set_webhook_backlog(17);
         // Not a whole number of seconds: the gauge renders milliseconds
         // (ADR-175), and a render that truncated would print 19.
         m.set_replication_lag_ms(19_250);
@@ -1666,6 +1758,7 @@ mod tests {
             divergence_count_compared: 61,
             divergence_count_deferred: 64,
             divergence_last_check: Some(now - Duration::from_secs(70)),
+            last_completed_round: Some(now - Duration::from_secs(80)),
             entries_skipped_unknown_collection: 72,
             entries_skipped_beyond_advertised: 74,
             repair_rounds: 76,
@@ -1682,6 +1775,7 @@ mod tests {
             divergence_count_compared: 2,
             divergence_count_deferred: 3,
             divergence_last_check: Some(now - Duration::from_secs(71)),
+            last_completed_round: Some(now - Duration::from_secs(81)),
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
             repair_rounds: 1,
@@ -1703,6 +1797,14 @@ mod tests {
         m.record_latency(Duration::from_micros(90));
         m.record_latency(Duration::from_micros(400));
         m.record_latency(Duration::from_millis(30));
+        // The stall probe's and the dispatcher's instants are taken by the
+        // calls above when they are made, so they are placed here instead,
+        // each at an age of its own (ADR-187). The embedding worker has no
+        // counters on this `Metrics`, so its row reads the time since the
+        // process started: 99, the whole of `now`'s 100 s less the moments
+        // since `Metrics::default()`.
+        *m.stall_probe_progress.lock() = Some(now - Duration::from_secs(83));
+        *m.dispatcher_progress.lock() = Some(now - Duration::from_secs(85));
         m
     }
 
@@ -1749,6 +1851,9 @@ mod tests {
             // this one match the wrong line.
             index_undecidable: 37,
             sync_ddl_relogged: 91,
+            webhook_active: 15,
+            webhook_invalidated: 16,
+            cluster_members: 18,
             writer_wait: kimmy_storage::WriterWaitSnapshot {
                 buckets: [1, 2, 0, 0, 3, 0, 0, 1],
                 count: 8,
@@ -2146,7 +2251,7 @@ kimmy_up 1
 # HELP kimmy_uptime_seconds Seconds since this process started serving.
 # TYPE kimmy_uptime_seconds gauge
 kimmy_uptime_seconds 0
-# HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. Read it beside that task's progress age rather than alone.
+# HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. For the embedding worker, read it beside kimmy_task_progress_age_seconds, which rises through a retry that never succeeds.
 # TYPE kimmy_task_retries_total counter
 kimmy_task_retries_total{task=\"cert_reloader\"} 0
 kimmy_task_retries_total{task=\"embedding_worker\"} 0
@@ -2163,6 +2268,12 @@ kimmy_task_retries_total{task=\"stall_probe\"} 0
 kimmy_task_retries_total{task=\"ttl_expiry\"} 0
 kimmy_task_retries_total{task=\"vector_index_invalidator\"} 0
 kimmy_task_retries_total{task=\"webhook_dispatcher\"} 0
+# HELP kimmy_task_progress_age_seconds Seconds since a background writer last completed its work, computed when this page is read: a completed replication round, a stall-probe wake, a dispatcher pass, an embedding flush or idle turn. Since the process started before the first, never 0. Alert on this, and read the gauges a writer sets only while its age is fresh: a dead, stuck or retrying writer leaves them at their last value. A writer this node does not run has no row.
+# TYPE kimmy_task_progress_age_seconds gauge
+kimmy_task_progress_age_seconds{task=\"embedding_worker\"} 99
+kimmy_task_progress_age_seconds{task=\"replication\"} 81
+kimmy_task_progress_age_seconds{task=\"stall_probe\"} 83
+kimmy_task_progress_age_seconds{task=\"webhook_dispatcher\"} 85
 # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.
 # TYPE kimmy_runtime_stall_seconds gauge
 kimmy_runtime_stall_seconds 0
@@ -2211,14 +2322,14 @@ kimmy_webhook_deliveries_total{outcome=\"failed\"} 1
 # HELP kimmy_webhook_events_total Change events pushed to endpoints.
 # TYPE kimmy_webhook_events_total counter
 kimmy_webhook_events_total 27
-# HELP kimmy_webhook_subscriptions Registered subscriptions, as this node sees the registry.
+# HELP kimmy_webhook_subscriptions Registered subscriptions by state, counted from this node's registry when this page is read.
 # TYPE kimmy_webhook_subscriptions gauge
 kimmy_webhook_subscriptions{state=\"active\"} 15
 kimmy_webhook_subscriptions{state=\"invalidated\"} 16
-# HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns.
+# HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns, as of the dispatcher's last pass; kimmy_task_progress_age_seconds says how old that is.
 # TYPE kimmy_webhook_backlog_seconds gauge
 kimmy_webhook_backlog_seconds 17
-# HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.
+# HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive, counted when this page is read. 0 with clustering off.
 # TYPE kimmy_cluster_members gauge
 kimmy_cluster_members 18
 # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round, to the millisecond. Measured after each round against the vector the peer advertised when its pull opened, so it reads 0 once a round's pull reached that vector - including while entries the peer wrote since wait up to cluster.sync_interval_secs for the next round. Non-zero means a round ended with a pull still truncated: a backlog deeper than a tick could drain. 0 when clustering is off.
@@ -2250,7 +2361,7 @@ kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 34
 # TYPE kimmy_sync_divergence_count_probes_total counter
 kimmy_sync_divergence_count_probes_total{outcome=\"compared\"} 63
 kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
-# HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. 0 before the first such contact, when ran is also 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
+# HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
 # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.
@@ -2798,7 +2909,10 @@ kimmy_sync_serve_walk_seconds_count 1201
                 // Since ADR-184, one per supervised task: the label set is
                 // `kimmy_task::TASKS`, so this counts the tasks rather than a
                 // number written twice.
-                + kimmy_task::TASKS.len(),
+                + kimmy_task::TASKS.len()
+                // Since ADR-187, one progress age per background writer, with
+                // no startup behind this render to leave any out.
+                + PROGRESS_WRITERS.len(),
             "expected one sample per series: {out}"
         );
     }
@@ -2926,7 +3040,6 @@ kimmy_sync_serve_walk_seconds_count 1201
         let m = Metrics::default();
         let now = Instant::now() + Duration::from_secs(100);
         m.set_replication_lag_ms(7_000);
-        m.set_cluster_members(2);
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 1,
             backing_off: 1,
@@ -2938,6 +3051,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             divergence_count_compared: 2,
             divergence_count_deferred: 1,
             divergence_last_check: Some(now - Duration::from_secs(30)),
+            last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
@@ -2954,6 +3068,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             divergence_count_compared: 0,
             divergence_count_deferred: 4,
             divergence_last_check: Some(now - Duration::from_secs(8)),
+            last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,
@@ -2968,7 +3083,6 @@ kimmy_sync_serve_walk_seconds_count 1201
 
         let out = m.render_at(now);
         assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
-        assert!(out.contains("kimmy_cluster_members 2"), "{out}");
         // The failure signals are pushed per tick: counters accumulate across
         // ticks, the backoff level is the latest tick's (ADR-123).
         assert!(out.contains("kimmy_sync_failures_total 3"), "{out}");
@@ -3014,38 +3128,102 @@ kimmy_sync_serve_walk_seconds_count 1201
         assert!(out.contains("kimmy_jwks_refresh_total{outcome=\"failed\"} 1"), "{out}");
     }
 
-    /// A loop that has never run the check reports no age, and the gauge
-    /// renders `0` for it — beside a `ran` counter that also reads `0`,
-    /// which is what tells "never checked" from "checked just now"
-    /// (ADR-145, answering ADR-135's objection to an age gauge).
+    /// **An age before the first completion is the time since the process
+    /// started, never 0** (ADR-187). This is the load-bearing detail: 0 is
+    /// what a writer that finished a moment ago reads, so a member that had
+    /// never checked anything reported the freshest possible reading, and
+    /// read it most confidently when it knew least. It is also the
+    /// "simplification" most likely to be made again.
     #[test]
-    fn an_age_the_loop_has_not_got_renders_as_zero() {
+    fn an_age_before_the_first_completion_is_the_time_since_start_never_zero() {
         let m = Metrics::default();
+        // A tick in which every round failed: it reports, and nothing in it
+        // completed or checked.
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 1,
-            backing_off: 1,
-            ddl_refused: 0,
-            ddl_declined: 0,
-            divergent_collections: 0,
-            divergence_checks: 0,
             divergence_skips: 1,
-            divergence_count_compared: 0,
-            divergence_count_deferred: 0,
-            divergence_last_check: None,
-            entries_skipped_unknown_collection: 0,
-            entries_skipped_beyond_advertised: 0,
-            repair_rounds: 0,
-            pulls: kimmy_cluster::PullReport::default(),
+            ..Default::default()
         });
+        let later = m.started + Duration::from_secs(90);
+        let out = m.render_at(later);
+        assert!(out.contains("kimmy_sync_divergence_check_age_seconds 90\n"), "{out}");
+        for writer in PROGRESS_WRITERS {
+            let row = format!("kimmy_task_progress_age_seconds{{task=\"{writer}\"}} 90\n");
+            assert!(out.contains(&row), "{writer}: {out}");
+        }
+        let snapshot = m.snapshot_with_at(&StorageReadings::default(), later);
+        assert_eq!(snapshot.sync_divergence_check_age_secs, 90);
+        assert_eq!(snapshot.task_progress_age_secs, [Some(90); PROGRESS_WRITERS.len()]);
+    }
+
+    /// Each writer's age resets when that writer completes, and only that
+    /// writer's: a completion recorded under the wrong name would leave a dead
+    /// writer reading fresh.
+    #[test]
+    fn each_writer_resets_its_own_age_and_no_other() {
+        let m = Metrics::default();
+        let later = m.started + Duration::from_secs(90);
+        let ages = |m: &Metrics| m.snapshot_with_at(&StorageReadings::default(), later);
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            last_completed_round: Some(later - Duration::from_secs(4)),
+            ..Default::default()
+        });
+        assert_eq!(ages(&m).task_progress_age_secs, [Some(90), Some(4), Some(90), Some(90)]);
+        // Stamped with the clock, which is 90 s short of `later`.
+        m.record_runtime_stall(Duration::ZERO);
+        m.set_webhook_backlog(0);
+        let got = ages(&m).task_progress_age_secs;
+        assert_eq!(got[0], Some(90), "the embedding worker made no progress: {got:?}");
+        assert_eq!(got[1], Some(4), "{got:?}");
+        assert!(got[2].is_some_and(|a| a < 90), "the stall probe woke: {got:?}");
+        assert!(got[3].is_some_and(|a| a < 90), "the dispatcher completed a pass: {got:?}");
+    }
+
+    /// A writer with nothing new to report keeps ageing: two reads, no writes
+    /// between them, two different ages. An age stored at the write, rather
+    /// than subtracted at the read, is frozen with the gauges it qualifies.
+    #[test]
+    fn an_age_rises_between_reads_when_nothing_is_written() {
+        let m = Metrics::default();
+        let at = m.started + Duration::from_secs(10);
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            last_completed_round: Some(at),
+            ..Default::default()
+        });
+        let age =
+            |now| m.snapshot_with_at(&StorageReadings::default(), now).task_progress_age_secs[1];
+        assert_eq!(age(at + Duration::from_secs(5)), Some(5));
+        assert_eq!(age(at + Duration::from_secs(500)), Some(500));
+    }
+
+    /// Only the writers this node runs have a row, fixed once (ADR-187): no
+    /// clustering means no replication loop, and a row for it would climb for
+    /// ever or read 0, and both are lies.
+    #[test]
+    fn a_writer_this_node_does_not_run_has_no_row() {
+        let m = Metrics::default();
+        m.fix_progress_writers(&["stall_probe", "session_invalidator", "webhook_dispatcher"]);
+        // A second call, as a restart of the fixing code would make, changes
+        // nothing: the label set is the same on every scrape.
+        m.fix_progress_writers(&PROGRESS_WRITERS);
         let out = m.render();
-        assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
-        assert!(out.contains("kimmy_sync_divergence_checks_total{outcome=\"ran\"} 0\n"), "{out}");
-        // And it stays 0 however long the loop goes without a check: there
-        // is no instant to age. "Never" is not "long ago" (ADR-135's
-        // objection, ADR-145's answer), and computing the age at the read
-        // (ADR-154) must not turn one into the other.
-        let out = m.render_at(Instant::now() + Duration::from_secs(3_600));
-        assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
+        let rows: Vec<&str> =
+            out.lines().filter(|l| l.starts_with("kimmy_task_progress_age_seconds{")).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("kimmy_task_progress_age_seconds{task=\"stall_probe\"}"));
+        assert!(
+            rows[1].starts_with("kimmy_task_progress_age_seconds{task=\"webhook_dispatcher\"}")
+        );
+        let snapshot = m.snapshot();
+        assert_eq!(snapshot.task_progress_age_secs[0], None, "embedding_worker");
+        assert_eq!(snapshot.task_progress_age_secs[1], None, "replication");
+    }
+
+    #[test]
+    fn every_progress_writer_is_a_supervised_task() {
+        for writer in PROGRESS_WRITERS {
+            assert!(kimmy_task::TASKS.contains(&writer), "{writer} is supervised under no name");
+        }
     }
 
     /// The age is computed when it is read, not when the loop pushed it
@@ -3076,6 +3254,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             divergence_count_compared: 0,
             divergence_count_deferred: 0,
             divergence_last_check: at,
+            last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
             repair_rounds: 0,

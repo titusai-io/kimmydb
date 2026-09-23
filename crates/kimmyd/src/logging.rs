@@ -413,6 +413,36 @@ impl TelemetryGuard {
         task_retries!("kimmy.task.retries.vector_index_invalidator", "vector_index_invalidator");
         task_retries!("kimmy.task.retries.webhook_dispatcher", "webhook_dispatcher");
 
+        // One instrument per progress writer, in the same shape (ADR-187). A
+        // writer this node does not run observes nothing, as it has no row on
+        // `/metrics`; the index is the writer's place in `PROGRESS_WRITERS`,
+        // which `every_progress_writer_reaches_the_bridge` holds.
+        macro_rules! task_progress_age {
+            ($name:literal, $slot:literal, $task:literal) => {{
+                let snapshot = snapshot.clone();
+                let _ = meter
+                    .u64_observable_gauge($name)
+                    .with_unit("s")
+                    .with_description(concat!(
+                        "Seconds since the ",
+                        $task,
+                        " writer last completed its work, computed at export; since the process \
+                         started before the first. Read the gauges it sets only while this is \
+                         fresh."
+                    ))
+                    .with_callback(move |observer| {
+                        if let Some(age) = snapshot().and_then(|s| s.task_progress_age_secs[$slot]) {
+                            observer.observe(age, &[]);
+                        }
+                    })
+                    .build();
+            }};
+        }
+        task_progress_age!("kimmy.task.progress_age.embedding_worker", 0, "embedding_worker");
+        task_progress_age!("kimmy.task.progress_age.replication", 1, "replication");
+        task_progress_age!("kimmy.task.progress_age.stall_probe", 2, "stall_probe");
+        task_progress_age!("kimmy.task.progress_age.webhook_dispatcher", 3, "webhook_dispatcher");
+
         observe!(
             u64_observable_counter,
             "kimmy.responses.2xx",
@@ -535,14 +565,14 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.webhook.subscriptions.active",
             "{subscription}",
-            "Active subscriptions, as this node sees the registry.",
+            "Active subscriptions, counted from this node's registry at export.",
             webhook_active
         );
         observe!(
             u64_observable_gauge,
             "kimmy.webhook.subscriptions.invalidated",
             "{subscription}",
-            "Invalidated subscriptions, as this node sees the registry.",
+            "Invalidated subscriptions, counted from this node's registry at export.",
             webhook_invalidated
         );
         observe!(
@@ -556,7 +586,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.cluster.members",
             "{node}",
-            "Peers this node's SWIM membership considers alive.",
+            "Peers this node's SWIM membership considers alive, counted at export.",
             cluster_members
         );
         // To the millisecond since ADR-175, so a floating-point gauge where it
@@ -826,7 +856,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",
-            "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; 0 before the first.",
+            "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; since the process started before the first.",
             sync_divergence_check_age_secs
         );
         // What a batch left rather than took, and the repairs that follow
@@ -1570,6 +1600,20 @@ mod tests {
              published as something it is not:\n  {}",
             shared.join("\n  ")
         );
+    }
+
+    #[test]
+    fn every_progress_writer_reaches_the_bridge() {
+        // The instruments index the snapshot's array by position, so each must
+        // name the writer at that position; a swap would publish one writer's
+        // age under another's name.
+        let source = include_str!("logging.rs");
+        for (slot, task) in kimmy_api::metrics::PROGRESS_WRITERS.iter().enumerate() {
+            let call = format!(
+                "task_progress_age!(\"kimmy.task.progress_age.{task}\", {slot}, \"{task}\");"
+            );
+            assert!(source.contains(&call), "the bridge has no `{call}`");
+        }
     }
 
     #[test]

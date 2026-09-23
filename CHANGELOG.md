@@ -12,6 +12,37 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmy_task_progress_age_seconds{task}`** (`kimmy.task.progress_age.<task>`
+  on the OTLP bridge): seconds since each background writer last completed its
+  work, for `replication`, `stall_probe`, `webhook_dispatcher` and
+  `embedding_worker` ([ADR-187](docs/decisions.md)). Before a writer's first
+  completion it reads the time since the process started, never 0, so a
+  writer that has never run, has died, is stuck or keeps retrying reads old.
+  Alert on it, and read the gauges a writer sets (replication lag, peers
+  backing off, divergent collections, runtime stall, webhook backlog) only
+  while its age is fresh: [operations.md](docs/operations.md) has the table.
+  A writer the node does not run has no row. A scrape config or a golden list
+  that enumerates series needs the new name.
+
+### Changed
+
+- **`kimmy_sync_divergence_check_age_seconds` is no longer 0 before the first
+  check.** It reads the time since the process started, so it can no longer
+  be mistaken for a check that ran a moment ago ([ADR-187](docs/decisions.md)).
+  A rule or dashboard that reads 0 there as "never checked" should read the
+  `ran` counter instead.
+- **`kimmy_webhook_subscriptions` is counted from the registry at each scrape,
+  and it counts a record the dispatcher cannot load** (one missing a field) as
+  `active`. It used to be set by the dispatcher, which skipped such a record.
+  If the registry cannot be read, the scrape fails instead of reporting 0
+  ([ADR-187](docs/decisions.md)).
+- **`kimmy_cluster_members` is counted from the member set at each scrape.**
+  It was written by the webhook dispatcher's loop, so it froze or read 0
+  whenever that loop stopped, whatever membership was doing. What it reads is
+  unchanged.
+
 ### Fixed
 
 - **A clustered node no longer grows its memory by one entry per membership

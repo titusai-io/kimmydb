@@ -164,6 +164,8 @@ impl AppState {
         // scrape and per export, for the same reason the engine's numbers
         // are: a gauge that lags is a gauge an alert fires late on.
         let memory = crate::metrics::ProcessMemory::read();
+        let (webhook_active, webhook_invalidated) =
+            crate::dispatch::subscription_counts(&self.engine)?;
         Ok(crate::metrics::StorageReadings {
             databases: databases.len() as u64,
             collections,
@@ -212,6 +214,15 @@ impl AppState {
             // release counter above cannot say: it moves only when a mark
             // goes (ADR-160, ADR-172).
             held_marks: self.engine.held_marks()?,
+            // Read here rather than set by the dispatcher (ADR-187): live
+            // state needs no writer, so it cannot be left unwritten, frozen
+            // or late. A registry that cannot be read fails the scrape.
+            webhook_active,
+            webhook_invalidated,
+            // Counted by address rather than node id, so the gauge keeps
+            // meaning "membership entries" even during the moment a moved
+            // node is known at two addresses. 0 with clustering off.
+            cluster_members: self.members().map_or(0, |m| m.snapshot().len() as u64),
         })
     }
 
@@ -526,7 +537,7 @@ impl Auth {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -553,5 +564,38 @@ mod tests {
             vec![kimmy_auth::Grant::new("shop", "*", vec![kimmy_auth::Action::Read])],
         );
         assert_eq!(principal_key(&a, None), principal_key(&b, None), "grants are not identity");
+    }
+
+    pub(crate) fn a_state(dir: &tempfile::TempDir) -> SharedState {
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let tokens =
+            kimmy_auth::TokenIssuer::new("a-state-test-secret-a-state-test-secret", 3600).unwrap();
+        crate::state_with_egress(
+            engine,
+            tokens,
+            false,
+            crate::RateLimits::disabled(),
+            crate::egress::EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()),
+        )
+        .unwrap()
+    }
+
+    /// `kimmy_cluster_members` is the member set, counted at the read
+    /// (ADR-187): nothing runs here that could write it, and it still moves
+    /// with the set. It was written by the webhook dispatcher's loop, so a
+    /// dispatcher that never started left it at 0 whatever gossip did.
+    #[test]
+    fn the_member_count_is_read_from_the_member_set_with_no_writer_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
+        assert_eq!(state.storage_readings().unwrap().cluster_members, 0, "clustering is off");
+        let members = kimmy_cluster::Members::default();
+        state.set_members(members.clone());
+        members.insert_for_test("127.0.0.1:7001".parse().unwrap(), kimmy_core::NodeId::generate());
+        members.insert_for_test("127.0.0.1:7002".parse().unwrap(), kimmy_core::NodeId::generate());
+        assert_eq!(state.storage_readings().unwrap().cluster_members, 2);
+        members.remove_for_test(&"127.0.0.1:7001".parse().unwrap());
+        let out = state.metrics.render_with(&state.storage_readings().unwrap());
+        assert!(out.contains("\nkimmy_cluster_members 1\n"), "{out}");
     }
 }

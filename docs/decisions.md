@@ -10447,6 +10447,8 @@ line with the defect, so the assertion above has a witness that can see it).
 
 ## ADR-145 — The count half compares against a peer that is behind but standing still, and the divergence gauge says how old its reading is
 
+> **Refined by [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age):** the age reads the time since the process started before the first check, not 0.
+
 > **Amended by [ADR-146](#adr-146--the-divergence-gate-compares-witnessed-with-witnessed-a-peer-is-behind-only-when-it-has-not-processed-everything-this-node-has).**
 > The gate and the memo below are fed the peer's *witnessed* vector, not
 > its servable one, so "behind" means the peer has not processed
@@ -12140,6 +12142,8 @@ helper whose name is not on its list is not seen, and neither is a walk in
 proves.
 
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
+
+> **Refined by [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age):** the age reads the time since the process started before the first check, not 0.
 
 **Decision.** `kimmy_sync_divergence_check_age_seconds` (ADR-145) is a
 subtraction the reader does, not a number the anti-entropy loop reports. The
@@ -18761,3 +18765,54 @@ Every row above was run alone on the final tree, across `kimmy-core`, `kimmy-sto
 `a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s.
 
 The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` stated the rule as "outside the filter means absent", which stopped being the whole truth. It is renamed and widened rather than left to contradict the code.
+
+---
+
+## ADR-187 — A gauge is read at the scrape where it can be, and every other gauge's writer publishes its age
+
+**Decision.** In two tiers, in this order.
+
+1. **What can be read at the scrape is read at the scrape.** `kimmy_cluster_members` is counted from the member set, and `kimmy_webhook_subscriptions{active,invalidated}` from the registry, every time `/metrics` renders or the OTLP bridge exports. Neither has a background writer any more, so neither can be unwritten, frozen or late. A registry that cannot be read fails the scrape, as every other engine reading does, rather than reporting 0.
+2. **What only a background pass can know keeps its natural value, and its writer publishes its age beside it.** `kimmy_task_progress_age_seconds{task}` has one row per writer this node runs: `replication`, `stall_probe`, `webhook_dispatcher` and `embedding_worker`. Each age is computed at the read, as the time since that writer last completed its work. **Before the first completion it is the time since the process started, never 0.** So never-measured, frozen, dead, stuck and retrying-for-ever are one condition with one alert. `kimmy_sync_divergence_check_age_seconds` follows the same rule and no longer reads 0 before the first check. This refines [ADR-145](#adr-145--the-count-half-compares-against-a-peer-that-is-behind-but-standing-still-and-the-divergence-gauge-says-how-old-its-reading-is) and [ADR-154](#adr-154--the-divergence-check-age-is-computed-when-it-is-read-so-a-stuck-loop-cannot-freeze-it) on that one point.
+
+The consumer rule is stated in [operations.md](operations.md) as a rule, not only in HELP text, because HELP is read once and dashboards are built from memory: **alert on the age; read the gauge only when its age says it is fresh.**
+
+### Why
+
+Seven gauges started at their healthy value and could not be told apart from a real measurement: the replication lag, peers backing off, divergent collections, the divergence check's age, the runtime stall, the webhook subscription counts and the webhook backlog. `kimmy_cluster_members` read 0 for four different reasons. A member that had never completed a replication round reported a lag of 0, and it reported that reading most confidently when it knew least. When a writer died or stuck, its gauges froze at their last value, which was usually healthy. The stall probe's gauge is reset on every scrape, so with its probe gone it read "no stall" for ever. ADR-184 makes a dead task stop the process. It cannot see a task that is alive and doing nothing, and a task retrying something permanent is exactly that.
+
+`kimmy_cluster_members` was written by the webhook dispatcher's loop. The cluster harness asserts gossip formation from it, so a webhook fault could fail a membership test.
+
+### What each writer's completion is
+
+| Row | Completes when | Not when |
+|---|---|---|
+| `replication` | a round with a peer ends and the lag it leaves is measured (`RoundReport::last_completed_round`) | a tick reports: a tick whose every round failed reports too. Nor a divergence check: a check can be skipped while rounds complete |
+| `stall_probe` | the probe wakes | — |
+| `webhook_dispatcher` | a pass reads the registry and sets the backlog | the registry read fails. That pass writes neither the backlog nor the age |
+| `embedding_worker` | a flush commits, or an idle turn has nothing waiting | it is retrying a provider or a store |
+
+The embedding worker's idle turn counts because an idle worker has no batch to complete, and its age must not climb for want of writes.
+
+### Rejected
+
+- **Absent until first measured.** This contradicts the exposition's standing rule, which `docs.rs` enforces: a series that can be absent from a render is one a dashboard can lose. It is also ambiguous with "not scraped".
+- **A per-gauge sentinel.** NaN is as blind as 0 to every threshold comparison and needs `x != x` to find. -1 poisons aggregation.
+- **A row for a writer this node never starts.** Replication with clustering off would climb for ever and alert on every single node, and 0 is the lie this record removes. So a writer this node does not run has no row. The rows are fixed once, after startup has spawned every task and before the HTTP listener binds (`Metrics::fix_progress_writers`), so the label set is the same on every scrape.
+
+### Behaviour that changes
+
+- `kimmy_sync_divergence_check_age_seconds` reads the time since start before the first check, where it read 0.
+- `kimmy_webhook_subscriptions` counts a record the dispatcher cannot load (one missing a field) as `active`. It used to leave such a record out, because the dispatcher's load skipped it. The skip itself is unchanged.
+- The dispatcher's registry read no longer turns an error into an empty registry.
+
+### Tests, and how they break
+
+| Taken out | What fails |
+|---|---|
+| the start-time fallback, so "never" reads 0 | `an_age_before_the_first_completion_is_the_time_since_start_never_zero`, `each_writer_resets_its_own_age_and_no_other` and the golden exposition |
+| the replication reset kept to the completed-round arm, with one added to the failed-round arm | `only_a_completed_round_is_progress_and_a_failed_one_is_not` |
+| the dispatcher's failed read, treated as an empty registry | `a_pass_that_cannot_read_the_registry_writes_no_backlog_and_no_progress`, which reads a backlog of 0 and a fresh age where 42 and an unchanged age stood |
+| a comment on the closer of a mid-file test module (`expiry.rs`'s `hooks`) | `no_closing_brace_in_the_walk_carries_a_comment`, naming the line |
+
+The last row belongs to the spawn lint (ADR-184). That walk ends a `#[cfg(test)]` module at the first line that is exactly the module's indentation and `}`, and under `cargo fmt` only a closer carrying a trailing comment breaks that. Such a closer ends the module late, and everything up to the next bare `}` goes unread. So that shape is banned outright. A premise about what may follow a test module was the alternative, and it is false on this tree, where hook modules sit mid-file with production code after them. The guard depends on `cargo fmt --all --check` gating. A module at the end of its file already fails loudly, as never closed.
