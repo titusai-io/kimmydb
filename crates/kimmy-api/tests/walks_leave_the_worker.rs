@@ -19,8 +19,9 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 7] = [
+const WALKS: [&str; 8] = [
     ".for_each_doc(",
+    ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
     ".for_each_record_after(",
     ".visit_index_candidates(",

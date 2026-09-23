@@ -914,7 +914,9 @@ async fn a_caught_up_subscription_reports_no_backlog() {
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     pass(&state).await;
 
-    let rendered = state.metrics.render();
+    // The subscription count is a reading taken at the scrape (ADR-187), so
+    // the render needs the readings the `/metrics` handler takes.
+    let rendered = state.metrics.render_with(&state.storage_readings().unwrap());
     assert!(
         rendered.contains("kimmy_webhook_backlog_seconds 0"),
         "a caught-up subscription must report no backlog:\n{rendered}"

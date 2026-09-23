@@ -464,6 +464,59 @@ fn every_long_lived_task_is_spawned_through_the_supervisor() {
     );
 }
 
+/// Lines that close a brace and then carry a comment: `} // mod tests`, or
+/// `} /* mod tests */`.
+///
+/// [`without_test_modules`] ends a module at the first line that is exactly the
+/// module's indentation and `}`. Under `cargo fmt` that is always the module's
+/// own closer, **unless the closer carries a trailing comment**, which fmt
+/// keeps. Then the match runs on to the next bare `}` at that indentation,
+/// which is production code's, and everything between is removed unread. A
+/// premise that tried to rule this out by what follows a test module was false
+/// on the tree as it stands: hook modules sit mid-file with production code
+/// after them. So the one shape that closes late is banned instead.
+fn closers_with_a_comment(body: &str) -> Vec<usize> {
+    body.lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.trim_start().strip_prefix('}').is_some_and(|r| {
+                let r = r.trim_start();
+                r.starts_with("//") || r.starts_with("/*")
+            })
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+#[test]
+fn no_closing_brace_in_the_walk_carries_a_comment() {
+    let found: Vec<String> = production_sources()
+        .iter()
+        .flat_map(|(path, _)| {
+            let body = std::fs::read_to_string(path).expect("a readable source file");
+            let shown = path.strip_prefix(root()).unwrap_or(path).display().to_string();
+            closers_with_a_comment(&body).into_iter().map(move |line| format!("{shown}:{line}"))
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "a closing brace with a comment after it can end a #[cfg(test)] module late, so the spawn \
+         lint stops reading production code there without saying so. Move the comment to its own \
+         line:\n  {}",
+        found.join("\n  ")
+    );
+
+    // The control: the shape this bans does hide a production spawn from the
+    // walk, and the guard names it.
+    let late = "#[cfg(test)]\nmod tests {\n    fn t() {}\n} // mod tests\n\nfn production() {\n    \
+                tokio::spawn(async {});\n}\n";
+    assert!(!without_test_modules(late).contains("tokio::spawn"), "premise: the walk loses it");
+    assert_eq!(closers_with_a_comment(late), vec![4]);
+    let block = late.replace("} // mod tests", "} /* mod tests */");
+    assert!(!without_test_modules(&block).contains("tokio::spawn"), "premise: this one too");
+    assert_eq!(closers_with_a_comment(&block), vec![4]);
+}
+
 #[test]
 fn the_spawn_matcher_sees_every_ordinary_spelling() {
     // The rule is a text rule, so it is tested as one. The end-to-end splices

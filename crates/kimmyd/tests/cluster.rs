@@ -1827,3 +1827,52 @@ async fn the_divergence_check_reads_a_kept_count_not_the_collection() {
          the count is being walked"
     );
 }
+
+/// A member that has never completed a round reads a replication lag of 0,
+/// the healthiest value there is. What says that 0 was never measured is the
+/// replication loop's progress age (ADR-187): counted from the start, since
+/// no round has completed, and still rising on the next scrape. Beside it the
+/// stall probe's age stays small, so the age is the loop's own and not the
+/// process's.
+#[tokio::test]
+#[ignore = "boots a real clustered kimmyd; run with --ignored"]
+async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_climbs() {
+    let client = reqwest::Client::new();
+    // A seed nobody listens on, so every round fails. And no embedding
+    // worker, so the row set below differs from the one a render with no
+    // startup behind it shows: that is what a dropped fixing of the rows
+    // would fall back to. The `[vector]` table rides in after `[storage]`'s
+    // lines, where `spawn_with` puts what it is handed.
+    let no_worker = "\n[vector]\nworker_enabled = false";
+    let node = Node::spawn_with("node-alone", ports::choose(), &[ports::choose()], no_worker);
+    node.wait_ready(&client).await;
+
+    let replication = "kimmy_task_progress_age_seconds{task=\"replication\"}";
+    let probe = "kimmy_task_progress_age_seconds{task=\"stall_probe\"}";
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let first = node.gauge(&client, replication).await.expect("a replication age row");
+    assert_eq!(node.gauge(&client, "kimmy_replication_lag_seconds").await, Some(0));
+    assert!(
+        node.gauge(&client, "kimmy_sync_failures_total").await.is_some_and(|n| n > 0),
+        "premise: the rounds are failing"
+    );
+    let uptime = node.gauge(&client, "kimmy_uptime_seconds").await.expect("uptime");
+    assert!(first + 1 >= uptime, "counted from the start: age {first}, uptime {uptime}");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let second = node.gauge(&client, replication).await.expect("a replication age row");
+    assert!(second >= first + 2, "and still rising: {first} then {second}");
+    let woke = node.gauge(&client, probe).await.expect("a stall probe age row");
+    assert!(woke <= 1, "the probe is waking, so its age is its own: {woke}");
+
+    // Exactly the writers this node starts, fixed at startup: a row missing
+    // here is a writer nobody can alert on, and a row for one it does not run
+    // would climb for ever.
+    let body = client.get(node.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    let rows: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("kimmy_task_progress_age_seconds{task=\""))
+        .filter_map(|l| l.split('"').next())
+        .collect();
+    assert_eq!(rows, ["replication", "stall_probe", "webhook_dispatcher"]);
+}

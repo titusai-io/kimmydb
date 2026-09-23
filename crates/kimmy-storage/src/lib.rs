@@ -15,6 +15,9 @@ pub mod docs;
 pub mod engine;
 pub mod error;
 pub mod expiry;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod faults;
 pub mod gc;
 pub mod hold_meter;
 pub mod index;

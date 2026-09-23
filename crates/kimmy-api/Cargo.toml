@@ -71,7 +71,10 @@ uuid.workspace = true
 reqwest.workspace = true
 bson.workspace = true
 kimmy-auth.workspace = true
-kimmy-storage.workspace = true
+# Records no write path can produce, for the readers that must survive them:
+# an undecodable webhook record, a registry whose metadata will not read
+# (ADR-187). Test-only; the feature never reaches a build that ships.
+kimmy-storage = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 serde_norway.workspace = true
 jsonschema.workspace = true

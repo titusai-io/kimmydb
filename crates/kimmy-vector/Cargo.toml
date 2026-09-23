@@ -42,6 +42,9 @@ local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
 
 [dev-dependencies]
 criterion.workspace = true
+# A document record that does not decode, so a store can be failed mid-batch
+# (ADR-187). Test-only; the feature never reaches a build that ships.
+kimmy-storage = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 

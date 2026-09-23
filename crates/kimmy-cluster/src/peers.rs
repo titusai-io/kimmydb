@@ -139,6 +139,18 @@ pub struct RoundReport {
     /// subtraction the reader does against its own clock, whether or not
     /// this loop ever ticks again.
     pub divergence_last_check: Option<Instant>,
+    /// When a round with any peer last completed — the contact's last pull
+    /// came back and its lag was measured; `None` before the first
+    /// (ADR-187). Carried on every tick as a level, like the check's
+    /// instant, and for the same reason: the reader subtracts it from its
+    /// own clock, so the age of `kimmy_replication_lag_seconds` and the
+    /// other figures this loop sets keeps rising through ticks whose every
+    /// round fails and through a tick that never ends.
+    ///
+    /// **Rounds, not ticks and not checks.** A tick in which every round
+    /// failed still reports, and a check can be skipped while rounds
+    /// complete, so neither says the lag gauge was re-measured.
+    pub last_completed_round: Option<Instant>,
     /// Batches the rounds in this tick stopped short at an entry for a
     /// collection this node does not hold — `SyncOutcome::unknown_collection`,
     /// summed over the peers reached (ADR-148). A counter. Each one is a
@@ -517,6 +529,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // not the age (ADR-154): the age is the reader's subtraction, so it
     // keeps rising while a tick of this loop is stuck and nothing here runs.
     let mut last_check = LastCheck::default();
+    let mut last_round = LastCheck::default();
 
     // Peers currently flagged as stale rejoiners, so the warning fires on the
     // transition and not on every round they stay that way.
@@ -695,6 +708,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // How the contact ended, counted once per contact
                             // on the pull that ended it (ADR-175).
                             report.pulls.ended(ended);
+                            // A completed round, which is what re-measures the
+                            // lag (ADR-187): here, on the pull that ended the
+                            // contact, and never in the `Err` arm.
+                            last_round.ran(Instant::now());
                             if ended == ContactEnd::Ceiling {
                                 // Budget left and still truncated at the
                                 // ceiling (ADR-157's addendum). The contact
@@ -892,6 +909,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // (ADR-154), so that the reader's number goes on rising
                 // through a tick of this loop that never ends.
                 report.divergence_last_check = last_check.at();
+                report.last_completed_round = last_round.at();
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.
@@ -1425,6 +1443,62 @@ mod tests {
         last.ran(t3);
         assert_eq!(last.age(t3), Some(Duration::ZERO), "a check resets it");
         assert_eq!(last.age(t3 + Duration::from_secs(2)), Some(Duration::from_secs(2)));
+    }
+
+    /// ADR-187 at the loop: the instant a report carries for the replication
+    /// writer's age is a **completed round**, never a tick. A tick in which
+    /// every round failed still reports, and an age reset there would read
+    /// fresh on a member that has not measured its lag since it started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_completed_round_is_progress_and_a_failed_one_is_not() {
+        const SECRET: &str = "a-loop-test-secret";
+        async fn ticks(
+            engine: &Arc<Engine>,
+            peer: std::net::SocketAddr,
+            n: usize,
+        ) -> Vec<RoundReport> {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+            let local = "127.0.0.1:1".parse().unwrap();
+            let mut config =
+                ReplicationConfig::new(vec![SeedSource::Static(vec![peer])], SECRET.into(), local);
+            config.sync_interval = Duration::from_millis(100);
+            config.discovery_interval = Duration::from_millis(100);
+            config.on_round = Some(Arc::new(move |report| {
+                let _ = tx.send(report);
+            }));
+            let looping = tokio::spawn(replicate(Arc::clone(engine), config));
+            let mut seen = Vec::new();
+            while seen.len() < n {
+                let report = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await;
+                seen.push(report.expect("the loop ticks").expect("the loop is running"));
+            }
+            looping.abort();
+            seen
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let here = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+
+        // A peer nobody answers for: bound and released, so a connect fails.
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let failing = ticks(&here, dead, 3).await;
+        assert!(failing.iter().any(|r| r.failed > 0), "the rounds failed: {failing:?}");
+        assert!(
+            failing.iter().all(|r| r.last_completed_round.is_none()),
+            "a failed round is not progress: {failing:?}"
+        );
+
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(Engine::open(&peer_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::transport::serve(peer, listener, SECRET.into()));
+        let before = Instant::now();
+        let working = ticks(&here, addr, 3).await;
+        assert!(
+            working.iter().any(|r| r.last_completed_round.is_some_and(|at| at >= before)),
+            "a round that completed is: {working:?}"
+        );
     }
 
     /// ADR-177 at the loop: a round that fails after its apply committed
