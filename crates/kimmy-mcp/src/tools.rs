@@ -13,7 +13,7 @@
 use kimmy_api::{ApiError, SharedState, exec, schema, vectors};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, tool, tool_router};
 use schemars::JsonSchema;
@@ -33,8 +33,8 @@ impl KimmyMcp {
         Self { state, tool_router: Self::tool_router() }
     }
 
-    pub(crate) fn server_info() -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
+    pub(crate) fn server_info() -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(Implementation::new("kimmydb", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "KimmyDB is a document database with vector and hybrid search. \

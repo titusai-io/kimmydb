@@ -22,7 +22,7 @@
 use kimmy_auth::Action;
 use rmcp::model::{
     ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ServerInfo,
+    ReadResourceResult, Resource, ResourceContents, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler};
@@ -43,7 +43,7 @@ const SAMPLE_DOCUMENTS: usize = 3;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KimmyMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         Self::server_info()
     }
 
