@@ -585,7 +585,8 @@ naming the error. **Alert on the exit** as on any restart. **When the disk is
 full, the marker usually cannot be written**, so the next start reports
 `previous run did not shut down cleanly` instead, and the `ERROR` line may be
 cut off if the log is a file on the same disk. The exit status, 70, is the
-reliable sign.
+reliable sign, and it comes within five seconds even when the log cannot be
+written at all, as when whatever reads the node's stdout has stalled.
 
 **On a disk that stays full, that is a restart loop, on purpose.** Each start
 repairs and serves reads, and the first write that needs space fails and stops

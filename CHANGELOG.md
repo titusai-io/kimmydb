@@ -38,6 +38,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   answers 503 until it does. On a disk that stays full this is a restart loop,
   on purpose ([ADR-188](docs/decisions.md)). A start that repairs a file after
   an unclean stop now says so, and how long it took: about 0.4 s per GiB.
+  The exit comes within 5 s even when the log cannot be written, as when
+  whatever reads the node's stdout has stalled; the same holds for a task
+  death's exit.
 
 - **`kimmy_sync_divergence_check_age_seconds` is no longer 0 before the first
   check** on a node with clustering on. It reads the time since the process

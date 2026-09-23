@@ -704,3 +704,48 @@ async fn a_task_supervised_many_times_is_recorded_as_started_once() {
     let seen = kimmy_task::started().iter().filter(|n| **n == "membership_timer").count();
     assert_eq!(seen, 1, "still once after all of them ran: {seen}");
 }
+
+/// A report that blocks, rather than fails, still ends in the exit, within
+/// `EXIT_DEADLINE`.
+///
+/// The child holds stderr's lock on a thread of its own, forever, which is what
+/// a stderr pipe whose reader is alive but no longer reading does to every other
+/// writer once the pipe is full: the report's write to stderr waits, and without
+/// the deadline the exit after it never comes. The parent gives up well after
+/// the deadline, so a hang fails here rather than hanging the suite.
+#[test]
+fn a_report_that_blocks_still_exits_70_within_the_deadline() {
+    if scenario_is("stalled_stderr") {
+        let (held, hold) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _stderr = std::io::stderr().lock();
+            held.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        hold.recv().unwrap();
+        kimmy_task::exit_because("probe_stalled", kimmy_task::Death::Returned, "the probe stalls");
+    }
+
+    let started = std::time::Instant::now();
+    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "a_report_that_blocks_still_exits_70_within_the_deadline"])
+        .env("KIMMY_TASK_PROBE", "stalled_stderr")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("re-running this test binary");
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > kimmy_task::EXIT_DEADLINE * 6 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("a report blocked on stderr kept the process from exiting");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(70), "the deadline's exit keeps the status: {status:?}");
+}

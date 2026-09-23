@@ -98,6 +98,34 @@ pub fn on_death(reporter: Box<dyn OnDeath>) -> bool {
 /// daemon uses the same number where it installs its own reporter.
 pub const EXIT_RESTART_WORTHY: i32 = 70;
 
+/// How long a report before an exit may take before the exit happens without it.
+pub const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Exit [`EXIT_RESTART_WORTHY`] after [`EXIT_DEADLINE`], from a thread of its
+/// own, whatever the caller is doing by then. Call it first thing on a way out.
+///
+/// `catch_unwind` bounds a report that panics, not one that blocks. A write to
+/// stdout or stderr whose reader is alive but not reading waits for the pipe to
+/// drain, and with it every other writer that wants the same lock: a log line
+/// in the report, and the flushes after it, wait forever, and so does the exit.
+/// So the exit is raw `_exit`, which neither flushes nor runs anything, and it
+/// keeps the status 70 an operator reads, where `abort` would give a signal and
+/// a core file. A thread that cannot be spawned leaves the exit unbounded, as
+/// it was before.
+pub fn exit_deadline() {
+    let _ = std::thread::Builder::new().name("exit-deadline".into()).spawn(|| {
+        std::thread::sleep(EXIT_DEADLINE);
+        #[cfg(unix)]
+        // SAFETY: `_exit` takes a plain status and never returns; it touches no
+        // Rust state, which is why it cannot block where `process::exit` can.
+        unsafe {
+            libc::_exit(EXIT_RESTART_WORTHY)
+        };
+        #[cfg(not(unix))]
+        std::process::abort();
+    });
+}
+
 /// End the process because `task` reached a restart-worthy state.
 ///
 /// Public because the same exit path serves every such state, not only a dead
@@ -116,6 +144,7 @@ pub fn exit_because(task: &'static str, cause: Death, detail: &str) -> ! {
         // status 70 and no explanation at all. Found exactly that way, by a
         // membership test binary disappearing mid-run.
         None => {
+            exit_deadline();
             // Under `catch_unwind`, and with a write that ignores its error
             // rather than `eprintln!`, which panics when stderr cannot be
             // written: nothing in the report may stop the exit after it.

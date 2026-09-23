@@ -55,12 +55,16 @@ impl kimmy_task::OnDeath for ExitOnDeath {
 /// already recorded, so the node never exited and served errors, which is the
 /// state this exit exists to end. So the report runs under `catch_unwind`, its
 /// writes ignore their errors, and the exit comes after it unconditionally.
+/// A report that blocks rather than fails, on a stdout whose reader has
+/// stalled, is bounded by [`kimmy_task::exit_deadline`]: the exit comes at
+/// most five seconds after the stop begins, with the same status.
 ///
 /// No destructors run, so the engine is not closed cleanly. redb repairs an
 /// unclean file on the next open, and the marker, when it could be written, is
 /// what distinguishes this from a crash.
 fn stop(report: impl FnOnce()) -> ! {
     use std::io::Write as _;
+    kimmy_task::exit_deadline();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(report));
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
