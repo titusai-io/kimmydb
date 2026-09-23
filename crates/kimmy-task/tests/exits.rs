@@ -685,3 +685,22 @@ async fn a_quiet_stretch_resets_the_backoff() {
 fn count_for(task: &str) -> u64 {
     kimmy_task::retries().into_iter().find(|(name, _)| *name == task).map_or(0, |(_, n)| n)
 }
+
+#[tokio::test]
+async fn a_task_supervised_many_times_is_recorded_as_started_once() {
+    // A membership timer is supervised once per scheduled event, so a name
+    // recorded per call grew the list by one entry per timer for the life of
+    // the process. And recorded before the spawn returns, not from inside the
+    // supervisor: the node reads this list before it starts serving.
+    let shutdown = kimmy_task::Shutdown::new();
+    let handles: Vec<_> = (0..1_000)
+        .map(|_| kimmy_task::supervise_oneshot("membership_timer", shutdown.clone(), async {}))
+        .collect();
+    let seen = kimmy_task::started().iter().filter(|n| **n == "membership_timer").count();
+    assert_eq!(seen, 1, "recorded once and before any supervisor ran: {seen}");
+    for handle in handles {
+        handle.await.expect("a one-shot that completes is not a death");
+    }
+    let seen = kimmy_task::started().iter().filter(|n| **n == "membership_timer").count();
+    assert_eq!(seen, 1, "still once after all of them ran: {seen}");
+}
