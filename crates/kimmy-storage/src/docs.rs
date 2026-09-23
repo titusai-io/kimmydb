@@ -279,8 +279,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Every live document in `coll`, handing `f` `None` for one that cannot
-    /// be decoded instead of failing the walk.
+    /// Every live document in `coll` with its stored key, handing `f` `None`
+    /// for one that cannot be decoded instead of failing the walk. The key is
+    /// what names a record that cannot be decoded.
     ///
     /// For a reader that must report on every record, one bad record
     /// included, such as the scrape counting webhook subscriptions (ADR-187).
@@ -288,12 +289,12 @@ impl Engine {
     /// being unreadable, not one record.
     pub fn for_each_doc_or_undecodable<F>(&self, coll: &CollectionMeta, mut f: F) -> Result<()>
     where
-        F: FnMut(Option<Document>) -> Result<bool>,
+        F: FnMut(&[u8], Option<Document>) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         for entry in docs.range(doc_range_after(coll.id, None))? {
-            let (_, value) = entry?;
+            let (key, value) = entry?;
             let decoded = codec::decode_doc_record(value.value()).ok().and_then(|record| {
                 if record.deleted {
                     return Some(None);
@@ -307,7 +308,7 @@ impl Engine {
                 Some(Some(doc)) => Some(doc),
                 None => None,
             };
-            if !f(doc)? {
+            if !f(key.value().1, doc)? {
                 break;
             }
         }

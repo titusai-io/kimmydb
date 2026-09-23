@@ -33,4 +33,34 @@ impl Engine {
         }
         txn.commit().expect("the commit");
     }
+
+    /// Add a row to the served version vector that does not decode, so every
+    /// read of the vector fails.
+    pub fn corrupt_version_vector_for_test(&self) {
+        let txn = self.begin_write(WriterHolder::Ddl).expect("the writer");
+        {
+            let mut versions = txn.open_table(tables::OPLOG_VERSIONS).expect("the table");
+            versions
+                .insert(b"not a node".as_slice(), b"not a clock".as_slice())
+                .expect("the insert");
+        }
+        txn.commit().expect("the commit");
+    }
+
+    /// Overwrite every oplog entry with bytes that do not decode, so a read of
+    /// the oplog that reaches one fails.
+    pub fn corrupt_oplog_for_test(&self) {
+        let txn = self.begin_write(WriterHolder::Ddl).expect("the writer");
+        {
+            let mut oplog = txn.open_table(tables::OPLOG).expect("the table");
+            let keys: Vec<Vec<u8>> = redb::ReadableTable::iter(&oplog)
+                .expect("the oplog")
+                .map(|row| row.expect("a row").0.value().to_vec())
+                .collect();
+            for key in keys {
+                oplog.insert(key.as_slice(), b"not an entry".as_slice()).expect("the insert");
+            }
+        }
+        txn.commit().expect("the commit");
+    }
 }

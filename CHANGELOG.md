@@ -34,8 +34,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   started, so it can no longer be mistaken for a check that ran a moment ago
   ([ADR-187](docs/decisions.md)). A rule or dashboard that reads 0 there as
   "never checked" should read the `ran` counter instead. With clustering off
-  it still reads 0, so alert on it only while `kimmy_cluster_members` is
-  above 0.
+  it still reads 0, so alert on it only where
+  `kimmy_task_progress_age_seconds` has a `replication` row.
 - **`kimmy_webhook_subscriptions` is counted from the registry at each scrape,
   and it counts a record the dispatcher cannot load** (one missing a field) as
   `active`. It used to be set by the dispatcher, which skipped such a record.
@@ -49,6 +49,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   unchanged.
 
 ### Fixed
+
+- **A webhook registry record that does not decode no longer stops delivery
+  for the subscriptions stored after it.** The dispatcher's load stopped
+  reading at the first such record and delivered nothing past it, silently.
+  It now skips that record with a warning naming its key, and every other
+  subscription is delivered. The scrape counts it under `unreadable`
+  ([ADR-187](docs/decisions.md)).
 
 - **A clustered node no longer grows its memory by one entry per membership
   timer.** The supervisor added in 0.34.0 ([ADR-184](docs/decisions.md))

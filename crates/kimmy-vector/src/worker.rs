@@ -712,15 +712,7 @@ impl EmbeddingWorker {
                         self.flush(&mut pending).await?;
                     }
                     self.drain_deferred(now).await;
-                    // An idle turn is progress when nothing is left waiting:
-                    // a quiet node has no batch to complete, and its age must
-                    // not climb for want of writes.
-                    if pending.batches.is_empty()
-                        && pending.token.is_none()
-                        && !self.deferred_retrying
-                    {
-                        self.counters.progressed();
-                    }
+                    self.idle_turn(&pending);
                     continue;
                 }
             };
@@ -1326,7 +1318,7 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_batch(ready, &mut Checkpoint::default()).await;
+                embedded += self.embed_scanned(ready).await;
             }
             batch.push(job);
             if batch.full(&self.batching) {
@@ -1334,10 +1326,10 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_batch(ready, &mut Checkpoint::default()).await;
+                embedded += self.embed_scanned(ready).await;
             }
         }
-        embedded += self.embed_batch(batch, &mut Checkpoint::default()).await;
+        embedded += self.embed_scanned(batch).await;
 
         // The completed scan is what the fingerprint attests. Failing to
         // write it costs a redundant re-scan next time, never a gap.
@@ -1586,6 +1578,25 @@ impl EmbeddingWorker {
     /// permanent failure hands it to none of its documents, and the flush
     /// writes it on its own afterwards — one extra commit on a path that
     /// had already failed.
+    /// An idle turn is progress when nothing is left waiting and no deferred
+    /// re-check is retrying (ADR-187): a quiet node has no batch to complete,
+    /// and its age must not climb for want of writes.
+    fn idle_turn(&self, pending: &Pending) {
+        if pending.batches.is_empty() && pending.token.is_none() && !self.deferred_retrying {
+            self.counters.progressed();
+        }
+    }
+
+    /// One batch of a scan, stored, and the worker's progress with it
+    /// (ADR-187). A backfill of a large collection is a long run of these
+    /// with no flush and no idle turn between them, and it is working: without
+    /// this its age climbed for the whole scan.
+    async fn embed_scanned(&mut self, batch: Batch) -> usize {
+        let embedded = self.embed_batch(batch, &mut Checkpoint::default()).await;
+        self.counters.progressed();
+        embedded
+    }
+
     async fn embed_batch(&mut self, batch: Batch, checkpoint: &mut Checkpoint) -> usize {
         let Batch { collection, shadow, config, jobs, .. } = batch;
         if jobs.is_empty() {
@@ -2618,9 +2629,10 @@ mod tests {
     }
 
     /// The worker's progress, behind its row of `kimmy_task_progress_age_seconds`
-    /// (ADR-187), is either of two things, and each is told apart here.
+    /// (ADR-187), is any of three things, and each is told apart here.
     ///
-    /// A flush that committed: a batch of one chunk is full as it is pushed,
+    /// A batch a backfill's scan stored: the scan runs before the loop, from
+    /// the configuration entry, so nothing else can have moved it. A flush that committed: a batch of one chunk is full as it is pushed,
     /// so it goes out from the entry arm, before any timed wait has elapsed.
     /// Then an idle turn with nothing waiting, which is all a quiet node ever
     /// does: once the position has settled, the stored position standing
@@ -2629,14 +2641,14 @@ mod tests {
     /// Real time rather than a paused clock: the batch deadline is read from
     /// the std clock, so a paused one never lets a batch go.
     #[tokio::test]
-    async fn a_committed_flush_and_an_idle_turn_are_each_progress() {
+    async fn a_scanned_batch_a_committed_flush_and_an_idle_turn_are_each_progress() {
         async fn waited(until: Duration, moved: impl Fn() -> bool) {
             let deadline = Instant::now() + until;
             while !moved() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        let (engine, coll, mut worker, _dir) = setup().await;
+        let (engine, coll, mut worker, _dir) = setup_with_history(3).await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
         worker.set_batching(BatchSettings {
@@ -2644,15 +2656,21 @@ mod tests {
             max_wait: Duration::from_secs(60),
             ..Default::default()
         });
-        position_at_latest(&engine);
         let counters = worker.counters();
 
-        engine.insert(&coll, doc! { "_id": 0i64, "title": "progress" }).unwrap();
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 3 });
+        let scanned = counters.last_progress();
+        assert!(scanned.is_some(), "each batch the scan stored");
+
+        position_at_latest(&engine);
+        engine.insert(&coll, doc! { "_id": 99i64, "title": "progress" }).unwrap();
         tokio::spawn(async move { worker.run().await });
-        // Inside `POSITION_WAIT`, the shortest timed wait the loop takes, so no
-        // timed turn can have come first.
-        waited(POSITION_WAIT / 2, || counters.last_progress().is_some()).await;
-        assert!(counters.last_progress().is_some(), "the flush that stored the batch");
+        // Inside `POSITION_WAIT`, the shortest timed wait the loop takes: a
+        // timed turn after it counts as idle, and a wider bound lets that turn
+        // stand in for a flush that recorded nothing.
+        waited(POSITION_WAIT / 2, || counters.last_progress() != scanned).await;
+        assert!(counters.last_progress() > scanned, "the flush that stored the batch");
 
         // Let anything held go out, then only an idle turn can move it.
         tokio::time::sleep(POSITION_WAIT * 2).await;
@@ -3725,6 +3743,32 @@ mod tests {
 
         assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
         assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A drain that puts a document back after a retryable provider error is
+    /// not idle (ADR-187): the next idle turn records no progress, and the
+    /// drain that gets it through lets the one after it count again.
+    #[tokio::test]
+    async fn an_idle_turn_is_not_progress_while_a_deferred_re_check_is_retrying() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let owner = switchable_owner(&mut worker, false);
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+        owner.store(true, std::sync::atomic::Ordering::SeqCst);
+        let counters = worker.counters();
+
+        fake.fail_times.store(1, std::sync::atomic::Ordering::SeqCst);
+        let due = Instant::now() + FOREIGN_GRACE;
+        assert_eq!(worker.drain_deferred(due).await, 0, "premise: the re-check failed");
+        worker.idle_turn(&Pending::default());
+        assert_eq!(counters.last_progress(), None, "a turn spent retrying is not idle");
+
+        assert_eq!(worker.drain_deferred(due + RETRY_DELAY).await, 1, "and then succeeded");
+        worker.idle_turn(&Pending::default());
+        assert!(counters.last_progress().is_some(), "a clean drain lets an idle turn count");
     }
 
     #[tokio::test]

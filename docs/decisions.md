@@ -18790,13 +18790,13 @@ Seven gauges started at their healthy value and could not be told apart from a r
 | `replication` | a round with a peer ends and the lag it leaves is measured (`RoundReport::last_completed_round`) | a tick reports: a tick whose every round failed reports too. Nor a divergence check: a check can be skipped while rounds complete |
 | `stall_probe` | the probe wakes | — |
 | `webhook_dispatcher` | a pass reads everything it planned from and sets the backlog | any read in the pass fails: the registry, this node's version vector, a subscription's oplog window. That pass writes neither the backlog nor the age, since a backlog missing a subscription it could not read would be a healthy value after a failed read |
-| `embedding_worker` | a flush commits, or an idle turn has nothing waiting | it is retrying a store, a backfill's provider calls, or a deferred re-check's provider call |
+| `embedding_worker` | a flush commits, a backfill's scan stores a batch, or an idle turn has nothing waiting | it is retrying a provider call, which every path that makes one does until it succeeds: a streamed batch, which is the main way the age climbs, a backfill, a deferred re-check. Nor while it retries a store |
 
 The embedding worker's idle turn counts because an idle worker has no batch to complete, and its age must not climb for want of writes. It does not count while a deferred re-check is retrying a provider call. It does count while documents another member wrote wait out that member's grace period, which is ordinary on a cluster and can last ten minutes.
 
 ### Thresholds
 
-Each suggested alert is twice the longest gap a healthy writer leaves between completions, derived from the constants rather than chosen: `replication` at 3 × `cluster.sync_interval_secs`; `stall_probe` at 1 s, the stall alert's own threshold, against a 250 ms period; `webhook_dispatcher` at 24 s, twice a delivery timeout of 10 s plus the 2 s between passes; `embedding_worker` at 130 s, twice the 5 s idle tick plus the provider's 60 s timeout. `operations.md` carries the table.
+Each suggested alert is derived from the writer's own timings rather than chosen: twice the longest gap a healthy writer leaves between completions, and never below what whole-second ages can resolve. `replication` at 4 × `cluster.sync_interval_secs`, since a tick that runs long delays the next by up to an interval; `stall_probe` at 2 s or more, since it wakes every 250 ms but a healthy probe reads 0 or 1 in whole seconds; `webhook_dispatcher` at 24 s, twice a delivery timeout of 10 s plus the 2 s between passes; `embedding_worker` at 130 s, twice the 5 s idle tick plus the provider's 60 s timeout, with a backfill resetting it per stored batch. `operations.md` carries the table. The divergence check's age is alerted on only where a `replication` row exists: a partitioned member reads 0 members, and it is the one whose age matters.
 
 ### Rejected
 
@@ -18809,6 +18809,7 @@ Each suggested alert is twice the longest gap a healthy writer leaves between co
 - `kimmy_sync_divergence_check_age_seconds` reads the time since start before the first check, where it read 0, on a node with clustering on. With clustering off it still reads 0.
 - `kimmy_webhook_subscriptions` counts a record the dispatcher cannot load (one missing a field) as `active`. It used to leave such a record out, because the dispatcher's load skipped it. The skip itself is unchanged.
 - `kimmy_webhook_subscriptions` has a third state, `unreadable`, for a record that does not decode.
+- The dispatcher skips a record that does not decode, with a warning naming its key, and delivers every other subscription. Its load used to stop at the first such record, silently, and deliver nothing stored after it.
 - The dispatcher's registry read no longer turns an error into an empty registry.
 
 ### Tests, and how they break
