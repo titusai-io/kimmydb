@@ -1124,7 +1124,9 @@ mod tests {
         };
         subscribe(&state, "wh_a", whole);
         let meta = state.engine.get_collection(WEBHOOKS_DB, WEBHOOKS_COLLECTION).unwrap();
-        state.engine.store_undecodable_doc_for_test(&meta, b"\xffbroken");
+        // Stored ahead of every real record, so a walk that stopped at it
+        // would load nothing: the shape the dispatcher's load used to have.
+        state.engine.store_undecodable_doc_for_test(&meta, b"\x00broken");
 
         let readings = state.storage_readings().expect("one bad record does not fail the scrape");
         assert_eq!(

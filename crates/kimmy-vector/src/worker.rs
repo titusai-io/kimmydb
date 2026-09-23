@@ -1557,6 +1557,30 @@ impl EmbeddingWorker {
         Ok(written.len())
     }
 
+    /// An idle turn is progress when nothing is left waiting and no deferred
+    /// re-check is retrying (ADR-187): a quiet node has no batch to complete,
+    /// and its age must not climb for want of writes.
+    fn idle_turn(&self, pending: &Pending) {
+        if pending.batches.is_empty() && pending.token.is_none() && !self.deferred_retrying {
+            self.counters.progressed();
+        }
+    }
+
+    /// One batch of a scan, and the worker's progress with it when its store
+    /// did not fail, as for a flush (ADR-187). A backfill of a large
+    /// collection is a long run of these with no flush and no idle turn
+    /// between them, and it is working: without this its age climbed for the
+    /// whole scan. A store that fails is not progress, or a shadow collection
+    /// that cannot be written would read fresh for the whole scan.
+    async fn embed_scanned(&mut self, batch: Batch) -> usize {
+        let mut checkpoint = Checkpoint::default();
+        let embedded = self.embed_batch(batch, &mut checkpoint).await;
+        if !checkpoint.failed {
+            self.counters.progressed();
+        }
+        embedded
+    }
+
     /// Embed one batch and return how many documents were written.
     ///
     /// A retryable failure retries the whole batch, forever, exactly as one
@@ -1578,25 +1602,6 @@ impl EmbeddingWorker {
     /// permanent failure hands it to none of its documents, and the flush
     /// writes it on its own afterwards — one extra commit on a path that
     /// had already failed.
-    /// An idle turn is progress when nothing is left waiting and no deferred
-    /// re-check is retrying (ADR-187): a quiet node has no batch to complete,
-    /// and its age must not climb for want of writes.
-    fn idle_turn(&self, pending: &Pending) {
-        if pending.batches.is_empty() && pending.token.is_none() && !self.deferred_retrying {
-            self.counters.progressed();
-        }
-    }
-
-    /// One batch of a scan, stored, and the worker's progress with it
-    /// (ADR-187). A backfill of a large collection is a long run of these
-    /// with no flush and no idle turn between them, and it is working: without
-    /// this its age climbed for the whole scan.
-    async fn embed_scanned(&mut self, batch: Batch) -> usize {
-        let embedded = self.embed_batch(batch, &mut Checkpoint::default()).await;
-        self.counters.progressed();
-        embedded
-    }
-
     async fn embed_batch(&mut self, batch: Batch, checkpoint: &mut Checkpoint) -> usize {
         let Batch { collection, shadow, config, jobs, .. } = batch;
         if jobs.is_empty() {
@@ -1898,6 +1903,9 @@ mod tests {
         /// An input the model "cannot take": any call containing it fails
         /// permanently, as a provider refusing one oversized input does.
         poison: std::sync::Mutex<Option<String>>,
+        /// Run once, at the next call: something to happen while the
+        /// provider has the batch, such as the document changing under it.
+        on_call: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl FakeProvider {
@@ -1910,6 +1918,7 @@ mod tests {
                 inputs: Default::default(),
                 sizes: Default::default(),
                 poison: Default::default(),
+                on_call: Default::default(),
             })
         }
 
@@ -1927,6 +1936,9 @@ mod tests {
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             use std::sync::atomic::Ordering;
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(on_call) = self.on_call.lock().unwrap().take() {
+                on_call();
+            }
             self.inputs.lock().unwrap().extend(texts.iter().cloned());
             self.sizes.lock().unwrap().push(texts.len());
             let poisoned = self
@@ -2642,6 +2654,24 @@ mod tests {
     /// the std clock, so a paused one never lets a batch go.
     #[tokio::test]
     async fn a_scanned_batch_a_committed_flush_and_an_idle_turn_are_each_progress() {
+        // First, a scanned batch whose store fails is not progress: its
+        // document is damaged while the provider has it, so the store's
+        // re-read of it fails. A shadow collection that cannot be written
+        // would otherwise read fresh for the whole scan.
+        {
+            let (engine, coll, mut worker, _dir) = setup_with_history(1).await;
+            let fake = FakeProvider::new(4);
+            let (e, c) = (Arc::clone(&engine), coll.clone());
+            *fake.on_call.lock().unwrap() = Some(Box::new(move || {
+                e.corrupt_document_for_test(&c, &kimmy_core::DocId::Int64(0));
+            }));
+            worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+            let counters = worker.counters();
+            let _ = worker.process(&last_entry(&engine)).await;
+            assert_eq!(fake.calls(), 1, "premise: the batch reached the provider");
+            assert_eq!(counters.last_progress(), None, "a scanned batch whose store failed");
+        }
+
         async fn waited(until: Duration, moved: impl Fn() -> bool) {
             let deadline = Instant::now() + until;
             while !moved() && Instant::now() < deadline {
@@ -3743,6 +3773,29 @@ mod tests {
 
         assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
         assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A streamed batch whose provider keeps failing retries in place, and
+    /// its age does not reset meanwhile (ADR-187): this is the main way a
+    /// provider outage shows. On a paused clock, so the retry delays cost
+    /// nothing; a batch of one chunk goes out from the entry arm, with no
+    /// deadline read from the std clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_retrying_its_provider_is_not_progress() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        fake.fail_times.store(1_000, std::sync::atomic::Ordering::SeqCst);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings { max_chunks: 1, ..Default::default() });
+        position_at_latest(&engine);
+        let counters = worker.counters();
+
+        engine.insert(&coll, doc! { "_id": 0i64, "title": "never lands" }).unwrap();
+        tokio::spawn(async move { worker.run().await });
+        tokio::time::sleep(RETRY_DELAY * 3 + Duration::from_secs(1)).await;
+
+        assert_eq!(counters.last_progress(), None, "a batch retrying its provider");
+        assert!(fake.calls() >= 3, "premise: it is retrying ({} calls)", fake.calls());
     }
 
     /// A drain that puts a document back after a retryable provider error is

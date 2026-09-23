@@ -63,4 +63,11 @@ impl Engine {
         }
         txn.commit().expect("the commit");
     }
+
+    /// Overwrite one document's record with bytes that do not decode, so a
+    /// write that re-reads it fails.
+    pub fn corrupt_document_for_test(&self, coll: &CollectionMeta, id: &kimmy_core::DocId) {
+        let key = crate::docs::doc_key(id).expect("an encodable id");
+        self.store_undecodable_doc_for_test(coll, &key);
+    }
 }
