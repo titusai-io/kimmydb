@@ -236,9 +236,26 @@ pub const RETRYING: &[&str] = &["embedding_worker"];
 /// waits for nothing.
 static STARTED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
-/// The task names supervised so far, in this process.
+/// The task names supervised so far, in this process, each once.
 pub fn started() -> Vec<&'static str> {
     STARTED.lock().expect("the started list is never held across a panic").clone()
+}
+
+/// Record that `name` has been supervised, once however often it is.
+///
+/// Called by each `supervise*` before it spawns, not from inside the spawned
+/// supervisor: the node reads this list to decide which progress-age rows
+/// `/metrics` carries, and it has to be complete before the HTTP listener binds,
+/// which a push from a task that has not been polled yet does not promise.
+///
+/// **Once per name.** A membership timer is supervised once per scheduled event,
+/// and pushing on every call grew this list by one entry per timer for the life
+/// of the process.
+fn mark_started(name: &'static str) {
+    let mut started = STARTED.lock().expect("the started list is never held across a panic");
+    if !started.contains(&name) {
+        started.push(name);
+    }
 }
 
 pub const TASKS: &[&str] = &[
@@ -594,7 +611,6 @@ where
     F: Future<Output = T> + Send + 'static,
     J: FnOnce(T) -> Return,
 {
-    STARTED.lock().expect("the started list is never held across a panic").push(name);
     let mut running = StopOnDrop {
         task: name,
         // UNSUPERVISED: the supervised task itself. This is the spawn every other one goes
@@ -616,6 +632,7 @@ pub fn supervise<F>(name: &'static str, shutdown: Shutdown, work: F) -> JoinHand
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    mark_started(name);
     // UNSUPERVISED: the supervisor task. Its body is `supervised`, which is the supervision.
     tokio::spawn(supervised(name, shutdown, work, |()| {
         Return::Fatal(Death::Returned, "the task returned".into())
@@ -815,6 +832,7 @@ pub fn supervise_judged<F>(name: &'static str, shutdown: Shutdown, work: F) -> J
 where
     F: Future<Output = Ended> + Send + 'static,
 {
+    mark_started(name);
     // UNSUPERVISED: the supervisor task, as in `supervise`.
     tokio::spawn(supervised(name, shutdown, work, |ended| match ended {
         Ended::Expected(why) => Return::Finished(why),
@@ -833,6 +851,7 @@ pub fn supervise_oneshot<F>(name: &'static str, shutdown: Shutdown, work: F) -> 
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    mark_started(name);
     // UNSUPERVISED: the supervisor task, as in `supervise`.
     tokio::spawn(supervised(name, shutdown, work, |()| Return::Expected))
 }

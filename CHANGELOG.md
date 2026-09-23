@@ -10,6 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A clustered node no longer grows its memory by one entry per membership
+  timer.** The supervisor added in 0.34.0 ([ADR-184](docs/decisions.md))
+  recorded a task's name every time it supervised one, and the membership
+  layer supervises one short task per scheduled timer. On a three-member
+  cluster at the default gossip settings each member ran about seven timers a
+  second, so the list grew by about 600,000 entries, roughly 10 MB, a day, for
+  as long as the process ran, and up to twice that in reserved capacity. Each
+  name is now recorded once, when it is first supervised. A single node, which
+  runs no membership, was not affected.
+
 ## 0.34.1 - 2026-09-23
 
 **A patch, and nothing in the server's behaviour changes.** It updates two
