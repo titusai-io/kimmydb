@@ -60,6 +60,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   It was written by the webhook dispatcher's loop, so it froze or read 0
   whenever that loop stopped, whatever membership was doing. What it reads is
   unchanged.
+- **The Python client requires Python 3.10 or later** (`requires-python =
+  ">=3.10"`). Python 3.9 reached end of life in October 2025, and the
+  releases that fix the advisories under Security below require 3.10, so the
+  client's lock could not fix them while it still declared 3.9. The server is
+  unaffected.
 
 ### Fixed
 
@@ -79,6 +84,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   as long as the process ran, and up to twice that in reserved capacity. Each
   name is now recorded once, when it is first supervised. A single node, which
   runs no membership, was not affected.
+
+### Security
+
+- **The Python client's lock is on fixed releases of anyio and pytest**:
+  anyio 4.14.2 (GHSA-82r6-8w77-94w6, critical, and GHSA-5p39-cfhj-2xmp) and
+  pytest 9.1.1 (GHSA-6w46-j5rx-g56g). The lock governs the client's own
+  development and test environment. **anyio also reaches an application at
+  run time**, through `httpx`, and the client does not pin it, so an
+  application's own resolver or lock decides the version: upgrade anyio to
+  4.14.2 or later there. pytest is only in the client's `dev` extra. The
+  server uses neither.
 
 ## 0.34.1 - 2026-09-23
 
