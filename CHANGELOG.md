@@ -68,6 +68,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Applying a peer's changes no longer holds an async worker thread for as
+  long as the apply takes.** A replicated window was applied on the runtime
+  worker that ran the replication round. An apply that takes long held that
+  worker the whole time, and every task queued on it waited, `/metrics` among
+  them. Index builds take long, and a collection drop took about two minutes per
+  400,000 documents. Pulled and pushed windows are now applied off the worker
+  ([ADR-177](docs/decisions.md)).
+
 - **A webhook registry record that does not decode no longer stops delivery
   for the subscriptions stored after it.** The dispatcher's load stopped
   reading at the first such record and delivered nothing past it, silently.

@@ -17459,6 +17459,22 @@ last commit landed turns the covered refusal red.
 still runs on the runtime worker (ADR-153's concern), so a 70 s apply occupies
 that tick's sequential contact loop for its whole length.
 
+**Addendum, 2026-09-23: the apply leaves the worker.** The residual above is
+closed for the worker, not for the loop. Both applies of a peer's window, the
+pulled one in `sync_round` and the pushed one on the serving side, now run under
+`kimmy_storage::blocking`, so the runtime moves the worker's other tasks off it
+for as long as the apply takes. That was measured at about 120 s for a replicated
+drop of a 400,000-document collection, which purged every row inside the apply.
+The tick's contact loop is still sequential, and a long apply still occupies it;
+what bounds that for a drop is a separate change.
+`walks_leave_the_worker.rs` now reads `kimmy-cluster` and counts applying a batch
+as a walk. It also reads each file with its test modules removed, rather than
+cutting at the first `#[cfg(test)]`. That cut sat on a hook inside the pull in
+`transport.rs`, and on a test-only method in `sessions.rs`, and hid the rest of
+each file. Tested by the guard itself, and by
+`the_walk_reads_past_a_test_hook_and_not_into_a_test_module`, which fails with
+the old cut.
+
 ---
 
 ## ADR-178 — A vector shadow is created at the stamp of the change that needs it, and only a client's configuration logs its creation

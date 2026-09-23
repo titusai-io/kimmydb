@@ -12,6 +12,9 @@
 //! precisely the evasion that guard names as its own blind spot, so these sit
 //! where the idiom is already accounted for.
 
+mod source;
+
+use source::{opens_a_module, test_modules_declared, without_test_modules};
 use std::path::{Path, PathBuf};
 
 /// The repository root.
@@ -87,89 +90,6 @@ fn production_sources() -> Vec<(PathBuf, String)> {
             (path, kept)
         })
         .collect()
-}
-
-/// Whether this line opens a `mod` item, at any visibility.
-fn opens_a_module(line: &str) -> bool {
-    let l = line.trim_start();
-    for prefix in ["pub(crate) ", "pub(super) ", "pub ", ""] {
-        if let Some(rest) = l.strip_prefix(prefix)
-            && let Some(rest) = rest.strip_prefix("mod ")
-            && rest.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// The names of every `#[cfg(test)] mod x;` in `body` — a module whose code is in
-/// another file.
-fn test_modules_declared(body: &str) -> Vec<String> {
-    let lines: Vec<&str> = body.lines().collect();
-    let mut out = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim() != "#[cfg(test)]" {
-            continue;
-        }
-        if let Some(item) = lines.get(i + 1)
-            && opens_a_module(item)
-            && let Some(rest) = item.trim().strip_suffix(';')
-            && let Some((_, name)) = rest.rsplit_once("mod ")
-        {
-            out.push(name.trim().to_string());
-        }
-    }
-    out
-}
-
-/// `body` with every `#[cfg(test)]`-attributed module removed.
-fn without_test_modules(body: &str) -> String {
-    let lines: Vec<&str> = body.lines().collect();
-    let mut kept = String::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim() == "#[cfg(test)]" {
-            // Any further attributes between the gate and the item.
-            let mut j = i + 1;
-            while j < lines.len()
-                && (lines[j].trim().starts_with("#[") || lines[j].trim().is_empty())
-            {
-                j += 1;
-            }
-            if j < lines.len() && opens_a_module(lines[j]) {
-                let item = lines[j].trim_end();
-                if item.ends_with('{') {
-                    // The closing brace sits at the module's own indentation.
-                    // Sound here because `cargo fmt --all --check` is a gate, so
-                    // there is no hand-laid-out block for this to misread.
-                    let indent: String =
-                        lines[j].chars().take_while(|c| c.is_whitespace()).collect();
-                    let close = format!("{indent}}}");
-                    let mut k = j + 1;
-                    while k < lines.len() && lines[k] != close {
-                        k += 1;
-                    }
-                    assert!(
-                        k < lines.len(),
-                        "a #[cfg(test)] module opened at line {} and never closed at its own \
-                         indentation, so this walk cannot tell where its test code ends",
-                        j + 1
-                    );
-                    i = k + 1;
-                    continue;
-                }
-                if item.ends_with(';') {
-                    i = j + 1;
-                    continue;
-                }
-            }
-        }
-        kept.push_str(lines[i]);
-        kept.push('\n');
-        i += 1;
-    }
-    kept
 }
 
 /// The marker that exempts one spawn, with the reason it is exempt.
