@@ -104,7 +104,13 @@ impl StorageHealth {
     }
 
     /// The error the test switch injects into `call`, once.
+    ///
+    /// On every backend call, so the unarmed case, which is every call outside
+    /// a test, is one relaxed load.
     pub(crate) fn injected(&self, call: &'static str) -> Option<std::io::Error> {
+        if self.armed.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
         let i = CALLS.iter().position(|c| *c == call)? as u8 + 1;
         self.armed
             .compare_exchange(i, 0, Ordering::SeqCst, Ordering::SeqCst)

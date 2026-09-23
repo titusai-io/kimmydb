@@ -58,6 +58,23 @@ impl Run {
     }
 
     fn spawn_on_with(dir: &Path, name: &str, http: u16, extra_env: &[(&str, &str)]) -> Run {
+        Run::spawn_full(dir, name, http, extra_env, false)
+    }
+
+    /// [`Run::spawn_with`], with the node's stderr a pipe whose reader is
+    /// already closed, so every write the node makes to it fails with EPIPE:
+    /// the stderr a process has when whatever was reading it has gone.
+    fn spawn_with_stderr_closed(dir: &Path, name: &str, env: &[(&str, &str)]) -> Run {
+        Run::spawn_full(dir, name, 0, env, true)
+    }
+
+    fn spawn_full(
+        dir: &Path,
+        name: &str,
+        http: u16,
+        extra_env: &[(&str, &str)],
+        stderr_closed: bool,
+    ) -> Run {
         let config = format!(
             r#"
 [server]
@@ -86,9 +103,16 @@ jwt_secret = "{JWT_SECRET}"
             .env("KIMMY_ROOT_PASSWORD", "harness-root-password")
             .env_remove("RUST_LOG")
             .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
-            .stderr(Stdio::from(std::fs::File::create(stderr).unwrap()))
+            .stderr(if stderr_closed {
+                Stdio::piped()
+            } else {
+                Stdio::from(std::fs::File::create(stderr).unwrap())
+            })
             .spawn()
             .expect("spawning kimmyd");
+        let mut child = child;
+        // The reader goes at once, so the node's first write to stderr fails.
+        drop(child.stderr.take());
         let pid = child.id();
         let bound = std::sync::OnceLock::new();
         if http != 0 {
@@ -549,7 +573,8 @@ async fn a_graceful_shutdown_is_not_a_task_death() {
 }
 
 /// A storage engine that hits an I/O error stops the process, and the next
-/// start says so and repairs the database (ADR-188).
+/// start says so, repairs the database, and serves what was written before
+/// (ADR-188).
 ///
 /// `KIMMY_TEST_FAIL_STORAGE=sync_data` fails the first fsync once the node is
 /// serving, once, with EIO: the disk is healthy again at the next call, which is
@@ -557,32 +582,57 @@ async fn a_graceful_shutdown_is_not_a_task_death() {
 /// write with `PreviousIo` all the same. Something commits soon after the node
 /// serves, whether the writes below or a background task, so readiness is tried
 /// and not required, as for the task deaths above.
+///
+/// **The failing run's stderr is a pipe nobody reads.** Every step of the report
+/// before the exit can fail, and a write to stderr that panicked instead of
+/// failing quietly once kept this node from exiting at all: the panic poisoned
+/// the reaction with the failure already recorded, and the node served errors
+/// with nothing to restart it. So the exit is asserted with stderr unwritable.
 #[tokio::test]
 async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
-
-    let mut first =
-        Run::spawn_with(dir.path(), "storage-fails", &[("KIMMY_TEST_FAIL_STORAGE", "sync_data")]);
-    if first.try_ready(&client, ports::BOUND_HTTP_LINE).await.is_ok()
-        && let Some(port) = first.http.get()
-    {
-        // Any of these commits, and whichever does first fails. Their answers
-        // are not the point.
-        let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
-        let login = client
-            .post(url("/v1/auth/login"))
+    let url = |run: &Run, path: &str| {
+        format!("http://127.0.0.1:{}{path}", run.http.get().expect("a bound port"))
+    };
+    let login = |run: &Run| {
+        client
+            .post(url(run, "/v1/auth/login"))
             .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
             .send()
-            .await;
-        if let Ok(res) = login
+    };
+
+    // Data written, and durable, before anything fails.
+    let mut before = Run::spawn(dir.path(), "storage-before");
+    before.wait_ready(&client).await;
+    let body: serde_json::Value = login(&before).await.unwrap().json().await.unwrap();
+    let token = body["token"].as_str().expect("a token").to_string();
+    for (path, body) in [
+        ("/v1/db/shop/collections", serde_json::json!({ "name": "orders" })),
+        ("/v1/db/shop/coll/orders/docs", serde_json::json!({ "_id": 1, "item": "kept" })),
+    ] {
+        let res = client.post(url(&before, path)).bearer_auth(&token).json(&body).send().await;
+        assert!(res.unwrap().status().is_success(), "{path}");
+    }
+    before.signal("TERM");
+    assert!(before.wait_exit().success());
+
+    let mut first = Run::spawn_with_stderr_closed(
+        dir.path(),
+        "storage-fails",
+        &[("KIMMY_TEST_FAIL_STORAGE", "sync_data")],
+    );
+    if first.try_ready(&client, ports::BOUND_HTTP_LINE).await.is_ok() {
+        // Any of these commits, and whichever does first fails. Their answers
+        // are not the point.
+        if let Ok(res) = login(&first).await
             && let Ok(body) = res.json::<serde_json::Value>().await
             && let Some(token) = body["token"].as_str()
         {
             let _ = client
-                .post(url("/v1/db/shop/collections"))
+                .post(url(&first, "/v1/db/shop/coll/orders/docs"))
                 .bearer_auth(token)
-                .json(&serde_json::json!({ "name": "orders" }))
+                .json(&serde_json::json!({ "_id": 2 }))
                 .send()
                 .await;
         }
@@ -603,9 +653,20 @@ async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
     let log = second.log();
     assert!(log.contains("stopped itself because its storage engine hit an I/O error"), "{log}");
     assert!(log.contains("repairing the database after an unclean stop"), "{log}");
-    let port = second.http.get().expect("a bound port");
-    let ready = client.get(format!("http://127.0.0.1:{port}/readyz")).send().await.unwrap();
+    let ready = client.get(url(&second, "/readyz")).send().await.unwrap();
     assert_eq!(ready.status(), 200, "the repaired database serves");
+    let body: serde_json::Value = login(&second).await.unwrap().json().await.unwrap();
+    let token = body["token"].as_str().expect("a token");
+    let kept: serde_json::Value = client
+        .get(url(&second, "/v1/db/shop/coll/orders/docs/1"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(kept["item"], "kept", "what was written before the failure is there: {kept}");
 
     second.signal("TERM");
     assert!(second.wait_exit().success());

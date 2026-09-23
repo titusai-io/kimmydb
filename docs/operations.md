@@ -581,7 +581,11 @@ with status **70**, the status a stopped background task uses
 ([ADR-184](decisions.md), [ADR-188](decisions.md)). The next start logs `the
 previous run stopped itself because its storage engine hit an I/O error` at
 `WARN`, repairs the file, and serves. Until the exit, `/readyz` answers 503
-naming the error. **Alert on the exit** as on any restart.
+naming the error. **Alert on the exit** as on any restart. **When the disk is
+full, the marker usually cannot be written**, so the next start reports
+`previous run did not shut down cleanly` instead, and the `ERROR` line may be
+cut off if the log is a file on the same disk. The exit status, 70, is the
+reliable sign.
 
 **On a disk that stays full, that is a restart loop, on purpose.** Each start
 repairs and serves reads, and the first write that needs space fails and stops
