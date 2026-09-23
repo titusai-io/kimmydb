@@ -6,8 +6,7 @@ on:
     # Kept here, deliberately, where it is removed from the pull request
     # trigger below: nothing waits on a status for a push, so no docs commit
     # is ever held up by its absence, and a push to main is the event that
-    # additionally starts the expensive jobs — the cluster harness, the
-    # reachability test and the two release-shaped builds. The pull request
+    # additionally starts the two release-shaped builds. The pull request
     # that carried the commit reported its verdict before the merge.
     paths-ignore:
       - "**.md"
@@ -270,10 +269,14 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --workspace --doc
 
+  # On pull requests as well as on main, so the harness reports before a
+  # merge rather than after it. Skipped for a documentation-only change, which
+  # compiles nothing it could exercise.
   cluster:
     name: cluster harness
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     env:
       # Debug info roughly doubles CI build time and nothing here reads a
       # backtrace symbol table.
@@ -318,7 +321,7 @@ jobs:
 
       # Every node of a failed cluster test, as the nodes logged it: which
       # peer refused what, and any panic in a connection task. Without it a
-      # red harness on `main` can only be rerun, not read.
+      # red harness can only be rerun, not read.
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
@@ -327,10 +330,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # On pull requests as well as on main, like the cluster harness above.
   vector-reachability:
     name: vector reachability
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     env:
       # Debug info roughly doubles CI build time and nothing here reads a
       # backtrace symbol table.
