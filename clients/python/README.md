@@ -4,6 +4,8 @@
 pip install kimmydb
 ```
 
+Requires Python 3.10 or later. Python 3.9 reached end of life in October 2025 and is not supported.
+
 ```python
 from kimmydb import Client
 

@@ -7,7 +7,7 @@ name = "kimmydb"
 version = "0.1.0"
 description = "Python client for KimmyDB"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Titus AI LLC", email = "licensing@titusai.io" }]
