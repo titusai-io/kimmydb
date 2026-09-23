@@ -113,6 +113,8 @@ pub const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// a core file. A thread that cannot be spawned leaves the exit unbounded, as
 /// it was before.
 pub fn exit_deadline() {
+    // UNSUPERVISED: the exit path's own deadline. Supervising it would route its death
+    // back into the exit it bounds.
     let _ = std::thread::Builder::new().name("exit-deadline".into()).spawn(|| {
         std::thread::sleep(EXIT_DEADLINE);
         #[cfg(unix)]
