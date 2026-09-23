@@ -42,6 +42,9 @@ pub(crate) enum PairedShadows {
 
 pub struct Engine {
     db: Database,
+    /// Whether the storage has hit an I/O error, shared with the backend that
+    /// records it (ADR-188).
+    health: std::sync::Arc<crate::health::StorageHealth>,
     node_id: NodeId,
     /// Guards the HLC. Every write takes this briefly to mint a stamp, so it
     /// must never be held across a redb commit.
@@ -770,13 +773,45 @@ impl Engine {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let backend =
-            crate::hold_meter::MeteredBackend::new(redb::backends::FileBackend::new(file)?);
+        // redb also calls the repair callback when it lays out a brand-new
+        // file, so a repair is reported only for a file that held a database.
+        let existing = file.metadata()?.len() > 0;
+        let health = std::sync::Arc::new(crate::health::StorageHealth::default());
+        let backend = crate::hold_meter::MeteredBackend::new(
+            redb::backends::FileBackend::new(file)?,
+            std::sync::Arc::clone(&health),
+        );
         let mut builder = Database::builder();
         if let Some(bytes) = cache_bytes {
             builder.set_cache_size(bytes);
         }
+        // redb repairs a file the last process did not close cleanly, before
+        // the open returns, and says nothing: the start just looks slow. About
+        // 0.4 s per GiB of file, measured (ADR-188), so on a large store it is
+        // the part of the start worth a line.
+        let repairing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opened = std::time::Instant::now();
+        {
+            let repairing = std::sync::Arc::clone(&repairing);
+            let path = path.display().to_string();
+            builder.set_repair_callback(move |session| {
+                if existing && !repairing.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        path = %path,
+                        "repairing the database after an unclean stop, before serving; this \
+                         takes about 0.4 s per GiB of file"
+                    );
+                }
+                debug!(progress = session.progress(), "database repair");
+            });
+        }
         let db = builder.create_with_backend(backend)?;
+        if repairing.load(std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                elapsed_ms = opened.elapsed().as_millis() as u64,
+                "database repaired after an unclean stop"
+            );
+        }
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
@@ -878,6 +913,7 @@ impl Engine {
 
         let engine = Self {
             db,
+            health,
             node_id,
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
@@ -1095,6 +1131,36 @@ impl Engine {
         self.expiry_cursors
             .lock()
             .retain(|&(c, i), _| c != collection.0 || index.is_some_and(|index| index != i));
+    }
+
+    /// The first I/O error the storage returned, if it has returned one
+    /// (ADR-188). From then on every read and write fails with redb's
+    /// `PreviousIo` until the database is reopened, so a node that sees this
+    /// can no longer serve and a restart is what recovers it.
+    pub fn storage_failed(&self) -> Option<&crate::health::StorageFailure> {
+        self.health.failed()
+    }
+
+    /// What to do when the storage first fails: called once, on the thread
+    /// that hit the error, and at once if it already has. The first call
+    /// wins; returns whether this one was installed.
+    ///
+    /// **It must not touch this engine.** It can run inside a write
+    /// transaction that holds the writer, and redb answers nothing but
+    /// `PreviousIo` from then on.
+    pub fn on_storage_failure(
+        &self,
+        reaction: Box<dyn Fn(&crate::health::StorageFailure) + Send + Sync>,
+    ) -> bool {
+        self.health.on_failure(reaction)
+    }
+
+    /// `KIMMY_TEST_FAIL_STORAGE`: fail the next backend `call` (`read`,
+    /// `write`, `sync_data`, `set_len` or `len`) once, with EIO. Returns
+    /// whether `call` names one. For tests of a real node; the daemon arms it
+    /// only once it is serving.
+    pub fn arm_test_storage_failure(&self, call: &str) -> bool {
+        self.health.arm(call)
     }
 
     pub fn node_id(&self) -> NodeId {

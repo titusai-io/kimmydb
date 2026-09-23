@@ -29,6 +29,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **A node whose storage hits an I/O error now stops itself, with status 70,
+  and the next start repairs the database and serves.** It used to keep
+  running and answer every later request with an error, because redb refuses
+  every read and write after the first failed disk call, while `/healthz` went
+  on reading green. It now logs `the storage engine hit an I/O error` at
+  `ERROR`, writes the exit marker as `storage_failed`, and exits, and `/readyz`
+  answers 503 until it does. On a disk that stays full this is a restart loop,
+  on purpose ([ADR-188](docs/decisions.md)). A start that repairs a file after
+  an unclean stop now says so, and how long it took: about 0.4 s per GiB.
+
 - **`kimmy_sync_divergence_check_age_seconds` is no longer 0 before the first
   check** on a node with clustering on. It reads the time since the process
   started, so it can no longer be mistaken for a check that ran a moment ago

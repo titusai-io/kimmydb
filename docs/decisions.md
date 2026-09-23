@@ -18822,3 +18822,35 @@ Each suggested alert is derived from the writer's own timings rather than chosen
 | a comment on the closer of a mid-file test module (`expiry.rs`'s `hooks`) | `no_closing_brace_in_the_walk_carries_a_comment`, naming the line |
 
 The last row belongs to the spawn lint (ADR-184). That walk ends a `#[cfg(test)]` module at the first line that is exactly the module's indentation and `}`, and under `cargo fmt` only a closer carrying a trailing comment breaks that. Such a closer ends the module late, and everything up to the next bare `}` goes unread. So that shape is banned outright. A premise about what may follow a test module was the alternative, and it is false on this tree, where hook modules sit mid-file with production code after them. The guard depends on `cargo fmt --all --check` gating. A module at the end of its file already fails loudly, as never closed.
+
+---
+
+## ADR-188 — A storage engine that hits an I/O error stops the process
+
+**Decision.** The first I/O error the storage backend returns, of any kind, marks the engine failed, and the daemon stops the process with status 70 so that it is restarted. On restart redb repairs the file before the node serves. This applies the ruling that a poisoned engine exits rather than failing liveness: exiting is the restart that works in every deployment, and compose consumes no health signal. It uses ADR-184's exit path.
+
+- **Where:** at `MeteredBackend`, the one backend every byte of the engine passes through. It records the first error's call, kind and text before returning it (`kimmy_storage::health`).
+- **What reads it:** `Engine::storage_failed`. `/readyz` answers 503 on it before it touches the engine.
+- **What acts on it:** the one reaction `Engine::on_storage_failure` installs. In `kimmyd` that is a structured `ERROR`, a line on stderr, the exit marker `storage_failed` with the call and error as its cause, a flush of both streams, and `exit(70)`. The next start announces the marker at `WARN`.
+- **A repair is logged:** a start that repairs an existing file logs `repairing the database after an unclean stop` and how long the repair took. redb repairs silently otherwise.
+
+### Why the first error, measured
+
+A threshold would need a transient error to exempt, and redb has none. Measured against redb 4.1.0, a backend that fails **one** call, once, with ENOSPC or EIO, and is healthy from the next call on: after a failed `write`, `sync_data`, `set_len` or `read`, every later read and write answers `PreviousIo`, in all eight cases. redb's `CheckedBackend` latches `io_failed` on any backend error and clears it only on close. So the first error is the moment the engine stops being able to serve in this process, and waiting past it only serves errors for longer.
+
+A repair after the exit is cheap. It took 1.27 s for a 4 GiB file and 5.22 s for a 12 GiB file on NVMe, about 0.4 s per GiB, and every committed row came back. A clean reopen afterwards needed no repair.
+
+### How the reaction is kept safe
+
+- **It runs once.** The failure is kept in a `OnceLock`, and only the call that sets it runs the reaction. The reaction itself is behind a `Once`, so a failure racing the reaction's installation runs it once too. Other threads that fail at the same moment return their own error normally.
+- **It does not re-enter the engine.** It runs on the thread that hit the error, possibly inside a write transaction holding the writer. It writes only the log, stderr, and the marker, which is a plain file beside `kimmy.redb`, and it takes no engine lock and opens no transaction. None of the process's tracing layers writes to the database.
+- **It exits on that thread.** Every other transaction is already answering `PreviousIo`, so there is nothing to drain, and a watcher task would only add a window of failed requests.
+
+### Consequences
+
+- **A disk that stays full is a restart loop.** Each start repairs, serves reads, and stops again at the first write that needs space. That loop is the visible outcome chosen over a node that serves errors while its liveness probe reads green, and a restart policy's backoff paces it.
+- **A write whose fsync failed may be durable.** The client is told it failed, and after the repair it is present, and it replicates. That is filed as its own finding. This change does not make it worse, because the entry is in the oplog either way.
+
+### Test
+
+`a_storage_io_error_exits_the_process_and_the_next_start_repairs_it` drives a real `kimmyd` with `KIMMY_TEST_FAIL_STORAGE=sync_data`, which fails one fsync with EIO once the node is serving. It asserts exit 70, the log line and the marker naming the call, and then on the next start the announcement, the repair and a ready node. With the backend no longer recording the failure, the node keeps running and serving `PreviousIo`, and the test fails on "did not exit".

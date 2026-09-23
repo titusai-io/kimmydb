@@ -57,6 +57,11 @@ pub enum Exit {
     /// the marker name which one and how.
     #[serde(rename = "task_died")]
     TaskDied,
+    /// The storage engine hit an I/O error, after which it serves nothing, so
+    /// the process stopped itself to be restarted (ADR-188). `cause` on the
+    /// marker names the call and the error.
+    #[serde(rename = "storage_failed")]
+    StorageFailed,
 }
 
 impl Exit {
@@ -66,6 +71,7 @@ impl Exit {
             Exit::Error => "error",
             Exit::Restore => "restore",
             Exit::TaskDied => "task_died",
+            Exit::StorageFailed => "storage_failed",
         }
     }
 }
@@ -136,6 +142,17 @@ pub fn record_task_death(data_dir: &Path, task: &str, cause: &str) {
     last.task = Some(task.to_string());
     last.cause = Some(cause.to_string());
     write_marker(data_dir, last, Exit::TaskDied);
+}
+
+/// Record that the storage engine hit an I/O error (ADR-188), with the call
+/// and the error as the cause.
+///
+/// A plain file write under the data directory and nothing else: it runs on
+/// the thread that hit the error, and it must not touch the engine.
+pub fn record_storage_failure(data_dir: &Path, cause: &str) {
+    let mut last = LastExit::now(Exit::StorageFailed);
+    last.cause = Some(cause.to_string());
+    write_marker(data_dir, last, Exit::StorageFailed);
 }
 
 fn write_marker(data_dir: &Path, last: LastExit, exit: Exit) {
@@ -245,6 +262,18 @@ pub fn announce(data_dir: &Path, previous: &PreviousRun) {
             previous_commit = %last.commit,
             ended_at_ms = last.at_ms,
             "the previous run stopped itself because a background task ended"
+        ),
+        // The same kind of line, for the same reason: the previous run stopped
+        // itself, and this is where an operator finds out why (ADR-188).
+        PreviousRun::Ended(last) if last.exit == Exit::StorageFailed => warn!(
+            exit = last.exit.name(),
+            cause = last.cause.as_deref().unwrap_or("unknown"),
+            previous_pid = last.pid,
+            previous_version = %last.version,
+            previous_commit = %last.commit,
+            ended_at_ms = last.at_ms,
+            "the previous run stopped itself because its storage engine hit an I/O error; \
+             the database is repaired on this open"
         ),
         PreviousRun::Ended(last) => info!(
             exit = last.exit.name(),

@@ -547,3 +547,66 @@ async fn a_graceful_shutdown_is_not_a_task_death() {
     assert!(marker.contains("exit = \"shutdown\""), "{marker}");
     assert!(!marker.contains("task_died"), "{marker}");
 }
+
+/// A storage engine that hits an I/O error stops the process, and the next
+/// start says so and repairs the database (ADR-188).
+///
+/// `KIMMY_TEST_FAIL_STORAGE=sync_data` fails the first fsync once the node is
+/// serving, once, with EIO: the disk is healthy again at the next call, which is
+/// the case that proves the point, because redb answers every later read and
+/// write with `PreviousIo` all the same. Something commits soon after the node
+/// serves, whether the writes below or a background task, so readiness is tried
+/// and not required, as for the task deaths above.
+#[tokio::test]
+async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first =
+        Run::spawn_with(dir.path(), "storage-fails", &[("KIMMY_TEST_FAIL_STORAGE", "sync_data")]);
+    if first.try_ready(&client, ports::BOUND_HTTP_LINE).await.is_ok()
+        && let Some(port) = first.http.get()
+    {
+        // Any of these commits, and whichever does first fails. Their answers
+        // are not the point.
+        let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+        let login = client
+            .post(url("/v1/auth/login"))
+            .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+            .send()
+            .await;
+        if let Ok(res) = login
+            && let Ok(body) = res.json::<serde_json::Value>().await
+            && let Some(token) = body["token"].as_str()
+        {
+            let _ = client
+                .post(url("/v1/db/shop/collections"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "name": "orders" }))
+                .send()
+                .await;
+        }
+    }
+
+    let status = first.wait_exit();
+    assert_eq!(status.code(), Some(70), "a storage I/O error exits 70: {status:?}");
+    let log = first.log();
+    assert!(log.contains("a test switch is set that fails a storage call"), "{log}");
+    assert!(log.contains("the storage engine hit an I/O error"), "{log}");
+    assert!(log.contains("sync_data"), "the log names the call: {log}");
+    let marker = marker(dir.path()).expect("a storage failure leaves the marker");
+    assert!(marker.contains("exit = \"storage_failed\""), "{marker}");
+    assert!(marker.contains("sync_data"), "the marker names the call: {marker}");
+
+    let mut second = Run::spawn(dir.path(), "storage-fails-second");
+    second.wait_ready(&client).await;
+    let log = second.log();
+    assert!(log.contains("stopped itself because its storage engine hit an I/O error"), "{log}");
+    assert!(log.contains("repairing the database after an unclean stop"), "{log}");
+    let port = second.http.get().expect("a bound port");
+    let ready = client.get(format!("http://127.0.0.1:{port}/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200, "the repaired database serves");
+
+    second.signal("TERM");
+    assert!(second.wait_exit().success());
+}

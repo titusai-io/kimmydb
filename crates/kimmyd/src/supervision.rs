@@ -43,6 +43,41 @@ impl kimmy_task::OnDeath for ExitOnDeath {
     }
 }
 
+/// Stop the process because the storage engine hit an I/O error (ADR-188).
+///
+/// Installed as the engine's one reaction, so it runs once, on the thread that
+/// hit the error, possibly inside a write transaction. So it touches nothing
+/// but the log and a plain file: the structured line, a line on stderr in case
+/// no subscriber is installed, the exit marker, and a flush of both streams
+/// before the exit, which runs no destructors.
+fn exit_on_storage_failure(
+    data_dir: &std::path::Path,
+    failed: &kimmy_storage::health::StorageFailure,
+) -> ! {
+    use std::io::Write as _;
+    let cause = format!("{}: {}", failed.call, failed.error);
+    error!(
+        call = failed.call,
+        kind = ?failed.kind,
+        error = %failed.error,
+        exit_code = RESTART_WORTHY,
+        "the storage engine hit an I/O error and serves nothing from here; stopping the \
+         process so it is restarted, and the database is repaired when it reopens"
+    );
+    eprintln!(
+        "kimmyd: the storage engine hit an I/O error ({cause}); stopping with {RESTART_WORTHY}"
+    );
+    lifecycle::record_storage_failure(data_dir, &cause);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(RESTART_WORTHY)
+}
+
+/// Install the engine's reaction to a storage I/O error: stop the process.
+pub fn install_storage_reaction(engine: &kimmy_storage::Engine, data_dir: PathBuf) -> bool {
+    engine.on_storage_failure(Box::new(move |failed| exit_on_storage_failure(&data_dir, failed)))
+}
+
 /// Install the death behaviour and the panic hook. Call once, at startup.
 ///
 /// Returns whether the death behaviour was installed; a second call is a

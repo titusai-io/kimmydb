@@ -19,6 +19,7 @@ pub mod expiry;
 #[doc(hidden)]
 pub mod faults;
 pub mod gc;
+pub mod health;
 pub mod hold_meter;
 pub mod index;
 mod live_count;

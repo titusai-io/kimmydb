@@ -632,6 +632,21 @@ fn not_a_protected_resource() -> ApiError {
 /// Readiness differs from liveness: it proves the storage engine responds, so
 /// a node with a wedged database is taken out of rotation rather than served.
 async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiError> {
+    // Before touching the engine, which answers nothing but `PreviousIo` from
+    // the first I/O error on (ADR-188). The daemon exits at that error, so this
+    // is the answer for the moment in between, and for an embedder that
+    // installed no exit.
+    if let Some(failed) = state.engine.storage_failed() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::error::ErrorCode::Internal,
+            format!(
+                "the storage engine hit an I/O error ({} failed: {}) and serves nothing until \
+                 the process restarts",
+                failed.call, failed.error
+            ),
+        ));
+    }
     state.engine.list_databases()?;
     Ok(Json(json!({ "status": "ready", "node": state.engine.node_id().to_string() })))
 }

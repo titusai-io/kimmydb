@@ -366,7 +366,9 @@ spec:
           # document grows with the store, so the estimate is a bound, not a
           # rate -- measured up to 10 million documents per index and
           # extrapolated above that, which is where you most need the margin.
-          # These values are for 10 million retained entries and one
+          # A start after an unclean stop also repairs the file first, about
+          # 0.4 s per GiB of kimmy.redb (measured, ADR-188), before any of
+          # that. These values are for 10 million retained entries and one
           # partial index over 10 million documents: 46 s + 80 s = 126 s, so
           # twice is 252 s and 300 s is set here. Compute yours.
           startupProbe:
@@ -402,6 +404,11 @@ never starts.** Kubernetes' defaults restart a container after about 30
 seconds of failed liveness checks, and nothing listens until the open
 completes, so an open longer than that is killed and begun again for ever.
 The comment beside the probe gives the arithmetic for your own numbers.
+**A start after an unclean stop repairs the database file first**, before the
+open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
+4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
+logs `repairing the database after an unclean stop` at `WARN`, then `database
+repaired after an unclean stop` with how long it took.
 
 ### Discovery formats
 
@@ -565,6 +572,25 @@ restarting under an orchestrator has no other way of saying it did not choose
 to. A first start in an empty directory says nothing about a previous run;
 there was none.
 
+**A node whose storage hits an I/O error stops itself.** redb answers every
+read and write after the first failed disk call with an error of its own,
+until the database is reopened, even when the disk is healthy again at the
+next call. So the node logs `the storage engine hit an I/O error` at `ERROR`,
+naming the call and the error, writes the marker as `storage_failed`, and exits
+with status **70**, the status a stopped background task uses
+([ADR-184](decisions.md), [ADR-188](decisions.md)). The next start logs `the
+previous run stopped itself because its storage engine hit an I/O error` at
+`WARN`, repairs the file, and serves. Until the exit, `/readyz` answers 503
+naming the error. **Alert on the exit** as on any restart.
+
+**On a disk that stays full, that is a restart loop, on purpose.** Each start
+repairs and serves reads, and the first write that needs space fails and stops
+it again. Your restart policy's backoff paces the loop (Docker's
+`restart: unless-stopped` and Kubernetes' `CrashLoopBackOff` both back off),
+and the loop is the signal: a node that stayed up would answer every request
+with an error while its liveness probe read green. Free the space, and the
+next start serves as normal.
+
 **The first start after upgrading warns once, on every node.** No release
 before this one wrote the marker, so a data directory written by 0.24.0 or
 earlier has a database and no marker beside it, and the code cannot tell
@@ -577,7 +603,7 @@ start after that is the first one the line means what it says.
 | Endpoint | Meaning | Probe |
 |---|---|---|
 | `/healthz` | The process is alive | liveness |
-| `/readyz` | The **storage engine responds** | readiness |
+| `/readyz` | The **storage engine responds**, and has not hit an I/O error | readiness |
 
 `/readyz` performing a real storage read is the point: a node with a wedged
 database is taken out of rotation rather than served traffic it cannot handle.
