@@ -189,7 +189,9 @@ pub async fn configure_vectors(
     auth.require(Action::Ddl, &db, Some(&coll))?;
     let body: VectorConfig = body.into();
     admit_provider(&state, &body.provider)?;
-    let meta = state.engine.configure_vectors(&db, &coll, body)?;
+    // A schema change, off the async worker: it creates the shadow
+    // collection, which finished a dropped shadow's purge first.
+    let meta = kimmy_storage::blocking(|| state.engine.configure_vectors(&db, &coll, body))?;
     // A changed dimension or metric makes any cached graph meaningless.
     invalidate_index(&state, &db, &coll);
     crate::audit::record_vectors(
@@ -246,7 +248,9 @@ pub async fn disable_vectors(
     // Resolved *before* the call: dropping the vectors also drops the shadow
     // collection, and afterwards there is no id left to forget the graph under.
     let shadow = state.engine.vector_collection(&db, &coll).ok().flatten().map(|s| s.id);
-    let disabled = state.engine.disable_vectors(&db, &coll, q.drop_vectors)?;
+    // With `drop_vectors`, a drop of the shadow collection: off the worker.
+    let disabled =
+        kimmy_storage::blocking(|| state.engine.disable_vectors(&db, &coll, q.drop_vectors))?;
     if let Some(id) = shadow {
         state.vectors.invalidate(id);
     }

@@ -30,7 +30,7 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 10] = [
+const WALKS: [&str; 17] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -43,6 +43,18 @@ const WALKS: [&str; 10] = [
     // or a collection drop included.
     ".apply_peer_batch_into(",
     ".apply_peer_batch(",
+    // Schema changes, each as long as the data under it: an index build files
+    // every document in one transaction, an index drop removes every entry in
+    // one, and a collection drop, a creation over a dropped life, and a
+    // vectors change that creates or drops the shadow can each purge a whole
+    // collection. System collections, created once and empty, are not here.
+    ".create_collection(",
+    ".drop_collection(",
+    ".drop_database(",
+    ".create_index_with(",
+    ".drop_index_stamped(",
+    ".configure_vectors(",
+    ".disable_vectors(",
 ];
 
 /// Walks allowed on the worker, per file, each bounded by something other than

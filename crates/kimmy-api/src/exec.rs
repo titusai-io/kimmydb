@@ -174,7 +174,11 @@ pub fn create_collection(
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Ddl, db, Some(name))?;
-    let meta = state.engine.create_collection(db, name)?;
+    // Off the async worker, as every schema change here is: each can take
+    // as long as the data under it (a creation finished a dropped life's
+    // purge first), and a handler that holds a worker stalls every task
+    // queued on it (ADR-153).
+    let meta = kimmy_storage::blocking(|| state.engine.create_collection(db, name))?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 
@@ -233,7 +237,7 @@ pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value
         .filter(|c| kimmy_core::vector_meta::is_shadow(&c.name))
         .map(|c| c.id)
         .collect();
-    let dropped = state.engine.drop_database(db)?;
+    let dropped = kimmy_storage::blocking(|| state.engine.drop_database(db))?;
     for shadow in shadows {
         state.vectors.invalidate(shadow);
     }
@@ -254,7 +258,7 @@ pub fn drop_collection(
     // search built forgotten with its predecessor's — a rebuild, never a wrong
     // answer, for the reasons given there.
     let shadow = shadow_of(db, coll);
-    let dropped = state.engine.drop_collection(db, coll)?;
+    let dropped = kimmy_storage::blocking(|| state.engine.drop_collection(db, coll))?;
     state.vectors.invalidate(shadow);
     Ok(json!({ "dropped": dropped }))
 }
@@ -1576,16 +1580,20 @@ fn create_index_stamped(
         None => None,
     };
 
-    let index = state.engine.create_index_with(
-        db,
-        coll,
-        fields,
-        spec.unique,
-        enforcement,
-        spec.name,
-        spec.expire_after_seconds,
-        partial_filter,
-    )?;
+    // The build files every document of the collection in the transaction
+    // that creates the index, so it runs off the async worker.
+    let index = kimmy_storage::blocking(|| {
+        state.engine.create_index_with(
+            db,
+            coll,
+            fields,
+            spec.unique,
+            enforcement,
+            spec.name,
+            spec.expire_after_seconds,
+            partial_filter,
+        )
+    })?;
     // What the backfill could not key, read back from the index it just
     // built: the one number a client creating an index over existing data
     // most wants beside `multikey`, and the listing reports the same field.
@@ -1743,7 +1751,8 @@ fn drop_index_stamped(
     // `dropped` says whether this member held the index; the drop is recorded
     // and replicated either way, and its stamp is what the confirmation
     // pushes (ADR-140, ADR-141).
-    let dropped = state.engine.drop_index_stamped(db, coll, name)?;
+    // One transaction that removes every entry of the index, off the worker.
+    let dropped = kimmy_storage::blocking(|| state.engine.drop_index_stamped(db, coll, name))?;
     Ok((json!({ "dropped": dropped.removed }), dropped.stamp))
 }
 

@@ -68,13 +68,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
-- **Applying a peer's changes no longer holds an async worker thread for as
-  long as the apply takes.** A replicated window was applied on the runtime
-  worker that ran the replication round. An apply that takes long held that
-  worker the whole time, and every task queued on it waited, `/metrics` among
-  them. Index builds take long, and a collection drop took about two minutes per
-  400,000 documents. Pulled and pushed windows are now applied off the worker
-  ([ADR-177](docs/decisions.md)).
+- **Schema changes and a peer's changes no longer hold an async worker
+  thread for as long as they take.** An index build, an index drop, a
+  collection or database drop, a collection creation, a vectors change, and the
+  apply of a replicated window each ran on the runtime worker that served the
+  request or ran the replication round. Every task queued on that worker waited
+  as long as the change took, `/metrics` among them. A burst of parallel index
+  creates timed out its peers' confirmations, and a replicated drop of 400,000
+  documents held a worker for about two minutes. They now run off the worker,
+  and a request's wait for the storage writer is still bounded by
+  `server.request_timeout_secs` ([ADR-153](docs/decisions.md),
+  [ADR-177](docs/decisions.md)).
 
 - **A webhook registry record that does not decode no longer stops delivery
   for the subscriptions stored after it.** The dispatcher's load stopped
