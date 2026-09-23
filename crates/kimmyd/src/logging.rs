@@ -86,20 +86,37 @@ impl TelemetryGuard {
         // not keep the engine alive past shutdown. A dead weak reference simply
         // observes nothing, which is the honest reading of "the node is gone".
         let weak = Arc::downgrade(state);
+        // One reading per export, not one per instrument. The SDK calls every
+        // instrument's callback in turn when it collects, and each used to take
+        // its own reading: over a hundred engine reads, and a walk of the
+        // webhook registry each, for one export (ADR-187). A reading taken in
+        // the last `SHARED_FOR` is reused, which covers one collection's
+        // callbacks and is far shorter than any export interval.
+        const SHARED_FOR: std::time::Duration = std::time::Duration::from_millis(250);
+        type Taken = Option<(std::time::Instant, Option<kimmy_api::metrics::MetricsSnapshot>)>;
+        let shared: Arc<std::sync::Mutex<Taken>> = Arc::default();
         let snapshot = move || {
+            let mut taken = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((at, snapshot)) = *taken
+                && at.elapsed() < SHARED_FOR
+            {
+                return snapshot;
+            }
             let state = weak.upgrade()?;
             // The engine's readings, taken fresh for this export exactly as
             // the `/metrics` handler takes them for a scrape (ADR-142). A
             // reading that fails observes nothing this export rather than
             // zeros: a counter reported as 0 and then its true value is a
             // reset a collector will believe.
-            match state.storage_readings() {
+            let snapshot = match state.storage_readings() {
                 Ok(readings) => Some(state.metrics.snapshot_with(&readings)),
                 Err(e) => {
                     tracing::debug!(error = ?e, "metrics bridge: engine readings unavailable this export");
                     None
                 }
-            }
+            };
+            *taken = Some((std::time::Instant::now(), snapshot));
+            snapshot
         };
 
         // `$description` is an `expr` rather than a `literal` so that a
@@ -577,6 +594,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.webhook.subscriptions.unreadable",
+            "{subscription}",
+            "Registry records that do not decode as a subscription, counted at export.",
+            webhook_unreadable
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.webhook.backlog",
             "s",
             "Age of the oldest undelivered event, across subscriptions this node owns.",
@@ -856,7 +880,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",
-            "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; since the process started before the first.",
+            "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; since the process started before the first, and 0 on a node without clustering.",
             sync_divergence_check_age_secs
         );
         // What a batch left rather than took, and the repairs that follow

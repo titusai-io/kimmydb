@@ -570,6 +570,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         held_marks: 15,
         webhook_active: 18,
         webhook_invalidated: 19,
+        webhook_unreadable: 21,
         cluster_members: 20,
     };
     assert_eq!(

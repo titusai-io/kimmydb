@@ -392,6 +392,11 @@ pub struct EmbeddingWorker {
     /// Documents written by another node, waiting to see whether that node
     /// embeds them. Ordered by deadline, which insertion order already gives.
     deferred: VecDeque<Deferred>,
+    /// Whether the last drain of `deferred` put a document back after a
+    /// retryable failure. While it does, an idle turn is not progress: the
+    /// worker is retrying, not idle (ADR-187). Documents merely waiting out
+    /// another member's grace are not this: they are ordinary on a cluster.
+    deferred_retrying: bool,
     /// Whether *this* node owns embedding work for a collection, injected by
     /// the caller because [`crate`] sits below the cluster crates that know
     /// the member set. The closure receives a stable `"{db}/{collection}"`
@@ -542,6 +547,7 @@ impl EmbeddingWorker {
             policy: ProviderPolicy::default(),
             refused: HashMap::new(),
             deferred: VecDeque::new(),
+            deferred_retrying: false,
             am_owner: None,
             counters: Arc::new(WorkerCounters::default()),
         }
@@ -709,7 +715,10 @@ impl EmbeddingWorker {
                     // An idle turn is progress when nothing is left waiting:
                     // a quiet node has no batch to complete, and its age must
                     // not climb for want of writes.
-                    if pending.batches.is_empty() && pending.token.is_none() {
+                    if pending.batches.is_empty()
+                        && pending.token.is_none()
+                        && !self.deferred_retrying
+                    {
                         self.counters.progressed();
                     }
                     continue;
@@ -934,9 +943,11 @@ impl EmbeddingWorker {
     /// deadline without sleeping through [`FOREIGN_GRACE`].
     pub async fn drain_deferred(&mut self, now: Instant) -> usize {
         let mut embedded = 0;
+        let (mut processed, mut retrying) = (false, false);
 
         while self.deferred.front().is_some_and(|d| d.due <= now) {
             let Some(item) = self.deferred.pop_front() else { break };
+            processed = true;
             match self.embed_deferred(&item).await {
                 Ok(Recheck::Embedded) => {
                     embedded += 1;
@@ -962,6 +973,7 @@ impl EmbeddingWorker {
                 Err(e) if e.is_retryable() => {
                     warn!(error = %e, "deferred embedding failed; will retry");
                     self.deferred.push_back(Deferred { due: now + RETRY_DELAY, ..item });
+                    retrying = true;
                     break;
                 }
                 Err(e) if e.is_refused_by_policy() => {
@@ -980,6 +992,12 @@ impl EmbeddingWorker {
                     );
                 }
             }
+        }
+        // Only a drain that reached a due document can say anything new. One
+        // with nothing due leaves the last answer standing, so the flag holds
+        // through the delay before a retried document comes due again.
+        if processed {
+            self.deferred_retrying = retrying;
         }
         embedded
     }
@@ -2600,29 +2618,53 @@ mod tests {
     }
 
     /// The worker's progress, behind its row of `kimmy_task_progress_age_seconds`
-    /// (ADR-187), is a flush that committed: none before the worker has done
-    /// anything, one once a batch has landed.
+    /// (ADR-187), is either of two things, and each is told apart here.
+    ///
+    /// A flush that committed: a batch of one chunk is full as it is pushed,
+    /// so it goes out from the entry arm, before any timed wait has elapsed.
+    /// Then an idle turn with nothing waiting, which is all a quiet node ever
+    /// does: once the position has settled, the stored position standing
+    /// still across the move says no flush made it.
+    ///
+    /// Real time rather than a paused clock: the batch deadline is read from
+    /// the std clock, so a paused one never lets a batch go.
     #[tokio::test]
-    async fn a_committed_flush_is_progress_and_nothing_before_it_is() {
+    async fn a_committed_flush_and_an_idle_turn_are_each_progress() {
+        async fn waited(until: Duration, moved: impl Fn() -> bool) {
+            let deadline = Instant::now() + until;
+            while !moved() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings {
+            max_chunks: 1,
+            max_wait: Duration::from_secs(60),
+            ..Default::default()
+        });
         position_at_latest(&engine);
         let counters = worker.counters();
-        assert_eq!(counters.last_progress(), None, "nothing has run");
 
-        let before = Instant::now();
-        tokio::spawn(async move { worker.run().await });
         engine.insert(&coll, doc! { "_id": 0i64, "title": "progress" }).unwrap();
-        vectors_land(&engine, 1).await;
-        for _ in 0..200 {
-            if counters.last_progress().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let at = counters.last_progress().expect("the flush that stored the batch is progress");
-        assert!(at >= before, "and it is this run's: {at:?} before {before:?}");
+        tokio::spawn(async move { worker.run().await });
+        // Inside `POSITION_WAIT`, the shortest timed wait the loop takes, so no
+        // timed turn can have come first.
+        waited(POSITION_WAIT / 2, || counters.last_progress().is_some()).await;
+        assert!(counters.last_progress().is_some(), "the flush that stored the batch");
+
+        // Let anything held go out, then only an idle turn can move it.
+        tokio::time::sleep(POSITION_WAIT * 2).await;
+        let settled = counters.last_progress();
+        let position = engine.consumer_position(CONSUMER).unwrap();
+        waited(DEFERRAL_TICK * 2, || counters.last_progress() != settled).await;
+        assert!(counters.last_progress() > settled, "an idle turn with nothing waiting");
+        assert_eq!(
+            engine.consumer_position(CONSUMER).unwrap(),
+            position,
+            "premise: no flush moved it, so the idle turn did"
+        );
     }
 
     /// A held position must not delay embedding. The deadline the worker

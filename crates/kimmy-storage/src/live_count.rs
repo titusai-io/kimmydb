@@ -880,8 +880,10 @@ mod tests {
     fn every_document_write_moves_the_count() {
         // Exempt: `migrate.rs` moves rows between ids during `Engine::open`,
         // before the counts are rebuilt; `backup.rs` restores into a file no
-        // engine has opened, which the first open rebuilds; and this module.
-        const EXEMPT: [&str; 3] = ["live_count.rs", "migrate.rs", "backup.rs"];
+        // engine has opened, which the first open rebuilds; `faults.rs`
+        // stores test-only records that are not documents, for readers that
+        // must survive them; and this module.
+        const EXEMPT: [&str; 4] = ["live_count.rs", "migrate.rs", "backup.rs", "faults.rs"];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         for entry in std::fs::read_dir(&src).unwrap() {

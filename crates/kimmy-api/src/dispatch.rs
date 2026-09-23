@@ -531,27 +531,48 @@ fn registry(
     }
 }
 
-/// Registered subscriptions as `(active, invalidated)`, counted from the
-/// registry at the moment of asking: what `kimmy_webhook_subscriptions` reads
-/// at every scrape (ADR-187).
+/// Registered subscriptions by state, counted from the registry at the moment
+/// of asking: what `kimmy_webhook_subscriptions` reads at every scrape
+/// (ADR-187).
 ///
 /// Counted by the `state` field alone, so a record the dispatcher cannot load
 /// is still counted, as active: it is registered, and not being delivered is
-/// a fault, not a reason to vanish from the count.
-pub fn subscription_counts(engine: &kimmy_storage::Engine) -> kimmy_storage::Result<(u64, u64)> {
-    let Some(meta) = registry(engine)? else {
-        return Ok((0, 0));
-    };
-    let (mut active, mut invalidated) = (0u64, 0u64);
-    engine.for_each_doc(&meta, |_id, document| {
-        if document.get_str("state").is_ok_and(|s| s == "invalidated") {
-            invalidated += 1;
-        } else {
-            active += 1;
-        }
-        Ok(true)
-    })?;
-    Ok((active, invalidated))
+/// a fault, not a reason to vanish from the count. A record that cannot be
+/// decoded at all is counted as `unreadable` rather than failing the count,
+/// so one bad record cannot take the whole page down with it. A registry
+/// that cannot be read is an error, and fails the scrape.
+///
+/// Off the async worker: any principal with a webhook grant can add
+/// subscriptions, so the walk is as long as a client makes it (ADR-153).
+pub fn subscription_counts(
+    engine: &kimmy_storage::Engine,
+) -> kimmy_storage::Result<SubscriptionCounts> {
+    kimmy_storage::blocking(|| {
+        let mut counts = SubscriptionCounts::default();
+        let Some(meta) = registry(engine)? else {
+            return Ok(counts);
+        };
+        engine.for_each_doc_or_undecodable(&meta, |document| {
+            match document {
+                None => counts.unreadable += 1,
+                Some(d) if d.get_str("state").is_ok_and(|s| s == "invalidated") => {
+                    counts.invalidated += 1
+                }
+                Some(_) => counts.active += 1,
+            }
+            Ok(true)
+        })?;
+        Ok(counts)
+    })
+}
+
+/// [`subscription_counts`]' answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionCounts {
+    pub active: u64,
+    pub invalidated: u64,
+    /// Records that do not decode as a document.
+    pub unreadable: u64,
 }
 
 /// Every subscription the dispatcher can deliver.
@@ -627,24 +648,6 @@ pub async fn dispatch_once(
     backoff: &mut Backoff,
     limits: Limits,
 ) -> DispatchOutcome {
-    let loaded = load_jobs(state);
-    dispatch_loaded(state, loaded, client, policy, me, members, backoff, limits).await
-}
-
-/// [`dispatch_once`] from the registry read onwards, so a test can hand it a
-/// read that failed: the engine offers no way to make that read fail on
-/// demand, and what the pass does then is the rule under test (ADR-187).
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_loaded(
-    state: &SharedState,
-    loaded: kimmy_storage::Result<Vec<Job>>,
-    client: &reqwest::Client,
-    policy: &EgressPolicy,
-    me: NodeId,
-    members: &BTreeSet<NodeId>,
-    backoff: &mut Backoff,
-    limits: Limits,
-) -> DispatchOutcome {
     let mut outcome = DispatchOutcome::default();
     let mut planned: Vec<Planned> = Vec::new();
 
@@ -655,7 +658,7 @@ async fn dispatch_loaded(
     let now_ms = kimmy_storage::physical_now_ms();
 
     // --- Phase 1: plan, serially -------------------------------------------
-    let jobs = match loaded {
+    let jobs = match load_jobs(state) {
         Ok(jobs) => jobs,
         Err(e) => {
             // Nothing is written: no backlog and no progress, so the
@@ -666,6 +669,11 @@ async fn dispatch_loaded(
         }
     };
     backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
+    // Any read in the plan that failed. The pass still delivers what it could
+    // plan, but it reports neither a backlog nor progress: a subscription whose
+    // read failed was not measured, and a backlog without it would be a
+    // healthy value after a failed read (ADR-187).
+    let mut read_failed = false;
     for job in jobs {
         if !crate::ownership::owns(&job.id, me, members) {
             outcome.skipped_not_owner += 1;
@@ -680,9 +688,15 @@ async fn dispatch_loaded(
         // anti-entropy asks of a peer. `None` means the subscription's progress
         // already covers everything this node holds — it is caught up, and
         // there is nothing to read, invalidate or deliver.
-        let Some(from) =
-            state.engine.version_vector().ok().and_then(|current| progress.behind(&current))
-        else {
+        let current = match state.engine.version_vector() {
+            Ok(current) => current,
+            Err(e) => {
+                warn!(subscription = %job.id, error = %e, "could not read this node's version vector");
+                read_failed = true;
+                continue;
+            }
+        };
+        let Some(from) = progress.behind(&current) else {
             continue;
         };
 
@@ -717,8 +731,13 @@ async fn dispatch_loaded(
             continue;
         }
 
-        let Ok(scanned) = state.engine.entries_for_peer(from, BATCH * 4).map(|w| w.entries) else {
-            continue;
+        let scanned = match state.engine.entries_for_peer(from, BATCH * 4) {
+            Ok(window) => window.entries,
+            Err(e) => {
+                warn!(subscription = %job.id, error = %e, "could not read the oplog for a subscription");
+                read_failed = true;
+                continue;
+            }
         };
         let batch: Vec<OplogEntry> = scanned
             .iter()
@@ -774,7 +793,9 @@ async fn dispatch_loaded(
         planned.push(Planned { job, progress, delivery, events });
     }
 
-    state.metrics.set_webhook_backlog(backlog_ms / 1_000);
+    if !read_failed {
+        state.metrics.set_webhook_backlog(backlog_ms / 1_000);
+    }
 
     // --- Phase 2: deliver, concurrently under a bound ----------------------
     //
@@ -983,7 +1004,11 @@ mod tests {
     fn the_subscription_counts_are_read_at_the_scrape_and_count_what_the_dispatcher_skips() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::state::tests::a_state(&dir);
-        assert_eq!(subscription_counts(&state.engine).unwrap(), (0, 0), "no registry yet");
+        assert_eq!(
+            subscription_counts(&state.engine).unwrap(),
+            SubscriptionCounts::default(),
+            "no registry yet"
+        );
         let whole = bson::doc! {
             "url": "https://example.com/hook", "secret": "s", "database": "shop",
             "collection": "orders", "operations": ["insert"],
@@ -1002,14 +1027,18 @@ mod tests {
         assert!(out.contains("kimmy_webhook_subscriptions{state=\"invalidated\"} 1\n"), "{out}");
     }
 
-    /// A pass whose registry read failed writes nothing (ADR-187): no
-    /// backlog, and no progress, so the dispatcher's age goes on rising. An
-    /// empty list in its place wrote a backlog of 0 and a fresh age, a healthy
-    /// reading after a read that saw nothing.
+    /// A registry that cannot be read is an error from the dispatcher's load
+    /// and from the scrape, not an empty registry (ADR-187), through the real
+    /// read: the dispatcher reports no backlog and no progress, and `/metrics`
+    /// fails rather than reading 0.
     #[tokio::test]
-    async fn a_pass_that_cannot_read_the_registry_writes_no_backlog_and_no_progress() {
+    async fn an_unreadable_registry_is_an_error_to_the_dispatcher_and_the_scrape() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::state::tests::a_state(&dir);
+        subscribe(&state, "wh_a", bson::doc! { "url": "https://example.com/hook" });
+        state.engine.corrupt_collection_meta_for_test(WEBHOOKS_DB, WEBHOOKS_COLLECTION);
+
+        assert!(load_jobs(&state).is_err(), "an unreadable registry is not an empty one");
         state.metrics.set_webhook_backlog(42);
         let later = std::time::Instant::now() + Duration::from_secs(1_000);
         let read = |state: &SharedState| {
@@ -1017,27 +1046,33 @@ mod tests {
             (s.webhook_backlog_secs, s.task_progress_age_secs[3])
         };
         let before = read(&state);
-
-        let failed: kimmy_storage::Result<Vec<Job>> =
-            Err(kimmy_storage::StorageError::Core(kimmy_core::Error::DatabaseNotFound("x".into())));
         let client = reqwest::Client::new();
         let policy = EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new());
-        let me = NodeId::generate();
         let mut backoff = Backoff::default();
-        dispatch_loaded(
-            &state,
-            failed,
-            &client,
-            &policy,
-            me,
-            &BTreeSet::new(),
-            &mut backoff,
-            Limits::default(),
-        )
-        .await;
-
+        let (me, live) = (NodeId::generate(), BTreeSet::new());
+        dispatch_once(&state, &client, &policy, me, &live, &mut backoff, Limits::default()).await;
         assert_eq!(read(&state), before, "the backlog and the dispatcher's age are untouched");
-        assert_eq!(before.0, 42);
+
+        assert!(state.storage_readings().is_err(), "the scrape fails rather than reading 0");
+    }
+
+    /// One record that does not decode is counted, not a failed scrape: the
+    /// rest of the page, and every other subscription, still reads.
+    #[test]
+    fn an_undecodable_record_is_counted_as_unreadable_and_the_scrape_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        subscribe(&state, "wh_a", bson::doc! { "url": "https://example.com/hook" });
+        let meta = state.engine.get_collection(WEBHOOKS_DB, WEBHOOKS_COLLECTION).unwrap();
+        state.engine.store_undecodable_doc_for_test(&meta, b"\xffbroken");
+
+        let readings = state.storage_readings().expect("one bad record does not fail the scrape");
+        assert_eq!(
+            (readings.webhook_active, readings.webhook_invalidated, readings.webhook_unreadable),
+            (1, 0, 1)
+        );
+        let out = state.metrics.render_with(&readings);
+        assert!(out.contains("kimmy_webhook_subscriptions{state=\"unreadable\"} 1\n"), "{out}");
     }
 
     /// The signature a receiver validates. Recorded from the implementation

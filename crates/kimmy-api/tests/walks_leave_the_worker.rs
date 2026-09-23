@@ -19,8 +19,9 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 7] = [
+const WALKS: [&str; 8] = [
     ".for_each_doc(",
+    ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
     ".for_each_record_after(",
     ".visit_index_candidates(",
@@ -33,12 +34,7 @@ const WALKS: [&str; 7] = [
 /// the data a client stored.
 const BOUNDED: [(&str, usize, &str); 5] = [
     ("webhooks.rs", 1, "the webhook registry: one document per subscription"),
-    (
-        "dispatch.rs",
-        4,
-        "webhook jobs, delivery progress, and the scrape's subscription count: subscriptions \
-         times members",
-    ),
+    ("dispatch.rs", 3, "webhook jobs and delivery progress: subscriptions times members"),
     ("topology.rs", 1, "the node registry: one document per member"),
     ("schema.rs", 1, "sample_documents stops at its limit"),
     ("vectors.rs", 1, "the emptiness check stops at the first live vector"),

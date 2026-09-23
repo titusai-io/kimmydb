@@ -8192,6 +8192,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_webhook_events_total",
         "kimmy_webhook_subscriptions",
         "kimmy_webhook_subscriptions",
+        "kimmy_webhook_subscriptions",
         "kimmy_webhook_backlog_seconds",
         "kimmy_cluster_members",
         "kimmy_replication_lag_seconds",

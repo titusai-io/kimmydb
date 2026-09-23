@@ -164,8 +164,7 @@ impl AppState {
         // scrape and per export, for the same reason the engine's numbers
         // are: a gauge that lags is a gauge an alert fires late on.
         let memory = crate::metrics::ProcessMemory::read();
-        let (webhook_active, webhook_invalidated) =
-            crate::dispatch::subscription_counts(&self.engine)?;
+        let subscriptions = crate::dispatch::subscription_counts(&self.engine)?;
         Ok(crate::metrics::StorageReadings {
             databases: databases.len() as u64,
             collections,
@@ -217,8 +216,9 @@ impl AppState {
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.
-            webhook_active,
-            webhook_invalidated,
+            webhook_active: subscriptions.active,
+            webhook_invalidated: subscriptions.invalidated,
+            webhook_unreadable: subscriptions.unreadable,
             // Counted by address rather than node id, so the gauge keeps
             // meaning "membership entries" even during the moment a moved
             // node is known at two addresses. 0 with clustering off.

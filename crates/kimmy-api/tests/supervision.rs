@@ -464,7 +464,8 @@ fn every_long_lived_task_is_spawned_through_the_supervisor() {
     );
 }
 
-/// Lines that close a brace and then carry a comment: `} // mod tests`.
+/// Lines that close a brace and then carry a comment: `} // mod tests`, or
+/// `} /* mod tests */`.
 ///
 /// [`without_test_modules`] ends a module at the first line that is exactly the
 /// module's indentation and `}`. Under `cargo fmt` that is always the module's
@@ -478,7 +479,10 @@ fn closers_with_a_comment(body: &str) -> Vec<usize> {
     body.lines()
         .enumerate()
         .filter(|(_, l)| {
-            l.trim_start().strip_prefix('}').is_some_and(|r| r.trim_start().starts_with("//"))
+            l.trim_start().strip_prefix('}').is_some_and(|r| {
+                let r = r.trim_start();
+                r.starts_with("//") || r.starts_with("/*")
+            })
         })
         .map(|(i, _)| i + 1)
         .collect()
@@ -508,6 +512,9 @@ fn no_closing_brace_in_the_walk_carries_a_comment() {
                 tokio::spawn(async {});\n}\n";
     assert!(!without_test_modules(late).contains("tokio::spawn"), "premise: the walk loses it");
     assert_eq!(closers_with_a_comment(late), vec![4]);
+    let block = late.replace("} // mod tests", "} /* mod tests */");
+    assert!(!without_test_modules(&block).contains("tokio::spawn"), "premise: this one too");
+    assert_eq!(closers_with_a_comment(&block), vec![4]);
 }
 
 #[test]
