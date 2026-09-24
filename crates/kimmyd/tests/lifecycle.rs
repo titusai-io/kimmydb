@@ -336,6 +336,30 @@ async fn a_start_that_fails_logs_its_exit_and_the_next_start_does_not_call_it_un
     assert!(next.wait_exit().success());
 }
 
+/// The review's L1: a start that reaches serving settles what it inherited.
+/// `.previous` is gone once it serves, and its own clean stop carries nothing
+/// and is not a failed start.
+#[tokio::test]
+async fn a_start_that_serves_settles_what_it_inherited() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+
+    let mut second = Run::spawn(dir.path(), "second");
+    second.wait_ready(&client).await;
+    assert!(
+        !dir.path().join("kimmy.last-exit.previous").exists(),
+        "serving removed what the start set aside"
+    );
+    second.signal("TERM");
+    assert!(second.wait_exit().success());
+    let marker = marker(dir.path()).expect("the clean stop is recorded");
+    assert!(!marker.contains("previous") && !marker.contains("failed_start"), "{marker}");
+}
+
 /// Hold a port, so a start opens its database, cannot bind, and fails
 /// before it serves; return the start's log.
 fn a_start_that_fails_to_bind(dir: &Path, name: &str) -> String {

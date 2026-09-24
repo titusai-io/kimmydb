@@ -194,7 +194,7 @@ impl LastExit {
 /// does not exist, which is a run that failed before it could create it and
 /// has already logged why.
 pub fn record_exit(data_dir: &Path, exit: Exit) {
-    write_marker(data_dir, LastExit::now(exit), exit);
+    record(data_dir, LastExit::now(exit));
 }
 
 /// Record that this run ended on an error, with its text as the cause. A
@@ -204,11 +204,22 @@ pub fn record_exit(data_dir: &Path, exit: Exit) {
 pub fn record_error(data_dir: &Path, cause: &str) {
     let mut last = LastExit::now(Exit::Error);
     last.cause = Some(cause.to_string());
+    record(data_dir, last);
+}
+
+/// Every exit's marker goes through here, so every one of them carries what
+/// this start inherited, if it has not settled yet: an error, a background
+/// task's death and a storage failure can each happen before the start is
+/// serving (their hooks are installed before it binds). An error that early is
+/// a failed start. `.previous` is removed once the carrying marker is written,
+/// and left for the next start to read as unclean if it is not.
+fn record(data_dir: &Path, mut last: LastExit) {
+    let exit = last.exit;
     if let Some(inherited) = inherited().remove(data_dir) {
-        last.failed_start = true;
+        last.failed_start = exit == Exit::Error;
         last.previous = inherited;
     }
-    if write_marker(data_dir, last, Exit::Error) {
+    if write_marker(data_dir, last, exit) {
         let _ = std::fs::remove_file(data_dir.join(PREVIOUS_FILE));
     }
 }
@@ -246,7 +257,7 @@ pub fn record_task_death(data_dir: &Path, task: &str, cause: &str) {
     let mut last = LastExit::now(Exit::TaskDied);
     last.task = Some(task.to_string());
     last.cause = Some(cause.to_string());
-    write_marker(data_dir, last, Exit::TaskDied);
+    record(data_dir, last);
 }
 
 /// Record that the storage engine hit an I/O error (ADR-188), with the call
@@ -257,12 +268,16 @@ pub fn record_task_death(data_dir: &Path, task: &str, cause: &str) {
 pub fn record_storage_failure(data_dir: &Path, cause: &str) {
     let mut last = LastExit::now(Exit::StorageFailed);
     last.cause = Some(cause.to_string());
-    write_marker(data_dir, last, Exit::StorageFailed);
+    record(data_dir, last);
 }
 
-/// Write the marker atomically: a temporary file, synced, renamed over the
-/// marker, and the directory synced. A marker cut short by a crash mid-write
-/// used to be an unreadable one; now it is either the whole marker or none.
+/// Write the marker atomically: a temporary file renamed over the marker, so a
+/// crash mid-write leaves the whole marker or none, where it used to leave an
+/// unreadable one. The file and the directory are synced where that works, and
+/// the rename happens whether or not it did: the rename is what protects
+/// against a process crash, and the syncs only against a power loss. A storage
+/// failure's marker is written on the disk that just failed, under a deadline,
+/// and it must not be lost for want of a sync.
 fn write_marker(data_dir: &Path, last: LastExit, exit: Exit) -> bool {
     if !data_dir.is_dir() {
         debug!(data_dir = %data_dir.display(), "no data directory to record the exit in");
@@ -277,7 +292,18 @@ fn write_marker(data_dir: &Path, last: LastExit, exit: Exit) -> bool {
         }
     };
     match write_atomically(data_dir, &path, body.as_bytes()) {
-        Ok(()) => true,
+        Ok(()) => {
+            // Durable against a power loss only once the directory is.
+            if let Err(e) = sync(&std::fs::File::open(data_dir)) {
+                warn!(
+                    error = %e,
+                    data_dir = %data_dir.display(),
+                    "the exit marker was written, but syncing its directory failed; a power loss \
+                     now could lose it"
+                );
+            }
+            true
+        }
         Err(e) => {
             warn!(
                 error = %e,
@@ -292,15 +318,42 @@ fn write_marker(data_dir: &Path, last: LastExit, exit: Exit) -> bool {
 
 fn write_atomically(dir: &Path, path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let temp = path.with_extension("tmp");
+    // Named for this marker and this process, so no other file's temporary
+    // and no concurrent writer share it.
+    let temp = dir.join(format!("{LAST_EXIT_FILE}.tmp.{}", std::process::id()));
     {
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(body)?;
-        file.sync_all()?;
+        if let Err(e) = sync(&Ok(file)) {
+            warn!(error = %e, "syncing the exit marker failed; writing it all the same");
+        }
     }
-    std::fs::rename(&temp, path)?;
-    // The rename is durable only once the directory is.
-    std::fs::File::open(dir)?.sync_all()
+    std::fs::rename(&temp, path)
+}
+
+/// `sync_all`, with a test's injected failure.
+fn sync(file: &std::io::Result<std::fs::File>) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::SYNC_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("an injected sync failure"));
+    }
+    match file {
+        Ok(file) => file.sync_all(),
+        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+    }
+}
+
+/// Remove temporary markers a crash mid-write left: never read, since the
+/// rename is what makes a marker.
+fn remove_stale_temporaries(data_dir: &Path) {
+    let prefix = format!("{LAST_EXIT_FILE}.tmp.");
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// What the data directory says about the run before this one.
@@ -334,7 +387,16 @@ pub enum PreviousRun {
 pub fn previous_run(data_dir: &Path, database: &Path) -> PreviousRun {
     let verdict = read_previous(data_dir, database);
     let carried = match &verdict {
-        PreviousRun::FirstStart | PreviousRun::Unreadable { .. } => None,
+        PreviousRun::FirstStart => None,
+        // Something ended here and left a marker that cannot be read: carried
+        // as that, not as nothing.
+        PreviousRun::Unreadable { error, .. } => Some(Earlier {
+            exit: "unreadable".to_string(),
+            version: None,
+            at_ms: None,
+            cause: Some(error.clone()),
+            last_write_secs_ago: None,
+        }),
         PreviousRun::Ended(last) => Some(Earlier::of(last)),
         PreviousRun::Unclean { last_write_secs_ago, .. } => Some(Earlier {
             exit: "unclean".to_string(),
@@ -349,6 +411,7 @@ pub fn previous_run(data_dir: &Path, database: &Path) -> PreviousRun {
 }
 
 fn read_previous(data_dir: &Path, database: &Path) -> PreviousRun {
+    remove_stale_temporaries(data_dir);
     let path = data_dir.join(LAST_EXIT_FILE);
     let aside = data_dir.join(PREVIOUS_FILE);
     match std::fs::read_to_string(&path) {
@@ -410,28 +473,38 @@ pub fn announce(data_dir: &Path, previous: &PreviousRun) {
         // is the one clean-marker case that is not a clean exit: the previous
         // run stopped itself to be restarted, and this line is where an
         // operator finds out why (ADR-184).
-        PreviousRun::Ended(last) if last.exit == Exit::TaskDied => warn!(
-            exit = last.exit.name(),
-            task = last.task.as_deref().unwrap_or("unknown"),
-            cause = last.cause.as_deref().unwrap_or("unknown"),
-            previous_pid = last.pid,
-            previous_version = %last.version,
-            previous_commit = %last.commit,
-            ended_at_ms = last.at_ms,
-            "the previous run stopped itself because a background task ended"
-        ),
+        PreviousRun::Ended(last) if last.exit == Exit::TaskDied => {
+            warn!(
+                exit = last.exit.name(),
+                task = last.task.as_deref().unwrap_or("unknown"),
+                cause = last.cause.as_deref().unwrap_or("unknown"),
+                previous_pid = last.pid,
+                previous_version = %last.version,
+                previous_commit = %last.commit,
+                ended_at_ms = last.at_ms,
+                "the previous run stopped itself because a background task ended"
+            );
+            if let Some(earlier) = &last.previous {
+                announce_earlier(earlier);
+            }
+        }
         // The same kind of line, for the same reason: the previous run stopped
         // itself, and this is where an operator finds out why (ADR-188).
-        PreviousRun::Ended(last) if last.exit == Exit::StorageFailed => warn!(
-            exit = last.exit.name(),
-            cause = last.cause.as_deref().unwrap_or("unknown"),
-            previous_pid = last.pid,
-            previous_version = %last.version,
-            previous_commit = %last.commit,
-            ended_at_ms = last.at_ms,
-            "the previous run stopped itself because its storage engine hit an I/O error; \
-             the database is repaired on this open"
-        ),
+        PreviousRun::Ended(last) if last.exit == Exit::StorageFailed => {
+            warn!(
+                exit = last.exit.name(),
+                cause = last.cause.as_deref().unwrap_or("unknown"),
+                previous_pid = last.pid,
+                previous_version = %last.version,
+                previous_commit = %last.commit,
+                ended_at_ms = last.at_ms,
+                "the previous run stopped itself because its storage engine hit an I/O error; \
+                 the database is repaired on this open"
+            );
+            if let Some(earlier) = &last.previous {
+                announce_earlier(earlier);
+            }
+        }
         // An error is not a clean end, and a start that failed before it
         // served is not a run at all: said as such, with the error.
         PreviousRun::Ended(last) if last.exit == Exit::Error => {
@@ -505,6 +578,79 @@ fn announce_earlier(earlier: &Earlier) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Makes every `sync` in this thread fail, as a full or failing disk does.
+        pub(super) static SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The review's M1: a sync that fails does not lose the marker. The rename
+    /// is what makes it whole against a crash, and it happens regardless.
+    #[test]
+    fn a_marker_is_written_even_when_syncing_it_fails() {
+        let (dir, db) = dir_with_database();
+        SYNC_FAILS.with(|f| f.set(true));
+        record_storage_failure(dir.path(), "write: No space left on device");
+        SYNC_FAILS.with(|f| f.set(false));
+        let PreviousRun::Ended(last) = previous_run(dir.path(), &db) else {
+            panic!("the marker must be there and readable")
+        };
+        assert_eq!(last.exit, Exit::StorageFailed);
+    }
+
+    /// The review's M2: every exit carries what an unsettled start inherited,
+    /// not only an error: a background task's death and a storage failure can
+    /// both come before the start is serving.
+    #[test]
+    fn every_exit_before_serving_carries_what_the_start_inherited() {
+        for (kind, record) in [
+            (
+                Exit::TaskDied,
+                &(|d: &Path| record_task_death(d, "retention_collector", "panicked"))
+                    as &dyn Fn(&Path),
+            ),
+            (Exit::StorageFailed, &|d: &Path| record_storage_failure(d, "sync_data: EIO")),
+            (Exit::Error, &|d: &Path| record_error(d, "binding 127.0.0.1:1")),
+        ] {
+            let (dir, db) = dir_with_database();
+            record_exit(dir.path(), Exit::Shutdown);
+            let _ = previous_run(dir.path(), &db);
+            record(dir.path());
+            assert!(
+                !dir.path().join(PREVIOUS_FILE).exists(),
+                "{kind:?}: .previous carried and gone"
+            );
+            let PreviousRun::Ended(last) = previous_run(dir.path(), &db) else {
+                panic!("{kind:?}")
+            };
+            assert_eq!(last.exit, kind);
+            assert_eq!(last.previous.map(|p| p.exit), Some("shutdown".to_string()), "{kind:?}");
+            assert_eq!(last.failed_start, kind == Exit::Error, "{kind:?}");
+        }
+    }
+
+    /// The review's L2: an unreadable marker is still evidence something ended
+    /// here, and is carried as that.
+    #[test]
+    fn an_unreadable_inherited_marker_is_carried_as_unreadable() {
+        let (dir, db) = dir_with_database();
+        std::fs::write(dir.path().join(LAST_EXIT_FILE), "exit = 7\n").unwrap();
+        let _ = previous_run(dir.path(), &db);
+        record_error(dir.path(), "refused");
+        let PreviousRun::Ended(last) = previous_run(dir.path(), &db) else { panic!() };
+        assert_eq!(last.previous.map(|p| p.exit), Some("unreadable".to_string()));
+    }
+
+    /// The review's L3: a temporary a crash left is never read, and is
+    /// removed; the temporary is named for the marker and the process.
+    #[test]
+    fn a_stale_temporary_marker_is_removed_and_never_read() {
+        let (dir, db) = dir_with_database();
+        let stale = dir.path().join(format!("{LAST_EXIT_FILE}.tmp.99999"));
+        std::fs::write(&stale, "exit = \"shutdown\"\n").unwrap();
+        assert!(matches!(previous_run(dir.path(), &db), PreviousRun::Unclean { .. }));
+        assert!(!stale.exists());
+    }
 
     fn dir_with_database() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();

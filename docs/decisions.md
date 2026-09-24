@@ -11050,10 +11050,14 @@ reported. It changes in four ways:
 - **The marker is set aside, not deleted.** It is renamed to
   `kimmy.last-exit.previous`, and removed only once the start is serving, right
   after it binds.
-- **A start that fails before then carries what it inherited.** It writes its
-  `error` marker with the error's text as `cause`, `failed_start = true`, and
-  the inherited verdict as a nested `previous` table: `unclean`, or the earlier
-  marker's exit, version, time and cause. **Repeated failed starts keep the
+- **Any exit before then carries what the start inherited.** An error writes
+  its marker with the error's text as `cause` and `failed_start = true`. A
+  background task's death (ADR-184) and a storage failure (ADR-188) can come
+  before the start serves too, since their hooks are installed before it binds.
+  Every one of them carries the inherited verdict as a nested `previous` table:
+  `unclean`; `unreadable` for a marker that could not be parsed; or the earlier
+  marker's exit, version, time and cause. `.previous` is removed once the
+  carrying marker is written. **Repeated failed starts keep the
   last run that ran**: a failed start that inherited a failed start passes on
   that one's `previous`, not the refusal itself.
 - **A `.previous` with no `kimmy.last-exit` is always an unclean end.** Only a
@@ -11061,9 +11065,26 @@ reported. It changes in four ways:
   as a start killed during the open. The verdict it holds is reported after the
   unclean end as what came before it, never in its place: a kill during a
   migration's open must not read as the clean stop before it.
-- **The marker is written atomically:** a temporary file, synced, renamed, and
-  the directory synced. A crash mid-write leaves a whole marker or none, where
-  it used to leave an unreadable one.
+- **The marker is written atomically:** a temporary file named for the marker
+  and the process (`kimmy.last-exit.tmp.<pid>`), renamed over the marker. A
+  crash mid-write leaves a whole marker or none, where it used to leave an
+  unreadable one, and a stale temporary is removed and never read. The file and
+  the directory are synced **where that works**, and the rename happens whether
+  or not it did. The rename is what protects against a process crash; the syncs
+  only against a power loss. A storage failure's marker is written on the disk
+  that just failed, under the exit's five-second deadline, and must not be lost
+  for want of a sync.
+
+**What a carried verdict can and cannot say.**
+- **A stale `.previous` can attach an arbitrarily old "before".** A
+  `.previous` left by a start killed long ago, found by the next start, is
+  reported as what came before however old it is. `ended_at_ms` on that line
+  is the reader's guide to how old.
+- **Collapsing keeps the last run that ran, and can drop a failed start in the
+  middle.** In the sequence *unclean, failed start, killed start*, the killed
+  start's `.previous` holds the failed start's marker, and the start after it
+  reports the kill with the failed start's carried *unclean* as what came
+  before. The failed start in between is not named.
 
 **Wording.** "previous run ended cleanly" is now only for `shutdown` and
 `restore`. An `error` marker reads "the previous start failed before it served"
@@ -11073,11 +11094,19 @@ that, the run ended with exit X". A build from before this addendum ignores the
 new fields, and never removes a `.previous`, which the rule above reads as
 unclean.
 
-Tested by `lifecycle`'s unit tests (a start killed before serving; a carried
-verdict; repeated failed starts; an error after serving carries nothing; no
-temporary file left) and by `crates/kimmyd/tests/lifecycle.rs`: a kill, then a
-failed start, then a start reports both; a clean stop, then a failed start,
-keeps the clean stop.
+Tested by `lifecycle`'s unit tests:
+- a start killed before serving;
+- a carried verdict, for every exit kind before serving;
+- repeated failed starts;
+- an unreadable marker carried as such;
+- an error after serving carries nothing;
+- a marker written although its sync fails;
+- no temporary left, and a stale one removed.
+
+And by `crates/kimmyd/tests/lifecycle.rs`:
+- a kill, then a failed start, then a start reports both;
+- a clean stop, then a failed start, keeps the clean stop;
+- a start that serves settles what it inherited.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
