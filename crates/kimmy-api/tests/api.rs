@@ -11193,6 +11193,46 @@ async fn a_write_that_cannot_get_the_writer_in_time_is_a_503_timeout() {
     );
 }
 
+/// A schema change runs off the async worker, under `kimmy_storage::blocking`,
+/// and keeps the request's write budget there (ADR-151): `block_in_place`
+/// runs it on the same thread, inside the task the budget is scoped to. Run on
+/// the multi-threaded runtime, where `blocking` really does leave the worker;
+/// on the single-threaded one it calls through and would prove nothing.
+///
+/// The writer is held by another thread for a fixed three seconds, so a
+/// budget lost on the way cannot hang the test: the creation would wait out
+/// the hold and succeed, and the assertions below fail on that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_change_off_the_worker_keeps_the_write_budget() {
+    let timeout = std::time::Duration::from_millis(300);
+    let held_for = std::time::Duration::from_secs(3);
+    let server = Server::start_with_request_timeout(timeout).await;
+    let token = server.root().await;
+
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    let (held, is_held) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _hold = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+        held.send(()).unwrap();
+        std::thread::sleep(held_for);
+    });
+    is_held.recv().unwrap();
+
+    let started = std::time::Instant::now();
+    let refused =
+        server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let took = started.elapsed();
+    assert_eq!(refused.status, 503, "gave up inside its budget: {:?} after {took:?}", refused.body);
+    assert_eq!(refused.body["error"], "timeout", "{:?}", refused.body);
+    assert!(took >= timeout && took < held_for, "refused at the budget, not the hold: {took:?}");
+    assert_eq!(server.state.engine.writer_wait_timeouts(), 1, "the refusal is counted");
+    holder.join().unwrap();
+
+    let created =
+        server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    assert_eq!(created.status, 200, "created once the writer is free: {:?}", created.body);
+}
+
 #[tokio::test]
 async fn an_index_carries_every_field_the_specification_requires() {
     // `docs/openapi.yaml` lists the Index schema's `required` fields, and

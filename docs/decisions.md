@@ -12141,6 +12141,44 @@ helper whose name is not on its list is not seen, and neither is a walk in
 `kimmy-cluster`, whose two are listed above. That is the limit of what it
 proves.
 
+**Addendum, 2026-09-23: schema changes and replicated applies leave the worker
+too.** A schema change reached from a request is a walk in all but name. An
+index build files every document of the collection in the transaction that
+creates it, and an index drop removes every entry in one. A collection drop,
+a creation over a dropped life, and a vectors change that creates or drops the
+shadow can each purge a whole collection. All of them ran on the worker, and
+so did the two applies of a peer's window in `kimmy-cluster`.
+
+Round 0380 measured the cost. A burst of 32 parallel index creates on one
+member produced confirmation timeouts on every peer and sync ticks of 14–35 s.
+A replicated drop of a 400,000-document collection held a worker for about
+120 s.
+
+Now under `blocking`:
+- the pulled and pushed applies (ADR-177's addendum);
+- `exec`'s collection create, collection drop, database drop, index build and
+  index drop;
+- the vectors route's configure and disable.
+
+`block_in_place` runs the closure on the same thread, inside the same task, so
+the request's write budget (ADR-151) still bounds each wait for the writer.
+`a_schema_change_off_the_worker_keeps_the_write_budget` proves it on the
+multi-threaded runtime.
+
+Left on the worker, each for a stated reason:
+- **System-collection creation** (topology, webhooks): created once, empty,
+  under a name no client can drop.
+- **Document writes** (insert, replace, update, delete, find-and-modify, bulk
+  insert): one document per transaction, or one `multi_chunk_docs` chunk, with
+  each wait for the writer bounded by the request budget. Moving every request
+  off the worker is a wider change than this finding, and waits for a
+  measurement that shows it matters.
+
+`walks_leave_the_worker.rs` now reads `kimmy-cluster` and lists these schema
+changes and the applies beside the walks. It reads each file with its test
+modules removed, rather than cutting at the first `#[cfg(test)]`, which had
+hidden the rest of `sessions.rs` and would have hidden most of `transport.rs`.
+
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
 > **Refined by [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age):** the age reads the time since the process started before the first check, not 0.
@@ -17458,6 +17496,22 @@ last commit landed turns the covered refusal red.
 **Recorded, not changed.** The apply's CPU between its yielding storage calls
 still runs on the runtime worker (ADR-153's concern), so a 70 s apply occupies
 that tick's sequential contact loop for its whole length.
+
+**Addendum, 2026-09-23: the apply leaves the worker.** The residual above is
+closed for the worker, not for the loop. Both applies of a peer's window, the
+pulled one in `sync_round` and the pushed one on the serving side, now run under
+`kimmy_storage::blocking`, so the runtime moves the worker's other tasks off it
+for as long as the apply takes. That was measured at about 120 s for a replicated
+drop of a 400,000-document collection, which purged every row inside the apply.
+The tick's contact loop is still sequential, and a long apply still occupies it;
+what bounds that for a drop is a separate change.
+`walks_leave_the_worker.rs` now reads `kimmy-cluster` and counts applying a batch
+as a walk. It also reads each file with its test modules removed, rather than
+cutting at the first `#[cfg(test)]`. That cut sat on a hook inside the pull in
+`transport.rs`, and on a test-only method in `sessions.rs`, and hid the rest of
+each file. Tested by the guard itself, and by
+`the_walk_reads_past_a_test_hook_and_not_into_a_test_module`, which fails with
+the old cut.
 
 ---
 

@@ -92,6 +92,18 @@ itself on a storage I/O error, and three metrics change what they read.**
 
 ### Fixed
 
+- **Schema changes and a peer's changes no longer hold an async worker
+  thread for as long as they take.** An index build, an index drop, a
+  collection or database drop, a collection creation, a vectors change, and the
+  apply of a replicated window each ran on the runtime worker that served the
+  request or ran the replication round. Every task queued on that worker waited
+  as long as the change took, `/metrics` among them. A burst of parallel index
+  creates timed out its peers' confirmations, and a replicated drop of 400,000
+  documents held a worker for about two minutes. They now run off the worker,
+  and a request's wait for the storage writer is still bounded by
+  `server.request_timeout_secs` ([ADR-153](docs/decisions.md),
+  [ADR-177](docs/decisions.md)).
+
 - **A webhook registry record that does not decode no longer stops delivery
   for the subscriptions stored after it.** The dispatcher's load stopped
   reading at the first such record and delivered nothing past it, silently.

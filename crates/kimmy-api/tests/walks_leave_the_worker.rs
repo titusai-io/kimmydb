@@ -1,4 +1,5 @@
-//! Every storage walk reached from a request runs under `kimmy_storage::blocking`.
+//! Every storage walk reached from a request or a replication round runs under
+//! `kimmy_storage::blocking`.
 //!
 //! [ADR-153](../../../docs/decisions.md) moved `exec::visit_matching`'s walks
 //! off the async worker and said every read verb that walks goes through that
@@ -14,12 +15,22 @@
 //! through. The walks that are allowed inline are counted
 //! per file with the reason they are bounded, so a new walk in one of those
 //! files still fails here.
+//!
+//! **A replication round is held to the same rule.** Applying a peer's window
+//! ran on the async worker, inside the round's poll, and that apply can take as
+//! long as the work an entry carries: a replicated collection drop purged every
+//! row of the collection there, about 120 s for 400,000 documents, holding the
+//! worker the whole time. So `kimmy-cluster` is read too, and applying a batch
+//! is a walk.
 
+mod source;
+
+use source::{test_modules_declared, without_test_modules};
 use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 8] = [
+const WALKS: [&str; 17] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -28,6 +39,22 @@ const WALKS: [&str; 8] = [
     ".count(&",
     ".live_unique_violations(",
     ".backup_to(",
+    // A peer's window: as long as whatever its entries carry, an index build
+    // or a collection drop included.
+    ".apply_peer_batch_into(",
+    ".apply_peer_batch(",
+    // Schema changes, each as long as the data under it: an index build files
+    // every document in one transaction, an index drop removes every entry in
+    // one, and a collection drop, a creation over a dropped life, and a
+    // vectors change that creates or drops the shadow can each purge a whole
+    // collection. System collections, created once and empty, are not here.
+    ".create_collection(",
+    ".drop_collection(",
+    ".drop_database(",
+    ".create_index_with(",
+    ".drop_index_stamped(",
+    ".configure_vectors(",
+    ".disable_vectors(",
 ];
 
 /// Walks allowed on the worker, per file, each bounded by something other than
@@ -93,15 +120,37 @@ fn uncovered(dir: &Path) -> Vec<(String, usize, String)> {
     let mut found = Vec::new();
     let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
     paths.sort();
+    // A `#[cfg(test)] mod x;` names a file that is test code, so it is not read.
+    let test_only: Vec<std::path::PathBuf> = paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .flat_map(|p| test_modules_declared(&std::fs::read_to_string(p).unwrap()))
+        .map(|named| dir.join(format!("{named}.rs")))
+        .collect();
     for path in paths {
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if test_only.contains(&path) {
+            continue;
+        }
         let body = std::fs::read_to_string(&path).unwrap();
-        // A file's own tests drive storage directly, on purpose.
-        let body = body.split("#[cfg(test)]").next().unwrap();
+        found.extend(uncovered_in(&name, &body));
+    }
+    found
+}
 
+/// The walks in one file's production code that no `blocking(` covers, as
+/// (file, line, text).
+fn uncovered_in(name: &str, body: &str) -> Vec<(String, usize, String)> {
+    let mut found = Vec::new();
+    // A file's own tests drive storage directly, on purpose, so its test
+    // modules are removed — the modules, not everything after the first
+    // `#[cfg(test)]`, which in `transport.rs` sits on a hook in the middle of
+    // the pull and hid the rest of the file.
+    let body = without_test_modules(body);
+    {
         let mut in_string = false;
         let mut depth = 0i64;
         // The bracket depth just inside each enclosing `blocking(`.
@@ -123,7 +172,7 @@ fn uncovered(dir: &Path) -> Vec<(String, usize, String)> {
                     continue;
                 }
                 if open.is_empty() && WALKS.iter().any(|w| rest.starts_with(w)) {
-                    found.push((name.clone(), n + 1, line.trim().to_string()));
+                    found.push((name.to_string(), n + 1, line.trim().to_string()));
                 }
                 match rest.as_bytes()[0] {
                     b'(' | b'{' | b'[' => depth += 1,
@@ -143,10 +192,14 @@ fn uncovered(dir: &Path) -> Vec<(String, usize, String)> {
 }
 
 #[test]
-fn every_walk_reached_from_a_request_runs_under_blocking() {
+fn every_walk_reached_from_a_request_or_a_round_runs_under_blocking() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut offenders = Vec::new();
-    for dir in [crates.join("kimmy-api/src"), crates.join("kimmy-mcp/src")] {
+    for dir in [
+        crates.join("kimmy-api/src"),
+        crates.join("kimmy-mcp/src"),
+        crates.join("kimmy-cluster/src"),
+    ] {
         let found = uncovered(&dir);
         let mut files: Vec<&str> = found.iter().map(|(f, _, _)| f.as_str()).collect();
         files.dedup();
@@ -173,4 +226,28 @@ fn every_walk_reached_from_a_request_runs_under_blocking() {
          data, count it in BOUNDED with the reason:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+#[test]
+fn the_walk_reads_past_a_test_hook_and_not_into_a_test_module() {
+    // The shape `transport.rs` has: a `#[cfg(test)]` on a statement, with the
+    // rest of the function and file after it. The first form of this guard cut
+    // there, so an apply on the worker below the hook passed unseen.
+    let hooked = "fn round() {\n    #[cfg(test)]\n    std::thread::sleep(HOOK);\n    \
+                  let applied = engine.apply_peer_batch_into(&theirs);\n}\n";
+    let found = uncovered_in("hooked.rs", hooked);
+    assert_eq!(found.len(), 1, "the apply after the hook is read: {found:?}");
+    assert_eq!(found[0].1, 4);
+
+    // Covered, it passes.
+    let covered = hooked.replace(
+        "engine.apply_peer_batch_into(&theirs)",
+        "kimmy_storage::blocking(|| engine.apply_peer_batch_into(&theirs))",
+    );
+    assert!(uncovered_in("covered.rs", &covered).is_empty());
+
+    // A test module still drives storage directly and is not read.
+    let tests = "fn production() {}\n\n#[cfg(test)]\nmod tests {\n    \
+                 fn t() {\n        engine.apply_peer_batch(&theirs);\n    }\n}\n";
+    assert!(uncovered_in("tests.rs", tests).is_empty());
 }

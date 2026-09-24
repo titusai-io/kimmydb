@@ -373,13 +373,16 @@ where
                 // it the pusher reads only a closed connection, and the reason
                 // is in this node's log alone.
                 let mut outcome = SyncOutcome::default();
-                let applied = engine.apply_peer_batch_into(
-                    &versions,
-                    &entries,
-                    scanned_to,
-                    exhausted,
-                    &mut outcome,
-                );
+                // Off the async worker, as the pull's apply is: see there.
+                let applied = kimmy_storage::blocking(|| {
+                    engine.apply_peer_batch_into(
+                        &versions,
+                        &entries,
+                        scanned_to,
+                        exhausted,
+                        &mut outcome,
+                    )
+                });
                 // Whether or not the window then failed: the outcome holds
                 // only what a commit made final, as a pulled window's does,
                 // and what none did is delivered again and counted then
@@ -1039,13 +1042,14 @@ where
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
             let applying = std::time::Instant::now();
             let mut outcome = SyncOutcome::default();
-            let applied = engine.apply_peer_batch_into(
-                &theirs,
-                &entries,
-                scanned_to,
-                exhausted,
-                &mut outcome,
-            );
+            // Off the async worker. An apply takes as long as the work its
+            // entries carry — an index build files every document of its
+            // collection in one transaction, and a collection drop purged the
+            // whole collection here — and a worker held that long stalls
+            // every task queued behind it, `/metrics` among them (ADR-153).
+            let applied = kimmy_storage::blocking(|| {
+                engine.apply_peer_batch_into(&theirs, &entries, scanned_to, exhausted, &mut outcome)
+            });
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
             clock.applied_for(applying.elapsed());
