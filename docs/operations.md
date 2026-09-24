@@ -567,6 +567,19 @@ before it served leaves only `kimmy.last-exit.previous`, and the next start
 reads that as an unclean end, with the set-aside verdict reported after it as
 what came before.
 
+**A second `kimmyd` on a data directory another one is using leaves it
+alone.** From 0.36.0, a node holds its data directory with an exclusive lock
+for as long as it runs. A second start on the same directory logs `data
+directory … is in use by another kimmyd` and exits, without reading, setting
+aside or writing any marker. The running node's next exit is then reported
+as its own. If the store is held by a process that doesn't take that lock,
+such as a build before 0.36.0, the second start is refused at the database
+instead (`… is open in another process`). It puts back the marker it set aside
+and writes none of its own. On a filesystem that can't lock a directory (NFS
+without lock support, for example, which answers `ENOLCK`), the node logs `could
+not hold the data directory` as a warning and starts anyway. redb's own lock on
+`kimmy.redb` still refuses a second opener.
+
 A start that finds the database and **no marker** logs at `WARN`:
 
 ```text
@@ -1804,6 +1817,55 @@ All three are idempotent and run before the node serves anything.
 > wipe its data directory and let it catch up from its peers, keeping clients
 > off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
 > back, restore the backup.
+
+### Rolling back, and `kimmy.format`
+
+**From 0.36.0, a build that refuses a newer store writes nothing to it**
+([ADR-190](decisions.md)). Before it opens `kimmy.redb` for writing, it reads
+redb's file header and `kimmy.format`, a small sidecar file beside the database.
+It refuses to start, with the path and what was newer, when any of these is
+newer than the build: the storage schema, the redb major.minor, or redb's file
+format. The database and its sidecar are left byte for byte as they were. A
+newer redb *patch* alone is not a boundary.
+
+"Writes nothing" applies to refusing a **newer** store. Upgrading an **older**
+store still migrates it, and a migration can stop partway through, for example
+on a partial filter this build can't parse, as described above.
+
+**Protection starts with 0.36.0.** Builds before 0.36.0 don't read
+`kimmy.format`. Rolling back to 0.35.0 or earlier still opens the store for
+writing and refuses it afterwards, after redb has repaired it (if it was not
+shut down cleanly) and a transaction has committed. Take the backup before
+upgrading, as above.
+
+**`kimmy.format` travels with the store.** Copy it with `kimmy.redb` whenever
+you move or copy a data directory.
+- **A copy that leaves it behind, taken from a store that was not shut down
+  cleanly, is opened by whatever build you start on it.** Without the sidecar,
+  and with redb unable to read a dirty file without repairing it, the build
+  can't tell whether a newer build wrote it. So it repairs the store, as every
+  build did before 0.36.0. To avoid this, start the build that wrote the store,
+  or restore the backup taken before the upgrade. If the store records that a
+  newer redb wrote it, the start stops right after the repair. Nothing is
+  written but redb's own repair and close, and the record stays in place, so
+  every later start refuses the store before opening it.
+- A clean store copied without its sidecar is still checked: the build reads
+  the schema and redb version from the database without writing.
+- **An unreadable `kimmy.format` refuses the start.** Restore the file from the
+  source directory or from the backup. Don't delete it: it records which builds
+  may open the store, and without it the check falls back to the weaker
+  no-sidecar rules above.
+
+**A logical backup is the way out of any refusal.** A backup (`GET
+/v1/admin/backup`) holds documents and definitions, not redb's pages, and a
+restore (`kimmyd restore`) builds a new file with the restoring build's own
+redb. So a backup taken on a newer build restores on an older one, as long as
+the backup format and the storage schema are ones the older build knows. A
+backup of a newer schema is refused before the restore creates any file. A
+restore writes a fresh `kimmy.format` for the build that ran it.
+
+The start after a refusal still reports the run before it. See
+[What a shutdown logs](#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
 
 ### Rebuild vector indexes after upgrading past 2026-08-15
 

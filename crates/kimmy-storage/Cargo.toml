@@ -29,6 +29,7 @@ kimmy-core.workspace = true
 redb.workspace = true
 bson.workspace = true
 serde.workspace = true
+toml.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

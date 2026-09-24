@@ -157,6 +157,9 @@ impl Engine {
             }};
         }
 
+        // META first, always: a restore reads the leading META records before
+        // it creates a file, to refuse a newer schema with nothing written
+        // (ADR-190). `meta_leads_the_backup_stream` pins the order.
         simple!(T_META, tables::META, |k: &str| k.as_bytes().to_vec());
         simple!(T_DATABASES, tables::DATABASES, |k: &str| k.as_bytes().to_vec());
         simple!(T_COLLECTIONS, tables::COLLECTIONS, |k: (&str, &str)| {
@@ -254,6 +257,17 @@ impl Engine {
 /// and there is deliberately no flag for it here: it would be one keystroke
 /// between "recover" and "corrupt the cluster's identity space".
 pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
+    restore_with(path, input, &crate::format::BuildVersions::ours())
+}
+
+/// [`restore`], as a build with `build`'s versions. A backup is logical, so the
+/// restored file is this build's redb writing it, whatever wrote the store the
+/// backup came from; the sidecar says so (ADR-190).
+pub fn restore_with(
+    path: &Path,
+    input: &mut impl Read,
+    build: &crate::format::BuildVersions,
+) -> Result<BackupInfo> {
     if path.exists() {
         return Err(StorageError::Database(format!(
             "{} already exists; restore writes a new database rather than overwriting one",
@@ -297,6 +311,40 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
     let node = NodeId::from_bytes(header[9..25].try_into().expect("16 bytes"));
     let created_ms = u64::from_be_bytes(header[25..33].try_into().expect("8 bytes"));
 
+    // META comes first in every backup, so its records are read before the
+    // file is created: a backup of a newer schema is refused with nothing
+    // written (ADR-190). They are buffered and restored with the rest.
+    let mut pending = std::collections::VecDeque::new();
+    let mut ended = false;
+    loop {
+        let mut tag = [0u8; 1];
+        input.read_exact(&mut tag).map_err(io)?;
+        if tag[0] == END {
+            ended = true;
+            break;
+        }
+        let key = read_chunk(input)?;
+        let value = read_chunk(input)?;
+        let is_meta = tag[0] == T_META;
+        pending.push_back((tag[0], key, value));
+        if !is_meta {
+            break;
+        }
+    }
+    let schema = pending
+        .iter()
+        .find(|(tag, key, _)| {
+            *tag == T_META && key.as_slice() == tables::META_FORMAT_VERSION.as_bytes()
+        })
+        .and_then(|(_, _, value)| value.first().copied());
+    if let Some(found) = schema
+        && found > build.schema
+    {
+        return Err(StorageError::UnsupportedFormat { found, expected: build.schema });
+    }
+
+    // A new file, which no check before it could read (ADR-190).
+    #[allow(clippy::disallowed_methods)]
     let db = Database::create(path)?;
     let mut records = 0usize;
     let mut bytes = header.len();
@@ -319,17 +367,26 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
             let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
 
             loop {
-                let mut tag = [0u8; 1];
-                input.read_exact(&mut tag).map_err(io)?;
-                if tag[0] == END {
-                    break;
-                }
-                let key = read_chunk(input)?;
-                let value = read_chunk(input)?;
+                let (tag, key, value) = match pending.pop_front() {
+                    Some(record) => record,
+                    None if ended => break,
+                    None => {
+                        let mut tag = [0u8; 1];
+                        input.read_exact(&mut tag).map_err(io)?;
+                        if tag[0] == END {
+                            break;
+                        }
+                        (tag[0], read_chunk(input)?, read_chunk(input)?)
+                    }
+                };
                 bytes += 1 + 8 + key.len() + value.len();
                 records += 1;
 
-                match tag[0] {
+                match tag {
+                    // The redb that wrote the source file says nothing about
+                    // this one, which this build's redb writes; it is recorded
+                    // below as this build's (ADR-190).
+                    T_META if key.as_slice() == crate::format::META_REDB_VERSION.as_bytes() => {}
                     T_META => {
                         meta.insert(as_str(&key)?, value.as_slice())?;
                     }
@@ -401,6 +458,12 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
         }
         txn.commit()?;
     }
+    // The sidecar is regenerated, never carried: this build's redb wrote the
+    // file, and the schema is what the restored META says (ADR-190). The
+    // backup format does not change.
+    crate::migrate::record_redb_version(&db, build)?;
+    let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
+    crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
     info!(records, bytes, %node, path = %path.display(), "restored a backup");
     Ok(BackupInfo { node: Some(node), created_ms, records, bytes })
@@ -441,6 +504,31 @@ mod tests {
 
     fn field(path: &str) -> IndexField {
         IndexField { path: path.to_string(), descending: false }
+    }
+
+    /// A restore refuses a newer schema from the META records it reads before
+    /// creating a file, so every META record must come before any other.
+    #[test]
+    fn meta_leads_the_backup_stream() {
+        let (engine, _dir) = populated();
+        let mut out = Vec::new();
+        engine.backup_to(&mut out).unwrap();
+        let mut rest = &out[8 + 1 + 16 + 8..];
+        let mut tags = Vec::new();
+        loop {
+            let tag = rest[0];
+            rest = &rest[1..];
+            if tag == END {
+                break;
+            }
+            tags.push(tag);
+            read_chunk(&mut rest).unwrap();
+            read_chunk(&mut rest).unwrap();
+        }
+        let metas = tags.iter().take_while(|&&t| t == T_META).count();
+        assert!(metas > 0, "the backup carries META");
+        assert!(tags[metas..].iter().all(|&t| t != T_META), "every META record leads: {tags:?}");
+        assert!(metas < tags.len(), "and other tables follow it");
     }
 
     /// An engine holding a bit of everything a backup has to carry.

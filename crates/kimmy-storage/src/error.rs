@@ -85,6 +85,18 @@ pub enum StorageError {
          once that finishes"
     )]
     CollectionPurging { db: String, name: String, id: kimmy_core::CollectionId },
+
+    /// The store was refused before anything opened it for writing, and
+    /// nothing in it was changed (ADR-190): a newer build wrote it, its
+    /// sidecar is unreadable, or it could not be read.
+    #[error("{0}")]
+    RefusedStore(String),
+
+    /// Another process has the store open, so this one does not open it and
+    /// writes nothing. Its own variant because a second start on a live data
+    /// directory must leave that directory's lifecycle marker alone.
+    #[error("{0}")]
+    StoreInUse(String),
 }
 
 /// What an operator can actually do about a stored partial filter this build

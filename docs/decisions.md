@@ -11068,7 +11068,8 @@ reported. It changes in four ways:
 - **The marker is written atomically:** a temporary file named for the marker
   and the process (`kimmy.last-exit.tmp.<pid>`), renamed over the marker. A
   crash mid-write leaves a whole marker or none, where it used to leave an
-  unreadable one, and a stale temporary is removed and never read. The file and
+  unreadable one. A stale temporary is never read, and it is removed once the
+  process named in it is gone. The file and
   the directory are synced **where that works**, and the rename happens whether
   or not it did. The rename is what protects against a process crash; the syncs
   only against a power loss. A storage failure's marker is written on the disk
@@ -11107,6 +11108,19 @@ And by `crates/kimmyd/tests/lifecycle.rs`:
 - a kill, then a failed start, then a start reports both;
 - a clean stop, then a failed start, keeps the clean stop;
 - a start that serves settles what it inherited.
+
+**A second start on a live directory leaves it alone.** A second `kimmyd`
+started on a directory a running node uses used to set the live node's marker
+aside, fail at redb's lock, and write a failed start of its own there. The
+running node's next unclean end was then reported as "the previous start
+failed". Now a node takes an exclusive `flock` on the data directory itself,
+before it reads anything there, and holds it until its last marker is written.
+A second start stops at that lock, reading, moving and writing nothing. A store
+held by a process that does not take the lock, such as a build before this
+one, is refused at redb's lock as `StorageError::StoreInUse`. On that error the
+start puts back any marker it set aside and writes none. Tested by
+`a_second_start_on_a_live_directory_leaves_its_markers_alone` and
+`a_start_that_finds_the_store_held_leaves_the_marker_as_it_was`.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
@@ -18561,6 +18575,13 @@ For 10 million retained entries and one partial index over 10 million documents 
 
 ### Downgrade is refused, and what rolling back means
 
+> **Amended by [ADR-190](#adr-190--a-store-is-checked-before-it-is-opened-for-writing).**
+> The refusal below came after the older build had opened the store
+> read-write: after redb's repair of a store that had not shut down cleanly,
+> and after the transaction that ensures the tables. From 0.36.0, a build
+> refuses a newer store before it writes anything. A rollback to 0.35.0 or
+> earlier still writes first, because those builds do not have the check.
+
 An older build refuses a schema 4 database (`UnsupportedFormat`, found 4 where it expects 3) instead of opening it and re-corrupting every partial index on each write. **A file whose migration was interrupted is schema 4 too**, by the ordering above, so it is refused on the same path: there is no state in which an older build opens a database some of whose partial indexes this build has rebuilt. A node that does not start is found in seconds. A node that starts and quietly degrades its indexes is found weeks later from a wrong answer.
 - **Rolling back one member** needs no backup, and it needs **keeping out of service until it has caught up**. Wipe its data directory and start the older build: it catches up from its peers by the ordinary whole-database snapshot. Until then it answers reads from a store that starts empty, so a document it has not pulled yet reads as not found, not as an error. Nothing reports that it is behind: `/readyz` does not know about catching up, and `kimmy_replication_lag_seconds` reads 0 from a fresh start. So it goes back into service by hand, once its document counts match a member that stayed up. Readiness that covers catching up is filed separately, and it is not simple: discovery on Kubernetes resolves only ready pods, so a readiness gate on peers would deadlock a whole-cluster cold start.
 - **Rolling back the whole cluster** leaves no un-upgraded peer to catch up from, so it needs a backup taken before the upgrade.
@@ -19161,3 +19182,168 @@ hang. Among them:
 - `a_purge_stopped_part_way_is_left_to_the_restarted_purger_and_not_to_open`;
 - `rows_with_no_tombstone_are_queued_by_the_creation_that_meets_them`;
 - `a_retention_pass_leaves_a_drops_rows_to_the_purger_and_keeps_its_tombstones`.
+
+---
+
+## ADR-190 — A store is checked before it is opened for writing
+
+**Decision.** Before any read-write open of `kimmy.redb`,
+`kimmy_storage::format::check_before_open` decides whether this build may write
+the store. It reads the file's header and a sidecar file, `kimmy.format`,
+beside it. It refuses (`StorageError::RefusedStore`) a store written by a newer
+build, and nothing in the store changes. The read-write open takes a `Cleared`
+token that only the check returns, so no path opens the store without it.
+
+The sidecar is TOML, written atomically (a temporary file, fsync, rename, then a
+directory fsync):
+
+```toml
+schema = 4                # the storage schema this store may hold
+redb_version = "4.1"      # major.minor of the redb that last opened it for writing
+redb_file_format = 3      # the file-format number in redb's header
+written_by = "0.36.0"
+```
+
+**The check, in order:**
+1. A missing or zero-length `kimmy.redb` is a fresh store. A file shorter than
+   redb's 320-byte header is refused.
+2. **The header.** The magic, and the file-format byte of both commit slots, are
+   read with a plain file read, whether the store is clean or dirty. A format
+   byte above this build's is refused before redb is asked anything. This check
+   only makes the error clearer, because redb would refuse the byte too before
+   writing. A test pins that.
+3. **The sidecar.** A store is refused when its sidecar holds any of these:
+   - a newer `schema`;
+   - a newer redb **major.minor**;
+   - a newer `redb_file_format`.
+
+   An unparseable sidecar, or one missing a field, is refused too, and never
+   guessed past. An unknown field is ignored.
+4. **No sidecar.** The store is opened with redb's `ReadOnlyDatabase`, which
+   cannot write, and its `META` is read: the schema, and the redb version each
+   open now records there. If either is newer, the store is refused. A dirty
+   store answers `RepairAborted` without repairing, and it proceeds to the
+   read-write open, which repairs it, as before. A store another process
+   holds is refused as `StorageError::StoreInUse`, and any other error refuses
+   as well.
+
+After the check, the order is:
+1. The file is opened, and redb's `FileBackend` takes its exclusive lock, which
+   writes nothing.
+2. The header and the sidecar are read again through the locked handle. The
+   start is refused if either changed after the check.
+3. Only then is the sidecar written: its redb fields are raised to this build's
+   and `schema` is kept. A dirty store with no sidecar gets its sidecar only
+   after the open.
+4. `create_with_backend` opens the database.
+5. `migrate::refuse_newer` runs before the transaction that ensures the tables.
+   It refuses a newer schema, and a newer redb recorded in `META`. The check
+   has already refused every store it could read, so what this catches is a
+   dirty store with no sidecar that a newer redb wrote: redb's repair has
+   written to it (the gap below), and redb's close writes as the open is
+   dropped, but kimmy writes nothing. `META` keeps the
+   newer version, since `record_redb_version` never lowers it, so every later
+   start refuses the store before opening it.
+6. The migration raises the sidecar's `schema` just before its first write.
+7. After a successful open, the sidecar is reconciled to the larger of the
+   schema it records and `META`'s.
+
+**Why.** Before this record, a build given a newer store opened it read-write
+first and refused it afterwards. By then two writes had happened:
+- redb's repair, for a store that had not shut down cleanly;
+- the ensure-tables commit.
+
+The refusal ADR-183 describes ("an older build refuses a schema 4 database")
+was real, but it came after the store had been written by a build that did not
+understand it. The same held for a redb upgrade. A newer redb's file, opened by
+an older redb, can be repaired or committed to under rules the older redb does
+not know, and redb's own version check comes too late to prevent that.
+
+**A newer redb major.minor or header format refuses; a newer patch does not.**
+redb keeps a patch release inside the same file format and the same allocator
+and system-table rules. Its format and rule changes land in a minor or major
+release, and a format change also moves the header byte. Refusing on a patch
+would make every routine dependency bump a rollback boundary for nothing, and a
+patch that did change the file would move the header byte, which step 2
+refuses. So the two checks together catch a format change at any version level.
+`redb = "~4.1"` in `Cargo.toml` keeps a minor bump a deliberate edit. A test
+compares `REDB_MAJOR_MINOR` against `Cargo.lock`, and another creates a store
+and pins its format byte to 3.
+
+**The schema is raised just before it moves, not at the start.** A start that
+fails before its migration writes leaves the sidecar at the old schema, so the
+previous build still opens the store. A crash between the raise and the
+migration's first commit leaves the sidecar ahead of `META`. The previous build
+then refuses a store it could have opened, which is the safe direction, and
+restoring the pre-upgrade backup is the way out.
+
+**The gap left open: a dirty store whose sidecar is missing.** Without a
+sidecar, this build can't tell a store from an older build (with no sidecar yet)
+from a newer store whose sidecar was deleted or not copied. A clean one is still
+caught, because the read-only open reads `META`. A dirty one can't be read
+without repair, so it proceeds and is repaired, exactly as before this record.
+If `META` then names a newer redb, the open stops there (step 5).
+Closing the gap would mean refusing every dirty store without a sidecar, which
+would refuse the ordinary upgrade of a pre-sidecar store after a crash.
+operations.md tells an operator that the sidecar must travel with a copied
+store.
+
+**Protection starts with the build that has this record.** A build from before
+this record does not read `kimmy.format`. Rolling back to 0.35.0 or earlier
+still opens the store read-write and refuses it afterwards. The check protects
+a rollback only when the build being rolled back **to** has it, so 0.36.0 is the
+first release a rollback is protected at.
+
+**Backup and restore.** A KIMMYBK1 backup is logical, and a restore builds a new
+file with the restoring build's own redb, so the backup format does not change.
+A backup's `META` records come first, so a restore reads them before creating
+the file and refuses a newer schema with nothing written. It does not restore
+the source store's recorded redb version, which described a file this restore
+does not write. It records its own, and it writes the sidecar after its commit:
+`schema` from the restored `META`, and the redb fields from this build. Because a logical backup crosses
+redb versions, a backup and restore is the way out of any refusal.
+
+**Only two calls open a store for writing:** `Engine::open_cleared` and
+`backup::restore`. `clippy.toml` disallows redb's `Database::create`,
+`Database::open` and `Builder`'s create and open methods everywhere else, and
+kimmy-storage allows them in its tests.
+
+**Rejected.**
+- **Aborting redb's repair until the check has run.** This is not byte-safe:
+  redb rewrites the header before the repair callback runs, the callback runs
+  only when the allocator-state table is missing, and opening for writing
+  writes anyway. The `Cleared` token enforces the order in the type system
+  instead.
+- **Recording the redb version from `build.rs`.** A constant plus a test against
+  `Cargo.lock` gives the same guarantee without a build script.
+- **Parsing the recovery flag from the raw header.** `ReadOnlyDatabase` answers
+  that question with `RepairAborted`, without writing and without depending on
+  redb's header layout beyond the format byte.
+
+**Amends** [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns):
+from the first build with this record, its "refuses" means the refusal comes
+before anything is written. The lifecycle marker that keeps the evidence of the
+run before a refused start is ADR-147's addendum.
+
+**Tested.** In `kimmy-storage`, each refusal compares the store's bytes and its
+sidecar before and after. Among the tests:
+- `a_newer_schema_in_the_sidecar_is_refused_untouched_clean_and_dirty`, with
+  `the_dirty_fixture_is_one_this_build_repairs` as its control;
+- `a_newer_redb_minor_or_file_format_in_the_sidecar_is_refused_untouched`, and
+  `a_newer_redb_patch_alone_is_not_a_boundary`;
+- `a_newer_format_byte_in_the_header_is_refused_before_redb_is_asked`;
+- `with_no_sidecar_a_newer_schema_or_redb_in_meta_is_refused_untouched`;
+- `an_unreadable_sidecar_is_refused_untouched_and_an_unknown_field_is_not`;
+- `a_store_another_holder_has_open_is_refused_and_its_sidecar_untouched`;
+- `a_zero_length_file_is_fresh_and_a_short_one_is_refused`;
+- `the_sidecar_is_raised_before_a_migration_writes`;
+- `a_restore_regenerates_the_sidecar_for_the_build_that_restores`, and
+  `a_restore_refuses_a_backup_of_a_newer_schema_before_writing`;
+- `a_dirty_store_a_newer_redb_wrote_with_no_sidecar_stops_and_keeps_the_evidence`;
+- `with_no_sidecar_a_store_redb_would_upgrade_is_refused_untouched`;
+- `a_store_that_changes_after_the_check_is_refused_under_the_lock`;
+- `an_open_records_its_redb_in_meta`.
+
+In `kimmyd`, `a_store_a_newer_build_wrote_is_refused_and_left_as_it_was` starts
+a real node on a store whose sidecar names a newer schema. It checks that the
+node refuses to start, and that neither the database nor its sidecar changes.

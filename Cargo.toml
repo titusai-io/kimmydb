@@ -95,7 +95,9 @@ bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 
 # Storage
-redb = "4.1"
+# Pinned to 4.1.x: a redb minor may change allocator or system-table rules,
+# which is a format event for a store (ADR-190). A patch may not.
+redb = "~4.1"
 
 # HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
 # the two cannot drift apart on features -- `rustls-tls` matters, because the
