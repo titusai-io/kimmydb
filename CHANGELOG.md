@@ -10,38 +10,47 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.36.0 - 2026-09-24
+
+**Roll the members one at a time. The storage schema stays at 4 and redb at
+4.1, and the one wire change, a field added to the sync protocol's `Pushed`
+reply, is ignored by an older member. A downgrade to 0.35.0 is not refused,
+but rollback protection starts with this release, so read the first entry
+before relying on one. Read three more before upgrading: a drop now answers at
+its burial, a recreation during the purge that follows is refused with `503
+collection_purging`, and a drop and a recreation in one replication window
+hold that member's replication back until the purge ends.**
 
 ### Changed
 
 - **A build refuses a store a newer build wrote before it writes anything to
-  it** ([ADR-190](docs/decisions.md)). Before opening `kimmy.redb` for
-  writing, a node reads redb's file header and a new sidecar file,
-  `kimmy.format`, beside it. It refuses to start, leaving the database and
-  sidecar unchanged, if any of these is newer than the build: the storage
-  schema, the redb major.minor, or redb's file format. A newer redb patch alone
-  is not a boundary. Until now a build opened the store read-write first,
-  which let redb repair it and commit to it, and refused only afterwards.
-  **Protection starts with this release:** builds before it don't read
-  `kimmy.format`, so a rollback to 0.35.0 or earlier still writes to the store
-  before refusing it. Copy `kimmy.format` with `kimmy.redb` when you copy a
-  data directory, and restore it rather than delete it if it is ever
-  unreadable. [operations.md](docs/operations.md) has the rollback rules and
-  the one case the check can't cover.
+  it** ([ADR-190](docs/decisions.md)). Before opening `kimmy.redb` for writing,
+  a node reads redb's file header and a new sidecar file, `kimmy.format`, beside
+  it. It refuses to start, leaving the database and sidecar unchanged, if any of
+  these is newer than the build: the storage schema, the redb major.minor, or
+  redb's file format. A newer redb patch alone is not a boundary. Until now a
+  build opened the store read-write first, which let redb repair it and commit
+  to it, and refused only afterwards. **Protection starts with this release:**
+  builds before it don't read `kimmy.format`, so a rollback to 0.35.0 or earlier
+  still opens the store read-write before refusing it. Copy `kimmy.format` with
+  `kimmy.redb` when you copy a data directory, and restore it rather than delete
+  it if it is ever unreadable. [operations.md](docs/operations.md) has the
+  rollback rules and the one case the check can't cover.
 
-- **A collection or database drop answers as soon as it is recorded, and what
-  it held is removed in the background** ([ADR-189](docs/decisions.md)). From
-  that answer the collection is gone to every client and peer, as it already
-  was while a drop was in progress, and the `DELETE` no longer takes as long as
-  the collection is large, so a client timeout no longer needs sizing for it. A
-  new background task, the drop purger, removes the rows, and
-  `kimmy_task_progress_age_seconds{task="drop_purger"}` reports it (alert above
-  15 s). A scrape config or golden list that enumerates series needs the new
-  row, the new `drop_purger` task in `kimmy_task_retries_total`, and
+- **A collection or database drop answers at its burial, as soon as it is
+  recorded, and what it held is removed in the background**
+  ([ADR-189](docs/decisions.md)). From that answer the collection is gone to
+  every client and peer, as it already was while a drop was in progress, and the
+  `DELETE` no longer takes as long as the collection is large, so a client
+  timeout no longer needs sizing for it. A new background task, the drop purger,
+  removes the rows, and `kimmy_task_progress_age_seconds{task="drop_purger"}`
+  reports it (alert above 15 s). A scrape config or golden list that enumerates
+  series needs the new row, the new `drop_purger` task in
+  `kimmy_task_retries_total`, and
   `kimmy_sync_entries_skipped_total{reason="purge_pending"}`.
 
 - **Creating a name again before that removal finishes is refused with `503
-  collection_purging`**, with `Retry-After`. So is enabling vectors on a
+  collection_purging`**, with `Retry-After: 5`. So is enabling vectors on a
   collection whose vectors were dropped with `drop_vectors=true`. It used to
   succeed at once, because the drop had already paid. Retry it: the refusal
   writes nothing and moves the removal to the front. A client that treats an
@@ -52,7 +61,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   creation, until its own removal is done.** A peer that does not hold it yet
   still serves other origins' changes up to what it advertised, so the delay
   reaches every peer the member pulls from as the creation does. It grows with
-  the dropped collection's size.
+  the dropped collection's size. For a drop and a recreation in one
+  replication window, the member's replication is held back until the purge
+  ends.
   `kimmy_sync_entries_skipped_total{reason="purge_pending"}` counts it, and the
   divergence-check age alert fires while it lasts.
 
