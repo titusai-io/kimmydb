@@ -10,11 +10,21 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.37.0 - 2026-09-24
 
-**A rollback boundary: redb moves from 4.1 to 4.3.** 0.36.x refuses a store
-this release has opened and writes nothing to it. Take a backup before
-upgrading; the way back is restoring it.
+**Roll the members one at a time: nothing on the wire changes, and each
+member's store and its lock are its own. This release is a rollback boundary.
+A store 0.37.0 has opened records redb 4.3, and 0.36.x refuses it with nothing
+written; 0.35.0 and earlier don't check and would open it. So take a backup
+before upgrading, and roll a member back only by restoring the backup or by
+wiping its data directory and letting it catch up. redb moves from 4.1 to 4.3,
+and the node now takes the store's lock itself, before it confirms what the
+start-up check read and before anything is written. A store with a damaged
+redb header is refused within a second instead of hanging, crashing or running
+out of memory. That includes one whose commit slot names a root page past the
+end of the file, and one that makes redb panic; both were reported upstream.
+Building needs Rust 1.90, and a store on a filesystem with neither byte-range
+locks nor `flock` is now refused.**
 
 ### Changed
 
