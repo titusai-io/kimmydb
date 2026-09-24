@@ -10,6 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`kimmy_sync_ddl_applied_total{via}`** counts the replicated schema
+  changes a member applied, `pull` for windows it pulled and `push` for
+  windows a peer pushed to confirm an index change (bridged as
+  `kimmy.sync.ddl_applied.pull` and `.push`). It counts entries applied, not
+  received, and a change already held that a window carries again is counted
+  each time. A push carries everything the member lacks from the pusher, so a
+  burst of N concurrent index creates on one member can make each peer apply
+  about N²/2 of them; this is where that shows. See
+  [the metrics table](docs/operations.md).
+
 ## 0.37.0 - 2026-09-24
 
 **Roll the members one at a time: nothing on the wire changes, and each

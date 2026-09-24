@@ -1061,6 +1061,7 @@ where
             // holds only what a commit made final, and what none did is
             // served again and counted then (ADR-177).
             let counted = &mut stalls.applied;
+            counted.ddl_applied += outcome.ddl;
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
@@ -1510,6 +1511,10 @@ pub struct PeerStalls {
 /// The counts a committed apply produced that a round's report carries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppliedCounts {
+    /// Schema-change entries the apply took as applied —
+    /// `SyncOutcome::ddl`, re-applies of a change already held here
+    /// included; see `RoundReport::ddl_applied`.
+    pub ddl_applied: usize,
     pub ddl_refused: usize,
     pub ddl_declined: usize,
     pub unknown_collection: usize,

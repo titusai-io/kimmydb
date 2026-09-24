@@ -670,6 +670,14 @@ async fn a_schema_change_made_right_after_its_collection_reaches_every_member() 
     // confirmed them before the response.
     assert_eq!(created["confirmation"]["confirmed"].as_array().map(Vec::len), Some(2), "{created}");
     assert_eq!(created["confirmation"]["pending"].as_array().map(Vec::len), Some(0), "{created}");
+    // And counted as pushed where they were applied: the push hook records
+    // before the peer answers, so each peer's count is in place by the time
+    // the response is. The index at least came by push; the collection too,
+    // unless a sync round took it first.
+    for node in [&b, &c] {
+        let pushed = node.gauge(&client, "kimmy_sync_ddl_applied_total{via=\"push\"}").await;
+        assert!(pushed >= Some(1), "{}'s pushed schema changes: {pushed:?}", node.name);
+    }
 
     for node in [&b, &c] {
         let token = node.login(&client).await;

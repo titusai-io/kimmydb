@@ -289,6 +289,12 @@ pub struct MetricsSnapshot {
     /// Replicated index drops declined as older than the index standing
     /// here (ADR-141).
     pub sync_ddl_declined: u64,
+    /// Replicated schema changes applied here, by the way they arrived: a
+    /// pulled window, or a window a peer pushed to confirm a change
+    /// (ADR-140). Every entry the apply took as applied, a change already
+    /// held here included — see [`Metrics::record_ddl_applied_push`].
+    pub sync_ddl_applied_pull: u64,
+    pub sync_ddl_applied_push: u64,
     /// Schema changes a snapshot restore re-logged so that this node can
     /// serve them onward (ADR-180). One of the engine's readings.
     pub sync_ddl_relogged: u64,
@@ -396,6 +402,8 @@ pub struct Metrics {
     sync_peers_backing_off: AtomicU64,
     sync_ddl_refused: AtomicU64,
     sync_ddl_declined: AtomicU64,
+    sync_ddl_applied_pull: AtomicU64,
+    sync_ddl_applied_push: AtomicU64,
     sync_divergent_collections: AtomicU64,
     /// The gauge above says how many collections disagree; these two say
     /// whether anything looked (ADR-135). Counters, unlike the gauge beside
@@ -505,6 +513,8 @@ impl Default for Metrics {
             sync_peers_backing_off: AtomicU64::new(0),
             sync_ddl_refused: AtomicU64::new(0),
             sync_ddl_declined: AtomicU64::new(0),
+            sync_ddl_applied_pull: AtomicU64::new(0),
+            sync_ddl_applied_push: AtomicU64::new(0),
             sync_divergent_collections: AtomicU64::new(0),
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
@@ -722,6 +732,7 @@ impl Metrics {
         self.sync_peers_backing_off.store(round.backing_off as u64, Ordering::Relaxed);
         self.sync_ddl_refused.fetch_add(round.ddl_refused as u64, Ordering::Relaxed);
         self.sync_ddl_declined.fetch_add(round.ddl_declined as u64, Ordering::Relaxed);
+        self.sync_ddl_applied_pull.fetch_add(round.ddl_applied as u64, Ordering::Relaxed);
         self.sync_divergent_collections
             .store(round.divergent_collections as u64, Ordering::Relaxed);
         self.sync_divergence_checks.fetch_add(round.divergence_checks as u64, Ordering::Relaxed);
@@ -772,6 +783,19 @@ impl Metrics {
     /// lands on, for the reason [`Self::record_ddl_refused`] gives.
     pub fn record_ddl_declined(&self, n: u64) {
         self.sync_ddl_declined.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count schema changes a peer pushed to this node that it applied
+    /// (ADR-140), beside the pulled ones on the same series under
+    /// `via="push"`. Unlike the refusal, which way the change arrived is the
+    /// point here: a push that confirms one change carries the whole window
+    /// the member lacks (ADR-143), so a burst of N concurrent creates can
+    /// make each member apply about N²/2 of them, and the pushed count is
+    /// where that shows. A change already held here that a window carries
+    /// again comes back from the apply as applied, and is counted, because
+    /// that apply is the work being measured.
+    pub fn record_ddl_applied_push(&self, n: u64) {
+        self.sync_ddl_applied_push.fetch_add(n, Ordering::Relaxed);
     }
 
     /// One backup produced, and how long the walk and the spill took
@@ -1010,6 +1034,8 @@ impl Metrics {
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
             sync_ddl_declined: self.get(&self.sync_ddl_declined),
+            sync_ddl_applied_pull: self.get(&self.sync_ddl_applied_pull),
+            sync_ddl_applied_push: self.get(&self.sync_ddl_applied_push),
             sync_ddl_relogged: readings.sync_ddl_relogged,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
@@ -1263,6 +1289,10 @@ impl Metrics {
              # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
+             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received - a refused, declined or skipped one is on its own series - and a change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply about N squared over 2 through push.\n\
+             # TYPE kimmy_sync_ddl_applied_total counter\n\
+             kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
+             kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
              # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
              # TYPE kimmy_sync_ddl_relogged_total counter\n\
              kimmy_sync_ddl_relogged_total {sync_ddl_relogged}\n\
@@ -1390,6 +1420,8 @@ impl Metrics {
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
             sync_ddl_declined = self.get(&self.sync_ddl_declined),
+            sync_ddl_applied_pull = self.get(&self.sync_ddl_applied_pull),
+            sync_ddl_applied_push = self.get(&self.sync_ddl_applied_push),
             sync_ddl_relogged = readings.sync_ddl_relogged,
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
@@ -1805,6 +1837,7 @@ mod tests {
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 20,
             backing_off: 99,
+            ddl_applied: 83,
             ddl_refused: 21,
             ddl_declined: 28,
             divergent_collections: 12,
@@ -1823,6 +1856,7 @@ mod tests {
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 3,
             backing_off: 24,
+            ddl_applied: 6,
             ddl_refused: 4,
             ddl_declined: 8,
             divergent_collections: 5,
@@ -1840,6 +1874,9 @@ mod tests {
             // buckets a long wait for the writer lands in (ADR-175).
             pulls: pulls_observed([8, 45_000, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
         });
+        // The pushed applies, on the series the pulled ones share: a push
+        // recorded under `via="pull"` would read 186 there.
+        m.record_ddl_applied_push(97);
         for _ in 0..20 {
             m.record_tls_reload(true);
         }
@@ -2408,6 +2445,10 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
+# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received - a refused, declined or skipped one is on its own series - and a change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply about N squared over 2 through push.
+# TYPE kimmy_sync_ddl_applied_total counter
+kimmy_sync_ddl_applied_total{via=\"pull\"} 89
+kimmy_sync_ddl_applied_total{via=\"push\"} 97
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91
@@ -2701,6 +2742,14 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
         expect(&format!("kimmy_sync_ddl_declined_total {}\n", s.sync_ddl_declined));
+        expect(&format!(
+            "kimmy_sync_ddl_applied_total{{via=\"pull\"}} {}\n",
+            s.sync_ddl_applied_pull
+        ));
+        expect(&format!(
+            "kimmy_sync_ddl_applied_total{{via=\"push\"}} {}\n",
+            s.sync_ddl_applied_push
+        ));
         expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
@@ -2983,7 +3032,9 @@ kimmy_sync_serve_walk_seconds_count 1201
                 + 1
                 // ADR-189: batches stopped at a creation waiting for the drop
                 // purger, a third reason for a skipped entry.
-                + 1,
+                + 1
+                // Replicated schema changes applied, pulled and pushed.
+                + 2,
             "expected one sample per series: {out}"
         );
     }
@@ -3114,6 +3165,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 1,
             backing_off: 1,
+            ddl_applied: 0,
             ddl_refused: 0,
             ddl_declined: 0,
             divergent_collections: 0,
@@ -3132,6 +3184,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 2,
             backing_off: 0,
+            ddl_applied: 7,
             ddl_refused: 3,
             ddl_declined: 0,
             divergent_collections: 6,
@@ -3147,6 +3200,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             repair_rounds: 0,
             pulls: kimmy_cluster::PullReport::default(),
         });
+        m.record_ddl_applied_push(11);
         m.record_tls_reload(true);
         m.record_tls_reload(false);
         m.record_tls_reload(false);
@@ -3161,6 +3215,8 @@ kimmy_sync_serve_walk_seconds_count 1201
         assert!(out.contains("kimmy_sync_failures_total 3"), "{out}");
         assert!(out.contains("kimmy_sync_peers_backing_off 0"), "{out}");
         assert!(out.contains("kimmy_sync_ddl_refused_total 3"), "{out}");
+        assert!(out.contains("kimmy_sync_ddl_applied_total{via=\"pull\"} 7"), "{out}");
+        assert!(out.contains("kimmy_sync_ddl_applied_total{via=\"push\"} 11"), "{out}");
         assert!(
             out.contains("kimmy_sync_divergent_collections 6"),
             "a level, not accumulated: {out}"
@@ -3336,6 +3392,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         let tick = |at: Option<Instant>| kimmy_cluster::RoundReport {
             failed: 0,
             backing_off: 0,
+            ddl_applied: 0,
             ddl_refused: 0,
             ddl_declined: 0,
             divergent_collections: 0,

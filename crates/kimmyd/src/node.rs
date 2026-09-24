@@ -1295,12 +1295,15 @@ async fn spawn_cluster(
     // A schema change a peer pushes here (ADR-140) goes through the same
     // batch application a pulled one does, and lands on the same counter when
     // this node cannot apply it: the member's own metric must not depend on
-    // which way the change arrived.
+    // which way the change arrived. What it applies is the exception, counted
+    // under `via="push"`, because how many applies the pushes cost is what
+    // that series is for.
     let on_pushed: kimmy_cluster::PushHook = Arc::new({
         let state = Arc::clone(&state);
         move |outcome: &kimmy_storage::SyncOutcome| {
             state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
             state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
+            state.metrics.record_ddl_applied_push(outcome.ddl as u64);
             state.metrics.record_entries_skipped(
                 outcome.unknown_collection as u64,
                 outcome.deferred as u64,

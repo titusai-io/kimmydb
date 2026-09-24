@@ -3588,6 +3588,36 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_change_delivered_again_is_applied_and_counted_again() {
+        // `SyncOutcome::ddl` is what `kimmy_sync_ddl_applied_total` sums, and
+        // it counts applies, not news: a window carrying a collection and an
+        // index this node already holds takes both again, and says so. That
+        // is the cost an overlapping push re-carrying earlier creates has,
+        // and the count must show it rather than hide it.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            false,
+            Some("by_email".into()),
+        )
+        .unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        assert_eq!(entries.iter().filter(|e| e.kind.is_ddl()).count(), 2, "{entries:?}");
+
+        let first = b.apply_batch(&entries).unwrap();
+        assert_eq!(first.ddl, 2, "{first:?}");
+        let indexes = b.list_indexes("shop", "orders").unwrap();
+        let again = b.apply_batch(&entries).unwrap();
+        assert_eq!(again.ddl, 2, "held already, and applied again: {again:?}");
+        // Applied, and nothing changed: the same indexes as before.
+        assert_eq!(b.list_indexes("shop", "orders").unwrap(), indexes);
+    }
+
+    #[test]
     fn a_schema_change_mid_batch_splits_it_into_runs_that_commit_once_each() {
         // A DDL entry commits transactions of its own, so it cannot share the
         // documents' transaction: the documents before it are one run, the
