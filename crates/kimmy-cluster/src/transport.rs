@@ -404,6 +404,7 @@ where
                         unknown_collection: outcome.unknown_collection,
                         ddl_declined: outcome.ddl_declined,
                         deferred: outcome.deferred,
+                        purge_pending: outcome.purge_pending,
                     },
                 )
                 .await?;
@@ -653,6 +654,7 @@ pub async fn push_entry(
                 unknown_collection,
                 ddl_declined,
                 deferred,
+                purge_pending,
             } => Ok(PushOutcome {
                 node: their_node,
                 outcome: SyncOutcome {
@@ -662,6 +664,7 @@ pub async fn push_entry(
                     unknown_collection,
                     ddl_declined,
                     deferred,
+                    purge_pending,
                     peer: Some(their_node),
                     ..SyncOutcome::default()
                 },
@@ -1044,9 +1047,10 @@ where
             let mut outcome = SyncOutcome::default();
             // Off the async worker. An apply takes as long as the work its
             // entries carry — an index build files every document of its
-            // collection in one transaction, and a collection drop purged the
-            // whole collection here — and a worker held that long stalls
-            // every task queued behind it, `/metrics` among them (ADR-153).
+            // collection in one transaction, and every entry can wait for the
+            // single writer — and a worker held that long stalls every task
+            // queued behind it, `/metrics` among them (ADR-153). A collection
+            // drop no longer purges here; it only buries (ADR-189).
             let applied = kimmy_storage::blocking(|| {
                 engine.apply_peer_batch_into(&theirs, &entries, scanned_to, exhausted, &mut outcome)
             });
@@ -1060,6 +1064,7 @@ where
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
+            counted.purge_pending += outcome.purge_pending;
             counted.deferred += outcome.deferred;
             applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
             #[cfg(test)]
@@ -1086,7 +1091,10 @@ where
             // reads — exactly the busy cluster the check exists for. A
             // batch stopped at a collection this node lacks did not reach
             // the tail (ADR-148).
-            window_exhausted = exhausted && outcome.unknown_collection == 0;
+            // Nor did one stopped at a creation waiting for the drop purger
+            // (ADR-189).
+            let stopped = outcome.unknown_collection > 0 || outcome.purge_pending > 0;
+            window_exhausted = exhausted && !stopped;
             // And whether the loop should spend another of this tick's
             // pulls here (ADR-157). `exhausted` is the peer's own statement
             // that its scan stopped at the limit with more log behind it,
@@ -1100,12 +1108,11 @@ where
             // introduced it with left this node's position exactly where it
             // was. Pulling again on either would spend the tick's budget
             // asking the same question.
-            window_truncated =
-                !exhausted && outcome.unknown_collection == 0 && outcome.deferred < entries.len();
+            window_truncated = !exhausted && !stopped && outcome.deferred < entries.len();
             // Where each span this request named resumes against this peer
             // (ADR-172). A batch stopped at a collection this node lacks did
             // not take what it carried past the stop, so it moves nothing.
-            if !marked.is_empty() && outcome.unknown_collection == 0 {
+            if !marked.is_empty() && !stopped {
                 stalls.marks_served(
                     their_node,
                     entries.last().map(|entry| entry.stamp),
@@ -1130,7 +1137,18 @@ where
                             "repair complete: the peer's oplog was re-served to the tail"
                         );
                     } else {
-                        let next = last.unwrap_or(from);
+                        // A batch stopped at a creation waiting for the drop
+                        // purger took nothing from the stop on (ADR-189), so
+                        // the replay resumes after the last entry before it,
+                        // not after the window.
+                        let next = match outcome.purge_pending_at {
+                            Some(stop) => entries
+                                .iter()
+                                .take_while(|entry| entry.stamp != stop)
+                                .last()
+                                .map_or(from, |entry| entry.stamp.hlc),
+                            None => last.unwrap_or(from),
+                        };
                         stalls.repair_continues(their_node, Repair::Replay { from: next });
                     }
                 }
@@ -1496,6 +1514,8 @@ pub struct AppliedCounts {
     pub ddl_declined: usize,
     pub unknown_collection: usize,
     pub deferred: usize,
+    /// Batches stopped at a creation waiting for the drop purger (ADR-189).
+    pub purge_pending: usize,
 }
 
 /// Local apply time a round's deadline does not charge the peer for
@@ -1958,6 +1978,16 @@ impl PeerStalls {
         }
     }
 
+    /// The snapshot with `peer` stopped at a page that waits for this node's
+    /// drop purger (ADR-189): the repair it serves is waiting, not stalled.
+    /// Nothing is wrong with the peer or the page, and the wait ends when the
+    /// purge does (a purger that dies stops the process, ADR-184), so it must
+    /// not count towards [`REPAIR_ATTEMPTS`] and be abandoned into the
+    /// cooldown with its cursor dropped.
+    fn snapshot_waiting(&mut self, peer: NodeId) {
+        self.snapshot_advanced(peer);
+    }
+
     /// The snapshot pull with `peer` is complete: nothing to resume.
     fn snapshot_done(&mut self, peer: NodeId) {
         self.snapshots.remove(&peer);
@@ -2384,6 +2414,24 @@ where
             pages += 1;
         }
         let applied = applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        // A page that would create a collection whose earlier life this node
+        // is still purging applied nothing and moved nothing (ADR-189). The
+        // snapshot ends here for this round, planned as it was, and asks for
+        // the same page once the drop purger is done: pulling on would only
+        // be refused the same way.
+        if let Some(waiting) = applied.purge_pending {
+            outcome.purge_pending += 1;
+            stalls.applied.purge_pending += 1;
+            stalls.snapshot_waiting(node);
+            info!(
+                %peer,
+                collection = %waiting,
+                "a snapshot page waits for this node's drop purger to remove what an earlier \
+                 collection of that name held; the snapshot resumes from that page on a later \
+                 round"
+            );
+            return Ok(SnapshotPulled { outcome, complete: false });
+        }
         outcome.applied += applied.applied;
         // Counted where a refusal reached through the oplog is, so the
         // metric and the round report do not depend on the route (ADR-123).
@@ -3178,6 +3226,89 @@ mod tests {
     /// window ended and finishes on an exhausted one, after which the round
     /// is an ordinary round again.
     #[tokio::test]
+    async fn a_replay_stopped_at_a_creation_waiting_for_a_purge_resumes_before_it() {
+        // A replay's window that stops at a creation waiting for this node's
+        // drop purger (ADR-189) took nothing from the stop on, so the next
+        // round asks from the last entry before the stop, not from the end of
+        // the window, which would skip the creation and the entry after it.
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let old = engine.create_collection("shop", "gone").unwrap();
+        engine.insert(&old, bson::doc! { "_id": 1 }).unwrap();
+        engine.drop_collection("shop", "gone").unwrap();
+        let origin = node(3);
+        // Later than the local drop, so the creation is one and not history.
+        let base = kimmy_storage::physical_now_ms() + 60_000;
+        let mut theirs = VersionVector::new();
+        theirs.insert(origin, Hlc::new(base + 9_000, 0));
+        engine.absorb_witnessed(&theirs).unwrap();
+        let insert = |wall: u64, id: i32| OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(wall, 0), origin),
+            kind: kimmy_core::OpKind::Insert,
+            collection: orders.id,
+            doc_id: Some(kimmy_core::DocId::Int64(id.into())),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id }).unwrap()),
+        };
+        let create = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), origin),
+            kind: kimmy_core::OpKind::CreateCollection,
+            collection: CollectionId::derive("shop", "gone"),
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&kimmy_core::CollectionRef::new("shop", "gone")).unwrap(),
+            ),
+        };
+        let window = vec![insert(base + 2_000, 1), create, insert(base + 4_000, 2)];
+
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            expect_from: Hlc,
+            window: Vec<OplogEntry>,
+        ) {
+            assert!(matches!(
+                read_frame(&mut stream).await.unwrap(),
+                Message::AskVersions { witnessed: true }
+            ));
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { from, .. } => assert_eq!(from, expect_from),
+                other => panic!("expected AskEntries, got {other:?}"),
+            }
+            let scanned_to = window.last().unwrap().stamp.hlc;
+            let entries = Message::Entries { entries: window, scanned_to, exhausted: false };
+            write_frame(&mut stream, &entries).await.unwrap();
+        }
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        let floor = Hlc::new(base + 1_000, 0);
+        assert!(stalls.plan_repair(node(9), orders.id, Repair::Replay { from: floor }));
+
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), floor, window.clone()));
+        let outcome = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        assert_eq!(outcome.purge_pending, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "only the entry before the stop: {outcome:?}");
+        assert!(outcome.unknown.is_none(), "no snapshot planned: {outcome:?}");
+
+        // The next round asks from the entry before the stop.
+        engine.finish_purges_now().unwrap();
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let resume = Hlc::new(base + 2_000, 0);
+        let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), resume, window));
+        let outcome = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        assert_eq!(outcome.purge_pending, 0, "{outcome:?}");
+        assert!(engine.get_collection("shop", "gone").is_ok(), "the creation applied");
+    }
+
+    #[tokio::test]
     async fn a_planned_replay_asks_below_the_position_until_the_tail_is_reached() {
         use tokio::io::DuplexStream;
 
@@ -3484,6 +3615,102 @@ mod tests {
              for — {mine:?}"
         );
         assert_eq!(mine.behind(&last_vector), Some(Hlc::new(3_000, 0)));
+    }
+
+    /// A scoped snapshot repair whose page waits for this node's drop purger
+    /// (ADR-189) waits for as many rounds as the purge takes: it is not
+    /// counted as stalled, so it is not abandoned at `REPAIR_ATTEMPTS`, and
+    /// its cursor is kept. Once the purge is done the same page applies.
+    #[tokio::test]
+    async fn a_snapshot_repair_waiting_on_a_purge_is_kept_past_the_stall_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+        let their_node = node(9);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let orders = CollectionId::derive("shop", "orders");
+        // This node's own earlier life of the name, dropped, its rows owed.
+        let old = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&old, bson::doc! { "_id": "old" }).unwrap();
+        engine.drop_collection("shop", "orders").unwrap();
+        assert!(engine.purge_pending(orders).unwrap());
+        engine.absorb_witnessed(&theirs).unwrap();
+
+        /// The peer's side: vectors, then the scoped snapshot, one page.
+        async fn fake_peer(
+            mut stream: tokio::io::DuplexStream,
+            theirs: VersionVector,
+            page: SnapshotPage,
+        ) {
+            assert!(matches!(
+                read_frame(&mut stream).await.unwrap(),
+                Message::AskVersions { witnessed: true }
+            ));
+            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskSnapshot { after, .. } => {
+                    assert_eq!(after, None, "the same page again: nothing moved")
+                }
+                other => panic!("expected AskSnapshot, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+        }
+
+        // A later life of the name at the sender, so the page is a creation
+        // here and not history.
+        let created = kimmy_storage::physical_now_ms() + 60_000;
+        let written = created + 1;
+        let mut page =
+            snapshot_page(origin, &[written], Some(cursor(written)), theirs.clone(), true);
+        page.collections[0].created = Some(Hlc::new(created, 0));
+
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(their_node, orders, Repair::Snapshot));
+        for round in 0..REPAIR_ATTEMPTS * 2 {
+            let (mut ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), page.clone()));
+            let outcome = sync_round(
+                &engine,
+                &mut ours,
+                addr,
+                their_node,
+                None,
+                &mut stalls,
+                spent(),
+                &RoundClock::default(),
+            )
+            .await
+            .unwrap();
+            drop(ours);
+            peer.await.unwrap();
+            assert_eq!(outcome.purge_pending, 1, "round {round}: {outcome:?}");
+            assert_eq!(outcome.applied, 0, "round {round}: {outcome:?}");
+            assert!(stalls.repairing(their_node), "round {round}: a waiting repair is kept");
+        }
+
+        engine.finish_purges_now().unwrap();
+        let (mut ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(peer_end, theirs.clone(), page));
+        let outcome = sync_round(
+            &engine,
+            &mut ours,
+            addr,
+            their_node,
+            None,
+            &mut stalls,
+            spent(),
+            &RoundClock::default(),
+        )
+        .await
+        .unwrap();
+        drop(ours);
+        peer.await.unwrap();
+        assert_eq!(outcome.purge_pending, 0, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "the page applies once the purge is done: {outcome:?}");
+        assert!(engine.get_collection("shop", "orders").is_ok());
     }
 
     /// ADR-152 on the repair path. A snapshot repair asks for the one

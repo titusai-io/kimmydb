@@ -1052,7 +1052,10 @@ mod tests {
         let later = std::time::Instant::now() + Duration::from_secs(1_000);
         let read = |state: &SharedState| {
             let s = state.metrics.snapshot_with_at(&Default::default(), later);
-            (s.webhook_backlog_secs, s.task_progress_age_secs[3])
+            (
+                s.webhook_backlog_secs,
+                s.task_progress_age_secs[crate::metrics::progress_slot("webhook_dispatcher")],
+            )
         };
         let before = read(&state);
         let client = reqwest::Client::new();
@@ -1097,7 +1100,10 @@ mod tests {
             let later = std::time::Instant::now() + Duration::from_secs(1_000);
             let read = |state: &SharedState| {
                 let s = state.metrics.snapshot_with_at(&Default::default(), later);
-                (s.webhook_backlog_secs, s.task_progress_age_secs[3])
+                (
+                    s.webhook_backlog_secs,
+                    s.task_progress_age_secs[crate::metrics::progress_slot("webhook_dispatcher")],
+                )
             };
             let before = read(&state);
             let client = reqwest::Client::new();

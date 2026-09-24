@@ -124,6 +124,13 @@ pub async fn run(config: Config) -> Result<()> {
 const EMBEDDING_RETRY_FIRST: Duration = Duration::from_secs(1);
 const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
 
+/// The drop purger's backoff after a chunk that failed with an error that is
+/// not the storage engine's (an I/O error stops the process, ADR-188). The id
+/// is back on its queue, so a retry loses nothing; the ceiling keeps a failure
+/// that does not clear from spinning.
+const DROP_PURGER_RETRY_FIRST: Duration = Duration::from_secs(1);
+const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
+
 async fn start_and_serve(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -410,6 +417,8 @@ async fn start_and_serve(config: Config) -> Result<()> {
     };
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
+    state.metrics.set_purge_counters(engine.purge_counters());
+    let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());
     let cluster =
         spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone()).await?;
 
@@ -712,6 +721,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
     if let Some(handle) = gc_handle {
         handle.abort();
     }
+    // A purge stops between chunks, each its own commit, and what is left is
+    // ADR-158's state, which the next start's purger finishes (ADR-189).
+    purger_handle.abort();
     // And expiry: each delete is its own commit, so an aborted pass leaves a
     // prefix of the batch removed and the rest still due. The next pass finds
     // them, which is the same property that lets a bounded pass drain a
@@ -1271,9 +1283,11 @@ async fn spawn_cluster(
         move |outcome: &kimmy_storage::SyncOutcome| {
             state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
             state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
-            state
-                .metrics
-                .record_entries_skipped(outcome.unknown_collection as u64, outcome.deferred as u64);
+            state.metrics.record_entries_skipped(
+                outcome.unknown_collection as u64,
+                outcome.deferred as u64,
+                outcome.purge_pending as u64,
+            );
         }
     });
     // Built before the node commits to serving. `serve_with` used to build it
@@ -1420,6 +1434,72 @@ async fn spawn_cluster(
     Ok(Cluster { tasks: cluster_tasks, members })
 }
 
+/// What one member's answer to a schema-change push makes it, in the
+/// confirmation a client reads.
+#[derive(Debug, PartialEq, Eq)]
+enum Pushed {
+    Confirmed,
+    Refused,
+    /// Anti-entropy carries the change; the reason says why it is not here yet.
+    Pending(String),
+}
+
+/// Sort one member's answer to a push, and say so in the log.
+fn classify_push(
+    addr: std::net::SocketAddr,
+    node: kimmy_core::NodeId,
+    result: Result<kimmy_cluster::PushOutcome, String>,
+) -> Pushed {
+    match result {
+        Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
+            info!(
+                peer = %addr,
+                node = %node,
+                %reason,
+                "a member was not pushed a schema change; anti-entropy will carry it"
+            );
+            Pushed::Pending(reason)
+        }
+        // A member still purging a drop of this name has not applied the
+        // creation, and will once its purge is done (ADR-189): pending,
+        // carried by anti-entropy, and not a refusal.
+        Ok(kimmy_cluster::PushOutcome { outcome, .. }) if outcome.purge_pending > 0 => {
+            info!(
+                peer = %addr,
+                node = %node,
+                "a member is still purging a drop of this name; the creation reaches it once \
+                 that is done"
+            );
+            Pushed::Pending("still purging a drop of this name".to_string())
+        }
+        Ok(kimmy_cluster::PushOutcome { outcome, .. })
+            if outcome.ddl_refused > 0
+                || outcome.unknown_collection > 0
+                || outcome.ddl_declined > 0 =>
+        {
+            warn!(
+                peer = %addr,
+                node = %node,
+                refused = outcome.ddl_refused,
+                unknown_collection = outcome.unknown_collection,
+                declined = outcome.ddl_declined,
+                "a member could not apply a schema change pushed to it"
+            );
+            Pushed::Refused
+        }
+        Ok(_) => Pushed::Confirmed,
+        Err(reason) => {
+            warn!(
+                peer = %addr,
+                node = %node,
+                %reason,
+                "a member did not confirm a schema change; anti-entropy will carry it"
+            );
+            Pushed::Pending(reason)
+        }
+    }
+}
+
 /// How this node confirms a schema change on its live members (ADR-140).
 ///
 /// Hands every member, at once, the window it lacks from this node ending in
@@ -1485,41 +1565,10 @@ fn ddl_confirmer(
                         continue;
                     }
                 };
-                match result {
-                    Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
-                        info!(
-                            peer = %addr,
-                            node = %node,
-                            %reason,
-                            "a member was not pushed a schema change; anti-entropy will carry it"
-                        );
-                        found.pending.push((node, reason));
-                    }
-                    Ok(kimmy_cluster::PushOutcome { outcome, .. })
-                        if outcome.ddl_refused > 0
-                            || outcome.unknown_collection > 0
-                            || outcome.ddl_declined > 0 =>
-                    {
-                        warn!(
-                            peer = %addr,
-                            node = %node,
-                            refused = outcome.ddl_refused,
-                            unknown_collection = outcome.unknown_collection,
-                            declined = outcome.ddl_declined,
-                            "a member could not apply a schema change pushed to it"
-                        );
-                        found.refused.push(node);
-                    }
-                    Ok(_) => found.confirmed.push(node),
-                    Err(reason) => {
-                        warn!(
-                            peer = %addr,
-                            node = %node,
-                            %reason,
-                            "a member did not confirm a schema change; anti-entropy will carry it"
-                        );
-                        found.pending.push((node, reason));
-                    }
+                match classify_push(addr, node, result) {
+                    Pushed::Confirmed => found.confirmed.push(node),
+                    Pushed::Refused => found.refused.push(node),
+                    Pushed::Pending(reason) => found.pending.push((node, reason)),
                 }
             }
             // Deterministic order, whatever order the members answered in.
@@ -1546,6 +1595,29 @@ fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
     } else {
         bind
     }
+}
+
+/// Start the drop purger (ADR-189): what a collection drop held is removed
+/// here, after the drop has answered, a chunk per commit. Always, whatever
+/// `storage.gc_interval_secs` says: it looks for owed rows on its own, and a
+/// drop's rows must not wait for a retention pass that may never run.
+fn spawn_drop_purger(
+    engine: Arc<Engine>,
+    shutdown: kimmy_task::Shutdown,
+) -> tokio::task::JoinHandle<()> {
+    kimmy_task::supervise("drop_purger", shutdown.clone(), async move {
+        // Every error it returns has re-queued its id, and is retried in
+        // place; `kimmy_task_retries_total{task="drop_purger"}` counts them.
+        // Returning from `forever` is a death, as for the embedding worker.
+        let mut retry =
+            kimmy_task::Retry::new("drop_purger", DROP_PURGER_RETRY_FIRST, DROP_PURGER_RETRY_MAX);
+        let mut engine = engine;
+        retry
+            .forever(&shutdown, &mut engine, |engine| {
+                Box::pin(Arc::clone(engine).run_drop_purger())
+            })
+            .await;
+    })
 }
 
 /// Start the retention collector, unless it is disabled.
@@ -1593,7 +1665,6 @@ fn spawn_collector(
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
-                    dropped_rows = outcome.dropped_rows_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),
@@ -1676,6 +1747,30 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// Each answer a push can bring, sorted as the confirmation reports it. A
+    /// member that stopped at a creation waiting for its drop purger
+    /// (ADR-189) is pending, carried by anti-entropy, and not a refusal.
+    #[test]
+    fn a_push_answer_is_sorted_into_confirmed_refused_or_pending() {
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let node = kimmy_core::NodeId::from_bytes([1; 16]);
+        let answered = |outcome: kimmy_storage::SyncOutcome| {
+            Ok(kimmy_cluster::PushOutcome { node, outcome, unreached: None })
+        };
+        let purging = kimmy_storage::SyncOutcome { purge_pending: 1, ..Default::default() };
+        assert_eq!(
+            classify_push(addr, node, answered(purging)),
+            Pushed::Pending("still purging a drop of this name".to_string())
+        );
+        let refused = kimmy_storage::SyncOutcome { ddl_refused: 1, ..Default::default() };
+        assert_eq!(classify_push(addr, node, answered(refused)), Pushed::Refused);
+        assert_eq!(classify_push(addr, node, answered(Default::default())), Pushed::Confirmed);
+        assert_eq!(
+            classify_push(addr, node, Err("no answer".to_string())),
+            Pushed::Pending("no answer".to_string())
+        );
+    }
 
     #[test]
     fn node_identity_is_stable_across_restarts() {

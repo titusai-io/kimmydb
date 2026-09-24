@@ -264,7 +264,7 @@ fn count_retry(task: &'static str) {
 /// only a task with a retry loop can honour — so for the other fourteen it does
 /// nothing at all, and used to do it silently. `every_retrying_task_is_declared`
 /// checks this against the `Retry::new` call sites, so it cannot drift.
-pub const RETRYING: &[&str] = &["embedding_worker"];
+pub const RETRYING: &[&str] = &["drop_purger", "embedding_worker"];
 
 /// Every task name that has actually been supervised in this process.
 ///
@@ -298,6 +298,7 @@ fn mark_started(name: &'static str) {
 
 pub const TASKS: &[&str] = &[
     "cert_reloader",
+    "drop_purger",
     "embedding_worker",
     "jwks_refresher",
     "membership",

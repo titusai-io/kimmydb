@@ -174,10 +174,10 @@ pub fn create_collection(
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Ddl, db, Some(name))?;
-    // Off the async worker, as every schema change here is: each can take
-    // as long as the data under it (a creation finished a dropped life's
-    // purge first), and a handler that holds a worker stalls every task
-    // queued on it (ADR-153).
+    // Off the async worker, as every schema change here is: an index build or
+    // drop takes as long as the data under it, and any of them can wait for
+    // the single writer for the whole of the request's budget. A handler that
+    // holds a worker stalls every task queued on it (ADR-153).
     let meta = kimmy_storage::blocking(|| state.engine.create_collection(db, name))?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }

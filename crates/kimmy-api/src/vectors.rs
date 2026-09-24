@@ -190,7 +190,7 @@ pub async fn configure_vectors(
     let body: VectorConfig = body.into();
     admit_provider(&state, &body.provider)?;
     // A schema change, off the async worker: it creates the shadow
-    // collection, which finished a dropped shadow's purge first.
+    // collection, and waits for the single writer to do it.
     let meta = kimmy_storage::blocking(|| state.engine.configure_vectors(&db, &coll, body))?;
     // A changed dimension or metric makes any cached graph meaningless.
     invalidate_index(&state, &db, &coll);

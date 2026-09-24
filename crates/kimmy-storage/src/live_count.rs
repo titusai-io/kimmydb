@@ -552,6 +552,8 @@ mod tests {
 
         a.drop_collection("app", "docs").unwrap();
         check("a drop");
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let recreated = a.create_collection("app", "docs").unwrap();
         a.insert(&recreated, doc! { "_id": "again" }).unwrap();
         check("a recreate");
@@ -1165,6 +1167,7 @@ mod tests {
         }
         assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(300));
         engine.drop_collection("app", "docs").unwrap();
+        engine.finish_purges_now().unwrap();
         assert_counts_exact(&engine, "a drop purge");
         let db = engine.db();
         let r = db.begin_read().unwrap();

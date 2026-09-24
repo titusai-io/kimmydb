@@ -162,16 +162,17 @@ impl crate::Engine {
             // or whose collection was dropped in between, left a shadow whose
             // creation replicated; minted after it, a crash between the two left
             // a configuration the embedding worker skips for want of a shadow.
-            // What a dropped shadow of this name left behind is purged first,
-            // outside the writer, as any creation's is.
             let shadow = vector_meta::shadow_name(collection);
             let shadow_missing = match self.get_collection(db, &shadow) {
                 Ok(_) => false,
                 Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => true,
                 Err(e) => return Err(e),
             };
+            // A dropped shadow's rows refuse the shadow's creation, inside its
+            // transaction (`create_collection_in_txn`, ADR-189); a shadow
+            // standing is this collection's own, and re-enabling over it is
+            // not refused.
             if shadow_missing {
-                self.purge_dropped_collection(CollectionId::derive(db, &shadow))?;
                 #[cfg(test)]
                 crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::SystemCreate);
             }
@@ -1615,6 +1616,8 @@ mod tests {
         with_one_embedded_document(&engine);
         engine.drop_collection("app", "docs").unwrap();
 
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         engine.create_collection("app", "docs").unwrap();
         engine.configure_vectors("app", "docs", config(8)).unwrap();
 

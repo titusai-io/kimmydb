@@ -163,6 +163,8 @@ pub struct Engine {
     /// cost at most. A drop of the index or its collection forgets it, and so
     /// does building an index under the name.
     expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
+    /// The drop purger's queue, wake and counters (ADR-189).
+    pub(crate) purges: crate::purge::Purges,
 }
 
 /// Upper bounds of the writer-wait histogram, in microseconds.
@@ -947,14 +949,15 @@ impl Engine {
             serve_counters: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),
+            purges: Default::default(),
         };
 
-        // Here rather than beside the rebuilds above, because it is the one
-        // repair that needs an engine: it takes the writer, a chunk at a time,
-        // through the same path a drop does. Ahead of any retention pass on
-        // this process, which is the ordering it needs — see its own
-        // documentation.
-        engine.resume_interrupted_drops()?;
+        // A drop a restart interrupted is announced here and finished by the
+        // drop purger once the node serves, not before it binds (ADR-158's
+        // second addendum, ADR-189). Finishing it here held a start for as
+        // long as the drop had left, and a restart part-way through a large
+        // purge is exactly when a node is most wanted back.
+        engine.announce_owed_purges()?;
 
         // The collisions a migration's rebuild of a unique partial index found
         // (ADR-183), reported as a replicated build's are, now that there is
@@ -2640,29 +2643,8 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
-        // Derived, not allocated: every node computes the same id for the
-        // same collection, so a replicated oplog entry addresses the same
-        // collection everywhere. See `CollectionId::derive`.
-        let id = CollectionId::derive(db, name);
-
-        // A drop is chunked (ADR-158), so a creation of the same name can land
-        // between two of its chunks — and the name derives the same id, so
-        // whatever that drop has not reached yet would be inherited by the new
-        // incarnation: documents of a life that has ended, answering queries
-        // under ids this collection never wrote, and index entries pointing at
-        // them. Finished here, before the definition that would stand over
-        // them exists. Ordinarily there is nothing to finish and this is two
-        // seeks against an empty range; where there is, it is the same bounded
-        // chunks the drop was making, so it does not hold the writer either.
-        // A vector shadow created in its configuration's transaction is purged
-        // the same way, by `configure_vectors_inner`, before it takes the
-        // writer.
-        //
-        // Those chunks are held as `drop` and not as `ddl` (ADR-159): the
-        // holder names the work, and finishing somebody else's drop is drop
-        // work whoever happens to be doing it. A creation that pays for one
-        // says so on the page.
-        self.purge_dropped_collection(id)?;
+        // A creation over a dropped life's rows is refused inside the
+        // transaction, below: see `create_collection_in_txn` (ADR-189).
 
         let txn = self.begin_write(WriterHolder::Ddl)?;
         // Minted *after* the writer is held, never before (ADR-148). A stamp
@@ -2788,6 +2770,30 @@ impl Engine {
                 return Err(StorageError::Corrupt(format!(
                     "collection id for {db}.{name} collides with {other}; rename one of them"
                 )));
+            }
+
+            // What a drop left under this id is the drop purger's to remove
+            // (ADR-158, ADR-189). Created over it, the new incarnation would
+            // inherit a life that has ended: documents answering queries under
+            // ids this collection never wrote. So the creation is refused while
+            // any remain, and asks for this id to be purged next. It does not
+            // remove them itself, which takes as long as the dropped collection
+            // was large and held whoever asked — a client's request, or a
+            // replication round — for all of it. Judged here, under the writer
+            // and after `history`, so a creation that is history creates
+            // nothing and waits on nothing, and no collection stands under the
+            // id (the collision check above). Two seeks.
+            let docs = txn.open_table(tables::DOCS)?;
+            let indexes = txn.open_table(tables::INDEX_ENTRIES)?;
+            if docs.range(doc_range(id))?.next().is_some()
+                || indexes.range(index_range(id))?.next().is_some()
+            {
+                self.prioritise_purge(id);
+                return Err(StorageError::CollectionPurging {
+                    db: db.to_string(),
+                    name: name.to_string(),
+                    id,
+                });
             }
 
             // `created` is the stamp of the create that produced this
@@ -2925,44 +2931,7 @@ impl Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<bool> {
-        let Some(buried) = self.bury_collection(db, name, replicated)? else {
-            return Ok(false);
-        };
-        for id in buried {
-            self.purge_what_the_drop_left(id, db, name)?;
-        }
-        Ok(true)
-    }
-
-    /// [`Self::purge_dropped_collection`], tolerating the one failure that is
-    /// not the drop's to report.
-    ///
-    /// Once the collection is buried the drop **has happened**: the definition
-    /// is gone, the tombstone is durable, and a local drop's entry is
-    /// published. What is left is a removal this node owes itself and nothing
-    /// can see. So a chunk that gives up waiting for the writer inside a
-    /// caller's budget (ADR-151) must not be reported as a failed drop — it is
-    /// not one, and a client told to retry would be answered `dropped: false`
-    /// by the retry while the rows stayed exactly where they are. The next
-    /// retention pass finishes it ([`Self::finish_owed_drops`]), as the next
-    /// start would; a collection created under the name before then finishes
-    /// it first. The tombstone that identifies the residue is not collected
-    /// while rows remain under it, so the pass that finds it is never late.
-    fn purge_what_the_drop_left(&self, id: CollectionId, db: &str, name: &str) -> Result<()> {
-        match self.purge_dropped_collection(id) {
-            Ok(_) => Ok(()),
-            Err(StorageError::WriterBusy { waited }) => {
-                warn!(
-                    db,
-                    collection = name,
-                    waited_ms = waited.as_millis() as u64,
-                    "a chunk of this drop gave up waiting for the single writer; the collection \
-                     is dropped and what it held is removed by the next retention pass"
-                );
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        Ok(self.bury_collection(db, name, replicated)?.is_some())
     }
 
     /// The first transaction of a drop: the definition goes, the tombstone is
@@ -3141,6 +3110,9 @@ impl Engine {
         for id in &buried {
             self.forget_expiry_cursors(*id, None);
         }
+        // Durable first, handed over second: a crash between the two leaves
+        // ADR-158's state, which the purger's owed check finds again.
+        self.hand_over_purges(&buried);
 
         if let Some(shadow) = &shadow {
             info!(db, collection = name, shadow = %shadow.name, "dropped collection and its vectors");
@@ -3151,19 +3123,13 @@ impl Engine {
     }
 
     /// Remove what a dropped collection held, a chunk per commit, with the
-    /// writer released between chunks (ADR-158). Returns how many rows went.
+    /// writer released between chunks (ADR-158), on the caller's thread.
+    /// Returns how many rows went.
     ///
-    /// The ranges are looked at under a read transaction and the writer is
-    /// taken only when there is something in them, so a drop of an empty
-    /// collection — and a sweep with nothing to finish — costs no transaction
-    /// at all, which is the rule the retention pass follows over the same
-    /// writer (ADR-151).
-    ///
-    /// Called by the drop itself, by [`Self::create_collection_inner`] before
-    /// a name that derives this id can stand over what is left, and by
-    /// [`Self::resume_interrupted_drops`] at open. All three want the same
-    /// thing and none of them may assume the others got there first.
-    pub(crate) fn purge_dropped_collection(&self, id: CollectionId) -> Result<usize> {
+    /// For tests only. While the node runs, the drop purger removes these
+    /// rows ([`Self::run_drop_purger`], ADR-189), with the same chunks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn purge_dropped_collection(&self, id: CollectionId) -> Result<usize> {
         let mut removed = 0usize;
         loop {
             if self.collection_range_is_empty(id)? {
@@ -3191,22 +3157,32 @@ impl Engine {
         Ok(indexes.range(index_range(id))?.next().is_none())
     }
 
-    /// One chunk of [`Self::purge_dropped_collection`]: at most
-    /// [`DROP_PURGE_CHUNK`] rows in one transaction, documents first and index
-    /// entries with whatever of the chunk they leave.
+    /// One chunk of a purge: at most [`DROP_PURGE_CHUNK`] rows in one
+    /// transaction, documents first and index entries with whatever of the
+    /// chunk they leave. The drop purger runs it (ADR-189), as do the tests'
+    /// synchronous `purge_dropped_collection`.
     ///
     /// Keys are read from the front of the range and then removed, both inside
     /// the transaction — the read is bounded by the chunk, not by the size of
     /// the collection, so it is not the walk under the writer ADR-151 forbids.
-    fn purge_chunk(&self, id: CollectionId) -> Result<usize> {
+    pub(crate) fn purge_chunk(&self, id: CollectionId) -> Result<usize> {
         // The whole of a drop's destructive work is here, so this is the
         // transaction `drop` counts (ADR-159) — once per chunk now rather
         // than once per drop, which is what the count of that row is for:
         // a `drop` count climbing in thousands beside a flat `ddl` is a large
-        // purge in progress, whoever started it. The same chunks are run by
-        // `create_collection_inner` and by the sweep at open, and they are
-        // `drop` there too: the holder names the work, not who asked.
-        let txn = self.begin_write(WriterHolder::Drop)?;
+        // purge in progress. Only the drop purger runs them while the node
+        // serves (ADR-189); the holder names the work, not who asked.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.purges.gate.pass()?;
+        // The wait for the writer, and only the wait, is what the drop
+        // purger's age holds through (ADR-189).
+        let counters = self.purge_counters();
+        counters.waiting_for_writer(true);
+        let txn = self.begin_write(WriterHolder::Drop);
+        counters.waiting_for_writer(false);
+        let txn = txn?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.purges.holding_gate.pass()?;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a
@@ -3216,14 +3192,12 @@ impl Engine {
             // and a creation either commits before this chunk sees it or after
             // this chunk has finished.
             //
-            // A backstop rather than the primary mechanism: the creation
-            // drains the range itself before it writes its definition, so in
-            // a real race the purge's loop usually ends at its own
-            // emptiness check and never reaches here. What is left for this
-            // is the narrow ordering where the dropper's last chunk was full,
-            // and the creation then drains, creates and writes before the
-            // dropper looks again — narrow, reachable, and what the
-            // sequential test pins.
+            // A backstop rather than the primary mechanism: a creation is
+            // refused while rows remain under the id it derives (ADR-189), so
+            // no collection should stand over a purge in progress. This is
+            // what keeps the new incarnation's rows safe if one ever does,
+            // and `a_purge_chunk_under_a_standing_collection_removes_nothing`
+            // pins it.
             let collections = txn.open_table(tables::COLLECTIONS)?;
             if collection_stands_under(&collections, id)? {
                 0
@@ -3273,148 +3247,6 @@ impl Engine {
             txn.commit()?;
         }
         Ok(removed)
-    }
-
-    /// Finish a drop a restart interrupted (ADR-158).
-    ///
-    /// A drop records the definition's removal and the tombstone in its first
-    /// transaction and removes what the collection held after it, so a process
-    /// that stops in between leaves rows under an id nothing resolves. They are
-    /// invisible to every reader and to every peer — the tombstone saw to that
-    /// before the first chunk — but a collection created again under the same
-    /// name derives the same id and would stand over them. There is nothing to
-    /// replay: the drop is durable and has already replicated, so what is left
-    /// is the removal.
-    ///
-    /// It is finished **here**, in `open`, to be ahead of the retention pass:
-    /// the residue is identified by a tombstone with no collection over it,
-    /// and `gc::collect_dropped_collections` removes that tombstone past
-    /// `storage.tombstone_retention_secs`, so a collector that ran first would
-    /// take the only marker this reads. Running inside `open` puts this ahead
-    /// of any collector on this process by construction. Being ahead of a
-    /// *creation* is not the reason — `create_collection_inner` purges the
-    /// derived id unconditionally, which covers that case whenever it happens.
-    fn resume_interrupted_drops(&self) -> Result<()> {
-        let owed = self.drops_left_unfinished()?;
-        // An ordinary start finds every drop finished and says nothing.
-        if owed.is_empty() {
-            return Ok(());
-        }
-
-        // Said **before** the work and not only after it. This runs on the
-        // way to opening, so a member restarted part-way through a large
-        // drop finishes it before it serves anything — up to the length of
-        // what is left of that drop. Each chunk is short, so the
-        // writer-hold `WARN` never fires either, and a purge that speaks
-        // only when it ends is indistinguishable from a start that has hung.
-        // The row count is what lets an operator size the wait.
-        for (id, rows) in &owed {
-            info!(
-                collection = %id,
-                rows,
-                "a collection drop was interrupted; finishing it before this node opens"
-            );
-        }
-
-        let mut rows = 0usize;
-        for (id, _) in &owed {
-            rows += self.purge_dropped_collection(*id)?;
-        }
-        info!(
-            collections = owed.len(),
-            rows, "finished the collection drops that a restart interrupted"
-        );
-        Ok(())
-    }
-
-    /// Finish, while the node runs, a drop whose purge was left owed (ADR-158's
-    /// addendum): the retention pass's half of [`Self::resume_interrupted_drops`].
-    ///
-    /// A purge is left owed when one of its chunks gives up waiting for the
-    /// writer inside a caller's budget ([`Self::purge_what_the_drop_left`]),
-    /// which happens under exactly the sustained load a member can then stay
-    /// up through for days. Found the way `open` finds it — a tombstone with no
-    /// collection over it and rows beneath — and removed with the same chunked
-    /// purge, so the pass holds the writer one chunk at a time as every other
-    /// part of it does (ADR-151). Run before the pass collects collection
-    /// tombstones, and those are not collected while rows remain under them,
-    /// so the marker this reads outlasts the residue it marks.
-    ///
-    /// A chunk that gives up here too leaves the rest for the next pass, which
-    /// finds it by the same marker. A pass with nothing owed reads the dropped
-    /// table and says nothing.
-    pub(crate) fn finish_owed_drops(&self) -> Result<usize> {
-        let owed = self.drops_left_unfinished()?;
-        if owed.is_empty() {
-            return Ok(0);
-        }
-        for (id, rows) in &owed {
-            info!(
-                collection = %id,
-                rows,
-                "a collection drop left rows behind; the retention pass is removing them"
-            );
-        }
-
-        let mut rows = 0usize;
-        for (id, _) in &owed {
-            match self.purge_dropped_collection(*id) {
-                Ok(removed) => rows += removed,
-                Err(StorageError::WriterBusy { waited }) => {
-                    warn!(
-                        collection = %id,
-                        rows,
-                        waited_ms = waited.as_millis() as u64,
-                        "removing what a collection drop left gave up waiting for the single \
-                         writer; the next retention pass carries on"
-                    );
-                    return Ok(rows);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        info!(collections = owed.len(), rows, "removed what the collection drops had left behind");
-        Ok(rows)
-    }
-
-    /// Every collection id a drop left rows under, with how many: a tombstone
-    /// with no collection standing over it, and something still filed beneath.
-    ///
-    /// Counted rather than merely detected, because the number is the only
-    /// thing that tells an operator how long the start is about to take. One
-    /// read transaction, and it walks only the ranges that are about to be
-    /// removed anyway; an id with nothing under it costs the two seeks that
-    /// find that out, which is what every start pays and nothing more.
-    fn drops_left_unfinished(&self) -> Result<Vec<(CollectionId, usize)>> {
-        let live: std::collections::HashSet<CollectionId> =
-            self.all_collections()?.into_iter().map(|c| c.id).collect();
-        // One row per dropped collection, so the table is walked whole, as
-        // the retention pass walks it.
-        let txn = self.db.begin_read()?;
-        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-        let docs = txn.open_table(tables::DOCS)?;
-        let indexes = txn.open_table(tables::INDEX_ENTRIES)?;
-        let mut owed = Vec::new();
-        for row in dropped.iter()? {
-            let (key, _) = row?;
-            let id = CollectionId(key.value());
-            if live.contains(&id) {
-                continue;
-            }
-            let mut rows = 0usize;
-            for row in docs.range(doc_range(id))? {
-                row?;
-                rows += 1;
-            }
-            for row in indexes.range(index_range(id))? {
-                row?;
-                rows += 1;
-            }
-            if rows > 0 {
-                owed.push((id, rows));
-            }
-        }
-        Ok(owed)
     }
 
     /// Persist a modified collection definition (used when adding an index).
@@ -3799,7 +3631,7 @@ pub(crate) fn release_held_in_position(
 /// two chunks safe rather than merely unlikely. A catalogue walk with a JSON
 /// parse per collection, metadata only and never a document, stopping at the
 /// first match.
-fn collection_stands_under(
+pub(crate) fn collection_stands_under(
     collections: &impl ReadableTable<(&'static str, &'static str), &'static [u8]>,
     id: CollectionId,
 ) -> Result<bool> {
@@ -4464,6 +4296,8 @@ mod tests {
         engine.insert(&coll, bson::doc! { "_id": 1, "v": "old" }).unwrap();
 
         engine.drop_collection("app", "a").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let recreated = engine.create_collection("app", "a").unwrap();
 
         assert_eq!(recreated.id, coll.id, "a derived id is stable across drop and recreate");
@@ -4511,21 +4345,27 @@ mod tests {
         (coll, shadow)
     }
 
-    /// A drop clears everything the collection held however many chunks that
-    /// takes — documents, index entries, and the vector shadow, which is the
-    /// slower half of the drop this change was made for. A chunked drop that
-    /// stopped short would leave the residue a collection recreated under the
-    /// same name inherits, since the name derives the id.
+    /// A drop answers at its burial and leaves what the collection held to the
+    /// drop purger (ADR-189), which clears all of it however many chunks that
+    /// takes: documents, index entries, and the vector shadow, the slower half
+    /// of the drop ADR-158 was made for. A purge that stopped short would leave
+    /// the residue a collection recreated under the same name inherits, since
+    /// the name derives the id.
     #[test]
-    fn a_drop_of_more_than_one_chunk_leaves_nothing_behind_including_its_shadow() {
+    fn a_drop_answers_at_its_burial_and_the_purge_leaves_nothing_behind_including_its_shadow() {
         let (engine, _dir) = engine();
         let (coll, shadow) = a_collection_of_more_than_one_chunk(&engine);
         assert!(rows_under(&engine, coll.id).1 > DROP_PURGE_CHUNK, "an index worth clearing");
+        let held = rows_under(&engine, coll.id);
 
         assert!(engine.drop_collection("shop", "orders").unwrap());
 
         assert!(engine.get_collection("shop", "orders").is_err());
         assert!(engine.get_collection("shop", &shadow.name).is_err(), "the shadow went too");
+        assert_eq!(rows_under(&engine, coll.id), held, "the drop removed nothing itself");
+        assert_eq!(engine.queued_purges(), vec![coll.id, shadow.id], "both handed to the purger");
+
+        engine.finish_purges_now().unwrap();
         for id in [coll.id, shadow.id] {
             assert_eq!(rows_under(&engine, id), (0, 0), "rows left under {id}");
             assert!(engine.collection_dropped_at(id).unwrap().is_some(), "no tombstone for {id}");
@@ -4582,16 +4422,15 @@ mod tests {
             .sum();
         assert!(chunks > 4, "a drop worth chunking: {chunks} chunks");
         let before = engine.commits();
-        let waits = engine.writer_wait().count;
-
         assert!(engine.drop_collection("shop", "orders").unwrap());
+        assert_eq!(engine.commits() - before, 1, "the drop itself is the burial's one commit");
+
+        let before = engine.commits();
+        let waits = engine.writer_wait().count;
+        engine.finish_purges_now().unwrap();
 
         let commits = (engine.commits() - before) as usize;
-        assert_eq!(
-            commits,
-            chunks + 1,
-            "the burial's commit and one per chunk of {DROP_PURGE_CHUNK}"
-        );
+        assert_eq!(commits, chunks, "the purge is one commit per chunk of {DROP_PURGE_CHUNK}");
         assert_eq!(
             engine.writer_wait().count - waits,
             commits as u64,
@@ -4601,11 +4440,12 @@ mod tests {
 
     /// A drop interrupted between chunks is a drop, not a half-collection:
     /// the definition and the tombstone were durable before the first chunk,
-    /// so what a restart finds is rows under an id nothing resolves. The next
-    /// start finishes the removal, which is all that is left of the drop —
-    /// there is nothing to replay, the drop has already replicated.
+    /// so what a restart finds is rows under an id nothing resolves. The start
+    /// names them and does **not** remove them: the drop purger does, once the
+    /// node serves (ADR-158's second addendum). Finishing them in `open` held
+    /// the start for as long as the drop had left.
     #[test]
-    fn a_drop_interrupted_between_chunks_is_finished_by_the_next_start() {
+    fn a_drop_interrupted_between_chunks_is_announced_at_start_and_finished_by_the_purger() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let (coll, shadow) = {
@@ -4616,54 +4456,104 @@ mod tests {
             assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK);
             assert!(engine.get_collection("shop", "orders").is_err(), "gone, not half-held");
             assert!(rows_under(&engine, coll.id).0 > 0, "the fixture must leave rows behind");
-
-            // What the next start names before it does the work, which is
-            // all an operator has to tell a long start from a hung one: both
-            // ids, and how many rows each still owes.
-            let owed: std::collections::BTreeMap<CollectionId, usize> =
-                engine.drops_left_unfinished().unwrap().into_iter().collect();
-            for id in [coll.id, shadow.id] {
-                let (docs, indexes) = rows_under(&engine, id);
-                assert_eq!(owed.get(&id), Some(&(docs + indexes)), "what is owed under {id}");
-            }
-            assert_eq!(owed.len(), 2, "and nothing else: {owed:?}");
             (coll, shadow)
         };
 
         let engine = Engine::open(&path).unwrap();
+        let mut owed = engine.owed_purges().unwrap();
+        owed.sort();
+        let mut expected = vec![coll.id, shadow.id];
+        expected.sort();
+        assert_eq!(owed, expected, "both ids are found owed after the restart, and nothing else");
+        assert!(rows_under(&engine, coll.id).0 > 0, "open removed nothing");
 
+        engine.finish_purges_now().unwrap();
         for id in [coll.id, shadow.id] {
-            assert_eq!(rows_under(&engine, id), (0, 0), "rows left under {id} after a restart");
+            assert_eq!(rows_under(&engine, id), (0, 0), "rows left under {id}");
             assert!(engine.collection_dropped_at(id).unwrap().is_some(), "the tombstone survived");
         }
         assert!(engine.get_collection("shop", "orders").is_err(), "and the drop still stands");
     }
 
-    /// A name created again between two chunks of its own drop keeps what it
-    /// writes. The id is derived from the name, so the purge is working in
-    /// the range the new collection now stands over; the check that no
-    /// collection stands under the id is made in the transaction that does
-    /// the removing, so a creation either lands before a chunk sees it or
-    /// after that chunk has finished.
+    /// A name created again while its drop's rows remain is refused at once,
+    /// and asks for that id to be purged next (ADR-189). The id is derived
+    /// from the name, so the new incarnation would stand over the old one's
+    /// rows. Refused rather than drained: draining held the creation for as
+    /// long as the dropped collection was large.
     #[test]
-    fn a_collection_created_again_between_two_chunks_of_its_drop_keeps_its_documents() {
+    fn a_collection_created_again_while_its_drop_is_purging_is_refused_and_asks_for_it_next() {
         let (engine, _dir) = engine();
         let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
+        engine.create_collection("shop", "other").unwrap();
+        engine.drop_collection("shop", "other").unwrap();
         engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
         assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK, "one chunk gone");
+        let held = rows_under(&engine, coll.id);
+        let commits = engine.commits();
 
-        // The recreation clears what the drop had not reached, so the new
-        // incarnation starts empty rather than over a previous life's rows.
+        match engine.create_collection("shop", "orders") {
+            Err(StorageError::CollectionPurging { id, .. }) => assert_eq!(id, coll.id),
+            other => panic!("expected CollectionPurging, got {other:?}"),
+        }
+        assert_eq!(engine.commits(), commits, "nothing was written");
+        assert_eq!(rows_under(&engine, coll.id), held, "and nothing was drained");
+        assert_eq!(engine.queued_purges()[0], coll.id, "the id went to the front");
+
+        engine.finish_purges_now().unwrap();
         let again = engine.create_collection("shop", "orders").unwrap();
         assert_eq!(again.id, coll.id, "a derived id is stable across drop and recreate");
         assert_eq!(rows_under(&engine, again.id), (0, 0), "nothing inherited");
-        engine.insert(&again, bson::doc! { "_id": 1, "v": 1 }).unwrap();
+    }
 
-        // What is left of the drop now runs on a live collection and must
-        // take nothing.
-        assert_eq!(engine.purge_dropped_collection(coll.id).unwrap(), 0);
+    /// A collection standing under the id is not a pending purge: creating it
+    /// again is a conflict, not a wait.
+    #[test]
+    fn creating_a_collection_that_stands_is_a_conflict_not_a_pending_purge() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        assert!(!engine.purge_pending(coll.id).unwrap(), "its rows are its own");
+        assert!(matches!(
+            engine.create_collection("shop", "orders"),
+            Err(StorageError::Core(CoreError::CollectionExists { .. }))
+        ));
+        assert!(engine.queued_purges().is_empty(), "and no purge was asked for");
+    }
 
-        assert_eq!(engine.count(&again).unwrap(), 1, "the new incarnation's own document");
+    /// The chunk's own guard, the backstop behind the refusal: a chunk run
+    /// under an id a collection stands over removes nothing, because what is
+    /// filed there belongs to that collection.
+    #[test]
+    fn a_purge_chunk_under_a_standing_collection_removes_nothing() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 1, "v": 1 }).unwrap();
+        assert_eq!(engine.purge_chunk(coll.id).unwrap(), 0);
+        assert_eq!(engine.count(&coll).unwrap(), 1, "the standing collection's own document");
+    }
+
+    /// Rows an older collector left without their tombstone (ADR-158's
+    /// residual, before its addendum) are found by no owed check, and would
+    /// block the name for good if only a queued id could be moved. A creation
+    /// that meets them adds the id, and the purger removes them.
+    #[test]
+    fn rows_with_no_tombstone_are_queued_by_the_creation_that_meets_them() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..5i64 {
+            engine.insert(&coll, bson::doc! { "_id": i }).unwrap();
+        }
+        let id = engine.forget_collection_leaving_rows("shop", "orders").unwrap();
+        assert!(engine.collection_dropped_at(id).unwrap().is_none(), "no tombstone");
+        assert!(engine.owed_purges().unwrap().is_empty(), "invisible to the owed check");
+
+        assert!(matches!(
+            engine.create_collection("shop", "orders"),
+            Err(StorageError::CollectionPurging { .. })
+        ));
+        assert_eq!(engine.queued_purges(), vec![id], "added, not only moved");
+        engine.finish_purges_now().unwrap();
+        engine.create_collection("shop", "orders").unwrap();
     }
 
     #[test]
@@ -4901,47 +4791,6 @@ mod tests {
         );
     }
 
-    /// A drop is done when it is buried, and the purge behind it is a
-    /// removal this node owes itself: a chunk that gives up waiting for the
-    /// writer inside the caller's budget (ADR-151) leaves the drop standing
-    /// and the rows for the next retention pass or the next start, rather than
-    /// reporting a failed drop whose retry would answer `dropped: false` over
-    /// rows still on disk. This one pins the start.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        let coll = {
-            let engine = Arc::new(Engine::open(&path).unwrap());
-            let coll = engine.create_collection("shop", "orders").unwrap();
-            for i in 0..5i64 {
-                engine.insert(&coll, bson::doc! { "_id": i }).unwrap();
-            }
-            engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
-
-            let hold = engine.hold_writer(WriterHolder::Bulk);
-            let budget = std::time::Duration::from_millis(100);
-            let owed = {
-                let engine = Arc::clone(&engine);
-                tokio::spawn(with_write_wait_budget(budget, async move {
-                    engine.purge_what_the_drop_left(coll.id, "shop", "orders")
-                }))
-                .await
-                .unwrap()
-            };
-            drop(hold);
-
-            assert!(owed.is_ok(), "the drop must not be reported as failed: {owed:?}");
-            assert_eq!(engine.writer_wait_timeouts(), 1, "a chunk did give up");
-            assert!(engine.get_collection("shop", "orders").is_err(), "the drop stands");
-            assert!(engine.collection_dropped_at(coll.id).unwrap().is_some(), "and its tombstone");
-            assert_eq!(rows_under(&engine, coll.id).0, 5, "with the rows still owed");
-            coll
-        };
-
-        assert_eq!(rows_under(&Engine::open(&path).unwrap(), coll.id), (0, 0), "the next start");
-    }
-
     /// The probe reading counts what `count_by_id` counts — live documents, a
     /// tombstone not among them — and hands back the witnessed vector beside
     /// it, both from one snapshot (ADR-168's limitation). An id this node does
@@ -4962,53 +4811,44 @@ mod tests {
         assert_eq!(engine.count_probe_reading(CollectionId(0x5eed)).unwrap().1, None);
     }
 
-    /// The same owed purge on a node that stays up: the next retention pass
-    /// finishes it, without a restart (ADR-158's addendum). More than a chunk
-    /// is owed, under the collection and its vector shadow both, and the
-    /// tombstones stay — they are not due, and they mark the drop.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_drop_left_owed_by_a_busy_writer_is_finished_by_the_next_retention_pass() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+    /// A retention pass removes nothing a drop left: that is the drop
+    /// purger's, and a pass that removed it too could meet a purge in
+    /// progress (ADR-189). It asks the purger to look, and keeps the
+    /// tombstones while rows remain under them, however old.
+    #[test]
+    fn a_retention_pass_leaves_a_drops_rows_to_the_purger_and_keeps_its_tombstones() {
+        let (engine, _dir) = engine();
         let (coll, shadow) = a_collection_of_more_than_one_chunk(&engine);
         engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
+        assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK, "a purge under way");
+        let held = [rows_under(&engine, coll.id), rows_under(&engine, shadow.id)];
 
-        let hold = engine.hold_writer(WriterHolder::Bulk);
-        let budget = std::time::Duration::from_millis(100);
-        let owed = {
-            let engine = Arc::clone(&engine);
-            tokio::spawn(with_write_wait_budget(budget, async move {
-                engine.purge_what_the_drop_left(coll.id, "shop", "orders")
-            }))
-            .await
-            .unwrap()
-        };
-        drop(hold);
-        assert!(owed.is_ok(), "the drop must not be reported as failed: {owed:?}");
-        assert_eq!(engine.writer_wait_timeouts(), 1, "a chunk did give up");
-        let rows: usize = [coll.id, shadow.id]
-            .into_iter()
-            .map(|id| {
-                let (docs, indexes) = rows_under(&engine, id);
-                docs + indexes
-            })
-            .sum();
-        assert!(rows > DROP_PURGE_CHUNK, "more than a chunk owed: {rows}");
+        // Far past tombstone retention, so only the rows keep the tombstones.
+        let policy = crate::RetentionPolicy::new(1, 1);
+        let later = physical_now_ms() + 10 * 60 * 1000;
+        engine.collect_garbage_at(later, policy).unwrap();
 
-        let policy = crate::RetentionPolicy::new(24 * 60 * 60, 24 * 60 * 60);
-        let outcome = engine.collect_garbage(policy).unwrap();
-
-        assert_eq!(outcome.dropped_rows_removed, rows, "{outcome:?}");
-        for id in [coll.id, shadow.id] {
-            assert_eq!(rows_under(&engine, id), (0, 0), "rows left under {id} after the pass");
-            assert!(engine.collection_dropped_at(id).unwrap().is_some(), "the tombstone stays");
-        }
-        assert!(engine.get_collection("shop", "orders").is_err(), "the drop still stands");
         assert_eq!(
-            engine.collect_garbage(policy).unwrap().dropped_rows_removed,
-            0,
-            "and the pass after owes nothing"
+            [rows_under(&engine, coll.id), rows_under(&engine, shadow.id)],
+            held,
+            "the pass removed none of the drop's rows"
         );
+        for id in [coll.id, shadow.id] {
+            assert!(engine.collection_dropped_at(id).unwrap().is_some(), "{id}'s tombstone kept");
+        }
+        assert!(
+            engine.purges.owed_check_asked.load(std::sync::atomic::Ordering::Relaxed),
+            "and it asked the purger to look"
+        );
+
+        engine.finish_purges_now().unwrap();
+        engine.collect_garbage_at(later, policy).unwrap();
+        for id in [coll.id, shadow.id] {
+            assert!(
+                engine.collection_dropped_at(id).unwrap().is_none(),
+                "{id}'s tombstone is collected once its rows are gone"
+            );
+        }
     }
 
     /// The holder set is a metric label, so its shape is load-bearing: a
@@ -5128,8 +4968,9 @@ mod tests {
         // a drop and a client write were one number before this.
         let drops = WriterHolder::Drop.slot();
         engine.drop_collection("app", "docs").unwrap();
+        engine.finish_purges_now().unwrap();
         let dropped = engine.writer_hold();
-        assert!(dropped.count[drops] >= 1, "the drop is its own holder");
+        assert!(dropped.count[drops] >= 1, "the drop's purge is its own holder");
         assert_eq!(dropped.count[write], after.count[write], "and it is not a client's write");
 
         // ADR-151's since-start maximum is unchanged by any of this.
@@ -5157,6 +4998,12 @@ mod tests {
         let before = engine.writer_hold();
 
         engine.drop_collection("shop", "orders").unwrap();
+        assert_eq!(
+            engine.writer_hold().count[drops],
+            before.count[drops],
+            "the drop itself holds nothing as `drop`: its purge is the purger's"
+        );
+        engine.finish_purges_now().unwrap();
         let after = engine.writer_hold();
 
         assert_eq!(
@@ -5175,42 +5022,27 @@ mod tests {
         assert_eq!(rows_under(&engine, coll.id), (0, 0), "the fixture really did purge");
     }
 
-    /// The sweep that finishes an interrupted drop runs inside
-    /// `Engine::open`, on an engine that is fully constructed by then, so its
-    /// chunks are attributed like any other purge — and are already on the
-    /// first scrape of a member that has served nothing yet.
-    ///
-    /// That is the reading an operator wants from a member whose start took a
-    /// minute, and it is the only series that offers it. It also puts the
-    /// line through `open` where `commits_are_counted_at_one_chokepoint`
-    /// puts it: the migrations and index rebuilds above write on the raw
-    /// database and stay outside this accounting, the sweep takes the gate
-    /// and is inside it.
+    /// A start does not purge an interrupted drop (ADR-158's second addendum):
+    /// no chunk is held as `drop` on the engine `open` returns, and the rows
+    /// are still there for the purger. The start that used to finish them was
+    /// as long as what the drop had left.
     #[test]
-    fn a_drop_finished_at_the_next_start_is_attributed_to_that_start() {
+    fn a_start_announces_an_interrupted_drop_and_purges_none_of_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
-        let coll = {
+        let (coll, owed) = {
             let engine = Engine::open(&path).unwrap();
             let (coll, _shadow) = a_collection_of_more_than_one_chunk(&engine);
             engine.bury_collection("shop", "orders", None).unwrap().expect("dropped");
             assert_eq!(engine.purge_chunk(coll.id).unwrap(), DROP_PURGE_CHUNK);
-            assert!(rows_under(&engine, coll.id).0 > 0, "the fixture must leave rows owed");
-            coll
+            let owed = rows_under(&engine, coll.id);
+            (coll, owed)
         };
 
         let restarted = Engine::open(&path).unwrap();
         let hold = restarted.writer_hold();
-        assert!(
-            hold.count[WriterHolder::Drop.slot()] >= 1,
-            "the sweep's chunks are on the engine it was returned with"
-        );
-        assert_eq!(
-            hold.count[WriterHolder::Ddl.slot()],
-            0,
-            "and the burial was another process's; this start buried nothing"
-        );
-        assert_eq!(rows_under(&restarted, coll.id), (0, 0), "the sweep did finish it");
+        assert_eq!(hold.count[WriterHolder::Drop.slot()], 0, "the start purged nothing");
+        assert_eq!(rows_under(&restarted, coll.id), owed, "the rows wait for the purger");
     }
 
     /// The barrier's own flush holds the writer without opening a counted

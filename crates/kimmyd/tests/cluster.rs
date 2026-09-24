@@ -1874,5 +1874,6 @@ async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_cl
         .filter_map(|l| l.strip_prefix("kimmy_task_progress_age_seconds{task=\""))
         .filter_map(|l| l.split('"').next())
         .collect();
-    assert_eq!(rows, ["replication", "stall_probe", "webhook_dispatcher"]);
+    // The drop purger runs on every node, clustered or not (ADR-189).
+    assert_eq!(rows, ["drop_purger", "replication", "stall_probe", "webhook_dispatcher"]);
 }

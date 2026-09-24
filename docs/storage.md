@@ -110,7 +110,12 @@ One consequence follows from that and cannot be avoided: **dropping and
 recreating a collection reuses its id**. "Same name means same id everywhere"
 and "recreating yields a fresh id" are contradictory. So purging on drop is
 load-bearing — a surviving document or index entry would be inherited by the new
-collection — and `drop_collection` removes both in the same transaction.
+collection. A drop is two stages ([ADR-158](decisions.md)): a short burial that
+removes the definition and records the tombstone, after which the collection is
+gone to everything that asks, and a purge of what it held, which the drop purger
+runs after the drop has answered, a chunk per commit
+([ADR-189](decisions.md)). Until the purge is done, creating the name again is
+refused rather than allowed to stand over the rows.
 
 **Index entries put the document id in the *key*, with an empty value.** A
 non-unique index can then hold many documents under one value without needing a

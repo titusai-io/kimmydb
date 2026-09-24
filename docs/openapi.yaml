@@ -1202,6 +1202,21 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            `collection_purging`: a collection of this name was dropped and
+            what it held is still being removed on this node, so a new one
+            cannot stand over it yet. Nothing was written, and that removal
+            was moved to the front. `timeout` is the other `503` this can
+            answer, when the storage writer stayed busy for the whole of the
+            request's budget.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying. Present on `collection_purging`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}:
     parameters:
@@ -1214,7 +1229,10 @@ paths:
         Each collection is dropped in turn as its own replicated change; the
         last drop removes the database from listings on every member.
         Databases are otherwise implicit — created by their first collection,
-        removed with their last. System databases (`__…`) are refused.
+        removed with their last. System databases (`__…`) are refused. Answers
+        once every collection is dropped, which is one short commit each: what
+        they held is removed afterwards, and until it is, creating one of those
+        names again answers `503 collection_purging`.
       x-kimmy-action: ddl
       responses:
         "200":
@@ -1243,6 +1261,11 @@ paths:
       tags: [collections]
       operationId: dropCollection
       summary: Drop a collection and everything in it.
+      description: >-
+        Answers at the drop's first commit, in milliseconds whatever the size:
+        from then the collection is gone to every read, write, listing and
+        peer. What it held is removed afterwards by the node's drop purger, and
+        until it is, creating the name again answers `503 collection_purging`.
       x-kimmy-action: ddl
       responses:
         "200":
@@ -2260,6 +2283,20 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: |
+            `collection_purging`: vectors were dropped from this collection
+            with `drop_vectors=true`, and what the old shadow collection held
+            is still being removed on this node, so a new one cannot stand
+            over it yet. Nothing was written, and that removal was moved to
+            the front. `timeout` is the other `503` this can answer.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying. Present on `collection_purging`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [vectors]
       operationId: disableVectors
@@ -2946,6 +2983,7 @@ components:
         | `misconfigured` | 500 | elsewhere | This node lacks something it needs, such as an API key named by its vector configuration |
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
+        | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
         | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
       enum:
         - bad_request
@@ -2967,6 +3005,7 @@ components:
         - provider_error
         - stale
         - timeout
+        - collection_purging
 
     Capability:
       type: string

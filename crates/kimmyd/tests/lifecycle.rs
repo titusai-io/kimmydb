@@ -440,6 +440,21 @@ async fn a_panicking_background_task_exits_the_process() {
 }
 
 #[tokio::test]
+async fn a_panicking_drop_purger_exits_the_process() {
+    // The drop purger (ADR-189), started on every node whatever
+    // `storage.gc_interval_secs` says: while it is dead, what a drop left stays
+    // on disk and the name cannot be created again, so its death must stop the
+    // process like any other writer's.
+    a_task_that_dies_exits_and_the_next_start_names_it(
+        "purger-panicking",
+        "panic",
+        "drop_purger",
+        "panicked",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn a_background_task_that_returns_exits_the_process() {
     // The stall probe, whose death makes `kimmy_runtime_stall_seconds` read 0 --
     // "no stall" -- for ever: a signal that cannot fail.

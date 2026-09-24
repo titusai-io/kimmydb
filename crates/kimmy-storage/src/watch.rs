@@ -1090,6 +1090,8 @@ mod tests {
 
         // And it stays ended: recreating the collection must not silently
         // adopt the stream that was watching the old one.
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let recreated = engine.create_collection("app", "docs").unwrap();
         assert_eq!(recreated.id, coll.id, "the id is derived from the name");
         engine.insert(&recreated, doc! { "_id": 2i64 }).unwrap();
@@ -1107,6 +1109,8 @@ mod tests {
         engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
         engine.drop_collection("app", "docs").unwrap();
 
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let recreated = engine.create_collection("app", "docs").unwrap();
         assert_eq!(recreated.id, coll.id, "the id is derived from the name");
         engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
@@ -1142,6 +1146,8 @@ mod tests {
         let token = stream.resume_token().expect("a delivered event yields a token");
 
         engine.drop_collection("app", "docs").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let recreated = engine.create_collection("app", "docs").unwrap();
         engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
 
@@ -1634,6 +1640,8 @@ mod tests {
             );
         }
 
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let recreated = engine.create_collection("app", "docs").unwrap();
         assert_eq!(recreated.id, coll.id, "the id is derived from the name");
         recreated
@@ -2171,6 +2179,8 @@ mod tests {
         engine.apply_remote(&coll, &remote_entry(&coll, "old", before_the_drop)).unwrap();
         engine.drop_collection("app", "docs").unwrap();
         let dropped_at = newest_stamp(&engine);
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         let coll = engine.create_collection("app", "docs").unwrap();
         engine.insert(&coll, doc! { "_id": "n1" }).unwrap();
 

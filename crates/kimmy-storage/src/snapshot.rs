@@ -258,6 +258,12 @@ pub struct SnapshotApplied {
     /// that drop, and restoring the shadow would leave it parentless here
     /// (ADR-138). The transport cancels a repair still queued for each.
     pub shadows_orphaned: Vec<CollectionId>,
+    /// A collection the page defines that this node cannot create yet,
+    /// because a drop of an earlier collection of that name still has rows
+    /// under its id (ADR-189). The page applied nothing past its drops,
+    /// `progress` did not move, and the drop purger has been asked to take
+    /// the id next: the same page is asked for again in a later round.
+    pub purge_pending: Option<CollectionId>,
 }
 
 /// One page of a snapshot.
@@ -566,62 +572,125 @@ impl Engine {
             None => Bound::Unbounded,
         };
 
+        // Only the rows of a collection that stands. Under an id with no
+        // collection over it lies what a drop left for the drop purger
+        // (ADR-189), or residue an older collector orphaned: a life that has
+        // ended, which a receiver must never be handed as documents. A drop's
+        // rows lie there for as long as its purge runs, so this is an
+        // ordinary state, not a narrow one. Read in the walk's own transaction,
+        // so the set and the rows are one snapshot.
+        let live: std::collections::HashSet<u64> = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let mut live = std::collections::HashSet::new();
+            for row in collections.iter()? {
+                let (_, value) = row?;
+                let meta: CollectionMeta = serde_json::from_slice(value.value())?;
+                live.insert(meta.id.0);
+            }
+            live
+        };
+        let mut start = start;
+
         // The key that ended a full page, kept only once the page is full.
         let mut last_sent: Option<(u64, Vec<u8>)> = None;
-        for row in docs.range::<(u64, &[u8])>((start, end))? {
-            if out.len() + deleted.len() >= SNAPSHOT_PAGE {
-                // Another row exists past a full page, so there is a next
-                // page; the cursor names the last row sent, a document or a
-                // tombstone. Looking
-                // one row ahead is what lets a snapshot of exactly a page's
-                // worth end here rather than with an empty page after it.
-                cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
-                    collection: CollectionId(collection),
-                    after_key,
-                });
-                break;
+        'walk: loop {
+            for row in docs.range::<(u64, &[u8])>((start, end))? {
+                if out.len() + deleted.len() >= SNAPSHOT_PAGE {
+                    // Another row exists past a full page, so there is a next
+                    // page; the cursor names the last row sent, a document or a
+                    // tombstone. Looking
+                    // one row ahead is what lets a snapshot of exactly a page's
+                    // worth end here rather than with an empty page after it.
+                    cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
+                        collection: CollectionId(collection),
+                        after_key,
+                    });
+                    break;
+                }
+
+                let (key, value) = row?;
+                let (collection, doc_key) = key.value();
+                if !live.contains(&collection) {
+                    // Past the whole of that id's range in one seek, rather than
+                    // row by row through what may be a large purge.
+                    match collection.checked_add(1) {
+                        Some(next) => {
+                            start = Bound::Included((next, empty));
+                            continue 'walk;
+                        }
+                        None => break 'walk,
+                    }
+                }
+                let record = codec::decode_doc_record(value.value())?;
+
+                // A tombstone travels by KEY. It has no `_id` to recover -- the
+                // body is gone and keyenc is one-way -- so it cannot be a
+                // `SnapshotDoc`, and it used to be skipped here. That skip was the
+                // defect ADR-167 closes: a receiver below this node's retention
+                // horizon may well hold the document, and completing a
+                // whole-database snapshot grants it coverage of the `Delete`, so
+                // no peer would ever send it. A receiver does not need the `_id`
+                // from us: where it holds the document, its own body carries one.
+                if !record.is_live() {
+                    deleted.push(SnapshotTombstone {
+                        collection: CollectionId(collection),
+                        key: doc_key.to_vec(),
+                        stamp: record.stamp,
+                    });
+                } else {
+                    let Some(document) = record.document()? else {
+                        continue;
+                    };
+                    let id = match document.get(crate::ID_FIELD) {
+                        Some(value) => DocId::try_from_bson(value)?,
+                        None => continue,
+                    };
+
+                    out.push(SnapshotDoc {
+                        collection: CollectionId(collection),
+                        id,
+                        stamp: record.stamp,
+                        body: Some(record.body),
+                    });
+                }
+                if out.len() + deleted.len() == SNAPSHOT_PAGE {
+                    last_sent = Some((collection, doc_key.to_vec()));
+                }
             }
 
-            let (key, value) = row?;
-            let (collection, doc_key) = key.value();
-            let record = codec::decode_doc_record(value.value())?;
-
-            // A tombstone travels by KEY. It has no `_id` to recover -- the
-            // body is gone and keyenc is one-way -- so it cannot be a
-            // `SnapshotDoc`, and it used to be skipped here. That skip was the
-            // defect ADR-167 closes: a receiver below this node's retention
-            // horizon may well hold the document, and completing a
-            // whole-database snapshot grants it coverage of the `Delete`, so
-            // no peer would ever send it. A receiver does not need the `_id`
-            // from us: where it holds the document, its own body carries one.
-            if !record.is_live() {
-                deleted.push(SnapshotTombstone {
-                    collection: CollectionId(collection),
-                    key: doc_key.to_vec(),
-                    stamp: record.stamp,
-                });
-            } else {
-                let Some(document) = record.document()? else {
-                    continue;
-                };
-                let id = match document.get(crate::ID_FIELD) {
-                    Some(value) => DocId::try_from_bson(value)?,
-                    None => continue,
-                };
-
-                out.push(SnapshotDoc {
-                    collection: CollectionId(collection),
-                    id,
-                    stamp: record.stamp,
-                    body: Some(record.body),
-                });
-            }
-            if out.len() + deleted.len() == SNAPSHOT_PAGE {
-                last_sent = Some((collection, doc_key.to_vec()));
-            }
+            break 'walk;
         }
 
         Ok((out, deleted, cursor))
+    }
+
+    /// The first collection `page` defines that this node cannot create yet,
+    /// because it is absent here and a drop's rows remain under its id; every
+    /// such id is asked for next.
+    fn page_waits_on_a_purge(&self, page: &SnapshotPage) -> Result<Option<CollectionId>> {
+        let mut waits = None;
+        for state in &page.collections {
+            match self.get_collection(&state.db, &state.name) {
+                Ok(_) => continue,
+                Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    ..
+                })) => {}
+                Err(e) => return Err(e),
+            }
+            let id = CollectionId::derive(&state.db, &state.name);
+            // A definition the tombstone here makes history is not restored
+            // (`restore_collection`'s rule), so it waits on nothing.
+            if let Some(dropped) = self.collection_dropped_at(id)?
+                && state.created.is_none_or(|created| created <= dropped.hlc)
+            {
+                continue;
+            }
+            if self.purge_pending(id)? {
+                self.prioritise_purge(id);
+                waits.get_or_insert(id);
+            }
+        }
+        Ok(waits)
     }
 
     /// Apply one page of a peer's snapshot, and move `progress` past it.
@@ -670,6 +739,12 @@ impl Engine {
         // holding a life NEWER than the tombstone keeps it, because
         // `aims_at_a_previous_incarnation` judges the tombstone against what
         // stands here whenever it runs.
+        // A page defining a collection this node cannot create yet waits,
+        // whole, before any of it is applied (ADR-189): `progress` is not
+        // moved, so the same page comes again once the drop purger is done.
+        if let Some(id) = self.page_waits_on_a_purge(page)? {
+            return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
+        }
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
             self.restore_collection_drop(id, dropped)?;
         }
@@ -688,7 +763,20 @@ impl Engine {
         }
         let mut ddl_refused = 0usize;
         for state in &page.collections {
-            ddl_refused += self.restore_collection(state)?;
+            match self.restore_collection(state) {
+                Ok(refused) => ddl_refused += refused,
+                // The page's own drops just buried a life of this name, and
+                // its rows are the purger's now. What the page committed so
+                // far is its drops and the definitions before this one, and
+                // both are idempotent when the page is asked for again: the
+                // tombstone is already here, and a definition present is left
+                // alone. Nothing past them is applied, and `progress` is not
+                // moved.
+                Err(crate::StorageError::CollectionPurging { id, .. }) => {
+                    return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
+                }
+                Err(e) => return Err(e),
+            }
         }
         let shadows_missing = self.shadows_missing(page)?;
         let shadows_orphaned = self.shadows_orphaned(page)?;
@@ -885,6 +973,7 @@ impl Engine {
                 superseded,
                 shadows_missing,
                 shadows_orphaned,
+                purge_pending: None,
             }),
         }
     }
@@ -1320,6 +1409,10 @@ impl Engine {
                 // means a concurrent local drop, and the rest of its indexes
                 // have nowhere to go.
                 crate::sync::Ddl::Gone => break,
+                // An index creation creates no collection, so it cannot wait
+                // on the drop purger; were it ever to, the rest of the
+                // collection's indexes wait with it, as for `Gone`.
+                crate::sync::Ddl::PurgePending(_) => break,
                 crate::sync::Ddl::Refused(reason) => {
                     refused += 1;
                     warn!(
@@ -1482,9 +1575,22 @@ mod tests {
     /// page, exactly as the transport does across its rounds.
     fn transfer_under(into: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> usize {
         let mut applied = 0;
+        let mut waited = false;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
-            applied += into.apply_snapshot_page(from.node_id(), progress, &page).unwrap().applied;
+            let outcome = into.apply_snapshot_page(from.node_id(), progress, &page).unwrap();
+            // A page that waits on a purge moved nothing. Between rounds the
+            // receiver's drop purger runs, so a transfer finishes it here,
+            // once; a page that waits again after that would never advance,
+            // and says so rather than looping.
+            if outcome.purge_pending.is_some() {
+                assert!(!waited, "a page waited on a purge the purger had finished: {outcome:?}");
+                waited = true;
+                into.finish_purges_now().unwrap();
+                continue;
+            }
+            waited = false;
+            applied += outcome.applied;
         }
         applied
     }
@@ -2625,6 +2731,111 @@ mod tests {
         // And the purge finishes over the top of the refused page.
         assert_eq!(b.purge_dropped_collection(cb.id).unwrap(), 1, "the one document it held");
         assert!(b.get_collection("shop", "orders").is_err());
+    }
+
+    /// A snapshot is served from collections that stand, never from rows under
+    /// an id with none over it (ADR-189): what a drop left for the purger,
+    /// and residue with no tombstone at all. The walk used to serve both as
+    /// documents; a receiver discarded the first against the tombstone the
+    /// page carried, and had nothing to discard the second against.
+    #[test]
+    fn a_snapshot_serves_no_row_of_a_collection_that_does_not_stand() {
+        let (a, _da) = engine();
+        let keep = a.create_collection("shop", "keep").unwrap();
+        a.insert(&keep, doc! { "_id": "k" }).unwrap();
+        let dropped = a.create_collection("shop", "dropped").unwrap();
+        let orphaned = a.create_collection("shop", "orphaned").unwrap();
+        for i in 0..5i64 {
+            a.insert(&dropped, doc! { "_id": i }).unwrap();
+            a.insert(&orphaned, doc! { "_id": i }).unwrap();
+        }
+        a.drop_collection("shop", "dropped").unwrap();
+        a.forget_collection_leaving_rows("shop", "orphaned").unwrap();
+        assert!(a.rows_under(dropped.id).unwrap() > 0 && a.rows_under(orphaned.id).unwrap() > 0);
+
+        let whole = a.snapshot_page(None, None).unwrap();
+        let served: Vec<CollectionId> = whole.documents.iter().map(|d| d.collection).collect();
+        assert_eq!(served, vec![keep.id], "only the standing collection's document: {whole:?}");
+        assert!(whole.deleted_documents.is_empty(), "{whole:?}");
+
+        for id in [dropped.id, orphaned.id] {
+            let scoped = a.snapshot_page(None, Some(id)).unwrap();
+            assert!(scoped.documents.is_empty() && scoped.next.is_none(), "{scoped:?}");
+        }
+    }
+
+    /// A whole-database page that would create a collection whose earlier
+    /// life's rows are still being purged here waits, whole: nothing on it is
+    /// applied and `progress` does not move, so the same page comes again
+    /// (the second ruling's N3). Once the purge is done it applies.
+    #[test]
+    fn a_whole_database_page_waiting_on_one_purge_moves_nothing_and_applies_after_it() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let old = b.create_collection("shop", "orders").unwrap();
+        b.insert(&old, doc! { "_id": 1 }).unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+        a_moment();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 2 }).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        a.insert(&other, doc! { "_id": 3 }).unwrap();
+
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(None, None).unwrap();
+        let waited = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(waited.purge_pending, Some(old.id), "{waited:?}");
+        assert_eq!(progress.pages(), 0, "progress did not move");
+        assert!(b.get_collection("shop", "other").is_err(), "nothing on the page was applied");
+        assert_eq!(b.queued_purges().first(), Some(&old.id), "and the purge was asked for");
+
+        b.finish_purges_now().unwrap();
+        let applied = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(applied.purge_pending, None, "{applied:?}");
+        assert!(progress.is_complete());
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, orders.created, "the sender's life");
+        assert!(b.get(&held, &DocId::Int64(1)).unwrap().is_none(), "none of the old one");
+        assert!(b.get(&held, &DocId::Int64(2)).unwrap().is_some());
+        assert!(b.get_collection("shop", "other").is_ok());
+    }
+
+    /// The page's pre-check runs before anything on the page is applied (the
+    /// second ruling's N3). A page carrying a drop, and defining a collection
+    /// that sorts before the one that waits, applies neither. Without the
+    /// pre-check the drop and that collection land before the definition
+    /// that waits is refused, and the page is left half applied.
+    #[test]
+    fn a_page_waiting_on_a_purge_applies_none_of_its_drops_or_earlier_definitions() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let victim = a.create_collection("shop", "victim").unwrap();
+        a.insert(&victim, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "victim").is_ok(), "B holds the collection A drops");
+
+        let old = b.create_collection("shop", "orders").unwrap();
+        b.insert(&old, doc! { "_id": 1 }).unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+        a_moment();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 2 }).unwrap();
+        let first = a.create_collection("shop", "aaa").unwrap();
+        a.insert(&first, doc! { "_id": 3 }).unwrap();
+        a.drop_collection("shop", "victim").unwrap();
+        a.finish_purges_now().unwrap();
+
+        let page = a.snapshot_page(None, None).unwrap();
+        let names: Vec<&str> = page.collections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.first(), Some(&"aaa"), "the page defines aaa first: {names:?}");
+        assert!(page.dropped_collections.iter().any(|(id, _)| *id == victim.id), "{page:?}");
+
+        let mut progress = SnapshotProgress::whole_database();
+        let waited = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(waited.purge_pending, Some(old.id), "{waited:?}");
+        assert!(b.get_collection("shop", "aaa").is_err(), "the earlier definition was not applied");
+        assert!(b.get_collection("shop", "victim").is_ok(), "nor was the carried drop");
+        assert_eq!(progress.pages(), 0, "and progress did not move");
     }
 
     /// The other side of the same rule, and the reason it is a comparison
@@ -3851,6 +4062,8 @@ mod tests {
         a.drop_collection("shop", "orders").unwrap();
         // Recreated on the sender: it now holds both a live incarnation and
         // the tombstone of the life before it.
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let again = a.create_collection("shop", "orders").unwrap();
         a.insert(&again, doc! { "_id": 2 }).unwrap();
         // And the RECEIVER already holds that same newer life, which is the
@@ -3938,6 +4151,8 @@ mod tests {
         let life1 = b.get_collection("shop", "orders").unwrap().created;
 
         a.drop_collection("shop", "orders").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let life2 = a.create_collection("shop", "orders").unwrap();
         a.insert(&life2, doc! { "_id": 2 }).unwrap();
         assert_ne!(life1, life2.created, "the fixture must be two distinct lives");
@@ -5174,9 +5389,19 @@ mod relog {
     /// A whole-database snapshot of `from` into `into`, page by page.
     fn transfer(into: &Engine, from: &Engine) -> Result<()> {
         let mut progress = SnapshotProgress::whole_database();
+        let mut waited = false;
         while !progress.is_complete() {
             let page = from.snapshot_page(progress.after().cloned(), progress.scope())?;
-            into.apply_snapshot_page(from.node_id(), &mut progress, &over_the_wire(page))?;
+            let outcome =
+                into.apply_snapshot_page(from.node_id(), &mut progress, &over_the_wire(page))?;
+            // As `transfer_under`: the purger runs between rounds, once.
+            if outcome.purge_pending.is_some() {
+                assert!(!waited, "a page waited on a purge the purger had finished: {outcome:?}");
+                waited = true;
+                into.finish_purges_now()?;
+                continue;
+            }
+            waited = false;
         }
         Ok(())
     }

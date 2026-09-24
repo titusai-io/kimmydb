@@ -164,6 +164,13 @@ pub struct RoundReport {
     /// rare on a busy cluster: the peer appended them between advertising
     /// and serving, and the next round takes them from the right position.
     pub entries_skipped_beyond_advertised: usize,
+    /// Batches the rounds in this tick stopped short at a replicated
+    /// creation waiting for this node's drop purger to remove what an earlier
+    /// collection of that name held — `SyncOutcome::purge_pending`, summed
+    /// (ADR-189). A counter. Each one is a window re-served from the same
+    /// place until the purge is done; nothing is missing, so no repair is
+    /// planned.
+    pub entries_skipped_purge_pending: usize,
     /// Pulls in this tick spent repairing against a peer (ADR-148):
     /// re-serving its oplog from below this node's position, or pulling its
     /// snapshot, because the check confirmed a divergence against it or a
@@ -680,6 +687,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     report.ddl_declined += applied.ddl_declined;
                     report.entries_skipped_unknown_collection += applied.unknown_collection;
                     report.entries_skipped_beyond_advertised += applied.deferred;
+                    report.entries_skipped_purge_pending += applied.purge_pending;
                     match pulled {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);

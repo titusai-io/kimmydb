@@ -4657,7 +4657,11 @@ async fn a_collection_recreated_on_the_peer_after_the_drop_is_still_pulled() {
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert!(b.engine.get_collection("shop", "bench").is_err(), "B applied the drop");
 
-    // And a new life for the name, on B.
+    // And a new life for the name, on B, once B's drop purger has removed what
+    // the first one held (ADR-189).
+    b.engine.finish_purges_now().unwrap();
+    // A's too, or A's pull of the recreation waits for it at the creation.
+    a.engine.finish_purges_now().unwrap();
     let recreated = b.engine.create_collection("shop", "bench").unwrap();
     assert!(recreated.created > dropped.hlc, "the recreation is later than the drop it follows");
     let new: Vec<_> = (0..10).map(|n| doc! { "_id": format!("new-{n}") }).collect();
@@ -5352,4 +5356,116 @@ async fn an_index_relays_through_two_snapshot_hops() {
     assert!(held.index("by_x").is_some(), "m learned the index from q: {:?}", held.indexes);
     let entry = q.engine.oplog_entry(&stamp.unwrap()).unwrap().expect("q holds the entry");
     assert_eq!(entry.stamp.node, a.engine.node_id(), "at a's stamp, not p's");
+}
+
+// -----------------------------------------------------------------------
+// A large collection drop does not stop a member's replication (ADR-189)
+
+/// Poll `done` every 10 ms for up to ten seconds; one that never holds fails
+/// the test rather than hanging it.
+async fn within_ten_seconds(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what} did not happen within ten seconds");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A member applying a peer's drop of a collection larger than a chunk goes
+/// on pulling the peer's other databases while the rows are removed. The
+/// member's purge is held at its gate for the whole round, so the round can
+/// only return if applying the drop does not wait for the purge. Before
+/// ADR-189 the apply ran the purge, the round blocked at the gate, and every
+/// database waited with it.
+///
+/// The round runs on a thread of its own, joined with a timeout: an apply
+/// that never yields cannot be timed out from inside, so a regression fails
+/// here at ten seconds rather than hanging the suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_pulls_of_another_database_go_on_while_a_large_replicated_drop_is_purged() {
+    let a = node().await;
+    let b = node().await;
+    let big = a.engine.create_collection("big", "c").unwrap();
+    let rows = kimmy_storage::engine::DROP_PURGE_CHUNK * 2 + 7;
+    a.engine.insert_many(&big, (0..rows).map(|i| doc! { "_id": i as i64 }).collect()).unwrap();
+    let other = a.engine.create_collection("other", "c").unwrap();
+    a.engine.insert(&other, doc! { "_id": "before" }).unwrap();
+    // A round carries a capped window, so B catches up over several.
+    for _ in 0..100 {
+        if sync_once(&b.engine, a.addr, SECRET, None).await.unwrap().exhausted {
+            break;
+        }
+    }
+    assert!(b.engine.rows_under(big.id).unwrap() >= rows, "B holds the big collection");
+
+    b.engine.close_purge_gate();
+    assert!(a.engine.drop_collection("big", "c").unwrap());
+    a.engine.insert(&other, doc! { "_id": "after" }).unwrap();
+
+    let (answered, answer) = std::sync::mpsc::channel();
+    let (engine, peer) = (Arc::clone(&b.engine), a.addr);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _ = answered.send(runtime.block_on(sync_once(&engine, peer, SECRET, None)));
+    });
+    let round = answer
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the round returned while B's purge was held");
+    round.expect("the round succeeds");
+
+    let other_here = b.engine.get_collection("other", "c").unwrap();
+    assert!(
+        b.engine.get(&other_here, &DocId::String("after".into())).unwrap().is_some(),
+        "the other database's write arrived in the same round"
+    );
+    assert!(b.engine.get_collection("big", "c").is_err(), "the drop applied");
+    assert!(b.engine.rows_under(big.id).unwrap() > 0, "and its rows wait for the purger");
+
+    b.engine.open_purge_gate();
+    let purger = tokio::spawn(Arc::clone(&b.engine).run_drop_purger());
+    within_ten_seconds("B's purge", || b.engine.rows_under(big.id).unwrap() == 0).await;
+    purger.abort();
+}
+
+/// A pushed creation of a name whose earlier collection the receiver is
+/// still purging is not applied, and the receiver says so in its reply
+/// (`Pushed::purge_pending`, ADR-189), so the pusher reports the member as
+/// pending rather than as refusing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so() {
+    let a = node().await;
+    let b = node().await;
+    let first = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&first, doc! { "_id": i }).unwrap();
+    }
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    // B takes the first life and its drop; with no purger running on B, the
+    // rows stay owed.
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(b.engine.get_collection("shop", "orders").is_err());
+    assert!(b.engine.rows_under(first.id).unwrap() > 0, "B still owes the first life's rows");
+
+    a.engine.finish_purges_now().unwrap();
+    a.engine.create_collection("shop", "orders").unwrap();
+    let entry = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 1_024)
+        .unwrap()
+        .entries
+        .into_iter()
+        .last()
+        .expect("the recreation's entry");
+    assert_eq!(entry.kind, kimmy_core::OpKind::CreateCollection);
+
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.expect("the push is answered");
+    assert_eq!(pushed.outcome.purge_pending, 1, "{pushed:?}");
+    assert_eq!(pushed.outcome.ddl, 0, "nothing was created: {pushed:?}");
+    assert_eq!(pushed.outcome.unknown_collection, 0, "nor is anything missing: {pushed:?}");
+    assert!(b.engine.get_collection("shop", "orders").is_err());
+
+    b.engine.finish_purges_now().unwrap();
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.outcome.purge_pending, 0, "{pushed:?}");
+    assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }

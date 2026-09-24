@@ -10,6 +10,77 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **A collection or database drop answers as soon as it is recorded, and what
+  it held is removed in the background** ([ADR-189](docs/decisions.md)). From
+  that answer the collection is gone to every client and peer, as it already
+  was while a drop was in progress, and the `DELETE` no longer takes as long as
+  the collection is large, so a client timeout no longer needs sizing for it. A
+  new background task, the drop purger, removes the rows, and
+  `kimmy_task_progress_age_seconds{task="drop_purger"}` reports it (alert above
+  15 s). A scrape config or golden list that enumerates series needs the new
+  row, the new `drop_purger` task in `kimmy_task_retries_total`, and
+  `kimmy_sync_entries_skipped_total{reason="purge_pending"}`.
+
+- **Creating a name again before that removal finishes is refused with `503
+  collection_purging`**, with `Retry-After`. So is enabling vectors on a
+  collection whose vectors were dropped with `drop_vectors=true`. It used to
+  succeed at once, because the drop had already paid. Retry it: the refusal
+  writes nothing and moves the removal to the front. A client that treats an
+  unknown `503` as retryable already does the right thing.
+
+- **A member applying a peer's re-creation of such a name takes nothing
+  stamped after the creation, for any database, from a peer that holds the
+  creation, until its own removal is done.** A peer that does not hold it yet
+  still serves other origins' changes up to what it advertised, so the delay
+  reaches every peer the member pulls from as the creation does. It grows with
+  the dropped collection's size.
+  `kimmy_sync_entries_skipped_total{reason="purge_pending"}` counts it, and the
+  divergence-check age alert fires while it lasts.
+
+- **The sync protocol's `Pushed` reply gains `purge_pending`.** An older member
+  receiving a push never sends it. **An older member pushing ignores it:**
+  during a rolling upgrade, a 0.35.0 member that pushes a schema change to an
+  upgraded one still stopped at a pending creation reads the reply as a
+  confirmation, when the change is not yet applied there. Anti-entropy still
+  applies it once the removal is done; only the confirmation is early.
+
+- **A restart no longer finishes an interrupted drop before the node serves.**
+  The start names each collection it owes, and the drop purger finishes them
+  once the node is up, where the start used to be as long as what the drop had
+  left.
+
+- **The retention pass no longer removes what a drop left.** Its log line loses
+  the `dropped_rows` field; the drop purger's own lines say what it removed.
+
+### Fixed
+
+- **Schema changes and a peer's changes no longer hold an async worker
+  thread for as long as they take.** An index build, an index drop, a
+  collection or database drop, a collection creation, a vectors change, and the
+  apply of a replicated window each ran on the runtime worker that served the
+  request or ran the replication round. Every task queued on that worker waited
+  as long as the change took, `/metrics` among them. A burst of parallel index
+  creates timed out its peers' confirmations, and a replicated drop of 400,000
+  documents held a worker for about two minutes. They now run off the worker,
+  and a request's wait for the storage writer is still bounded by
+  `server.request_timeout_secs` ([ADR-153](docs/decisions.md),
+  [ADR-177](docs/decisions.md)).
+
+- **Applying a peer's collection drop no longer stops a member's replication**
+  for every database for as long as the removal takes: about two minutes per
+  400,000 documents, with nothing counted as a failure. A replicated drop now
+  only records the drop ([ADR-189](docs/decisions.md)).
+
+- **The retention pass no longer joins a drop in progress** and logs it as rows
+  a drop left behind.
+
+- **A snapshot no longer serves a dropped collection's rows** while they are
+  still being removed, nor rows left with no collection and no tombstone at all.
+
 ## 0.35.0 - 2026-09-24
 
 **Nothing on the wire, on disk or in configuration changes, and a downgrade
@@ -91,18 +162,6 @@ itself on a storage I/O error, and three metrics change what they read.**
   unaffected.
 
 ### Fixed
-
-- **Schema changes and a peer's changes no longer hold an async worker
-  thread for as long as they take.** An index build, an index drop, a
-  collection or database drop, a collection creation, a vectors change, and the
-  apply of a replicated window each ran on the runtime worker that served the
-  request or ran the replication round. Every task queued on that worker waited
-  as long as the change took, `/metrics` among them. A burst of parallel index
-  creates timed out its peers' confirmations, and a replicated drop of 400,000
-  documents held a worker for about two minutes. They now run off the worker,
-  and a request's wait for the storage writer is still bounded by
-  `server.request_timeout_secs` ([ADR-153](docs/decisions.md),
-  [ADR-177](docs/decisions.md)).
 
 - **A webhook registry record that does not decode no longer stops delivery
   for the subscriptions stored after it.** The dispatcher's load stopped
