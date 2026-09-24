@@ -580,15 +580,15 @@ impl Cleared {
         }
         #[cfg(test)]
         crate::store_lock::test_hooks::before_put_back(database);
+        // Unlocked, the file cannot be looked at for what redb wrote, so this
+        // refusal claims nothing about it, unlike [`refused`].
         let Some(relocked) = crate::store_lock::StoreLock::relock(database) else {
-            return Some(refused(
-                database,
-                format!(
-                    "{why}. The store could not be locked again to put its sidecar back, so {} \
-                     keeps this build's",
-                    sidecar_path(database).display()
-                ),
-            ));
+            return Some(StorageError::RefusedStore(format!(
+                "{} is not opened by this build: {why}. It could not be locked again to check \
+                 it, so {} keeps this build's",
+                database.display(),
+                sidecar_path(database).display()
+            )));
         };
         if !self.store_unchanged(database) {
             return None;
@@ -1272,6 +1272,7 @@ mod tests {
     const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
     const PROBE_OPEN: &str = "KIMMY_FORMAT_PROBE_OPEN";
     const PROBE_HOLD: &str = "KIMMY_FORMAT_PROBE_HOLD";
+    const PROBE_PLAIN_REDB: &str = "KIMMY_FORMAT_PROBE_PLAIN_REDB";
 
     fn edit_store(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
         let mut bytes = std::fs::read(path).unwrap();
@@ -1455,6 +1456,14 @@ mod tests {
             };
             // On a line of its own: libtest has already printed the test's name.
             println!("\nPROBE {} {} {outcome}", redb_time::take().as_millis(), max_rss_kib());
+        } else if let Ok(path) = std::env::var(PROBE_PLAIN_REDB) {
+            // Plain redb, nothing of this build's in front of it.
+            let opened = redb::Builder::new().open_read_only(&path).map(drop);
+            let outcome = match opened {
+                Ok(()) => "opened".to_string(),
+                Err(e) => format!("error {e:?}"),
+            };
+            println!("\nPROBE 0 {} {outcome}", max_rss_kib());
         } else if let Ok(path) = std::env::var(PROBE_HOLD) {
             let engine = Engine::open(Path::new(&path)).unwrap();
             let c = engine.create_collection("shop", "orders").unwrap();
@@ -1687,7 +1696,9 @@ mod tests {
         assert!(holder.borrow().is_some(), "the probe ran");
         match result {
             Err(StorageError::RefusedStore(why)) => assert!(
-                why.contains("damaged") && why.contains("could not be locked again"),
+                why.contains("damaged")
+                    && why.contains("could not be locked again to check it")
+                    && !why.contains("nothing in it was changed"),
                 "{why}"
             ),
             Err(other) => panic!("refused with the wrong error: {other}"),
@@ -1783,21 +1794,31 @@ mod tests {
         assert!(fingerprints(&path) == before, "the store or its sidecar changed");
     }
 
-    /// Why [`check_roots`] exists, kept honest: redb 4.3 itself, with no check
-    /// in front of it, still reads a root page that lies past the file's end
-    /// into a buffer of the page's length before it fails, rather than refusing
-    /// it as corrupted. A root of order 12, 16 MiB, keeps this test's own
-    /// allocation small; order 20 takes the same path at 4 GiB.
+    /// Why [`check_roots`] exists, kept honest: redb 4.3 itself, with nothing
+    /// in front of it, still allocates a root page that lies past the file's
+    /// end before it fails, rather than refusing it without allocating. Each
+    /// open runs plain redb in a child. The damaged file's root is of order
+    /// 12, 16 MiB, which keeps this test's own allocation small; order 20
+    /// takes the same path at 4 GiB. The child's peak resident set must rise
+    /// by at least half the page's size over the same child opening the file
+    /// undamaged. That is the allocation itself, whatever error follows it.
+    /// Half, not all: the undamaged open reads pages the failing one never
+    /// does, so the rise measured is a little under the page (16,240 KiB for
+    /// the 16,384 KiB page on macOS), while a redb that refused the page
+    /// without allocating it would rise by close to nothing.
     ///
-    /// **When a redb bump makes this fail, because redb now refuses such a page
-    /// without reading it, delete `check_roots`, `root_ranges`, this test and
-    /// the tests of the check together**, and the paragraph in ADR-190's
-    /// addendum that names them.
+    /// **When a redb bump makes this fail, because redb no longer allocates
+    /// such a page, delete `check_roots`, `root_ranges`, this test and the
+    /// tests of the check together**, and the paragraph in ADR-190's addendum
+    /// that names them. Reported upstream at
+    /// https://github.com/cberner/redb/issues/1503.
     #[test]
     fn redb_itself_still_allocates_for_a_root_page_past_eof() {
+        const ORDER: u8 = 12;
+        let page_kib = (4096u64 << ORDER) / 1024;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("plain.redb");
-        {
+        let plain = |name: &str| {
+            let path = dir.path().join(name);
             let db = redb::Database::create(&path).unwrap();
             let txn = db.begin_write().unwrap();
             txn.open_table(redb::TableDefinition::<u64, u64>::new("t"))
@@ -1805,25 +1826,31 @@ mod tests {
                 .insert(1, 1)
                 .unwrap();
             txn.commit().unwrap();
-        }
-        damage_page_order_validly(&path, 12);
-        let len = std::fs::metadata(&path).unwrap().len();
-        let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
+            path
+        };
+        let undamaged = plain("undamaged.redb");
+        let damaged = plain("damaged.redb");
+        damage_page_order_validly(&damaged, ORDER);
+        let len = std::fs::metadata(&damaged).unwrap().len();
+        let header = std::fs::read(&damaged).unwrap()[..HEADER_LEN].to_vec();
         let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
         assert!(root_past_end(&header, primary, len).is_some(), "the fixture's root fits");
-        let read_past_the_end = |r: std::result::Result<(), redb::DatabaseError>| {
-            matches!(
-                r,
-                Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof
-            )
+
+        let rss = |path: &Path| {
+            let line = run_child(PROBE_PLAIN_REDB, path, CHILD_LIMIT);
+            let mut parts = line.splitn(3, ' ');
+            parts.next();
+            let kib: u64 = parts.next().unwrap().parse().unwrap();
+            (kib, parts.next().unwrap().to_string())
         };
-        let read_only = redb::Builder::new().open_read_only(&path).map(drop);
-        let read_write = redb::Builder::new().open(&path).map(drop);
+        let (baseline, opened) = rss(&undamaged);
+        assert_eq!(opened, "opened", "the undamaged file opens");
+        let (allocated, outcome) = rss(&damaged);
         assert!(
-            read_past_the_end(read_only) && read_past_the_end(read_write),
-            "redb no longer reads a root page past the file's end before refusing it: retire \
-             check_roots (see this test's doc comment)"
+            allocated >= baseline + page_kib / 2,
+            "redb no longer allocates a root page past the file's end: the damaged open peaked \
+             at {allocated} KiB against {baseline} KiB undamaged, with a {page_kib} KiB page \
+             ({outcome}). Retire check_roots (see this test's doc comment)"
         );
     }
 
