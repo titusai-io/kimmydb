@@ -1061,6 +1061,7 @@ where
             // holds only what a commit made final, and what none did is
             // served again and counted then (ADR-177).
             let counted = &mut stalls.applied;
+            counted.ddl_applied += outcome.ddl;
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
@@ -1510,6 +1511,10 @@ pub struct PeerStalls {
 /// The counts a committed apply produced that a round's report carries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppliedCounts {
+    /// Schema-change entries the apply took as applied —
+    /// `SyncOutcome::ddl`, re-applies of a change already held here
+    /// included; see `RoundReport::ddl_applied`.
+    pub ddl_applied: usize,
     pub ddl_refused: usize,
     pub ddl_declined: usize,
     pub unknown_collection: usize,
@@ -4273,6 +4278,58 @@ mod tests {
         let failed = matches!(answer, Ok(Message::Fault(_)));
         let seen = std::mem::take(&mut *seen.lock().unwrap());
         (seen, failed)
+    }
+
+    /// The same window pushed twice is applied twice, and the second push
+    /// reports its schema changes as applied again: the member already holds
+    /// the collection and the index, and takes both entries as applied. That
+    /// is what `kimmy_sync_ddl_applied_total{via="push"}` counts, and why a
+    /// burst of overlapping windows shows on it (ADR-143). A count of only
+    /// the changes the member lacked would read 0 the second time.
+    #[tokio::test]
+    async fn a_window_pushed_twice_reports_its_schema_changes_applied_twice() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
+        a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
+        let window = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let versions = a.version_vector().unwrap();
+
+        const SECRET: &str = "a-push-twice-secret";
+        const BINDING: &[u8] = b"a-push-twice-binding";
+        let hooked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: PushHook = Arc::new({
+            let hooked = Arc::clone(&hooked);
+            move |outcome: &SyncOutcome| hooked.lock().unwrap().push(outcome.ddl)
+        });
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = async { serve_peer(&b, theirs, SECRET, BINDING, Some(&hook)).await };
+        let pushing = async {
+            open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+            let mut answered = Vec::new();
+            for _ in 0..2 {
+                let push = Message::Push {
+                    entries: window.entries.clone(),
+                    scanned_to: window.scanned_to,
+                    exhausted: window.exhausted,
+                    versions: versions.clone(),
+                };
+                write_frame(&mut ours, &push).await.unwrap();
+                match read_frame(&mut ours).await.unwrap() {
+                    Message::Pushed { ddl, .. } => answered.push(ddl),
+                    other => panic!("expected Pushed, got {other:?}"),
+                }
+            }
+            drop(ours);
+            answered
+        };
+        let (_, answered) = tokio::join!(serving, pushing);
+
+        assert_eq!(answered, vec![2, 2], "the collection and the index, applied each time");
+        assert_eq!(*hooked.lock().unwrap(), vec![2, 2], "and counted each time");
     }
 
     /// The window a pull re-serves `into` from `from` after a push: above what

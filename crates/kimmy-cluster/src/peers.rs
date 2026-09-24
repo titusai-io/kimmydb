@@ -42,10 +42,10 @@ pub type PeerStalenessHook = Arc<dyn Fn(NodeId, Option<u64>) + Send + Sync>;
 ///
 /// A tick makes one **contact** per peer and may make several **pulls**
 /// within it, draining a backlog while the batch cap keeps truncating it
-/// (ADR-157). The counters of what the entries did — `ddl_refused`,
-/// `ddl_declined`, the two `entries_skipped_*` and `repair_rounds` — sum
-/// over the pulls, which is the work the tick actually did. The divergence
-/// pair is per contact, one `divergence_checks` or one `divergence_skips`
+/// (ADR-157). The counters of what the entries did — `ddl_applied`,
+/// `ddl_refused`, `ddl_declined`, the two `entries_skipped_*` and
+/// `repair_rounds` — sum over the pulls, which is the work the tick actually
+/// did. The divergence pair is per contact, one `divergence_checks` or one `divergence_skips`
 /// per peer, decided by the tick's last pull at it; and `failed` is per
 /// contact too, since a failure ends one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,6 +60,18 @@ pub struct RoundReport {
     /// the end of the tick: 0 when every known peer answered its last
     /// round, or when there are no peers. A level, for a gauge.
     pub backing_off: usize,
+    /// Replicated schema changes the rounds in this tick applied —
+    /// `SyncOutcome::ddl`, summed over the pulls, counted as each apply
+    /// commits (ADR-177). Entries **applied**, not received: a refused,
+    /// declined, unknown-collection or purge-pending one is not counted here.
+    /// Nor is a replayed drop this node had already recorded, or a change for
+    /// a collection dropped here (counted only as superseded); no outcome
+    /// series counts those two. A change already held here that the apply takes again
+    /// — a creation of a collection that stands, a definition or a drop that
+    /// is history — comes back from `apply_ddl` as applied and is counted:
+    /// it is one more apply this node did for one delivered entry, which is
+    /// what the count is for (`kimmy_sync_ddl_applied_total`).
+    pub ddl_applied: usize,
     /// Replicated schema changes the rounds in this tick could not apply to
     /// this node's state and skipped — `SyncOutcome::ddl_refused`, summed
     /// over the peers reached. Each one is an index this node now lacks and
@@ -683,6 +695,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // skipped: counted as they committed, not only when the
                     // round went on to succeed (ADR-177).
                     let applied = stalls.take_applied();
+                    report.ddl_applied += applied.ddl_applied;
                     report.ddl_refused += applied.ddl_refused;
                     report.ddl_declined += applied.ddl_declined;
                     report.entries_skipped_unknown_collection += applied.unknown_collection;
@@ -1587,17 +1600,78 @@ mod tests {
             };
             seen.failed += report.failed;
             seen.ddl_refused += report.ddl_refused;
+            seen.ddl_applied += report.ddl_applied;
         }
         // A few more ticks: the refusal is not counted again.
         for _ in 0..3 {
             if let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
             {
                 seen.ddl_refused += report.ddl_refused;
+                seen.ddl_applied += report.ddl_applied;
             }
         }
         looping.abort();
 
         assert!(seen.failed >= 1, "the round failed after its apply: {seen:?}");
         assert_eq!(seen.ddl_refused, 1, "and its refusal is reported, once: {seen:?}");
+        // `kimmy_sync_ddl_applied_total` counts entries applied, not entries
+        // received: the collection's creation is an apply, and the refused
+        // index is not.
+        assert_eq!(seen.ddl_applied, 1, "the collection, not the refused index: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_reports_the_schema_changes_its_pulls_applied() {
+        // `kimmy_sync_ddl_applied_total{via="pull"}` is this count, summed
+        // over rounds: a pull that applies a collection and an index reports
+        // two, and later rounds, which find both witnessed, report none.
+        const SECRET: &str = "a-loop-test-secret";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::transport::serve(Arc::clone(&a), listener, SECRET.into()));
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            false,
+            Some("by_email".into()),
+        )
+        .unwrap();
+
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Arc::new(Engine::open(&b_dir.path().join("kimmy.redb")).unwrap());
+        let b_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![a_addr])], SECRET.into(), b_addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&b), config));
+
+        let mut applied = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while applied < 2 {
+            let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            applied += report.ddl_applied;
+        }
+        // A few more ticks: a pull that finds nothing new applies nothing.
+        for _ in 0..3 {
+            if let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            {
+                applied += report.ddl_applied;
+            }
+        }
+        looping.abort();
+
+        assert_eq!(applied, 2, "the collection and the index, once each");
+        assert!(b.get_collection("shop", "orders").is_ok(), "and B holds them");
     }
 }

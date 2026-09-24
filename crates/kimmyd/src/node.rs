@@ -1292,22 +1292,8 @@ async fn spawn_cluster(
         .with_context(|| format!("binding the cluster listener on {}", config.cluster.bind))?;
     let local = listener.local_addr().unwrap_or(config.cluster.bind);
 
-    // A schema change a peer pushes here (ADR-140) goes through the same
-    // batch application a pulled one does, and lands on the same counter when
-    // this node cannot apply it: the member's own metric must not depend on
-    // which way the change arrived.
-    let on_pushed: kimmy_cluster::PushHook = Arc::new({
-        let state = Arc::clone(&state);
-        move |outcome: &kimmy_storage::SyncOutcome| {
-            state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
-            state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
-            state.metrics.record_entries_skipped(
-                outcome.unknown_collection as u64,
-                outcome.deferred as u64,
-                outcome.purge_pending as u64,
-            );
-        }
-    });
+    // A schema change a peer pushes here (ADR-140): see `pushed_hook`.
+    let on_pushed = pushed_hook(Arc::clone(&state), |state| &state.metrics);
     // Built before the node commits to serving. `serve_with` used to build it
     // and return on failure, which made a fatal condition fatal to that task
     // only: the node went on serving while no peer could pull from it. With
@@ -1427,12 +1413,7 @@ async fn spawn_cluster(
                 // report one series under another's name until somebody read a
                 // dashboard closely. There is nothing here to get in the wrong
                 // order (ADR-135).
-                on_round: Some(std::sync::Arc::new({
-                    let state = state.clone();
-                    move |report: kimmy_cluster::RoundReport| {
-                        state.metrics.record_sync_round(&report);
-                    }
-                })),
+                on_round: Some(round_hook(state.clone(), |state| &state.metrics)),
                 // The replication loop is the only place a peer's version vector
                 // exists, so lag is pushed from there into the gauge (ADR-046).
                 on_lag: Some(std::sync::Arc::new(move |ms| {
@@ -1450,6 +1431,32 @@ async fn spawn_cluster(
         "clustering enabled"
     );
     Ok(Cluster { tasks: cluster_tasks, members })
+}
+
+/// Where a window a peer pushed here lands on this node's metrics (ADR-140).
+///
+/// It goes through the same batch application a pulled one does, and lands
+/// on the same counters when this node cannot apply it: the member's own
+/// metric must not depend on which way the change arrived. What it applies is
+/// the exception, counted under `via="push"`, because how many applies the
+/// pushes cost is what that series is for. A function of whatever holds the
+/// metrics, rather than a closure over the node's state, so a test can hold
+/// the hook the node installs to one call per pushed window.
+fn pushed_hook<T: Send + Sync + 'static>(
+    owner: Arc<T>,
+    metrics: fn(&T) -> &kimmy_api::Metrics,
+) -> kimmy_cluster::PushHook {
+    Arc::new(move |outcome: &kimmy_storage::SyncOutcome| metrics(&owner).record_pushed(outcome))
+}
+
+/// Where a tick of the replication loop lands on this node's metrics: what
+/// the loop saw that lag cannot say. See the call site, and `pushed_hook` for
+/// why it is a function.
+fn round_hook<T: Send + Sync + 'static>(
+    owner: Arc<T>,
+    metrics: fn(&T) -> &kimmy_api::Metrics,
+) -> kimmy_cluster::RoundHook {
+    Arc::new(move |report: kimmy_cluster::RoundReport| metrics(&owner).record_sync_round(&report))
 }
 
 /// What one member's answer to a schema-change push makes it, in the
@@ -1788,6 +1795,37 @@ mod tests {
             classify_push(addr, node, Err("no answer".to_string())),
             Pushed::Pending("no answer".to_string())
         );
+    }
+
+    #[test]
+    fn the_node_records_a_pushed_window_once_and_a_pulled_round_only_as_pulled() {
+        // The two hooks the node installs, held to what each records. The
+        // push hook counts a window's applies under `via="push"` once, beside
+        // what it refused and declined; the round hook counts the pulls'
+        // applies under `via="pull"` and nothing under `via="push"`.
+        let metrics = Arc::new(kimmy_api::Metrics::default());
+        let pushed = pushed_hook(Arc::clone(&metrics), |m| m);
+        pushed(&kimmy_storage::SyncOutcome {
+            ddl: 2,
+            ddl_refused: 1,
+            ddl_declined: 1,
+            ..Default::default()
+        });
+        let s = metrics.snapshot();
+        assert_eq!(
+            (
+                s.sync_ddl_applied_push,
+                s.sync_ddl_applied_pull,
+                s.sync_ddl_refused,
+                s.sync_ddl_declined
+            ),
+            (2, 0, 1, 1)
+        );
+
+        let round = round_hook(Arc::clone(&metrics), |m| m);
+        round(kimmy_cluster::RoundReport { ddl_applied: 3, ..Default::default() });
+        let s = metrics.snapshot();
+        assert_eq!((s.sync_ddl_applied_pull, s.sync_ddl_applied_push), (3, 2));
     }
 
     #[test]

@@ -791,6 +791,20 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.ddl_applied.pull",
+            "{change}",
+            "Replicated schema changes this node applied from windows it pulled, a change already held here that a window carried again included.",
+            sync_ddl_applied_pull
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.ddl_applied.push",
+            "{change}",
+            "Replicated schema changes this node applied from windows a peer pushed to confirm a change, a change already held here that a window carried again included.",
+            sync_ddl_applied_push
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.ddl_relogged",
             "{change}",
             "Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward.",
