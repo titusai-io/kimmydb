@@ -3181,6 +3181,8 @@ impl Engine {
         let txn = self.begin_write(WriterHolder::Drop);
         counters.waiting_for_writer(false);
         let txn = txn?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.purges.holding_gate.pass()?;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a

@@ -18994,6 +18994,14 @@ purger**, a chunk per commit, with the chunks and guards ADR-158 gave the purge.
   - A snapshot page that would create such a collection applies nothing and
     moves nothing, and is asked for again. A whole-database catch-up therefore
     waits for every pending purge among the collections it carries.
+  - **A repair waiting on such a page keeps its place.** It is counted as
+    waiting, not stalled, so it is not abandoned after `REPAIR_ATTEMPTS`
+    rounds. It also keeps the peer's one repair slot (one repair per peer at
+    a time), so a repair of another collection planned against the same peer
+    waits behind it until the purge is done. Replication from that peer is
+    otherwise unaffected. Letting other repairs run meanwhile would need more
+    than one repair per peer, which this change does not add.
+
 - **Snapshots serve only what stands.** A snapshot page is served from the
   rows of collections that stand. The walk used to serve a dropped life's owed
   rows as documents. A receiver discarded those against the tombstone the page
