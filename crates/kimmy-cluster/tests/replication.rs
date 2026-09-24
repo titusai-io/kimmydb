@@ -5061,15 +5061,21 @@ async fn a_pull_says_how_long_the_oldest_entry_it_lacked_had_waited() {
         other => panic!("the oldest lacked entry's wait was not taken: {other:?}"),
     }
 
-    // Fresh writes, pulled at once, read a wait far shorter: the reading is
-    // the entries' age, not something the round always adds.
+    // A fresh write, pulled at once, reads no longer than it has existed: the
+    // reading is the entry's age, not something the round always adds. Bound
+    // by the time measured around the write and the pull rather than by a
+    // fixed floor, which a loaded runner's slow round crossed on its own. The
+    // stamp and the clock read are whole milliseconds, hence the grain.
     let ca = a.engine.get_collection("shop", "orders").unwrap();
+    let written = std::time::Instant::now();
     a.engine.insert(&ca, doc! { "_id": "fresh" }).unwrap();
     let (_, pull) = pull_timed(&b.engine, a.addr).await;
+    let existed = written.elapsed();
     match pull.oldest_lacked {
-        Some(kimmy_storage::EntryWait::Waited(waited)) => {
-            assert!(waited < FLOOR, "written just before the pull: {pull:?}")
-        }
+        Some(kimmy_storage::EntryWait::Waited(waited)) => assert!(
+            waited <= existed + Duration::from_millis(2),
+            "written {existed:?} before the pull returned: {pull:?}"
+        ),
         other => panic!("the fresh entry's wait was not taken: {other:?}"),
     }
     assert_eq!(pull.entries, 1, "only what it lacked was served: {pull:?}");
