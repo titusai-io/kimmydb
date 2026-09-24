@@ -577,8 +577,11 @@ such as a build before 0.36.0, the second start is refused at the database
 instead (`… is open in another process`). It puts back the marker it set aside
 and writes none of its own. On a filesystem that can't lock a directory (NFS
 without lock support, for example, which answers `ENOLCK`), the node logs `could
-not hold the data directory` as a warning and starts anyway. redb's own lock on
-`kimmy.redb` still refuses a second opener.
+not hold the data directory` as a warning and starts anyway. The node's own lock
+on `kimmy.redb` still refuses a second opener. That lock is a byte-range lock,
+and where the filesystem has none (`EINVAL`, `ENOTSUP`) it is a `flock`. Where
+the filesystem supports neither, the start fails rather than open the store
+unlocked.
 
 A start that finds the database and **no marker** logs at `WARN`:
 

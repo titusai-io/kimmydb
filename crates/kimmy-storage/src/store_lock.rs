@@ -56,6 +56,19 @@ impl LockGrant {
     }
 }
 
+/// The store's lock taken again by [`StoreLock::relock`], released on drop.
+pub(crate) struct Relocked {
+    backend: redb::backends::FileBackend,
+    lock: StoreLock,
+}
+
+impl Drop for Relocked {
+    fn drop(&mut self) {
+        let _ = self.backend.close();
+        self.lock.release();
+    }
+}
+
 /// The two locks, held for as long as the backend lives.
 #[derive(Debug)]
 pub(crate) struct StoreLock {
@@ -120,6 +133,17 @@ impl StoreLock {
             flock: std::sync::Mutex::new(flock),
             granted: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Take the lock again on a store redb has closed, for as long as the
+    /// returned pair lives: `None` if anything else holds it, or it cannot be
+    /// opened.
+    pub(crate) fn relock(database: &std::path::Path) -> Option<Relocked> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(database).ok()?;
+        let clone = file.try_clone().ok()?;
+        let backend = redb::backends::FileBackend::new(file).ok()?;
+        let lock = StoreLock::take(&clone, &backend).ok()?;
+        Some(Relocked { backend, lock })
     }
 
     pub(crate) fn grant(&self) -> LockGrant {
@@ -197,6 +221,17 @@ pub(crate) mod test_hooks {
         pub static PRETEND_NOT_GRANTED: Cell<bool> = const { Cell::new(false) };
         /// Run by the engine's open just before it writes the sidecar.
         pub static BEFORE_SIDECAR_WRITE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+        /// Run after a failed open, just before the lock is taken again to put
+        /// the sidecar back.
+        pub static BEFORE_PUT_BACK: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    }
+
+    pub fn before_put_back(path: &std::path::Path) {
+        BEFORE_PUT_BACK.with(|p| {
+            if let Some(probe) = p.borrow_mut().as_mut() {
+                probe(path);
+            }
+        });
     }
 
     pub fn before_sidecar_write(path: &std::path::Path) {

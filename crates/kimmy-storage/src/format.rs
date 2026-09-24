@@ -378,15 +378,40 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
 /// (`btree.rs:1112`, `types.rs:721`) rather than return `Corrupted`. A
 /// read-only open never writes, and no sidecar has been written yet. The same
 /// holds for the read-write open ([`Cleared::after_panicked_open`]). Reported
-/// upstream at <PANIC-ISSUE-URL>. Once a redb release returns an error there,
+/// upstream at https://github.com/cberner/redb/issues/1505. Once a redb release returns an error there,
 /// `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
 /// fails, and both catches and that test go.
 fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -> Result<Prior> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         read_only_fallback(database, build)
-    })) {
+    }));
+    #[cfg(test)]
+    redb_time::add(started.elapsed());
+    match read {
         Ok(read) => read,
         Err(panic) => Err(refused(database, redb_panicked(&*panic))),
+    }
+}
+
+/// How long redb's opens took on this thread: the tests bound a refusal by
+/// redb's own time, not by the check's reads and fsyncs around it.
+#[cfg(test)]
+pub(crate) mod redb_time {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static SPENT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub fn add(spent: Duration) {
+        SPENT.with(|s| s.set(s.get() + spent));
+    }
+
+    pub fn take() -> Duration {
+        SPENT.with(|s| s.replace(Duration::ZERO))
     }
 }
 
@@ -538,22 +563,44 @@ impl Cleared {
     /// The refusal of a store redb wrote nothing to, with the sidecar written
     /// before its open put back; `None` if the store is no longer as the check
     /// read it, and the sidecar stays.
+    ///
+    /// redb's failed open has closed its backend, and with it the store's
+    /// lock, so the lock is taken again for the look at the file and the
+    /// put-back, and let go after. If it cannot be, another process has the
+    /// store, this build's sidecar stays, which is the safe direction, and the
+    /// store is refused as damaged all the same.
     fn refuse_unwritten(
         &self,
         database: &Path,
         why: String,
         sidecar_written: bool,
     ) -> Option<StorageError> {
+        if !sidecar_written {
+            return self.store_unchanged(database).then(|| refused(database, why));
+        }
+        #[cfg(test)]
+        crate::store_lock::test_hooks::before_put_back(database);
+        let Some(relocked) = crate::store_lock::StoreLock::relock(database) else {
+            return Some(refused(
+                database,
+                format!(
+                    "{why}. The store could not be locked again to put its sidecar back, so {} \
+                     keeps this build's",
+                    sidecar_path(database).display()
+                ),
+            ));
+        };
         if !self.store_unchanged(database) {
             return None;
         }
-        if sidecar_written {
+        {
             let path = sidecar_path(database);
             let put_back = match &self.sidecar {
                 Some(bytes) => write_sidecar_bytes(database, bytes, self.sidecar_modified),
                 None => std::fs::remove_file(&path).map_err(Into::into),
             };
             if let Err(e) = put_back {
+                drop(relocked);
                 return Some(StorageError::RefusedStore(format!(
                     "{} is not opened by this build: {why}. Nothing in it was written, but the \
                      sidecar written before redb's open could not be put back ({e}); restore \
@@ -563,6 +610,7 @@ impl Cleared {
                 )));
             }
         }
+        drop(relocked);
         Some(refused(database, why))
     }
 
@@ -1319,7 +1367,8 @@ mod tests {
     }
 
     struct ChildOpen {
-        elapsed_ms: u64,
+        /// How long redb's opens took in the child ([`redb_time`]).
+        redb_ms: u64,
         max_rss_kib: u64,
         outcome: String,
     }
@@ -1368,8 +1417,8 @@ mod tests {
         let line = run_child(PROBE_OPEN, path, CHILD_LIMIT);
         let mut parts = line.splitn(3, ' ');
         let mut number = || parts.next().unwrap().parse().unwrap();
-        let (elapsed_ms, max_rss_kib) = (number(), number());
-        ChildOpen { elapsed_ms, max_rss_kib, outcome: parts.next().unwrap().to_string() }
+        let (redb_ms, max_rss_kib) = (number(), number());
+        ChildOpen { redb_ms, max_rss_kib, outcome: parts.next().unwrap().to_string() }
     }
 
     /// This process's peak resident set, in KiB.
@@ -1390,7 +1439,6 @@ mod tests {
     fn child_probe() {
         use std::io::Write as _;
         if let Ok(path) = std::env::var(PROBE_OPEN) {
-            let started = std::time::Instant::now();
             let outcome = match Engine::open(Path::new(&path)) {
                 Ok(engine) => {
                     let found = engine
@@ -1406,7 +1454,7 @@ mod tests {
                 Err(other) => format!("error {other}"),
             };
             // On a line of its own: libtest has already printed the test's name.
-            println!("\nPROBE {} {} {outcome}", started.elapsed().as_millis(), max_rss_kib());
+            println!("\nPROBE {} {} {outcome}", redb_time::take().as_millis(), max_rss_kib());
         } else if let Ok(path) = std::env::var(PROBE_HOLD) {
             let engine = Engine::open(Path::new(&path)).unwrap();
             let c = engine.create_collection("shop", "orders").unwrap();
@@ -1432,7 +1480,10 @@ mod tests {
             opened.max_rss_kib,
             opened.outcome
         );
-        assert!(opened.elapsed_ms < 1_000, "{what}: answered after {} ms", opened.elapsed_ms);
+        // redb's own time: the sidecar's write and put-back are fsyncs this
+        // build makes around it, and on a loaded machine they alone can take
+        // a second. The whole open is bounded by the child's kill.
+        assert!(opened.redb_ms < 1_000, "{what}: redb answered after {} ms", opened.redb_ms);
         assert!(opened.outcome.starts_with("refused "), "{what}: {}", opened.outcome);
         assert!(
             opened.outcome.contains("nothing in it was changed")
@@ -1613,6 +1664,46 @@ mod tests {
         }
     }
 
+    /// The sidecar is put back under the store's lock, taken again after redb's
+    /// failed open let it go. With another process holding the store at that
+    /// moment, this build's sidecar stays and the store is still refused as
+    /// damaged; with nothing holding it, the put-back lets the lock go after.
+    #[test]
+    fn the_sidecar_is_put_back_only_under_the_stores_lock() {
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        damage_page_order(&path, 1);
+        let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hold = std::rc::Rc::clone(&holder);
+        crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| {
+            *p.borrow_mut() = Some(Box::new(move |path: &Path| {
+                let other = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+                other.try_lock().unwrap();
+                *hold.borrow_mut() = Some(other);
+            }));
+        });
+        let result = Engine::open(&path);
+        crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| p.borrow_mut().take());
+        assert!(holder.borrow().is_some(), "the probe ran");
+        match result {
+            Err(StorageError::RefusedStore(why)) => assert!(
+                why.contains("damaged") && why.contains("could not be locked again"),
+                "{why}"
+            ),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened"),
+        }
+        let kept = read_sidecar(&path).unwrap();
+        assert_eq!(major_minor(&kept.redb_version), Some(REDB_MAJOR_MINOR), "this build's stays");
+        drop(holder.borrow_mut().take());
+
+        // Nothing holding it: put back, and the lock let go after.
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore(_))));
+        assert_eq!(read_sidecar(&path).unwrap().redb_version, "4.1", "put back");
+        std::fs::File::open(&path).unwrap().try_lock().expect("the put-back let the lock go");
+    }
+
     /// After redb's read-write open panicked, the store's lock is gone: the
     /// next open meets the damage again rather than a holder, and another
     /// descriptor can lock the file.
@@ -1636,6 +1727,7 @@ mod tests {
     /// itself, with nothing in front of it, panics on a commit slot that
     /// verifies and names a root of the wrong order inside the file, where it
     /// should return an error. The store is a plain redb file of 500 rows.
+    /// Reported upstream at https://github.com/cberner/redb/issues/1505.
     ///
     /// **When a redb bump makes this fail, because both opens now return an
     /// error, delete `read_only_fallback_unless_it_panics`,

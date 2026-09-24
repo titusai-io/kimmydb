@@ -29,6 +29,11 @@ upgrading; the way back is restoring it.
   written.** redb 4.3 no longer locks the file when it is opened, so the node
   takes the lock itself. A second start on the same data directory, or a
   0.36.x node on the same store, is refused as in use with nothing written.
+- **A store on a filesystem with no file locking at all is refused at start.**
+  Where byte-range locks are unsupported (`EINVAL`, `ENOTSUP`) the store is
+  locked with `flock` instead, as before. Only where `flock` is unsupported
+  too does the start now fail, where redb 4.1 opened the store unlocked with a
+  warning.
 - **Rust 1.90** is the minimum to build, which redb 4.3 requires.
 
 ### Fixed

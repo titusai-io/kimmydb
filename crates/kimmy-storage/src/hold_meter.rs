@@ -1626,14 +1626,41 @@ mod tests {
         assert_adds_up(&row);
     }
 
+    /// Closing the backend lets the store go even while another descriptor
+    /// shares its open file description, which keeps a `flock` alive past the
+    /// backend's own descriptor: only the explicit release frees it.
+    #[test]
+    fn closing_the_backend_releases_the_store_while_its_description_is_shared() {
+        use redb::StorageBackend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let shared = file.try_clone().unwrap();
+        let inner = redb::backends::FileBackend::new(file).unwrap();
+        let lock = crate::store_lock::StoreLock::take(&shared, &inner).unwrap();
+        let backend = MeteredBackend::new(inner, lock, Default::default());
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "held");
+        backend.close().unwrap();
+        other.try_lock().expect("closed, with the description still shared");
+        drop((shared, backend));
+    }
+
     #[test]
     fn inside_a_hold_redb_reads_the_files_size_only_to_resize_it() {
         // redb 4.1 read the backend's `len` only when a database was opened.
-        // redb 4.3 also reads it inside a transaction, once before each
-        // `set_len` (`PagedCachedFile::resize`), and the metering is what
-        // keeps that time out of `off_cpu`. Every kind of hold here, the file
-        // growing under them, may read the size once per resize and no more; a
-        // redb that starts reading it anywhere else fails this.
+        // redb 4.3 also reads it inside a transaction, exactly once before
+        // each `set_len` (`PagedCachedFile::resize`, the only caller of
+        // `set_len`), and the metering is what keeps that time out of
+        // `off_cpu`. Every kind of hold here, the file growing under them,
+        // reads the size once per resize; a redb that reads it anywhere else,
+        // or resizes without reading it, fails this.
         let (engine, _dir) = fresh();
         test_hooks::reset();
         let coll = engine.create_collection("shop", "orders").unwrap();
@@ -1659,9 +1686,9 @@ mod tests {
         test_hooks::reset();
         let set_len = file_size - len;
         assert!(set_len > 0, "the file grew inside a hold, so the hook was reachable");
-        assert!(
-            len <= set_len,
-            "redb read the file's size {len} times inside holds that resized it {set_len} times"
+        assert_eq!(
+            len, set_len,
+            "redb reads the file's size once per resize inside a hold, and nowhere else"
         );
 
         // And the hook sees a `len` when one happens: opening a database reads

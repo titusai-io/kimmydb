@@ -855,13 +855,17 @@ impl Engine {
             });
         }
         // The one read-write open of a store, behind the check (ADR-190).
-        #[allow(clippy::disallowed_methods)]
         // A panic in redb's open is a damaged store, refused like its errors
         // (`format::after_panicked_open`); the backend, and with it the lock,
         // is dropped as it unwinds.
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        #[allow(clippy::disallowed_methods)]
         let open = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             builder.create_with_backend(backend)
         }));
+        #[cfg(test)]
+        crate::format::redb_time::add(started.elapsed());
         let db = match open {
             Ok(open) => open.map_err(|e| cleared.after_failed_open(path, e, sidecar_written))?,
             Err(panic) => {

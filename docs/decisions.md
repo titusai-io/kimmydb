@@ -19451,7 +19451,7 @@ panic refuses the store as damaged, with redb's message.
   and length are as the check read them; after a recovery write-back it stays.
 
 **This catch is a stopgap too, to be removed with redb 4.3.** It is reported
-upstream at <PANIC-ISSUE-URL>. It goes once kimmydb depends on a redb release
+upstream at https://github.com/cberner/redb/issues/1505. It goes once kimmydb depends on a redb release
 that returns an error there instead of panicking. The signal is
 `redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`, which opens a
 plain redb file with such a root and fails on the first redb that no longer
@@ -19470,7 +19470,15 @@ store and the process dies, 0.36.x must refuse it. redb's refusals of a damaged 
 After one of these, if the header and the length are still what the check
 read, the sidecar is put back byte for byte, with its modification time. After
 any other failure it stays, because a `Corrupted` from a repair's tree walk can
-follow a write. The refusal says the store is damaged and names the way out:
+follow a write. redb's failed open closes its backend, which lets the lock go,
+so the look at the file and the put-back run under the lock taken again, and
+it is let go after. If the lock can't be taken again, another process has the
+store: this build's sidecar stays, the safe direction, and the store is still
+refused as damaged.
+
+A filesystem with no byte-range locks gets a `flock` instead, because redb's
+backend falls back to it for a whole-storage lock. One with no file locking at
+all is refused, where redb 4.1 opened it unlocked with a warning. The refusal says the store is damaged and names the way out:
 operations.md, "A damaged store".
 
 **Tested.** In `kimmy-storage`, each refusal compares the store's bytes and its
