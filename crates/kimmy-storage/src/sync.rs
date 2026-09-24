@@ -104,6 +104,18 @@ pub struct SyncOutcome {
     /// data, so neither moves the witnessed vector, and the window is
     /// re-served from where it stopped.
     pub deferred: usize,
+    /// Batches this round stopped short at a replicated creation whose name
+    /// this node cannot create yet: a drop of an earlier collection of that
+    /// name still has rows under the id it derives, and the drop purger is
+    /// removing them (ADR-189). At most one per batch, like
+    /// [`Self::unknown_collection`], and like it the entry and everything
+    /// after it are left for the next window. Unlike it, nothing is missing:
+    /// no repair is planned, the purger is asked to take that id next, and
+    /// the next window is taken once it has.
+    pub purge_pending: usize,
+    /// The entry a batch stopped at when [`Self::purge_pending`] is non-zero,
+    /// so a replay resumes just before it rather than past the window.
+    pub purge_pending_at: Option<kimmy_core::Stamp>,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds of history —
@@ -930,7 +942,8 @@ impl Engine {
         introduced: Option<Introduced<'_>>,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
-        let (unknown, deferred) = (outcome.unknown_collection, outcome.deferred);
+        let (unknown, deferred, purging) =
+            (outcome.unknown_collection, outcome.deferred, outcome.purge_pending);
         let mut run = Run::default();
         let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
         let refused = std::mem::take(&mut run.refused);
@@ -940,6 +953,7 @@ impl Engine {
                 if !run.last_committed {
                     outcome.unknown_collection = unknown;
                     outcome.deferred = deferred;
+                    outcome.purge_pending = purging;
                 }
                 // Read after the error, so what landed before it is what
                 // decides. A read that fails counts nothing: under-counting
@@ -995,6 +1009,22 @@ impl Engine {
                     outcome.unknown_collection += 1;
                     outcome.unknown =
                         Some(UnknownCollection { id: entry.collection, name, stamp: entry.stamp });
+                    stopped_at = Some(entry.stamp);
+                    break;
+                }
+                // Ended the same way, and for as long as the drop purger
+                // takes to remove what the earlier life held: this node takes
+                // nothing stamped after the creation, from any peer that holds
+                // it, until then (ADR-189). `outcome.unknown` stays unset, so
+                // no snapshot is planned for a collection that is not missing.
+                Step::PurgePending(name) => {
+                    info!(
+                        collection = %name,
+                        "a replicated creation waits for the drop purger to remove what an \
+                         earlier collection of that name held; this window ends before it"
+                    );
+                    outcome.purge_pending += 1;
+                    outcome.purge_pending_at = Some(entry.stamp);
                     stopped_at = Some(entry.stamp);
                     break;
                 }
@@ -1346,6 +1376,9 @@ pub(crate) enum Ddl<T> {
     Gone,
     /// The definition cannot be applied to this node's current state.
     Refused(kimmy_core::Error),
+    /// It creates a collection whose name this node cannot create yet: a
+    /// drop's rows remain under the id it derives (ADR-189).
+    PurgePending(String),
 }
 
 impl<T> Ddl<T> {
@@ -1354,6 +1387,7 @@ impl<T> Ddl<T> {
             Ddl::Applied(value) => Ddl::Applied(f(value)),
             Ddl::Gone => Ddl::Gone,
             Ddl::Refused(e) => Ddl::Refused(e),
+            Ddl::PurgePending(name) => Ddl::PurgePending(name),
         }
     }
 }
@@ -1383,6 +1417,11 @@ enum DdlOutcome {
     /// healthy cluster and the diagnostic fire on correct behaviour — round
     /// 0270's one product finding, deterministic over three iterations.
     DeclinedReplay,
+    /// A creation this node cannot make yet, because a drop's rows remain
+    /// under the id its name derives (ADR-189): `db.name`, for the log line.
+    /// The batch stops at it, and the next window takes it once the drop
+    /// purger has removed them.
+    PurgePending(String),
 }
 
 /// Sort a schema change's result into applied, gone, or refused, leaving
@@ -1451,6 +1490,9 @@ pub(crate) fn settle<T>(result: Result<T>) -> Result<Ddl<T>> {
         Ok(value) => Ok(Ddl::Applied(value)),
         Err(crate::StorageError::Core(Core::CollectionNotFound { .. })) => Ok(Ddl::Gone),
         Err(crate::StorageError::Core(e)) if e.is_a_request_refusal() => Ok(Ddl::Refused(e)),
+        Err(crate::StorageError::CollectionPurging { db, name, .. }) => {
+            Ok(Ddl::PurgePending(format!("{db}.{name}")))
+        }
         Err(e) => Err(e),
     }
 }
@@ -1462,6 +1504,9 @@ enum Step {
     Taken,
     /// Left, with the collection's `db.name` if the entry carried one.
     Unknown(Option<String>),
+    /// Left, because it creates a collection whose drop is still being
+    /// purged here (ADR-189); `db.name`.
+    PurgePending(String),
 }
 
 /// What judging a replicated document against its collection decided.
@@ -1559,6 +1604,7 @@ impl Engine {
                 DdlOutcome::Declined => outcome.ddl_declined += 1,
                 // Deliberately uncounted: see `DdlOutcome::DeclinedReplay`.
                 DdlOutcome::DeclinedReplay => {}
+                DdlOutcome::PurgePending(name) => return Ok(Step::PurgePending(name)),
             }
             return Ok(Step::Taken);
         }
@@ -1715,6 +1761,12 @@ impl Engine {
                             // Refused, it failed the whole batch: a push
                             // answered with a closed connection and reported
                             // pending, and a pull lost its round to a backoff.
+                            // A drop of an earlier life of this name still
+                            // has rows here: the creation waits for the drop
+                            // purger, and the batch stops at it (ADR-189).
+                            Err(crate::StorageError::CollectionPurging { db, name, .. }) => {
+                                return Ok(DdlOutcome::PurgePending(format!("{db}.{name}")));
+                            }
                             Err(crate::StorageError::Core(
                                 kimmy_core::Error::CollectionExists { .. },
                             )) => {
@@ -1812,6 +1864,7 @@ impl Engine {
                         );
                         return Ok(DdlOutcome::Refused);
                     }
+                    Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
                 }
             }
             OpKind::DropIndex => {
@@ -1956,6 +2009,7 @@ impl Engine {
                         );
                         return Ok(DdlOutcome::Refused);
                     }
+                    Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
                 }
             }
             OpKind::ConfigureVectors => {
@@ -1999,6 +2053,7 @@ impl Engine {
                         );
                         return Ok(DdlOutcome::Refused);
                     }
+                    Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
                 }
             }
             _ => {}
@@ -5587,6 +5642,8 @@ mod tests {
         b.insert(&cb, doc! { "_id": 2 }).unwrap();
 
         a.drop_collection("shop", "orders").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let ca = a.create_collection("shop", "orders").unwrap();
 
         pull(&a, &b);
@@ -7076,6 +7133,60 @@ mod tests {
         race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
     }
 
+    /// A replicated drop and recreation of one name in one window, on a
+    /// member still holding the first life's rows (ADR-189, the second
+    /// ruling's H1 and N5). The drop applies and only buries. The recreation
+    /// waits for this member's purge, and the batch ends before it: nothing
+    /// stamped after it is taken, whichever collection it is for, no snapshot
+    /// is planned for a collection that is not missing, and a window served
+    /// again stops at the same entry. Once the purge is done the same window
+    /// applies whole.
+    #[test]
+    fn a_replicated_drop_and_recreation_in_one_window_waits_at_the_creation() {
+        let (a, _a_dir) = engine();
+        let (b, _b_dir) = engine();
+        let first = a.create_collection("shop", "orders").unwrap();
+        for i in 0..5i64 {
+            a.insert(&first, doc! { "_id": i }).unwrap();
+        }
+        let (theirs, window) = window_for(&b, &a);
+        b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
+        assert_eq!(b.rows_under(first.id).unwrap(), 5);
+
+        a.drop_collection("shop", "orders").unwrap();
+        a.finish_purges_now().unwrap();
+        let second = a.create_collection("shop", "orders").unwrap();
+        a.insert(&second, doc! { "_id": "new" }).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        a.insert(&other, doc! { "_id": "unrelated" }).unwrap();
+        let (theirs, window) = window_for(&b, &a);
+
+        for round in 0..2 {
+            let outcome = b
+                .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+                .unwrap();
+            assert_eq!(outcome.purge_pending, 1, "round {round}: {outcome:?}");
+            assert_eq!(outcome.unknown_collection, 0, "not a missing collection: {outcome:?}");
+            assert!(outcome.unknown.is_none(), "so no snapshot is planned: {outcome:?}");
+            assert!(b.get_collection("shop", "orders").is_err(), "the drop applied, and buried");
+            assert!(
+                b.get_collection("shop", "other").is_err(),
+                "round {round}: nothing stamped after the creation was taken"
+            );
+        }
+        assert_eq!(b.queued_purges().first(), Some(&first.id), "the purge was asked for");
+
+        b.finish_purges_now().unwrap();
+        let outcome = b
+            .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        assert_eq!(outcome.purge_pending, 0, "{outcome:?}");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.created, second.created);
+        assert_eq!(b.count(&held).unwrap(), 1, "the second life's one document");
+        assert_eq!(b.count(&b.get_collection("shop", "other").unwrap()).unwrap(), 1);
+    }
+
     #[test]
     fn a_drop_that_reads_the_collection_before_a_recreation_does_not_bury_the_recreation() {
         // A drop reads the collection, then takes the writer to bury it. A
@@ -7094,6 +7205,8 @@ mod tests {
 
         a.insert(&first, doc! { "_id": 1 }).unwrap();
         a.drop_collection("shop", "orders").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let second = a.create_collection("shop", "orders").unwrap();
         a.insert(&second, doc! { "_id": 2 }).unwrap();
         let theirs = a.version_vector().unwrap();
@@ -7118,6 +7231,15 @@ mod tests {
             race_hooks::Race::Burial,
             move || {
                 let (b, theirs, whole) = competing;
+                let first =
+                    b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)?;
+                // The recreation waits for this node's purge of the first
+                // life (ADR-189): the purger runs, and the window comes again,
+                // still inside the race.
+                if first.purge_pending == 0 {
+                    return Ok(first);
+                }
+                b.finish_purges_now()?;
                 b.apply_peer_batch(&theirs, &whole.entries, whole.scanned_to, whole.exhausted)
             },
             || {
@@ -7754,6 +7876,8 @@ mod tests {
         let b = Arc::new(b);
         a_document_behind(&a, &b);
         a.drop_collection("shop", "orders").unwrap();
+        // The drop's purge finished: this test is about what comes after it.
+        a.finish_purges_now().unwrap();
         let second = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
         let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
@@ -7824,7 +7948,10 @@ mod tests {
             "documents of a dropped collection open no write transaction of their own"
         );
 
-        // History: below the floor of the collection recreated since.
+        // History: below the floor of the collection recreated since. Both
+        // drops' purges finished: this test is about what comes after them.
+        a.finish_purges_now().unwrap();
+        b.finish_purges_now().unwrap();
         a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
         apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();

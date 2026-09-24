@@ -666,6 +666,8 @@ mod tests {
             "the drop forgets where the collection's scan stopped"
         );
 
+        // The drop's purge finished: this test is about what comes after it.
+        engine.finish_purges_now().unwrap();
         engine.create_collection("app", "sessions").unwrap();
         let (coll, index) = with_ttl(&engine, 60);
         assert_eq!(

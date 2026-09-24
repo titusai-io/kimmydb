@@ -73,6 +73,18 @@ pub enum StorageError {
         waited.as_millis()
     )]
     WriterBusy { waited: std::time::Duration },
+
+    /// A collection cannot be created under this name yet: a drop of an
+    /// earlier collection of the same name still has rows under the id the
+    /// name derives, and the drop purger is removing them (ADR-189). Nothing
+    /// was written, and the purger has been asked to take this id next; the
+    /// caller may retry. The creation does not remove the rows itself, because
+    /// that takes as long as the dropped collection was large.
+    #[error(
+        "{db}.{name} was dropped and what it held is still being removed; it can be created again \
+         once that finishes"
+    )]
+    CollectionPurging { db: String, name: String, id: kimmy_core::CollectionId },
 }
 
 /// What an operator can actually do about a stored partial filter this build

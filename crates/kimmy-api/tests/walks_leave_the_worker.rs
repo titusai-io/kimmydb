@@ -43,11 +43,12 @@ const WALKS: [&str; 17] = [
     // or a collection drop included.
     ".apply_peer_batch_into(",
     ".apply_peer_batch(",
-    // Schema changes, each as long as the data under it: an index build files
-    // every document in one transaction, an index drop removes every entry in
-    // one, and a collection drop, a creation over a dropped life, and a
-    // vectors change that creates or drops the shadow can each purge a whole
-    // collection. System collections, created once and empty, are not here.
+    // Schema changes: an index build files every document in one
+    // transaction, an index drop removes every entry in one, and any of them
+    // can wait for the single writer for the whole of a request's budget.
+    // A collection drop only buries now, and a creation refuses rather than
+    // purges (ADR-189), but both still wait for the writer. System
+    // collections, created once and empty, are not here.
     ".create_collection(",
     ".drop_collection(",
     ".drop_database(",

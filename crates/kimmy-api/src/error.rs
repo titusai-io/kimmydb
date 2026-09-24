@@ -43,6 +43,9 @@ use tracing::{Level, error, info, warn};
 /// from the envelope, which is exactly why that field exists (ADR-057), and it
 /// keeps the string — but the code reaches it as `ErrorCode::Unknown` rather
 /// than as a named variant, and a named variant is what a caller matches on.
+/// The `Retry-After` a `collection_purging` refusal carries, in seconds.
+pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
@@ -69,6 +72,9 @@ pub enum ErrorCode {
     /// The request ran past `server.request_timeout_secs` and this node gave
     /// up on it (ADR-099).
     Timeout,
+    /// A collection cannot be created under this name yet: what a drop of an
+    /// earlier collection of the name held is still being removed (ADR-189).
+    CollectionPurging,
 }
 
 /// What a client may do about a failure.
@@ -148,7 +154,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 19] = [
+    pub const ALL: [ErrorCode; 20] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -168,6 +174,7 @@ impl ErrorCode {
         Self::ProviderError,
         Self::Stale,
         Self::Timeout,
+        Self::CollectionPurging,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -192,6 +199,7 @@ impl ErrorCode {
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
             Self::Timeout => "timeout",
+            Self::CollectionPurging => "collection_purging",
         }
     }
 
@@ -240,6 +248,10 @@ impl ErrorCode {
             // calls the same provider. `elsewhere` would send the same slow
             // upload round the whole cluster (ADR-099).
             Self::Timeout => Retry::Wait,
+            // The removal ends by itself on this node and the creation then
+            // succeeds here; another member may still be removing its own copy
+            // of the same drop, so moving does not help.
+            Self::CollectionPurging => Retry::Wait,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -288,7 +300,10 @@ impl ErrorCode {
             | Self::NoVectors
             | Self::ResumeTokenExpired
             | Self::RateLimited
-            | Self::Stale => None,
+            | Self::Stale
+            // Expected, bounded and explained by the response itself; the
+            // drop purger's own log lines are the operator's record.
+            | Self::CollectionPurging => None,
 
             // Reserved and unbuilt, by default. The reference says this will
             // be refused, the caller asked for it anyway, and there is no
@@ -463,6 +478,23 @@ impl ApiError {
     /// The message names no user and no limit: it is returned before
     /// authentication, so anything specific to the attempt would be readable by
     /// whoever triggered it.
+    /// A creation refused while a drop of the same name is still being purged
+    /// (ADR-189). `Retry-After` is a hint: the purge takes as long as the
+    /// dropped collection was large, and each retry is two seeks.
+    pub fn collection_purging(db: &str, name: &str) -> Self {
+        Self {
+            retry_after_secs: Some(COLLECTION_PURGING_RETRY_AFTER_SECS),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::CollectionPurging,
+                format!(
+                    "{db}.{name} was dropped and what it held is still being removed; it can be \
+                     created again once that finishes"
+                ),
+            )
+        }
+    }
+
     pub fn too_many_requests(retry_after_secs: u64) -> Self {
         Self {
             retry_after_secs: Some(retry_after_secs),
@@ -729,6 +761,12 @@ impl From<StorageError> for ApiError {
             // (ADR-151). Nothing was written; the documented `timeout`
             // refusal, whose retry hint is to wait, is the honest answer.
             StorageError::WriterBusy { waited } => ApiError::writer_busy(waited),
+            // A creation over a dropped life's rows, which the drop purger is
+            // removing and has been asked to take next (ADR-189). Nothing was
+            // written; retrying after a few seconds succeeds once it is done.
+            StorageError::CollectionPurging { db, name, .. } => {
+                ApiError::collection_purging(&db, &name)
+            }
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -833,7 +871,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 19] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 20] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -848,6 +886,7 @@ mod tests {
             (ResumeTokenExpired, None),
             (RateLimited, None),
             (Stale, None),
+            (CollectionPurging, None),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
             (NotImplemented, Some(LogLevel::Info)),

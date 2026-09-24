@@ -1329,6 +1329,10 @@ mod tests {
     /// A vector collection with nothing written to it yet, so its generation
     /// counter has not moved.
     fn empty_collection(engine: &Engine, name: &str) -> CollectionMeta {
+        // A previous collection of this name may have been dropped: its
+        // purge finished, as the drop purger would, before the name is
+        // created again (ADR-189).
+        engine.finish_purges_now().unwrap();
         engine.create_collection("app", name).unwrap();
         engine
             .configure_vectors(

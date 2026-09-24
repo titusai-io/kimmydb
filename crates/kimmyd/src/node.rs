@@ -124,6 +124,13 @@ pub async fn run(config: Config) -> Result<()> {
 const EMBEDDING_RETRY_FIRST: Duration = Duration::from_secs(1);
 const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
 
+/// The drop purger's backoff after a chunk that failed with an error that is
+/// not the storage engine's (an I/O error stops the process, ADR-188). The id
+/// is back on its queue, so a retry loses nothing; the ceiling keeps a failure
+/// that does not clear from spinning.
+const DROP_PURGER_RETRY_FIRST: Duration = Duration::from_secs(1);
+const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
+
 async fn start_and_serve(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -410,6 +417,8 @@ async fn start_and_serve(config: Config) -> Result<()> {
     };
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
+    state.metrics.set_purge_counters(engine.purge_counters());
+    let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());
     let cluster =
         spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone()).await?;
 
@@ -712,6 +721,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
     if let Some(handle) = gc_handle {
         handle.abort();
     }
+    // A purge stops between chunks, each its own commit, and what is left is
+    // ADR-158's state, which the next start's purger finishes (ADR-189).
+    purger_handle.abort();
     // And expiry: each delete is its own commit, so an aborted pass leaves a
     // prefix of the batch removed and the rest still due. The next pass finds
     // them, which is the same property that lets a bounded pass drain a
@@ -1271,9 +1283,11 @@ async fn spawn_cluster(
         move |outcome: &kimmy_storage::SyncOutcome| {
             state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
             state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
-            state
-                .metrics
-                .record_entries_skipped(outcome.unknown_collection as u64, outcome.deferred as u64);
+            state.metrics.record_entries_skipped(
+                outcome.unknown_collection as u64,
+                outcome.deferred as u64,
+                outcome.purge_pending as u64,
+            );
         }
     });
     // Built before the node commits to serving. `serve_with` used to build it
@@ -1495,6 +1509,19 @@ fn ddl_confirmer(
                         );
                         found.pending.push((node, reason));
                     }
+                    // A member still purging a drop of this name has not
+                    // applied the creation, and will once its purge is done
+                    // (ADR-189): pending, carried by anti-entropy, and not a
+                    // refusal.
+                    Ok(kimmy_cluster::PushOutcome { outcome, .. }) if outcome.purge_pending > 0 => {
+                        info!(
+                            peer = %addr,
+                            node = %node,
+                            "a member is still purging a drop of this name; the creation reaches \
+                             it once that is done"
+                        );
+                        found.pending.push((node, "still purging a drop of this name".to_string()));
+                    }
                     Ok(kimmy_cluster::PushOutcome { outcome, .. })
                         if outcome.ddl_refused > 0
                             || outcome.unknown_collection > 0
@@ -1548,6 +1575,29 @@ fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
     }
 }
 
+/// Start the drop purger (ADR-189): what a collection drop held is removed
+/// here, after the drop has answered, a chunk per commit. Always, whatever
+/// `storage.gc_interval_secs` says: it looks for owed rows on its own, and a
+/// drop's rows must not wait for a retention pass that may never run.
+fn spawn_drop_purger(
+    engine: Arc<Engine>,
+    shutdown: kimmy_task::Shutdown,
+) -> tokio::task::JoinHandle<()> {
+    kimmy_task::supervise("drop_purger", shutdown.clone(), async move {
+        // Every error it returns has re-queued its id, and is retried in
+        // place; `kimmy_task_retries_total{task="drop_purger"}` counts them.
+        // Returning from `forever` is a death, as for the embedding worker.
+        let mut retry =
+            kimmy_task::Retry::new("drop_purger", DROP_PURGER_RETRY_FIRST, DROP_PURGER_RETRY_MAX);
+        let mut engine = engine;
+        retry
+            .forever(&shutdown, &mut engine, |engine| {
+                Box::pin(Arc::clone(engine).run_drop_purger())
+            })
+            .await;
+    })
+}
+
 /// Start the retention collector, unless it is disabled.
 fn spawn_collector(
     engine: Arc<Engine>,
@@ -1593,7 +1643,6 @@ fn spawn_collector(
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
-                    dropped_rows = outcome.dropped_rows_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),

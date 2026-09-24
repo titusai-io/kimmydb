@@ -12146,8 +12146,9 @@ too.** A schema change reached from a request is a walk in all but name. An
 index build files every document of the collection in the transaction that
 creates it, and an index drop removes every entry in one. A collection drop,
 a creation over a dropped life, and a vectors change that creates or drops the
-shadow can each purge a whole collection. All of them ran on the worker, and
-so did the two applies of a peer's window in `kimmy-cluster`.
+shadow could each purge a whole collection, until ADR-189 took every purge out
+of them. All of them ran on the worker, and so did the two applies of a peer's
+window in `kimmy-cluster`.
 
 Round 0380 measured the cost. A burst of 32 parallel index creates on one
 member produced confirmation timeouts on every peer and sync ticks of 14–35 s.
@@ -13582,6 +13583,33 @@ gave up, gone after one pass without reopening, tombstones kept) and
 checked by reverting its production line and watching it fail.
 `a_chunk_that_cannot_take_the_writer_leaves_the_drop_standing` still pins the
 start.
+
+**Addendum, 2026-09-23: a drop answers at its burial, and the drop purger
+removes what it held ([ADR-189](#adr-189--a-collection-drop-is-its-burial-and-one-supervised-task-removes-what-it-held)).**
+Nothing above about the two stages, their order, the tombstone written first or
+the chunk's guard changes. What changes is **who runs the purge, and when**:
+
+- **Not the drop's caller.** A local drop and a replicated one both return
+  after the burial and hand the buried ids to the drop purger. The `DELETE`
+  used to answer only when the last row went, and a replicated drop ran the
+  whole purge inside the replication round.
+- **Not `open`.** An interrupted drop is announced at start and finished by
+  the purger once the node serves. The reason this ADR gave for sweeping in
+  `open` — to be ahead of the tombstone collector — no longer needs the sweep:
+  the collector keeps any tombstone with rows under it (this ADR's first
+  addendum), and a creation no longer drains the rows at all. The sweep held a
+  start, and `/readyz`, for as long as the drop had left.
+- **Not the retention pass.** It asks the purger to look. A pass that purged
+  too could meet a purge in progress and log it as rows left behind.
+- **Not a creation.** A creation over a dropped life's rows is refused while
+  they remain, and asks for that id next. It used to finish the purge itself,
+  which only moved the wait to whoever created the name.
+
+**"An interrupted drop and a drop in progress are the same state on disk"** is
+still the recovery story, now for every drop: between the burial and the
+purger's last chunk a collection is in that state, and nothing but the purger
+removes it. The residual this ADR recorded — a start that finishes an
+interrupted drop before binding — is closed.
 
 ---
 
@@ -17504,7 +17532,7 @@ pulled one in `sync_round` and the pushed one on the serving side, now run under
 for as long as the apply takes. That was measured at about 120 s for a replicated
 drop of a 400,000-document collection, which purged every row inside the apply.
 The tick's contact loop is still sequential, and a long apply still occupies it;
-what bounds that for a drop is a separate change.
+a drop's apply is no longer long, as the amendment below records.
 `walks_leave_the_worker.rs` now reads `kimmy-cluster` and counts applying a batch
 as a walk. It also reads each file with its test modules removed, rather than
 cutting at the first `#[cfg(test)]`. That cut sat on a hook inside the pull in
@@ -17512,6 +17540,28 @@ cutting at the first `#[cfg(test)]`. That cut sat on a hook inside the pull in
 each file. Tested by the guard itself, and by
 `the_walk_reads_past_a_test_hook_and_not_into_a_test_module`, which fails with
 the old cut.
+
+**Amended by [ADR-189](#adr-189--a-collection-drop-is-its-burial-and-one-supervised-task-removes-what-it-held), 2026-09-23: what bounds a
+member's replication during a drop.** A replicated `DropCollection` used to
+purge the whole collection inside this apply, about 120 s for 400,000
+documents. Since apply time is outside the round's deadline, the round ran it
+to the end, the member pulled nothing, for any database, and nothing counted it
+as a failure. The drop now only buries, which is one short transaction whatever
+the size. The purge is the drop purger's, and shares the writer with this
+node's applies one chunk at a time.
+
+**One residual remains, and it grows with the collection's size.** A
+replicated creation of a name whose earlier life this node is still purging
+cannot be applied until the purge is done. The batch ends before it, like a
+batch that meets a collection it lacks, but plans no repair, since nothing is
+missing. A window is served in stamp order and contiguously from this node's
+position (ADR-148), and each peer's coverage is clamped per origin by what it
+advertised. So the member takes nothing stamped after the creation from a peer
+that holds it, for any database, until every peer it pulls from holds the
+creation and its own purge is done. For a drop and a recreation in one window
+that is nearly the whole purge. The loop itself runs throughout: rounds
+complete, entries stamped before the creation still arrive, and
+`kimmy_sync_entries_skipped_total{reason="purge_pending"}` names the stop.
 
 ---
 
@@ -18845,12 +18895,15 @@ Seven gauges started at their healthy value and could not be told apart from a r
 | `stall_probe` | the probe wakes | — |
 | `webhook_dispatcher` | a pass reads everything it planned from and sets the backlog | any read in the pass fails: the registry, this node's version vector, a subscription's oplog window. That pass writes neither the backlog nor the age, since a backlog missing a subscription it could not read would be a healthy value after a failed read |
 | `embedding_worker` | a flush commits, a backfill's scan stores a batch, or an idle turn has nothing waiting | it is retrying a provider call, which every path that makes one does until it succeeds: a streamed batch, which is the main way the age climbs, a backfill, a deferred re-check. Nor while it retries a store |
+| `drop_purger` | a purge chunk commits, an owed check finishes, or an idle turn finds nothing queued, nothing owed and no retry pending; and on entering the writer for a chunk, after which the age holds until the chunk returns (ADR-189) | a chunk fails: the id goes back on the queue and `Retry` backs off, and nothing about that is progress |
 
 The embedding worker's idle turn counts because an idle worker has no batch to complete, and its age must not climb for want of writes. It does not count while a deferred re-check is retrying a provider call. It does count while documents another member wrote wait out that member's grace period, which is ordinary on a cluster and can last ten minutes.
 
 ### Thresholds
 
 Each suggested alert is derived from the writer's own timings rather than chosen: twice the longest gap a healthy writer leaves between completions, and never below what whole-second ages can resolve. `replication` at 4 × `cluster.sync_interval_secs`, since a tick that runs long delays the next by up to an interval; `stall_probe` at 2 s or more, since it wakes every 250 ms but a healthy probe reads 0 or 1 in whole seconds; `webhook_dispatcher` at 24 s, twice a delivery timeout of 10 s plus the 2 s between passes; `embedding_worker` at 130 s, twice the 5 s idle tick plus the provider's 60 s timeout, with a backfill resetting it per stored batch. `operations.md` carries the table. The divergence check's age takes the same 4 × `cluster.sync_interval_secs`, by the same argument, and is alerted on only where a `replication` row exists: a partitioned member reads 0 members, and it is the one whose age matters.
+
+`drop_purger` (added by ADR-189) at **15 s**, by the same rule once its writer wait is taken out of the age. Queued behind another holder — an index build files a whole collection in one transaction, and replicated DDL waits with no budget — a healthy purger can wait minutes, so the age holds at its value when the wait began, and a writer never released is read from `kimmy_write_lock_wait_seconds` and `kimmy_write_lock_held_seconds` instead. What is left is the purger's own work: the 5 s idle tick, one chunk's hold of 1,000 rows, and an owed check of two seeks per dropped id. So twice (5 s + 2.5 s).
 
 ### Rejected
 
@@ -18910,3 +18963,121 @@ A repair after the exit is cheap. It took 1.27 s for a 4 GiB file and 5.22 s for
 ### Test
 
 `a_storage_io_error_exits_the_process_and_the_next_start_repairs_it` drives a real `kimmyd` with `KIMMY_TEST_FAIL_STORAGE=sync_data`, which fails one fsync with EIO once the node is serving. It asserts exit 70, the log line and the marker naming the call, and then on the next start the announcement, the repair and a ready node. With the backend no longer recording the failure, the node keeps running and serving `PreviousIo`, and the test fails on "did not exit".
+
+---
+
+## ADR-189 — A collection drop is its burial, and one supervised task removes what it held
+
+**Decision.** A collection drop is ADR-158's burial: one short transaction
+removes the definition, records the tombstone, mints the entry, and removes the
+database row with the last collection in it. The drop's caller — a client's
+`DELETE`, a replicated `DropCollection`, a database drop — returns there. What
+the collection held is removed by **one supervised background task, the drop
+purger**, a chunk per commit, with the chunks and guards ADR-158 gave the purge.
+
+- **The queue is a hint.** A burial hands its ids to the purger after it
+  commits. The purger also looks for owed rows on its own: at start, every 60
+  s, and whenever the retention pass asks. It finds them the way ADR-158's sweep
+  did, as a tombstone with no collection over it and rows beneath, but without
+  counting them. A crash anywhere leaves ADR-158's state, which it finds again.
+- **Nothing else purges while the node runs.** A creation over a dropped life's
+  rows is refused while any remain (`StorageError::CollectionPurging`), inside
+  its own transaction, after the history judgement and the id-collision check.
+  So it is one rule for a client's creation, a replicated one, a snapshot
+  restore and a vector shadow. The refused id goes to the front of the queue,
+  and is added if absent, which is how rows whose tombstone an older collector
+  removed are found at all.
+- **How each caller meets a pending purge:**
+  - A client's creation, or a vectors enable that creates the shadow, is
+    answered `503 collection_purging` with `Retry-After`.
+  - A replicated creation ends its batch before it (ADR-177's amendment).
+  - A snapshot page that would create such a collection applies nothing and
+    moves nothing, and is asked for again. A whole-database catch-up therefore
+    waits for every pending purge among the collections it carries.
+- **Snapshots serve only what stands.** A snapshot page is served from the
+  rows of collections that stand. The walk used to serve a dropped life's owed
+  rows as documents. A receiver discarded those against the tombstone the page
+  carried, but had nothing to discard rows without a tombstone against.
+- **Failure, stop and shutdown.**
+  - An error from a chunk puts its id back on the queue, and `Retry` counts and
+    backs off.
+  - An I/O error stops the process (ADR-188).
+  - A panic stops it too (ADR-184).
+  - A stop lands between chunks, and what is left is ADR-158's state.
+- **Replication and the push path.** Applies of a peer's window, pulled or
+  pushed, run under `kimmy_storage::blocking` (ADR-153's addendum). `Pushed`
+  gains `purge_pending`, a backward-compatible field that an older receiver
+  never sends and an older pusher ignores. A member that stopped at a pending
+  creation is reported as pending, not as refusing.
+
+**Why.** Round 0380 dropped a database of 400,000 documents and ten partial
+indexes.
+- **Each replica stopped replicating** for about 120 s, for every database,
+  while its round purged the collection inside the apply, and nothing counted
+  a failure.
+- **The member that took the `DELETE` answered after about 120 s.** The
+  request-timeout middleware cannot fire on a handler that never yields, so a
+  client with a shorter timeout saw a failed drop that completed anyway.
+- **A retention pass that fired during the purge** logged it as rows a drop
+  had left behind, and purged the same range concurrently.
+
+**Why a creation refuses rather than drains.** A creation that drained took as
+long as the dropped collection was large.
+- **Over HTTP**, only each chunk's wait for the writer was bounded (ADR-151).
+  An uncontended drain ran to the end past the client's timeout, and the retry
+  then met `409 conflict`.
+- **In a replicated window**, it moved the whole purge back into the round.
+
+Refusing is honest and cheap: two seeks under the writer.
+
+**Why one owner.** ADR-158 had four actors purging the same ranges — the drop,
+a creation, the start and the retention pass — and each had to tolerate the
+others. With one owner, the chunk's guard is a backstop rather than a
+coordination point, and the log says what happened once.
+
+**What changes for a client.**
+- A `DELETE` of a collection or a database answers in milliseconds. From that
+  answer the collection is gone to every read, write, listing, peer and check,
+  as it already was during a purge.
+- The disk the rows took is reused after the answer, not before. The file
+  never shrank either way.
+- Creating the same name again before the purge finishes is refused with
+  `503 collection_purging`. It used to succeed at once, because the `DELETE`
+  had paid.
+- Change streams are unchanged: the `CollectionDropped` invalidate is driven by
+  the entry the burial publishes.
+
+**What an operator reads.**
+- `kimmy_task_progress_age_seconds{task="drop_purger"}`, with its writer wait
+  held out of the age (ADR-187's table, 15 s).
+- `kimmy_task_retries_total{task="drop_purger"}`.
+- `kimmy_sync_entries_skipped_total{reason="purge_pending"}`.
+- The purger's log lines: `removed what a dropped collection held` with the
+  rows and the time, and `a collection drop left rows behind` only for rows it
+  was not handed.
+- During a replicated holdback the divergence-check age alert fires by design,
+  because rounds do not reach the tail. Read it beside the `purge_pending`
+  count.
+
+**Rejected.** Holding back only the recreated collection's entries and taking
+the rest of the window, by applying them as held state (`Position::Hold`) and
+releasing them on the contiguous re-serve (ADR-169). The ordering argument
+holds for document entries: no apply reads another collection's state. But it
+would give the held-state machinery (ADR-160 to ADR-172) a second producer. It
+would apply DDL under `Hold` for the first time. And it would re-serve and
+re-supersede every held entry each round. Held entries would also reach
+webhooks and resume tokens late: delayed, not lost. That waits for a
+measurement showing the holdback matters, and its own design round.
+
+**Tested.** In `kimmy-storage` (`purge.rs`, `engine.rs`, `snapshot.rs`,
+`sync.rs`), `kimmy-cluster` and `kimmy-api`, each against a per-engine purge
+gate that holds chunks without a clock and fails a test it would otherwise
+hang. Among them:
+- `a_replicated_drop_and_recreation_in_one_window_waits_at_the_creation`;
+- `a_snapshot_serves_no_row_of_a_collection_that_does_not_stand`;
+- `a_whole_database_page_waiting_on_one_purge_moves_nothing_and_applies_after_it`;
+- `the_purgers_age_holds_at_the_writer_and_moves_with_each_chunk`;
+- `a_failed_chunk_puts_its_id_back_and_returns_the_error`;
+- `a_purge_stopped_part_way_is_left_to_the_restarted_purger_and_not_to_open`;
+- `rows_with_no_tombstone_are_queued_by_the_creation_that_meets_them`;
+- `a_retention_pass_leaves_a_drops_rows_to_the_purger_and_keeps_its_tombstones`.

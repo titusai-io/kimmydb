@@ -86,14 +86,11 @@ struct ExpiredTombstone {
 pub struct GcOutcome {
     pub oplog_removed: usize,
     pub tombstones_removed: usize,
-    /// Rows a collection drop had left owed, removed by this pass
-    /// ([`Engine::finish_owed_drops`]).
-    pub dropped_rows_removed: usize,
 }
 
 impl GcOutcome {
     pub fn is_empty(&self) -> bool {
-        self.oplog_removed == 0 && self.tombstones_removed == 0 && self.dropped_rows_removed == 0
+        self.oplog_removed == 0 && self.tombstones_removed == 0
     }
 }
 
@@ -113,15 +110,16 @@ impl Engine {
         let _span = tracing::info_span!("storage.retention").entered();
         let started = std::time::Instant::now();
         let tombstone_cutoff = cutoff(now_ms, policy.tombstone_secs);
-        // What a drop left owed goes first: it is found by the collection
-        // tombstone this same pass collects further down (ADR-158's addendum).
-        let dropped_rows_removed = self.finish_owed_drops()?;
+        // What a drop left is the drop purger's to remove, never this pass's:
+        // a pass that removed it too could meet a purge in progress and report
+        // it as rows left behind (ADR-189). The pass asks the purger to look,
+        // and keeps any tombstone with rows still under it, below.
+        self.ask_for_owed_check();
         let outcome = GcOutcome {
             oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
-            dropped_rows_removed,
         };
 
         // Always, not only when something was removed: a pass that collects
@@ -130,7 +128,6 @@ impl Engine {
         debug!(
             oplog = outcome.oplog_removed,
             tombstones = outcome.tombstones_removed,
-            dropped_rows = outcome.dropped_rows_removed,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "retention pass"
         );
@@ -408,8 +405,8 @@ impl Engine {
         };
         // A tombstone with rows still under it is the only marker of a purge
         // that is still owed; collecting it would leave those rows reachable
-        // by nothing but a creation under the same name. Kept until the purge
-        // is done, which `finish_owed_drops` retries on every pass.
+        // by nothing but a creation under the same name. Kept until the drop
+        // purger has removed them (ADR-189).
         // Unsure is kept too: a tombstone left one more pass costs nothing.
         let mut expired = expired;
         expired.retain(|(id, _)| {

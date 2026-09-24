@@ -26,6 +26,7 @@ mod live_count;
 pub mod meta;
 pub mod migrate;
 pub mod modify;
+pub mod purge;
 pub mod rewind;
 pub mod snapshot;
 pub mod sync;
@@ -54,6 +55,7 @@ pub use hold_meter::{
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
+pub use purge::PurgeCounters;
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
     SnapshotProgress, SnapshotTombstone,

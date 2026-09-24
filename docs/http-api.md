@@ -468,6 +468,17 @@ decision is made where it is applied. `DELETE /v1/db/{db}` drops each
 collection in turn (`ddl` over the database); system databases (`__…`) are
 refused.
 
+**Creating a name again soon after dropping it can be refused, for a while.**
+A drop answers before what the collection held is removed (below), and a
+collection created under the same name would stand over those rows, so
+`POST /v1/db/{db}/collections` answers **`503 collection_purging`** with
+`retry: wait` and a `Retry-After` in seconds until the removal is done. The
+refusal is immediate, writes nothing, and moves that removal to the front, so a
+client that waits and retries succeeds; how long it takes depends on how large
+the dropped collection was. Enabling vectors on a collection whose previous
+vectors were dropped with `drop_vectors=true` is refused the same way until
+they are removed ([ADR-189](decisions.md)).
+
 **Issue a database drop once, on one member, and let it replicate.** It drops
 the collections that member holds **at the moment it is applied**, and that is
 the whole of what replicates. Sending the same `DELETE` to every member is not
@@ -487,16 +498,16 @@ member's other writes are not held behind it ([ADR-158](decisions.md), and
 collection is **gone** to every client and every peer: `GET
 /v1/db/{db}/collections` does not list it, reads and writes to it answer as
 they do for a collection that never existed, and there is no window in which it
-is served intact and short of documents. The `DELETE` itself still answers when
-the removal is finished, so a drop of a large collection is a long request —
-size a client timeout for it, and issue it once rather than retrying, since a
-retry answers `{"dropped": false}` for the drop that is already in progress or
-done. Two drops of one collection sent at once to one member are the same
+is served intact and short of documents. **The `DELETE` answers at that first
+commit**, in milliseconds whatever the size, and what the collection held is
+removed afterwards by the node's drop purger ([ADR-189](decisions.md)); a
+client timeout no longer needs sizing for the drop. Issue it once rather than
+retrying, since a retry answers `{"dropped": false}` for the drop that is
+already done. Two drops of one collection sent at once to one member are the same
 case: one answers `200 {"dropped": true}`, the other `200 {"dropped": false}`,
-and only the first replicates. A member restarted mid-drop finishes the removal
-at its next start, and a member whose removal gave up on a busy writer finishes
-it at its next retention pass; the drop itself was durable and replicated before
-the first row went.
+and only the first replicates. A member restarted part-way through a removal
+finishes it once it is serving again; the drop itself was durable and
+replicated before the first row went.
 
 **A drop stays dropped.** It is applied where it lands, it replicates as a
 change like any other, and it is not undone by the anti-entropy that converges
@@ -1088,6 +1099,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
+| 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |
 | 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |

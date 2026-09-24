@@ -285,6 +285,11 @@ pub enum Message {
         /// the field, which never left any.
         #[serde(default)]
         deferred: usize,
+        /// Batches the receiver stopped at a creation that waits for its drop
+        /// purger (ADR-189). Absent from a receiver on a version before the
+        /// field, which never stopped there.
+        #[serde(default)]
+        purge_pending: usize,
     },
     /// Something went wrong; the sender is closing.
     Fault(String),
@@ -635,6 +640,7 @@ mod tests {
                 unknown_collection: 0,
                 ddl_declined: 3,
                 deferred: 4,
+                purge_pending: 5,
             },
             Message::Fault("nope".into()),
         ];
@@ -764,6 +770,44 @@ mod tests {
                 marked: Vec::new()
             },
             "a request without the field must read as one naming no spans"
+        );
+    }
+
+    /// `Pushed::purge_pending` (ADR-189) is a backward-compatible addition: a
+    /// receiver before the field sends a `Pushed` without it, which reads as
+    /// no stop at a pending creation, which is what that receiver never made.
+    #[tokio::test]
+    async fn pushed_without_purge_pending_reads_as_none() {
+        let mut written = Vec::new();
+        let current = Message::Pushed {
+            applied: 1,
+            ddl: 1,
+            ddl_refused: 0,
+            unknown_collection: 0,
+            ddl_declined: 0,
+            deferred: 0,
+            purge_pending: 1,
+        };
+        write_frame(&mut written, &current).await.unwrap();
+        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let fields = body.get_document_mut("Pushed").expect("a struct variant");
+        assert!(fields.remove("purge_pending").is_some(), "the field is on the wire: {fields:?}");
+
+        let bytes = bson::serialize_to_vec(&body).unwrap();
+        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
+        old.extend_from_slice(&bytes);
+        assert_eq!(
+            read_frame(&mut old.as_slice()).await.unwrap(),
+            Message::Pushed {
+                applied: 1,
+                ddl: 1,
+                ddl_refused: 0,
+                unknown_collection: 0,
+                ddl_declined: 0,
+                deferred: 0,
+                purge_pending: 0,
+            },
+            "an older receiver's reply must read as no stop"
         );
     }
 

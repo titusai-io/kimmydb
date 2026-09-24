@@ -8167,7 +8167,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_task_retries_total",
         "kimmy_task_retries_total",
         "kimmy_task_retries_total",
+        "kimmy_task_retries_total",
         // One per progress writer (ADR-187): no startup has fixed a smaller set.
+        "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
@@ -8207,6 +8209,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_divergence_count_probes_total",
         "kimmy_sync_divergence_count_probes_total",
         "kimmy_sync_divergence_check_age_seconds",
+        "kimmy_sync_entries_skipped_total",
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_entries_skipped_total",
         "kimmy_sync_held_marks_released_total",
@@ -10546,7 +10549,13 @@ fn replicate(from: &Server, to: &Server) {
     let theirs = from.state.engine.version_vector().unwrap();
     if let Some(start) = mine.behind(&theirs) {
         let window = from.state.engine.entries_for_peer(start, 1024).unwrap();
-        to.state.engine.apply_batch(&window.entries).unwrap();
+        let applied = to.state.engine.apply_batch(&window.entries).unwrap();
+        // A recreation waiting for this member's drop purger (ADR-189): the
+        // purger runs between rounds, and the next round takes the rest.
+        if applied.purge_pending > 0 {
+            to.state.engine.finish_purges_now().unwrap();
+            replicate(from, to);
+        }
     }
 }
 
@@ -10963,6 +10972,9 @@ async fn stage_incarnation_one(
 async fn drop_and_plainly_recreate_docs(issuer: &Server, token: &str) {
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
+    // The drop purger's work, done here: the name cannot be created again
+    // until what the drop left is gone (ADR-189).
+    issuer.state.engine.finish_purges_now().unwrap();
     let res = issuer.post("/v1/db/shop/collections", Some(token), json!({ "name": "docs" })).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     issuer
@@ -11381,4 +11393,155 @@ async fn explain_reports_the_undecidable_run_it_read() {
         spec["components"]["schemas"]["Explain"]["properties"]["undecidableCandidates"].is_object(),
         "docs/openapi.yaml's Explain schema does not document undecidableCandidates"
     );
+}
+
+// -----------------------------------------------------------------------
+// A drop answers at its burial, and a creation waits for the purge (ADR-189)
+
+/// Fill `db.coll` with more rows than one purge chunk.
+fn more_than_a_chunk(server: &Server, db: &str, coll: &str) -> kimmy_core::CollectionId {
+    let meta = server.state.engine.get_collection(db, coll).unwrap();
+    let rows = kimmy_storage::engine::DROP_PURGE_CHUNK * 2 + 7;
+    server
+        .state
+        .engine
+        .insert_many(&meta, (0..rows).map(|i| bson::doc! { "_id": i as i64 }).collect())
+        .unwrap();
+    meta.id
+}
+
+/// The `DELETE` answers at the burial, whatever the size, and what the
+/// collection held is left for the drop purger: held at the gate here for the
+/// whole request, which a drop that purged before answering could not survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_http_drop_answers_before_its_rows_are_removed() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let id = more_than_a_chunk(&server, "shop", "orders");
+    server.state.engine.close_purge_gate();
+
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.delete("/v1/db/shop/coll/orders", Some(&token)),
+    )
+    .await
+    .expect("the drop answered while its purge was held");
+    assert_eq!(dropped.body, json!({ "dropped": true }));
+    let listed = server.get("/v1/db/shop/collections", Some(&token)).await;
+    assert!(!listed.body.to_string().contains("orders"), "{:?}", listed.body);
+    assert!(server.state.engine.rows_under(id).unwrap() > 0, "the rows wait for the purger");
+    server.state.engine.open_purge_gate();
+}
+
+/// A creation over a purge in progress is refused at once — two seeks under
+/// the writer, well inside the request's budget — with `collection_purging`,
+/// `retry: wait` and a `Retry-After`, and it moves the purge to the front.
+/// Once the purger is done the same request succeeds, and the new collection
+/// holds nothing of the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_creation_over_a_purge_in_progress_is_refused_fast_and_succeeds_after_it() {
+    let timeout = std::time::Duration::from_secs(5);
+    let server = Server::start_with_request_timeout(timeout).await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let id = more_than_a_chunk(&server, "shop", "orders");
+    let engine = std::sync::Arc::clone(&server.state.engine);
+    engine.allow_purge_chunks(1);
+    let purger = tokio::spawn(std::sync::Arc::clone(&engine).run_drop_purger());
+    server.delete("/v1/db/shop/coll/orders", Some(&token)).await;
+    let held =
+        kimmy_storage::engine::DROP_PURGE_CHUNK * 2 + 7 - kimmy_storage::engine::DROP_PURGE_CHUNK;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.rows_under(id).unwrap() > held {
+        assert!(std::time::Instant::now() < deadline, "the purger never took its first chunk");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let started = std::time::Instant::now();
+    let refused =
+        server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+    let took = started.elapsed();
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "collection_purging", "{:?}", refused.body);
+    assert_eq!(refused.body["retry"], "wait", "{:?}", refused.body);
+    let retry = refused.header("retry-after").expect("collection_purging carries Retry-After");
+    assert!(retry.parse::<u64>().is_ok_and(|s| s > 0), "Retry-After in seconds: {retry}");
+    assert!(took < timeout / 10, "refused at once, not after a wait: {took:?}");
+
+    engine.open_purge_gate();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let created = loop {
+        let res =
+            server.post("/v1/db/shop/collections", Some(&token), json!({"name": "orders"})).await;
+        if res.status != 503 {
+            break res;
+        }
+        assert!(std::time::Instant::now() < deadline, "the purge never finished");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    let count = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
+    assert_eq!(count.body["count"], 0, "nothing of the dropped life: {:?}", count.body);
+    purger.abort();
+}
+
+/// Vectors dropped with `drop_vectors=true` leave the shadow's rows to the
+/// purger, and enabling vectors again is refused until they are gone: the new
+/// shadow derives the same id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_vectors_again_waits_until_the_dropped_shadow_is_purged() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    let shadow = server.state.engine.vector_collection("shop", "docs").unwrap().unwrap();
+    server.state.engine.insert(&shadow, bson::doc! { "_id": "chunk" }).unwrap();
+
+    let res = server.delete("/v1/db/shop/coll/docs/vector?drop_vectors=true", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let config = json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3 });
+    let refused = server.post("/v1/db/shop/coll/docs/vector", Some(&token), config.clone()).await;
+    assert_eq!(refused.status, 503, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "collection_purging", "{:?}", refused.body);
+
+    server.state.engine.finish_purges_now().unwrap();
+    let enabled = server.post("/v1/db/shop/coll/docs/vector", Some(&token), config).await;
+    assert_eq!(enabled.status, 200, "{:?}", enabled.body);
+}
+
+/// A database drop is one burial per collection, so it answers with every
+/// collection's purge held at the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_of_many_collections_answers_with_the_purge_held() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let mut ids = Vec::new();
+    for i in 0..20 {
+        let name = format!("c{i}");
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+        ids.push(more_than_a_chunk(&server, "shop", &name));
+    }
+    server.state.engine.close_purge_gate();
+
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.delete("/v1/db/shop", Some(&token)),
+    )
+    .await
+    .expect("the database drop answered while every purge was held");
+    assert_eq!(dropped.body, json!({ "dropped": true }));
+    let dbs = server.get("/v1/databases", Some(&token)).await;
+    assert!(!dbs.body.to_string().contains("\"shop\""), "{:?}", dbs.body);
+    for id in &ids {
+        assert!(
+            server.state.engine.rows_under(*id).unwrap() > 0,
+            "{id}'s rows wait for the purger"
+        );
+    }
+
+    server.state.engine.open_purge_gate();
+    server.state.engine.finish_purges_now().unwrap();
+    for id in ids {
+        assert_eq!(server.state.engine.rows_under(id).unwrap(), 0);
+    }
 }

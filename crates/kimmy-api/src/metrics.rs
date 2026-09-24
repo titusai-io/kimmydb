@@ -142,8 +142,18 @@ pub struct StorageReadings {
 /// dispatcher's backlog, and the embedding worker's work. Every name is a
 /// `kimmy_task::TASKS` entry, which `every_progress_writer_is_a_supervised_task`
 /// holds.
-pub const PROGRESS_WRITERS: [&str; 4] =
-    ["embedding_worker", "replication", "stall_probe", "webhook_dispatcher"];
+pub const PROGRESS_WRITERS: [&str; 5] =
+    ["drop_purger", "embedding_worker", "replication", "stall_probe", "webhook_dispatcher"];
+
+/// Where `writer` sits in [`PROGRESS_WRITERS`], and so in every array ordered
+/// by it. Read by name, so that a writer added to the list cannot move a
+/// reader onto its neighbour's age.
+pub fn progress_slot(writer: &str) -> usize {
+    PROGRESS_WRITERS
+        .iter()
+        .position(|w| *w == writer)
+        .unwrap_or_else(|| panic!("{writer} is not a progress writer"))
+}
 
 /// The process's resident memory, read from the kernel.
 ///
@@ -316,6 +326,7 @@ pub struct MetricsSnapshot {
     /// snapshot closes it, the second ordinary and rare.
     pub sync_entries_skipped_unknown_collection: u64,
     pub sync_entries_skipped_beyond_advertised: u64,
+    pub sync_entries_skipped_purge_pending: u64,
     /// Entries held as state that a sync window released (ADR-169's
     /// addendum): the release path itself, which `beyond_advertised` cannot
     /// tell from the ordinary race. An engine reading, not a round report.
@@ -416,6 +427,7 @@ pub struct Metrics {
     sync_divergence_last_check: parking_lot::Mutex<Option<Instant>>,
     sync_entries_skipped_unknown_collection: AtomicU64,
     sync_entries_skipped_beyond_advertised: AtomicU64,
+    sync_entries_skipped_purge_pending: AtomicU64,
     sync_repair_rounds: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
@@ -474,6 +486,8 @@ pub struct Metrics {
     /// `[vector] worker_enabled = false`, which an operator must be able to
     /// distinguish from "worker enabled but idle".
     vector_counters: OnceLock<std::sync::Arc<kimmy_vector::WorkerCounters>>,
+    /// The drop purger's, for its progress age (ADR-189).
+    purge_counters: OnceLock<std::sync::Arc<kimmy_storage::PurgeCounters>>,
 }
 
 impl Default for Metrics {
@@ -499,6 +513,7 @@ impl Default for Metrics {
             sync_divergence_last_check: parking_lot::Mutex::new(None),
             sync_entries_skipped_unknown_collection: AtomicU64::new(0),
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
+            sync_entries_skipped_purge_pending: AtomicU64::new(0),
             sync_repair_rounds: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             runtime_stall_otlp_us: AtomicU64::new(0),
@@ -527,6 +542,7 @@ impl Default for Metrics {
             jwks_refresh_ok: AtomicU64::new(0),
             jwks_refresh_failed: AtomicU64::new(0),
             vector_counters: OnceLock::new(),
+            purge_counters: OnceLock::new(),
         }
     }
 }
@@ -536,6 +552,11 @@ impl Metrics {
     /// startup, before the worker task is spawned; later calls are ignored,
     /// because a renderer that switched handles mid-flight would report two
     /// partial series where one total was meant.
+    /// The drop purger's counters, read for its progress age (ADR-189).
+    pub fn set_purge_counters(&self, counters: std::sync::Arc<kimmy_storage::PurgeCounters>) {
+        let _ = self.purge_counters.set(counters);
+    }
+
     pub fn set_vector_counters(&self, counters: std::sync::Arc<kimmy_vector::WorkerCounters>) {
         let _ = self.vector_counters.set(counters);
     }
@@ -714,6 +735,7 @@ impl Metrics {
         self.record_entries_skipped(
             round.entries_skipped_unknown_collection as u64,
             round.entries_skipped_beyond_advertised as u64,
+            round.entries_skipped_purge_pending as u64,
         );
         self.sync_repair_rounds.fetch_add(round.repair_rounds as u64, Ordering::Relaxed);
         self.sync_pulls.lock().add(&round.pulls);
@@ -723,11 +745,18 @@ impl Metrics {
     /// pulled and a pushed batch share, for the reason
     /// [`Self::record_ddl_refused`] gives: `unknown_collection` batches
     /// stopped at a collection this node lacks, `beyond_advertised` entries
-    /// left for a later window.
-    pub fn record_entries_skipped(&self, unknown_collection: u64, beyond_advertised: u64) {
+    /// left for a later window, `purge_pending` batches stopped at a creation
+    /// waiting for the drop purger (ADR-189).
+    pub fn record_entries_skipped(
+        &self,
+        unknown_collection: u64,
+        beyond_advertised: u64,
+        purge_pending: u64,
+    ) {
         self.sync_entries_skipped_unknown_collection
             .fetch_add(unknown_collection, Ordering::Relaxed);
         self.sync_entries_skipped_beyond_advertised.fetch_add(beyond_advertised, Ordering::Relaxed);
+        self.sync_entries_skipped_purge_pending.fetch_add(purge_pending, Ordering::Relaxed);
     }
 
     /// Count schema changes a peer pushed to this node that it could not
@@ -854,6 +883,7 @@ impl Metrics {
     fn task_progress_ages_at(&self, now: Instant) -> [Option<u64>; PROGRESS_WRITERS.len()] {
         PROGRESS_WRITERS.map(|writer| {
             let last = match writer {
+                "drop_purger" => self.purge_counters.get().and_then(|c| c.last_progress()),
                 "embedding_worker" => self.vector_counters.get().and_then(|c| c.last_progress()),
                 "replication" => *self.replication_progress.lock(),
                 "stall_probe" => *self.stall_probe_progress.lock(),
@@ -991,6 +1021,7 @@ impl Metrics {
                 .get(&self.sync_entries_skipped_unknown_collection),
             sync_entries_skipped_beyond_advertised: self
                 .get(&self.sync_entries_skipped_beyond_advertised),
+            sync_entries_skipped_purge_pending: self.get(&self.sync_entries_skipped_purge_pending),
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
@@ -1249,10 +1280,11 @@ impl Metrics {
              # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
-             # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.\n\
+             # HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned, the window is re-served from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design.\n\
              # TYPE kimmy_sync_entries_skipped_total counter\n\
              kimmy_sync_entries_skipped_total{{reason=\"unknown_collection\"}} {sync_skipped_unknown}\n\
              kimmy_sync_entries_skipped_total{{reason=\"beyond_advertised\"}} {sync_skipped_beyond}\n\
+             kimmy_sync_entries_skipped_total{{reason=\"purge_pending\"}} {sync_skipped_purge}\n\
              # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.\n\
              # TYPE kimmy_sync_held_marks_released_total counter\n\
              kimmy_sync_held_marks_released_total {sync_held_released}\n\
@@ -1367,6 +1399,7 @@ impl Metrics {
             sync_div_age = self.sync_divergence_check_age_secs_at(now),
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
+            sync_skipped_purge = self.get(&self.sync_entries_skipped_purge_pending),
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
@@ -1783,6 +1816,7 @@ mod tests {
             last_completed_round: Some(now - Duration::from_secs(80)),
             entries_skipped_unknown_collection: 72,
             entries_skipped_beyond_advertised: 74,
+            entries_skipped_purge_pending: 77,
             repair_rounds: 76,
             pulls: pulls_observed([3, 40, 700], 1_024, Some(1_500), 115, [101, 102, 103, 104]),
         });
@@ -1800,6 +1834,7 @@ mod tests {
             last_completed_round: Some(now - Duration::from_secs(81)),
             entries_skipped_unknown_collection: 1,
             entries_skipped_beyond_advertised: 1,
+            entries_skipped_purge_pending: 1,
             repair_rounds: 1,
             // A wait of 45 s: past the old 10 s top, so the golden reads the
             // buckets a long wait for the writer lands in (ADR-175).
@@ -2277,6 +2312,7 @@ kimmy_uptime_seconds 0
 # HELP kimmy_task_retries_total Times a supervised background task retried its work in place after a transient failure, by task. A task whose count rises while nothing else changes is retrying for ever: alive, and doing no work. For the embedding worker, read it beside kimmy_task_progress_age_seconds, which rises through a retry that never succeeds.
 # TYPE kimmy_task_retries_total counter
 kimmy_task_retries_total{task=\"cert_reloader\"} 0
+kimmy_task_retries_total{task=\"drop_purger\"} 0
 kimmy_task_retries_total{task=\"embedding_worker\"} 0
 kimmy_task_retries_total{task=\"jwks_refresher\"} 0
 kimmy_task_retries_total{task=\"membership\"} 0
@@ -2293,6 +2329,7 @@ kimmy_task_retries_total{task=\"vector_index_invalidator\"} 0
 kimmy_task_retries_total{task=\"webhook_dispatcher\"} 0
 # HELP kimmy_task_progress_age_seconds Seconds since a background writer last completed its work, computed when this page is read: a completed replication round, a stall-probe wake, a dispatcher pass, an embedding flush or idle turn. Since the process started before the first, never 0. Alert on this, and read the gauges a writer sets only while its age is fresh: a dead, stuck or retrying writer leaves them at their last value. A writer this node does not run has no row.
 # TYPE kimmy_task_progress_age_seconds gauge
+kimmy_task_progress_age_seconds{task=\"drop_purger\"} 99
 kimmy_task_progress_age_seconds{task=\"embedding_worker\"} 99
 kimmy_task_progress_age_seconds{task=\"replication\"} 81
 kimmy_task_progress_age_seconds{task=\"stall_probe\"} 83
@@ -2388,10 +2425,11 @@ kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
-# HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move.
+# HELP kimmy_sync_entries_skipped_total Replicated entries a sync round left rather than took. unknown_collection: batches stopped at an entry for a collection this node has no record of - neither holding it nor a tombstone for it - because its creation was witnessed here without being applied, or has aged out of the peer's oplog; one per stopped batch, the window is re-served from the same place every round, and the round plans a snapshot from the peer to bring the collection. A collection dropped here is history instead and stops nothing. beyond_advertised: entries above the vector the peer advertised before serving the window, left for the next round, which asks for them from the right position; ordinary and rare on a busy cluster. A hole of either kind reads 0 on kimmy_replication_lag_seconds; this and kimmy_sync_divergent_collections are what move. purge_pending: batches stopped at a replicated creation of a name whose earlier collection this node's drop purger is still removing (ADR-189); nothing is missing, so no snapshot is planned, the window is re-served from the same place until the purge is done, and nothing stamped after the creation is taken meanwhile, so kimmy_sync_divergence_check_age_seconds rises by design.
 # TYPE kimmy_sync_entries_skipped_total counter
 kimmy_sync_entries_skipped_total{reason=\"unknown_collection\"} 73
 kimmy_sync_entries_skipped_total{reason=\"beyond_advertised\"} 75
+kimmy_sync_entries_skipped_total{reason=\"purge_pending\"} 78
 # HELP kimmy_sync_held_marks_released_total Entries this node held as state - written by a snapshot page, a carried delete or a scoped repair, above the vector it advertises - that arrived in a sync window served contiguously from its position and were released: the mark removed and both vectors raised over the entry. One per entry, counted when the batch commits. The release path itself: the beyond_advertised reason of kimmy_sync_entries_skipped_total rises on a peer while these entries are held and also for the ordinary race, and only this tells the two apart.
 # TYPE kimmy_sync_held_marks_released_total counter
 kimmy_sync_held_marks_released_total 53
@@ -2693,6 +2731,10 @@ kimmy_sync_serve_walk_seconds_count 1201
             "kimmy_sync_entries_skipped_total{{reason=\"beyond_advertised\"}} {}\n",
             s.sync_entries_skipped_beyond_advertised
         ));
+        expect(&format!(
+            "kimmy_sync_entries_skipped_total{{reason=\"purge_pending\"}} {}\n",
+            s.sync_entries_skipped_purge_pending
+        ));
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
         expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
@@ -2938,6 +2980,9 @@ kimmy_sync_serve_walk_seconds_count 1201
                 // no startup behind this render to leave any out.
                 + PROGRESS_WRITERS.len()
                 // And a third subscription state, for records that do not decode.
+                + 1
+                // ADR-189: batches stopped at a creation waiting for the drop
+                // purger, a third reason for a skipped entry.
                 + 1,
             "expected one sample per series: {out}"
         );
@@ -3080,6 +3125,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
+            entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             pulls: kimmy_cluster::PullReport::default(),
         });
@@ -3097,6 +3143,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
+            entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             pulls: kimmy_cluster::PullReport::default(),
         });
@@ -3194,15 +3241,24 @@ kimmy_sync_serve_walk_seconds_count 1201
             last_completed_round: Some(later - Duration::from_secs(4)),
             ..Default::default()
         });
-        assert_eq!(ages(&m).task_progress_age_secs, [Some(90), Some(4), Some(90), Some(90)]);
+        assert_eq!(
+            ages(&m).task_progress_age_secs,
+            [Some(90), Some(90), Some(4), Some(90), Some(90)],
+            "only replication's, in {PROGRESS_WRITERS:?}"
+        );
         // Stamped with the clock, which is 90 s short of `later`.
         m.record_runtime_stall(Duration::ZERO);
         m.set_webhook_backlog(0);
         let got = ages(&m).task_progress_age_secs;
-        assert_eq!(got[0], Some(90), "the embedding worker made no progress: {got:?}");
-        assert_eq!(got[1], Some(4), "{got:?}");
-        assert!(got[2].is_some_and(|a| a < 90), "the stall probe woke: {got:?}");
-        assert!(got[3].is_some_and(|a| a < 90), "the dispatcher completed a pass: {got:?}");
+        let slot = |writer| got[progress_slot(writer)];
+        assert_eq!(slot("drop_purger"), Some(90), "the drop purger made no progress: {got:?}");
+        assert_eq!(slot("embedding_worker"), Some(90), "nor the embedding worker: {got:?}");
+        assert_eq!(slot("replication"), Some(4), "{got:?}");
+        assert!(slot("stall_probe").is_some_and(|a| a < 90), "the stall probe woke: {got:?}");
+        assert!(
+            slot("webhook_dispatcher").is_some_and(|a| a < 90),
+            "the dispatcher completed a pass: {got:?}"
+        );
     }
 
     /// A writer with nothing new to report keeps ageing: two reads, no writes
@@ -3216,8 +3272,10 @@ kimmy_sync_serve_walk_seconds_count 1201
             last_completed_round: Some(at),
             ..Default::default()
         });
-        let age =
-            |now| m.snapshot_with_at(&StorageReadings::default(), now).task_progress_age_secs[1];
+        let age = |now| {
+            m.snapshot_with_at(&StorageReadings::default(), now).task_progress_age_secs
+                [progress_slot("replication")]
+        };
         assert_eq!(age(at + Duration::from_secs(5)), Some(5));
         assert_eq!(age(at + Duration::from_secs(500)), Some(500));
     }
@@ -3242,8 +3300,9 @@ kimmy_sync_serve_walk_seconds_count 1201
         );
         let later = m.started + Duration::from_secs(90);
         let snapshot = m.snapshot_with_at(&StorageReadings::default(), later);
-        assert_eq!(snapshot.task_progress_age_secs[0], None, "embedding_worker");
-        assert_eq!(snapshot.task_progress_age_secs[1], None, "replication");
+        for writer in ["drop_purger", "embedding_worker", "replication"] {
+            assert_eq!(snapshot.task_progress_age_secs[progress_slot(writer)], None, "{writer}");
+        }
         // And with no replication loop there is no divergence check to age: a
         // standalone node's age reads 0, not the time since it started, or
         // the documented alert would fire on it for ever.
@@ -3288,6 +3347,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
             entries_skipped_beyond_advertised: 0,
+            entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             pulls: kimmy_cluster::PullReport::default(),
         };

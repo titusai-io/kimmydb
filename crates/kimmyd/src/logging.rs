@@ -415,6 +415,7 @@ impl TelemetryGuard {
             }};
         }
         task_retries!("kimmy.task.retries.cert_reloader", "cert_reloader");
+        task_retries!("kimmy.task.retries.drop_purger", "drop_purger");
         task_retries!("kimmy.task.retries.embedding_worker", "embedding_worker");
         task_retries!("kimmy.task.retries.jwks_refresher", "jwks_refresher");
         task_retries!("kimmy.task.retries.membership", "membership");
@@ -455,10 +456,11 @@ impl TelemetryGuard {
                     .build();
             }};
         }
-        task_progress_age!("kimmy.task.progress_age.embedding_worker", 0, "embedding_worker");
-        task_progress_age!("kimmy.task.progress_age.replication", 1, "replication");
-        task_progress_age!("kimmy.task.progress_age.stall_probe", 2, "stall_probe");
-        task_progress_age!("kimmy.task.progress_age.webhook_dispatcher", 3, "webhook_dispatcher");
+        task_progress_age!("kimmy.task.progress_age.drop_purger", 0, "drop_purger");
+        task_progress_age!("kimmy.task.progress_age.embedding_worker", 1, "embedding_worker");
+        task_progress_age!("kimmy.task.progress_age.replication", 2, "replication");
+        task_progress_age!("kimmy.task.progress_age.stall_probe", 3, "stall_probe");
+        task_progress_age!("kimmy.task.progress_age.webhook_dispatcher", 4, "webhook_dispatcher");
 
         observe!(
             u64_observable_counter,
@@ -899,6 +901,13 @@ impl TelemetryGuard {
             "{entry}",
             "Replicated entries left for a later window because they sat above the vector the peer advertised before serving it.",
             sync_entries_skipped_beyond_advertised
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.entries_skipped.purge_pending",
+            "{batch}",
+            "Sync batches stopped at a replicated creation waiting for this node's drop purger; re-served from the same place until the purge is done.",
+            sync_entries_skipped_purge_pending
         );
         // The release that beyond_advertised cannot tell from the race it has
         // always counted (ADR-169's addendum).
