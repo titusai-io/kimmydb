@@ -157,6 +157,9 @@ impl Engine {
             }};
         }
 
+        // META first, always: a restore reads the leading META records before
+        // it creates a file, to refuse a newer schema with nothing written
+        // (ADR-190). `meta_leads_the_backup_stream` pins the order.
         simple!(T_META, tables::META, |k: &str| k.as_bytes().to_vec());
         simple!(T_DATABASES, tables::DATABASES, |k: &str| k.as_bytes().to_vec());
         simple!(T_COLLECTIONS, tables::COLLECTIONS, |k: (&str, &str)| {
@@ -501,6 +504,31 @@ mod tests {
 
     fn field(path: &str) -> IndexField {
         IndexField { path: path.to_string(), descending: false }
+    }
+
+    /// A restore refuses a newer schema from the META records it reads before
+    /// creating a file, so every META record must come before any other.
+    #[test]
+    fn meta_leads_the_backup_stream() {
+        let (engine, _dir) = populated();
+        let mut out = Vec::new();
+        engine.backup_to(&mut out).unwrap();
+        let mut rest = &out[8 + 1 + 16 + 8..];
+        let mut tags = Vec::new();
+        loop {
+            let tag = rest[0];
+            rest = &rest[1..];
+            if tag == END {
+                break;
+            }
+            tags.push(tag);
+            read_chunk(&mut rest).unwrap();
+            read_chunk(&mut rest).unwrap();
+        }
+        let metas = tags.iter().take_while(|&&t| t == T_META).count();
+        assert!(metas > 0, "the backup carries META");
+        assert!(tags[metas..].iter().all(|&t| t != T_META), "every META record leads: {tags:?}");
+        assert!(metas < tags.len(), "and other tables follow it");
     }
 
     /// An engine holding a bit of everything a backup has to carry.

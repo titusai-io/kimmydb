@@ -19240,7 +19240,8 @@ After the check, the order is:
    It refuses a newer schema, and a newer redb recorded in `META`. The check
    has already refused every store it could read, so what this catches is a
    dirty store with no sidecar that a newer redb wrote: redb's repair has
-   written to it (the gap below), but nothing else is written. `META` keeps the
+   written to it (the gap below), and redb's close writes as the open is
+   dropped, but kimmy writes nothing. `META` keeps the
    newer version, since `record_redb_version` never lowers it, so every later
    start refuses the store before opening it.
 6. The migration raises the sidecar's `schema` just before its first write.

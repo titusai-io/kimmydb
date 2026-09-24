@@ -1846,9 +1846,9 @@ you move or copy a data directory.
   can't tell whether a newer build wrote it. So it repairs the store, as every
   build did before 0.36.0. To avoid this, start the build that wrote the store,
   or restore the backup taken before the upgrade. If the store records that a
-  newer redb wrote it, the start stops right after the repair, before writing
-  anything else, and leaves that record in place so every later start refuses
-  the store before opening it.
+  newer redb wrote it, the start stops right after the repair. Nothing is
+  written but redb's own repair and close, and the record stays in place, so
+  every later start refuses the store before opening it.
 - A clean store copied without its sidecar is still checked: the build reads
   the schema and redb version from the database without writing.
 - **An unreadable `kimmy.format` refuses the start.** Restore the file from the

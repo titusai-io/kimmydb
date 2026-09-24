@@ -662,7 +662,8 @@ pub(crate) fn refuse_newer(
         return Err(StorageError::RefusedStore(format!(
             "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
              kimmy.format and was not shut down cleanly, so redb repaired it before that could be \
-             read; nothing else was written. Start the build that wrote it, or restore a backup",
+             read; nothing but redb's own repair and close was written. Start the build that \
+             wrote it, or restore a backup",
             path.display(),
             build.redb.0,
             build.redb.1
