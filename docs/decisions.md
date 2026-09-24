@@ -19427,12 +19427,36 @@ verifies and names such a page while the secondary is sound. Producing it
 takes damage that matches a 128-bit checksum.
 
 **This check is a stopgap, to be removed with redb 4.3.** It is reported
-upstream at <ISSUE-URL>. It goes once kimmydb depends on a redb release that
+upstream at https://github.com/cberner/redb/issues/1503. It goes once kimmydb depends on a redb release that
 refuses such a page without allocating it, and a test says when:
 `redb_itself_still_allocates_for_a_root_page_past_eof` opens a plain redb file
 with a root past its end and fails on the first redb that no longer reads the
 page. On that bump, delete the check, `root_ranges`, their tests and this
 paragraph together.
+
+**A panic in redb's open is refused as damage.** A primary slot that verifies
+and names a root inside the file, but of the wrong order, makes redb 4.3 panic
+in its first tree read instead of returning an error: `unreachable!()` in
+`btree.rs:1112` on a page that is neither a leaf nor a branch, or a UTF-8
+unwrap in `types.rs:721`. Both of the engine's redb opens are wrapped in
+`catch_unwind`, the read-only fallback and the read-write open, and a caught
+panic refuses the store as damaged, with redb's message.
+- The workspace keeps `panic = unwind`, which this depends on. kimmyd's panic
+  hook still logs the caught panic at `ERROR` before the refusal.
+- The lock goes with the backend as the panic unwinds.
+- The sidecar follows the same rule as a refusal before redb's first write. The
+  panic comes from `Database::get_allocator_state_table` (`db.rs:1643`), which
+  runs after `TransactionalMemory::new` (`db.rs:1631`) and before
+  `begin_writable` (`db.rs:1672`). So the sidecar is put back only if the header
+  and length are as the check read them; after a recovery write-back it stays.
+
+**This catch is a stopgap too, to be removed with redb 4.3.** It is reported
+upstream at <PANIC-ISSUE-URL>. It goes once kimmydb depends on a redb release
+that returns an error there instead of panicking. The signal is
+`redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`, which opens a
+plain redb file with such a root and fails on the first redb that no longer
+panics. On that bump, delete the catches, `Cleared::after_panicked_open`, their
+tests and this paragraph together.
 
 **The sidecar is written before redb's open, and is put back only when redb
 wrote nothing.** It is written first on purpose: if redb 4.3 writes to the

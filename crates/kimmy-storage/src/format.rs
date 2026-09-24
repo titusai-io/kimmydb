@@ -193,7 +193,7 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
             check_sidecar(database, &sidecar, build)?;
             Prior::Sidecar(sidecar)
         }
-        None => read_only_fallback(database, build)?,
+        None => read_only_fallback_unless_it_panics(database, build)?,
     };
     let sidecar_modified = match sidecar_bytes {
         Some(_) => std::fs::metadata(&sidecar_file).and_then(|m| m.modified()).ok(),
@@ -286,7 +286,7 @@ fn root_past_end(header: &[u8], slot: usize, len: u64) -> Option<(std::ops::Rang
 /// or less it reads into a zero-filled buffer of the page's length first, up to
 /// 4 GiB, and only then fails at the file's end. Under a 2 GiB memory limit
 /// that start is OOM-killed rather than refused. Reported upstream at
-/// <ISSUE-URL>. Once kimmydb depends on a redb that refuses such a page
+/// https://github.com/cberner/redb/issues/1503. Once kimmydb depends on a redb that refuses such a page
 /// without allocating it, delete this check, `root_ranges` and their tests:
 /// `format::tests::redb_itself_still_allocates_for_a_root_page_past_eof`
 /// fails on the first redb that does.
@@ -368,6 +368,36 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
         }
         None => Ok(()),
     }
+}
+
+/// [`read_only_fallback`], with a panic in redb refused as damage.
+///
+/// **This exists because of redb 4.3.0, and is to be removed with it.** A
+/// primary slot that verifies but names a root of the wrong order, one that
+/// still lies inside the file, makes redb 4.3 panic in its first tree read
+/// (`btree.rs:1112`, `types.rs:721`) rather than return `Corrupted`. A
+/// read-only open never writes, and no sidecar has been written yet. The same
+/// holds for the read-write open ([`Cleared::after_panicked_open`]). Reported
+/// upstream at <PANIC-ISSUE-URL>. Once a redb release returns an error there,
+/// `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
+/// fails, and both catches and that test go.
+fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -> Result<Prior> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_only_fallback(database, build)
+    })) {
+        Ok(read) => read,
+        Err(panic) => Err(refused(database, redb_panicked(&*panic))),
+    }
+}
+
+/// Why a store redb panicked on is refused.
+pub(crate) fn redb_panicked(panic: &(dyn std::any::Any + Send)) -> String {
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into());
+    format!("redb panicked reading it ({message}), so it is damaged. {DAMAGED_WAY_OUT}")
 }
 
 fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
@@ -483,8 +513,39 @@ impl Cleared {
         sidecar_written: bool,
     ) -> StorageError {
         let Some(why) = header_refusal(&error) else { return error.into() };
+        self.refuse_unwritten(database, why, sidecar_written).unwrap_or_else(|| error.into())
+    }
+
+    /// What a read-write open that panicked in redb returns, by the same rule
+    /// as [`Self::after_failed_open`]. In redb 4.3 the panics a damaged slot
+    /// causes come from `Database::get_allocator_state_table` (`db.rs:1643`),
+    /// which reads, after `TransactionalMemory::new` (`db.rs:1631`), which
+    /// writes the header back only for a store that needs recovery, and before
+    /// `begin_writable` (`db.rs:1672`), the first write on a clean store. So a
+    /// clean store is unwritten; one that needed recovery may not be, and the
+    /// file says which.
+    pub(crate) fn after_panicked_open(
+        &self,
+        database: &Path,
+        panic: &(dyn std::any::Any + Send),
+        sidecar_written: bool,
+    ) -> StorageError {
+        let why = redb_panicked(panic);
+        self.refuse_unwritten(database, why.clone(), sidecar_written)
+            .unwrap_or_else(|| StorageError::Database(format!("{}: {why}", database.display())))
+    }
+
+    /// The refusal of a store redb wrote nothing to, with the sidecar written
+    /// before its open put back; `None` if the store is no longer as the check
+    /// read it, and the sidecar stays.
+    fn refuse_unwritten(
+        &self,
+        database: &Path,
+        why: String,
+        sidecar_written: bool,
+    ) -> Option<StorageError> {
         if !self.store_unchanged(database) {
-            return error.into();
+            return None;
         }
         if sidecar_written {
             let path = sidecar_path(database);
@@ -493,16 +554,16 @@ impl Cleared {
                 None => std::fs::remove_file(&path).map_err(Into::into),
             };
             if let Err(e) = put_back {
-                return StorageError::RefusedStore(format!(
+                return Some(StorageError::RefusedStore(format!(
                     "{} is not opened by this build: {why}. Nothing in it was written, but the \
                      sidecar written before redb's open could not be put back ({e}); restore \
                      {} from the backup",
                     database.display(),
                     path.display()
-                ));
+                )));
             }
         }
-        refused(database, why)
+        Some(refused(database, why))
     }
 
     /// Whether the database's header and length are still what the check read.
@@ -1152,6 +1213,8 @@ mod tests {
     /// What this build answers a primary slot naming a root page past the
     /// file's end, before redb reads it ([`check_roots`]).
     const ROOT_PAST_END: &str = "past the file's end";
+    /// What this build answers a store redb panicked on.
+    const REDB_PANICKED: &str = "redb panicked reading it";
     /// The most a refused open may make the child's resident set: an open
     /// that allocates the page it was pointed at blows through it.
     const REFUSAL_MAX_RSS_KIB: u64 = 256 * 1024;
@@ -1532,6 +1595,83 @@ mod tests {
         let god = std::fs::read(&path).unwrap()[GOD_BYTE];
         assert!(god & TWO_PHASE_COMMIT == 0, "god byte {god:#04x}");
         assert_refused_as_damaged_untouched(&path, "both slots, dirty", ROOT_PAST_END);
+    }
+
+    /// A primary slot that verifies and names a root inside the file, but of
+    /// the wrong order, makes redb 4.3 panic in its first tree read. The panic
+    /// is caught and the store refused as damaged, whichever open meets it: the
+    /// read-only fallback with no sidecar, the read-write open with one.
+    #[test]
+    fn a_verified_primary_root_of_the_wrong_order_is_refused_untouched() {
+        for case in SIDECAR_CASES {
+            let (_dir, path) = a_store();
+            with_sidecar_case(&path, case);
+            damage_page_order_validly(&path, 1);
+            let what = format!("valid slot, page order 1, sidecar {case:?}");
+            assert_two_phase(&path, &what);
+            assert_refused_as_damaged_untouched(&path, &what, REDB_PANICKED);
+        }
+    }
+
+    /// After redb's read-write open panicked, the store's lock is gone: the
+    /// next open meets the damage again rather than a holder, and another
+    /// descriptor can lock the file.
+    #[test]
+    fn a_panic_in_redbs_open_releases_the_store() {
+        let (_dir, path) = a_store();
+        damage_page_order_validly(&path, 1);
+        for attempt in ["first", "second"] {
+            match Engine::open(&path) {
+                Err(StorageError::RefusedStore(why)) => {
+                    assert!(why.contains(REDB_PANICKED), "{attempt}: {why}")
+                }
+                Err(other) => panic!("{attempt}: refused with the wrong error: {other}"),
+                Ok(_) => panic!("{attempt}: opened"),
+            }
+        }
+        std::fs::File::open(&path).unwrap().try_lock().expect("nothing holds the store");
+    }
+
+    /// Why the catches around redb's opens exist, kept honest: redb 4.3
+    /// itself, with nothing in front of it, panics on a commit slot that
+    /// verifies and names a root of the wrong order inside the file, where it
+    /// should return an error. The store is a plain redb file of 500 rows.
+    ///
+    /// **When a redb bump makes this fail, because both opens now return an
+    /// error, delete `read_only_fallback_unless_it_panics`,
+    /// `Cleared::after_panicked_open`, the catch in `Engine::open_cleared`,
+    /// this test and the tests of the catch together**, and the paragraph in
+    /// ADR-190's addendum that names them.
+    #[test]
+    fn redb_itself_still_panics_on_a_verified_root_of_the_wrong_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table =
+                    txn.open_table(redb::TableDefinition::<&str, &str>::new("t")).unwrap();
+                for i in 0..500 {
+                    table.insert(format!("key-{i}").as_str(), "value").unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        damage_page_order_validly(&path, 1);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
+        let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+        assert!(root_past_end(&header, primary, len).is_none(), "the root lies inside the file");
+        let read_only =
+            std::panic::catch_unwind(|| redb::Builder::new().open_read_only(&path).map(drop));
+        let read_write = std::panic::catch_unwind(|| redb::Builder::new().open(&path).map(drop));
+        assert!(
+            read_only.is_err() && read_write.is_err(),
+            "redb no longer panics on a verified root of the wrong order: retire the catches \
+             around its opens (see this test's doc comment); read-only {read_only:?}, \
+             read-write {read_write:?}"
+        );
     }
 
     /// The roots are checked again under the lock, against the file's length

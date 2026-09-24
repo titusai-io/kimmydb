@@ -40,7 +40,9 @@ upgrading; the way back is restoring it.
   aborted. Such a store is now refused within a second, with the path and
   "damaged", and neither it nor `kimmy.format` is changed. So is one whose
   commit slot names a root page past the end of the file, which redb 4.3 would
-  still read into a buffer of up to 4 GiB first. See
+  still read into a buffer of up to 4 GiB first, and one whose commit slot
+  names a root of the wrong size inside the file, which makes redb 4.3 panic
+  (the panic is logged, then the store refused). See
   [A damaged store](docs/operations.md#a-damaged-store).
 
 ## 0.36.0 - 2026-09-24

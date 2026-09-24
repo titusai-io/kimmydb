@@ -856,9 +856,18 @@ impl Engine {
         }
         // The one read-write open of a store, behind the check (ADR-190).
         #[allow(clippy::disallowed_methods)]
-        let db = builder
-            .create_with_backend(backend)
-            .map_err(|e| cleared.after_failed_open(path, e, sidecar_written))?;
+        // A panic in redb's open is a damaged store, refused like its errors
+        // (`format::after_panicked_open`); the backend, and with it the lock,
+        // is dropped as it unwinds.
+        let open = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.create_with_backend(backend)
+        }));
+        let db = match open {
+            Ok(open) => open.map_err(|e| cleared.after_failed_open(path, e, sidecar_written))?,
+            Err(panic) => {
+                return Err(cleared.after_panicked_open(path, &*panic, sidecar_written));
+            }
+        };
         // redb opens unlocked when it never asks for the lock; the backend
         // holds it regardless, but a redb that stopped asking has changed how
         // it locks, and the store is not used until the backend is changed
