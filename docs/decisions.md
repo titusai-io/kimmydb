@@ -19406,10 +19406,33 @@ growing without bound; on Linux, an abort. redb 4.3 checks the slot first:
 - **A clean store whose other slot alone is damaged still opens**, because redb
   reads only the primary.
 
-One case redb 4.3 still does not bound below 4 GiB. A slot that verifies, and
-names a page of order 20 or less, gets a zero-filled buffer of up to 4 GiB
-before the read past the file's end fails. That needs damage matching the
-slot's 128-bit checksum, so it is not what storage corruption produces.
+**A root page past the file's end is refused before redb reads it.** redb 4.3
+still reads a root page of order 20 or less, a page of up to 4 GiB, into a
+zero-filled buffer of its full length before its read fails at the file's end.
+Measured: a 1 MB file with such a root peaked at 4.3 GB resident, and under a
+2 GiB memory limit the process was OOM-killed instead of refused. So the check
+computes each root's byte range, exactly as redb 4.3 does (`format.rs`,
+`root_ranges`, which cites redb's lines), and refuses a store whose root ends
+past the file, before the read-only fallback and again under the lock.
+
+Which slot is checked follows redb's own choice of slot:
+- **With the two-phase bit**, which every clean close sets, redb reads the
+  primary slot or refuses the store, so the primary slot's roots must fit.
+- **Without it**, redb picks a slot by checksum, which the check does not
+  compute. The store is refused only when both slots name a root past the end.
+  A torn primary on a crashed store stays redb's to repair from the secondary.
+
+What stays open is a store without the two-phase bit whose primary slot
+verifies and names such a page while the secondary is sound. Producing it
+takes damage that matches a 128-bit checksum.
+
+**This check is a stopgap, to be removed with redb 4.3.** It is reported
+upstream at <ISSUE-URL>. It goes once kimmydb depends on a redb release that
+refuses such a page without allocating it, and a test says when:
+`redb_itself_still_allocates_for_a_root_page_past_eof` opens a plain redb file
+with a root past its end and fails on the first redb that no longer reads the
+page. On that bump, delete the check, `root_ranges`, their tests and this
+paragraph together.
 
 **The sidecar is written before redb's open, and is put back only when redb
 wrote nothing.** It is written first on purpose: if redb 4.3 writes to the

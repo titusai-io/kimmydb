@@ -38,7 +38,9 @@ upgrading; the way back is restoring it.
   changed, redb 4.1 allocated terabytes and filled them. On macOS the start
   sat at full CPU with memory growing until it was killed; on Linux it
   aborted. Such a store is now refused within a second, with the path and
-  "damaged", and neither it nor `kimmy.format` is changed. See
+  "damaged", and neither it nor `kimmy.format` is changed. So is one whose
+  commit slot names a root page past the end of the file, which redb 4.3 would
+  still read into a buffer of up to 4 GiB first. See
   [A damaged store](docs/operations.md#a-damaged-store).
 
 ## 0.36.0 - 2026-09-24

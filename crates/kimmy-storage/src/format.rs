@@ -64,6 +64,22 @@ pub(crate) const META_REDB_VERSION: &str = "redb_version";
 const HEADER_LEN: usize = 320;
 const MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 const SLOT_OFFSETS: [usize; 2] = [64, 192];
+/// The god byte, whose bit 0 names the primary slot, and the region geometry
+/// after it (redb 4.3, `header.rs:13-63`).
+const GOD_BYTE: usize = MAGIC.len();
+const PRIMARY_BIT: u8 = 1;
+const TWO_PHASE_COMMIT: u8 = 4;
+const PAGE_SIZE_OFFSET: usize = 12;
+const REGION_HEADER_PAGES_OFFSET: usize = 16;
+const REGION_MAX_DATA_PAGES_OFFSET: usize = 20;
+/// A commit slot's two B-tree roots, as (non-null flag, page number) offsets
+/// within the slot: the user root, then the system root (`header.rs:65-73`).
+/// The slot's other page number, formerly the freed tree's root, is unused and
+/// never read.
+const SLOT_ROOTS: [(usize, usize); 2] = [(1, 8), (2, 40)];
+/// How the way out of a damaged store is put, in every refusal of one.
+const DAMAGED_WAY_OUT: &str = "Restore it from a backup, or on a cluster member wipe the data \
+     directory and let it catch up from its peers (see operations.md, \"A damaged store\")";
 
 /// The versions a build writes, and so the newest it may open. Injectable, so a
 /// test can be an older build.
@@ -164,6 +180,7 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
     }
     let header = read_header(&mut std::fs::File::open(database)?)?;
     check_header(database, &header, build)?;
+    check_roots(database, &header, len)?;
 
     let sidecar_bytes = match std::fs::read(&sidecar_file) {
         Ok(bytes) => Some(bytes),
@@ -217,6 +234,88 @@ fn check_header(database: &Path, header: &[u8], build: &BuildVersions) -> Result
         }
     }
     Ok(())
+}
+
+/// The byte ranges of the roots in the slot at `slot`, with each page's order,
+/// computed as redb 4.3 computes them, or `None` for a file format whose slot
+/// layout this build does not know.
+///
+/// redb 4.3 decodes a page number in `PageNumber::from_le_bytes`
+/// (`base.rs:97-108`): the order is the top five bits, the region the 20 bits
+/// above bit 20, and the index the low bits under a mask shrunk by the order.
+/// `TransactionalMemory::get_page` (`page_manager.rs:1905-1913`) reads it at
+/// `PageNumber::address_range` (`base.rs:142-161`), called with the page size
+/// as the data section's offset, the full region's length, and its header's
+/// length (`page_manager.rs:1216-1217`, `layout.rs:48-72`). The sums are in
+/// `u128`, so a damaged header cannot overflow them.
+fn root_ranges(header: &[u8], slot: usize) -> Option<Vec<(std::ops::Range<u128>, u32)>> {
+    if SLOT_OFFSETS.iter().any(|&o| header[o] != REDB_FILE_FORMAT) {
+        return None;
+    }
+    let u32_at =
+        |o: usize| u128::from(u32::from_le_bytes(header[o..o + 4].try_into().expect("4 bytes")));
+    let page_size = u32_at(PAGE_SIZE_OFFSET);
+    let region_header = u32_at(REGION_HEADER_PAGES_OFFSET) * page_size;
+    let region_len = region_header + u32_at(REGION_MAX_DATA_PAGES_OFFSET) * page_size;
+    let mut ranges = Vec::new();
+    for (non_null, at) in SLOT_ROOTS {
+        if header[slot + non_null] == 0 {
+            continue;
+        }
+        let raw = u64::from_le_bytes(header[slot + at..slot + at + 8].try_into().expect("8 bytes"));
+        let order = (raw >> 59) as u32;
+        let index = u128::from(raw & (0x000F_FFFF >> order));
+        let region = u128::from((raw >> 20) & 0x000F_FFFF);
+        let page_bytes = (1u128 << order) * page_size;
+        let start = page_size + region * region_len + region_header + index * page_bytes;
+        ranges.push((start..start + page_bytes, order));
+    }
+    Some(ranges)
+}
+
+/// The first root in the slot at `slot` that ends past `len`.
+fn root_past_end(header: &[u8], slot: usize, len: u64) -> Option<(std::ops::Range<u128>, u32)> {
+    root_ranges(header, slot)?.into_iter().find(|(range, _)| range.end > u128::from(len))
+}
+
+/// Refuse a store whose commit slot names a root page that ends past the
+/// file, where redb would read it.
+///
+/// **This exists because of redb 4.3.0, and is to be removed with it.** redb
+/// 4.3 refuses a root of order above 20 before reading it, but one of order 20
+/// or less it reads into a zero-filled buffer of the page's length first, up to
+/// 4 GiB, and only then fails at the file's end. Under a 2 GiB memory limit
+/// that start is OOM-killed rather than refused. Reported upstream at
+/// <ISSUE-URL>. Once kimmydb depends on a redb that refuses such a page
+/// without allocating it, delete this check, `root_ranges` and their tests:
+/// `format::tests::redb_itself_still_allocates_for_a_root_page_past_eof`
+/// fails on the first redb that does.
+///
+/// Which slot redb reads decides what is checked, as redb 4.3 decides it
+/// (`header.rs`, `select_primary_slot`). With the two-phase bit, which every
+/// clean close sets, redb reads the primary slot or refuses the store, so the
+/// primary's roots must fit. Without it, redb picks between the slots by their
+/// checksums, which this does not compute; the store is refused only when
+/// both slots name a root past the end, since then whichever redb picks would
+/// allocate. A torn primary slot on a store that crashed is redb's to repair
+/// from the secondary.
+fn check_roots(database: &Path, header: &[u8], len: u64) -> Result<()> {
+    let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+    let Some((range, order)) = root_past_end(header, primary, len) else { return Ok(()) };
+    let two_phase = header[GOD_BYTE] & TWO_PHASE_COMMIT != 0;
+    let secondary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT) ^ 1];
+    if !two_phase && root_past_end(header, secondary, len).is_none() {
+        return Ok(());
+    }
+    let which = if two_phase { "primary commit slot" } else { "commit slots both" };
+    Err(refused(
+        database,
+        format!(
+            "its {which} name a root page past the file's end (order {order}, bytes \
+             {}..{}, file {len} bytes), so it is damaged. {DAMAGED_WAY_OUT}",
+            range.start, range.end
+        ),
+    ))
 }
 
 fn parse_sidecar(path: &Path, bytes: &[u8]) -> Result<Sidecar> {
@@ -340,11 +439,9 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
 /// [`Cleared::after_failed_open`] also looks at the file.
 fn header_refusal(error: &redb::DatabaseError) -> Option<String> {
     match error {
-        redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => Some(format!(
-            "redb refused it as damaged ({why}). Restore it from a backup, or on a cluster \
-             member wipe the data directory and let it catch up from its peers (see \
-             operations.md, \"A damaged store\")"
-        )),
+        redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => {
+            Some(format!("redb refused it as damaged ({why}). {DAMAGED_WAY_OUT}"))
+        }
         redb::DatabaseError::UpgradeRequired(format) => Some(format!(
             "it is in redb file format {format}, which redb would upgrade by writing to it. \
              Start the build that wrote it, or restore a backup (see operations.md, \"Rolling \
@@ -437,6 +534,10 @@ impl Cleared {
         let sidecar_matters = !matches!(self.prior, Prior::Fresh);
         if header != self.header || (sidecar_matters && sidecar != self.sidecar) {
             return Err(refused(database, "it changed while it was being checked".into()));
+        }
+        // The same header, against the file's length now.
+        if let Some(header) = &header {
+            check_roots(database, header, len)?;
         }
         Ok(())
     }
@@ -1048,9 +1149,12 @@ mod tests {
     /// checksum: a clean close commits with two-phase commit, and such a
     /// primary is never passed over for the secondary.
     const PRIMARY_CORRUPTED: &str = "Primary is corrupted despite 2-phase commit";
-    /// What it answers a slot that verifies but names a page larger than any
-    /// redb writes: the check 4.2 added before a page is read.
-    const PAGE_ORDER_TOO_LARGE: &str = "has order greater than the maximum";
+    /// What this build answers a primary slot naming a root page past the
+    /// file's end, before redb reads it ([`check_roots`]).
+    const ROOT_PAST_END: &str = "past the file's end";
+    /// The most a refused open may make the child's resident set: an open
+    /// that allocates the page it was pointed at blows through it.
+    const REFUSAL_MAX_RSS_KIB: u64 = 256 * 1024;
     /// How long a child is given to open a store before it is killed. The
     /// open itself must answer within a second; the rest is a debug test
     /// binary starting.
@@ -1153,6 +1257,7 @@ mod tests {
 
     struct ChildOpen {
         elapsed_ms: u64,
+        max_rss_kib: u64,
         outcome: String,
     }
 
@@ -1198,8 +1303,22 @@ mod tests {
 
     fn open_in_child(path: &Path) -> ChildOpen {
         let line = run_child(PROBE_OPEN, path, CHILD_LIMIT);
-        let (ms, outcome) = line.split_once(' ').unwrap();
-        ChildOpen { elapsed_ms: ms.parse().unwrap(), outcome: outcome.to_string() }
+        let mut parts = line.splitn(3, ' ');
+        let mut number = || parts.next().unwrap().parse().unwrap();
+        let (elapsed_ms, max_rss_kib) = (number(), number());
+        ChildOpen { elapsed_ms, max_rss_kib, outcome: parts.next().unwrap().to_string() }
+    }
+
+    /// This process's peak resident set, in KiB.
+    fn max_rss_kib() -> u64 {
+        // SAFETY: `getrusage` fills the struct it is given and reads nothing.
+        let usage = unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+            usage
+        };
+        let max = usage.ru_maxrss as u64;
+        if cfg!(target_vendor = "apple") { max / 1024 } else { max }
     }
 
     /// The child side of [`run_child`]. Does nothing unless one of its
@@ -1224,7 +1343,7 @@ mod tests {
                 Err(other) => format!("error {other}"),
             };
             // On a line of its own: libtest has already printed the test's name.
-            println!("\nPROBE {} {outcome}", started.elapsed().as_millis());
+            println!("\nPROBE {} {} {outcome}", started.elapsed().as_millis(), max_rss_kib());
         } else if let Ok(path) = std::env::var(PROBE_HOLD) {
             let engine = Engine::open(Path::new(&path)).unwrap();
             let c = engine.create_collection("shop", "orders").unwrap();
@@ -1242,6 +1361,15 @@ mod tests {
     fn assert_refused_as_damaged_untouched(path: &Path, what: &str, reason: &str) {
         let before = fingerprints(path);
         let opened = open_in_child(path);
+        // The bounds first: an open that allocated the page and then failed
+        // some other way is the regression these tests exist for.
+        assert!(
+            opened.max_rss_kib < REFUSAL_MAX_RSS_KIB,
+            "{what}: the open peaked at {} KiB resident: {}",
+            opened.max_rss_kib,
+            opened.outcome
+        );
+        assert!(opened.elapsed_ms < 1_000, "{what}: answered after {} ms", opened.elapsed_ms);
         assert!(opened.outcome.starts_with("refused "), "{what}: {}", opened.outcome);
         assert!(
             opened.outcome.contains("nothing in it was changed")
@@ -1251,7 +1379,6 @@ mod tests {
             "{what}: {}",
             opened.outcome
         );
-        assert!(opened.elapsed_ms < 1_000, "{what}: refused after {} ms", opened.elapsed_ms);
         assert!(fingerprints(path) == before, "{what}: the store or its sidecar changed");
     }
 
@@ -1263,7 +1390,7 @@ mod tests {
             damage_both_slots(&path);
             let what = format!("both slots, sidecar {case:?}");
             assert_two_phase(&path, &what);
-            assert_refused_as_damaged_untouched(&path, &what, PRIMARY_CORRUPTED);
+            assert_refused_as_damaged_untouched(&path, &what, ROOT_PAST_END);
         }
     }
 
@@ -1276,9 +1403,17 @@ mod tests {
                 damage_page_order(&path, order);
                 let what = format!("page order {order}, sidecar {case:?}");
                 assert_two_phase(&path, &what);
-                assert_refused_as_damaged_untouched(&path, &what, PRIMARY_CORRUPTED);
+                assert_refused_as_damaged_untouched(&path, &what, reason_for(order));
             }
         }
+    }
+
+    /// Which check refuses a primary slot whose root's order was changed and
+    /// whose checksum was not: a root that ends past the file is this build's
+    /// to refuse, before redb reads anything; one that still fits is redb's,
+    /// for the checksum.
+    fn reason_for(order: u8) -> &'static str {
+        if order >= 2 { ROOT_PAST_END } else { PRIMARY_CORRUPTED }
     }
 
     /// 4 GiB and 8 GiB pages, which redb 4.1 allocated and then failed to read,
@@ -1292,25 +1427,172 @@ mod tests {
                 damage_page_order(&path, order);
                 let what = format!("page order {order}, sidecar {case:?}");
                 assert_two_phase(&path, &what);
-                assert_refused_as_damaged_untouched(&path, &what, PRIMARY_CORRUPTED);
+                assert_refused_as_damaged_untouched(&path, &what, reason_for(order));
             }
         }
     }
 
-    /// The regression proof of the upstream fix itself: a primary slot that
-    /// verifies, naming a root page of 2^31 pages, the 8 TiB page redb 4.1
-    /// allocated and filled. Only redb 4.3's page-order check stands between
-    /// it and that allocation.
+    /// A primary slot that verifies, naming a root page past the file's end.
+    /// Order 31 is the 8 TiB page redb 4.1 allocated and filled; order 21 is
+    /// past the largest redb 4.3 reads. Order 20, 4 GiB, redb 4.3 still
+    /// allocates and fills before its read fails at the file's end, which a
+    /// start under a smaller memory limit does not survive; only this build's
+    /// check stands between the open and that allocation, and the child's peak
+    /// resident set is what shows it did.
     #[test]
-    fn a_valid_primary_slot_naming_a_page_past_redbs_largest_is_refused_untouched() {
-        for case in SIDECAR_CASES {
-            let (_dir, path) = a_store();
-            with_sidecar_case(&path, case);
-            damage_page_order_validly(&path, 31);
-            let what = format!("valid slot, page order 31, sidecar {case:?}");
-            assert_two_phase(&path, &what);
-            assert_refused_as_damaged_untouched(&path, &what, PAGE_ORDER_TOO_LARGE);
+    fn a_valid_primary_slot_naming_a_root_page_past_the_file_is_refused_untouched() {
+        for order in [20, 21, 31] {
+            for case in SIDECAR_CASES {
+                let (_dir, path) = a_store();
+                with_sidecar_case(&path, case);
+                damage_page_order_validly(&path, order);
+                let what = format!("valid slot, page order {order}, sidecar {case:?}");
+                assert_two_phase(&path, &what);
+                assert_refused_as_damaged_untouched(&path, &what, ROOT_PAST_END);
+            }
         }
+    }
+
+    /// [`root_ranges`] mirrors redb's page arithmetic, so on stores redb
+    /// wrote, every root it computes lies inside the file, in both slots, and
+    /// at the first byte of each primary root is a B-tree page: redb's leaf
+    /// (1) or branch (2) type byte. A
+    /// redb that lays pages out differently fails this rather than letting the
+    /// check refuse good stores. Covered: a small store, one whose table tree's
+    /// root is a branch, one whose root leaf is a page of order above 0, and a
+    /// dirty store. A store of more than one region needs a file over 4 GiB,
+    /// and redb's region size is settable only inside redb's own tests.
+    #[test]
+    fn every_root_page_of_a_valid_store_lies_inside_it_where_redb_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_small_dir, small) = a_store();
+        let (_dirty_dir, dirty) = a_dirty_copy();
+        let branch = dir.path().join("branch.redb");
+        {
+            let db = redb::Database::create(&branch).unwrap();
+            let txn = db.begin_write().unwrap();
+            for i in 0..2_000 {
+                let name = format!("table-{i:05}");
+                txn.open_table(redb::TableDefinition::<u64, u64>::new(&name)).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let big_leaf = dir.path().join("big_leaf.redb");
+        {
+            let db = redb::Database::create(&big_leaf).unwrap();
+            let txn = db.begin_write().unwrap();
+            let name = "n".repeat(40_000);
+            txn.open_table(redb::TableDefinition::<u64, u64>::new(&name)).unwrap();
+            txn.commit().unwrap();
+        }
+        let mut orders = Vec::new();
+        let mut types = Vec::new();
+        for path in [&small, &dirty, &branch, &big_leaf] {
+            let bytes = std::fs::read(path).unwrap();
+            let primary = SLOT_OFFSETS[usize::from(bytes[GOD_BYTE] & PRIMARY_BIT)];
+            let secondary = SLOT_OFFSETS[usize::from(bytes[GOD_BYTE] & PRIMARY_BIT) ^ 1];
+            for (range, _) in root_ranges(&bytes[..HEADER_LEN], secondary).expect("format 3") {
+                assert!(
+                    range.end <= bytes.len() as u128,
+                    "{}: secondary {range:?}",
+                    path.display()
+                );
+            }
+            let ranges = root_ranges(&bytes[..HEADER_LEN], primary).expect("format 3");
+            assert!(!ranges.is_empty(), "{}: no root", path.display());
+            for (range, order) in ranges {
+                assert!(range.end <= bytes.len() as u128, "{}: {range:?}", path.display());
+                let first = bytes[range.start as usize];
+                assert!(
+                    first == 1 || first == 2,
+                    "{}: page type {first} at {range:?}",
+                    path.display()
+                );
+                orders.push(order);
+                types.push(first);
+            }
+            drop(Engine::open(path).ok());
+        }
+        assert!(orders.iter().any(|&o| o > 0), "no root of order above 0: {orders:?}");
+        assert!(types.contains(&2), "no branch root: {types:?}");
+    }
+
+    /// A store without the two-phase bit, whose two slots both name a root
+    /// past the file's end: whichever redb picks, it would allocate the page,
+    /// so it is refused.
+    #[test]
+    fn a_dirty_store_whose_slots_both_name_a_root_past_the_end_is_refused_untouched() {
+        let (_d, path) = a_dirty_copy();
+        edit_store(&path, |b| {
+            for slot in SLOT_OFFSETS {
+                // The system root's page order, in the slot's top byte of it.
+                b[slot + 47] = (b[slot + 47] & 0x07) | (20 << 3);
+            }
+        });
+        let god = std::fs::read(&path).unwrap()[GOD_BYTE];
+        assert!(god & TWO_PHASE_COMMIT == 0, "god byte {god:#04x}");
+        assert_refused_as_damaged_untouched(&path, "both slots, dirty", ROOT_PAST_END);
+    }
+
+    /// The roots are checked again under the lock, against the file's length
+    /// then: a store cut short after the check is refused before redb reads it.
+    #[test]
+    fn a_store_cut_short_after_the_check_is_refused_under_the_lock() {
+        let (_d, path) = a_dirty_copy();
+        let cleared = check_before_open(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..8192]).unwrap();
+        let before = fingerprints(&path);
+        match Engine::open_cleared(&path, None, cleared) {
+            Err(StorageError::RefusedStore(why)) => assert!(why.contains(ROOT_PAST_END), "{why}"),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a store cut short"),
+        }
+        assert!(fingerprints(&path) == before, "the store or its sidecar changed");
+    }
+
+    /// Why [`check_roots`] exists, kept honest: redb 4.3 itself, with no check
+    /// in front of it, still reads a root page that lies past the file's end
+    /// into a buffer of the page's length before it fails, rather than refusing
+    /// it as corrupted. A root of order 12, 16 MiB, keeps this test's own
+    /// allocation small; order 20 takes the same path at 4 GiB.
+    ///
+    /// **When a redb bump makes this fail, because redb now refuses such a page
+    /// without reading it, delete `check_roots`, `root_ranges`, this test and
+    /// the tests of the check together**, and the paragraph in ADR-190's
+    /// addendum that names them.
+    #[test]
+    fn redb_itself_still_allocates_for_a_root_page_past_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(redb::TableDefinition::<u64, u64>::new("t"))
+                .unwrap()
+                .insert(1, 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        damage_page_order_validly(&path, 12);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
+        let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+        assert!(root_past_end(&header, primary, len).is_some(), "the fixture's root fits");
+        let read_past_the_end = |r: std::result::Result<(), redb::DatabaseError>| {
+            matches!(
+                r,
+                Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof
+            )
+        };
+        let read_only = redb::Builder::new().open_read_only(&path).map(drop);
+        let read_write = redb::Builder::new().open(&path).map(drop);
+        assert!(
+            read_past_the_end(read_only) && read_past_the_end(read_write),
+            "redb no longer reads a root page past the file's end before refusing it: retire \
+             check_roots (see this test's doc comment)"
+        );
     }
 
     /// A store without the two-phase bit, one not shut down cleanly, is
