@@ -17164,13 +17164,16 @@ inside a write transaction, and neither went through the meter. A bulk of 1,000
 documents made two `set_len` calls totalling 84 µs, a cost that grows with the
 store. Both calls are now metered, `len` with `read` and `set_len` with
 `write`, their CPU read exactly, and a test puts time inside them and fails if
-it reaches `off_cpu`. **`len` is metered as a precaution**: in redb 4.1 the
-backend's `len` is reached only from `TransactionalMemory::new`, when a database
-is opened. A test runs inserts, a bulk that grows the file, an index build and a
-drop, and fails if any hold reads the file's size, and its positive control
-shows the meter does see the `len` an open makes. A redb upgrade that starts
-reading the size inside a transaction turns that test red, and the metering is
-then what keeps the time out of `off_cpu`. Every call redb's `StorageBackend` makes during a hold now
+it reaches `off_cpu`. **`len` was metered as a precaution, and redb 4.3 made it
+needed**: in redb 4.1 the backend's `len` was reached only from
+`TransactionalMemory::new`, when a database is opened; redb 4.3 also reads it
+inside a transaction, once before each `set_len` that resizes the file
+(`PagedCachedFile::resize`). A test runs inserts, a bulk that grows the file,
+an index build and a drop, and fails if a hold reads the file's size more often
+than it resizes the file, and its positive control shows the meter does see the
+`len` an open makes. A redb upgrade that starts reading the size anywhere else
+inside a transaction turns that test red, and the metering is what keeps the
+time out of `off_cpu`. Every call redb's `StorageBackend` makes during a hold now
 goes through the meter; `close` is never called inside one. What remains
 unbounded is anything that is not a backend call.
 
@@ -19032,7 +19035,7 @@ The last row belongs to the spawn lint (ADR-184). That walk ends a `#[cfg(test)]
 
 ### Why the first error, measured
 
-A threshold would need a transient error to exempt, and redb has none. Measured against redb 4.1.0, a backend that fails **one** call, once, with ENOSPC or EIO, and is healthy from the next call on: after a failed `write`, `sync_data`, `set_len` or `read`, every later read and write answers `PreviousIo`, in all eight cases. redb's `CheckedBackend` latches `io_failed` on any backend error and clears it only on close. So the first error is the moment the engine stops being able to serve in this process, and waiting past it only serves errors for longer.
+A threshold would need a transient error to exempt, and redb has none. Measured against redb 4.1.0, a backend that fails **one** call, once, with ENOSPC or EIO, and is healthy from the next call on: after a failed `write`, `sync_data`, `set_len` or `read`, every later read and write answers `PreviousIo`, in all eight cases. redb's `CheckedBackend` latches `io_failed` on any backend error and clears it only on close, and redb 4.3's does the same. So the first error is the moment the engine stops being able to serve in this process, and waiting past it only serves errors for longer.
 
 A repair after the exit is cheap. It took 1.27 s for a 4 GiB file and 5.22 s for a 12 GiB file on NVMe, about 0.4 s per GiB, and every committed row came back. A clean reopen afterwards needed no repair.
 
@@ -19228,8 +19231,8 @@ written_by = "0.36.0"
    as well.
 
 After the check, the order is:
-1. The file is opened, and redb's `FileBackend` takes its exclusive lock, which
-   writes nothing.
+1. The file is opened and the store's lock is taken, which writes nothing
+   (the invariant is in the redb 4.3 addendum below).
 2. The header and the sidecar are read again through the locked handle. The
    start is refused if either changed after the check.
 3. Only then is the sidecar written: its redb fields are raised to this build's
@@ -19266,7 +19269,7 @@ release, and a format change also moves the header byte. Refusing on a patch
 would make every routine dependency bump a rollback boundary for nothing, and a
 patch that did change the file would move the header byte, which step 2
 refuses. So the two checks together catch a format change at any version level.
-`redb = "~4.1"` in `Cargo.toml` keeps a minor bump a deliberate edit. A test
+`redb = "~4.3"` in `Cargo.toml` keeps a minor bump a deliberate edit. A test
 compares `REDB_MAJOR_MINOR` against `Cargo.lock`, and another creates a store
 and pins its format byte to 3.
 
@@ -19324,6 +19327,159 @@ kimmy-storage allows them in its tests.
 from the first build with this record, its "refuses" means the refusal comes
 before anything is written. The lifecycle marker that keeps the evidence of the
 run before a refused start is ADR-147's addendum.
+
+### Addendum: redb 4.3, the store's lock, and a damaged header
+
+**redb goes from 4.1 to 4.3, and that is a rollback boundary.** A store this
+build has opened records redb 4.3 in `kimmy.format` and `META`, and 0.36.x
+refuses it with nothing written. The file format byte is still 3, and redb 4.3
+upgrades nothing on open. A probe had redb 4.1 read back a file 4.3 wrote. The
+boundary stays anyway, because 4.2 changed the allocator's page-reuse rules and
+4.3 writes shorter branch separators for byte and string keys, and a probe
+cannot show that every store survives an older redb writing under the old
+rules.
+
+**The lock is an invariant.** It is taken on `kimmy.redb` itself, after the
+check's first read and before the check's reads are confirmed, and before
+anything is written. It is held until redb closes the backend. It is two
+locks on one open file description (`kimmy_storage::store_lock`):
+- **redb's whole-storage range lock**, taken through the `FileBackend`. It
+  excludes every redb 4.3 opener, read-write or read-only.
+- **On Linux, a `flock`.** That is the lock redb 4.1 took, so it is what
+  excludes a 0.36.x node. On Linux, `flock` and range locks are separate
+  namespaces. On macOS they are one, the range lock alone excludes a `flock`
+  holder, and taking both would conflict with ourselves.
+
+Why the engine takes the lock rather than redb:
+- redb 4.1 took its lock when the `FileBackend` was built. redb 4.3 takes none
+  there. It locks from inside its open, through lock methods on the backend,
+  after the point where this record needs the lock: the sidecar is written
+  before redb's open.
+- A backend that does not implement those methods opens with no lock at all,
+  and silently. The bump alone let a second process open a store the first was
+  writing, and `a_store_another_holder_has_open_is_refused_and_its_sidecar_untouched`
+  caught it.
+- A separate lock file was rejected. It would let this build check a store
+  that a 0.36.x node holds, and even rewrite its sidecar, and refuse only at
+  redb's open.
+
+The check's first read cannot be under the lock. With no sidecar, it opens redb
+read-only, which takes its own shared lock on a new descriptor, and redb 4.3
+has no read-only open over a caller's backend. So the lock is taken
+immediately after that read, and everything the check read is read again under
+it.
+
+**How redb is told it holds the lock.** The backend answers redb as the
+trait's second level, which supports only a whole-storage lock:
+1. redb asks for its own ranges first, and is told they are unsupported.
+2. redb falls back to the whole storage, and is told it holds it, which it
+   does.
+
+Only redb's `ExclusiveWriter` mode works at that level, and it is the only
+mode the engine uses. An open without the lock can't happen:
+- "Unsupported" is never the answer to the whole storage. That answer is what
+  makes redb open unlocked.
+- Anything redb asks for after the grant is an error.
+- The engine refuses a store that redb opened without asking.
+
+A test pins the requests redb 4.3 makes: one of its ranges, then the whole
+storage. A redb that asks for anything else fails that test, so the next bump
+cannot drop the lock quietly.
+
+**A damaged header is refused, not spun on.** redb 4.1 never checked a commit
+slot's checksum on a store closed cleanly. It trusted the primary slot's root
+page number, whose top five bits are a page order: `0xFF` bytes made it
+allocate 8 TiB and fill it with zeros. On macOS that meant 100% CPU and memory
+growing without bound; on Linux, an abort. redb 4.3 checks the slot first:
+- **A clean store whose primary slot fails its checksum is refused**, within a
+  second, as damaged (`Primary is corrupted despite 2-phase commit`). redb's
+  close commits with two-phase commit even though the engine never asks for
+  it, and such a primary is never passed over for the secondary. The tests
+  read that bit from the damaged store, so a redb that stops setting it fails
+  them rather than changing the refusal quietly.
+- **A slot that verifies but names a root page larger than any redb writes**
+  (order above 20) is refused by the page-order check redb 4.2 added before a
+  page is read. The `redb_damage` example makes exactly that store from a real
+  one, and the tests use its code.
+- **A store not shut down cleanly** has no two-phase bit. When its primary
+  fails its checksum, redb repairs it from the secondary, and it opens.
+- **A clean store whose other slot alone is damaged still opens**, because redb
+  reads only the primary.
+
+**A root page past the file's end is refused before redb reads it.** redb 4.3
+still reads a root page of order 20 or less, a page of up to 4 GiB, into a
+zero-filled buffer of its full length before its read fails at the file's end.
+Measured: a 1 MB file with such a root peaked at 4.3 GB resident, and under a
+2 GiB memory limit the process was OOM-killed instead of refused. So the check
+computes each root's byte range, exactly as redb 4.3 does (`format.rs`,
+`root_ranges`, which cites redb's lines), and refuses a store whose root ends
+past the file, before the read-only fallback and again under the lock.
+
+Which slot is checked follows redb's own choice of slot:
+- **With the two-phase bit**, which every clean close sets, redb reads the
+  primary slot or refuses the store, so the primary slot's roots must fit.
+- **Without it**, redb picks a slot by checksum, which the check does not
+  compute. The store is refused only when both slots name a root past the end.
+  A torn primary on a crashed store stays redb's to repair from the secondary.
+
+What stays open is a store without the two-phase bit whose primary slot
+verifies and names such a page while the secondary is sound. Producing it
+takes damage that matches a 128-bit checksum.
+
+**This check is a stopgap, to be removed with redb 4.3.** It is reported
+upstream at https://github.com/cberner/redb/issues/1503. It goes once kimmydb depends on a redb release that
+refuses such a page without allocating it, and a test says when:
+`redb_itself_still_allocates_for_a_root_page_past_eof` opens a plain redb file
+with a root past its end and fails on the first redb that no longer reads the
+page. On that bump, delete the check, `root_ranges`, their tests and this
+paragraph together.
+
+**A panic in redb's open is refused as damage.** A primary slot that verifies
+and names a root inside the file, but of the wrong order, makes redb 4.3 panic
+in its first tree read instead of returning an error: `unreachable!()` in
+`btree.rs:1112` on a page that is neither a leaf nor a branch, or a UTF-8
+unwrap in `types.rs:721`. Both of the engine's redb opens are wrapped in
+`catch_unwind`, the read-only fallback and the read-write open, and a caught
+panic refuses the store as damaged, with redb's message.
+- The workspace keeps `panic = unwind`, which this depends on. kimmyd's panic
+  hook still logs the caught panic at `ERROR` before the refusal.
+- The lock goes with the backend as the panic unwinds.
+- The sidecar follows the same rule as a refusal before redb's first write. The
+  panic comes from `Database::get_allocator_state_table` (`db.rs:1643`), which
+  runs after `TransactionalMemory::new` (`db.rs:1631`) and before
+  `begin_writable` (`db.rs:1672`). So the sidecar is put back only if the header
+  and length are as the check read them; after a recovery write-back it stays.
+
+**This catch is a stopgap too, to be removed with redb 4.3.** It is reported
+upstream at https://github.com/cberner/redb/issues/1505. It goes once kimmydb depends on a redb release
+that returns an error there instead of panicking. The signal is
+`redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`, which opens a
+plain redb file with such a root and fails on the first redb that no longer
+panics. On that bump, delete the catches, `Cleared::after_panicked_open`, their
+tests and this paragraph together.
+
+**The sidecar is written before redb's open, and is put back only when redb
+wrote nothing.** It is written first on purpose: if redb 4.3 writes to the
+store and the process dies, 0.36.x must refuse it. redb's refusals of a damaged store come before its first write:
+- `Corrupted` and `UpgradeRequired` from `TransactionalMemory::read_header`,
+  through `UnrepairedDatabaseHeader::from_bytes`, `finalize` and
+  `TransactionHeader::from_bytes`;
+- on a clean store, the page-order `Corrupted` from the first tree read, which
+  runs before `begin_writable` writes the header.
+
+After one of these, if the header and the length are still what the check
+read, the sidecar is put back byte for byte, with its modification time. After
+any other failure it stays, because a `Corrupted` from a repair's tree walk can
+follow a write. redb's failed open closes its backend, which lets the lock go,
+so the look at the file and the put-back run under the lock taken again, and
+it is let go after. If the lock can't be taken again, another process has the
+store: this build's sidecar stays, the safe direction, and the store is still
+refused as damaged.
+
+A filesystem with no byte-range locks gets a `flock` instead, because redb's
+backend falls back to it for a whole-storage lock. One with no file locking at
+all is refused, where redb 4.1 opened it unlocked with a warning. The refusal says the store is damaged and names the way out:
+operations.md, "A damaged store".
 
 **Tested.** In `kimmy-storage`, each refusal compares the store's bytes and its
 sidecar before and after. Among the tests:

@@ -638,10 +638,13 @@ pub struct ServeSnapshot {
 }
 
 /// A file backend that meters what it is asked to do (ADR-176). Every engine
-/// opens its database through one.
+/// opens its database through one. It also holds the store's lock, taken
+/// before the backend is built and answered to redb from there (ADR-190,
+/// [`crate::store_lock`]).
 #[derive(Debug)]
 pub(crate) struct MeteredBackend {
     inner: redb::backends::FileBackend,
+    lock: crate::store_lock::StoreLock,
     /// Where the first I/O error is recorded (ADR-188). Here because every
     /// byte the engine reads or writes passes through this backend, and it
     /// sees each error at the call where redb latches it.
@@ -651,9 +654,10 @@ pub(crate) struct MeteredBackend {
 impl MeteredBackend {
     pub(crate) fn new(
         inner: redb::backends::FileBackend,
+        lock: crate::store_lock::StoreLock,
         health: std::sync::Arc<crate::health::StorageHealth>,
     ) -> Self {
-        Self { inner, health }
+        Self { inner, lock, health }
     }
 
     /// `call`, with the test switch's injected error ahead of it and any error
@@ -707,7 +711,57 @@ impl redb::StorageBackend for MeteredBackend {
     }
 
     fn close(&self) -> std::result::Result<(), std::io::Error> {
-        self.inner.close()
+        let closed = self.inner.close();
+        self.lock.release();
+        closed
+    }
+
+    fn try_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        self.lock.request(start, end, false)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        self.lock.request(start, end, true)
+    }
+
+    fn lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        Err(crate::store_lock::unexpected("a blocking lock", start, end))
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        Err(crate::store_lock::unexpected("a blocking shared lock", start, end))
+    }
+
+    fn unlock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        self.lock.unlock(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        Err(crate::store_lock::unexpected("a lock query", start, end))
     }
 }
 
@@ -751,6 +805,9 @@ pub(crate) mod test_hooks {
         pub static CPU_CLOCK_STUCK_AT: Cell<Option<Duration>> = const { Cell::new(None) };
         /// Slept inside every write call from this index on.
         pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
+        /// The backend call the next engine open on this thread fails once,
+        /// armed before redb's open runs.
+        pub static ARM_AT_OPEN: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 
     pub fn spin(d: Duration) {
@@ -1569,14 +1626,41 @@ mod tests {
         assert_adds_up(&row);
     }
 
+    /// Closing the backend lets the store go even while another descriptor
+    /// shares its open file description, which keeps a `flock` alive past the
+    /// backend's own descriptor: only the explicit release frees it.
     #[test]
-    fn redb_reads_the_files_size_only_when_it_opens_and_never_inside_a_hold() {
-        // `len` is metered as a precaution, not because a hold reaches it. In
-        // redb 4.1 the backend's `len` is reached only through
-        // `TransactionalMemory::new`, which runs when a database is opened.
-        // Every kind of hold here, the file growing under them, must make
-        // none; a redb upgrade that starts calling it inside a transaction
-        // fails this, and the metering is then what keeps it out of `off_cpu`.
+    fn closing_the_backend_releases_the_store_while_its_description_is_shared() {
+        use redb::StorageBackend as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let shared = file.try_clone().unwrap();
+        let inner = redb::backends::FileBackend::new(file).unwrap();
+        let lock = crate::store_lock::StoreLock::take(&shared, &inner).unwrap();
+        let backend = MeteredBackend::new(inner, lock, Default::default());
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "held");
+        backend.close().unwrap();
+        other.try_lock().expect("closed, with the description still shared");
+        drop((shared, backend));
+    }
+
+    #[test]
+    fn inside_a_hold_redb_reads_the_files_size_only_to_resize_it() {
+        // redb 4.1 read the backend's `len` only when a database was opened.
+        // redb 4.3 also reads it inside a transaction, exactly once before
+        // each `set_len` (`PagedCachedFile::resize`, the only caller of
+        // `set_len`), and the metering is what keeps that time out of
+        // `off_cpu`. Every kind of hold here, the file growing under them,
+        // reads the size once per resize; a redb that reads it anywhere else,
+        // or resizes without reading it, fails this.
         let (engine, _dir) = fresh();
         test_hooks::reset();
         let coll = engine.create_collection("shop", "orders").unwrap();
@@ -1600,8 +1684,12 @@ mod tests {
             test_hooks::FILE_SIZE_CALLS.with(|c| c.get()),
         );
         test_hooks::reset();
-        assert!(file_size > 0, "the file grew inside a hold, so the hook was reachable");
-        assert_eq!(len, 0, "redb read the file's size inside a hold");
+        let set_len = file_size - len;
+        assert!(set_len > 0, "the file grew inside a hold, so the hook was reachable");
+        assert_eq!(
+            len, set_len,
+            "redb reads the file's size once per resize inside a hold, and nowhere else"
+        );
 
         // And the hook sees a `len` when one happens: opening a database reads
         // the file's size, here under a meter installed for the purpose.

@@ -801,22 +801,35 @@ impl Engine {
         // file, so a repair is reported only for a file that held a database.
         let existing = file.metadata()?.len() > 0;
         let health = std::sync::Arc::new(crate::health::StorageHealth::default());
-        // The backend takes the exclusive lock and writes nothing. What the
-        // check read is read again under that lock, and only then is anything
+        #[cfg(test)]
+        if let Some(call) = crate::hold_meter::test_hooks::ARM_AT_OPEN.with(|a| a.take()) {
+            health.arm(call);
+        }
+        // The store's lock is taken here, before anything is written, and
+        // held until redb closes the backend ([`crate::store_lock`]). What the
+        // check read is read again under it, and only then is anything
         // written: the sidecar first, then whatever redb's open writes.
         let locked = file.try_clone()?;
-        let backend = crate::hold_meter::MeteredBackend::new(
-            redb::backends::FileBackend::new(file).map_err(|e| match e {
-                redb::DatabaseError::DatabaseAlreadyOpen => crate::format::in_use(path),
-                e => e.into(),
-            })?,
-            std::sync::Arc::clone(&health),
-        );
+        let already_open = |e: redb::DatabaseError| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => crate::format::in_use(path),
+            e => e.into(),
+        };
+        let inner = redb::backends::FileBackend::new(file).map_err(already_open)?;
+        let lock = crate::store_lock::StoreLock::take(&locked, &inner).map_err(already_open)?;
+        let grant = lock.grant();
+        let backend =
+            crate::hold_meter::MeteredBackend::new(inner, lock, std::sync::Arc::clone(&health));
         cleared.confirm_under_lock(path, &locked)?;
         drop(locked);
-        if let Some(sidecar) = cleared.sidecar_before_open() {
-            crate::format::write_sidecar(path, &sidecar)?;
-        }
+        #[cfg(test)]
+        crate::store_lock::test_hooks::before_sidecar_write(path);
+        let sidecar_written = match cleared.sidecar_before_open() {
+            Some(sidecar) => {
+                crate::format::write_sidecar(path, &sidecar)?;
+                true
+            }
+            None => false,
+        };
         let mut builder = Database::builder();
         if let Some(bytes) = cache_bytes {
             builder.set_cache_size(bytes);
@@ -842,8 +855,35 @@ impl Engine {
             });
         }
         // The one read-write open of a store, behind the check (ADR-190).
+        // A panic in redb's open is a damaged store, refused like its errors
+        // (`format::after_panicked_open`); the backend, and with it the lock,
+        // is dropped as it unwinds.
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         #[allow(clippy::disallowed_methods)]
-        let db = builder.create_with_backend(backend)?;
+        let open = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder.create_with_backend(backend)
+        }));
+        #[cfg(test)]
+        crate::format::redb_time::add(started.elapsed());
+        let db = match open {
+            Ok(open) => open.map_err(|e| cleared.after_failed_open(path, e, sidecar_written))?,
+            Err(panic) => {
+                return Err(cleared.after_panicked_open(path, &*panic, sidecar_written));
+            }
+        };
+        // redb opens unlocked when it never asks for the lock; the backend
+        // holds it regardless, but a redb that stopped asking has changed how
+        // it locks, and the store is not used until the backend is changed
+        // to match.
+        if !grant.granted() {
+            drop(db);
+            return Err(StorageError::Database(format!(
+                "redb opened {} without asking the storage backend for its lock; this build's \
+                 locking does not match its redb (ADR-190)",
+                path.display()
+            )));
+        }
         if repairing.load(std::sync::atomic::Ordering::Relaxed) {
             warn!(
                 elapsed_ms = opened.elapsed().as_millis() as u64,

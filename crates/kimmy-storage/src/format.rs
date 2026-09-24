@@ -48,12 +48,12 @@ use crate::error::{Result, StorageError};
 use crate::tables;
 
 /// The redb major.minor this build is compiled against. `Cargo.toml` pins redb
-/// to `~4.1`, so a patch release is the only kind that can arrive unnoticed; a
+/// to `~4.3`, so a patch release is the only kind that can arrive unnoticed; a
 /// test holds this constant to `Cargo.lock`.
-pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 1);
+pub const REDB_MAJOR_MINOR: (u64, u64) = (4, 3);
 
-/// The file-format byte redb 4.1 writes in each commit slot. A test creates a
-/// store and reads it back.
+/// The file-format byte redb 4.3 writes in each commit slot, the same as 4.1's.
+/// A test creates a store and reads it back.
 pub const REDB_FILE_FORMAT: u8 = 3;
 
 /// META key holding the redb major.minor that last opened the store for
@@ -64,6 +64,22 @@ pub(crate) const META_REDB_VERSION: &str = "redb_version";
 const HEADER_LEN: usize = 320;
 const MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 const SLOT_OFFSETS: [usize; 2] = [64, 192];
+/// The god byte, whose bit 0 names the primary slot, and the region geometry
+/// after it (redb 4.3, `header.rs:13-63`).
+const GOD_BYTE: usize = MAGIC.len();
+const PRIMARY_BIT: u8 = 1;
+const TWO_PHASE_COMMIT: u8 = 4;
+const PAGE_SIZE_OFFSET: usize = 12;
+const REGION_HEADER_PAGES_OFFSET: usize = 16;
+const REGION_MAX_DATA_PAGES_OFFSET: usize = 20;
+/// A commit slot's two B-tree roots, as (non-null flag, page number) offsets
+/// within the slot: the user root, then the system root (`header.rs:65-73`).
+/// The slot's other page number, formerly the freed tree's root, is unused and
+/// never read.
+const SLOT_ROOTS: [(usize, usize); 2] = [(1, 8), (2, 40)];
+/// How the way out of a damaged store is put, in every refusal of one.
+const DAMAGED_WAY_OUT: &str = "Restore it from a backup, or on a cluster member wipe the data \
+     directory and let it catch up from its peers (see operations.md, \"A damaged store\")";
 
 /// The versions a build writes, and so the newest it may open. Injectable, so a
 /// test can be an older build.
@@ -122,7 +138,11 @@ enum Prior {
 pub struct Cleared {
     prior: Prior,
     header: Option<Vec<u8>>,
+    /// The database's length when it was checked.
+    len: u64,
     sidecar: Option<Vec<u8>>,
+    /// The sidecar's modification time, so a sidecar put back is as it was.
+    sidecar_modified: Option<std::time::SystemTime>,
     pub(crate) build: BuildVersions,
 }
 
@@ -149,7 +169,9 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
         return Ok(Cleared {
             prior: Prior::Fresh,
             header: None,
+            len,
             sidecar: None,
+            sidecar_modified: None,
             build: build.clone(),
         });
     }
@@ -158,6 +180,7 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
     }
     let header = read_header(&mut std::fs::File::open(database)?)?;
     check_header(database, &header, build)?;
+    check_roots(database, &header, len)?;
 
     let sidecar_bytes = match std::fs::read(&sidecar_file) {
         Ok(bytes) => Some(bytes),
@@ -170,9 +193,20 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
             check_sidecar(database, &sidecar, build)?;
             Prior::Sidecar(sidecar)
         }
-        None => read_only_fallback(database, build)?,
+        None => read_only_fallback_unless_it_panics(database, build)?,
     };
-    Ok(Cleared { prior, header: Some(header), sidecar: sidecar_bytes, build: build.clone() })
+    let sidecar_modified = match sidecar_bytes {
+        Some(_) => std::fs::metadata(&sidecar_file).and_then(|m| m.modified()).ok(),
+        None => None,
+    };
+    Ok(Cleared {
+        prior,
+        header: Some(header),
+        len,
+        sidecar: sidecar_bytes,
+        sidecar_modified,
+        build: build.clone(),
+    })
 }
 
 fn read_header(file: &mut std::fs::File) -> Result<Vec<u8>> {
@@ -200,6 +234,88 @@ fn check_header(database: &Path, header: &[u8], build: &BuildVersions) -> Result
         }
     }
     Ok(())
+}
+
+/// The byte ranges of the roots in the slot at `slot`, with each page's order,
+/// computed as redb 4.3 computes them, or `None` for a file format whose slot
+/// layout this build does not know.
+///
+/// redb 4.3 decodes a page number in `PageNumber::from_le_bytes`
+/// (`base.rs:97-108`): the order is the top five bits, the region the 20 bits
+/// above bit 20, and the index the low bits under a mask shrunk by the order.
+/// `TransactionalMemory::get_page` (`page_manager.rs:1905-1913`) reads it at
+/// `PageNumber::address_range` (`base.rs:142-161`), called with the page size
+/// as the data section's offset, the full region's length, and its header's
+/// length (`page_manager.rs:1216-1217`, `layout.rs:48-72`). The sums are in
+/// `u128`, so a damaged header cannot overflow them.
+fn root_ranges(header: &[u8], slot: usize) -> Option<Vec<(std::ops::Range<u128>, u32)>> {
+    if SLOT_OFFSETS.iter().any(|&o| header[o] != REDB_FILE_FORMAT) {
+        return None;
+    }
+    let u32_at =
+        |o: usize| u128::from(u32::from_le_bytes(header[o..o + 4].try_into().expect("4 bytes")));
+    let page_size = u32_at(PAGE_SIZE_OFFSET);
+    let region_header = u32_at(REGION_HEADER_PAGES_OFFSET) * page_size;
+    let region_len = region_header + u32_at(REGION_MAX_DATA_PAGES_OFFSET) * page_size;
+    let mut ranges = Vec::new();
+    for (non_null, at) in SLOT_ROOTS {
+        if header[slot + non_null] == 0 {
+            continue;
+        }
+        let raw = u64::from_le_bytes(header[slot + at..slot + at + 8].try_into().expect("8 bytes"));
+        let order = (raw >> 59) as u32;
+        let index = u128::from(raw & (0x000F_FFFF >> order));
+        let region = u128::from((raw >> 20) & 0x000F_FFFF);
+        let page_bytes = (1u128 << order) * page_size;
+        let start = page_size + region * region_len + region_header + index * page_bytes;
+        ranges.push((start..start + page_bytes, order));
+    }
+    Some(ranges)
+}
+
+/// The first root in the slot at `slot` that ends past `len`.
+fn root_past_end(header: &[u8], slot: usize, len: u64) -> Option<(std::ops::Range<u128>, u32)> {
+    root_ranges(header, slot)?.into_iter().find(|(range, _)| range.end > u128::from(len))
+}
+
+/// Refuse a store whose commit slot names a root page that ends past the
+/// file, where redb would read it.
+///
+/// **This exists because of redb 4.3.0, and is to be removed with it.** redb
+/// 4.3 refuses a root of order above 20 before reading it, but one of order 20
+/// or less it reads into a zero-filled buffer of the page's length first, up to
+/// 4 GiB, and only then fails at the file's end. Under a 2 GiB memory limit
+/// that start is OOM-killed rather than refused. Reported upstream at
+/// https://github.com/cberner/redb/issues/1503. Once kimmydb depends on a redb that refuses such a page
+/// without allocating it, delete this check, `root_ranges` and their tests:
+/// `format::tests::redb_itself_still_allocates_for_a_root_page_past_eof`
+/// fails on the first redb that does.
+///
+/// Which slot redb reads decides what is checked, as redb 4.3 decides it
+/// (`header.rs`, `select_primary_slot`). With the two-phase bit, which every
+/// clean close sets, redb reads the primary slot or refuses the store, so the
+/// primary's roots must fit. Without it, redb picks between the slots by their
+/// checksums, which this does not compute; the store is refused only when
+/// both slots name a root past the end, since then whichever redb picks would
+/// allocate. A torn primary slot on a store that crashed is redb's to repair
+/// from the secondary.
+fn check_roots(database: &Path, header: &[u8], len: u64) -> Result<()> {
+    let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+    let Some((range, order)) = root_past_end(header, primary, len) else { return Ok(()) };
+    let two_phase = header[GOD_BYTE] & TWO_PHASE_COMMIT != 0;
+    let secondary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT) ^ 1];
+    if !two_phase && root_past_end(header, secondary, len).is_none() {
+        return Ok(());
+    }
+    let which = if two_phase { "primary commit slot" } else { "commit slots both" };
+    Err(refused(
+        database,
+        format!(
+            "its {which} name a root page past the file's end (order {order}, bytes \
+             {}..{}, file {len} bytes), so it is damaged. {DAMAGED_WAY_OUT}",
+            range.start, range.end
+        ),
+    ))
 }
 
 fn parse_sidecar(path: &Path, bytes: &[u8]) -> Result<Sidecar> {
@@ -254,6 +370,61 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
     }
 }
 
+/// [`read_only_fallback`], with a panic in redb refused as damage.
+///
+/// **This exists because of redb 4.3.0, and is to be removed with it.** A
+/// primary slot that verifies but names a root of the wrong order, one that
+/// still lies inside the file, makes redb 4.3 panic in its first tree read
+/// (`btree.rs:1112`, `types.rs:721`) rather than return `Corrupted`. A
+/// read-only open never writes, and no sidecar has been written yet. The same
+/// holds for the read-write open ([`Cleared::after_panicked_open`]). Reported
+/// upstream at https://github.com/cberner/redb/issues/1505. Once a redb release returns an error there,
+/// `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
+/// fails, and both catches and that test go.
+fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -> Result<Prior> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_only_fallback(database, build)
+    }));
+    #[cfg(test)]
+    redb_time::add(started.elapsed());
+    match read {
+        Ok(read) => read,
+        Err(panic) => Err(refused(database, redb_panicked(&*panic))),
+    }
+}
+
+/// How long redb's opens took on this thread: the tests bound a refusal by
+/// redb's own time, not by the check's reads and fsyncs around it.
+#[cfg(test)]
+pub(crate) mod redb_time {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static SPENT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub fn add(spent: Duration) {
+        SPENT.with(|s| s.set(s.get() + spent));
+    }
+
+    pub fn take() -> Duration {
+        SPENT.with(|s| s.replace(Duration::ZERO))
+    }
+}
+
+/// Why a store redb panicked on is refused.
+pub(crate) fn redb_panicked(panic: &(dyn std::any::Any + Send)) -> String {
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into());
+    format!("redb panicked reading it ({message}), so it is damaged. {DAMAGED_WAY_OUT}")
+}
+
 fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
     match redb::Builder::new().open_read_only(database) {
         Ok(db) => {
@@ -299,8 +470,39 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(in_use(database)),
         Err(e) => Err(refused(
             database,
-            format!("it could not be read before opening it for writing: {e}"),
+            header_refusal(&e).unwrap_or_else(|| {
+                format!("it could not be read before opening it for writing: {e}")
+            }),
         )),
+    }
+}
+
+/// Why redb refused a store as damaged (`Corrupted`), or as an older file
+/// format it would upgrade by writing (`UpgradeRequired`).
+///
+/// In redb 4.3 the header's refusals come from
+/// `TransactionalMemory::read_header`, which runs after the open's lock and
+/// before anything is written: `Corrupted` from
+/// `UnrepairedDatabaseHeader::from_bytes` (page size, region counts, the slot
+/// format byte) and `finalize` (the file length against the layout, the
+/// primary slot's checksum), `UpgradeRequired` from
+/// `TransactionHeader::from_bytes`. The header is written back only after
+/// `finalize` returns. On a clean store, the page-order check that refuses a
+/// slot naming too large a root page (`TransactionalMemory::get_page`) runs in
+/// the first tree read, before `begin_writable` writes. A `Corrupted` from a
+/// tree walk during a repair can follow a write, which is why
+/// [`Cleared::after_failed_open`] also looks at the file.
+fn header_refusal(error: &redb::DatabaseError) -> Option<String> {
+    match error {
+        redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => {
+            Some(format!("redb refused it as damaged ({why}). {DAMAGED_WAY_OUT}"))
+        }
+        redb::DatabaseError::UpgradeRequired(format) => Some(format!(
+            "it is in redb file format {format}, which redb would upgrade by writing to it. \
+             Start the build that wrote it, or restore a backup (see operations.md, \"Rolling \
+             back, and kimmy.format\")"
+        )),
+        _ => None,
     }
 }
 
@@ -321,6 +523,105 @@ fn refused(database: &Path, why: String) -> StorageError {
 }
 
 impl Cleared {
+    /// What a failed read-write open returns, and whether the sidecar written
+    /// before it is put back.
+    ///
+    /// The sidecar goes on disk before redb's open on purpose: if redb writes
+    /// to the store and the process dies, an older build must refuse it. So it
+    /// is put back only when redb wrote nothing: a refusal at the header
+    /// ([`header_refusal`]), with the header and the length still what the
+    /// check read. Any other failure keeps it.
+    pub(crate) fn after_failed_open(
+        &self,
+        database: &Path,
+        error: redb::DatabaseError,
+        sidecar_written: bool,
+    ) -> StorageError {
+        let Some(why) = header_refusal(&error) else { return error.into() };
+        self.refuse_unwritten(database, why, sidecar_written).unwrap_or_else(|| error.into())
+    }
+
+    /// What a read-write open that panicked in redb returns, by the same rule
+    /// as [`Self::after_failed_open`]. In redb 4.3 the panics a damaged slot
+    /// causes come from `Database::get_allocator_state_table` (`db.rs:1643`),
+    /// which reads, after `TransactionalMemory::new` (`db.rs:1631`), which
+    /// writes the header back only for a store that needs recovery, and before
+    /// `begin_writable` (`db.rs:1672`), the first write on a clean store. So a
+    /// clean store is unwritten; one that needed recovery may not be, and the
+    /// file says which.
+    pub(crate) fn after_panicked_open(
+        &self,
+        database: &Path,
+        panic: &(dyn std::any::Any + Send),
+        sidecar_written: bool,
+    ) -> StorageError {
+        let why = redb_panicked(panic);
+        self.refuse_unwritten(database, why.clone(), sidecar_written)
+            .unwrap_or_else(|| StorageError::Database(format!("{}: {why}", database.display())))
+    }
+
+    /// The refusal of a store redb wrote nothing to, with the sidecar written
+    /// before its open put back; `None` if the store is no longer as the check
+    /// read it, and the sidecar stays.
+    ///
+    /// redb's failed open has closed its backend, and with it the store's
+    /// lock, so the lock is taken again for the look at the file and the
+    /// put-back, and let go after. If it cannot be, another process has the
+    /// store, this build's sidecar stays, which is the safe direction, and the
+    /// store is refused as damaged all the same.
+    fn refuse_unwritten(
+        &self,
+        database: &Path,
+        why: String,
+        sidecar_written: bool,
+    ) -> Option<StorageError> {
+        if !sidecar_written {
+            return self.store_unchanged(database).then(|| refused(database, why));
+        }
+        #[cfg(test)]
+        crate::store_lock::test_hooks::before_put_back(database);
+        // Unlocked, the file cannot be looked at for what redb wrote, so this
+        // refusal claims nothing about it, unlike [`refused`].
+        let Some(relocked) = crate::store_lock::StoreLock::relock(database) else {
+            return Some(StorageError::RefusedStore(format!(
+                "{} is not opened by this build: {why}. It could not be locked again to check \
+                 it, so {} keeps this build's",
+                database.display(),
+                sidecar_path(database).display()
+            )));
+        };
+        if !self.store_unchanged(database) {
+            return None;
+        }
+        {
+            let path = sidecar_path(database);
+            let put_back = match &self.sidecar {
+                Some(bytes) => write_sidecar_bytes(database, bytes, self.sidecar_modified),
+                None => std::fs::remove_file(&path).map_err(Into::into),
+            };
+            if let Err(e) = put_back {
+                drop(relocked);
+                return Some(StorageError::RefusedStore(format!(
+                    "{} is not opened by this build: {why}. Nothing in it was written, but the \
+                     sidecar written before redb's open could not be put back ({e}); restore \
+                     {} from the backup",
+                    database.display(),
+                    path.display()
+                )));
+            }
+        }
+        drop(relocked);
+        Some(refused(database, why))
+    }
+
+    /// Whether the database's header and length are still what the check read.
+    fn store_unchanged(&self, database: &Path) -> bool {
+        let Some(checked) = &self.header else { return false };
+        let Ok(mut file) = std::fs::File::open(database) else { return false };
+        let len = file.metadata().map(|m| m.len()).ok();
+        len == Some(self.len) && read_header(&mut file).ok().as_ref() == Some(checked)
+    }
+
     /// Read the header and the sidecar again through the locked handle, and
     /// refuse if either changed since the check: another process got there in
     /// between.
@@ -342,6 +643,10 @@ impl Cleared {
         let sidecar_matters = !matches!(self.prior, Prior::Fresh);
         if header != self.header || (sidecar_matters && sidecar != self.sidecar) {
             return Err(refused(database, "it changed while it was being checked".into()));
+        }
+        // The same header, against the file's length now.
+        if let Some(header) = &header {
+            check_roots(database, header, len)?;
         }
         Ok(())
     }
@@ -378,16 +683,29 @@ impl Cleared {
 /// Write the sidecar atomically: a temporary file, synced, renamed, and the
 /// directory synced.
 pub(crate) fn write_sidecar(database: &Path, sidecar: &Sidecar) -> Result<()> {
+    let body = toml::to_string(sidecar)
+        .map_err(|e| StorageError::Database(format!("encoding the store's sidecar: {e}")))?;
+    write_sidecar_bytes(database, body.as_bytes(), None)
+}
+
+/// [`write_sidecar`], of bytes already encoded: the same temporary, sync and
+/// rename, and the modification time `modified` if one is given.
+fn write_sidecar_bytes(
+    database: &Path,
+    body: &[u8],
+    modified: Option<std::time::SystemTime>,
+) -> Result<()> {
     use std::io::Write;
     let path = sidecar_path(database);
     // Named for the sidecar and this process: no other file's temporary, and
     // no concurrent writer, shares it.
     let temp = temporary(&path);
-    let body = toml::to_string(sidecar)
-        .map_err(|e| StorageError::Database(format!("encoding the store's sidecar: {e}")))?;
     {
         let mut file = std::fs::File::create(&temp)?;
-        file.write_all(body.as_bytes())?;
+        file.write_all(body)?;
+        if let Some(modified) = modified {
+            file.set_modified(modified)?;
+        }
         file.sync_all()?;
     }
     std::fs::rename(&temp, &path)?;
@@ -924,5 +1242,897 @@ mod tests {
         let sidecar = read_sidecar(&restored).expect("regenerated");
         assert_eq!(major_minor(&sidecar.redb_version), Some(older_redb.redb));
         drop(Engine::open_as(&restored, None, &older_redb).expect("the restoring build opens it"));
+    }
+
+    // A damaged header, and the store's lock (redb 4.3).
+
+    /// The damage the `redb_damage` example does to a real store, so a test
+    /// round's fixture and these cannot diverge.
+    mod damage {
+        #![allow(dead_code)]
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/redb_damage/damage.rs"));
+    }
+    use damage::{GOD_BYTE, PRIMARY_BIT, RECOVERY_REQUIRED, TWO_PHASE_COMMIT};
+
+    /// What redb 4.3 answers a clean store whose primary slot fails its
+    /// checksum: a clean close commits with two-phase commit, and such a
+    /// primary is never passed over for the secondary.
+    const PRIMARY_CORRUPTED: &str = "Primary is corrupted despite 2-phase commit";
+    /// What this build answers a primary slot naming a root page past the
+    /// file's end, before redb reads it ([`check_roots`]).
+    const ROOT_PAST_END: &str = "past the file's end";
+    /// What this build answers a store redb panicked on.
+    const REDB_PANICKED: &str = "redb panicked reading it";
+    /// The most a refused open may make the child's resident set: an open
+    /// that allocates the page it was pointed at blows through it.
+    const REFUSAL_MAX_RSS_KIB: u64 = 256 * 1024;
+    /// How long a child is given to open a store before it is killed. The
+    /// open itself must answer within a second; the rest is a debug test
+    /// binary starting.
+    const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+    const PROBE_OPEN: &str = "KIMMY_FORMAT_PROBE_OPEN";
+    const PROBE_HOLD: &str = "KIMMY_FORMAT_PROBE_HOLD";
+    const PROBE_PLAIN_REDB: &str = "KIMMY_FORMAT_PROBE_PLAIN_REDB";
+
+    fn edit_store(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        edit(&mut bytes);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Both commit slots' bytes 1..128 set to 0xFF, the format byte left at 3:
+    /// the store that made redb 4.1 allocate 8 TiB and fill it.
+    fn damage_both_slots(path: &Path) {
+        edit_store(path, |b| {
+            for slot in SLOT_OFFSETS {
+                b[slot + 1..slot + 128].fill(0xFF);
+            }
+        });
+    }
+
+    /// One byte: the primary slot's system-root page order set to `order`, a
+    /// page of 2^order pages. The slot's checksum no longer matches.
+    fn damage_page_order(path: &Path, order: u8) {
+        edit_store(path, |b| {
+            damage::set_primary_page_order(b, order, false).unwrap();
+        });
+    }
+
+    /// The same byte, with the slot's checksum recomputed: only a check of the
+    /// page order itself can refuse it.
+    fn damage_page_order_validly(path: &Path, order: u8) {
+        edit_store(path, |b| {
+            let change = damage::set_primary_page_order(b, order, true).unwrap();
+            assert!(damage::slot_checksum_valid(b, change.offset));
+        });
+    }
+
+    /// A clean store's close commits with two-phase commit, which is what makes
+    /// redb refuse a damaged primary rather than open the secondary. A redb
+    /// that stops doing so fails here, not in a refusal that went missing.
+    fn assert_two_phase(path: &Path, what: &str) {
+        let god = std::fs::read(path).unwrap()[GOD_BYTE];
+        assert!(god & TWO_PHASE_COMMIT != 0, "{what}: god byte {god:#04x} has no two-phase bit");
+    }
+
+    fn damage_secondary_slot(path: &Path) {
+        edit_store(path, |b| {
+            let secondary = SLOT_OFFSETS[usize::from(b[GOD_BYTE] & PRIMARY_BIT) ^ 1];
+            b[secondary + 1..secondary + 128].fill(0xFF);
+        });
+    }
+
+    /// A file's digest, length and modification time.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Fingerprint {
+        sha256: Vec<u8>,
+        len: u64,
+        modified: std::time::SystemTime,
+    }
+
+    fn fingerprint(path: &Path) -> Option<Fingerprint> {
+        use sha2::Digest;
+        let bytes = std::fs::read(path).ok()?;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Fingerprint {
+            sha256: sha2::Sha256::digest(&bytes).to_vec(),
+            len: meta.len(),
+            modified: meta.modified().unwrap(),
+        })
+    }
+
+    /// The store's and its sidecar's.
+    fn fingerprints(path: &Path) -> (Option<Fingerprint>, Option<Fingerprint>) {
+        (fingerprint(path), fingerprint(&sidecar_path(path)))
+    }
+
+    /// The sidecars a damaged store is tried with: none; this build's, which
+    /// the open does not rewrite; and one an older redb stamped, which it
+    /// rewrites before redb's open and must put back.
+    #[derive(Clone, Copy, Debug)]
+    enum SidecarCase {
+        None,
+        Ours,
+        OlderRedb,
+    }
+
+    const SIDECAR_CASES: [SidecarCase; 3] =
+        [SidecarCase::None, SidecarCase::Ours, SidecarCase::OlderRedb];
+
+    fn with_sidecar_case(path: &Path, case: SidecarCase) {
+        match case {
+            SidecarCase::None => std::fs::remove_file(sidecar_path(path)).unwrap(),
+            SidecarCase::Ours => {}
+            SidecarCase::OlderRedb => with_sidecar(path, |s| s.redb_version = "4.1".into()),
+        }
+    }
+
+    struct ChildOpen {
+        /// How long redb's opens took in the child ([`redb_time`]).
+        redb_ms: u64,
+        max_rss_kib: u64,
+        outcome: String,
+    }
+
+    /// Run this test binary again, as a child running [`child_probe`] with
+    /// `var` set to `path`, and return what it printed. A child still running
+    /// after `limit` is killed, and the test fails: a regression to the hang
+    /// neither hangs the suite nor keeps allocating.
+    fn run_child(var: &str, path: &Path, limit: std::time::Duration) -> String {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
+            .env(var, path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "opening {} did not finish within {limit:?}, so it was killed",
+                    path.display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let (mut out, mut err) = (String::new(), String::new());
+        child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+        child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        match out.lines().find_map(|l| l.split_once("PROBE ").map(|(_, rest)| rest)) {
+            Some(line) => line.to_string(),
+            None => panic!(
+                "the child opening {} ended {status} without a result\nstdout: {out}\nstderr: {err}",
+                path.display()
+            ),
+        }
+    }
+
+    fn open_in_child(path: &Path) -> ChildOpen {
+        let line = run_child(PROBE_OPEN, path, CHILD_LIMIT);
+        let mut parts = line.splitn(3, ' ');
+        let mut number = || parts.next().unwrap().parse().unwrap();
+        let (redb_ms, max_rss_kib) = (number(), number());
+        ChildOpen { redb_ms, max_rss_kib, outcome: parts.next().unwrap().to_string() }
+    }
+
+    /// This process's peak resident set, in KiB.
+    fn max_rss_kib() -> u64 {
+        // SAFETY: `getrusage` fills the struct it is given and reads nothing.
+        let usage = unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+            usage
+        };
+        let max = usage.ru_maxrss as u64;
+        if cfg!(target_vendor = "apple") { max / 1024 } else { max }
+    }
+
+    /// The child side of [`run_child`]. Does nothing unless one of its
+    /// variables is set.
+    #[test]
+    fn child_probe() {
+        use std::io::Write as _;
+        if let Ok(path) = std::env::var(PROBE_OPEN) {
+            let outcome = match Engine::open(Path::new(&path)) {
+                Ok(engine) => {
+                    let found = engine
+                        .get_collection("shop", "orders")
+                        .ok()
+                        .and_then(|c| engine.get(&c, &kimmy_core::DocId::String("a".into())).ok())
+                        .flatten()
+                        .is_some();
+                    format!("opened found={found}")
+                }
+                Err(StorageError::RefusedStore(why)) => format!("refused {why}"),
+                Err(StorageError::StoreInUse(why)) => format!("in_use {why}"),
+                Err(other) => format!("error {other}"),
+            };
+            // On a line of its own: libtest has already printed the test's name.
+            println!("\nPROBE {} {} {outcome}", redb_time::take().as_millis(), max_rss_kib());
+        } else if let Ok(path) = std::env::var(PROBE_PLAIN_REDB) {
+            // Plain redb, nothing of this build's in front of it.
+            let opened = redb::Builder::new().open_read_only(&path).map(drop);
+            let outcome = match opened {
+                Ok(()) => "opened".to_string(),
+                Err(e) => format!("error {e:?}"),
+            };
+            println!("\nPROBE 0 {} {outcome}", max_rss_kib());
+        } else if let Ok(path) = std::env::var(PROBE_HOLD) {
+            let engine = Engine::open(Path::new(&path)).unwrap();
+            let c = engine.create_collection("shop", "orders").unwrap();
+            engine.insert(&c, bson::doc! { "_id": "a" }).unwrap();
+            println!("\nPROBE ready");
+            std::io::stdout().flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            drop(engine);
+        }
+    }
+
+    /// Opened in a child, refused as damaged for `reason` within a second, and
+    /// the store and its sidecar unchanged: digest, length and modification
+    /// time.
+    fn assert_refused_as_damaged_untouched(path: &Path, what: &str, reason: &str) {
+        let before = fingerprints(path);
+        let opened = open_in_child(path);
+        // The bounds first: an open that allocated the page and then failed
+        // some other way is the regression these tests exist for.
+        assert!(
+            opened.max_rss_kib < REFUSAL_MAX_RSS_KIB,
+            "{what}: the open peaked at {} KiB resident: {}",
+            opened.max_rss_kib,
+            opened.outcome
+        );
+        // redb's own time: the sidecar's write and put-back are fsyncs this
+        // build makes around it, and on a loaded machine they alone can take
+        // a second. The whole open is bounded by the child's kill.
+        assert!(opened.redb_ms < 1_000, "{what}: redb answered after {} ms", opened.redb_ms);
+        assert!(opened.outcome.starts_with("refused "), "{what}: {}", opened.outcome);
+        assert!(
+            opened.outcome.contains("nothing in it was changed")
+                && opened.outcome.contains("damaged")
+                && opened.outcome.contains(reason)
+                && opened.outcome.contains(&path.display().to_string()),
+            "{what}: {}",
+            opened.outcome
+        );
+        assert!(fingerprints(path) == before, "{what}: the store or its sidecar changed");
+    }
+
+    #[test]
+    fn a_store_with_both_commit_slots_damaged_is_refused_within_a_second_untouched() {
+        for case in SIDECAR_CASES {
+            let (_dir, path) = a_store();
+            with_sidecar_case(&path, case);
+            damage_both_slots(&path);
+            let what = format!("both slots, sidecar {case:?}");
+            assert_two_phase(&path, &what);
+            assert_refused_as_damaged_untouched(&path, &what, ROOT_PAST_END);
+        }
+    }
+
+    #[test]
+    fn one_byte_of_page_order_in_the_primary_slot_is_refused_within_a_second_untouched() {
+        for order in [31, 24] {
+            for case in SIDECAR_CASES {
+                let (_dir, path) = a_store();
+                with_sidecar_case(&path, case);
+                damage_page_order(&path, order);
+                let what = format!("page order {order}, sidecar {case:?}");
+                assert_two_phase(&path, &what);
+                assert_refused_as_damaged_untouched(&path, &what, reason_for(order));
+            }
+        }
+    }
+
+    /// Which check refuses a primary slot whose root's order was changed and
+    /// whose checksum was not: a root that ends past the file is this build's
+    /// to refuse, before redb reads anything; one that still fits is redb's,
+    /// for the checksum.
+    fn reason_for(order: u8) -> &'static str {
+        if order >= 2 { ROOT_PAST_END } else { PRIMARY_CORRUPTED }
+    }
+
+    /// 4 GiB and 8 GiB pages, which redb 4.1 allocated and then failed to read,
+    /// and a page of two, which made it panic.
+    #[test]
+    fn smaller_page_orders_in_the_primary_slot_are_refused_too() {
+        for order in [21, 20, 1] {
+            for case in SIDECAR_CASES {
+                let (_dir, path) = a_store();
+                with_sidecar_case(&path, case);
+                damage_page_order(&path, order);
+                let what = format!("page order {order}, sidecar {case:?}");
+                assert_two_phase(&path, &what);
+                assert_refused_as_damaged_untouched(&path, &what, reason_for(order));
+            }
+        }
+    }
+
+    /// A primary slot that verifies, naming a root page past the file's end.
+    /// Order 31 is the 8 TiB page redb 4.1 allocated and filled; order 21 is
+    /// past the largest redb 4.3 reads. Order 20, 4 GiB, redb 4.3 still
+    /// allocates and fills before its read fails at the file's end, which a
+    /// start under a smaller memory limit does not survive; only this build's
+    /// check stands between the open and that allocation, and the child's peak
+    /// resident set is what shows it did.
+    #[test]
+    fn a_valid_primary_slot_naming_a_root_page_past_the_file_is_refused_untouched() {
+        for order in [20, 21, 31] {
+            for case in SIDECAR_CASES {
+                let (_dir, path) = a_store();
+                with_sidecar_case(&path, case);
+                damage_page_order_validly(&path, order);
+                let what = format!("valid slot, page order {order}, sidecar {case:?}");
+                assert_two_phase(&path, &what);
+                assert_refused_as_damaged_untouched(&path, &what, ROOT_PAST_END);
+            }
+        }
+    }
+
+    /// [`root_ranges`] mirrors redb's page arithmetic, so on stores redb
+    /// wrote, every root it computes lies inside the file, in both slots, and
+    /// at the first byte of each primary root is a B-tree page: redb's leaf
+    /// (1) or branch (2) type byte. A
+    /// redb that lays pages out differently fails this rather than letting the
+    /// check refuse good stores. Covered: a small store, one whose table tree's
+    /// root is a branch, one whose root leaf is a page of order above 0, and a
+    /// dirty store. A store of more than one region needs a file over 4 GiB,
+    /// and redb's region size is settable only inside redb's own tests.
+    #[test]
+    fn every_root_page_of_a_valid_store_lies_inside_it_where_redb_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_small_dir, small) = a_store();
+        let (_dirty_dir, dirty) = a_dirty_copy();
+        let branch = dir.path().join("branch.redb");
+        {
+            let db = redb::Database::create(&branch).unwrap();
+            let txn = db.begin_write().unwrap();
+            for i in 0..2_000 {
+                let name = format!("table-{i:05}");
+                txn.open_table(redb::TableDefinition::<u64, u64>::new(&name)).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let big_leaf = dir.path().join("big_leaf.redb");
+        {
+            let db = redb::Database::create(&big_leaf).unwrap();
+            let txn = db.begin_write().unwrap();
+            let name = "n".repeat(40_000);
+            txn.open_table(redb::TableDefinition::<u64, u64>::new(&name)).unwrap();
+            txn.commit().unwrap();
+        }
+        let mut orders = Vec::new();
+        let mut types = Vec::new();
+        for path in [&small, &dirty, &branch, &big_leaf] {
+            let bytes = std::fs::read(path).unwrap();
+            let primary = SLOT_OFFSETS[usize::from(bytes[GOD_BYTE] & PRIMARY_BIT)];
+            let secondary = SLOT_OFFSETS[usize::from(bytes[GOD_BYTE] & PRIMARY_BIT) ^ 1];
+            for (range, _) in root_ranges(&bytes[..HEADER_LEN], secondary).expect("format 3") {
+                assert!(
+                    range.end <= bytes.len() as u128,
+                    "{}: secondary {range:?}",
+                    path.display()
+                );
+            }
+            let ranges = root_ranges(&bytes[..HEADER_LEN], primary).expect("format 3");
+            assert!(!ranges.is_empty(), "{}: no root", path.display());
+            for (range, order) in ranges {
+                assert!(range.end <= bytes.len() as u128, "{}: {range:?}", path.display());
+                let first = bytes[range.start as usize];
+                assert!(
+                    first == 1 || first == 2,
+                    "{}: page type {first} at {range:?}",
+                    path.display()
+                );
+                orders.push(order);
+                types.push(first);
+            }
+            drop(Engine::open(path).ok());
+        }
+        assert!(orders.iter().any(|&o| o > 0), "no root of order above 0: {orders:?}");
+        assert!(types.contains(&2), "no branch root: {types:?}");
+    }
+
+    /// A store without the two-phase bit, whose two slots both name a root
+    /// past the file's end: whichever redb picks, it would allocate the page,
+    /// so it is refused.
+    #[test]
+    fn a_dirty_store_whose_slots_both_name_a_root_past_the_end_is_refused_untouched() {
+        let (_d, path) = a_dirty_copy();
+        edit_store(&path, |b| {
+            for slot in SLOT_OFFSETS {
+                // The system root's page order, in the slot's top byte of it.
+                b[slot + 47] = (b[slot + 47] & 0x07) | (20 << 3);
+            }
+        });
+        let god = std::fs::read(&path).unwrap()[GOD_BYTE];
+        assert!(god & TWO_PHASE_COMMIT == 0, "god byte {god:#04x}");
+        assert_refused_as_damaged_untouched(&path, "both slots, dirty", ROOT_PAST_END);
+    }
+
+    /// A primary slot that verifies and names a root inside the file, but of
+    /// the wrong order, makes redb 4.3 panic in its first tree read. The panic
+    /// is caught and the store refused as damaged, whichever open meets it: the
+    /// read-only fallback with no sidecar, the read-write open with one.
+    #[test]
+    fn a_verified_primary_root_of_the_wrong_order_is_refused_untouched() {
+        for case in SIDECAR_CASES {
+            let (_dir, path) = a_store();
+            with_sidecar_case(&path, case);
+            damage_page_order_validly(&path, 1);
+            let what = format!("valid slot, page order 1, sidecar {case:?}");
+            assert_two_phase(&path, &what);
+            assert_refused_as_damaged_untouched(&path, &what, REDB_PANICKED);
+        }
+    }
+
+    /// The sidecar is put back under the store's lock, taken again after redb's
+    /// failed open let it go. With another process holding the store at that
+    /// moment, this build's sidecar stays and the store is still refused as
+    /// damaged; with nothing holding it, the put-back lets the lock go after.
+    #[test]
+    fn the_sidecar_is_put_back_only_under_the_stores_lock() {
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        damage_page_order(&path, 1);
+        let holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hold = std::rc::Rc::clone(&holder);
+        crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| {
+            *p.borrow_mut() = Some(Box::new(move |path: &Path| {
+                let other = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+                other.try_lock().unwrap();
+                *hold.borrow_mut() = Some(other);
+            }));
+        });
+        let result = Engine::open(&path);
+        crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| p.borrow_mut().take());
+        assert!(holder.borrow().is_some(), "the probe ran");
+        match result {
+            Err(StorageError::RefusedStore(why)) => assert!(
+                why.contains("damaged")
+                    && why.contains("could not be locked again to check it")
+                    && !why.contains("nothing in it was changed"),
+                "{why}"
+            ),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened"),
+        }
+        let kept = read_sidecar(&path).unwrap();
+        assert_eq!(major_minor(&kept.redb_version), Some(REDB_MAJOR_MINOR), "this build's stays");
+        drop(holder.borrow_mut().take());
+
+        // Nothing holding it: put back, and the lock let go after.
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore(_))));
+        assert_eq!(read_sidecar(&path).unwrap().redb_version, "4.1", "put back");
+        std::fs::File::open(&path).unwrap().try_lock().expect("the put-back let the lock go");
+    }
+
+    /// After redb's read-write open panicked, the store's lock is gone: the
+    /// next open meets the damage again rather than a holder, and another
+    /// descriptor can lock the file.
+    #[test]
+    fn a_panic_in_redbs_open_releases_the_store() {
+        let (_dir, path) = a_store();
+        damage_page_order_validly(&path, 1);
+        for attempt in ["first", "second"] {
+            match Engine::open(&path) {
+                Err(StorageError::RefusedStore(why)) => {
+                    assert!(why.contains(REDB_PANICKED), "{attempt}: {why}")
+                }
+                Err(other) => panic!("{attempt}: refused with the wrong error: {other}"),
+                Ok(_) => panic!("{attempt}: opened"),
+            }
+        }
+        std::fs::File::open(&path).unwrap().try_lock().expect("nothing holds the store");
+    }
+
+    /// Why the catches around redb's opens exist, kept honest: redb 4.3
+    /// itself, with nothing in front of it, panics on a commit slot that
+    /// verifies and names a root of the wrong order inside the file, where it
+    /// should return an error. The store is a plain redb file of 500 rows.
+    /// Reported upstream at https://github.com/cberner/redb/issues/1505.
+    ///
+    /// **When a redb bump makes this fail, because both opens now return an
+    /// error, delete `read_only_fallback_unless_it_panics`,
+    /// `Cleared::after_panicked_open`, the catch in `Engine::open_cleared`,
+    /// this test and the tests of the catch together**, and the paragraph in
+    /// ADR-190's addendum that names them.
+    #[test]
+    fn redb_itself_still_panics_on_a_verified_root_of_the_wrong_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table =
+                    txn.open_table(redb::TableDefinition::<&str, &str>::new("t")).unwrap();
+                for i in 0..500 {
+                    table.insert(format!("key-{i}").as_str(), "value").unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        damage_page_order_validly(&path, 1);
+        let len = std::fs::metadata(&path).unwrap().len();
+        let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
+        let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+        assert!(root_past_end(&header, primary, len).is_none(), "the root lies inside the file");
+        let read_only =
+            std::panic::catch_unwind(|| redb::Builder::new().open_read_only(&path).map(drop));
+        let read_write = std::panic::catch_unwind(|| redb::Builder::new().open(&path).map(drop));
+        assert!(
+            read_only.is_err() && read_write.is_err(),
+            "redb no longer panics on a verified root of the wrong order: retire the catches \
+             around its opens (see this test's doc comment); read-only {read_only:?}, \
+             read-write {read_write:?}"
+        );
+    }
+
+    /// The roots are checked again under the lock, against the file's length
+    /// then: a store cut short after the check is refused before redb reads it.
+    #[test]
+    fn a_store_cut_short_after_the_check_is_refused_under_the_lock() {
+        let (_d, path) = a_dirty_copy();
+        let cleared = check_before_open(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..8192]).unwrap();
+        let before = fingerprints(&path);
+        match Engine::open_cleared(&path, None, cleared) {
+            Err(StorageError::RefusedStore(why)) => assert!(why.contains(ROOT_PAST_END), "{why}"),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a store cut short"),
+        }
+        assert!(fingerprints(&path) == before, "the store or its sidecar changed");
+    }
+
+    /// Why [`check_roots`] exists, kept honest: redb 4.3 itself, with nothing
+    /// in front of it, still allocates a root page that lies past the file's
+    /// end before it fails, rather than refusing it without allocating. Each
+    /// open runs plain redb in a child. The damaged file's root is of order
+    /// 12, 16 MiB, which keeps this test's own allocation small; order 20
+    /// takes the same path at 4 GiB. The child's peak resident set must rise
+    /// by at least half the page's size over the same child opening the file
+    /// undamaged. That is the allocation itself, whatever error follows it.
+    /// Half, not all: the undamaged open reads pages the failing one never
+    /// does, so the rise measured is a little under the page (16,240 KiB for
+    /// the 16,384 KiB page on macOS), while a redb that refused the page
+    /// without allocating it would rise by close to nothing.
+    ///
+    /// **When a redb bump makes this fail, because redb no longer allocates
+    /// such a page, delete `check_roots`, `root_ranges`, this test and the
+    /// tests of the check together**, and the paragraph in ADR-190's addendum
+    /// that names them. Reported upstream at
+    /// https://github.com/cberner/redb/issues/1503.
+    #[test]
+    fn redb_itself_still_allocates_for_a_root_page_past_eof() {
+        const ORDER: u8 = 12;
+        let page_kib = (4096u64 << ORDER) / 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = |name: &str| {
+            let path = dir.path().join(name);
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(redb::TableDefinition::<u64, u64>::new("t"))
+                .unwrap()
+                .insert(1, 1)
+                .unwrap();
+            txn.commit().unwrap();
+            path
+        };
+        let undamaged = plain("undamaged.redb");
+        let damaged = plain("damaged.redb");
+        damage_page_order_validly(&damaged, ORDER);
+        let len = std::fs::metadata(&damaged).unwrap().len();
+        let header = std::fs::read(&damaged).unwrap()[..HEADER_LEN].to_vec();
+        let primary = SLOT_OFFSETS[usize::from(header[GOD_BYTE] & PRIMARY_BIT)];
+        assert!(root_past_end(&header, primary, len).is_some(), "the fixture's root fits");
+
+        let rss = |path: &Path| {
+            let line = run_child(PROBE_PLAIN_REDB, path, CHILD_LIMIT);
+            let mut parts = line.splitn(3, ' ');
+            parts.next();
+            let kib: u64 = parts.next().unwrap().parse().unwrap();
+            (kib, parts.next().unwrap().to_string())
+        };
+        let (baseline, opened) = rss(&undamaged);
+        assert_eq!(opened, "opened", "the undamaged file opens");
+        let (allocated, outcome) = rss(&damaged);
+        assert!(
+            allocated >= baseline + page_kib / 2,
+            "redb no longer allocates a root page past the file's end: the damaged open peaked \
+             at {allocated} KiB against {baseline} KiB undamaged, with a {page_kib} KiB page \
+             ({outcome}). Retire check_roots (see this test's doc comment)"
+        );
+    }
+
+    /// A store without the two-phase bit, one not shut down cleanly, is
+    /// repaired from its secondary slot when its primary fails its checksum.
+    #[test]
+    fn a_dirty_store_whose_primary_slot_is_damaged_opens_from_the_secondary() {
+        let (_d, path) = a_dirty_copy();
+        let god = std::fs::read(&path).unwrap()[GOD_BYTE];
+        assert!(god & TWO_PHASE_COMMIT == 0 && god & RECOVERY_REQUIRED != 0, "god byte {god:#04x}");
+        damage_page_order(&path, 31);
+        let opened = open_in_child(&path);
+        assert!(opened.outcome.starts_with("opened"), "{}", opened.outcome);
+    }
+
+    /// redb reads only the primary slot of a clean store, so damage to the
+    /// other one is no reason to refuse it.
+    #[test]
+    fn a_store_with_only_its_secondary_slot_damaged_still_opens() {
+        for case in SIDECAR_CASES {
+            let (_dir, path) = a_store();
+            with_sidecar_case(&path, case);
+            damage_secondary_slot(&path);
+            let opened = open_in_child(&path);
+            assert!(opened.outcome.starts_with("opened"), "sidecar {case:?}: {}", opened.outcome);
+        }
+    }
+
+    #[test]
+    fn a_clean_store_opens() {
+        let (_dir, path) = a_store();
+        let opened = open_in_child(&path);
+        assert!(opened.outcome.starts_with("opened"), "{}", opened.outcome);
+    }
+
+    /// A store whose process was killed with SIGKILL is dirty, is repaired,
+    /// and keeps what was committed.
+    #[test]
+    fn a_store_killed_mid_run_is_repaired_and_opens_with_its_data() {
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "format::tests::child_probe", "--nocapture", "--test-threads=1"])
+            .env(PROBE_HOLD, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = std::io::BufReader::new(holder.stdout.take().unwrap())
+            .lines()
+            .map_while(|l| l.ok())
+            .any(|l| l.ends_with("PROBE ready"));
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert!(ready, "the holder never said it was ready");
+        let header = std::fs::read(&path).unwrap();
+        assert!(header[GOD_BYTE] & RECOVERY_REQUIRED != 0, "the killed store is dirty");
+
+        let opened = open_in_child(&path);
+        assert_eq!(opened.outcome, "opened found=true");
+    }
+
+    /// The branch that keeps this build's sidecar: redb's open failed after
+    /// it wrote, so the store may already be one an older build must refuse.
+    #[test]
+    fn an_open_that_fails_after_redb_wrote_keeps_this_builds_sidecar() {
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        let header = std::fs::read(&path).unwrap()[..HEADER_LEN].to_vec();
+        crate::hold_meter::test_hooks::ARM_AT_OPEN.with(|a| a.set(Some("sync_data")));
+        let result = Engine::open(&path);
+        crate::hold_meter::test_hooks::ARM_AT_OPEN.with(|a| a.set(None));
+        match result {
+            Err(StorageError::RefusedStore(why)) => {
+                panic!("refused, as if nothing was written: {why}")
+            }
+            Err(_) => {}
+            Ok(_) => panic!("the injected fsync failure did not fail the open"),
+        }
+        assert_ne!(std::fs::read(&path).unwrap()[..HEADER_LEN], header[..], "redb wrote");
+        let sidecar = read_sidecar(&path).unwrap();
+        assert_eq!(major_minor(&sidecar.redb_version), Some(REDB_MAJOR_MINOR));
+    }
+
+    /// A header refusal puts the sidecar back only if the store is as the check
+    /// read it; one that changed keeps this build's sidecar.
+    #[test]
+    fn a_header_refusal_puts_the_sidecar_back_only_if_the_store_is_unchanged() {
+        let corrupted =
+            || redb::DatabaseError::Storage(redb::StorageError::Corrupted("damaged".into()));
+        for (what, error) in
+            [("damaged", corrupted()), ("an older format", redb::DatabaseError::UpgradeRequired(2))]
+        {
+            for changed in [false, true] {
+                let (_dir, path) = a_store();
+                with_sidecar(&path, |s| s.redb_version = "4.1".into());
+                let older = std::fs::read(sidecar_path(&path)).unwrap();
+                let cleared = check_before_open(&path).unwrap();
+                write_sidecar(&path, &cleared.sidecar_before_open().unwrap()).unwrap();
+                if changed {
+                    damage_secondary_slot(&path);
+                }
+                let returned = cleared.after_failed_open(&path, error_clone(&error), true);
+                let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
+                if changed {
+                    assert!(
+                        !matches!(returned, StorageError::RefusedStore(_)),
+                        "{what}, changed: {returned}"
+                    );
+                    assert_ne!(
+                        sidecar, older,
+                        "{what}: a changed store keeps this build's sidecar"
+                    );
+                } else {
+                    assert!(
+                        matches!(&returned, StorageError::RefusedStore(why) if why.contains("nothing in it was changed")),
+                        "{what}: {returned}"
+                    );
+                    assert_eq!(sidecar, older, "{what}: the older sidecar is put back");
+                }
+            }
+        }
+        // Any other error keeps it, however unchanged the store.
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        let cleared = check_before_open(&path).unwrap();
+        let written = cleared.sidecar_before_open().unwrap();
+        write_sidecar(&path, &written).unwrap();
+        let returned = cleared.after_failed_open(
+            &path,
+            redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::other("eio"))),
+            true,
+        );
+        assert!(!matches!(returned, StorageError::RefusedStore(_)), "{returned}");
+        assert_eq!(read_sidecar(&path), Some(written));
+    }
+
+    fn error_clone(error: &redb::DatabaseError) -> redb::DatabaseError {
+        match error {
+            redb::DatabaseError::UpgradeRequired(v) => redb::DatabaseError::UpgradeRequired(*v),
+            redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => {
+                redb::DatabaseError::Storage(redb::StorageError::Corrupted(why.clone()))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// A `flock` held on the store by another descriptor, which is how a
+    /// 0.36.x node (redb 4.1) holds it, refuses the open before the sidecar an
+    /// older redb stamped is rewritten. On Linux this is the engine's own
+    /// `flock`; on macOS, where `flock` and range locks are one namespace, the
+    /// range lock alone.
+    #[test]
+    fn a_flock_held_by_another_descriptor_refuses_the_open_before_anything_is_written() {
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        let holder = std::fs::File::open(&path).unwrap();
+        holder.try_lock().unwrap();
+        let before = fingerprints(&path);
+        assert!(matches!(Engine::open(&path), Err(StorageError::StoreInUse(_))));
+        assert!(fingerprints(&path) == before, "the store or its sidecar changed");
+        drop(holder);
+        drop(Engine::open(&path).expect("and it opens once the holder lets go"));
+    }
+
+    /// The reverse: while an engine holds the store, a 0.36.x node's `flock`
+    /// is refused.
+    #[test]
+    fn while_an_engine_holds_the_store_a_flock_from_another_descriptor_is_refused() {
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        let other = std::fs::File::open(&path).unwrap();
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(engine);
+        other.try_lock().expect("the engine's close releases it");
+    }
+
+    /// While an engine holds the store, redb 4.3's own locks are refused: a
+    /// whole-storage range lock from another descriptor, and redb's read-write
+    /// and read-only opens.
+    #[test]
+    fn while_an_engine_holds_the_store_redbs_own_locks_are_refused() {
+        use redb::StorageBackend as _;
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let backend = redb::backends::FileBackend::new(other).unwrap();
+        assert!(matches!(
+            backend.try_lock_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            Ok(false)
+        ));
+        assert!(matches!(
+            redb::Builder::new().open(&path),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen)
+        ));
+        assert!(matches!(
+            redb::Builder::new().open_read_only(&path),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen)
+        ));
+        drop(engine);
+        assert!(matches!(
+            backend.try_lock_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            Ok(true)
+        ));
+    }
+
+    /// The lock is held before the check confirms what it read, so a second
+    /// engine on a held store is refused before it rewrites a sidecar an
+    /// older redb stamped.
+    #[test]
+    fn a_second_engine_on_a_held_store_is_refused_before_it_writes_the_sidecar() {
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        let sidecar = fingerprint(&sidecar_path(&path));
+        assert!(matches!(Engine::open(&path), Err(StorageError::StoreInUse(_))));
+        assert!(fingerprint(&sidecar_path(&path)) == sidecar, "the sidecar was rewritten");
+        drop(engine);
+    }
+
+    /// The lock is held from before the check's confirmation to redb's open:
+    /// just before the sidecar is written, another descriptor can take
+    /// neither lock.
+    #[test]
+    fn the_lock_is_held_while_the_sidecar_is_written() {
+        use redb::StorageBackend as _;
+        let (_dir, path) = a_store();
+        with_sidecar(&path, |s| s.redb_version = "4.1".into());
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = std::rc::Rc::clone(&seen);
+        crate::store_lock::test_hooks::BEFORE_SIDECAR_WRITE.with(|p| {
+            *p.borrow_mut() = Some(Box::new(move |path: &Path| {
+                let other = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+                let flock = other.try_lock();
+                let backend = redb::backends::FileBackend::new(other).unwrap();
+                let range =
+                    backend.try_lock_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+                *record.borrow_mut() = Some((
+                    matches!(flock, Err(std::fs::TryLockError::WouldBlock)),
+                    matches!(range, Ok(false)),
+                ));
+            }));
+        });
+        let opened = Engine::open(&path);
+        crate::store_lock::test_hooks::BEFORE_SIDECAR_WRITE.with(|p| p.borrow_mut().take());
+        drop(opened.unwrap());
+        assert_eq!(
+            *seen.borrow(),
+            Some((true, true)),
+            "(flock refused, range lock refused) just before the sidecar write"
+        );
+    }
+
+    /// What redb 4.3 asks the backend for when it opens: one range of its own,
+    /// refused as unsupported, then the whole storage. A redb that asks for
+    /// something else has changed how it locks, and fails this before it can
+    /// open a store unlocked.
+    #[test]
+    fn redb_asks_for_the_whole_storage_lock_after_its_own_ranges() {
+        use std::ops::Bound;
+        let dir = tempfile::tempdir().unwrap();
+        crate::store_lock::test_hooks::take();
+        drop(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let requests = crate::store_lock::test_hooks::take();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let ((own, _), own_shared) = requests[0];
+        assert!(!own_shared && own != Bound::Unbounded, "{requests:?}");
+        assert_eq!(requests[1], ((Bound::Unbounded, Bound::Unbounded), false), "{requests:?}");
+    }
+
+    /// An open redb made without asking for the lock is refused.
+    #[test]
+    fn a_store_redb_opened_without_asking_for_the_lock_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::store_lock::test_hooks::PRETEND_NOT_GRANTED.with(|p| p.set(true));
+        let result = Engine::open(&dir.path().join("kimmy.redb"));
+        crate::store_lock::test_hooks::PRETEND_NOT_GRANTED.with(|p| p.set(false));
+        match result {
+            Err(StorageError::Database(why)) => assert!(why.contains("without asking"), "{why}"),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened"),
+        }
     }
 }

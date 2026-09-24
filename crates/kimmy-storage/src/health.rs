@@ -5,7 +5,8 @@
 //! answers every later read and write with `PreviousIo` until the database is
 //! closed and reopened. Measured against redb 4.1.0, one failed `write`,
 //! `sync_data`, `set_len` or `read` does it, with ENOSPC or EIO, even when the
-//! disk is healthy again at the next call. So there is no transient case: the
+//! disk is healthy again at the next call. redb 4.3's `CheckedBackend` latches
+//! the same way. So there is no transient case: the
 //! first error is the moment the engine stops being able to serve, and it is
 //! recorded here, at the one backend every engine byte passes through.
 //!
