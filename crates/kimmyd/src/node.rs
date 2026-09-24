@@ -99,11 +99,26 @@ const CERT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// status already says it failed.
 pub async fn run(config: Config) -> Result<()> {
     let data_dir = config.storage.data_dir.clone();
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    // Held until the last marker below is written. A directory another kimmyd
+    // holds is left exactly as it is: no marker is read, set aside or written.
+    let _held = match lifecycle::hold(&data_dir) {
+        Ok(held) => held,
+        Err(e) => {
+            info!(error = %e, "exiting on an error");
+            return Err(e.into());
+        }
+    };
     let outcome = start_and_serve(config).await;
     match &outcome {
         Ok(()) => {
             lifecycle::record_exit(&data_dir, lifecycle::Exit::Shutdown);
             info!("shutdown complete");
+        }
+        Err(e) if lifecycle::store_in_use(e) => {
+            lifecycle::leave(&data_dir);
+            info!(error = format!("{e:#}"), "exiting on an error");
         }
         Err(e) => {
             lifecycle::record_error(&data_dir, &format!("{e:#}"));

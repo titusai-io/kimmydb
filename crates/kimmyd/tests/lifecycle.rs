@@ -425,6 +425,127 @@ async fn a_clean_stop_then_a_failed_start_keeps_the_clean_stop() {
     assert!(next.wait_exit().success());
 }
 
+/// A second kimmyd started on a live data directory leaves it exactly as it
+/// is: it refuses before reading the marker, so the live node's own set-aside
+/// marker and its next exit are untouched. Before, it set the marker aside,
+/// failed at redb's lock, and wrote a failed start there, and a later kill of
+/// the live node was reported as "the previous start failed".
+#[tokio::test]
+async fn a_second_start_on_a_live_directory_leaves_its_markers_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let data = dir.path().join("data");
+
+    let mut stopped = Run::spawn(dir.path(), "stopped");
+    stopped.wait_ready(&client).await;
+    stopped.signal("TERM");
+    assert!(stopped.wait_exit().success());
+
+    let mut live = Run::spawn(dir.path(), "live");
+    live.wait_ready(&client).await;
+    // Put back what a start that has not settled holds, so the test sees
+    // whether the second start disturbs a set-aside marker as well.
+    let aside = data.join("kimmy.last-exit.previous");
+    std::fs::write(&aside, "exit = \"shutdown\"\n").unwrap();
+    let listing = |d: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = (listing(&data), std::fs::read(&aside).unwrap());
+
+    let mut second = Run::spawn(dir.path(), "second");
+    assert!(!second.wait_exit().success());
+    let log = second.log();
+    assert!(log.contains("is in use by another kimmyd"), "{log}");
+    assert!(!log.contains("previous run"), "it read nothing: {log}");
+    assert_eq!((listing(&data), std::fs::read(&aside).unwrap()), before);
+    assert!(marker(dir.path()).is_none(), "no marker is written for the live node");
+
+    std::fs::remove_file(&aside).unwrap();
+    live.signal("KILL");
+    assert!(!live.wait_exit().success());
+    let mut next = Run::spawn(dir.path(), "next");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    assert!(log.contains("previous run did not shut down cleanly"), "{log}");
+    assert!(!log.contains("the previous start failed"), "{log}");
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}
+
+/// A store held by a process that does not hold the data directory, such as a
+/// build from before the directory was held: the start that meets it puts
+/// back the marker it set aside and writes none, so the clean stop before it
+/// is still what the next start reads.
+#[tokio::test]
+async fn a_start_that_finds_the_store_held_leaves_the_marker_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let data = dir.path().join("data");
+
+    let mut stopped = Run::spawn(dir.path(), "stopped");
+    stopped.wait_ready(&client).await;
+    stopped.signal("TERM");
+    assert!(stopped.wait_exit().success());
+    let before = marker(dir.path()).expect("a clean stop leaves a marker");
+
+    let holder = kimmy_storage::Engine::open(&data.join("kimmy.redb")).unwrap();
+    let mut refused = Run::spawn(dir.path(), "refused");
+    assert!(!refused.wait_exit().success());
+    let log = refused.log();
+    assert!(log.contains("is open in another process"), "{log}");
+    drop(holder);
+    assert_eq!(marker(dir.path()), Some(before), "the marker is back, unchanged");
+    assert!(!data.join("kimmy.last-exit.previous").exists());
+
+    let mut next = Run::spawn(dir.path(), "next");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    assert!(!log.contains("did not shut down cleanly"), "{log}");
+    assert!(!log.contains("the previous start failed"), "{log}");
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}
+
+/// ADR-190 through the shipped binary: a store stamped by a newer build is
+/// refused at start, and neither the database nor its sidecar changes. Before,
+/// a refused start opened the store read-write first, and round 0380 saw the
+/// file change on a killed store and on a cleanly stopped one.
+#[tokio::test]
+async fn a_store_a_newer_build_wrote_is_refused_and_left_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+
+    let database = dir.path().join("data").join("kimmy.redb");
+    let sidecar = dir.path().join("data").join("kimmy.format");
+    let stamped = std::fs::read_to_string(&sidecar).expect("the store has a sidecar");
+    let newer = stamped
+        .lines()
+        .map(
+            |l| if l.starts_with("schema = ") { "schema = 250".to_string() } else { l.to_string() },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&sidecar, format!("{newer}\n")).unwrap();
+    let before = (std::fs::read(&database).unwrap(), std::fs::read(&sidecar).unwrap());
+
+    let mut refused = Run::spawn(dir.path(), "refused");
+    assert!(!refused.wait_exit().success());
+    let log = refused.log();
+    assert!(log.contains("is not opened by this build"), "{log}");
+    assert!(log.contains("storage schema 250"), "the log names what is newer: {log}");
+    let after = (std::fs::read(&database).unwrap(), std::fs::read(&sidecar).unwrap());
+    assert!(before == after, "the database and its sidecar are exactly as they were");
+}
+
 /// Reading a node's HTTP port from its log couples the harness to that line.
 /// A line renamed, or one without a readable `bind=`, must fail the wait at
 /// once, not after `PATIENCE`. Both are simulated by asking for a line the

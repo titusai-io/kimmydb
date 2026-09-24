@@ -47,24 +47,35 @@ pub const SCHEMA_VERSION: u8 = 4;
 pub(crate) type Unreported = Vec<(CollectionMeta, Vec<crate::index::UniqueViolation>)>;
 
 /// Bring a database up to [`SCHEMA_VERSION`], or refuse if it cannot be.
-pub(crate) fn run(db: &Database) -> Result<Unreported> {
-    step(db)?;
+/// `raise` records in the store's sidecar that its schema is about to move
+/// (ADR-190): called immediately before the first write of any
+/// migration, and before a fresh store's version is written, so an older build
+/// refuses a store whose migration has begun, and a migration that never
+/// began leaves a rollback open.
+pub(crate) fn run(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<Unreported> {
+    step(db, raise)?;
     // Read from the store, not carried out of the loop: this run's recorded
     // collisions and any an earlier interrupted run left unreported.
     persisted_violations(db)
 }
 
 /// Take the database to [`SCHEMA_VERSION`], or refuse if it cannot be.
-fn step(db: &Database) -> Result<()> {
+fn step(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
     let found = stored_version(db)?;
 
-    // Before anything is written, on every path that migrates -- including a
-    // schema 1 or 2 source, whose id-deriving steps run before the rebuild, and
-    // a schema 4 file whose rebuild was interrupted. Any later and the claim the
-    // refusal makes, that nothing was changed, would already be false. (What an
-    // operator can then do depends on the version it found -- the previous build
-    // opens a schema 1, 2 or 3 directory, and no build opens a half-migrated
-    // one; the message says which.)
+    // Before the migration writes anything, on every path that migrates --
+    // including a schema 1 or 2 source, whose id-deriving steps run before the
+    // rebuild, and a schema 4 file whose rebuild was interrupted. Any later and
+    // the claim the refusal makes, that no version and no entry was changed,
+    // would already be false. The open before this point has written, though
+    // nothing the previous build reads differently: redb's repair of a dirty
+    // file, the commit that ensures the tables exist, and the sidecar's redb
+    // fields, with its schema left where it was (ADR-190). So "a refused start
+    // writes nothing" holds for a newer store, refused before the open, and
+    // not for this refusal of an older one. (What an operator can then do
+    // depends on the version it found -- the previous build opens a schema 1,
+    // 2 or 3 directory, and no build opens a half-migrated one; the message
+    // says which.)
     let resuming = found == Some(SCHEMA_VERSION) && partial_rebuild_owed(db)?;
     if matches!(found, Some(1..SCHEMA_VERSION)) || resuming {
         refuse_unparseable_partial_filters(db, found.expect("a version was read"))?;
@@ -72,7 +83,10 @@ fn step(db: &Database) -> Result<()> {
 
     match found {
         // A fresh database: nothing to migrate, just stamp it.
-        None => write_version(db, SCHEMA_VERSION),
+        None => {
+            raise(SCHEMA_VERSION)?;
+            write_version(db, SCHEMA_VERSION)
+        }
         // Schema 4 with markers still present is a migration interrupted
         // part-way, not a finished one: the version is written in the first
         // index's commit precisely so that an older build refuses a file in
@@ -80,6 +94,7 @@ fn step(db: &Database) -> Result<()> {
         // last commit deletes them, so their absence is what "finished" means.
         Some(SCHEMA_VERSION) if partial_rebuild_owed(db)? => {
             info!("resuming an interrupted storage schema 3 -> 4 migration (partial indexes)");
+            raise(SCHEMA_VERSION)?;
             rebuild_partial_indexes(db)
         }
         Some(SCHEMA_VERSION) => Ok(()),
@@ -87,6 +102,7 @@ fn step(db: &Database) -> Result<()> {
         // rather than needing its own path to the latest. The last step
         // writes the version itself, with its own bookkeeping.
         Some(1) => {
+            raise(SCHEMA_VERSION)?;
             info!("migrating storage schema 1 -> 2 (derived collection ids)");
             derive_collection_ids(db)?;
             info!("migrating storage schema 2 -> 3 (derived index ids)");
@@ -95,12 +111,14 @@ fn step(db: &Database) -> Result<()> {
             rebuild_partial_indexes(db)
         }
         Some(2) => {
+            raise(SCHEMA_VERSION)?;
             info!("migrating storage schema 2 -> 3 (derived index ids)");
             derive_index_ids(db)?;
             info!("migrating storage schema 3 -> 4 (partial index membership)");
             rebuild_partial_indexes(db)
         }
         Some(3) => {
+            raise(SCHEMA_VERSION)?;
             info!("migrating storage schema 3 -> 4 (partial index membership)");
             rebuild_partial_indexes(db)
         }
@@ -551,6 +569,29 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Record the redb major.minor in META, if it is not already what is there
+/// (ADR-190): run on the raw database during `Engine::open`, as the migrations
+/// are, so the read-only check can refuse a clean store with no sidecar that a
+/// newer redb wrote.
+pub(crate) fn record_redb_version(
+    db: &Database,
+    build: &crate::format::BuildVersions,
+) -> Result<()> {
+    let ours = format!("{}.{}", build.redb.0, build.redb.1);
+    let stored = {
+        let txn = db.begin_read()?;
+        let meta = txn.open_table(tables::META)?;
+        meta.get(crate::format::META_REDB_VERSION)?.map(|v| v.value().to_vec())
+    };
+    if stored.as_deref() == Some(ours.as_bytes()) {
+        return Ok(());
+    }
+    let txn = db.begin_write()?;
+    txn.open_table(tables::META)?.insert(crate::format::META_REDB_VERSION, ours.as_bytes())?;
+    txn.commit()?;
+    Ok(())
+}
+
 /// Test-only points in the membership migration.
 #[cfg(test)]
 pub(crate) mod hooks {
@@ -588,10 +629,25 @@ pub(crate) mod hooks {
     }
 }
 
-fn stored_version(db: &Database) -> Result<Option<u8>> {
+pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {
     let txn = db.begin_read()?;
-    let meta = txn.open_table(tables::META)?;
+    let meta = match txn.open_table(tables::META) {
+        Ok(meta) => meta,
+        // A fresh store, before the tables exist.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     Ok(meta.get(tables::META_FORMAT_VERSION)?.and_then(|v| v.value().first().copied()))
+}
+
+/// Refuse a store a newer build wrote, reading only (ADR-190, §2).
+pub(crate) fn refuse_newer(db: &Database) -> Result<()> {
+    match stored_version(db)? {
+        Some(found) if found > SCHEMA_VERSION => {
+            Err(StorageError::UnsupportedFormat { found, expected: SCHEMA_VERSION })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn write_version(db: &Database, version: u8) -> Result<()> {
@@ -2064,6 +2120,46 @@ mod membership_migration {
             !partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
             "the markers are gone, which is what finished means"
         );
+    }
+
+    /// ADR-190: the sidecar records the new schema before the first
+    /// write of a migration. A migration that fails at its first index, before
+    /// that commit, leaves the sidecar ahead of META, so a build of the old
+    /// schema refuses the store without touching it rather than opening one
+    /// whose migration has begun.
+    #[test]
+    fn the_sidecar_is_raised_before_a_migration_writes() {
+        let (_dir, path) = fixture();
+        assert_the_fixture_is_the_old_membership(&path);
+        std::fs::remove_file(crate::format::sidecar_path(&path)).unwrap();
+
+        hooks::fail_at_index(1);
+        assert!(Engine::open(&path).is_err(), "premise: the first index's commit failed");
+        assert_eq!(version(&path), Some(3), "META did not move");
+        assert_eq!(
+            crate::format::read_sidecar(&path).map(|s| s.schema),
+            Some(SCHEMA_VERSION),
+            "the sidecar did, before the first write"
+        );
+
+        let before = (
+            std::fs::read(&path).unwrap(),
+            std::fs::read(crate::format::sidecar_path(&path)).unwrap(),
+        );
+        let schema_3 =
+            crate::format::BuildVersions { schema: 3, ..crate::format::BuildVersions::ours() };
+        assert!(matches!(
+            Engine::open_as(&path, None, &schema_3),
+            Err(StorageError::RefusedStore(_))
+        ));
+        let after = (
+            std::fs::read(&path).unwrap(),
+            std::fs::read(crate::format::sidecar_path(&path)).unwrap(),
+        );
+        assert!(before == after, "refused untouched");
+
+        drop(Engine::open(&path).expect("this build resumes the migration"));
+        assert_eq!(version(&path), Some(SCHEMA_VERSION));
     }
 
     #[test]

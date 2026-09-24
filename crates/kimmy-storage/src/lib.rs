@@ -18,6 +18,7 @@ pub mod expiry;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod faults;
+pub mod format;
 pub mod gc;
 pub mod health;
 pub mod hold_meter;

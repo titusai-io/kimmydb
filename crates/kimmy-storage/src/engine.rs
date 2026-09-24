@@ -766,6 +766,28 @@ impl Engine {
     /// every collection dropped and nothing to do. `None` is redb's own
     /// default (1 GiB). The daemon sets this from `storage.cache_bytes`.
     pub fn open_with_cache(path: &Path, cache_bytes: Option<usize>) -> Result<Self> {
+        Self::open_as(path, cache_bytes, &crate::format::BuildVersions::ours())
+    }
+
+    /// [`Self::open_with_cache`], as a build with `build`'s versions: the
+    /// store is checked before anything opens it for writing, and refused,
+    /// untouched, if a newer build wrote it (ADR-190). The versions are a
+    /// parameter so a test can be an older build.
+    pub fn open_as(
+        path: &Path,
+        cache_bytes: Option<usize>,
+        build: &crate::format::BuildVersions,
+    ) -> Result<Self> {
+        let cleared = crate::format::check_before_open_with(path, build)?;
+        Self::open_cleared(path, cache_bytes, cleared)
+    }
+
+    /// The read-write open, which only a [`crate::format::Cleared`] reaches.
+    fn open_cleared(
+        path: &Path,
+        cache_bytes: Option<usize>,
+        cleared: crate::format::Cleared,
+    ) -> Result<Self> {
         // Through a backend that meters what it is asked for, so a hold can
         // say how much of it was the disk (ADR-176). Opened exactly as
         // `Builder::create` opens it.
@@ -779,10 +801,22 @@ impl Engine {
         // file, so a repair is reported only for a file that held a database.
         let existing = file.metadata()?.len() > 0;
         let health = std::sync::Arc::new(crate::health::StorageHealth::default());
+        // The backend takes the exclusive lock and writes nothing. What the
+        // check read is read again under that lock, and only then is anything
+        // written: the sidecar first, then whatever redb's open writes.
+        let locked = file.try_clone()?;
         let backend = crate::hold_meter::MeteredBackend::new(
-            redb::backends::FileBackend::new(file)?,
+            redb::backends::FileBackend::new(file).map_err(|e| match e {
+                redb::DatabaseError::DatabaseAlreadyOpen => crate::format::in_use(path),
+                e => e.into(),
+            })?,
             std::sync::Arc::clone(&health),
         );
+        cleared.confirm_under_lock(path, &locked)?;
+        drop(locked);
+        if let Some(sidecar) = cleared.sidecar_before_open() {
+            crate::format::write_sidecar(path, &sidecar)?;
+        }
         let mut builder = Database::builder();
         if let Some(bytes) = cache_bytes {
             builder.set_cache_size(bytes);
@@ -815,6 +849,11 @@ impl Engine {
             );
         }
 
+        // A newer schema is refused before the ensure-tables commit, not after
+        // it. The check before the open already refused it; this makes the
+        // order structural rather than something that check holds up alone.
+        crate::migrate::refuse_newer(&db)?;
+
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
         let txn = db.begin_write()?;
@@ -840,7 +879,14 @@ impl Engine {
 
         // Before anything reads a collection id: schema 1 allocated them from a
         // counter, schema 2 derives them from the name.
-        let unreported = crate::migrate::run(&db)?;
+        let build = cleared.build.clone();
+        let unreported =
+            crate::migrate::run(&db, &|schema| crate::format::raise_schema(path, schema, &build))?;
+        // The redb that last opened this store for writing, in the store too,
+        // so a clean store whose sidecar is gone is still refused by an older
+        // redb's build.
+        crate::migrate::record_redb_version(&db, &build)?;
+        crate::format::reconcile_after_open(path, crate::migrate::stored_version(&db)?, &build);
 
         // The arrival index is derived from the oplog, so a database written
         // before it existed — or by a build that did not maintain it — is

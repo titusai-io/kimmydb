@@ -228,11 +228,92 @@ fn record(data_dir: &Path, mut last: LastExit) {
 /// is no longer carried by an exit of this run.
 pub fn settle(data_dir: &Path) {
     inherited().remove(data_dir);
+    set_aside().remove(data_dir);
     match std::fs::remove_file(data_dir.join(PREVIOUS_FILE)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!(error = %e, "could not remove the previous run's exit marker"),
     }
+}
+
+/// Another process holds this data directory: a start that meets it reads,
+/// moves and writes nothing in it.
+#[derive(Debug)]
+pub struct InUse(std::path::PathBuf);
+
+impl std::fmt::Display for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "data directory {} is in use by another kimmyd; nothing in it was read or changed",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for InUse {}
+
+/// Hold the data directory for as long as the returned handle lives, before
+/// anything in it is read or set aside. A second start on a live directory
+/// stops here. Before this, it set the live node's marker aside, failed at
+/// redb's lock, and wrote a failed start of its own there, and the live node's
+/// next unclean end was then reported as that failed start.
+///
+/// An exclusive `flock` on the directory itself, so no file is added. `None`
+/// where the filesystem cannot lock: the start goes on, as it did before, and
+/// the store's own lock still refuses a second opener.
+pub fn hold(data_dir: &Path) -> Result<Option<std::fs::File>, InUse> {
+    let dir = match std::fs::File::open(data_dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            warn!(error = %e, data_dir = %data_dir.display(), "could not open the data directory to hold it");
+            return Ok(None);
+        }
+    };
+    match dir.try_lock() {
+        Ok(()) => Ok(Some(dir)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(InUse(data_dir.to_path_buf())),
+        Err(std::fs::TryLockError::Error(e)) => {
+            warn!(error = %e, data_dir = %data_dir.display(), "could not hold the data directory");
+            Ok(None)
+        }
+    }
+}
+
+/// Whether a start ended because another process had its store open. Such a
+/// start leaves no marker: the directory, and whatever its marker says, belong
+/// to that process. The data directory's own hold catches another kimmyd
+/// first; this is for a holder that does not take it, such as a build from
+/// before it did.
+pub fn store_in_use(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<kimmy_storage::StorageError>(),
+            Some(kimmy_storage::StorageError::StoreInUse(_))
+        )
+    })
+}
+
+/// A start that ended because another process holds the store leaves the
+/// directory as it found it: the marker it set aside goes back, and nothing
+/// is written.
+pub fn leave(data_dir: &Path) {
+    inherited().remove(data_dir);
+    if set_aside().remove(data_dir)
+        && !data_dir.join(LAST_EXIT_FILE).exists()
+        && let Err(e) = std::fs::rename(data_dir.join(PREVIOUS_FILE), data_dir.join(LAST_EXIT_FILE))
+    {
+        warn!(error = %e, "could not put the previous run's exit marker back");
+    }
+}
+
+/// The data directories whose marker this process set aside, so [`leave`]
+/// puts back only what this start moved.
+fn set_aside() -> std::sync::MutexGuard<'static, std::collections::HashSet<std::path::PathBuf>> {
+    static SET_ASIDE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    SET_ASIDE.get_or_init(Default::default).lock().expect("never held across a panic")
 }
 
 /// The verdict each data directory's start inherited, until it is serving:
@@ -344,12 +425,18 @@ fn sync(file: &std::io::Result<std::fs::File>) -> std::io::Result<()> {
 }
 
 /// Remove temporary markers a crash mid-write left: never read, since the
-/// rename is what makes a marker.
+/// rename is what makes a marker. One whose writer is still running is kept,
+/// so no start deletes a live node's file between its create and its rename.
 fn remove_stale_temporaries(data_dir: &Path) {
     let prefix = format!("{LAST_EXIT_FILE}.tmp.");
     if let Ok(entries) = std::fs::read_dir(data_dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let file_name = entry.file_name();
+            let Some(pid) = file_name.to_string_lossy().strip_prefix(&prefix).map(str::to_owned)
+            else {
+                continue;
+            };
+            if !pid.parse().is_ok_and(kimmy_storage::format::process_is_running) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -420,9 +507,14 @@ fn read_previous(data_dir: &Path, database: &Path) -> PreviousRun {
             // says, it is about the run that ended, and a crash of this run
             // must not find it again as its own goodbye. The rename is atomic,
             // so there is no instant with neither file and a database.
-            if let Err(e) = std::fs::rename(&path, &aside) {
-                warn!(error = %e, path = %path.display(), "could not set the exit marker aside");
-                let _ = std::fs::remove_file(&path);
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => {
+                    set_aside().insert(data_dir.to_path_buf());
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "could not set the exit marker aside");
+                    let _ = std::fs::remove_file(&path);
+                }
             }
             match toml::from_str::<LastExit>(&body) {
                 Ok(last) => PreviousRun::Ended(last),
@@ -526,6 +618,10 @@ pub fn announce(data_dir: &Path, previous: &PreviousRun) {
                 announce_earlier(earlier);
             }
         }
+        // A shutdown or a restore never carries `previous`, so there is none
+        // to announce: `run` returns `Ok` only after the start has served and
+        // settled, and `kimmyd restore` never reads the marker, so it
+        // inherits nothing.
         PreviousRun::Ended(last) => info!(
             exit = last.exit.name(),
             previous_pid = last.pid,
@@ -646,10 +742,16 @@ mod tests {
     #[test]
     fn a_stale_temporary_marker_is_removed_and_never_read() {
         let (dir, db) = dir_with_database();
-        let stale = dir.path().join(format!("{LAST_EXIT_FILE}.tmp.99999"));
+        // No process has this id, so its writer is gone.
+        let stale = dir.path().join(format!("{LAST_EXIT_FILE}.tmp.{}", i32::MAX));
         std::fs::write(&stale, "exit = \"shutdown\"\n").unwrap();
+        let live = dir
+            .path()
+            .join(format!("{LAST_EXIT_FILE}.tmp.{}", std::os::unix::process::parent_id()));
+        std::fs::write(&live, "exit = \"shutdown\"\n").unwrap();
         assert!(matches!(previous_run(dir.path(), &db), PreviousRun::Unclean { .. }));
         assert!(!stale.exists());
+        assert!(live.exists(), "a running writer's temporary is kept");
     }
 
     fn dir_with_database() -> (tempfile::TempDir, std::path::PathBuf) {

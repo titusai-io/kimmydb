@@ -14,6 +14,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **A build refuses a store a newer build wrote before it writes anything to
+  it** ([ADR-190](docs/decisions.md)). Before opening `kimmy.redb` for
+  writing, a node reads redb's file header and a new sidecar file,
+  `kimmy.format`, beside it. It refuses to start, leaving the database and
+  sidecar unchanged, if any of these is newer than the build: the storage
+  schema, the redb major.minor, or redb's file format. A newer redb patch alone
+  is not a boundary. Until now a build opened the store read-write first,
+  which let redb repair it and commit to it, and refused only afterwards.
+  **Protection starts with this release:** builds before it don't read
+  `kimmy.format`, so a rollback to 0.35.0 or earlier still writes to the store
+  before refusing it. Copy `kimmy.format` with `kimmy.redb` when you copy a
+  data directory, and restore it rather than delete it if it is ever
+  unreadable. [operations.md](docs/operations.md) has the rollback rules and
+  the one case the check can't cover.
+
 - **A collection or database drop answers as soon as it is recorded, and what
   it held is removed in the background** ([ADR-189](docs/decisions.md)). From
   that answer the collection is gone to every client and peer, as it already
@@ -96,6 +111,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   marker, and the next start reports both. A start killed before it served
   now reads as an unclean end. The marker is written atomically
   ([ADR-147](docs/decisions.md)).
+
+- **A second `kimmyd` started on a data directory a running node uses no
+  longer disturbs that node's exit marker.** It used to set the marker aside,
+  fail at the database lock, and write a failed start of its own, so the
+  running node's next crash was reported as "the previous start failed". A
+  node now holds its data directory with an exclusive lock while it runs. A
+  second start exits with `data directory … is in use by another kimmyd` and
+  changes nothing ([ADR-147](docs/decisions.md)).
 
 ## 0.35.0 - 2026-09-24
 

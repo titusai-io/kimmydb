@@ -193,6 +193,16 @@ note. An older node does not understand a newer token and refuses it as
 completes. The single-stamp token 0.30.0 replaced is the first case
 ([ADR-173](decisions.md)).
 
+**A downgrade across a storage boundary is refused before anything is
+written.** A storage schema change, a redb major.minor bump or a redb
+file-format change is a boundary. From 0.36.0, a build started on a store that
+a newer build has written across one of these boundaries refuses to start, and
+leaves the store unchanged ([ADR-190](decisions.md)). A redb patch bump is not
+a boundary. Builds before 0.36.0 do not have this check, so a rollback to one
+of them still writes to the store before refusing it. The way back across a
+boundary is a logical backup and restore; see
+[operations.md](operations.md#rolling-back-and-kimmyformat).
+
 **One version, two binaries.** `[workspace.package] version` in the root
 `Cargo.toml` is the single source of truth. `kimmyd` and `kimmy` are always
 released together, carry the same number, and a test pins that neither can

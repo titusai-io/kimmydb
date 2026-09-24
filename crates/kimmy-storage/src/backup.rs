@@ -254,6 +254,17 @@ impl Engine {
 /// and there is deliberately no flag for it here: it would be one keystroke
 /// between "recover" and "corrupt the cluster's identity space".
 pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
+    restore_with(path, input, &crate::format::BuildVersions::ours())
+}
+
+/// [`restore`], as a build with `build`'s versions. A backup is logical, so the
+/// restored file is this build's redb writing it, whatever wrote the store the
+/// backup came from; the sidecar says so (ADR-190).
+pub fn restore_with(
+    path: &Path,
+    input: &mut impl Read,
+    build: &crate::format::BuildVersions,
+) -> Result<BackupInfo> {
     if path.exists() {
         return Err(StorageError::Database(format!(
             "{} already exists; restore writes a new database rather than overwriting one",
@@ -401,6 +412,12 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
         }
         txn.commit()?;
     }
+    // The sidecar is regenerated, never carried: this build's redb wrote the
+    // file, and the schema is what the restored META says (ADR-190). The
+    // backup format does not change.
+    crate::migrate::record_redb_version(&db, build)?;
+    let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
+    crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
     info!(records, bytes, %node, path = %path.display(), "restored a backup");
     Ok(BackupInfo { node: Some(node), created_ms, records, bytes })
