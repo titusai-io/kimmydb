@@ -56,6 +56,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **The retention pass no longer removes what a drop left.** Its log line loses
   the `dropped_rows` field; the drop purger's own lines say what it removed.
 
+- **The start line for a previous exit on an error says so**, at `WARN` with
+  the error as its `cause`: `the previous start failed before it served`, or
+  `the previous run exited on an error`. It used to read `previous run ended
+  cleanly` at `INFO`. A log alert that matched the old line for an error exit
+  needs the new one ([ADR-147](docs/decisions.md)).
+
 ### Fixed
 
 - **Schema changes and a peer's changes no longer hold an async worker
@@ -80,6 +86,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **A snapshot no longer serves a dropped collection's rows** while they are
   still being removed, nor rows left with no collection and no tombstone at all.
+
+- **A start that fails before it serves no longer erases the record of the
+  run before it.** It read the exit marker and deleted it before opening the
+  database, so a start refused by an older build, or one that could not bind,
+  replaced the evidence that the run before it had been killed: two starts
+  later the kill read as a clean end. The marker is now set aside until the
+  start is serving, a failed start carries what it inherited into its own
+  marker, and the next start reports both. A start killed before it served
+  now reads as an unclean end. The marker is written atomically
+  ([ADR-147](docs/decisions.md)).
 
 ## 0.35.0 - 2026-09-24
 

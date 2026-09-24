@@ -321,8 +321,80 @@ async fn a_start_that_fails_logs_its_exit_and_the_next_start_does_not_call_it_un
     let mut next = Run::spawn(dir.path(), "next");
     next.wait_ready(&client).await;
     let log = next.log();
-    assert!(log.contains("previous run ended cleanly"), "{log}");
-    assert!(log.contains("exit=\"error\"") || log.contains("exit=error"), "{log}");
+    // Named for what it was, at WARN: not "ended cleanly", which an error is
+    // not, and not unclean, which a start that logged its exit is not either.
+    let line = log
+        .lines()
+        .find(|l| l.contains("the previous start failed before it served"))
+        .unwrap_or_else(|| panic!("no failed-start line:\n{log}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("binding"), "with the error's text: {line}");
+    assert!(!log.contains("previous run ended cleanly"), "{log}");
+    assert!(!log.contains("did not shut down cleanly"), "{log}");
+
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}
+
+/// Hold a port, so a start opens its database, cannot bind, and fails
+/// before it serves; return the start's log.
+fn a_start_that_fails_to_bind(dir: &Path, name: &str) -> String {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut failed = Run::spawn_on(dir, name, port);
+    assert!(!failed.wait_exit().success());
+    failed.log()
+}
+
+/// Round 0380's sequence, with a start that fails to bind in place of an
+/// older build refusing the store: a run killed, then a start that fails
+/// before it serves, then a start. The last one reports both, the failed
+/// start and the unclean end before it. The failed start used to replace the
+/// evidence of the kill.
+#[tokio::test]
+async fn a_kill_then_a_failed_start_then_a_start_reports_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first = Run::spawn(dir.path(), "killed");
+    first.wait_ready(&client).await;
+    first.signal("KILL");
+    assert!(!first.wait_exit().success());
+
+    let failed = a_start_that_fails_to_bind(dir.path(), "failed");
+    assert!(failed.contains("did not shut down cleanly"), "the failed start saw it: {failed}");
+    let marker = marker(dir.path()).expect("the failed start records itself");
+    assert!(marker.contains("[previous]") && marker.contains("unclean"), "{marker}");
+
+    let mut next = Run::spawn(dir.path(), "next");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    assert!(log.contains("the previous start failed before it served"), "{log}");
+    assert!(log.contains("and the run before it did not shut down cleanly"), "{log}");
+
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}
+
+/// A clean stop, then a failed start: the clean stop is kept, as what came
+/// before the failure.
+#[tokio::test]
+async fn a_clean_stop_then_a_failed_start_keeps_the_clean_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first = Run::spawn(dir.path(), "stopped");
+    first.wait_ready(&client).await;
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+
+    a_start_that_fails_to_bind(dir.path(), "failed");
+
+    let mut next = Run::spawn(dir.path(), "next");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    assert!(log.contains("the previous start failed before it served"), "{log}");
+    assert!(log.contains("and before that, the run ended with exit shutdown"), "{log}");
     assert!(!log.contains("did not shut down cleanly"), "{log}");
 
     next.signal("TERM");

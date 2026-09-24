@@ -106,7 +106,7 @@ pub async fn run(config: Config) -> Result<()> {
             info!("shutdown complete");
         }
         Err(e) => {
-            lifecycle::record_exit(&data_dir, lifecycle::Exit::Error);
+            lifecycle::record_error(&data_dir, &format!("{e:#}"));
             info!(error = format!("{e:#}"), "exiting on an error");
         }
     }
@@ -650,6 +650,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
     let local = listener.local_addr().unwrap_or(config.server.bind);
+    // Serving from here on: what this start inherited has been announced, and
+    // an exit of this run no longer carries it (ADR-190's lifecycle half).
+    lifecycle::settle(&config.storage.data_dir);
 
     if tls.is_some() {
         info!(

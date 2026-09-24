@@ -11040,6 +11040,45 @@ series; by `kimmyd`'s `lifecycle` unit tests; and by
 `SIGKILL`, after which the next start warns under its banner; and a bind that
 fails, which logs its exit and is read as clean by the start after it.
 
+**Addendum, 2026-09-24: a start that fails keeps what it inherited.** Round
+0380 killed a run in the middle of a migration, then started an older build,
+which refused the store. That refused start read the marker, deleted it before
+opening the engine, failed, and wrote its own `error` marker. The next start
+reported "previous run ended cleanly … exit error", and the kill was never
+reported. It changes in four ways:
+
+- **The marker is set aside, not deleted.** It is renamed to
+  `kimmy.last-exit.previous`, and removed only once the start is serving, right
+  after it binds.
+- **A start that fails before then carries what it inherited.** It writes its
+  `error` marker with the error's text as `cause`, `failed_start = true`, and
+  the inherited verdict as a nested `previous` table: `unclean`, or the earlier
+  marker's exit, version, time and cause. **Repeated failed starts keep the
+  last run that ran**: a failed start that inherited a failed start passes on
+  that one's `previous`, not the refusal itself.
+- **A `.previous` with no `kimmy.last-exit` is always an unclean end.** Only a
+  start that neither reached serving nor wrote its own marker leaves one, such
+  as a start killed during the open. The verdict it holds is reported after the
+  unclean end as what came before it, never in its place: a kill during a
+  migration's open must not read as the clean stop before it.
+- **The marker is written atomically:** a temporary file, synced, renamed, and
+  the directory synced. A crash mid-write leaves a whole marker or none, where
+  it used to leave an unreadable one.
+
+**Wording.** "previous run ended cleanly" is now only for `shutdown` and
+`restore`. An `error` marker reads "the previous start failed before it served"
+or "the previous run exited on an error", at `WARN`, with its cause. A carried
+verdict adds "and the run before it did not shut down cleanly" or "and before
+that, the run ended with exit X". A build from before this addendum ignores the
+new fields, and never removes a `.previous`, which the rule above reads as
+unclean.
+
+Tested by `lifecycle`'s unit tests (a start killed before serving; a carried
+verdict; repeated failed starts; an error after serving carries nothing; no
+temporary file left) and by `crates/kimmyd/tests/lifecycle.rs`: a kill, then a
+failed start, then a start reports both; a clean stop, then a failed start,
+keeps the clean stop.
+
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
 > **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
