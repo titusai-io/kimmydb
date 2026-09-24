@@ -63,8 +63,10 @@ pub struct RoundReport {
     /// Replicated schema changes the rounds in this tick applied —
     /// `SyncOutcome::ddl`, summed over the pulls, counted as each apply
     /// commits (ADR-177). Entries **applied**, not received: a refused,
-    /// declined, unknown-collection or purge-pending one is in its own count
-    /// and not here. A change already held here that the apply takes again
+    /// declined, unknown-collection or purge-pending one is not counted here.
+    /// Nor is a replayed drop this node had already recorded, or a change for
+    /// a collection dropped here (counted only as superseded); no series
+    /// counts those two. A change already held here that the apply takes again
     /// — a creation of a collection that stands, a definition or a drop that
     /// is history — comes back from `apply_ddl` as applied and is counted:
     /// it is one more apply this node did for one delivered entry, which is
@@ -1598,18 +1600,29 @@ mod tests {
             };
             seen.failed += report.failed;
             seen.ddl_refused += report.ddl_refused;
+            seen.ddl_applied += report.ddl_applied;
         }
         // A few more ticks: the refusal is not counted again.
         for _ in 0..3 {
             if let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
             {
                 seen.ddl_refused += report.ddl_refused;
+                seen.ddl_applied += report.ddl_applied;
             }
         }
         looping.abort();
 
         assert!(seen.failed >= 1, "the round failed after its apply: {seen:?}");
         assert_eq!(seen.ddl_refused, 1, "and its refusal is reported, once: {seen:?}");
+        // `kimmy_sync_ddl_applied_total` counts entries applied, not entries
+        // received: the refused index is not an apply. The collection's
+        // creation is, although B already held the collection from the
+        // snapshot page above: a change already held that a pulled window
+        // carries again is applied again, and counted.
+        assert_eq!(
+            seen.ddl_applied, 1,
+            "the held collection again, not the refused index: {seen:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

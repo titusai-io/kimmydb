@@ -785,13 +785,28 @@ impl Metrics {
         self.sync_ddl_declined.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Everything a window a peer pushed to this node did that its metrics
+    /// count (ADR-140): what it refused, declined and skipped, on the series
+    /// a pulled window's land on, and what it applied, under `via="push"`.
+    /// One call per pushed window, from the node's push hook.
+    pub fn record_pushed(&self, outcome: &kimmy_storage::SyncOutcome) {
+        self.record_ddl_refused(outcome.ddl_refused as u64);
+        self.record_ddl_declined(outcome.ddl_declined as u64);
+        self.record_ddl_applied_push(outcome.ddl as u64);
+        self.record_entries_skipped(
+            outcome.unknown_collection as u64,
+            outcome.deferred as u64,
+            outcome.purge_pending as u64,
+        );
+    }
+
     /// Count schema changes a peer pushed to this node that it applied
     /// (ADR-140), beside the pulled ones on the same series under
     /// `via="push"`. Unlike the refusal, which way the change arrived is the
     /// point here: a push that confirms one change carries the whole window
     /// the member lacks (ADR-143), so a burst of N concurrent creates can
-    /// make each member apply about N²/2 of them, and the pushed count is
-    /// where that shows. A change already held here that a window carries
+    /// make each member apply up to about N²/2 of them, and the pushed count
+    /// is where that shows. A change already held here that a window carries
     /// again comes back from the apply as applied, and is counted, because
     /// that apply is the work being measured.
     pub fn record_ddl_applied_push(&self, n: u64) {
@@ -1289,7 +1304,7 @@ impl Metrics {
              # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
-             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received - a refused, declined or skipped one is on its own series - and a change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply about N squared over 2 through push.\n\
+             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no series counts. A change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply up to about N squared over 2 through push; compare the increase over a burst, not the total.\n\
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
@@ -2445,7 +2460,7 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
-# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received - a refused, declined or skipped one is on its own series - and a change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply about N squared over 2 through push.
+# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no series counts. A change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply up to about N squared over 2 through push; compare the increase over a burst, not the total.
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
@@ -3149,6 +3164,35 @@ kimmy_sync_serve_walk_seconds_count 1201
         m.record_runtime_stall(std::time::Duration::from_micros(9_000));
         m.record_runtime_stall(std::time::Duration::from_micros(400));
         assert_eq!(m.take_runtime_stall_otlp_us(), 9_000);
+    }
+
+    #[test]
+    fn a_pushed_window_counts_what_it_applied_as_pushed_and_the_rest_where_a_pull_would() {
+        // Applied, not received: the refusal, the decline and the skips are
+        // on their own series and not under `via="push"`, and nothing lands
+        // under `via="pull"`.
+        let m = Metrics::default();
+        m.record_pushed(&kimmy_storage::SyncOutcome {
+            ddl: 2,
+            ddl_refused: 1,
+            ddl_declined: 1,
+            unknown_collection: 1,
+            deferred: 1,
+            purge_pending: 1,
+            ..Default::default()
+        });
+        let s = m.snapshot();
+        assert_eq!(s.sync_ddl_applied_push, 2);
+        assert_eq!(s.sync_ddl_applied_pull, 0);
+        assert_eq!((s.sync_ddl_refused, s.sync_ddl_declined), (1, 1));
+        assert_eq!(
+            (
+                s.sync_entries_skipped_unknown_collection,
+                s.sync_entries_skipped_beyond_advertised,
+                s.sync_entries_skipped_purge_pending
+            ),
+            (1, 1, 1)
+        );
     }
 
     #[test]
