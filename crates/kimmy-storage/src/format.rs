@@ -219,7 +219,7 @@ fn parse_sidecar(path: &Path, bytes: &[u8]) -> Result<Sidecar> {
 }
 
 /// `major.minor` from `major.minor` or `major.minor.patch`.
-fn major_minor(version: &str) -> Option<(u64, u64)> {
+pub(crate) fn major_minor(version: &str) -> Option<(u64, u64)> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -406,6 +406,11 @@ fn temporary(sidecar: &Path) -> PathBuf {
 /// whose process is still running is kept: a second start on a live data
 /// directory must not delete the live node's file between its create and its
 /// rename.
+///
+/// In a container, every run is pid 1, so a temporary an earlier run left as
+/// `.tmp.1` reads as this process's and is kept. That is harmless: nothing
+/// reads a temporary, and this process's own next write uses the same name,
+/// truncating it and renaming it over the sidecar.
 fn remove_stale_temporaries(sidecar: &Path) {
     let (Some(dir), Some(name)) = (sidecar.parent(), sidecar.file_name()) else { return };
     let prefix = format!("{}.tmp.", name.to_string_lossy());
@@ -589,9 +594,135 @@ mod tests {
     #[test]
     fn the_dirty_fixture_is_one_this_build_repairs() {
         let (_d, dirty) = a_dirty_copy();
+        assert!(
+            matches!(
+                redb::Builder::new().open_read_only(&dirty),
+                Err(redb::DatabaseError::RepairAborted)
+            ),
+            "the fixture is a file redb must repair"
+        );
         let before = std::fs::read(&dirty).unwrap();
         drop(Engine::open(&dirty).unwrap());
         assert_ne!(std::fs::read(&dirty).unwrap(), before, "the open wrote: it repaired");
+        assert!(redb::Builder::new().open_read_only(&dirty).is_ok(), "and it is clean after");
+    }
+
+    /// A dirty store with no sidecar cannot be read before redb repairs it, so
+    /// the check lets it through (the gap ADR-190 documents). If META then
+    /// says a newer redb wrote it, the open stops before the ensure-tables
+    /// commit, and META keeps saying so: the next start refuses it read-only.
+    #[test]
+    fn a_dirty_store_a_newer_redb_wrote_with_no_sidecar_stops_and_keeps_the_evidence() {
+        let (dir, live) = a_store();
+        std::fs::remove_file(sidecar_path(&live)).unwrap();
+        let newer = format!("{}.{}", REDB_MAJOR_MINOR.0, REDB_MAJOR_MINOR.1 + 1);
+        let copy = dir.path().join("copy.redb");
+        {
+            let db = redb::Database::create(&live).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::META)
+                .unwrap()
+                .insert(META_REDB_VERSION, newer.as_bytes())
+                .unwrap();
+            txn.commit().unwrap();
+            std::fs::copy(&live, &copy).unwrap();
+        }
+        assert!(matches!(
+            redb::Builder::new().open_read_only(&copy),
+            Err(redb::DatabaseError::RepairAborted)
+        ));
+        match Engine::open(&copy) {
+            Err(StorageError::RefusedStore(why)) => assert!(why.contains(&newer), "{why}"),
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("opened a store a newer redb wrote"),
+        }
+        assert!(!sidecar_path(&copy).exists(), "no sidecar claims this build wrote it");
+        {
+            let db = redb::Builder::new().open_read_only(&copy).unwrap();
+            let txn = db.begin_read().unwrap();
+            let meta = txn.open_table(tables::META).unwrap();
+            let recorded = meta.get(META_REDB_VERSION).unwrap().unwrap().value().to_vec();
+            assert_eq!(recorded, newer.as_bytes(), "META still names the newer redb");
+        }
+        assert_refused_untouched(&copy, &BuildVersions::ours(), "the next start");
+    }
+
+    #[test]
+    fn an_open_records_its_redb_in_meta() {
+        let (_dir, path) = a_store();
+        let db = redb::Builder::new().open_read_only(&path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let meta = txn.open_table(tables::META).unwrap();
+        let recorded = meta.get(META_REDB_VERSION).unwrap().expect("recorded on open");
+        let recorded = std::str::from_utf8(recorded.value()).unwrap().to_string();
+        assert_eq!(major_minor(&recorded), Some(REDB_MAJOR_MINOR));
+    }
+
+    /// With no sidecar, any read-only error other than "needs repair" refuses:
+    /// here, an older file format that redb would upgrade by writing.
+    #[test]
+    fn with_no_sidecar_a_store_redb_would_upgrade_is_refused_untouched() {
+        let (_dir, path) = a_store();
+        std::fs::remove_file(sidecar_path(&path)).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        for offset in SLOT_OFFSETS {
+            bytes[offset] = REDB_FILE_FORMAT - 1;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            redb::Builder::new().open_read_only(&path),
+            Err(redb::DatabaseError::UpgradeRequired(_))
+        ));
+        assert_refused_untouched(&path, &BuildVersions::ours(), "an older format byte");
+    }
+
+    /// What the check read is read again under the lock: a sidecar or header
+    /// that changed in between refuses the open, and nothing is written.
+    #[test]
+    fn a_store_that_changes_after_the_check_is_refused_under_the_lock() {
+        for what in ["sidecar", "header"] {
+            let (_dir, path) = a_store();
+            let cleared = check_before_open(&path).unwrap();
+            if what == "sidecar" {
+                with_sidecar(&path, |s| s.schema = crate::migrate::SCHEMA_VERSION + 1);
+            } else {
+                let mut bytes = std::fs::read(&path).unwrap();
+                for offset in SLOT_OFFSETS {
+                    bytes[offset] = REDB_FILE_FORMAT + 1;
+                }
+                std::fs::write(&path, &bytes).unwrap();
+            }
+            let before = snapshot(&path);
+            match Engine::open_cleared(&path, None, cleared) {
+                Err(StorageError::RefusedStore(why)) => {
+                    assert!(why.contains("changed while it was being checked"), "{what}: {why}")
+                }
+                Err(other) => panic!("{what}: refused with the wrong error: {other}"),
+                Ok(_) => panic!("{what}: opened a store that changed under the check"),
+            }
+            assert!(snapshot(&path) == before, "{what}: nothing is written");
+        }
+    }
+
+    /// A backup of a newer schema is refused before the restore creates a file.
+    #[test]
+    fn a_restore_refuses_a_backup_of_a_newer_schema_before_writing() {
+        let (_dir, path) = a_store();
+        let engine = Engine::open(&path).unwrap();
+        let mut backup = Vec::new();
+        engine.backup_to(&mut backup).unwrap();
+        drop(engine);
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("kimmy.redb");
+        match crate::backup::restore_with(&restored, &mut backup.as_slice(), &older()) {
+            Err(StorageError::UnsupportedFormat { found, expected }) => {
+                assert_eq!((found, expected), (crate::migrate::SCHEMA_VERSION, older().schema))
+            }
+            Err(other) => panic!("refused with the wrong error: {other}"),
+            Ok(_) => panic!("restored a newer schema"),
+        }
+        assert!(!restored.exists(), "no file is created");
+        assert!(!sidecar_path(&restored).exists());
     }
 
     #[test]

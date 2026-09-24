@@ -19237,6 +19237,12 @@ After the check, the order is:
    after the open.
 4. `create_with_backend` opens the database.
 5. `migrate::refuse_newer` runs before the transaction that ensures the tables.
+   It refuses a newer schema, and a newer redb recorded in `META`. The check
+   has already refused every store it could read, so what this catches is a
+   dirty store with no sidecar that a newer redb wrote: redb's repair has
+   written to it (the gap below), but nothing else is written. `META` keeps the
+   newer version, since `record_redb_version` never lowers it, so every later
+   start refuses the store before opening it.
 6. The migration raises the sidecar's `schema` just before its first write.
 7. After a successful open, the sidecar is reconciled to the larger of the
    schema it records and `META`'s.
@@ -19275,6 +19281,7 @@ sidecar, this build can't tell a store from an older build (with no sidecar yet)
 from a newer store whose sidecar was deleted or not copied. A clean one is still
 caught, because the read-only open reads `META`. A dirty one can't be read
 without repair, so it proceeds and is repaired, exactly as before this record.
+If `META` then names a newer redb, the open stops there (step 5).
 Closing the gap would mean refusing every dirty store without a sidecar, which
 would refuse the ordinary upgrade of a pre-sidecar store after a crash.
 operations.md tells an operator that the sidecar must travel with a copied
@@ -19288,9 +19295,17 @@ first release a rollback is protected at.
 
 **Backup and restore.** A KIMMYBK1 backup is logical, and a restore builds a new
 file with the restoring build's own redb, so the backup format does not change.
-A restore writes the sidecar after its commit: `schema` from the restored
-`META`, and the redb fields from this build. Because a logical backup crosses
+A backup's `META` records come first, so a restore reads them before creating
+the file and refuses a newer schema with nothing written. It does not restore
+the source store's recorded redb version, which described a file this restore
+does not write. It records its own, and it writes the sidecar after its commit:
+`schema` from the restored `META`, and the redb fields from this build. Because a logical backup crosses
 redb versions, a backup and restore is the way out of any refusal.
+
+**Only two calls open a store for writing:** `Engine::open_cleared` and
+`backup::restore`. `clippy.toml` disallows redb's `Database::create`,
+`Database::open` and `Builder`'s create and open methods everywhere else, and
+kimmy-storage allows them in its tests.
 
 **Rejected.**
 - **Aborting redb's repair until the check has run.** This is not byte-safe:
@@ -19321,7 +19336,12 @@ sidecar before and after. Among the tests:
 - `a_store_another_holder_has_open_is_refused_and_its_sidecar_untouched`;
 - `a_zero_length_file_is_fresh_and_a_short_one_is_refused`;
 - `the_sidecar_is_raised_before_a_migration_writes`;
-- `a_restore_regenerates_the_sidecar_for_the_build_that_restores`.
+- `a_restore_regenerates_the_sidecar_for_the_build_that_restores`, and
+  `a_restore_refuses_a_backup_of_a_newer_schema_before_writing`;
+- `a_dirty_store_a_newer_redb_wrote_with_no_sidecar_stops_and_keeps_the_evidence`;
+- `with_no_sidecar_a_store_redb_would_upgrade_is_refused_untouched`;
+- `a_store_that_changes_after_the_check_is_refused_under_the_lock`;
+- `an_open_records_its_redb_in_meta`.
 
 In `kimmyd`, `a_store_a_newer_build_wrote_is_refused_and_left_as_it_was` starts
 a real node on a store whose sidecar names a newer schema. It checks that the

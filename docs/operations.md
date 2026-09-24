@@ -575,7 +575,10 @@ aside or writing any marker. The running node's next exit is then reported
 as its own. If the store is held by a process that doesn't take that lock,
 such as a build before 0.36.0, the second start is refused at the database
 instead (`… is open in another process`). It puts back the marker it set aside
-and writes none of its own.
+and writes none of its own. On a filesystem that can't lock a directory (NFS
+without lock support, for example, which answers `ENOLCK`), the node logs `could
+not hold the data directory` as a warning and starts anyway. redb's own lock on
+`kimmy.redb` still refuses a second opener.
 
 A start that finds the database and **no marker** logs at `WARN`:
 
@@ -1842,7 +1845,10 @@ you move or copy a data directory.
   and with redb unable to read a dirty file without repairing it, the build
   can't tell whether a newer build wrote it. So it repairs the store, as every
   build did before 0.36.0. To avoid this, start the build that wrote the store,
-  or restore the backup taken before the upgrade.
+  or restore the backup taken before the upgrade. If the store records that a
+  newer redb wrote it, the start stops right after the repair, before writing
+  anything else, and leaves that record in place so every later start refuses
+  the store before opening it.
 - A clean store copied without its sidecar is still checked: the build reads
   the schema and redb version from the database without writing.
 - **An unreadable `kimmy.format` refuses the start.** Restore the file from the
@@ -1855,6 +1861,7 @@ you move or copy a data directory.
 restore (`kimmyd restore`) builds a new file with the restoring build's own
 redb. So a backup taken on a newer build restores on an older one, as long as
 the backup format and the storage schema are ones the older build knows. A
+backup of a newer schema is refused before the restore creates any file. A
 restore writes a fresh `kimmy.format` for the build that ran it.
 
 The start after a refusal still reports the run before it. See

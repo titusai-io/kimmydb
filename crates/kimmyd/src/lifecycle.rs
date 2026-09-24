@@ -427,6 +427,9 @@ fn sync(file: &std::io::Result<std::fs::File>) -> std::io::Result<()> {
 /// Remove temporary markers a crash mid-write left: never read, since the
 /// rename is what makes a marker. One whose writer is still running is kept,
 /// so no start deletes a live node's file between its create and its rename.
+/// A container's earlier run left its temporary as pid 1, which is this one
+/// too, and it is kept: harmless, since nothing reads it and this run's own
+/// marker write truncates and renames that same file.
 fn remove_stale_temporaries(data_dir: &Path) {
     let prefix = format!("{LAST_EXIT_FILE}.tmp.");
     if let Ok(entries) = std::fs::read_dir(data_dir) {

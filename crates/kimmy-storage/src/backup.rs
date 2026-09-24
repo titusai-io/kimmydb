@@ -308,6 +308,40 @@ pub fn restore_with(
     let node = NodeId::from_bytes(header[9..25].try_into().expect("16 bytes"));
     let created_ms = u64::from_be_bytes(header[25..33].try_into().expect("8 bytes"));
 
+    // META comes first in every backup, so its records are read before the
+    // file is created: a backup of a newer schema is refused with nothing
+    // written (ADR-190). They are buffered and restored with the rest.
+    let mut pending = std::collections::VecDeque::new();
+    let mut ended = false;
+    loop {
+        let mut tag = [0u8; 1];
+        input.read_exact(&mut tag).map_err(io)?;
+        if tag[0] == END {
+            ended = true;
+            break;
+        }
+        let key = read_chunk(input)?;
+        let value = read_chunk(input)?;
+        let is_meta = tag[0] == T_META;
+        pending.push_back((tag[0], key, value));
+        if !is_meta {
+            break;
+        }
+    }
+    let schema = pending
+        .iter()
+        .find(|(tag, key, _)| {
+            *tag == T_META && key.as_slice() == tables::META_FORMAT_VERSION.as_bytes()
+        })
+        .and_then(|(_, _, value)| value.first().copied());
+    if let Some(found) = schema
+        && found > build.schema
+    {
+        return Err(StorageError::UnsupportedFormat { found, expected: build.schema });
+    }
+
+    // A new file, which no check before it could read (ADR-190).
+    #[allow(clippy::disallowed_methods)]
     let db = Database::create(path)?;
     let mut records = 0usize;
     let mut bytes = header.len();
@@ -330,17 +364,26 @@ pub fn restore_with(
             let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
 
             loop {
-                let mut tag = [0u8; 1];
-                input.read_exact(&mut tag).map_err(io)?;
-                if tag[0] == END {
-                    break;
-                }
-                let key = read_chunk(input)?;
-                let value = read_chunk(input)?;
+                let (tag, key, value) = match pending.pop_front() {
+                    Some(record) => record,
+                    None if ended => break,
+                    None => {
+                        let mut tag = [0u8; 1];
+                        input.read_exact(&mut tag).map_err(io)?;
+                        if tag[0] == END {
+                            break;
+                        }
+                        (tag[0], read_chunk(input)?, read_chunk(input)?)
+                    }
+                };
                 bytes += 1 + 8 + key.len() + value.len();
                 records += 1;
 
-                match tag[0] {
+                match tag {
+                    // The redb that wrote the source file says nothing about
+                    // this one, which this build's redb writes; it is recorded
+                    // below as this build's (ADR-190).
+                    T_META if key.as_slice() == crate::format::META_REDB_VERSION.as_bytes() => {}
                     T_META => {
                         meta.insert(as_str(&key)?, value.as_slice())?;
                     }

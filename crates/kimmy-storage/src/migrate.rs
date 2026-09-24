@@ -572,18 +572,17 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
 /// Record the redb major.minor in META, if it is not already what is there
 /// (ADR-190): run on the raw database during `Engine::open`, as the migrations
 /// are, so the read-only check can refuse a clean store with no sidecar that a
-/// newer redb wrote.
+/// newer redb wrote. Never lowered: a newer version recorded there is the
+/// evidence that check reads, and `refuse_newer` has already stopped the open.
 pub(crate) fn record_redb_version(
     db: &Database,
     build: &crate::format::BuildVersions,
 ) -> Result<()> {
     let ours = format!("{}.{}", build.redb.0, build.redb.1);
-    let stored = {
-        let txn = db.begin_read()?;
-        let meta = txn.open_table(tables::META)?;
-        meta.get(crate::format::META_REDB_VERSION)?.map(|v| v.value().to_vec())
-    };
-    if stored.as_deref() == Some(ours.as_bytes()) {
+    let stored = stored_redb_version(db)?;
+    if stored.as_deref() == Some(ours.as_str())
+        || stored.as_deref().and_then(crate::format::major_minor).is_some_and(|v| v > build.redb)
+    {
         return Ok(());
     }
     let txn = db.begin_write()?;
@@ -640,14 +639,49 @@ pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {
     Ok(meta.get(tables::META_FORMAT_VERSION)?.and_then(|v| v.value().first().copied()))
 }
 
-/// Refuse a store a newer build wrote, reading only (ADR-190, §2).
-pub(crate) fn refuse_newer(db: &Database) -> Result<()> {
+/// Refuse a store a newer build wrote, reading only, before the ensure-tables
+/// commit (ADR-190): a newer schema, or a newer redb recorded in META. The
+/// check before the open already refused both for every store it could read.
+/// What reaches here is a dirty store with no sidecar, which redb has just
+/// repaired: the repair wrote, which is the gap ADR-190 documents, but the
+/// session stops here, and META still says which redb wrote the store.
+pub(crate) fn refuse_newer(
+    db: &Database,
+    path: &std::path::Path,
+    build: &crate::format::BuildVersions,
+) -> Result<()> {
     match stored_version(db)? {
         Some(found) if found > SCHEMA_VERSION => {
-            Err(StorageError::UnsupportedFormat { found, expected: SCHEMA_VERSION })
+            return Err(StorageError::UnsupportedFormat { found, expected: SCHEMA_VERSION });
         }
-        _ => Ok(()),
+        _ => {}
     }
+    if let Some(recorded) = stored_redb_version(db)?
+        && crate::format::major_minor(&recorded).is_some_and(|v| v > build.redb)
+    {
+        return Err(StorageError::RefusedStore(format!(
+            "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
+             kimmy.format and was not shut down cleanly, so redb repaired it before that could be \
+             read; nothing else was written. Start the build that wrote it, or restore a backup",
+            path.display(),
+            build.redb.0,
+            build.redb.1
+        )));
+    }
+    Ok(())
+}
+
+/// The redb major.minor META records, tolerating a missing META.
+fn stored_redb_version(db: &Database) -> Result<Option<String>> {
+    let txn = db.begin_read()?;
+    let meta = match txn.open_table(tables::META) {
+        Ok(meta) => meta,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(meta
+        .get(crate::format::META_REDB_VERSION)?
+        .and_then(|v| std::str::from_utf8(v.value()).ok().map(str::to_string)))
 }
 
 fn write_version(db: &Database, version: u8) -> Result<()> {

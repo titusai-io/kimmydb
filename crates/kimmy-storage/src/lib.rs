@@ -7,6 +7,9 @@
 //! cluster anti-entropy all read the same log and trust it.
 
 #![allow(dead_code)]
+// Tests build stores with redb directly; production opens them only after the
+// check before the open (ADR-190, and `disallowed-methods` in clippy.toml).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod backup;
 pub mod codec;

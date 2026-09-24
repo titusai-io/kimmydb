@@ -783,7 +783,7 @@ impl Engine {
     }
 
     /// The read-write open, which only a [`crate::format::Cleared`] reaches.
-    fn open_cleared(
+    pub(crate) fn open_cleared(
         path: &Path,
         cache_bytes: Option<usize>,
         cleared: crate::format::Cleared,
@@ -841,6 +841,8 @@ impl Engine {
                 debug!(progress = session.progress(), "database repair");
             });
         }
+        // The one read-write open of a store, behind the check (ADR-190).
+        #[allow(clippy::disallowed_methods)]
         let db = builder.create_with_backend(backend)?;
         if repairing.load(std::sync::atomic::Ordering::Relaxed) {
             warn!(
@@ -849,10 +851,11 @@ impl Engine {
             );
         }
 
-        // A newer schema is refused before the ensure-tables commit, not after
-        // it. The check before the open already refused it; this makes the
-        // order structural rather than something that check holds up alone.
-        crate::migrate::refuse_newer(&db)?;
+        // A newer schema or redb is refused before the ensure-tables commit,
+        // not after it. The check before the open already refused every store
+        // it could read; this makes the order structural, and it is what stops
+        // a dirty store with no sidecar that a newer redb wrote.
+        crate::migrate::refuse_newer(&db, path, &cleared.build)?;
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
