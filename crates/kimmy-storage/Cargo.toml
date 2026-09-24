@@ -45,6 +45,11 @@ criterion.workspace = true
 # identical to a full scan. No production dependency in this direction.
 kimmy-query.workspace = true
 proptest.workspace = true
+# Dev-only: a refused store is proved unchanged by its digest.
+sha2 = "0.11"
+# Dev-only: the `redb_damage` example and the tests recompute a damaged commit
+# slot's checksum, redb's XXH3-128, which redb does not export.
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 # Dev-only: a test reads what `Engine::open` logs, since a line an operator

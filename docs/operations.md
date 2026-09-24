@@ -1832,6 +1832,17 @@ newer redb *patch* alone is not a boundary.
 store still migrates it, and a migration can stop partway through, for example
 on a partial filter this build can't parse, as described above.
 
+**The release after 0.36.0 moves redb from 4.1 to 4.3, and that is a rollback
+boundary.** Once a store has been opened by it, 0.36.x refuses the store and
+writes nothing, and 0.35.0 and earlier would open it unprotected (below). To
+roll back across it, restore the backup taken before the upgrade, or on a
+cluster member wipe the data directory and let it catch up from its peers.
+
+**A store is locked while a node has it open**, and a second start on the same
+data directory is refused as in use with nothing written, before the start
+reads anything it might act on. The lock also refuses, and is refused by, a
+0.36.x node on the same store.
+
 **Protection starts with 0.36.0.** Builds before 0.36.0 don't read
 `kimmy.format`. Rolling back to 0.35.0 or earlier still opens the store for
 writing and refuses it afterwards, after redb has repaired it (if it was not
@@ -1866,6 +1877,25 @@ restore writes a fresh `kimmy.format` for the build that ran it.
 
 The start after a refusal still reports the run before it. See
 [What a shutdown logs](#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
+
+### A damaged store
+
+A start refuses a store whose redb header or primary commit slot is damaged,
+within a second, with the path and `redb refused it as damaged` followed by
+redb's reason. Nothing in the store is written, and `kimmy.format` is left as
+it was. Before the redb 4.3 bump, such a store made the start run at full CPU
+and grow its memory until it was killed, or abort on Linux, instead of
+refusing.
+
+A damaged store is not repaired in place. Either:
+- **restore it from a backup** with `kimmyd restore` (see
+  [Backup and restore](#backup-and-restore)), or
+- **on a cluster member, wipe the data directory** and let the member catch up
+  from its peers, keeping clients off it until it has.
+
+Keep a copy of the damaged file if you want to know what happened to it. A
+store whose other commit slot alone is damaged opens normally, because redb
+reads only the primary slot of a store that was shut down cleanly.
 
 ### Rebuild vector indexes after upgrading past 2026-08-15
 

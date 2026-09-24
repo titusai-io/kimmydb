@@ -27,7 +27,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.36.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.90"
 license = "AGPL-3.0-only"
 repository = "https://github.com/titusai-io/kimmydb"
 homepage = "https://github.com/titusai-io/kimmydb"
@@ -95,9 +95,9 @@ bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 
 # Storage
-# Pinned to 4.1.x: a redb minor may change allocator or system-table rules,
+# Pinned to 4.3.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
-redb = "~4.1"
+redb = "~4.3"
 
 # HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
 # the two cannot drift apart on features -- `rustls-tls` matters, because the

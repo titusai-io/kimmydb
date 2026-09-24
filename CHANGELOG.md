@@ -10,6 +10,37 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**A rollback boundary: redb moves from 4.1 to 4.3.** 0.36.x refuses a store
+this release has opened and writes nothing to it. Take a backup before
+upgrading; the way back is restoring it.
+
+### Changed
+
+- **redb 4.3** ([ADR-190](docs/decisions.md), addendum). A store this release
+  opens records redb 4.3 in `kimmy.format` and `META`, and a 0.36.x build then
+  refuses it at start with nothing written. 0.35.0 and earlier don't read
+  `kimmy.format` and would open it, so roll back only by restoring a backup
+  or, on a cluster member, by wiping the data directory and letting it catch
+  up. The file format is unchanged, and redb upgrades nothing when it opens an
+  older store.
+- **A store is locked by the node before anything is read under the lock or
+  written.** redb 4.3 no longer locks the file when it is opened, so the node
+  takes the lock itself. A second start on the same data directory, or a
+  0.36.x node on the same store, is refused as in use with nothing written.
+- **Rust 1.90** is the minimum to build, which redb 4.3 requires.
+
+### Fixed
+
+- **A store whose redb header is damaged is refused instead of hanging the
+  start.** With both commit slots overwritten, or one byte of the primary slot
+  changed, redb 4.1 allocated terabytes and filled them. On macOS the start
+  sat at full CPU with memory growing until it was killed; on Linux it
+  aborted. Such a store is now refused within a second, with the path and
+  "damaged", and neither it nor `kimmy.format` is changed. See
+  [A damaged store](docs/operations.md#a-damaged-store).
+
 ## 0.36.0 - 2026-09-24
 
 **Roll the members one at a time. The storage schema stays at 4 and redb at

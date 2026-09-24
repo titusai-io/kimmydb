@@ -33,6 +33,7 @@ pub mod modify;
 pub mod purge;
 pub mod rewind;
 pub mod snapshot;
+mod store_lock;
 pub mod sync;
 pub mod tables;
 pub mod vectors;
