@@ -550,9 +550,22 @@ already bound, a certificate that will not parse — logs `exiting on an error`
 with the error's text, beside the one-line error on stderr. Both leave a
 marker, `kimmy.last-exit`, in the data directory beside `kimmy.redb`: how the
 run ended (`shutdown`, `error`, or `restore` for a directory `kimmyd restore`
-wrote), its pid, its build and the time, as TOML. The next start reads and
-removes it, and logs `previous run ended cleanly` at `INFO` with those fields
-([ADR-147](decisions.md)).
+wrote), its pid, its build and the time, as TOML. The next start reads it and
+sets it aside as `kimmy.last-exit.previous` until it is serving. For a
+`shutdown` or a `restore` it logs `previous run ended cleanly` at `INFO` with
+those fields. For an `error` it logs, at `WARN` with the error as `cause`,
+either `the previous start failed before it served` or `the previous run exited
+on an error` ([ADR-147](decisions.md)).
+
+**A start that fails before it serves keeps what it inherited.** An older
+build refusing the store, a port already bound, a duty that cannot start: the
+failed start writes its `error` marker with the verdict it inherited carried
+in it, so the next start reports both, for example `the previous start failed
+before it served` and then `and the run before it did not shut down cleanly`.
+Repeated failed starts keep the last run that actually ran. A start killed
+before it served leaves only `kimmy.last-exit.previous`, and the next start
+reads that as an unclean end, with the set-aside verdict reported after it as
+what came before.
 
 A start that finds the database and **no marker** logs at `WARN`:
 
@@ -1874,6 +1887,7 @@ node. How to read and consume it, and what it does not prove, is in
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |
 | Second `Engine::open` fails | redb allows one handle per file; share an `Arc<Engine>` |
 | Queries slow on a large collection | Check `find` with `"explain": true`; if `strategy` is `collectionScan`, add an index |
+| `the previous start failed before it served` | A start failed before it could serve, with its error as `cause`: a store it refused, a port already bound, a duty that could not start. A second line, `and the run before it …` or `and before that …`, says what that failed start inherited ([ADR-147](decisions.md)) |
 | `previous run did not shut down cleanly` | The process before this one was ended without getting to log its exit — killed, or its container lost. Look at the runtime and kernel log around `last_database_write_secs_ago` before this start, and at `kimmy_process_resident_peak_bytes` ([Logs](#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one)) |
 
 ---
