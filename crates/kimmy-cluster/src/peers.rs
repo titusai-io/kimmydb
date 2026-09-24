@@ -65,8 +65,8 @@ pub struct RoundReport {
     /// commits (ADR-177). Entries **applied**, not received: a refused,
     /// declined, unknown-collection or purge-pending one is not counted here.
     /// Nor is a replayed drop this node had already recorded, or a change for
-    /// a collection dropped here (counted only as superseded); no series
-    /// counts those two. A change already held here that the apply takes again
+    /// a collection dropped here (counted only as superseded); no outcome
+    /// series counts those two. A change already held here that the apply takes again
     /// — a creation of a collection that stands, a definition or a drop that
     /// is history — comes back from `apply_ddl` as applied and is counted:
     /// it is one more apply this node did for one delivered entry, which is
@@ -1615,14 +1615,9 @@ mod tests {
         assert!(seen.failed >= 1, "the round failed after its apply: {seen:?}");
         assert_eq!(seen.ddl_refused, 1, "and its refusal is reported, once: {seen:?}");
         // `kimmy_sync_ddl_applied_total` counts entries applied, not entries
-        // received: the refused index is not an apply. The collection's
-        // creation is, although B already held the collection from the
-        // snapshot page above: a change already held that a pulled window
-        // carries again is applied again, and counted.
-        assert_eq!(
-            seen.ddl_applied, 1,
-            "the held collection again, not the refused index: {seen:?}"
-        );
+        // received: the collection's creation is an apply, and the refused
+        // index is not.
+        assert_eq!(seen.ddl_applied, 1, "the collection, not the refused index: {seen:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

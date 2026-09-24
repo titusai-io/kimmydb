@@ -21,7 +21,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   received, and a change already held that a window carries again is counted
   each time. A push carries everything the member lacks from the pusher, so a
   burst of N concurrent index creates on one member can make each peer apply
-  about N²/2 of them; this is where that shows. See
+  up to about N²/2 of them; this is where that shows. See
   [the metrics table](docs/operations.md).
 
 ## 0.37.0 - 2026-09-24
