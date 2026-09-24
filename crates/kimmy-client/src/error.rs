@@ -14,7 +14,8 @@ pub enum Error {
         message: String,
         /// What the server says a client may do about it.
         retry: Retry,
-        /// Seconds to wait, from `Retry-After`. Present on `rate_limited`.
+        /// Seconds to wait, from `Retry-After`. Present on `rate_limited` and
+        /// `collection_purging`.
         retry_after: Option<u64>,
     },
 
@@ -164,6 +165,11 @@ pub enum ErrorCode {
     /// waiting, and neither a slow upload nor a slow provider improves by
     /// moving to a peer.
     Timeout,
+    /// A collection cannot be created under this name yet: what a drop of an
+    /// earlier collection of the name held is still being removed (ADR-189).
+    /// The class is `wait`, with a `Retry-After`: the retry succeeds once the
+    /// removal is done.
+    CollectionPurging,
     /// A code this client does not know. The string is kept.
     Unknown(Arc<str>),
 }
@@ -190,6 +196,7 @@ impl ErrorCode {
             "provider_error" => Self::ProviderError,
             "stale" => Self::Stale,
             "timeout" => Self::Timeout,
+            "collection_purging" => Self::CollectionPurging,
             // The code is kept rather than flattened to a placeholder. A
             // caller that meets a code newer than its client can act on
             // `retry` and still say in a log *which* code it was; a client
@@ -221,6 +228,7 @@ impl ErrorCode {
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
             Self::Timeout => "timeout",
+            Self::CollectionPurging => "collection_purging",
             Self::Unknown(s) => s.as_ref(),
         }
     }
@@ -342,6 +350,27 @@ mod tests {
     }
 
     #[test]
+    fn a_creation_waiting_for_a_purge_is_a_code_this_client_knows() {
+        // `503 collection_purging` (ADR-189): a caller that retries a creation
+        // after a drop has to be able to tell this wait from any other 503,
+        // and to read how long to wait.
+        assert_eq!(ErrorCode::parse("collection_purging"), ErrorCode::CollectionPurging);
+        assert_eq!(ErrorCode::CollectionPurging.to_string(), "collection_purging");
+        let e = from_response(
+            503,
+            Some(5),
+            &json!({ "error": "collection_purging", "message": "still being removed",
+                     "retry": "wait" }),
+        );
+        assert_eq!(e.code(), Some(ErrorCode::CollectionPurging));
+        assert_eq!(e.retry(), Retry::Wait);
+        assert!(
+            matches!(e, Error::Api { retry_after: Some(5), .. }),
+            "the Retry-After reaches the caller: {e:?}"
+        );
+    }
+
+    #[test]
     fn a_server_without_the_retry_field_falls_back_to_the_status() {
         // A node older than ADR-057. Guessing from the status is worse advice
         // than the server's own, and better than none.
@@ -365,7 +394,7 @@ mod tests {
         // repeating it and being checked. It had fallen two behind the server:
         // `stale` and `timeout` were both parseable-or-not with nothing here
         // to say which, and `timeout` was in fact not.
-        const CODES: [&str; 19] = [
+        const CODES: [&str; 20] = [
             "bad_request",
             "payload_too_large",
             "unsupported_media_type",
@@ -385,6 +414,7 @@ mod tests {
             "provider_error",
             "stale",
             "timeout",
+            "collection_purging",
         ];
 
         for code in CODES {

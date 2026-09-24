@@ -29,6 +29,9 @@ use serde_json::json;
 use std::fmt;
 use tracing::{Level, error, info, warn};
 
+/// The `Retry-After` a `collection_purging` refusal carries, in seconds.
+pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
+
 /// Every code the API can return, and nothing else.
 ///
 /// **Adding a variant here also means editing `kimmy-client`.** That crate
@@ -43,9 +46,6 @@ use tracing::{Level, error, info, warn};
 /// from the envelope, which is exactly why that field exists (ADR-057), and it
 /// keeps the string — but the code reaches it as `ErrorCode::Unknown` rather
 /// than as a named variant, and a named variant is what a caller matches on.
-/// The `Retry-After` a `collection_purging` refusal carries, in seconds.
-pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
@@ -473,11 +473,6 @@ impl ApiError {
         self.level_override.or_else(|| self.code.log_level())
     }
 
-    /// Over a rate limit.
-    ///
-    /// The message names no user and no limit: it is returned before
-    /// authentication, so anything specific to the attempt would be readable by
-    /// whoever triggered it.
     /// A creation refused while a drop of the same name is still being purged
     /// (ADR-189). `Retry-After` is a hint: the purge takes as long as the
     /// dropped collection was large, and each retry is two seeks.
@@ -495,6 +490,11 @@ impl ApiError {
         }
     }
 
+    /// Over a rate limit.
+    ///
+    /// The message names no user and no limit: it is returned before
+    /// authentication, so anything specific to the attempt would be readable by
+    /// whoever triggered it.
     pub fn too_many_requests(retry_after_secs: u64) -> Self {
         Self {
             retry_after_secs: Some(retry_after_secs),

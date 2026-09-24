@@ -2283,6 +2283,20 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: |
+            `collection_purging`: vectors were dropped from this collection
+            with `drop_vectors=true`, and what the old shadow collection held
+            is still being removed on this node, so a new one cannot stand
+            over it yet. Nothing was written, and that removal was moved to
+            the front. `timeout` is the other `503` this can answer.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying. Present on `collection_purging`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [vectors]
       operationId: disableVectors

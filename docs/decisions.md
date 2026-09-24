@@ -18895,7 +18895,7 @@ Seven gauges started at their healthy value and could not be told apart from a r
 | `stall_probe` | the probe wakes | — |
 | `webhook_dispatcher` | a pass reads everything it planned from and sets the backlog | any read in the pass fails: the registry, this node's version vector, a subscription's oplog window. That pass writes neither the backlog nor the age, since a backlog missing a subscription it could not read would be a healthy value after a failed read |
 | `embedding_worker` | a flush commits, a backfill's scan stores a batch, or an idle turn has nothing waiting | it is retrying a provider call, which every path that makes one does until it succeeds: a streamed batch, which is the main way the age climbs, a backfill, a deferred re-check. Nor while it retries a store |
-| `drop_purger` | a purge chunk commits, an owed check finishes, or an idle turn finds nothing queued, nothing owed and no retry pending; and on entering the writer for a chunk, after which the age holds until the chunk returns (ADR-189) | a chunk fails: the id goes back on the queue and `Retry` backs off, and nothing about that is progress |
+| `drop_purger` | a purge chunk commits, an owed check finishes, or an idle turn finds nothing queued, nothing owed and no retry pending; and on entering a chunk; while that chunk waits for the writer the age holds, and only while it waits (ADR-189) | a chunk fails: the id goes back on the queue and `Retry` backs off, and until a chunk commits again nothing the purger does counts, its restarts, owed checks and writer entries included |
 
 The embedding worker's idle turn counts because an idle worker has no batch to complete, and its age must not climb for want of writes. It does not count while a deferred re-check is retrying a provider call. It does count while documents another member wrote wait out that member's grace period, which is ordinary on a cluster and can last ten minutes.
 
@@ -19006,9 +19006,13 @@ purger**, a chunk per commit, with the chunks and guards ADR-158 gave the purge.
   - A stop lands between chunks, and what is left is ADR-158's state.
 - **Replication and the push path.** Applies of a peer's window, pulled or
   pushed, run under `kimmy_storage::blocking` (ADR-153's addendum). `Pushed`
-  gains `purge_pending`, a backward-compatible field that an older receiver
-  never sends and an older pusher ignores. A member that stopped at a pending
-  creation is reported as pending, not as refusing.
+  gains `purge_pending`, a `#[serde(default)]` field an older receiver never
+  sends. A member that stopped at a pending creation is reported as pending,
+  not as refusing, **by a pusher that knows the field**. An older pusher
+  ignores it and reads the reply as a confirmation. So during a rolling
+  upgrade, a push from a 0.35.0 member to an upgraded one still purging
+  confirms a creation that is not yet applied there. The change still arrives
+  by anti-entropy once the purge is done; only the confirmation is early.
 
 **Why.** Round 0380 dropped a database of 400,000 documents and ten partial
 indexes.

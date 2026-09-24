@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use kimmy_core::CollectionId;
 use redb::{ReadableDatabase, ReadableTable};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::engine::{DROP_PURGE_CHUNK, Engine};
 use crate::error::Result;
@@ -57,6 +57,14 @@ pub(crate) struct Purges {
     pub(crate) owed_check_asked: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
     counters: Arc<PurgeCounters>,
+    /// When the purger last looked for owed rows. Here rather than in the
+    /// purger's loop, so a restart by `Retry` after a failure does not look
+    /// again at once and call that progress.
+    last_owed_check: parking_lot::Mutex<Option<Instant>>,
+    /// Set by a chunk that failed, cleared by the next that commits. While it
+    /// is set nothing marks progress: retrying is not progress (ADR-187), and
+    /// a purger failing every chunk must read as old.
+    failing: std::sync::atomic::AtomicBool,
     /// A test's hold on this engine's purge chunks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) gate: PurgeGate,
@@ -68,21 +76,23 @@ pub struct PurgeCounters {
     /// When the purger last made progress: a chunk committed, an owed check
     /// finished, or an idle turn with nothing queued and nothing owed.
     last_progress: parking_lot::Mutex<Option<Instant>>,
-    /// Set while the purger is queued at, or holding, the single writer for a
-    /// chunk.
+    /// Set while a purge chunk waits for the single writer, from just before
+    /// `begin_write` until it returns: the wait alone, not the chunk's own
+    /// work or its commit.
     at_writer: std::sync::atomic::AtomicBool,
 }
 
 impl PurgeCounters {
     /// When the purger last made progress; `None` before it first did.
     ///
-    /// **While it is at the writer, now.** A purger queued behind another
+    /// **While it waits for the writer, now.** A purger queued behind another
     /// holder — an index build files a whole collection in one transaction,
     /// and replicated DDL waits with no budget — is not stuck, and an age that
     /// climbed through that wait would fire the alert on a healthy node. A
     /// writer that is never released is reported by the writer's own series
     /// (`kimmy_write_lock_wait_seconds`, `kimmy_write_lock_held_seconds`), not
-    /// by this one.
+    /// by this one. Only the wait: a chunk that has the writer and never
+    /// commits reads old, as it should.
     pub fn last_progress(&self) -> Option<Instant> {
         if self.at_writer.load(std::sync::atomic::Ordering::Relaxed) {
             return Some(Instant::now());
@@ -92,6 +102,10 @@ impl PurgeCounters {
 
     fn progressed(&self) {
         *self.last_progress.lock() = Some(Instant::now());
+    }
+
+    pub(crate) fn waiting_for_writer(&self, waiting: bool) {
+        self.at_writer.store(waiting, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -188,7 +202,6 @@ impl Engine {
     /// an `await`: a chunk runs to its commit under `blocking`, so a stop
     /// lands between chunks, where the rows left are ADR-158's state.
     pub async fn run_drop_purger(self: Arc<Self>) -> Result<()> {
-        let mut last_owed_check: Option<Instant> = None;
         loop {
             // Registered before the queue is read, so a hand-over between the
             // read and the wait still wakes it.
@@ -199,7 +212,9 @@ impl Engine {
             let asked =
                 self.purges.owed_check_asked.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut owed_found = false;
-            if asked || last_owed_check.is_none_or(|at| at.elapsed() >= OWED_CHECK) {
+            let due =
+                self.purges.last_owed_check.lock().is_none_or(|at| at.elapsed() >= OWED_CHECK);
+            if asked || due {
                 let owed = crate::blocking(|| self.owed_purges())?;
                 let mut queue = self.purges.queue.lock();
                 for id in owed {
@@ -213,8 +228,8 @@ impl Engine {
                     }
                 }
                 drop(queue);
-                last_owed_check = Some(Instant::now());
-                self.purges.counters.progressed();
+                *self.purges.last_owed_check.lock() = Some(Instant::now());
+                self.mark_progress();
             }
 
             let mut purged_any = false;
@@ -225,12 +240,20 @@ impl Engine {
 
             // An idle turn is progress only when there is truly nothing to do.
             if !purged_any && !owed_found && self.purges.queue.lock().is_empty() {
-                self.purges.counters.progressed();
+                self.mark_progress();
             }
             tokio::select! {
                 () = &mut woken => {}
                 () = tokio::time::sleep(IDLE_TICK) => {}
             }
+        }
+    }
+
+    /// Progress, unless the last chunk failed: nothing the purger does while
+    /// it is failing counts until a chunk commits again.
+    fn mark_progress(&self) {
+        if !self.purges.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            self.purges.counters.progressed();
         }
     }
 
@@ -245,14 +268,14 @@ impl Engine {
         let started = Instant::now();
         let mut removed = 0usize;
         loop {
-            let counters = &self.purges.counters;
-            counters.progressed();
-            counters.at_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+            // On entering the chunk, so a purger queued at the writer starts
+            // from a fresh mark (the wait itself is held by `at_writer`).
+            self.mark_progress();
             let chunk = crate::blocking(|| self.purge_chunk(id));
-            counters.at_writer.store(false, std::sync::atomic::Ordering::Relaxed);
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => {
+                    self.purges.failing.store(true, std::sync::atomic::Ordering::Relaxed);
                     let mut queue = self.purges.queue.lock();
                     if !queue.contains(&id) {
                         queue.push_back(id);
@@ -260,7 +283,8 @@ impl Engine {
                     return Err(e);
                 }
             };
-            counters.progressed();
+            self.purges.failing.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.purges.counters.progressed();
             removed += chunk;
             // Short of a full chunk: the ranges are exhausted, or a collection
             // stands under the id again and the chunk's guard removed nothing.
@@ -294,7 +318,7 @@ impl Engine {
     /// once the node serves (ADR-158's second addendum).
     pub(crate) fn announce_owed_purges(&self) -> Result<()> {
         for id in self.owed_purges()? {
-            warn!(
+            info!(
                 collection = %id,
                 "a collection drop was interrupted; the drop purger finishes it once this node \
                  is serving"
@@ -323,6 +347,8 @@ enum GateState {
     Allow(usize),
     /// The next chunk fails with an injected error, then the gate is open.
     FailNext,
+    /// Every chunk fails with an injected error until the gate is set again.
+    FailAlways,
 }
 
 /// How long a chunk waits at a closed gate before the test is declared broken.
@@ -348,6 +374,7 @@ impl PurgeGate {
                     *state = GateState::Open;
                     return Err(crate::sync::count_hooks::injected());
                 }
+                GateState::FailAlways => return Err(crate::sync::count_hooks::injected()),
                 GateState::Allow(n) if n > 0 => {
                     *state = GateState::Allow(n - 1);
                     self.changed.notify_all();
@@ -386,6 +413,11 @@ impl Engine {
     /// Fail the next chunk with an injected error, then open.
     pub fn fail_next_purge_chunk(&self) {
         self.purges.gate.set(GateState::FailNext);
+    }
+
+    /// Fail every chunk with an injected error until the gate is set again.
+    pub fn fail_every_purge_chunk(&self) {
+        self.purges.gate.set(GateState::FailAlways);
     }
 
     /// Do on this thread what the drop purger would, to the end: every
@@ -489,39 +521,80 @@ mod tests {
     }
 
     /// ADR-187's age for the purger, with the writer wait apart from it (the
-    /// second ruling's N4): a purger queued at the writer — here, at the
-    /// test's gate, which it passes inside the chunk, before `begin_write` —
-    /// reads fresh however long it waits, and each committed chunk marks
-    /// progress.
+    /// second ruling's N4). Another holder has the single writer, as an index
+    /// build does for a whole collection: the purger queued behind it reads
+    /// fresh for as long as the hold lasts, and each committed chunk marks
+    /// progress once the writer is free.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_purgers_age_holds_at_the_writer_and_moves_with_each_chunk() {
+    async fn the_purgers_age_holds_while_another_holder_has_the_writer() {
         let dir = tempfile::tempdir().unwrap();
         let engine = open(&dir);
         let id = a_large_collection(&engine, "orders");
         let counters = engine.purge_counters();
-        engine.close_purge_gate();
         engine.drop_collection("shop", "orders").unwrap();
 
+        let (held, is_held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holding = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            let _hold = holding.hold_writer(crate::engine::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(20));
+        });
+        is_held.recv().unwrap();
+
         let purger = tokio::spawn(Arc::clone(&engine).run_drop_purger());
-        eventually("the purger reaching the writer", || {
+        eventually("the purger waiting for the writer", || {
             counters.at_writer.load(std::sync::atomic::Ordering::Relaxed)
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
         let age = counters.last_progress().map(|at| at.elapsed());
         assert!(
             age.is_some_and(|age| age < Duration::from_millis(50)),
-            "queued at the writer reads fresh, not {age:?}"
+            "queued behind another holder reads fresh, not {age:?}"
         );
+        assert!(engine.rows_under(id).unwrap() > 0, "and it removed nothing while it waited");
 
-        let rows = engine.rows_under(id).unwrap();
         let before = *counters.last_progress.lock();
-        engine.allow_purge_chunks(1);
-        eventually("one chunk", || engine.rows_under(id).unwrap() == rows - DROP_PURGE_CHUNK).await;
-        eventually("the chunk's mark", || *counters.last_progress.lock() > before).await;
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        eventually("the purge", || engine.rows_under(id).unwrap() == 0).await;
+        assert!(*counters.last_progress.lock() > before, "the chunks marked progress");
+        purger.abort();
+    }
+
+    /// A purger that fails every chunk reads old: neither its restarts by
+    /// `Retry`, nor the owed check, nor entering the writer again count as
+    /// progress while the last chunk failed (the delta review's M-b).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purger_failing_every_chunk_shows_a_rising_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open(&dir);
+        a_large_collection(&engine, "orders");
+        engine.drop_collection("shop", "orders").unwrap();
+        engine.fail_every_purge_chunk();
+        let counters = engine.purge_counters();
+
+        let first = Arc::clone(&engine).run_drop_purger().await;
+        assert!(first.is_err(), "{first:?}");
+        let stuck_at = *counters.last_progress.lock();
+        for restart in 0..3 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let again = Arc::clone(&engine).run_drop_purger().await;
+            assert!(again.is_err(), "restart {restart}: {again:?}");
+            assert_eq!(
+                *counters.last_progress.lock(),
+                stuck_at,
+                "restart {restart}: a failing purger made no progress"
+            );
+        }
+        let age = counters.last_progress().map(|at| at.elapsed()).unwrap();
+        assert!(age >= Duration::from_millis(150), "the age rose: {age:?}");
 
         engine.open_purge_gate();
-        eventually("the rest of the purge", || engine.rows_under(id).unwrap() == 0).await;
+        let purger = tokio::spawn(Arc::clone(&engine).run_drop_purger());
+        eventually("the first commit's mark", || *counters.last_progress.lock() > stuck_at).await;
         purger.abort();
     }
 

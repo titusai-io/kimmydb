@@ -3157,9 +3157,10 @@ impl Engine {
         Ok(indexes.range(index_range(id))?.next().is_none())
     }
 
-    /// One chunk of [`Self::purge_dropped_collection`]: at most
-    /// [`DROP_PURGE_CHUNK`] rows in one transaction, documents first and index
-    /// entries with whatever of the chunk they leave.
+    /// One chunk of a purge: at most [`DROP_PURGE_CHUNK`] rows in one
+    /// transaction, documents first and index entries with whatever of the
+    /// chunk they leave. The drop purger runs it (ADR-189), as do the tests'
+    /// synchronous `purge_dropped_collection`.
     ///
     /// Keys are read from the front of the range and then removed, both inside
     /// the transaction — the read is bounded by the chunk, not by the size of
@@ -3169,12 +3170,17 @@ impl Engine {
         // transaction `drop` counts (ADR-159) — once per chunk now rather
         // than once per drop, which is what the count of that row is for:
         // a `drop` count climbing in thousands beside a flat `ddl` is a large
-        // purge in progress, whoever started it. The same chunks are run by
-        // `create_collection_inner` and by the sweep at open, and they are
-        // `drop` there too: the holder names the work, not who asked.
+        // purge in progress. Only the drop purger runs them while the node
+        // serves (ADR-189); the holder names the work, not who asked.
         #[cfg(any(test, feature = "test-hooks"))]
         self.purges.gate.pass()?;
-        let txn = self.begin_write(WriterHolder::Drop)?;
+        // The wait for the writer, and only the wait, is what the drop
+        // purger's age holds through (ADR-189).
+        let counters = self.purge_counters();
+        counters.waiting_for_writer(true);
+        let txn = self.begin_write(WriterHolder::Drop);
+        counters.waiting_for_writer(false);
+        let txn = txn?;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a
@@ -3184,14 +3190,12 @@ impl Engine {
             // and a creation either commits before this chunk sees it or after
             // this chunk has finished.
             //
-            // A backstop rather than the primary mechanism: the creation
-            // drains the range itself before it writes its definition, so in
-            // a real race the purge's loop usually ends at its own
-            // emptiness check and never reaches here. What is left for this
-            // is the narrow ordering where the dropper's last chunk was full,
-            // and the creation then drains, creates and writes before the
-            // dropper looks again — narrow, reachable, and what the
-            // sequential test pins.
+            // A backstop rather than the primary mechanism: a creation is
+            // refused while rows remain under the id it derives (ADR-189), so
+            // no collection should stand over a purge in progress. This is
+            // what keeps the new incarnation's rows safe if one ever does,
+            // and `a_purge_chunk_under_a_standing_collection_removes_nothing`
+            // pins it.
             let collections = txn.open_table(tables::COLLECTIONS)?;
             if collection_stands_under(&collections, id)? {
                 0

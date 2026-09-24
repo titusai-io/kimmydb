@@ -69,13 +69,20 @@ itself on a storage I/O error, and three metrics change what they read.**
   succeed at once, because the drop had already paid. Retry it: the refusal
   writes nothing and moves the removal to the front. A client that treats an
   unknown `503` as retryable already does the right thing.
-- **A member applying a peer's re-creation of such a name takes no later
-  changes from that peer, for any database, until its own removal is done** and
-  every peer it pulls from holds the creation. The delay grows with the dropped
-  collection's size. `kimmy_sync_entries_skipped_total{reason="purge_pending"}`
-  counts it, and the divergence-check age alert fires while it lasts. The sync
-  protocol's `Pushed` reply gains a field for it; that is backward-compatible
-  in both directions.
+- **A member applying a peer's re-creation of such a name takes nothing
+  stamped after the creation, for any database, from a peer that holds the
+  creation, until its own removal is done.** A peer that does not hold it yet
+  still serves other origins' changes up to what it advertised, so the delay
+  reaches every peer the member pulls from as the creation does. It grows with
+  the dropped collection's size.
+  `kimmy_sync_entries_skipped_total{reason="purge_pending"}` counts it, and the
+  divergence-check age alert fires while it lasts.
+- **The sync protocol's `Pushed` reply gains `purge_pending`.** An older member
+  receiving a push never sends it. **An older member pushing ignores it:**
+  during a rolling upgrade, a 0.35.0 member that pushes a schema change to an
+  upgraded one still stopped at a pending creation reads the reply as a
+  confirmation, when the change is not yet applied there. Anti-entropy still
+  applies it once the removal is done; only the confirmation is early.
 - **A restart no longer finishes an interrupted drop before the node serves.**
   The start names each collection it owes, and the drop purger finishes them
   once the node is up, where the start used to be as long as what the drop had

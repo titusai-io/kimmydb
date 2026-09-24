@@ -2800,6 +2800,44 @@ mod tests {
         assert!(b.get_collection("shop", "other").is_ok());
     }
 
+    /// The page's pre-check runs before anything on the page is applied (the
+    /// second ruling's N3). A page carrying a drop, and defining a collection
+    /// that sorts before the one that waits, applies neither. Without the
+    /// pre-check the drop and that collection land before the definition
+    /// that waits is refused, and the page is left half applied.
+    #[test]
+    fn a_page_waiting_on_a_purge_applies_none_of_its_drops_or_earlier_definitions() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let victim = a.create_collection("shop", "victim").unwrap();
+        a.insert(&victim, doc! { "_id": 1 }).unwrap();
+        transfer(&b, &a);
+        assert!(b.get_collection("shop", "victim").is_ok(), "B holds the collection A drops");
+
+        let old = b.create_collection("shop", "orders").unwrap();
+        b.insert(&old, doc! { "_id": 1 }).unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+        a_moment();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, doc! { "_id": 2 }).unwrap();
+        let first = a.create_collection("shop", "aaa").unwrap();
+        a.insert(&first, doc! { "_id": 3 }).unwrap();
+        a.drop_collection("shop", "victim").unwrap();
+        a.finish_purges_now().unwrap();
+
+        let page = a.snapshot_page(None, None).unwrap();
+        let names: Vec<&str> = page.collections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.first(), Some(&"aaa"), "the page defines aaa first: {names:?}");
+        assert!(page.dropped_collections.iter().any(|(id, _)| *id == victim.id), "{page:?}");
+
+        let mut progress = SnapshotProgress::whole_database();
+        let waited = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(waited.purge_pending, Some(old.id), "{waited:?}");
+        assert!(b.get_collection("shop", "aaa").is_err(), "the earlier definition was not applied");
+        assert!(b.get_collection("shop", "victim").is_ok(), "nor was the carried drop");
+        assert_eq!(progress.pages(), 0, "and progress did not move");
+    }
+
     /// The other side of the same rule, and the reason it is a comparison
     /// rather than a refusal: a collection genuinely recreated after the drop
     /// is restored, under the sender's incarnation.
