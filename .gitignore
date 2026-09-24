@@ -22,3 +22,7 @@
 
 # CI drops the prebuilt kimmyd here for the docker job (see ci.yml)
 .prebuilt/
+
+# Python bytecode
+__pycache__/
+*.pyc
