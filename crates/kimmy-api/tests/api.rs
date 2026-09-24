@@ -6357,6 +6357,58 @@ async fn a_partial_index_is_answered_and_listed_with_the_filter_it_was_sent() {
 }
 
 #[tokio::test]
+async fn a_partial_filter_holding_nan_is_answered_and_listed_as_nan() {
+    // ADR-182's claim for the one double that is not equal to itself: sent as
+    // canonical Extended JSON, it comes back so from the create and from every
+    // listing, not as `null` or a bare number, which is what a relaxed
+    // rendering of NaN turns into.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"items"})).await;
+    let nan = json!({"$numberDouble": "NaN"});
+    let created = server
+        .post(
+            "/v1/db/app/coll/items/indexes",
+            Some(&token),
+            json!({"name": "x_nan", "fields": [{"path": "x"}], "partialFilterExpression": {"k": nan}}),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["partialFilterExpression"]["k"], nan, "{:?}", created.body);
+    let listed = server.get("/v1/db/app/coll/items/indexes", Some(&token)).await;
+    let listed = &listed.body["indexes"][0]["partialFilterExpression"];
+    assert_eq!(listed["k"], nan, "NaN is listed as NaN: {listed:?}");
+    assert_eq!(&created.body["partialFilterExpression"], listed);
+}
+
+#[tokio::test]
+async fn a_partial_filter_differing_only_in_the_sign_of_zero_is_a_conflict_under_one_name() {
+    // `0.0` and `-0.0` compare equal, and a filter on one does not select the
+    // same documents as a filter on the other's bytes, so two definitions that
+    // differ only there are two definitions (0.34.0's `### Changed`). The same
+    // name sent again with the other sign is therefore a conflict, where the
+    // identical definition sent again is not.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"items"})).await;
+    let create = |filter: Value| json!({"name": "x_zero", "fields": [{"path": "x"}], "partialFilterExpression": filter});
+    let first =
+        server.post("/v1/db/app/coll/items/indexes", Some(&token), create(json!({"k": 0.0}))).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    let same =
+        server.post("/v1/db/app/coll/items/indexes", Some(&token), create(json!({"k": 0.0}))).await;
+    assert_eq!(same.status, 200, "the identical definition is not a conflict: {:?}", same.body);
+
+    let signed = server
+        .post("/v1/db/app/coll/items/indexes", Some(&token), create(json!({"k": -0.0})))
+        .await;
+    assert_eq!(signed.status, 409, "{:?}", signed.body);
+    assert_eq!(signed.body["error"], "conflict", "{:?}", signed.body);
+    let listed = server.get("/v1/db/app/coll/items/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"].as_array().map(Vec::len), Some(1), "{:?}", listed.body);
+}
+
+#[tokio::test]
 async fn creating_a_partial_unique_index_judges_only_the_documents_it_covers() {
     // Existing data that violates the constraint *outside* the filter is not a
     // violation, because those documents are not in the index. Refusing here
