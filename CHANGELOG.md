@@ -10,7 +10,31 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.35.0 - 2026-09-24
+
+**Nothing on the wire, on disk or in configuration changes, and a downgrade
+to 0.34.x is not refused. Read two things before upgrading: a node now stops
+itself on a storage I/O error, and three metrics change what they read.**
+- **A storage I/O error stops the node, with status 70**
+  ([ADR-188](docs/decisions.md)), where it used to keep running and fail
+  every request. Restart it the way you already restart a node since 0.34.0;
+  compose and Kubernetes both do it on any non-zero exit. The next start
+  repairs the database file, at about 0.4 s per GiB, and serves. **On a disk
+  that stays full the node restart-loops**, paced by your restart policy's
+  backoff: alert on restarts, and on the `storage_failed` exit marker the
+  next start reports at `WARN`.
+- **`kimmy_task_progress_age_seconds{task}` is new.** It is the series to
+  alert on for every gauge a background task sets. The thresholds, derived
+  from each task's own timings, are in [operations.md](docs/operations.md).
+- **`kimmy_sync_divergence_check_age_seconds` is no longer 0 before the first
+  check** on a clustered node. A rule that treats 0 as "never checked" needs
+  changing.
+- **`kimmy_webhook_subscriptions` has a third state, `unreadable`.** A scrape
+  config or golden list that enumerates series needs it, and the new age
+  series too.
+- **The Python client requires Python 3.10 or later**, and an application
+  using it should upgrade anyio to 4.14.2 or later (see Security). The server
+  is unaffected.
 
 ### Added
 
