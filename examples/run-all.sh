@@ -10,7 +10,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(pwd)
 work=$(mktemp -d)
-trap 'kill "${node_pid:-}" 2>/dev/null || true; rm -rf "$work"' EXIT
+# Wait for the node before removing its directory: on SIGTERM it writes an exit
+# marker into its data dir, and an `rm -rf` racing that write fails with
+# "Directory not empty". The node is this shell's own child, so `wait` works.
+cleanup() {
+    if [ -n "${node_pid:-}" ]; then
+        kill "$node_pid" 2>/dev/null || true
+        wait "$node_pid" 2>/dev/null || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
 
 port=$((20000 + RANDOM % 20000))
 export KIMMY_URL="http://127.0.0.1:$port"

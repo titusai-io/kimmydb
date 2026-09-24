@@ -129,6 +129,7 @@ token_ttl_secs = {token_ttl}
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait()
         self.log.close()
 
 
