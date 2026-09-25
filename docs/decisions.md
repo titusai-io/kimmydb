@@ -18331,19 +18331,18 @@ commit landed (ADR-177), and the batch fails.
 
 A schema change whose entry this node already holds under its stamp, byte for
 byte, takes no writer for its append and commits nothing there; it is
-witnessed and published still, and counted in `kimmy_sync_ddl_held_total`, not as applied. What a kind writes before its
-append is unchanged: a replicated `CreateIndex` found standing writes nothing,
-so a re-delivered create costs no commit at all, but a replayed `DropIndex`
-for an index already gone still commits its tombstone in `drop_index_inner`,
-as it did before. **Bytes,
-not the key**: `append_oplog` replaces a different value under the stamp, so
-the origin's entry replaces a rebuild of it, and a rebuild relayed by a third
+witnessed and published still, and counted in `kimmy_sync_ddl_held_total`, not
+as applied. What a kind writes before its append is unchanged: a replicated
+`CreateIndex` found standing writes nothing, so a re-delivered create costs no
+commit at all, but a replayed `DropIndex` for an index already gone still
+commits its tombstone in `drop_index_inner`, as it did before. **Bytes, not
+the key**: `append_oplog` replaces a different value under the stamp, so the
+origin's entry replaces a rebuild of it, and a rebuild relayed by a third
 member replaces the origin's; both still happen, and only a write that would
 change nothing is skipped. The check is made in a read transaction and made
-again under the writer, so two applies of one entry that both found it
-missing commit it once. No held mark is lost: a replicated schema change is
-appended under `Raise`, which releases none over an existing key; only
-`InWindow` does.
+again under the writer, so two applies of one entry that both found it missing
+commit it once. No held mark is lost: a replicated schema change is appended
+under `Raise`, which releases none over an existing key; only `InWindow` does.
 
 **Tested**: a replicated create is one commit with its entry in it; a held
 entry takes no writer and is still published; a definition held without its

@@ -297,8 +297,9 @@ pub struct MetricsSnapshot {
     pub sync_ddl_applied_pull: u64,
     pub sync_ddl_applied_push: u64,
     /// Replicated schema changes a window carried that this node already
-    /// held, entry and all, by the same two ways: neither applied nor
-    /// committed. The overlap of windows, kept visible.
+    /// held, entry and all, by the same two ways: not applied again, and
+    /// their append committed nothing (a kind's own writes are unchanged).
+    /// The overlap of windows, kept visible.
     pub sync_ddl_held_pull: u64,
     pub sync_ddl_held_push: u64,
     /// Schema-change confirmations on each member, by how each ended, in
@@ -1359,7 +1360,7 @@ impl Metrics {
              # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
-             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is neither applied again nor committed and is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.\n\
+             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is not applied again and whose append commits nothing (a kind's own writes are unchanged); it is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.\n\
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
@@ -2541,7 +2542,7 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
-# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is neither applied again nor committed and is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.
+# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is not applied again and whose append commits nothing (a kind's own writes are unchanged); it is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
