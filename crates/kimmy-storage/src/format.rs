@@ -307,11 +307,19 @@ fn check_roots(database: &Path, header: &[u8], len: u64) -> Result<()> {
     if !two_phase && root_past_end(header, secondary, len).is_none() {
         return Ok(());
     }
-    let which = if two_phase { "primary commit slot" } else { "commit slots both" };
+    // The check reads the slot's bytes without verifying its checksum, so
+    // what it knows is only that they name a page past the end: a slot that
+    // verifies and does, or a damaged one whose bytes decode that way, which
+    // raw damage almost always does. The message says both, not one.
+    let which = if two_phase {
+        "primary commit slot is damaged or names"
+    } else {
+        "commit slots are both damaged or name"
+    };
     Err(refused(
         database,
         format!(
-            "its {which} name a root page past the file's end (order {order}, bytes \
+            "its {which} a root page past the file's end (read as order {order}, bytes \
              {}..{}, file {len} bytes), so it is damaged. {DAMAGED_WAY_OUT}",
             range.start, range.end
         ),
@@ -1638,6 +1646,40 @@ mod tests {
         }
         assert!(orders.iter().any(|&o| o > 0), "no root of order above 0: {orders:?}");
         assert!(types.contains(&2), "no branch root: {types:?}");
+    }
+
+    /// The refusal says what the check knows, for each kind of slot it meets:
+    /// a primary damaged in place (the raw byte damage of rounds' H1–H5a and
+    /// H7, whose bytes decode to a page past the end), a primary that verifies
+    /// and names one (H3c20, order 20, which redb 4.3 would allocate), and a
+    /// dirty store's two slots. Each is refused within the bound, and none
+    /// is described as something the check did not establish.
+    #[test]
+    fn the_past_the_end_refusal_says_what_it_knows_for_each_kind_of_slot() {
+        const PRIMARY: &str = "its primary commit slot is damaged or names a root page past the \
+                               file's end (read as order";
+        let (_raw_dir, raw) = a_store();
+        damage_page_order(&raw, 20);
+        assert_two_phase(&raw, "raw damage, order 20");
+        assert_refused_as_damaged_untouched(&raw, "raw damage, order 20", PRIMARY);
+
+        let (_valid_dir, valid) = a_store();
+        damage_page_order_validly(&valid, 20);
+        assert_two_phase(&valid, "valid slot, order 20");
+        assert_refused_as_damaged_untouched(&valid, "valid slot, order 20", PRIMARY);
+
+        let (_dirty_dir, dirty) = a_dirty_copy();
+        edit_store(&dirty, |b| {
+            for slot in SLOT_OFFSETS {
+                b[slot + 47] = (b[slot + 47] & 0x07) | (20 << 3);
+            }
+        });
+        assert_refused_as_damaged_untouched(
+            &dirty,
+            "both slots, dirty",
+            "its commit slots are both damaged or name a root page past the file's end (read as \
+             order",
+        );
     }
 
     /// A store without the two-phase bit, whose two slots both name a root

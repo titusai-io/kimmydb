@@ -24,6 +24,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   up to about N²/2 of them; this is where that shows. See
   [the metrics table](docs/operations.md).
 
+### Fixed
+
+- **The refusal of a store whose commit slot points past the end of the file
+  says the slot is damaged or names such a page.** It said only the second, as
+  "its primary commit slot name a root page past the file's end", including
+  for a slot whose checksum does not verify, which is what raw byte damage to
+  a header usually leaves.
+
 ## 0.37.0 - 2026-09-24
 
 **Roll the members one at a time: nothing on the wire changes, and each
