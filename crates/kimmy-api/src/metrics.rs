@@ -295,6 +295,11 @@ pub struct MetricsSnapshot {
     /// held here included — see [`Metrics::record_ddl_applied_push`].
     pub sync_ddl_applied_pull: u64,
     pub sync_ddl_applied_push: u64,
+    /// Schema-change confirmations on each member, by how each ended, in
+    /// `ConfirmOutcome::ALL` order (ADR-191); and the windows pushed for
+    /// them, whose ratio to the confirmations is the coalescing.
+    pub ddl_confirmations: [u64; kimmy_cluster::ConfirmOutcome::COUNT],
+    pub ddl_confirm_pushes: u64,
     /// Schema changes a snapshot restore re-logged so that this node can
     /// serve them onward (ADR-180). One of the engine's readings.
     pub sync_ddl_relogged: u64,
@@ -404,6 +409,8 @@ pub struct Metrics {
     sync_ddl_declined: AtomicU64,
     sync_ddl_applied_pull: AtomicU64,
     sync_ddl_applied_push: AtomicU64,
+    ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
+    ddl_confirm_pushes: AtomicU64,
     sync_divergent_collections: AtomicU64,
     /// The gauge above says how many collections disagree; these two say
     /// whether anything looked (ADR-135). Counters, unlike the gauge beside
@@ -515,6 +522,8 @@ impl Default for Metrics {
             sync_ddl_declined: AtomicU64::new(0),
             sync_ddl_applied_pull: AtomicU64::new(0),
             sync_ddl_applied_push: AtomicU64::new(0),
+            ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
+            ddl_confirm_pushes: AtomicU64::new(0),
             sync_divergent_collections: AtomicU64::new(0),
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
@@ -800,6 +809,17 @@ impl Metrics {
         );
     }
 
+    /// One schema-change confirmation on one member, by how it ended
+    /// (ADR-191). Called once per member per change, from the confirmer.
+    pub fn record_ddl_confirmation(&self, outcome: kimmy_cluster::ConfirmOutcome) {
+        self.ddl_confirmations[outcome.slot()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One window pushed to confirm schema changes (ADR-191).
+    pub fn record_ddl_confirm_push(&self) {
+        self.ddl_confirm_pushes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Count schema changes a peer pushed to this node that it applied
     /// (ADR-140), beside the pulled ones on the same series under
     /// `via="push"`. Unlike the refusal, which way the change arrived is the
@@ -1051,6 +1071,8 @@ impl Metrics {
             sync_ddl_declined: self.get(&self.sync_ddl_declined),
             sync_ddl_applied_pull: self.get(&self.sync_ddl_applied_pull),
             sync_ddl_applied_push: self.get(&self.sync_ddl_applied_push),
+            ddl_confirmations: std::array::from_fn(|slot| self.get(&self.ddl_confirmations[slot])),
+            ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged: readings.sync_ddl_relogged,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
@@ -1146,6 +1168,18 @@ impl Metrics {
         // for this page is that no series is conditional, so the label set comes
         // from the declared task list rather than from what has happened to
         // retry (`kimmy_task::TASKS`).
+        // One line per outcome, always: the label set is the enum's
+        // (ADR-191), not what has happened.
+        let ddl_confirmations = kimmy_cluster::ConfirmOutcome::ALL
+            .iter()
+            .map(|outcome| {
+                format!(
+                    "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
+                    outcome.label(),
+                    self.get(&self.ddl_confirmations[outcome.slot()])
+                )
+            })
+            .collect::<String>();
         let task_retries = kimmy_task::retries()
             .into_iter()
             .map(|(task, n)| format!("kimmy_task_retries_total{{task=\"{task}\"}} {n}\n"))
@@ -1308,6 +1342,12 @@ impl Metrics {
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
+             # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes.\n\
+             # TYPE kimmy_ddl_confirmations_total counter\n\
+             {ddl_confirmations}\
+             # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.\n\
+             # TYPE kimmy_ddl_confirm_pushes_total counter\n\
+             kimmy_ddl_confirm_pushes_total {ddl_confirm_pushes}\n\
              # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
              # TYPE kimmy_sync_ddl_relogged_total counter\n\
              kimmy_sync_ddl_relogged_total {sync_ddl_relogged}\n\
@@ -1437,6 +1477,7 @@ impl Metrics {
             sync_ddl_declined = self.get(&self.sync_ddl_declined),
             sync_ddl_applied_pull = self.get(&self.sync_ddl_applied_pull),
             sync_ddl_applied_push = self.get(&self.sync_ddl_applied_push),
+            ddl_confirm_pushes = self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged = readings.sync_ddl_relogged,
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
@@ -1892,6 +1933,16 @@ mod tests {
         // The pushed applies, on the series the pulled ones share: a push
         // recorded under `via="pull"` would read 186 there.
         m.record_ddl_applied_push(97);
+        // A distinct count per outcome, so a line under the wrong label
+        // cannot match: 120 for the first, one more for each after it.
+        for outcome in kimmy_cluster::ConfirmOutcome::ALL {
+            for _ in 0..(120 + outcome.slot()) {
+                m.record_ddl_confirmation(outcome);
+            }
+        }
+        for _ in 0..131 {
+            m.record_ddl_confirm_push();
+        }
         for _ in 0..20 {
             m.record_tls_reload(true);
         }
@@ -2464,6 +2515,22 @@ kimmy_sync_ddl_declined_total 36
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
+# HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes.
+# TYPE kimmy_ddl_confirmations_total counter
+kimmy_ddl_confirmations_total{outcome=\"confirmed\"} 120
+kimmy_ddl_confirmations_total{outcome=\"refused\"} 121
+kimmy_ddl_confirmations_total{outcome=\"timeout\"} 122
+kimmy_ddl_confirmations_total{outcome=\"failed\"} 123
+kimmy_ddl_confirmations_total{outcome=\"unreached\"} 124
+kimmy_ddl_confirmations_total{outcome=\"purging\"} 125
+kimmy_ddl_confirmations_total{outcome=\"stopped_unknown\"} 126
+kimmy_ddl_confirmations_total{outcome=\"other_member\"} 127
+kimmy_ddl_confirmations_total{outcome=\"task_ended\"} 128
+kimmy_ddl_confirmations_total{outcome=\"backoff\"} 129
+kimmy_ddl_confirmations_total{outcome=\"unattributable\"} 130
+# HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.
+# TYPE kimmy_ddl_confirm_pushes_total counter
+kimmy_ddl_confirm_pushes_total 131
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91
@@ -2765,6 +2832,14 @@ kimmy_sync_serve_walk_seconds_count 1201
             "kimmy_sync_ddl_applied_total{{via=\"push\"}} {}\n",
             s.sync_ddl_applied_push
         ));
+        for outcome in kimmy_cluster::ConfirmOutcome::ALL {
+            expect(&format!(
+                "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                s.ddl_confirmations[outcome.slot()]
+            ));
+        }
+        expect(&format!("kimmy_ddl_confirm_pushes_total {}\n", s.ddl_confirm_pushes));
         expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
@@ -3049,7 +3124,11 @@ kimmy_sync_serve_walk_seconds_count 1201
                 // purger, a third reason for a skipped entry.
                 + 1
                 // Replicated schema changes applied, pulled and pushed.
-                + 2,
+                + 2
+                // Schema-change confirmations by outcome, and the pushes
+                // made for them (ADR-191).
+                + kimmy_cluster::ConfirmOutcome::COUNT
+                + 1,
             "expected one sample per series: {out}"
         );
     }

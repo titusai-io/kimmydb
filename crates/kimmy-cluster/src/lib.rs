@@ -18,6 +18,7 @@
 
 #![allow(dead_code)]
 
+pub mod confirm;
 pub mod discovery;
 pub mod health;
 pub mod membership;
@@ -26,6 +27,9 @@ pub mod protocol;
 pub mod tls;
 pub mod transport;
 
+pub use confirm::{
+    ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
+};
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};

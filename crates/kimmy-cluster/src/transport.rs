@@ -49,7 +49,7 @@ use crate::protocol::{
 const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 
 /// Whether a batch fits in one frame, and how much of it does if not.
-enum Fits {
+pub(crate) enum Fits {
     All,
     Only(usize),
 }
@@ -59,7 +59,7 @@ enum Fits {
 /// Sizes each entry once and takes a running total, rather than serializing the
 /// whole batch to find out it is too big and then doing it again for a smaller one.
 /// The common case is a single pass that says `All`.
-fn how_many_fit(entries: &[OplogEntry]) -> Fits {
+pub(crate) fn how_many_fit(entries: &[OplogEntry]) -> Fits {
     let mut total = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         let size = match bson::serialize_to_vec(entry) {
@@ -84,7 +84,7 @@ fn how_many_fit(entries: &[OplogEntry]) -> Fits {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one request may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much of a round's [`REQUEST_TIMEOUT`] a snapshot pull leaves unspent
 /// before it stops asking for pages (ADR-152).
@@ -405,6 +405,8 @@ where
                         ddl_declined: outcome.ddl_declined,
                         deferred: outcome.deferred,
                         purge_pending: outcome.purge_pending,
+                        refused: outcome.refused_at.clone(),
+                        stopped_at: outcome.stopped_at(),
                     },
                 )
                 .await?;
@@ -540,6 +542,11 @@ pub struct PushOutcome {
     /// member is more than a batch behind this node, or below its retention
     /// horizon. Nothing was sent, and anti-entropy carries the entry.
     pub unreached: Option<String>,
+    /// The entry the member's batch stopped at, as its answer named it
+    /// (ADR-191): it and everything after it in the window were not taken.
+    /// `None` when nothing stopped the batch, or when the member predates the
+    /// field; `outcome`'s counts tell the two apart.
+    pub stopped_at: Option<kimmy_core::Stamp>,
 }
 
 /// Hand `peer` the window it lacks from this node, ending in `entry`, and
@@ -574,6 +581,7 @@ pub async fn push_entry(
         node: their_node,
         outcome: SyncOutcome { peer: Some(their_node), ..SyncOutcome::default() },
         unreached,
+        stopped_at: None,
     };
     let exchange = async {
         write_frame(&mut stream, &Message::AskWitnessed {}).await?;
@@ -655,6 +663,8 @@ pub async fn push_entry(
                 ddl_declined,
                 deferred,
                 purge_pending,
+                refused,
+                stopped_at,
             } => Ok(PushOutcome {
                 node: their_node,
                 outcome: SyncOutcome {
@@ -665,10 +675,12 @@ pub async fn push_entry(
                     ddl_declined,
                     deferred,
                     purge_pending,
+                    refused_at: refused,
                     peer: Some(their_node),
                     ..SyncOutcome::default()
                 },
                 unreached: None,
+                stopped_at,
             }),
             Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
             other => Err(ProtocolError::Malformed(format!("expected Pushed, got {other:?}"))),
@@ -681,7 +693,7 @@ pub async fn push_entry(
 
 /// Dial `peer`, complete TLS and the handshake, and hand back the stream and
 /// the peer's proven node id. The prelude every client-side exchange shares.
-async fn dial(
+pub(crate) async fn dial(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,

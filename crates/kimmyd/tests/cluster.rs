@@ -704,6 +704,96 @@ async fn a_schema_change_made_right_after_its_collection_reaches_every_member() 
     }
 }
 
+/// A burst of index creates on one member is applied about once each on the
+/// others (ADR-191). Before, each create pushed its own window, and the
+/// windows overlapped: a burst of N cost each peer up to about N²/2 applies,
+/// and the confirmations timed out behind them.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_others() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "burst" }))
+        .send()
+        .await
+        .unwrap();
+    // Every member holds the collection before the burst, so the burst's
+    // windows carry the creates and nothing older.
+    for node in [&b, &c] {
+        let token = node.login(&client).await;
+        eventually("the collection to reach every member", || {
+            let client = client.clone();
+            let url = node.url("/v1/db/shop/collections");
+            let token = token.clone();
+            async move {
+                let Ok(res) = client.get(url).bearer_auth(&token).send().await else {
+                    return false;
+                };
+                res.text().await.is_ok_and(|body| body.contains("\"burst\""))
+            }
+        })
+        .await;
+    }
+    let pushed = |node: &Node| {
+        let client = client.clone();
+        let node_url = node.url("/metrics");
+        async move {
+            let body = client.get(node_url).send().await.unwrap().text().await.unwrap();
+            body.lines()
+                .find(|l| l.starts_with("kimmy_sync_ddl_applied_total{via=\"push\"} "))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        }
+    };
+    let before = (pushed(&b).await, pushed(&c).await);
+
+    const N: usize = 16;
+    let mut creates = tokio::task::JoinSet::new();
+    for i in 0..N {
+        let client = client.clone();
+        let url = a.url("/v1/db/shop/coll/burst/indexes");
+        let token = token.clone();
+        creates.spawn(async move {
+            client
+                .post(url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "name": format!("f{i}"), "fields": [{ "path": format!("f{i}") }] }))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        });
+    }
+    while let Some(created) = creates.join_next().await {
+        let created = created.unwrap();
+        assert_eq!(
+            created["confirmation"]["pending"].as_array().map(Vec::len),
+            Some(0),
+            "{created}"
+        );
+    }
+
+    // The creates once each, plus at most one window that a member's own
+    // pull took first and the push then applied again: the one overlap a
+    // single push in flight leaves (ADR-191). Against up to about N²/2, 128
+    // here, before.
+    let after = (pushed(&b).await, pushed(&c).await);
+    for (name, rise) in [("b", after.0 - before.0), ("c", after.1 - before.1)] {
+        assert!(rise <= (2 * N) as u64, "{name} applied {rise} pushed schema changes for {N}");
+    }
+    let timeouts = a.gauge(&client, "kimmy_ddl_confirmations_total{outcome=\"timeout\"}").await;
+    assert_eq!(timeouts, Some(0), "no confirmation timed out");
+}
+
 // ---------------------------------------------------------------------------
 // Webhook ownership across the cluster
 // ---------------------------------------------------------------------------

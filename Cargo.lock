@@ -2481,6 +2481,7 @@ dependencies = [
  "kimmy-task",
  "parking_lot",
  "postcard",
+ "proptest",
  "rand 0.10.2",
  "rcgen",
  "rustls",

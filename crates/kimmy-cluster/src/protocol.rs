@@ -290,6 +290,20 @@ pub enum Message {
         /// field, which never stopped there.
         #[serde(default)]
         purge_pending: usize,
+        /// The entries in the window the receiver refused or declined, by
+        /// stamp (ADR-191): what lets a pusher whose window carried several
+        /// changes say which of them a member could not take. Absent from a
+        /// receiver on a version before the field; the pusher then finds it
+        /// does not account for the counts above and says so rather than
+        /// guessing (ADR-191).
+        #[serde(default)]
+        refused: Vec<kimmy_core::Stamp>,
+        /// The entry the batch stopped at, for an unknown collection
+        /// (ADR-148) or a creation waiting for the drop purger (ADR-189): it
+        /// and everything after it in the window were not taken. Absent from
+        /// a receiver on a version before the field, like `refused`.
+        #[serde(default)]
+        stopped_at: Option<kimmy_core::Stamp>,
     },
     /// Something went wrong; the sender is closing.
     Fault(String),
@@ -641,6 +655,11 @@ mod tests {
                 ddl_declined: 3,
                 deferred: 4,
                 purge_pending: 5,
+                refused: vec![kimmy_core::Stamp::new(Hlc::new(3, 1), NodeId::from_bytes([7; 16]))],
+                stopped_at: Some(kimmy_core::Stamp::new(
+                    Hlc::new(4, 0),
+                    NodeId::from_bytes([8; 16]),
+                )),
             },
             Message::Fault("nope".into()),
         ];
@@ -787,6 +806,8 @@ mod tests {
             ddl_declined: 0,
             deferred: 0,
             purge_pending: 1,
+            refused: Vec::new(),
+            stopped_at: None,
         };
         write_frame(&mut written, &current).await.unwrap();
         let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
@@ -806,8 +827,55 @@ mod tests {
                 ddl_declined: 0,
                 deferred: 0,
                 purge_pending: 0,
+                refused: Vec::new(),
+                stopped_at: None,
             },
             "an older receiver's reply must read as no stop"
+        );
+    }
+
+    /// `Pushed::refused` and `Pushed::stopped_at` (ADR-191) are
+    /// backward-compatible additions: a receiver before them sends a
+    /// `Pushed` without either, which reads as none named. The pusher tells
+    /// that apart from "none happened" by the counts, not by the fields.
+    #[tokio::test]
+    async fn pushed_without_the_per_change_fields_reads_as_none_named() {
+        let stamp = kimmy_core::Stamp::new(Hlc::new(9, 0), NodeId::from_bytes([3; 16]));
+        let mut written = Vec::new();
+        let current = Message::Pushed {
+            applied: 0,
+            ddl: 1,
+            ddl_refused: 1,
+            unknown_collection: 1,
+            ddl_declined: 0,
+            deferred: 0,
+            purge_pending: 0,
+            refused: vec![stamp],
+            stopped_at: Some(stamp),
+        };
+        write_frame(&mut written, &current).await.unwrap();
+        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let fields = body.get_document_mut("Pushed").expect("a struct variant");
+        assert!(fields.remove("refused").is_some(), "the field is on the wire: {fields:?}");
+        assert!(fields.remove("stopped_at").is_some(), "the field is on the wire: {fields:?}");
+
+        let bytes = bson::serialize_to_vec(&body).unwrap();
+        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
+        old.extend_from_slice(&bytes);
+        assert_eq!(
+            read_frame(&mut old.as_slice()).await.unwrap(),
+            Message::Pushed {
+                applied: 0,
+                ddl: 1,
+                ddl_refused: 1,
+                unknown_collection: 1,
+                ddl_declined: 0,
+                deferred: 0,
+                purge_pending: 0,
+                refused: Vec::new(),
+                stopped_at: None,
+            },
+            "an older receiver's reply must read as naming nothing"
         );
     }
 

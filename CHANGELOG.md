@@ -23,6 +23,36 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   burst of N concurrent index creates on one member can make each peer apply
   up to about N²/2 of them; this is where that shows. See
   [the metrics table](docs/operations.md).
+- **`kimmy_ddl_confirmations_total{outcome}`** counts each index create or
+  drop's confirmation on each member by how it ended (`confirmed`, `refused`,
+  `timeout`, `failed`, `unreached`, `purging`, `stopped_unknown`,
+  `other_member`, `task_ended`, `backoff`, `unattributable`), and
+  **`kimmy_ddl_confirm_pushes_total`** the windows pushed for them (bridged
+  as `kimmy.ddl.confirmations.<outcome>` and `kimmy.ddl.confirm_pushes`).
+
+### Changed
+
+- **A member is sent one confirmation push at a time** ([ADR-191](docs/decisions.md)).
+  Index creates and drops made while a push to a member is in flight ride the
+  next push, which carries everything queued. A request whose deadline passes
+  still answers `pending`, but its push is no longer cancelled, so the member's
+  answer is read. After a push the member took and did not answer, that member
+  is not pushed to for `cluster.sync_interval_secs`, doubling to 60 s while it
+  keeps not answering, and its confirmations answer `pending` meanwhile; SWIM
+  seeing it come back ends that early.
+- **A confirmation names the member refused only for the change it refused.**
+  It used to name it refused for any refusal in the window it was sent. A
+  member on an earlier version cannot say which, and is then named pending,
+  not refused, except for a window of one change. Two optional fields are
+  added to the push answer; nothing else changes on the wire.
+
+### Fixed
+
+- **A burst of index creates on one member no longer times out every
+  confirmation.** Each peer applied up to about N²/2 schema changes for a
+  burst of N, holding its writer for the whole burst, and every confirmation
+  timed out with a broken pipe on the peer. It now applies each create about
+  once.
 
 ### Fixed
 

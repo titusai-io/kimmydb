@@ -96,6 +96,14 @@ pub struct SyncOutcome {
     /// so the counter said "look for a clock problem" when there was none.
     /// Telling them apart is cheaper than keeping the first rare.
     pub ddl_declined: usize,
+    /// The entries behind [`Self::ddl_refused`] and [`Self::ddl_declined`],
+    /// by stamp, in the order the batch met them: what a confirmation reads to
+    /// say *which* change a member could not take, rather than that some
+    /// change in the window was one (ADR-191). Exact for a batch that
+    /// succeeded, which is the only kind a push answers with; a failed batch
+    /// keeps the refusals its commits made final and may list a decline that
+    /// did not land, which no reader of a failed batch uses.
+    pub refused_at: Vec<kimmy_core::Stamp>,
     /// Entries this round left for a later window rather than witnessing
     /// (ADR-148): above the vector the peer introduced the window with, so
     /// nothing says the entries between this node's position and them were
@@ -383,6 +391,13 @@ pub fn lag_beyond_horizon_ms(
 }
 
 impl SyncOutcome {
+    /// The entry a batch stopped at, for either reason a batch stops
+    /// (ADR-148, ADR-189): it and everything after it in the window were not
+    /// taken.
+    pub fn stopped_at(&self) -> Option<Stamp> {
+        self.unknown.as_ref().map(|unknown| unknown.stamp).or(self.purge_pending_at)
+    }
+
     pub fn total(&self) -> usize {
         self.applied
             + self.superseded
@@ -948,7 +963,10 @@ impl Engine {
         let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
         let refused = std::mem::take(&mut run.refused);
         match &applied {
-            Ok(()) => outcome.ddl_refused += refused.len(),
+            Ok(()) => {
+                outcome.ddl_refused += refused.len();
+                outcome.refused_at.extend(refused);
+            }
             Err(_) => {
                 if !run.last_committed {
                     outcome.unknown_collection = unknown;
@@ -959,8 +977,12 @@ impl Engine {
                 // decides. A read that fails counts nothing: under-counting
                 // an entry served again is the lesser error.
                 if let Ok(covered) = self.witnessed_vector() {
-                    outcome.ddl_refused +=
-                        refused.iter().filter(|stamp| stamp.hlc <= covered.get(stamp.node)).count();
+                    let landed: Vec<_> = refused
+                        .into_iter()
+                        .filter(|stamp| stamp.hlc <= covered.get(stamp.node))
+                        .collect();
+                    outcome.ddl_refused += landed.len();
+                    outcome.refused_at.extend(landed);
                 }
             }
         }
@@ -1601,7 +1623,10 @@ impl Engine {
                     }
                 }
                 DdlOutcome::Refused => run.refused.push(entry.stamp),
-                DdlOutcome::Declined => outcome.ddl_declined += 1,
+                DdlOutcome::Declined => {
+                    outcome.ddl_declined += 1;
+                    outcome.refused_at.push(entry.stamp);
+                }
                 // Deliberately uncounted: see `DdlOutcome::DeclinedReplay`.
                 DdlOutcome::DeclinedReplay => {}
                 DdlOutcome::PurgePending(name) => return Ok(Step::PurgePending(name)),

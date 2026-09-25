@@ -3562,10 +3562,13 @@ components:
           type: array
           description: |
             Members that did not answer before `cluster.ddl_confirm_timeout_secs`,
-            or that were too far behind for one push to reach — more than a
-            batch behind this node, or below its retention horizon — each with
-            why. Each receives the change through anti-entropy; the response
-            cannot say when.
+            that were too far behind for one push to reach — more than a batch
+            behind this node, or below its retention horizon — or that this
+            node is not pushing to for a while because they did not answer
+            the last push (ADR-191), each with why. A member on an earlier
+            version whose answer cannot say which change it refused is listed
+            here rather than under `refused`. Each receives the change through
+            anti-entropy; the response cannot say when.
           items:
             type: object
             required: [node, reason]
