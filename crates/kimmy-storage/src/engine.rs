@@ -1164,6 +1164,15 @@ impl Engine {
         if let Some(meter) = meter {
             let (metered, cpu) = meter.finish();
             let hold = crate::hold_meter::decompose(&metered, held, cpu);
+            #[cfg(test)]
+            crate::hold_meter::test_hooks::LAST_HOLD.with(|h| {
+                h.set(Some(crate::hold_meter::test_hooks::LastHold {
+                    meter: metered,
+                    cpu_over_hold: cpu,
+                    held,
+                    decomposed: hold,
+                }))
+            });
             self.hold_counters.record(holder, &hold, phases);
         }
         let us = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
