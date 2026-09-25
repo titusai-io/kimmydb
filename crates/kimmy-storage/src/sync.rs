@@ -44,8 +44,10 @@ pub struct SyncOutcome {
     /// Not one this node already held as sent: see [`Self::ddl_held`].
     pub ddl: usize,
     /// Schema changes a window carried that this node already held, byte for
-    /// byte, and so neither applied again nor committed: the overlap of a
-    /// push and a pull, or a third member relaying what the origin pushed.
+    /// byte, and so not applied again, with no commit for their append: the
+    /// overlap of a push and a pull, or a third member relaying what the
+    /// origin pushed. A kind's own writes before the append are unchanged (a
+    /// replayed drop of an index already gone records its tombstone).
     pub ddl_held: usize,
     /// Batches this round stopped short at an entry for a collection this
     /// node does not hold and has no tombstone for (ADR-148). At most one
@@ -403,10 +405,15 @@ impl SyncOutcome {
         self.unknown.as_ref().map(|unknown| unknown.stamp).or(self.purge_pending_at)
     }
 
+    /// Every entry the batch decided on, whatever it decided. A schema
+    /// change already held counts here, under `ddl_held`, as a document
+    /// already held does under `superseded`: a window that carried only
+    /// changes this node already had still merged something from the peer.
     pub fn total(&self) -> usize {
         self.applied
             + self.superseded
             + self.ddl
+            + self.ddl_held
             + self.unknown_collection
             + self.ddl_refused
             + self.ddl_declined
@@ -1426,8 +1433,10 @@ enum DdlOutcome {
     Applied,
     /// The change is already held here as sent — its entry is in the oplog
     /// under its stamp, byte for byte — so appending it would commit nothing
-    /// new: no writer is kept, nothing is committed, and it is counted as
-    /// held rather than applied. See `Engine::append_replicated_ddl`.
+    /// new: no writer is kept for the append, nothing is committed there, and
+    /// it is counted as held rather than applied. What the kind wrote before
+    /// the append is its own (a drop's tombstone), and unchanged. See
+    /// `Engine::append_replicated_ddl`.
     Held,
     /// Applied, and final: its commit landed. What had to follow the commit
     /// then failed — reporting a replicated unique index's backfill
@@ -2163,7 +2172,10 @@ impl Engine {
     /// such arrival used to take the writer and commit an append that
     /// changed nothing — one fsync per duplicate, 11–26 per member in a burst
     /// of 32 index creates. An entry held under its stamp with exactly these
-    /// bytes is left as it is: no writer is kept, nothing is committed.
+    /// bytes is left as it is: no writer is kept, nothing is committed here.
+    /// What the kind wrote before reaching this is its own and unchanged: a
+    /// replicated index create found standing wrote nothing, but a replayed
+    /// drop of an index already gone has recorded its tombstone.
     ///
     /// **Why bytes, not the key alone.** [`crate::engine::append_oplog`]
     /// inserts unconditionally, so a different value under the stamp is
@@ -3792,6 +3804,7 @@ mod tests {
         let commits = b.commits();
         let again = b.apply_batch(&entries).unwrap();
         assert_eq!((again.ddl, again.ddl_held), (0, 2), "held already, and not again: {again:?}");
+        assert_eq!(again.total(), 2, "and still merged from the peer: {again:?}");
         assert_eq!(
             b.commits() - commits,
             1,
@@ -3991,6 +4004,7 @@ mod tests {
             .chain([collection])
             .collect();
         assert_eq!(replays.len(), 3, "{entries:?}");
+        let mut published = b.subscribe();
         for entry in &replays {
             let writes = race_hooks::replication_writes_opened();
             assert!(matches!(b.apply_ddl(entry).unwrap(), DdlOutcome::Held), "{:?}", entry.kind);
@@ -3998,6 +4012,14 @@ mod tests {
                 race_hooks::replication_writes_opened() - writes,
                 0,
                 "{:?}: no append transaction",
+                entry.kind
+            );
+            // Still woken, whatever the kind: the publish is what covers an
+            // earlier apply that committed and failed before it published.
+            assert_eq!(
+                published.try_recv().map(|e| e.stamp).ok(),
+                Some(entry.stamp),
+                "{:?}: published",
                 entry.kind
             );
         }

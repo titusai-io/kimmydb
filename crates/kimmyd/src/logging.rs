@@ -807,14 +807,14 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.ddl_held.pull",
             "{change}",
-            "Replicated schema changes in windows this node pulled that it already held, entry and all: neither applied nor committed.",
+            "Replicated schema changes in windows this node pulled that it already held, entry and all: not applied again, and their append committed nothing.",
             sync_ddl_held_pull
         );
         observe!(
             u64_observable_counter,
             "kimmy.sync.ddl_held.push",
             "{change}",
-            "Replicated schema changes in windows a peer pushed that this node already held, entry and all: neither applied nor committed.",
+            "Replicated schema changes in windows a peer pushed that this node already held, entry and all: not applied again, and their append committed nothing.",
             sync_ddl_held_push
         );
         // Each way a schema-change confirmation ends, one instrument per

@@ -73,8 +73,8 @@ pub struct RoundReport {
     /// (`kimmy_sync_ddl_applied_total`).
     pub ddl_applied: usize,
     /// Replicated schema changes the rounds in this tick carried that this
-    /// node already held, entry and all, and so neither applied nor
-    /// committed — `SyncOutcome::ddl_held`, summed over the pulls
+    /// node already held, entry and all, and so did not apply again or
+    /// append — `SyncOutcome::ddl_held`, summed over the pulls
     /// (`kimmy_sync_ddl_held_total`).
     pub ddl_held: usize,
     /// Replicated schema changes the rounds in this tick could not apply to

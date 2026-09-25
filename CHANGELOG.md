@@ -16,10 +16,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **`kimmy_sync_ddl_held_total{via}`** counts the replicated schema changes a
   window carried that the member already held, entry and all (bridged as
-  `kimmy.sync.ddl_held.pull` and `.push`). They are neither applied again nor
-  committed. Windows overlap by design: a pull that read the member's position
-  before a push landed, or a third member relaying what the origin pushed.
-  This keeps that overlap visible now that it costs no commit. See
+  `kimmy.sync.ddl_held.pull` and `.push`). They are not applied again, and
+  appending their entry commits nothing; a kind's own writes are unchanged, so
+  a replayed drop of an index already gone still commits its tombstone.
+  Windows overlap by design: a pull that read the member's position before a
+  push landed, or a third member relaying what the origin pushed. This keeps
+  that overlap visible now that a re-delivered index create costs no commit.
+  See
   [the metrics table](docs/operations.md).
 
 ### Changed
@@ -28,7 +31,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   originating entry is now appended in the transaction that builds the index,
   as a restored definition's already was, so the definition and its entry
   commit together or not at all. A schema change whose entry the member
-  already holds, byte for byte, takes no commit at all. In a burst of 32
+  already holds, byte for byte, no longer commits an append of it; a
+  re-delivered index create takes no commit at all, and a kind's own writes
+  (a replayed index drop's tombstone) are unchanged. In a burst of 32
   index creates on one member, each other member made 94-111 commits, nearly
   all of them an fsync; about half of those are gone.
 - **`kimmy_sync_ddl_applied_total{via}` no longer counts a change the member

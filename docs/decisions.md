@@ -18330,8 +18330,12 @@ writers of its own and can fail: the apply is then counted, because its
 commit landed (ADR-177), and the batch fails.
 
 A schema change whose entry this node already holds under its stamp, byte for
-byte, takes no writer and commits nothing; it is witnessed and published
-still, and counted in `kimmy_sync_ddl_held_total`, not as applied. **Bytes,
+byte, takes no writer for its append and commits nothing there; it is
+witnessed and published still, and counted in `kimmy_sync_ddl_held_total`, not as applied. What a kind writes before its
+append is unchanged: a replicated `CreateIndex` found standing writes nothing,
+so a re-delivered create costs no commit at all, but a replayed `DropIndex`
+for an index already gone still commits its tombstone in `drop_index_inner`,
+as it did before. **Bytes,
 not the key**: `append_oplog` replaces a different value under the stamp, so
 the origin's entry replaces a rebuild of it, and a rebuild relayed by a third
 member replaces the origin's; both still happen, and only a write that would

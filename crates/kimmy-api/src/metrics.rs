@@ -846,7 +846,8 @@ impl Metrics {
     }
 
     /// Count schema changes a peer pushed to this node that it already held,
-    /// entry and all, under `via="push"`: nothing applied, nothing committed.
+    /// entry and all, under `via="push"`: not applied again, and its append
+    /// committed nothing.
     pub fn record_ddl_held_push(&self, n: u64) {
         self.sync_ddl_held_push.fetch_add(n, Ordering::Relaxed);
     }
@@ -1362,7 +1363,7 @@ impl Metrics {
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
-             # HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again, and nothing committed for them. Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; it costs a read, not a commit.\n\
+             # HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again: the append of the entry commits nothing, though a kind's own writes are unchanged (a drop of an index already gone still records its tombstone). Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; for an index create it costs a read, not a commit.\n\
              # TYPE kimmy_sync_ddl_held_total counter\n\
              kimmy_sync_ddl_held_total{{via=\"pull\"}} {sync_ddl_held_pull}\n\
              kimmy_sync_ddl_held_total{{via=\"push\"}} {sync_ddl_held_push}\n\
@@ -2544,7 +2545,7 @@ kimmy_sync_ddl_declined_total 36
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
-# HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again, and nothing committed for them. Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; it costs a read, not a commit.
+# HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again: the append of the entry commits nothing, though a kind's own writes are unchanged (a drop of an index already gone still records its tombstone). Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; for an index create it costs a read, not a commit.
 # TYPE kimmy_sync_ddl_held_total counter
 kimmy_sync_ddl_held_total{via=\"pull\"} 48
 kimmy_sync_ddl_held_total{via=\"push\"} 58

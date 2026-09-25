@@ -280,7 +280,7 @@ pub enum Message {
         /// entry it already held as sent: those are `ddl_held`.
         ddl: usize,
         /// Schema changes the window carried that the receiver already held,
-        /// entry and all, and so neither applied nor committed. Absent from a
+        /// entry and all, and so did not apply again or append. Absent from a
         /// receiver on a version before the field, which counted them in
         /// `ddl`.
         #[serde(default)]

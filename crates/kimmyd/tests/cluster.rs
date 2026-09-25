@@ -704,6 +704,37 @@ async fn a_schema_change_made_right_after_its_collection_reaches_every_member() 
     }
 }
 
+/// Wait until no member of `nodes` has pulled anything for two sync
+/// intervals, so a counter read next is not raced by a tick still applying:
+/// a pulled window reaches the metrics only when its tick ends.
+async fn pulls_settle(client: &reqwest::Client, nodes: &[&Node]) {
+    let pulls = || async {
+        let mut all = Vec::new();
+        for node in nodes {
+            let body = client.get(node.url("/metrics")).send().await.unwrap().text().await.unwrap();
+            let prefix = "kimmy_sync_pull_seconds_count{phase=\"apply\"} ";
+            all.push(
+                body.lines()
+                    .find(|l| l.starts_with(prefix))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .expect("the pull histogram is on the page"),
+            );
+        }
+        all
+    };
+    let mut last = pulls().await;
+    let mut quiet = 0;
+    let deadline = std::time::Instant::now() + patience();
+    while quiet < 2 {
+        assert!(std::time::Instant::now() < deadline, "pulls to settle");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = pulls().await;
+        quiet = if now == last { quiet + 1 } else { 0 };
+        last = now;
+    }
+}
+
 /// A burst of index creates on one member is applied once each on the others
 /// (ADR-191, ADR-180). Before, each create pushed its own window, and the
 /// windows overlapped: a burst of N cost each peer up to about N²/2 applies,
@@ -760,6 +791,9 @@ async fn a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_othe
                 .sum::<u64>()
         }
     };
+    // The collection's own creation reaches the pulled count only when the
+    // tick that pulled it ends; read before that, it lands in the burst.
+    pulls_settle(&client, &[&b, &c]).await;
     let before = (pushed(&b).await, pushed(&c).await);
 
     const N: usize = 16;
@@ -890,20 +924,7 @@ async fn a_burst_of_creates_on_one_member_costs_the_others_one_commit_each() {
             }
         }
     };
-    // Settled: nothing left to pull, as far as two sync intervals can tell.
-    let settle = || async {
-        let mut last = (read(&b).await.pulls, read(&c).await.pulls);
-        let mut quiet = 0;
-        let deadline = std::time::Instant::now() + patience();
-        while quiet < 2 {
-            assert!(std::time::Instant::now() < deadline, "pulls to settle");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let now = (read(&b).await.pulls, read(&c).await.pulls);
-            quiet = if now == last { quiet + 1 } else { 0 };
-            last = now;
-        }
-    };
-    settle().await;
+    pulls_settle(&client, &[&b, &c]).await;
     let started = std::time::Instant::now();
     let before = (read(&a).await, read(&b).await, read(&c).await);
 
@@ -934,7 +955,7 @@ async fn a_burst_of_creates_on_one_member_costs_the_others_one_commit_each() {
         })
         .await;
     }
-    settle().await;
+    pulls_settle(&client, &[&b, &c]).await;
     let window = started.elapsed();
     let after = (read(&a).await, read(&b).await, read(&c).await);
 
