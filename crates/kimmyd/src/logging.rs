@@ -803,6 +803,100 @@ impl TelemetryGuard {
             "Replicated schema changes this node applied from windows a peer pushed to confirm a change, a change already held here that a window carried again included.",
             sync_ddl_applied_push
         );
+        // Each way a schema-change confirmation ends, one instrument per
+        // label value, in `ConfirmOutcome::ALL` order (ADR-191).
+        use kimmy_cluster::ConfirmOutcome;
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.confirmed",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended confirmed.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Confirmed.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.refused",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended refused.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Refused.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.timeout",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended timeout.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Timeout.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.failed",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended failed.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Failed.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.unreached",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended unreached.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Unreached.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.purging",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended purging.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Purging.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.stopped_unknown",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended stopped_unknown.",
+            |s| s.ddl_confirmations[ConfirmOutcome::StoppedUnknown.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.other_member",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended other_member.",
+            |s| s.ddl_confirmations[ConfirmOutcome::OtherMember.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.task_ended",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended task_ended.",
+            |s| s.ddl_confirmations[ConfirmOutcome::TaskEnded.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.backoff",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended backoff.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Backoff.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.unattributable",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended unattributable.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Unattributable.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirmations.cancelled",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended cancelled.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Cancelled.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ddl.confirm_pushes",
+            "{push}",
+            "Windows pushed to members to confirm schema changes; at most one in flight per member.",
+            ddl_confirm_pushes
+        );
         observe!(
             u64_observable_counter,
             "kimmy.sync.ddl_relogged",

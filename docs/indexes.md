@@ -246,10 +246,14 @@ every live member has applied or refused the change**, or a deadline has
 passed ([ADR-140](decisions.md)). The response's `confirmation` names each
 member's answer, so a client that creates an index here and writes through a
 front a moment later finds it enforced wherever the write lands. What is
-pushed is the window the member lacks, ending in the change, so a member's
-history never gains a hole ([ADR-143](decisions.md)). A member that did not
-answer in time, or was too far behind for one push to reach, is listed as
-`pending` and receives the change through anti-entropy; a partitioned member
+pushed is the window the member lacks, running at least to the change, so a
+member's history never gains a hole ([ADR-143](decisions.md)). A member is
+sent one push at a time, and changes made while it is in flight ride the
+next, so a burst of creates costs each member about one apply per create
+([ADR-191](decisions.md)). A member that did not answer in time, was too far
+behind for one push to reach, or did not answer the last push and is not
+being pushed to for a while, is listed as `pending` and receives the change
+through anti-entropy; a partitioned member
 always will, which is why the
 paragraph above, not this one, is what keeps the cluster safe.
 

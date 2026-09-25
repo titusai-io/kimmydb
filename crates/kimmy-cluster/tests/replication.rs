@@ -14,8 +14,7 @@ use std::collections::BTreeSet;
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
 use kimmy_cluster::transport::{
-    DivergenceProbe, PeerStalls, entries_threshold, push_entry, serve, serve_with, sync_once,
-    sync_once_with,
+    DivergenceProbe, PeerStalls, entries_threshold, serve_with, sync_once, sync_once_with,
 };
 use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
@@ -27,6 +26,9 @@ struct Node {
     engine: Arc<Engine>,
     addr: std::net::SocketAddr,
     serving: tokio::task::JoinHandle<()>,
+    /// What each window pushed to this node became here, in order: what its
+    /// push hook was handed.
+    pushed: Pushed,
     path: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -40,9 +42,11 @@ async fn node_with_secret(secret: &str) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kimmy.redb");
     let engine = Arc::new(Engine::open(&path).unwrap());
-    let (addr, serving) = listen(&engine, secret).await;
-    Node { engine, addr, serving, path, _dir: dir }
+    let (addr, serving, pushed) = listen(&engine, secret).await;
+    Node { engine, addr, serving, pushed, path, _dir: dir }
 }
+
+type Pushed = Arc<std::sync::Mutex<Vec<kimmy_storage::SyncOutcome>>>;
 
 /// Bind an ephemeral port and serve `engine` on it.
 ///
@@ -50,11 +54,49 @@ async fn node_with_secret(secret: &str) -> Node {
 async fn listen(
     engine: &Arc<Engine>,
     secret: &str,
-) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, Pushed) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let serving = tokio::spawn(serve(Arc::clone(engine), listener, secret.to_string()));
-    (addr, serving)
+    let pushed: Pushed = Arc::default();
+    let hook: kimmy_cluster::PushHook = Arc::new({
+        let pushed = Arc::clone(&pushed);
+        move |outcome: &kimmy_storage::SyncOutcome| pushed.lock().unwrap().push(outcome.clone())
+    });
+    let tls = Arc::new(kimmy_cluster::tls::ClusterTls::new().expect("cluster TLS"));
+    let serving =
+        tokio::spawn(serve_with(Arc::clone(engine), listener, secret.to_string(), Some(hook), tls));
+    (addr, serving, pushed)
+}
+
+/// Confirm `entry` from `from` on the member at `addr`, known as `node`, the
+/// way the node does: through a [`kimmy_cluster::Confirmer`] (ADR-191).
+async fn confirm_at(
+    from: &Node,
+    addr: std::net::SocketAddr,
+    node: kimmy_core::NodeId,
+    entry: &kimmy_core::OplogEntry,
+) -> kimmy_cluster::Resolution {
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test(addr, node);
+    let confirmer = kimmy_cluster::Confirmer::new(
+        Arc::clone(&from.engine),
+        SECRET.into(),
+        members,
+        kimmy_cluster::ConfirmConfig::new(Duration::from_secs(1)),
+    );
+    confirmer.confirm(addr, node, entry.clone(), Duration::from_secs(10)).await
+}
+
+/// [`confirm_at`] on `to`, with what each window pushed to it became there.
+async fn confirm(
+    from: &Node,
+    to: &Node,
+    entry: &kimmy_core::OplogEntry,
+) -> (kimmy_cluster::Resolution, Vec<kimmy_storage::SyncOutcome>) {
+    let before = to.pushed.lock().unwrap().len();
+    let resolution = confirm_at(from, to.addr, to.engine.node_id(), entry).await;
+    let windows = to.pushed.lock().unwrap()[before..].to_vec();
+    (resolution, windows)
 }
 
 impl Node {
@@ -77,8 +119,8 @@ impl Node {
         drop(engine);
 
         let engine = Arc::new(Engine::open(&path).unwrap());
-        let (addr, serving) = listen(&engine, SECRET).await;
-        Node { engine, addr, serving, path, _dir }
+        let (addr, serving, pushed) = listen(&engine, SECRET).await;
+        Node { engine, addr, serving, pushed, path, _dir }
     }
 }
 
@@ -1403,10 +1445,11 @@ async fn a_push_to_a_caught_up_member_carries_the_change_and_not_what_it_holds()
     let entry = b.engine.oplog_entry(&stamp).unwrap().expect("B's schema change");
     assert_eq!(entry.kind, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&b.engine, c.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert_eq!(pushed.outcome.ddl, 1, "the change is applied at once: {pushed:?}");
-    assert_eq!(pushed.outcome.superseded, 0, "and nothing C holds is sent: {pushed:?}");
+    let (resolution, windows) = confirm(&b, &c, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert_eq!(windows[0].ddl, 1, "the change is applied at once: {windows:?}");
+    assert_eq!(windows[0].superseded, 0, "and nothing C holds is sent: {windows:?}");
 }
 
 // -----------------------------------------------------------------------
@@ -3861,14 +3904,11 @@ async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
         .unwrap();
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.expect("the push is answered");
-    assert_eq!(pushed.node, b.engine.node_id(), "the peer names itself in the handshake");
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert_eq!(
-        pushed.outcome.ddl, 2,
-        "the collection the member lacked, then the index: {pushed:?}"
-    );
-    assert_eq!(pushed.outcome.ddl_refused, 0, "{pushed:?}");
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert_eq!(windows[0].ddl, 2, "the collection the member lacked, then the index: {windows:?}");
+    assert_eq!(windows[0].ddl_refused, 0, "{windows:?}");
     assert!(
         b.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
         "held now, not after the next sync interval"
@@ -3909,10 +3949,11 @@ async fn a_push_carries_everything_the_member_lacks_before_the_change() {
         .unwrap();
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert_eq!(pushed.outcome.unknown_collection, 0, "the collection arrived first: {pushed:?}");
-    assert_eq!((pushed.outcome.ddl, pushed.outcome.applied), (2, 1), "{pushed:?}");
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert_eq!(windows[0].unknown_collection, 0, "the collection arrived first: {windows:?}");
+    assert_eq!((windows[0].ddl, windows[0].applied), (2, 1), "{windows:?}");
     let cb = b.engine.get_collection("shop", "sessions").expect("the collection, not a hole");
     assert!(cb.index("ttl_seen").is_some(), "and the index over it");
     assert!(
@@ -3936,9 +3977,9 @@ async fn a_member_that_already_holds_the_change_is_confirmed_without_a_window() 
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert_eq!(pushed.outcome.total(), 0, "already held; nothing sent: {pushed:?}");
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Confirmed, "held: confirmed");
+    assert!(windows.is_empty(), "and no window was sent: {windows:?}");
 }
 
 #[tokio::test]
@@ -3959,10 +4000,13 @@ async fn a_member_more_than_a_batch_behind_is_reported_unreached_and_sent_nothin
         .unwrap();
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
-    let reason = pushed.unreached.clone().expect("named unreached");
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
+    let kimmy_cluster::Resolution::Pending { outcome, reason } = resolution else {
+        panic!("named pending: {resolution:?}")
+    };
+    assert_eq!(outcome, kimmy_cluster::ConfirmOutcome::Unreached);
     assert!(reason.contains("entries behind"), "{reason}");
-    assert_eq!(pushed.outcome.total(), 0, "nothing was sent: {pushed:?}");
+    assert!(windows.is_empty(), "nothing was sent: {windows:?}");
     assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
 
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
@@ -3994,11 +4038,18 @@ async fn a_member_below_the_retention_horizon_is_reported_unreached() {
     let b = node().await;
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
     assert!(
-        pushed.unreached.as_deref().is_some_and(|r| r.contains("retention horizon")),
-        "{pushed:?}"
+        matches!(
+            &resolution,
+            kimmy_cluster::Resolution::Pending {
+                outcome: kimmy_cluster::ConfirmOutcome::Unreached,
+                reason
+            } if reason.contains("retention horizon")
+        ),
+        "{resolution:?}"
     );
+    assert!(windows.is_empty(), "{windows:?}");
     assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
 
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
@@ -4015,9 +4066,9 @@ async fn a_pushed_schema_change_the_receiver_cannot_apply_is_reported_as_refused
     let (a, b) = sender_with_a_definition_the_receiver_cannot_arbitrate().await;
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert_eq!(pushed.outcome.ddl_refused, 1, "refused and reported: {pushed:?}");
+    let (resolution, windows) = confirm(&a, &b, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Refused, "{windows:?}");
+    assert_eq!(windows.iter().map(|w| w.ddl_refused).sum::<usize>(), 1, "{windows:?}");
     assert!(
         !b.engine.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
         "B keeps the definition it cannot arbitrate away"
@@ -4068,8 +4119,8 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
         .unwrap();
     let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let pushed = push_entry(&a.engine, addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.outcome.ddl_refused, 1, "{pushed:?}");
+    let resolution = confirm_at(&a, addr, engine.node_id(), &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Refused);
     assert_eq!(refused.load(Ordering::SeqCst), 1, "the hook saw the refusal");
 }
 
@@ -4124,10 +4175,13 @@ async fn a_drop_pushed_from_a_member_without_the_index_is_applied_by_the_holder(
     let dropped = b.engine.drop_index_stamped("shop", "orders", "by_email").unwrap();
     let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
 
-    let pushed = push_entry(&b.engine, a.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.unreached, None, "{pushed:?}");
-    assert!(pushed.outcome.ddl >= 1, "applied on the holder: {pushed:?}");
-    assert_eq!(pushed.outcome.ddl_declined, 0, "{pushed:?}");
+    let (resolution, windows) = confirm(&b, &a, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
+    assert!(
+        windows.iter().map(|w| w.ddl).sum::<usize>() >= 1,
+        "applied on the holder: {windows:?}"
+    );
+    assert_eq!(windows.iter().map(|w| w.ddl_declined).sum::<usize>(), 0, "{windows:?}");
     assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_none());
 }
 
@@ -4147,8 +4201,14 @@ async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
         .unwrap();
     let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
 
-    let pushed = push_entry(&b.engine, a.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.outcome.ddl_declined, 1, "declined and reported: {pushed:?}");
+    // The window carries B's collection creation and its drop, two changes:
+    // only the declined stamp on the wire lets the drop be named refused
+    // rather than unattributable (ADR-191).
+    let (resolution, windows) = confirm(&b, &a, &entry).await;
+    assert_eq!(resolution, kimmy_cluster::Resolution::Refused, "{windows:?}");
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert_eq!(windows[0].ddl_declined, 1, "declined and reported: {windows:?}");
+    assert_eq!(windows[0].refused_at, vec![entry.stamp], "by its stamp: {windows:?}");
     assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some());
 }
 
@@ -5453,25 +5513,45 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     assert!(b.engine.rows_under(first.id).unwrap() > 0, "B still owes the first life's rows");
 
     a.engine.finish_purges_now().unwrap();
+    // A change before the stop, in the same window as the recreation: what
+    // the member's answer must place the stop against, by stamp.
+    a.engine.create_collection("shop", "before").unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
-    let entry = a
-        .engine
-        .entries_for_peer(Hlc::ZERO, 1_024)
-        .unwrap()
-        .entries
-        .into_iter()
-        .last()
-        .expect("the recreation's entry");
+    let mut entries = a.engine.entries_for_peer(Hlc::ZERO, 1_024).unwrap().entries;
+    let entry = entries.pop().expect("the recreation's entry");
+    let before = entries.pop().expect("the change before it");
     assert_eq!(entry.kind, kimmy_core::OpKind::CreateCollection);
+    assert_eq!(before.kind, kimmy_core::OpKind::CreateCollection);
 
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.expect("the push is answered");
-    assert_eq!(pushed.outcome.purge_pending, 1, "{pushed:?}");
-    assert_eq!(pushed.outcome.ddl, 0, "nothing was created: {pushed:?}");
-    assert_eq!(pushed.outcome.unknown_collection, 0, "nor is anything missing: {pushed:?}");
+    // Both queued on one confirmer before its first push: one window.
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test(b.addr, b.engine.node_id());
+    let confirmer = kimmy_cluster::Confirmer::new(
+        Arc::clone(&a.engine),
+        SECRET.into(),
+        members,
+        kimmy_cluster::ConfirmConfig::new(Duration::from_secs(1)),
+    );
+    let node = b.engine.node_id();
+    let deadline = Duration::from_secs(10);
+    let (first, recreated) = tokio::join!(
+        confirmer.confirm(b.addr, node, before.clone(), deadline),
+        confirmer.confirm(b.addr, node, entry.clone(), deadline),
+    );
+    let windows = b.pushed.lock().unwrap().clone();
+    assert_eq!(windows.len(), 1, "one window for both: {windows:?}");
+    assert_eq!(windows[0].purge_pending, 1, "{windows:?}");
+    assert_eq!(windows[0].ddl, 1, "only the change before the stop: {windows:?}");
+    assert_eq!(windows[0].unknown_collection, 0, "nor is anything missing: {windows:?}");
+    assert_eq!(windows[0].stopped_at(), Some(entry.stamp), "the stop, by its stamp");
+    // Placed by the stamp on the wire: without it, a window of two changes
+    // cannot be attributed, and neither would read as it does here.
+    assert_eq!(first, kimmy_cluster::Resolution::Confirmed);
+    assert_eq!(recreated.outcome(), kimmy_cluster::ConfirmOutcome::Purging, "{recreated:?}");
     assert!(b.engine.get_collection("shop", "orders").is_err());
 
     b.engine.finish_purges_now().unwrap();
-    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
-    assert_eq!(pushed.outcome.purge_pending, 0, "{pushed:?}");
+    let (again, windows) = confirm(&a, &b, &entry).await;
+    assert_eq!(again, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
     assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }

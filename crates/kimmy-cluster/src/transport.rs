@@ -49,7 +49,7 @@ use crate::protocol::{
 const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 
 /// Whether a batch fits in one frame, and how much of it does if not.
-enum Fits {
+pub(crate) enum Fits {
     All,
     Only(usize),
 }
@@ -59,7 +59,7 @@ enum Fits {
 /// Sizes each entry once and takes a running total, rather than serializing the
 /// whole batch to find out it is too big and then doing it again for a smaller one.
 /// The common case is a single pass that says `All`.
-fn how_many_fit(entries: &[OplogEntry]) -> Fits {
+pub(crate) fn how_many_fit(entries: &[OplogEntry]) -> Fits {
     let mut total = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         let size = match bson::serialize_to_vec(entry) {
@@ -84,7 +84,7 @@ fn how_many_fit(entries: &[OplogEntry]) -> Fits {
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one request may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much of a round's [`REQUEST_TIMEOUT`] a snapshot pull leaves unspent
 /// before it stops asking for pages (ADR-152).
@@ -405,6 +405,8 @@ where
                         ddl_declined: outcome.ddl_declined,
                         deferred: outcome.deferred,
                         purge_pending: outcome.purge_pending,
+                        refused: outcome.refused_at.clone(),
+                        stopped_at: outcome.stopped_at(),
                     },
                 )
                 .await?;
@@ -527,161 +529,9 @@ pub async fn sync_once_with(
     sync_over(engine, &mut stream, peer, their_node, probe, stalls).await
 }
 
-/// What a push to one member became (ADR-140, ADR-143).
-#[derive(Clone, Debug, PartialEq)]
-pub struct PushOutcome {
-    /// The member, as it named itself in the handshake.
-    pub node: kimmy_core::NodeId,
-    /// What the window became there: `ddl_refused` above zero is a schema
-    /// change the member could not apply and skipped, counted there. Empty
-    /// when the member had already processed the entry and nothing was sent.
-    pub outcome: SyncOutcome,
-    /// Why the window could not carry the entry, when it could not: the
-    /// member is more than a batch behind this node, or below its retention
-    /// horizon. Nothing was sent, and anti-entropy carries the entry.
-    pub unreached: Option<String>,
-}
-
-/// Hand `peer` the window it lacks from this node, ending in `entry`, and
-/// wait for what became of it.
-///
-/// **A push is a pull the sender starts** (ADR-143). The peer is asked what
-/// it has processed, the window is derived from that exactly as the peer
-/// would derive it for itself — same threshold, same horizon check, same
-/// batch and frame limits — and the peer accounts for it through the same
-/// coverage rule a pulled window goes through. So a push never carries an
-/// entry out of order, and a member's witnessed vector is raised only over
-/// entries it was sent. The first form of this call pushed the entry alone
-/// through `apply_batch`, which raised the vector past every earlier entry
-/// the member had not yet pulled; nothing re-served them.
-///
-/// A peer that has already processed `entry` is confirmed without anything
-/// being sent. A peer the window cannot reach — more than a batch behind, or
-/// below this node's retention horizon — is sent nothing and reported
-/// `unreached`: a window that stops short of the entry would only do a sync
-/// round's work on a request's clock, and the sync loop is already doing
-/// that work at its own pace.
-///
-/// One exchange on a fresh connection, bounded like a sync round.
-pub async fn push_entry(
-    engine: &Engine,
-    peer: SocketAddr,
-    secret: &str,
-    entry: &OplogEntry,
-) -> Result<PushOutcome, ProtocolError> {
-    let (mut stream, their_node) = dial(engine, peer, secret).await?;
-    let nothing_sent = |unreached: Option<String>| PushOutcome {
-        node: their_node,
-        outcome: SyncOutcome { peer: Some(their_node), ..SyncOutcome::default() },
-        unreached,
-    };
-    let exchange = async {
-        write_frame(&mut stream, &Message::AskWitnessed {}).await?;
-        let held = match read_frame(&mut stream).await? {
-            Message::Witnessed(held) => held,
-            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
-            other => {
-                return Err(ProtocolError::Malformed(format!("expected Witnessed, got {other:?}")));
-            }
-        };
-        if held.get(entry.stamp.node) >= entry.stamp.hlc {
-            // A sync round got there first; the member holds or has refused
-            // the entry already, and counted whichever it was.
-            return Ok(nothing_sent(None));
-        }
-
-        // What this node can serve, read *before* the window so the vector
-        // never claims more than the window could carry — the order a served
-        // pull has, where `AskVersions` precedes `AskEntries`.
-        let mine = engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        let Some(from) = held.behind(&mine) else {
-            return Ok(nothing_sent(None));
-        };
-        let servable = engine
-            .can_serve_peer_holding(&held)
-            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        if !servable {
-            return Ok(nothing_sent(Some(
-                "the member is below this node's retention horizon; anti-entropy will hand it \
-                 a snapshot"
-                    .into(),
-            )));
-        }
-        // The window a pull from the member's position would be served, what
-        // it has processed passed over (ADR-171).
-        // Off the worker, for the reason the served arm gives (ADR-153).
-        let mut window = kimmy_storage::blocking(|| {
-            engine.entries_for_peer_holding(from, MAX_BATCH, Some(&held))
-        })
-        .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        if let Fits::Only(fits) = how_many_fit(&window.entries) {
-            if fits == 0 {
-                return Err(ProtocolError::Malformed(format!(
-                    "a single oplog entry at or after {from:?} exceeds the {MAX_FRAME} byte \
-                     frame limit and cannot replicate"
-                )));
-            }
-            // Re-read at the smaller limit rather than trim: the end the
-            // window reports must match the entries it carries (ADR-127).
-            window = kimmy_storage::blocking(|| {
-                engine.entries_for_peer_holding(from, fits, Some(&held))
-            })
-            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        }
-        if !window.entries.iter().any(|e| e.stamp == entry.stamp) {
-            return Ok(nothing_sent(Some(format!(
-                "the member is more than {} entries behind this node; anti-entropy will carry \
-                 the change",
-                window.entries.len()
-            ))));
-        }
-
-        write_frame(
-            &mut stream,
-            &Message::Push {
-                entries: window.entries,
-                scanned_to: window.scanned_to,
-                exhausted: window.exhausted,
-                versions: mine,
-            },
-        )
-        .await?;
-        match read_frame(&mut stream).await? {
-            Message::Pushed {
-                applied,
-                ddl,
-                ddl_refused,
-                unknown_collection,
-                ddl_declined,
-                deferred,
-                purge_pending,
-            } => Ok(PushOutcome {
-                node: their_node,
-                outcome: SyncOutcome {
-                    applied,
-                    ddl,
-                    ddl_refused,
-                    unknown_collection,
-                    ddl_declined,
-                    deferred,
-                    purge_pending,
-                    peer: Some(their_node),
-                    ..SyncOutcome::default()
-                },
-                unreached: None,
-            }),
-            Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
-            other => Err(ProtocolError::Malformed(format!("expected Pushed, got {other:?}"))),
-        }
-    };
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
-        .await
-        .map_err(|_| ProtocolError::TimedOut("push".into()))?
-}
-
 /// Dial `peer`, complete TLS and the handshake, and hand back the stream and
 /// the peer's proven node id. The prelude every client-side exchange shares.
-async fn dial(
+pub(crate) async fn dial(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,

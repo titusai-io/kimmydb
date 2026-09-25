@@ -10132,6 +10132,16 @@ through `apply_peer_batch`. The decision here — confirm on every live member
 before answering — stands unchanged. (ADR-141 has since made a drop mint its
 entry wherever it lands, so a drop always has an entry to confirm.)
 
+**Amended 2026-09-24 — one push in flight per member (ADR-191).** The deadline
+is still per request and per member, but it now bounds a request's wait on a
+push it may share with other changes, not a push of its own: a request whose
+deadline passes answers `pending` as before, and the push goes on, owned by
+the member's queue, to its answer. `refused` is decided per change, from the
+stamps the member's answer names, where it used to be any refusal in the
+window. What the response means is unchanged. The cost paragraph gains a
+queue per member with a push in flight, and a back-off after a push the member
+did not answer.
+
 **Why.** The window ADR-139's finding came through. A client created an index
 on one member and, seconds later, wrote through a front that spread requests
 across members; the write landed on a member that had not yet received the
@@ -10347,6 +10357,19 @@ kind ADR-054, ADR-082 and ADR-127 each closed one shape of. It showed as two
 cluster-harness TTL tests failing whenever the collection's expiry owner was
 not the node that created the index — about two runs in three — before the
 change was released.
+
+**Amended 2026-09-24 (ADR-191).** A pushed window runs *at least* to the
+newest change waiting on that member, not to one change: it carries every
+change queued there, and may extend past the newest of them, to the batch cap
+or the tail of what the member lacks, exactly as a pulled window does. The
+entries past the newest waiter are applied and witnessed by the same coverage
+rule; they are nobody's confirmation. The invariant below and the coverage
+rule are unchanged. A change is confirmed by a window that carried it,
+within the vector the window was introduced with and before any stop, and
+that the member answered: so the member took it, through this rule. The one
+other way is the early exit, unchanged: a member whose witnessed vector
+already covers the change when a push begins is confirmed with nothing sent,
+which is ADR-140's "holds or has refused".
 
 **The invariant, stated.** Nothing raises a node's witnessed vector for an
 origin except a window that starts at that node's own position for it, or a
@@ -19503,3 +19526,114 @@ sidecar before and after. Among the tests:
 In `kimmyd`, `a_store_a_newer_build_wrote_is_refused_and_left_as_it_was` starts
 a real node on a store whose sidecar names a newer schema. It checks that the
 node refuses to start, and that neither the database nor its sidecar changes.
+
+---
+
+## ADR-191 — A schema change is confirmed by one push in flight per member, and a push is not cancelled by a request
+
+**Decision.** Each node confirms schema changes (ADR-140) through one queue per
+member and at most one push in flight to each. A change waiting on a member is
+resolved by the first push to it whose *answered* window covers the change:
+
+- **Covered** means the change's entry was in the window sent; at or below the
+  vector the window was introduced with, so the member did not leave it for
+  its next pull (ADR-148); and before any entry the member's batch stopped at,
+  by position in the window. The member must have answered `Pushed`.
+- **Resolved** means confirmed if the member did not name the entry among the
+  ones it refused or declined, and refused if it did. `Pushed` gains two
+  fields, `refused` (those stamps) and `stopped_at`, both optional on the wire.
+- A change queued before a push's snapshot, which is taken just before that
+  push reads what this node can serve, is resolved by that push whatever its
+  answer. A change queued after it is carried to the next push if this one does
+  not cover it. So every change is resolved by at most two pushes. A push that
+  fails before its snapshot, at the dial, the handshake or the read of the
+  member's vector, flagged no one and reached no member: it resolves everyone
+  queued as pending, since no push can have covered them.
+- A request that stops waiting, its client gone, is counted `cancelled`, from the
+  moment its confirmation is made rather than when its task first runs, so one
+  dropped before it ever ran is counted too; a panic inside it counts `task_ended`.
+- A push is bounded end to end by the request timeout, the dial included. It
+  belongs to the member's queue, not to any request: a request whose deadline
+  passes answers `pending`, and the push goes on to its answer.
+- A push whose window was sent (its write had begun) and not answered starts a
+  back-off for that member: `cluster.sync_interval_secs`, doubling to 60 s,
+  during which a confirmation there answers `pending` at once and nothing is
+  pushed. An answered push ends it, and so does SWIM bringing the member up
+  again, which a generation per address records; a successful pull does not.
+  A failure before anything was sent backs off nothing.
+- The queue's drivers belong to the node and are aborted at shutdown with the
+  cluster tasks.
+- Any push added later goes through the same queue.
+
+`kimmy_ddl_confirmations_total{outcome}` counts each confirmation by how it
+ended, and `kimmy_ddl_confirm_pushes_total` the windows sent for them.
+
+**Why.** Round 0380 found, and round 0390 measured, that 32 parallel index
+creates on one member held each peer's single writer for 96% of the burst,
+and every confirmation timed out. Each create pushed the member the whole
+window it lacked (ADR-143), and all 32 pushes read the member's position before
+any of them had applied, so push k carried the first k creates: about N²/2
+schema changes applied on each peer for N creates. And each request's
+deadline dropped its push mid-apply, which the peer met as a broken pipe. One
+push in flight per member, carrying everything queued, applies each create
+about once; a push that belongs to the queue is read to its answer.
+
+**Why covered is decided by the answered window.** A change is never reported
+confirmed on a member unless its entry was in a window the member answered,
+and the member took it; or, as before, the member's witnessed vector already
+covered it when the push began, the early exit that confirms with nothing sent
+and that ADR-140 calls "holds or has refused". The window's entries are what was sent; the vector
+bound excludes an entry minted between the read of the vector and the read of
+the window, which the member defers (ADR-148); the stop bound excludes what
+the batch never reached. What a taken entry can be is applied, refused,
+declined, a replayed drop, or history for a dropped collection, and the answer
+names the refused and the declined. So `confirmed` means ADR-140's "holds",
+with the refusal separated out.
+
+**Why the per-window rule went.** A confirmation used to call a member
+`refused` if anything in the window was refused. With one change per window
+that was nearly exact; it was already wrong in bursts, where push k carried
+creates 1..k and one refusal marked every later create refused; and one
+window per queue would have made it wrong for whole bursts. A member on a
+version before the two fields answers without them; a pusher sees that the
+fields do not account for the counts, and answers `pending` for each change in
+such a window, or keeps the old rule where the window holds exactly one
+change and no stop.
+
+**Alternatives.** *A per-peer mutex around the push.* It serialises pushes but
+keeps one per change, and every push after the first finds its change already
+witnessed and takes the early exit, "holds or has refused", as confirmed: it
+would report refused creates as confirmed. *A cap on outstanding pushes per
+peer.* The work stays about N²/2. *A receiver that skips DDL it already holds.*
+It cuts the applies and keeps the N connections, the broken pipes and the
+misattribution; it stays possible hardening. *Confirming during a back-off by
+asking only for the member's witnessed vector.* A witnessed vector covers
+refused entries too, so a create the member refused would read confirmed, and
+in a saturated back-off that becomes the common case; telling the two apart
+would need a per-stamp "is it in your oplog?" request, a later design if the
+back-off's `pending` ever matters.
+
+**Cost.** A queue per member with a change waiting, a driver per member with a
+push in flight, and a back-off entry that outlives its driver by at most 60 s
+past its pause. A change can wait behind the push in flight and then its own:
+up to two windows' applies, inside the same deadline; and a fast create can
+wait behind a slow window for another collection, where today's concurrent
+push might have fitted into a gap. `Pushed` gains two optional fields; a
+confirmation gains per-change attribution; `Members` gains a generation per
+address. `push_entry`, the one-change push, is removed; its tests drive the
+confirmer. The HTTP response does not change.
+
+**Tested.** In `kimmy-cluster`'s `confirm` module, against real members served
+over TLS: a burst of 32 creates applied once each; a change minted while a
+push is in flight confirmed by the next; a change minted between the vector
+and the window read deferred by the member and confirmed by the next push;
+one queued between the snapshot and that read covered by the push; a deadline
+that passes without cancelling the push; a push that fails after sending,
+before sending, and by its timeout, with the back-off, its doubling, its reset
+by SWIM and not by a pull; a different member at the address; the batch cap;
+shutdown; and the driver set bounded. Pure tests pin the coverage rule, the
+old-member fallback, and the stop by position, and a property test models a
+member with the deferral and the stop rule and checks that nothing is
+confirmed that it did not take. The cluster harness's
+`a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_others`
+checks a burst of 16 end to end.

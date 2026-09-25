@@ -143,37 +143,62 @@ impl Identity for Member {
 /// holding it, which is the trap that left every clustered webhook undelivered
 /// until the harness caught it.
 #[derive(Clone, Default)]
-pub struct Members(Arc<RwLock<BTreeMap<SocketAddr, NodeId>>>);
+pub struct Members(Arc<MembersInner>);
+
+#[derive(Default)]
+struct MembersInner {
+    live: RwLock<BTreeMap<SocketAddr, NodeId>>,
+    /// Each address's generation: the value of `next` when it was last
+    /// inserted. Kept when the address is removed, so a generation only ever
+    /// moves forward (ADR-191).
+    generations: RwLock<BTreeMap<SocketAddr, u64>>,
+    next: std::sync::atomic::AtomicU64,
+}
 
 impl Members {
     /// Peer addresses, for anything that needs to dial one.
     pub fn snapshot(&self) -> BTreeSet<SocketAddr> {
-        self.0.read().keys().copied().collect()
+        self.0.live.read().keys().copied().collect()
+    }
+
+    /// Which time this address last came into the live set: a value that
+    /// moves forward every time SWIM brings it (back) up, whether after being
+    /// declared down or under a new incarnation, and never moves back, not
+    /// even when the address is removed. `None` for an address never seen.
+    ///
+    /// What a confirmation's back-off after an unanswered push compares
+    /// against, so a member that restarts ends it (ADR-191). A per-address
+    /// counter reset by removal could land on the value a back-off already
+    /// recorded; one global counter cannot.
+    pub fn generation(&self, addr: &SocketAddr) -> Option<u64> {
+        self.0.generations.read().get(addr).copied()
     }
 
     /// Peer node ids, for anything that needs to name a peer independently of
     /// where it is listening.
     pub fn node_ids(&self) -> BTreeSet<NodeId> {
-        self.0.read().values().copied().collect()
+        self.0.live.read().values().copied().collect()
     }
 
     /// Every peer with both its address and its id, for a caller that dials
     /// by address and reports by id — a member that never answered the dial
     /// still has to be named.
     pub fn entries(&self) -> Vec<(SocketAddr, NodeId)> {
-        self.0.read().iter().map(|(addr, node)| (*addr, *node)).collect()
+        self.0.live.read().iter().map(|(addr, node)| (*addr, *node)).collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.read().is_empty()
+        self.0.live.read().is_empty()
     }
 
     fn insert(&self, addr: SocketAddr, node: NodeId) {
-        self.0.write().insert(addr, node);
+        let generation = self.0.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.0.generations.write().insert(addr, generation);
+        self.0.live.write().insert(addr, node);
     }
 
     fn remove(&self, addr: &SocketAddr) {
-        self.0.write().remove(addr);
+        self.0.live.write().remove(addr);
     }
 
     /// Populate a member set without a running SWIM task.

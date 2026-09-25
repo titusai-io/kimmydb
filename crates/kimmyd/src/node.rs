@@ -750,7 +750,14 @@ async fn start_and_serve(config: Config) -> Result<()> {
         handle.abort();
     }
     // And replication: anti-entropy is idempotent and resumes from version
-    // vectors, so an interrupted round costs nothing but a repeat.
+    // vectors, so an interrupted round costs nothing but a repeat. The
+    // confirmation drivers with it: a push they abandon is a window the
+    // member applies or not, and anti-entropy carries it either way; left
+    // running, one holds the engine and a connection for up to a push's
+    // timeout after the drain (ADR-191).
+    if let Some(confirmer) = &cluster.confirmer {
+        confirmer.abort_all();
+    }
     for handle in cluster.tasks {
         handle.abort();
     }
@@ -1271,6 +1278,9 @@ fn is_loopback(addr: &std::net::SocketAddr) -> bool {
 struct Cluster {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     members: Option<kimmy_cluster::Members>,
+    /// The schema-change confirmer, whose push drivers the shutdown aborts
+    /// with the tasks above (ADR-191).
+    confirmer: Option<Arc<kimmy_cluster::Confirmer>>,
 }
 
 async fn spawn_cluster(
@@ -1280,7 +1290,7 @@ async fn spawn_cluster(
     shutdown: kimmy_task::Shutdown,
 ) -> Result<Cluster> {
     if !config.cluster.enabled {
-        return Ok(Cluster { tasks: Vec::new(), members: None });
+        return Ok(Cluster { tasks: Vec::new(), members: None, confirmer: None });
     }
 
     let secret = config.cluster.cluster_secret.clone().context(
@@ -1356,14 +1366,38 @@ async fn spawn_cluster(
     // answers (ADR-140). The member set is SWIM's, so this needs membership;
     // with it off the node answers as it always did, saying nothing about
     // its peers.
+    let mut confirmer = None;
     match (&members, config.cluster.ddl_confirm_timeout_secs) {
         (Some(live), secs) if secs > 0 => {
-            state.set_ddl_confirmer(ddl_confirmer(
+            // Weak: the state holds the confirmer through its confirmation
+            // closure, and a strong reference back would keep both, and the
+            // engine, alive past shutdown.
+            let recorded = Arc::downgrade(&state);
+            let pushed = Arc::downgrade(&state);
+            let built = kimmy_cluster::Confirmer::with_hooks(
                 Arc::clone(&engine),
                 secret.clone(),
                 live.clone(),
+                kimmy_cluster::ConfirmConfig::new(Duration::from_secs(
+                    config.cluster.sync_interval_secs,
+                )),
+                Some(Arc::new(move |outcome| {
+                    if let Some(state) = recorded.upgrade() {
+                        state.metrics.record_ddl_confirmation(outcome);
+                    }
+                })),
+                Some(Arc::new(move || {
+                    if let Some(state) = pushed.upgrade() {
+                        state.metrics.record_ddl_confirm_push();
+                    }
+                })),
+            );
+            state.set_ddl_confirmer(ddl_confirmer(
+                Arc::clone(&built),
+                live.clone(),
                 Duration::from_secs(secs),
             ));
+            confirmer = Some(built);
         }
         (Some(_), _) => {
             info!("schema-change confirmation is off (cluster.ddl_confirm_timeout_secs = 0)")
@@ -1430,7 +1464,7 @@ async fn spawn_cluster(
         membership = config.cluster.membership,
         "clustering enabled"
     );
-    Ok(Cluster { tasks: cluster_tasks, members })
+    Ok(Cluster { tasks: cluster_tasks, members, confirmer })
 }
 
 /// Where a window a peer pushed here lands on this node's metrics (ADR-140).
@@ -1469,14 +1503,23 @@ enum Pushed {
     Pending(String),
 }
 
-/// Sort one member's answer to a push, and say so in the log.
-fn classify_push(
+/// Sort how one member's confirmation ended, and say so in the log, at the
+/// level each case had when every change was pushed on its own.
+fn classify(
     addr: std::net::SocketAddr,
     node: kimmy_core::NodeId,
-    result: Result<kimmy_cluster::PushOutcome, String>,
+    resolution: kimmy_cluster::Resolution,
 ) -> Pushed {
-    match result {
-        Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
+    use kimmy_cluster::{ConfirmOutcome, Resolution};
+    match resolution {
+        Resolution::Confirmed => Pushed::Confirmed,
+        Resolution::Refused => {
+            warn!(peer = %addr, node = %node, "a member could not apply a schema change pushed to it");
+            Pushed::Refused
+        }
+        // Neither is a failure: the window could not reach the change, or a
+        // purge of the name is still running there (ADR-189).
+        Resolution::Pending { outcome: ConfirmOutcome::Unreached, reason } => {
             info!(
                 peer = %addr,
                 node = %node,
@@ -1485,35 +1528,16 @@ fn classify_push(
             );
             Pushed::Pending(reason)
         }
-        // A member still purging a drop of this name has not applied the
-        // creation, and will once its purge is done (ADR-189): pending,
-        // carried by anti-entropy, and not a refusal.
-        Ok(kimmy_cluster::PushOutcome { outcome, .. }) if outcome.purge_pending > 0 => {
+        Resolution::Pending { outcome: ConfirmOutcome::Purging, reason } => {
             info!(
                 peer = %addr,
                 node = %node,
                 "a member is still purging a drop of this name; the creation reaches it once \
                  that is done"
             );
-            Pushed::Pending("still purging a drop of this name".to_string())
+            Pushed::Pending(reason)
         }
-        Ok(kimmy_cluster::PushOutcome { outcome, .. })
-            if outcome.ddl_refused > 0
-                || outcome.unknown_collection > 0
-                || outcome.ddl_declined > 0 =>
-        {
-            warn!(
-                peer = %addr,
-                node = %node,
-                refused = outcome.ddl_refused,
-                unknown_collection = outcome.unknown_collection,
-                declined = outcome.ddl_declined,
-                "a member could not apply a schema change pushed to it"
-            );
-            Pushed::Refused
-        }
-        Ok(_) => Pushed::Confirmed,
-        Err(reason) => {
+        Resolution::Pending { reason, .. } => {
             warn!(
                 peer = %addr,
                 node = %node,
@@ -1527,70 +1551,52 @@ fn classify_push(
 
 /// How this node confirms a schema change on its live members (ADR-140).
 ///
-/// Hands every member, at once, the window it lacks from this node ending in
-/// the entry (ADR-143), and waits for each, bounded by `deadline` per member,
-/// so the request waits about as long as the slowest member takes rather
-/// than the sum. A member the window cannot reach — too far behind — is
-/// named pending with the reason. A member that answers with a refusal is
-/// named as such — it counted the refusal itself, on its own
-/// `kimmy_sync_ddl_refused_total` — and one that does not answer is named
-/// pending with the reason. Anti-entropy still carries the change to both,
-/// as it always did; what the push adds is the response meaning what a
+/// Asks the node's [`kimmy_cluster::Confirmer`] for every member at once, and
+/// waits for each, bounded by `deadline` per member, so the request waits
+/// about as long as the slowest member takes rather than the sum. The
+/// confirmer keeps at most one push in flight per member and resolves each
+/// change by the first answered window that covers it (ADR-191): a burst of
+/// creates costs each member about one apply per create, not one per window
+/// per create. A member that took the change is confirmed; one that could
+/// not apply it is refused, and counted the refusal itself; anything else is
+/// pending, with the reason. Anti-entropy still carries the change to all of
+/// them, as it always did; what the push adds is the response meaning what a
 /// client reads it to mean.
 fn ddl_confirmer(
-    engine: Arc<Engine>,
-    secret: String,
+    confirmer: Arc<kimmy_cluster::Confirmer>,
     members: kimmy_cluster::Members,
     deadline: Duration,
 ) -> kimmy_api::DdlConfirmer {
     Arc::new(move |entry: kimmy_core::OplogEntry| {
-        let engine = Arc::clone(&engine);
-        let secret = secret.clone();
+        let confirmer = Arc::clone(&confirmer);
         let members = members.clone();
         Box::pin(async move {
-            let mut pushes = tokio::task::JoinSet::new();
+            let mut asked = tokio::task::JoinSet::new();
             for (addr, node) in members.entries() {
-                let engine = Arc::clone(&engine);
-                let secret = secret.clone();
                 let entry = entry.clone();
-                // UNSUPERVISED: one push per peer in a JoinSet this round awaits. It is
-                // this round's work rather than background work, so a panic in one
-                // must not stop the node -- the round below logs it and carries on,
-                // and anti-entropy carries the entry.
-                pushes.spawn(async move {
-                    let pushed = tokio::time::timeout(
-                        deadline,
-                        kimmy_cluster::push_entry(&engine, addr, &secret, &entry),
-                    )
-                    .await;
-                    let result = match pushed {
-                        Ok(Ok(pushed)) => Ok(pushed),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(_) => Err(format!("no answer within {deadline:?}")),
-                    };
-                    (addr, node, result)
-                });
+                // Made before it is spawned, so a request gone before the
+                // task first runs is still counted (ADR-191).
+                let waiting = confirmer.confirm(addr, node, entry, deadline);
+                // One wait per member in a JoinSet this request awaits. The
+                // push it waits on belongs to the confirmer's driver for that
+                // member, which the node's shutdown aborts.
+                // UNSUPERVISED: a panic here must not stop the node; the loop below logs it and anti-entropy carries the entry.
+                asked.spawn(async move { (addr, node, waiting.await) });
             }
             let mut found = kimmy_api::DdlConfirmation::default();
-            while let Some(joined) = pushes.join_next().await {
-                // A panicked or cancelled push used to land here and be dropped,
-                // so the peer was left out of the confirmation with nothing said:
-                // the round looked as if it had simply not been asked. The
-                // behaviour is unchanged -- one failed push does not fail the
-                // round, and anti-entropy carries the entry -- but it is no longer
-                // silent.
-                let (addr, node, result) = match joined {
-                    Ok(pushed) => pushed,
+            while let Some(joined) = asked.join_next().await {
+                let (addr, node, resolution) = match joined {
+                    Ok(answered) => answered,
                     Err(e) => {
                         warn!(
                             error = %e,
-                            "a schema-change push task ended without answering, so that member is \
-                             not in this confirmation; anti-entropy will carry the change"
+                            "a schema-change confirmation task ended without answering, so that \
+                             member is not in this confirmation; anti-entropy will carry the change"
                         );
                         continue;
                     }
                 };
-                match classify_push(addr, node, result) {
+                match classify(addr, node, resolution) {
                     Pushed::Confirmed => found.confirmed.push(node),
                     Pushed::Refused => found.refused.push(node),
                     Pushed::Pending(reason) => found.pending.push((node, reason)),
@@ -1773,28 +1779,29 @@ mod tests {
 
     use super::*;
 
-    /// Each answer a push can bring, sorted as the confirmation reports it. A
-    /// member that stopped at a creation waiting for its drop purger
-    /// (ADR-189) is pending, carried by anti-entropy, and not a refusal.
+    /// Each way a confirmation ends, sorted as the response reports it: a
+    /// member still purging a drop of this name (ADR-189), or one backing off
+    /// after a push it did not answer (ADR-191), is pending, carried by
+    /// anti-entropy, and not a refusal.
     #[test]
-    fn a_push_answer_is_sorted_into_confirmed_refused_or_pending() {
+    fn a_confirmation_is_sorted_into_confirmed_refused_or_pending() {
+        use kimmy_cluster::{ConfirmOutcome, Resolution};
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let node = kimmy_core::NodeId::from_bytes([1; 16]);
-        let answered = |outcome: kimmy_storage::SyncOutcome| {
-            Ok(kimmy_cluster::PushOutcome { node, outcome, unreached: None })
-        };
-        let purging = kimmy_storage::SyncOutcome { purge_pending: 1, ..Default::default() };
-        assert_eq!(
-            classify_push(addr, node, answered(purging)),
-            Pushed::Pending("still purging a drop of this name".to_string())
-        );
-        let refused = kimmy_storage::SyncOutcome { ddl_refused: 1, ..Default::default() };
-        assert_eq!(classify_push(addr, node, answered(refused)), Pushed::Refused);
-        assert_eq!(classify_push(addr, node, answered(Default::default())), Pushed::Confirmed);
-        assert_eq!(
-            classify_push(addr, node, Err("no answer".to_string())),
-            Pushed::Pending("no answer".to_string())
-        );
+        let pending =
+            |outcome, reason: &str| Resolution::Pending { outcome, reason: reason.to_string() };
+        assert_eq!(classify(addr, node, Resolution::Confirmed), Pushed::Confirmed);
+        assert_eq!(classify(addr, node, Resolution::Refused), Pushed::Refused);
+        for outcome in ConfirmOutcome::ALL {
+            if matches!(outcome, ConfirmOutcome::Confirmed | ConfirmOutcome::Refused) {
+                continue;
+            }
+            assert_eq!(
+                classify(addr, node, pending(outcome, "why")),
+                Pushed::Pending("why".to_string()),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

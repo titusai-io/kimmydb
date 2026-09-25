@@ -18,6 +18,7 @@
 
 #![allow(dead_code)]
 
+pub mod confirm;
 pub mod discovery;
 pub mod health;
 pub mod membership;
@@ -26,6 +27,9 @@ pub mod protocol;
 pub mod tls;
 pub mod transport;
 
+pub use confirm::{
+    ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
+};
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
@@ -35,6 +39,6 @@ pub use peers::{
     RoundReport, replicate,
 };
 pub use transport::{
-    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, PushOutcome, REPAIR_ATTEMPTS,
-    REPAIR_COOLDOWN_ROUNDS, Repair, push_entry, serve, serve_with, sync_once, sync_once_with,
+    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
+    Repair, serve, serve_with, sync_once, sync_once_with,
 };
