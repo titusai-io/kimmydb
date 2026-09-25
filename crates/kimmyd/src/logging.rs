@@ -904,6 +904,58 @@ impl TelemetryGuard {
             "Schema-change confirmations on a member that ended cancelled.",
             |s| s.ddl_confirmations[ConfirmOutcome::Cancelled.slot()]
         );
+        // Each reason a peer connection failed to be served, one instrument
+        // per label value, in `ServeFailure::ALL` order.
+        use kimmy_cluster::ServeFailure;
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.io",
+            "{connection}",
+            "Peer replication connections this node failed to serve because reading or writing the connection failed.",
+            |s| s.sync_serve_failures[ServeFailure::Io.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.timeout",
+            "{connection}",
+            "Peer replication connections this node failed to serve because the handshake ran out of time.",
+            |s| s.sync_serve_failures[ServeFailure::Timeout.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.malformed",
+            "{connection}",
+            "Peer replication connections this node failed to serve on a frame it could not read or accept.",
+            |s| s.sync_serve_failures[ServeFailure::Malformed.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.local",
+            "{connection}",
+            "Peer replication connections this node failed to serve because its own storage failed answering.",
+            |s| s.sync_serve_failures[ServeFailure::Local.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.unauthenticated",
+            "{connection}",
+            "Peer replication connections this node refused because the peer failed the shared-secret proof or hung up on reading this node's.",
+            |s| s.sync_serve_failures[ServeFailure::Unauthenticated.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.fault",
+            "{connection}",
+            "Peer replication connections that ended with the peer reporting a fault of its own.",
+            |s| s.sync_serve_failures[ServeFailure::Fault.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.binding",
+            "{connection}",
+            "Peer replication connections refused because the TLS session gave no channel binding.",
+            |s| s.sync_serve_failures[ServeFailure::Binding.slot()]
+        );
         observe!(
             u64_observable_counter,
             "kimmy.ddl.confirm_pushes",

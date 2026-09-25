@@ -1304,6 +1304,8 @@ async fn spawn_cluster(
 
     // A schema change a peer pushes here (ADR-140): see `pushed_hook`.
     let on_pushed = pushed_hook(Arc::clone(&state), |state| &state.metrics);
+    // A peer connection this node failed to serve, and why.
+    let on_failed = serve_failed_hook(Arc::clone(&state), |state| &state.metrics);
     // Built before the node commits to serving. `serve_with` used to build it
     // and return on failure, which made a fatal condition fatal to that task
     // only: the node went on serving while no peer could pull from it. With
@@ -1322,6 +1324,7 @@ async fn spawn_cluster(
             listener,
             secret.clone(),
             Some(on_pushed),
+            Some(on_failed),
             cluster_tls,
         ),
     );
@@ -1481,6 +1484,16 @@ fn pushed_hook<T: Send + Sync + 'static>(
     metrics: fn(&T) -> &kimmy_api::Metrics,
 ) -> kimmy_cluster::PushHook {
     Arc::new(move |outcome: &kimmy_storage::SyncOutcome| metrics(&owner).record_pushed(outcome))
+}
+
+/// Where a peer connection this node failed to serve lands on its metrics:
+/// `kimmy_sync_serve_failures_total{reason}`. A function, for the reason
+/// `pushed_hook` is one.
+fn serve_failed_hook<T: Send + Sync + 'static>(
+    owner: Arc<T>,
+    metrics: fn(&T) -> &kimmy_api::Metrics,
+) -> kimmy_cluster::ServeFailHook {
+    Arc::new(move |reason| metrics(&owner).record_sync_serve_failure(reason))
 }
 
 /// Where a tick of the replication loop lands on this node's metrics: what
@@ -1833,6 +1846,24 @@ mod tests {
         round(kimmy_cluster::RoundReport { ddl_applied: 3, ..Default::default() });
         let s = metrics.snapshot();
         assert_eq!((s.sync_ddl_applied_pull, s.sync_ddl_applied_push), (3, 2));
+    }
+
+    #[test]
+    fn the_node_records_a_failed_serve_under_its_reason_and_no_other() {
+        let metrics = Arc::new(kimmy_api::Metrics::default());
+        let failed = serve_failed_hook(Arc::clone(&metrics), |m| m);
+        failed(kimmy_cluster::ServeFailure::Io);
+        failed(kimmy_cluster::ServeFailure::Io);
+        failed(kimmy_cluster::ServeFailure::Unauthenticated);
+        let s = metrics.snapshot();
+        for reason in kimmy_cluster::ServeFailure::ALL {
+            let expected = match reason {
+                kimmy_cluster::ServeFailure::Io => 2,
+                kimmy_cluster::ServeFailure::Unauthenticated => 1,
+                _ => 0,
+            };
+            assert_eq!(s.sync_serve_failures[reason.slot()], expected, "{reason:?}");
+        }
     }
 
     #[test]

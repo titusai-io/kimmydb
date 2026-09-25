@@ -344,6 +344,13 @@ pub enum ProtocolError {
     Fault(String),
     #[error("peer closed the connection")]
     Closed,
+    /// This node's own storage failed while answering the peer: a read to
+    /// serve it, or a write applying a window it pushed. Separate from
+    /// [`Self::Malformed`] because a full disk is not a wire problem, and
+    /// sending whoever reads the log to the peer's frames for it wastes
+    /// their time.
+    #[error("local storage: {0}")]
+    Local(String),
 }
 
 /// Write one length-prefixed frame.
@@ -365,11 +372,22 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Read one length-prefixed frame.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, ProtocolError> {
+    // Closed only at a frame boundary, before the first byte of a prefix. A
+    // connection that ends inside the prefix ended mid-frame, which is an
+    // I/O failure like one that ends inside the body.
     let mut len = [0u8; 4];
-    match reader.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(ProtocolError::Closed),
-        Err(e) => return Err(e.into()),
+    let mut got = 0;
+    while got < len.len() {
+        match reader.read(&mut len[got..]).await? {
+            0 if got == 0 => return Err(ProtocolError::Closed),
+            0 => {
+                return Err(ProtocolError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("the connection closed after {got} of a frame's 4 length bytes"),
+                )));
+            }
+            n => got += n,
+        }
     }
 
     // Checked *before* allocating: the length comes from the network.
@@ -1142,6 +1160,18 @@ mod tests {
         let empty: &[u8] = &[];
         let err = read_frame(&mut { empty }).await.unwrap_err();
         assert!(matches!(err, ProtocolError::Closed), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_inside_a_length_prefix_is_an_io_failure_not_a_close() {
+        // Two of the four prefix bytes, then nothing: the peer went away
+        // mid-frame, which is not the clean close at a frame boundary.
+        let partial: &[u8] = &[0, 0];
+        let err = read_frame(&mut { partial }).await.unwrap_err();
+        assert!(
+            matches!(&err, ProtocolError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

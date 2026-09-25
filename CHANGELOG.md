@@ -14,6 +14,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy_sync_serve_failures_total{reason}`** counts the replication
+  connections a peer opened to this node that ended in an error on this side,
+  by reason: `io`, `timeout`, `malformed`, `local`, `unauthenticated`,
+  `fault` and `binding` (bridged as `kimmy.sync.serve_failures.<reason>`).
+  The serving side's failures reached only a `WARN` line before; the line now
+  also names the reason. A clean close and an unfinished TLS handshake are
+  not counted, and `io` is a lower bound for pushers that gave up waiting
+  (their own `kimmy_ddl_confirmations_total` is the reliable signal). See
+  [the metrics table](docs/operations.md).
 - **`kimmy_sync_ddl_held_total{via}`** counts the replicated schema changes a
   window carried that the member already held, entry and all (bridged as
   `kimmy.sync.ddl_held.pull` and `.push`). They are not applied again, and
@@ -27,6 +36,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **A member whose `cluster_secret` differs is now logged as an
+  authentication failure when it connects.** It hangs up on reading this
+  node's proof, which was logged at `debug` as an ordinary disconnect. It is
+  now a `WARN` saying the secrets likely differ, counted as
+  `unauthenticated`. A replication connection that ends partway through a
+  frame's length prefix is now an I/O failure rather than a clean close, and
+  a storage error while serving a peer is reported as `local storage`, not as
+  a malformed frame.
 - **A replicated index create costs its member one commit, not two.** The
   originating entry is now appended in the transaction that builds the index,
   as a restored definition's already was, so the definition and its entry

@@ -40,5 +40,5 @@ pub use peers::{
 };
 pub use transport::{
     FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
-    Repair, serve, serve_with, sync_once, sync_once_with,
+    Repair, ServeFailHook, ServeFailure, serve, serve_with, sync_once, sync_once_with,
 };
