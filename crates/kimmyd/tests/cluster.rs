@@ -2123,6 +2123,35 @@ async fn the_divergence_check_reads_a_kept_count_not_the_collection() {
     );
 }
 
+/// A peer connection the node fails to serve reaches
+/// `kimmy_sync_serve_failures_total` through the hook the node installs on
+/// its real listener: a TLS session that sends a frame the node cannot read.
+#[tokio::test]
+#[ignore = "boots a real clustered kimmyd; run with --ignored"]
+async fn a_replication_connection_the_node_cannot_serve_is_counted_by_reason() {
+    use tokio::io::AsyncWriteExt;
+    let client = reqwest::Client::new();
+    let node = Node::spawn_with("node-served", ports::choose(), &[ports::choose()], "");
+    node.wait_ready(&client).await;
+    let malformed = "kimmy_sync_serve_failures_total{reason=\"malformed\"}";
+    assert_eq!(node.gauge(&client, malformed).await, Some(0), "premise: a row, at 0");
+
+    let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", node.cluster)).await.unwrap();
+    let mut stream =
+        tls.connector().connect(kimmy_cluster::tls::ClusterTls::server_name(), tcp).await.unwrap();
+    stream.write_all(&4u32.to_be_bytes()).await.unwrap();
+    stream.write_all(b"junk").await.unwrap();
+    stream.flush().await.unwrap();
+
+    eventually("the unreadable frame to be counted as malformed", || {
+        let (client, node) = (&client, &node);
+        async move { node.gauge(client, malformed).await == Some(1) }
+    })
+    .await;
+    drop(stream);
+}
+
 /// A member that has never completed a round reads a replication lag of 0,
 /// the healthiest value there is. What says that 0 was never measured is the
 /// replication loop's progress age (ADR-187): counted from the start, since

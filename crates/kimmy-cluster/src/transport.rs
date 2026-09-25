@@ -142,10 +142,16 @@ pub enum ServeFailure {
     Io,
     /// A bounded wait ran out: the handshake (ProtocolError::TimedOut).
     Timeout,
-    /// A frame this node could not read or would not accept, or a local error
-    /// answering one (ProtocolError::Malformed, TooLarge).
+    /// A frame this node could not read or would not accept
+    /// (ProtocolError::Malformed, TooLarge).
     Malformed,
-    /// The peer failed the shared-secret proof (ProtocolError::Unauthenticated).
+    /// This node's own storage failed answering the peer: a read to serve it,
+    /// or a write applying a window it pushed. A pushed entry that does not
+    /// decode is `Malformed` (ProtocolError::Local).
+    Local,
+    /// The peer failed the shared-secret proof, or hung up on reading this
+    /// node's, which is how a member with a different secret ends it
+    /// (ProtocolError::Unauthenticated).
     Unauthenticated,
     /// The peer reported a fault of its own (ProtocolError::Fault).
     Fault,
@@ -155,11 +161,12 @@ pub enum ServeFailure {
 }
 
 impl ServeFailure {
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Io,
         Self::Timeout,
         Self::Malformed,
+        Self::Local,
         Self::Unauthenticated,
         Self::Fault,
         Self::Binding,
@@ -174,6 +181,7 @@ impl ServeFailure {
             Self::Io => "io",
             Self::Timeout => "timeout",
             Self::Malformed => "malformed",
+            Self::Local => "local",
             Self::Unauthenticated => "unauthenticated",
             Self::Fault => "fault",
             Self::Binding => "binding",
@@ -189,6 +197,7 @@ impl ServeFailure {
             ProtocolError::Io(_) => Some(Self::Io),
             ProtocolError::TimedOut(_) => Some(Self::Timeout),
             ProtocolError::Malformed(_) | ProtocolError::TooLarge { .. } => Some(Self::Malformed),
+            ProtocolError::Local(_) => Some(Self::Local),
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
             ProtocolError::Fault(_) => Some(Self::Fault),
         }
@@ -289,6 +298,28 @@ pub async fn serve_with(
     }
 }
 
+/// Whether an apply that failed failed on this node's own storage, rather
+/// than on what the peer sent: a push whose entry does not decode is the
+/// peer's frame, and a full disk is this node's. Exhaustive, so a new
+/// storage error has to be placed.
+fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
+    use kimmy_storage::StorageError as E;
+    match e {
+        E::Database(_)
+        | E::Transaction(_)
+        | E::Io(_)
+        | E::WriterBusy { .. }
+        | E::RefusedStore(_)
+        | E::StoreInUse(_) => true,
+        E::Core(_)
+        | E::Corrupt(_)
+        | E::UnsupportedFormat { .. }
+        | E::UnparseablePartialFilter { .. }
+        | E::Stale { .. }
+        | E::CollectionPurging { .. } => false,
+    }
+}
+
 /// Serve one authenticated-or-not peer connection to its end, and say how it
 /// ended: a clean close at `debug`, anything else at `WARN` and to
 /// `on_failed`, which is what makes a serve failure visible outside the log.
@@ -308,6 +339,18 @@ async fn serve_connection<S>(
     };
     match ServeFailure::of(&e) {
         None => debug!(%peer, "peer disconnected"),
+        Some(ServeFailure::Unauthenticated) => {
+            warn!(
+                %peer,
+                error = %e,
+                reason = ServeFailure::Unauthenticated.label(),
+                "peer connection failed: the peer did not complete the shared-secret handshake; \
+                 its cluster_secret likely differs from this node's, or it is not a member"
+            );
+            if let Some(hook) = on_failed {
+                hook(ServeFailure::Unauthenticated);
+            }
+        }
         Some(reason) => {
             warn!(%peer, error = %e, reason = reason.label(), "peer connection failed");
             if let Some(hook) = on_failed {
@@ -339,7 +382,7 @@ where
         match read_frame(&mut stream).await? {
             Message::AskVersions { witnessed } => {
                 let servable =
-                    engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                    engine.version_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 if !witnessed {
                     // A requester that predates the flag, answered as it
                     // always was (ADR-146).
@@ -352,15 +395,13 @@ where
                 // true of the pair on the wire, so the requester's gate can
                 // only ever read this node as further along, never as short
                 // of what it can serve.
-                let witnessed = engine
-                    .witnessed_vector()
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                let witnessed =
+                    engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Vectors { servable, witnessed }).await?;
             }
             Message::AskWitnessed {} => {
-                let witnessed = engine
-                    .witnessed_vector()
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                let witnessed =
+                    engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
             Message::AskEntries { from, limit, held, marked } => {
@@ -375,7 +416,7 @@ where
                     Some(held) => engine.can_serve_peer_holding(held),
                     None => engine.can_serve_from_oplog(from),
                 }
-                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                .map_err(|e| ProtocolError::Local(e.to_string()))?;
                 if !servable {
                     write_frame(&mut stream, &Message::BeyondHorizon {}).await?;
                     continue;
@@ -395,7 +436,7 @@ where
                 let window = kimmy_storage::blocking(|| {
                     engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked)
                 })
-                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                .map_err(|e| ProtocolError::Local(e.to_string()))?;
 
                 // Large entries can put a full batch over the frame limit. Failing the
                 // write would drop the connection, and the same oversized batch is the
@@ -426,7 +467,7 @@ where
                 // (ADR-152); resumed from wherever the requester says.
                 let page = engine
                     .snapshot_page(after, collection)
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                    .map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
             Message::AskDivergence { probe } => {
@@ -437,14 +478,14 @@ where
                 // compared against.
                 let held = engine
                     .collection_incarnations()
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                    .map_err(|e| ProtocolError::Local(e.to_string()))?;
                 // The one document read in this exchange, bounded to the
                 // single collection the requester named (ADR-133).
                 let probe_count = match probe {
                     // The kept count of that collection (ADR-174), not a walk;
                     // off the worker as every storage read here is (ADR-153).
                     Some(id) => kimmy_storage::blocking(|| engine.count_by_id(id))
-                        .map_err(|e| ProtocolError::Malformed(e.to_string()))?,
+                        .map_err(|e| ProtocolError::Local(e.to_string()))?,
                     None => None,
                 };
                 write_frame(
@@ -500,7 +541,11 @@ where
                 if let Err(e) = applied {
                     let reason = format!("the pushed window could not be applied: {e}");
                     let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
-                    return Err(ProtocolError::Malformed(reason));
+                    return Err(if is_local_failure(&e) {
+                        ProtocolError::Local(reason)
+                    } else {
+                        ProtocolError::Malformed(reason)
+                    });
                 }
                 write_frame(
                     &mut stream,
@@ -556,8 +601,15 @@ where
     )
     .await?;
 
-    let Message::Confirm { proof } = read_frame(stream).await? else {
-        return Err(ProtocolError::Malformed("expected Confirm".into()));
+    // A peer that reads our proof and hangs up is a peer whose secret does
+    // not match: that is what `open_handshake` does on a proof it cannot
+    // verify, before it would answer with one of its own. So a close here is
+    // an authentication failure, not the ordinary end of a contact.
+    let proof = match read_frame(stream).await {
+        Ok(Message::Confirm { proof }) => proof,
+        Ok(_) => return Err(ProtocolError::Malformed("expected Confirm".into())),
+        Err(ProtocolError::Closed) => return Err(ProtocolError::Unauthenticated),
+        Err(e) => return Err(e),
     };
     if !proof_is_valid(secret, &ours, binding, &proof) {
         // Deliberately terse: telling a caller *why* their proof failed helps
@@ -4283,6 +4335,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_with_a_different_secret_is_a_serve_failure_counted_as_unauthenticated() {
+        // What a real member does on a proof it cannot verify: it hangs up
+        // after reading ours, before sending its own. That close used to read
+        // as the ordinary end of a contact, so a member with the wrong secret
+        // was never counted at all.
+        let seen = serve_failures(|mut ours, peer| async move {
+            let refused =
+                open_handshake(&peer, &mut ours, "a-different-secret", b"a-serve-failure-binding")
+                    .await;
+            assert!(matches!(refused, Err(ProtocolError::Unauthenticated)), "{refused:?}");
+            drop(ours);
+        })
+        .await;
+        assert_eq!(seen, vec![ServeFailure::Unauthenticated]);
+    }
+
+    #[tokio::test]
     async fn a_peer_whose_proof_is_wrong_is_a_serve_failure_counted_as_unauthenticated() {
         let seen = serve_failures(|mut ours, peer| async move {
             write_frame(
@@ -4328,6 +4397,14 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_that_fails_on_this_nodes_storage_is_local_and_on_the_peers_entry_is_not() {
+        use kimmy_storage::StorageError as E;
+        assert!(is_local_failure(&E::Io(std::io::ErrorKind::StorageFull.into())));
+        assert!(is_local_failure(&E::Database("no space".into())));
+        assert!(!is_local_failure(&E::Corrupt("document too short".into())));
+    }
+
+    #[test]
     fn every_protocol_error_but_a_clean_close_is_a_serve_failure_with_its_own_label() {
         let cases = [
             (ProtocolError::Closed, None),
@@ -4335,6 +4412,7 @@ mod tests {
             (ProtocolError::TimedOut("handshake".into()), Some(ServeFailure::Timeout)),
             (ProtocolError::Malformed("x".into()), Some(ServeFailure::Malformed)),
             (ProtocolError::TooLarge { size: MAX_FRAME + 1 }, Some(ServeFailure::Malformed)),
+            (ProtocolError::Local("disk full".into()), Some(ServeFailure::Local)),
             (ProtocolError::Unauthenticated, Some(ServeFailure::Unauthenticated)),
             (ProtocolError::Fault("x".into()), Some(ServeFailure::Fault)),
         ];

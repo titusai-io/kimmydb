@@ -925,14 +925,21 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.serve_failures.malformed",
             "{connection}",
-            "Peer replication connections this node failed to serve on a frame it could not read or accept, or a local error answering one.",
+            "Peer replication connections this node failed to serve on a frame it could not read or accept.",
             |s| s.sync_serve_failures[ServeFailure::Malformed.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_failures.local",
+            "{connection}",
+            "Peer replication connections this node failed to serve because its own storage failed answering.",
+            |s| s.sync_serve_failures[ServeFailure::Local.slot()]
         );
         observe!(
             u64_observable_counter,
             "kimmy.sync.serve_failures.unauthenticated",
             "{connection}",
-            "Peer replication connections this node refused because the peer failed the shared-secret proof.",
+            "Peer replication connections this node refused because the peer failed the shared-secret proof or hung up on reading this node's.",
             |s| s.sync_serve_failures[ServeFailure::Unauthenticated.slot()]
         );
         observe!(

@@ -8264,6 +8264,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_serve_failures_total",
         "kimmy_sync_serve_failures_total",
         "kimmy_sync_serve_failures_total",
+        "kimmy_sync_serve_failures_total",
         "kimmy_ddl_confirmations_total",
         "kimmy_ddl_confirmations_total",
         "kimmy_ddl_confirmations_total",
