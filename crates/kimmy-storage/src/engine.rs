@@ -5293,7 +5293,12 @@ mod tests {
                 })
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // Longer on request, for a soak: `KIMMY_TEST_SWITCH_MS`.
+        let run_ms = std::env::var("KIMMY_TEST_SWITCH_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or(1500);
+        std::thread::sleep(std::time::Duration::from_millis(run_ms));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let written: i64 = writers.into_iter().map(|h| h.join().unwrap()).sum();
         let flips = flipper.join().unwrap();
