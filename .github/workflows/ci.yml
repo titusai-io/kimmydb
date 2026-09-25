@@ -233,6 +233,18 @@ jobs:
           KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
         run: cargo nextest run --workspace
 
+      # The page cache's statistics are a build feature, off by default, so the
+      # run above never compiles them. These are the two crates that do: all of
+      # kimmy-api, whose render, golden and documentation tests change with the
+      # feature, and kimmy-storage's cache tests, since the rest of that crate
+      # does not.
+      - name: Test the storage-cache-metrics feature
+        if: needs.changes.outputs.docs_only != 'true'
+        run: >-
+          cargo nextest run -p kimmy-storage -p kimmy-api
+          --features kimmy-storage/cache-metrics,kimmy-api/storage-cache-metrics
+          -E 'package(kimmy-api) | (package(kimmy-storage) & test(/cache/))'
+
       # Every test that reads a documentation file lives in `kimmy-api`, which
       # `documentation_tests_live_in_this_crate` holds true, so this is the
       # whole set of them and there is no list here to fall out of date. The

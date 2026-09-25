@@ -8,6 +8,12 @@ repository.workspace = true
 authors.workspace = true
 description = "HTTP and WebSocket API surface for KimmyDB"
 
+[features]
+# `/metrics` gains `kimmy_storage_cache_*`, the storage engine's page cache
+# statistics. Off by default: see kimmy-storage's `cache-metrics` for the cost.
+# Without it the series are absent, not zero.
+storage-cache-metrics = ["kimmy-storage/cache-metrics"]
+
 [dependencies]
 kimmy-core.workspace = true
 kimmy-task.workspace = true

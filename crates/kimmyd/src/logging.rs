@@ -343,6 +343,39 @@ impl TelemetryGuard {
             "Size of the database file on disk.",
             storage_bytes
         );
+        // The page cache's statistics, only in a build that has them.
+        #[cfg(feature = "storage-cache-metrics")]
+        observe!(
+            u64_observable_gauge,
+            "kimmy.storage.cache.bytes",
+            "By",
+            "Bytes the storage engine's page cache holds: the read cache and the write buffer together, softly bounded by storage.cache_bytes.",
+            |s| s.storage_cache.used_bytes
+        );
+        #[cfg(feature = "storage-cache-metrics")]
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.evictions",
+            "{page}",
+            "Pages the storage engine's page cache gave up, since the database was opened: read-cache pages dropped to make room, and write-buffer pages written out early.",
+            |s| s.storage_cache.evictions
+        );
+        #[cfg(feature = "storage-cache-metrics")]
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.reads.hit",
+            "{read}",
+            "Page reads the storage engine served from its page cache, since the database was opened.",
+            |s| s.storage_cache.read_hits
+        );
+        #[cfg(feature = "storage-cache-metrics")]
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.reads.miss",
+            "{read}",
+            "Page reads the storage engine went to the file for, since the database was opened.",
+            |s| s.storage_cache.read_misses
+        );
         observe!(
             u64_observable_gauge,
             "kimmy.vector.index_cache.bytes",

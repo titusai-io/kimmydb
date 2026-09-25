@@ -150,5 +150,28 @@ fn find_paths(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, find_paths);
+/// The same indexed lookup from eight threads at once, each iteration the wall
+/// time for all eight. Reads served from the cache take the same few global
+/// counters redb keeps for its cache statistics, so contention on them, if
+/// any, shows here and nowhere in the single-threaded runs above.
+fn concurrent_finds(c: &mut Criterion) {
+    const THREADS: usize = 8;
+    let mut group = c.benchmark_group("find_10k_concurrent");
+    group.sample_size(20);
+    let (engine, coll, _dir) = fixture(10, true);
+    let parsed = filter::parse(&doc! { "bucket": 0i64 }).unwrap();
+    assert_eq!(indexed_find(&engine, &coll, &parsed) as i64, DOCS / 10);
+    group.bench_function(BenchmarkId::new("indexed", format!("{}x{THREADS}", DOCS / 10)), |b| {
+        b.iter(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| black_box(indexed_find(&engine, &coll, &parsed)));
+                }
+            });
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, find_paths, concurrent_finds);
 criterion_main!(benches);
