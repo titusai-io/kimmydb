@@ -5138,6 +5138,24 @@ it is on. The 429 counter is no longer a single-source number:
 `kimmy_rate_limited_total` counts both limiters, and
 `kimmy_rate_limited_principal_total` is how they are told apart.
 
+**Addendum, 2026-09-26: a committed change is never answered `timeout`.** The
+deadline is a timeout around the handler, and Tokio polls the handler before
+the timer, so the timer can answer only while the handler is pending at an
+`.await`. Every commit runs inside `block_in_place` within one poll, so a
+handler is never dropped mid-commit. **The invariant: between a write's commit
+and its response there is no `.await`, except a schema change's confirmation
+(ADR-140), and that one does not await once the deadline is near.** The
+confirmation waits at most the request's time left less 250 ms for writing the
+answer. When no time is left, typically because an index build over a large
+collection took it all, the confirmer answers in the same poll with every
+member pending, and nothing is awaited: an await then could return pending, and
+the timer, already overdue, would answer "abandoned" for an index that exists
+and replicates. A confirmer given no time is required to be ready when first
+polled (`DdlConfirmer`); one that is not is still not awaited, and the change
+is answered without a confirmation. An audit of every `.await` in the API and
+MCP crates found no other one after a commit. A new one after a commit breaks
+this, and must either come before the commit or be capped the same way.
+
 ---
 
 ## ADR-100 — Local login is a mode, and a federated subject has a display name that is never an identity

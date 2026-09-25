@@ -159,7 +159,7 @@ impl UserStore {
     }
 
     pub fn count(&self, engine: &Engine) -> Result<u64> {
-        engine.count(&self.collection).map_err(storage_error)
+        engine.count(&self.collection).map_err(AuthError::Storage)
     }
 
     pub fn create(
@@ -182,13 +182,13 @@ impl UserStore {
         };
         let doc = bson::serialize_to_document(&user)
             .map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))?;
-        engine.insert(&self.collection, doc).map_err(storage_error)?;
+        engine.insert(&self.collection, doc).map_err(AuthError::Storage)?;
         Ok(user)
     }
 
     pub fn get(&self, engine: &Engine, name: &str) -> Result<Option<User>> {
         let id = DocId::String(name.to_string());
-        let Some(doc) = engine.get(&self.collection, &id).map_err(storage_error)? else {
+        let Some(doc) = engine.get(&self.collection, &id).map_err(AuthError::Storage)? else {
             return Ok(None);
         };
         bson::deserialize_from_document(doc)
@@ -203,7 +203,7 @@ impl UserStore {
                 names.push(id.to_string());
                 Ok(true)
             })
-            .map_err(storage_error)?;
+            .map_err(AuthError::Storage)?;
         Ok(names)
     }
 
@@ -217,7 +217,7 @@ impl UserStore {
 
     pub fn delete(&self, engine: &Engine, name: &str) -> Result<bool> {
         let id = DocId::String(name.to_string());
-        engine.delete(&self.collection, &id).map_err(storage_error)
+        engine.delete(&self.collection, &id).map_err(AuthError::Storage)
     }
 
     /// Set a new password, ending every session the old one opened.
@@ -266,7 +266,7 @@ impl UserStore {
         let doc = bson::serialize_to_document(user)
             .map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))?;
         let id = DocId::String(user.name.clone());
-        engine.replace(&self.collection, &id, doc, true).map_err(storage_error)?;
+        engine.replace(&self.collection, &id, doc, true).map_err(AuthError::Storage)?;
         Ok(())
     }
 
@@ -301,10 +301,6 @@ impl UserStore {
 /// The plaintext is irrelevant; only the work factor matters.
 const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$\
     JbQnG7z1PbTsn0k7WT0LvJKKVQmJVBEcnRPBrIsCTFE";
-
-fn storage_error(e: kimmy_storage::StorageError) -> AuthError {
-    AuthError::Hashing(format!("user store: {e}"))
-}
 
 #[cfg(test)]
 mod tests {

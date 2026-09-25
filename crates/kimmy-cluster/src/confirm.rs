@@ -373,6 +373,26 @@ impl Confirmer {
         }
     }
 
+    /// Report the member at `addr` pending without pushing to it or waiting:
+    /// for a request whose deadline leaves no time to wait. `Timeout`, counted
+    /// like any other confirmation; anti-entropy carries the change, as it does
+    /// for every pending member.
+    ///
+    /// Synchronous, deliberately: a schema change that has committed is
+    /// answered in the same poll as its confirmation, so a request deadline
+    /// that has passed cannot fire first and answer it "abandoned" (ADR-057).
+    /// No push, because a push nothing waits for is dropped from its queue
+    /// unsent.
+    pub fn pending_without_waiting(&self) -> Resolution {
+        let mut counted = Counted { hook: self.on_resolved.clone(), done: false };
+        let resolution = Resolution::pending(
+            ConfirmOutcome::Timeout,
+            "the request's deadline left no time to wait for an answer",
+        );
+        counted.record(resolution.outcome());
+        resolution
+    }
+
     /// Queue `entry` for `addr`, starting its driver if none runs; or answer
     /// at once, during a back-off.
     fn enqueue(

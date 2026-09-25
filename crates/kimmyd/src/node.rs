@@ -1586,6 +1586,23 @@ fn ddl_confirmer(
         // The request's own deadline, when it is sooner: what no member has
         // answered by then is pending, not a request abandoned.
         let deadline = cap.map_or(deadline, |cap| deadline.min(cap));
+        if deadline.is_zero() {
+            // No time left: every member pending, and a future that is ready
+            // when first polled, so the committed change is answered in that
+            // same poll. Anything that awaited here — a JoinSet, a zero
+            // sleep — could return pending, and then the request's own
+            // deadline, already passed, answered it "abandoned".
+            let mut found = kimmy_api::DdlConfirmation::default();
+            for (addr, node) in members.entries() {
+                if let Pushed::Pending(reason) =
+                    classify(addr, node, confirmer.pending_without_waiting())
+                {
+                    found.pending.push((node, reason));
+                }
+            }
+            found.pending.sort();
+            return Box::pin(std::future::ready(found));
+        }
         Box::pin(async move {
             let mut asked = tokio::task::JoinSet::new();
             for (addr, node) in members.entries() {
@@ -1794,6 +1811,82 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// The daemon's confirmer over one member that accepts a connection and
+    /// never answers, with its own deadline of ten seconds; and a schema
+    /// change's entry to hand it.
+    async fn silent_member() -> (
+        kimmy_api::DdlConfirmer,
+        kimmy_core::OplogEntry,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![kimmy_storage::IndexField::ascending("email")],
+                false,
+                Some("by_email".into()),
+            )
+            .unwrap();
+        let entry =
+            engine.entries_for_peer(kimmy_core::Hlc::ZERO, 1_000).unwrap().entries.pop().unwrap();
+        let members = kimmy_cluster::Members::default();
+        members.insert_for_test(addr, kimmy_core::NodeId::generate());
+        let confirmer = kimmy_cluster::Confirmer::new(
+            engine,
+            "a-secret-long-enough-for-the-node-tests".into(),
+            members.clone(),
+            kimmy_cluster::ConfirmConfig::new(Duration::from_secs(30)),
+        );
+        (ddl_confirmer(confirmer, members, Duration::from_secs(10)), entry, silent, dir)
+    }
+
+    /// The request's time left caps the confirmer's own deadline: a member
+    /// that never answers is pending once the request's time is up, not after
+    /// the confirmer's ten seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemons_confirmer_waits_no_longer_than_the_request_has_left() {
+        let (confirm, entry, silent, _dir) = silent_member().await;
+        let started = std::time::Instant::now();
+        let found = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm(entry, Some(Duration::from_millis(300))),
+        )
+        .await
+        .expect("capped by the request's time, not the confirmer's ten seconds");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(found.pending.len(), 1, "{found:?}");
+        assert_eq!(found.pending[0].1, "no answer within 300ms");
+        silent.abort();
+    }
+
+    /// Given no time at all, the daemon's confirmer is ready when first
+    /// polled, with the member pending: the caller never awaits it, so a
+    /// committed change is answered before an overdue deadline can fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemons_confirmer_given_no_time_answers_at_once() {
+        use futures::FutureExt;
+        let (confirm, entry, silent, _dir) = silent_member().await;
+        let found = confirm(entry, Some(Duration::ZERO))
+            .now_or_never()
+            .expect("ready when first polled, with nothing awaited");
+        assert_eq!(found.pending.len(), 1, "{found:?}");
+        assert_eq!(found.pending[0].1, "the request's deadline left no time to wait for an answer");
+        silent.abort();
+    }
 
     /// Each way a confirmation ends, sorted as the response reports it: a
     /// member still purging a drop of this name (ADR-189), or one backing off

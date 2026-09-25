@@ -1626,6 +1626,28 @@ pub async fn confirm_ddl(
     // left to write the answer: cut off by the deadline instead, the request
     // was answered "abandoned" for a change that exists and replicates.
     let cap = crate::limits::request_time_left().map(|left| left.saturating_sub(ANSWER_MARGIN));
+    if cap.is_some_and(|cap| cap.is_zero()) {
+        // No time left, typically because the change itself took it (an index
+        // build over a large collection). Nothing may be awaited now: pending
+        // at an `.await`, the handler lets the request's deadline, already
+        // passed, answer "abandoned" for a change that exists. So the
+        // confirmation is polled once, and a confirmer given no time answers
+        // at once (`DdlConfirmer`). One that did not would still not be
+        // awaited: the change is answered with no confirmation, which says
+        // nothing about the members rather than something false.
+        let mut waiting = confirm(entry, cap);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        return Ok(match std::future::Future::poll(waiting.as_mut(), &mut context) {
+            std::task::Poll::Ready(found) => Some(confirmation_to_json(&found)),
+            std::task::Poll::Pending => {
+                tracing::warn!(
+                    "a schema-change confirmation given no time did not answer at once; the \
+                     change is answered without one"
+                );
+                None
+            }
+        });
+    }
     Ok(Some(confirmation_to_json(&confirm(entry, cap).await)))
 }
 

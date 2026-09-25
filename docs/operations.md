@@ -640,8 +640,11 @@ write is present, and it replicates. Its client learns this in one of two ways.
 - **Sometimes, from `500 outcome_unknown`** with `retry: verify`. That is the
   answer when the first I/O error hit another thread, such as a reader, and the
   write's own fsync failed while that thread was still reporting (up to five
-  seconds). It is also the answer for any other failure after a commit's fsync
-  began, such as the file shrink redb makes after its final fsync.
+  seconds). The same holds for any other failure after a commit's fsync
+  began, such as the file shrink redb makes after its final fsync: that failure
+  is itself an I/O error, so if it is the first, the node stops inside it and
+  the client sees a dropped connection. It is answered `outcome_unknown` only
+  inside another thread's reporting window, as above.
 
 Either way the write **may or may not have happened**. Clients must read it back
 before resending it, unless it is idempotent: see

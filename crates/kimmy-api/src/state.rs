@@ -40,6 +40,12 @@ pub struct DdlConfirmation {
 /// request has a deadline: whatever it has not heard by then it reports as
 /// pending, so a change that has already committed is never answered as a
 /// request the node abandoned.
+///
+/// **Given a cap of zero, the future must be ready when first polled**, with
+/// every member it has not heard from pending: there is no time left to wait,
+/// and the caller polls it once and never awaits it. An `.await` of anything
+/// at that point can return pending, and the request's deadline, already
+/// passed, then answers the committed change "abandoned".
 pub type DdlConfirmer = Arc<
     dyn Fn(
             kimmy_core::OplogEntry,

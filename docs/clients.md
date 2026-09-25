@@ -105,8 +105,9 @@ known whether it did**. The third comes two ways:
 
 **The planned cure** is server-side idempotency keys: a key the client sends
 with a write, so that the server applies any retry of it only once. With them,
-every write becomes safe to retry after an unknown outcome. They are designed
-and on the roadmap, and not in this release.
+every write becomes safe to retry after an unknown outcome. They are planned,
+on the [roadmap](roadmap.md#planned-not-scheduled) with no version set, and not
+in this release.
 
 ---
 

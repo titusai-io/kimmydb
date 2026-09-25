@@ -830,6 +830,16 @@ Next ADR number: **ADR-062**.
 
 ---
 
+## Planned, not scheduled
+
+Designed or wanted, with no milestone or version set.
+
+| | Why |
+|---|---|
+| Idempotency keys | A key a client sends with a write, so that the server applies any retry of it only once. With them every write is safe to retry after an unknown outcome (`outcome_unknown`, or a dropped connection after the request was sent); today only an idempotent write is. See [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome) |
+
+---
+
 ## Explicitly not planned
 
 | | Why |

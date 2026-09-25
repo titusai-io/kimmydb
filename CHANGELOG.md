@@ -102,7 +102,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   abandoned, although the index existed and replicated. The confirmation now
   waits no longer than the request has left. Members that have not answered
   by then are reported under `confirmation.pending`, as members that answer
-  too slowly always were.
+  too slowly always were. When the build itself used the whole deadline, as
+  on a large collection, the members are reported pending at once, with the
+  reason "the request's deadline left no time to wait for an answer", and
+  nothing is waited for.
+- **A user or role write whose storage failed is answered with the storage
+  error's own code.** The user and role stores turned every storage error into
+  an authentication failure, answered `500 internal` with `retry: elsewhere`.
+  A create, delete or password change whose commit failed after its fsync began
+  is now `500 outcome_unknown`, `retry: verify`, as a document write is, and
+  every other storage error keeps its code (a write that waited out the
+  deadline for the storage writer, for one, is `503 timeout`,
+  `retry: wait`).
 - **Under `storage.durability = coalesced`, a write could be acknowledged
   durable when no fsync covered it, and lost on a crash.** A commit that
   landed in a narrow window, after the shared flush had synced and before the

@@ -847,6 +847,10 @@ impl From<AuthError> for ApiError {
             | AuthError::AdminNotFederatable { .. }
             | AuthError::EmptyRoleMapping { .. }
             | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
+            // The storage error's own answer: `outcome_unknown` for a
+            // commit that may have happened, and every other code as for a
+            // document write.
+            AuthError::Storage(e) => ApiError::from(e),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");
                 ApiError::internal("authentication failure")
