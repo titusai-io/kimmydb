@@ -28,14 +28,18 @@ What it does, and each is a promise the server makes:
   node resumes from one without a gap (a node other than the one that issued
   it may repeat a few events).
 
-And one thing it deliberately does not do: **retry a write**. ``elsewhere``
-means *this node* did not answer, not that the work did not happen.
+And one thing it deliberately does not do: **retry a write elsewhere**.
+``elsewhere`` means *this node* did not answer, not that the work did not
+happen. (``wait`` is retried for a write, on the same node: it is answered only
+when nothing was done.) A write that was sent and got no answer raises
+:class:`OutcomeUnknown`: read it back before sending it again.
 """
 
 from .client import Client
 from .errors import (
     KimmyError,
     NoNodeAvailable,
+    OutcomeUnknown,
     ProtocolError,
     Retry,
     TransportError,
@@ -49,6 +53,7 @@ __all__ = [
     "Client",
     "KimmyError",
     "NoNodeAvailable",
+    "OutcomeUnknown",
     "Pages",
     "ProtocolError",
     "Retry",

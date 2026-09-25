@@ -4,7 +4,11 @@ use std::fmt;
 use std::sync::Arc;
 
 /// A failure, from the wire or from the attempt to reach it.
+///
+/// `#[non_exhaustive]`: a `match` needs a wildcard arm, so that a kind of
+/// failure added later is not a breaking change.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The server refused, and said why in the envelope every route uses.
     #[error("{status} {code}: {message}")]
@@ -28,6 +32,25 @@ pub enum Error {
         endpoint: String,
         #[source]
         source: reqwest::Error,
+    },
+
+    /// A write that **may or may not have been applied**: read it back before
+    /// sending it again, unless it is idempotent. Its [`Error::retry`] is
+    /// [`Retry::Verify`].
+    ///
+    /// Either the node said so (`500 outcome_unknown`; `source` is that
+    /// [`Error::Api`]), or the request was sent and no answer came back
+    /// (`source` is the [`Error::Transport`]). Never an [`Error::Transport`]
+    /// itself, because code that resends on one must not resend this: an
+    /// applied write sent again is applied twice.
+    #[error(
+        "the write to {endpoint} may or may not have been applied; read it back before sending \
+         it again: {source}"
+    )]
+    OutcomeUnknown {
+        endpoint: String,
+        #[source]
+        source: Box<Error>,
     },
 
     /// Every endpoint was tried and none answered.
@@ -68,6 +91,7 @@ impl Error {
         match self {
             Self::Api { retry, .. } => *retry,
             Self::Transport { .. } => Retry::Elsewhere,
+            Self::OutcomeUnknown { .. } => Retry::Verify,
             _ => Retry::No,
         }
     }
@@ -76,6 +100,7 @@ impl Error {
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             Self::Api { code, .. } => Some(code.clone()),
+            Self::OutcomeUnknown { source, .. } => source.code(),
             _ => None,
         }
     }
@@ -84,6 +109,7 @@ impl Error {
     pub fn code_str(&self) -> Option<&str> {
         match self {
             Self::Api { code, .. } => Some(code.as_str()),
+            Self::OutcomeUnknown { source, .. } => source.code_str(),
             _ => None,
         }
     }
@@ -91,8 +117,15 @@ impl Error {
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Api { status, .. } => Some(*status),
+            Self::OutcomeUnknown { source, .. } => source.status(),
             _ => None,
         }
+    }
+
+    /// Whether a write may or may not have been applied: read it back before
+    /// sending it again.
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
     }
 
     /// Whether this is the server saying the caller's credentials are no good.
@@ -103,17 +136,24 @@ impl Error {
 
 /// What a client may do about a failure.
 ///
-/// Three-valued because KimmyDB is leaderless: every node accepts writes, so
-/// "ask a different node" is a real answer and the right one for a failure
-/// local to the node that answered (ADR-057).
+/// More than a boolean because KimmyDB is leaderless: every node accepts
+/// writes, so "ask a different node" is a real answer and the right one for a
+/// failure local to the node that answered (ADR-057).
+///
+/// **The set is open**: a server newer than this client may name a class it
+/// does not know, which is read as [`Retry::No`]. Hence `#[non_exhaustive]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Retry {
     /// Nothing to retry. The request must change, or the condition must.
     No,
-    /// The same node, after a delay.
+    /// The same node, after a delay. The node did nothing.
     Wait,
     /// A different node.
     Elsewhere,
+    /// Read the target back before sending the request again: it may already
+    /// have been applied.
+    Verify,
 }
 
 impl Retry {
@@ -121,6 +161,7 @@ impl Retry {
         match s {
             "wait" => Self::Wait,
             "elsewhere" => Self::Elsewhere,
+            "verify" => Self::Verify,
             // An unknown class is treated as `no`, which is the safe reading:
             // a client that does not understand the advice does not act on it.
             _ => Self::No,
@@ -139,7 +180,10 @@ impl Retry {
 /// can still log and report *which* code it was, and a `&'static str` payload
 /// cannot hold a string that arrived over a socket. It stores an `Arc<str>` so
 /// inspection and cloning remain cheap without reallocating strings.
+///
+/// `#[non_exhaustive]`, like [`Error`] and [`Retry`]: the server adds codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorCode {
     BadRequest,
     PayloadTooLarge,
@@ -170,6 +214,10 @@ pub enum ErrorCode {
     /// The class is `wait`, with a `Retry-After`: the retry succeeds once the
     /// removal is done.
     CollectionPurging,
+    /// A write reached the storage engine's durability step and then failed,
+    /// so it may or may not have been applied. The class is `verify`. It
+    /// arrives inside an [`Error::OutcomeUnknown`].
+    OutcomeUnknown,
     /// A code this client does not know. The string is kept.
     Unknown(Arc<str>),
 }
@@ -197,6 +245,7 @@ impl ErrorCode {
             "stale" => Self::Stale,
             "timeout" => Self::Timeout,
             "collection_purging" => Self::CollectionPurging,
+            "outcome_unknown" => Self::OutcomeUnknown,
             // The code is kept rather than flattened to a placeholder. A
             // caller that meets a code newer than its client can act on
             // `retry` and still say in a log *which* code it was; a client
@@ -229,6 +278,7 @@ impl ErrorCode {
             Self::Stale => "stale",
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::Unknown(s) => s.as_ref(),
         }
     }
@@ -394,7 +444,7 @@ mod tests {
         // repeating it and being checked. It had fallen two behind the server:
         // `stale` and `timeout` were both parseable-or-not with nothing here
         // to say which, and `timeout` was in fact not.
-        const CODES: [&str; 20] = [
+        const CODES: [&str; 21] = [
             "bad_request",
             "payload_too_large",
             "unsupported_media_type",
@@ -415,6 +465,7 @@ mod tests {
             "stale",
             "timeout",
             "collection_purging",
+            "outcome_unknown",
         ];
 
         for code in CODES {
@@ -437,9 +488,12 @@ mod tests {
 
     #[test]
     fn every_retry_class_round_trips() {
-        for (text, expected) in
-            [("no", Retry::No), ("wait", Retry::Wait), ("elsewhere", Retry::Elsewhere)]
-        {
+        for (text, expected) in [
+            ("no", Retry::No),
+            ("wait", Retry::Wait),
+            ("elsewhere", Retry::Elsewhere),
+            ("verify", Retry::Verify),
+        ] {
             assert_eq!(Retry::parse(text), expected);
         }
         // Anything else is `no`, which is the safe reading: a client that does

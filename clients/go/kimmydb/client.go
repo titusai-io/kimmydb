@@ -32,17 +32,24 @@
 //   - Resumes change streams from the last token seen, which is safe only
 //     because those tokens are portable between nodes.
 //
-// And one thing it will not do: retry a write. RetryElsewhere means *this
-// node* did not answer, not that the work did not happen.
+// And one thing it will not do: retry a write elsewhere. RetryElsewhere means
+// *this node* did not answer, not that the work did not happen. (RetryWait is
+// retried for a write, on the same node: it is answered only when nothing was
+// done.) A write that was sent and got no answer is an *OutcomeUnknownError:
+// read it back before sending it again.
 package kimmydb
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +68,7 @@ type Client struct {
 	http        *http.Client
 	credentials *credentials
 	timeout     time.Duration
+	waitBudget  time.Duration
 
 	mu        sync.RWMutex
 	endpoints []string
@@ -80,6 +88,7 @@ type options struct {
 	discover    bool
 	timeout     time.Duration
 	httpClient  *http.Client
+	waitBudget  time.Duration
 }
 
 // WithCredentials logs in and keeps the token renewed.
@@ -111,6 +120,17 @@ func WithTimeout(d time.Duration) Option {
 	return func(o *options) { o.timeout = d }
 }
 
+// WithWaitBudget bounds how long one request may spend waiting on
+// `retry: wait` answers from a node before it moves to the next one, or
+// returns the error when there is no next one. 30 seconds by default.
+//
+// The server answers `wait` only when it did nothing — a rate limit, a busy
+// writer, a drop still being purged — so the same request is sent to the same
+// node again, after the delay its Retry-After gives, writes included.
+func WithWaitBudget(d time.Duration) Option {
+	return func(o *options) { o.waitBudget = d }
+}
+
 // WithHTTPClient supplies the HTTP client to use — for a custom TLS
 // configuration, a proxy, or a transport with different pool limits.
 //
@@ -122,7 +142,7 @@ func WithHTTPClient(client *http.Client) Option {
 
 // New connects to a cluster, logging in if it was given credentials.
 func New(ctx context.Context, endpoint string, opts ...Option) (*Client, error) {
-	settings := options{timeout: 30 * time.Second}
+	settings := options{timeout: 30 * time.Second, waitBudget: 30 * time.Second}
 	for _, apply := range opts {
 		apply(&settings)
 	}
@@ -136,6 +156,7 @@ func New(ctx context.Context, endpoint string, opts ...Option) (*Client, error) 
 		http:        httpClient,
 		credentials: settings.credentials,
 		timeout:     settings.timeout,
+		waitBudget:  settings.waitBudget,
 		endpoints:   append([]string{normalize(endpoint)}, normalizeAll(settings.endpoints)...),
 		token:       settings.token,
 	}
@@ -591,11 +612,14 @@ func (c *Client) request(ctx context.Context, method, routePath string, body any
 	tried := make([]string, 0, len(endpoints))
 	var last error
 	relogged := false
+	// Spent across every node this request tries, so a cluster of busy nodes
+	// cannot multiply it.
+	waited := time.Duration(0)
 
 	for _, endpoint := range endpoints {
 		tried = append(tried, endpoint)
 		for {
-			parsed, err := c.roundTrip(ctx, endpoint, method, routePath, body)
+			parsed, err := c.roundTrip(ctx, endpoint, method, routePath, body, safety)
 			if err == nil {
 				c.promote(endpoint)
 				return parsed, nil
@@ -613,19 +637,32 @@ func (c *Client) request(ctx context.Context, method, routePath string, body any
 
 			switch retryOf(err) {
 			case RetryWait:
-				if safety != Idempotent {
-					return nil, err
-				}
+				// The same node again, after the delay it asked for: the
+				// server answers `wait` only when it did nothing, so this is
+				// safe for a write too. Until the budget is spent; then the
+				// next node, if there is one.
 				delay := time.Second
 				if apiErr, ok := err.(*APIError); ok && apiErr.RetryAfter > 0 {
 					delay = time.Duration(min(apiErr.RetryAfter, 30)) * time.Second
+				}
+				if left := c.waitBudget - waited; delay > left {
+					delay = left
+				}
+				if delay <= 0 {
+					last = err
+					break
 				}
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-time.After(delay):
 				}
+				waited += delay
 				last = err
+				continue
+			case RetryVerify:
+				// It may already have happened: never sent again here.
+				return nil, err
 			case RetryElsewhere:
 				if safety != Idempotent {
 					return nil, err
@@ -660,7 +697,7 @@ func (c *Client) sendAny(ctx context.Context, method, routePath string, body any
 
 	for _, endpoint := range endpoints {
 		tried = append(tried, endpoint)
-		parsed, err := c.roundTripWithToken(ctx, endpoint, method, routePath, body, token)
+		parsed, err := c.roundTripWithToken(ctx, endpoint, method, routePath, body, token, Idempotent)
 		if err == nil {
 			c.promote(endpoint)
 			return parsed, nil
@@ -676,12 +713,12 @@ func (c *Client) sendAny(ctx context.Context, method, routePath string, body any
 	return nil, &ErrNoNodeAvailable{Tried: tried}
 }
 
-func (c *Client) roundTrip(ctx context.Context, endpoint, method, routePath string, body any) (map[string]any, error) {
-	return c.roundTripWithToken(ctx, endpoint, method, routePath, body, c.Token())
+func (c *Client) roundTrip(ctx context.Context, endpoint, method, routePath string, body any, safety Safety) (map[string]any, error) {
+	return c.roundTripWithToken(ctx, endpoint, method, routePath, body, c.Token(), safety)
 }
 
-func (c *Client) roundTripWithToken(ctx context.Context, endpoint, method, routePath string, body any, token string) (map[string]any, error) {
-	response, err := c.send(ctx, endpoint, method, routePath, body, token)
+func (c *Client) roundTripWithToken(ctx context.Context, endpoint, method, routePath string, body any, token string, safety Safety) (map[string]any, error) {
+	response, err := c.sendAs(ctx, endpoint, method, routePath, body, token, safety)
 	if err != nil {
 		return nil, err
 	}
@@ -689,10 +726,19 @@ func (c *Client) roundTripWithToken(ctx context.Context, endpoint, method, route
 
 	raw, readErr := io.ReadAll(response.Body)
 	if readErr != nil {
+		// The status arrived and the answer did not: for a write, it was
+		// received and may have been applied.
+		if safety == Unsafe {
+			return nil, &OutcomeUnknownError{Endpoint: endpoint, Err: readErr}
+		}
 		return nil, &TransportError{Endpoint: endpoint, Err: readErr}
 	}
 	if response.StatusCode >= 400 {
-		return nil, errorFrom(response.StatusCode, raw, retryAfterOf(response))
+		apiErr := errorFrom(response.StatusCode, raw, retryAfterOf(response))
+		if apiErr.Retry == RetryVerify {
+			return nil, &OutcomeUnknownError{Endpoint: endpoint, Err: apiErr}
+		}
+		return nil, apiErr
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
@@ -705,6 +751,19 @@ func (c *Client) roundTripWithToken(ctx context.Context, endpoint, method, route
 }
 
 func (c *Client) send(ctx context.Context, endpoint, method, routePath string, body any, token string) (*http.Response, error) {
+	return c.sendAs(ctx, endpoint, method, routePath, body, token, Idempotent)
+}
+
+// sendAs sends a request, and says of a failure whether the request can have
+// been applied.
+//
+// A write whose connection failed after it was sent may have been applied, so
+// for an Unsafe request a transport failure is an OutcomeUnknownError unless
+// there is positive evidence that it was not sent: the connection was never
+// made, the TLS handshake failed, or writing the request failed. The absence of
+// a trace event is not evidence — a transport supplied with WithHTTPClient need
+// not report any — so a failure with no evidence either way is unknown.
+func (c *Client) sendAs(ctx context.Context, endpoint, method, routePath string, body any, token string, safety Safety) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -714,7 +773,28 @@ func (c *Client) send(ctx context.Context, endpoint, method, routePath string, b
 		reader = bytes.NewReader(encoded)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, method, endpoint+routePath, reader)
+	var notSent struct {
+		sync.Mutex
+		yes bool
+	}
+	mark := func() {
+		notSent.Lock()
+		notSent.yes = true
+		notSent.Unlock()
+	}
+	trace := &httptrace.ClientTrace{
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err != nil {
+				mark()
+			}
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err != nil {
+				mark()
+			}
+		},
+	}
+	request, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), method, endpoint+routePath, reader)
 	if err != nil {
 		return nil, fmt.Errorf("kimmydb: building the request: %w", err)
 	}
@@ -725,6 +805,16 @@ func (c *Client) send(ctx context.Context, endpoint, method, routePath string, b
 
 	response, err := c.http.Do(request)
 	if err != nil {
+		notSent.Lock()
+		evidence := notSent.yes
+		notSent.Unlock()
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			evidence = true
+		}
+		if safety == Unsafe && !evidence {
+			return nil, &OutcomeUnknownError{Endpoint: endpoint, Err: err}
+		}
 		return nil, &TransportError{Endpoint: endpoint, Err: err}
 	}
 	return response, nil

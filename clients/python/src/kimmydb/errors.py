@@ -13,6 +13,11 @@ class Retry(str, Enum):
     node accepts writes, so "ask a different node" is a real answer and the
     right one for a failure local to the node that answered.
 
+    ``verify`` is the fourth: the write may or may not have been applied, so
+    read it back before sending it again. The set is open — a server newer than
+    this client may name a class it has never heard of, and :meth:`parse` reads
+    that as ``no``.
+
     A `str` enum so that ``event["retry"] == Retry.NO`` works and printing one
     shows the wire value rather than ``Retry.NO``.
     """
@@ -20,6 +25,7 @@ class Retry(str, Enum):
     NO = "no"
     WAIT = "wait"
     ELSEWHERE = "elsewhere"
+    VERIFY = "verify"
 
     @classmethod
     def parse(cls, value: Optional[str]) -> "Retry":
@@ -111,6 +117,29 @@ class TransportError(Exception):
         # A node that did not answer is exactly the case "ask another one"
         # exists for.
         self.retry = Retry.ELSEWHERE
+
+
+class OutcomeUnknown(Exception):
+    """A write may or may not have been applied: read it back before resending.
+
+    Raised for a write in two ways. The node said so, answering
+    ``outcome_unknown`` (then :attr:`cause` is that :class:`KimmyError`); or the
+    request was sent and no answer came back (then :attr:`cause` is the
+    transport's exception).
+
+    Deliberately *not* a :class:`TransportError`: code that catches that to
+    send the request again elsewhere must not catch this, because sending an
+    applied write again applies it twice.
+    """
+
+    def __init__(self, endpoint: str, cause: BaseException) -> None:
+        super().__init__(
+            f"the write to {endpoint} may or may not have been applied; "
+            f"read it back before sending it again: {cause}"
+        )
+        self.endpoint = endpoint
+        self.cause = cause
+        self.retry = Retry.VERIFY
 
 
 class NoNodeAvailable(Exception):

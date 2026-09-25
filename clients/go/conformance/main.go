@@ -10,7 +10,7 @@
 // is wanted is one oracle and three answers.
 //
 //	conformance list
-//	conformance run <scenario> <base-url> [dead-url]
+//	conformance run <scenario> <base-url> [dead-url] [misbehaving-url]
 //
 // Output is a single JSON object on stdout. Anything else goes to stderr.
 package main
@@ -46,6 +46,9 @@ var scenarios = []string{
 	"stale_resume_token_is_refused",
 	"stale_write_is_typed",
 	"array_filters_address_one_element",
+	"wait_is_ridden_out_on_one_node",
+	"rate_limited_write_is_ridden_out",
+	"unanswered_write_is_outcome_unknown",
 }
 
 func password() string {
@@ -65,10 +68,14 @@ func main() {
 		if len(os.Args) > 4 {
 			dead = os.Args[4]
 		}
+		misbehaving := dead
+		if len(os.Args) > 5 {
+			misbehaving = os.Args[5]
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		observations, err := run(ctx, os.Args[2], os.Args[3], dead)
+		observations, err := run(ctx, os.Args[2], os.Args[3], dead, misbehaving)
 		if err != nil {
 			emit(map[string]any{"error": err.Error()})
 			os.Exit(1)
@@ -76,7 +83,7 @@ func main() {
 		emit(observations)
 		return
 	}
-	fmt.Fprintln(os.Stderr, "usage: conformance list | conformance run <scenario> <base-url> [dead-url]")
+	fmt.Fprintln(os.Stderr, "usage: conformance list | conformance run <scenario> <base-url> [dead-url] [misbehaving-url]")
 	os.Exit(2)
 }
 
@@ -108,37 +115,89 @@ func seed(ctx context.Context, db *kimmydb.Client, n int) error {
 	return err
 }
 
-// recreate creates shop.orders again after it was dropped, waiting out the
-// drop's purge: until that is done the name is refused 503 collection_purging,
-// retry wait, with a Retry-After (ADR-189). On a tiny collection the purge
-// usually wins the race, which is why recreating at once passed until it
-// didn't.
-func recreate(ctx context.Context, db *kimmydb.Client) error {
-	giveUp := time.Now().Add(30 * time.Second)
-	for {
-		_, err := db.CreateCollection(ctx, "shop", "orders")
-		var apiErr *kimmydb.APIError
-		if err == nil || !errors.As(err, &apiErr) || apiErr.Code != "collection_purging" ||
-			time.Now().After(giveUp) {
-			return err
-		}
-		wait := time.Second
-		if apiErr.RetryAfter > 0 {
-			wait = time.Duration(apiErr.RetryAfter) * time.Second
-		}
-		if left := time.Until(giveUp); wait > left {
-			wait = left
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
+// outcome says how a call that may fail failed, in the suite's words.
+func outcome(err error) string {
+	var transport *kimmydb.TransportError
+	var apiErr *kimmydb.APIError
+	switch {
+	case err == nil:
+		return "succeeded"
+	case kimmydb.IsOutcomeUnknown(err):
+		return "outcome_unknown"
+	case errors.As(err, &transport):
+		return "transport"
+	case errors.As(err, &apiErr):
+		return apiErr.Code
 	}
+	return "other"
 }
 
-func run(ctx context.Context, scenario, base, dead string) (map[string]any, error) {
+func run(ctx context.Context, scenario, base, dead, misbehaving string) (map[string]any, error) {
 	switch scenario {
+	case "wait_is_ridden_out_on_one_node":
+		db, err := connect(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		if err := seed(ctx, db, 0); err != nil {
+			return nil, err
+		}
+		for start := 0; start < 2000; start += 1000 {
+			documents := make([]any, 0, 1000)
+			for i := start; i < start+1000; i++ {
+				documents = append(documents, map[string]any{"_id": i, "qty": i})
+			}
+			if _, err := db.InsertMany(ctx, "shop", "orders", documents); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := db.Request(ctx, http.MethodDelete, "/v1/db/shop/coll/orders", nil, kimmydb.Idempotent); err != nil {
+			return nil, err
+		}
+		started := time.Now()
+		if err := seed(ctx, db, 0); err != nil {
+			return nil, err
+		}
+		return map[string]any{"created": true, "waited": time.Since(started) >= 900*time.Millisecond}, nil
+
+	case "rate_limited_write_is_ridden_out":
+		db, err := connect(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		if err := seed(ctx, db, 0); err != nil {
+			return nil, err
+		}
+		started := time.Now()
+		inserted := 0
+		for id := range 4 {
+			if _, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": id}); err != nil {
+				return nil, err
+			}
+			inserted++
+		}
+		return map[string]any{"inserted": inserted, "waited": time.Since(started) >= 900*time.Millisecond}, nil
+
+	case "unanswered_write_is_outcome_unknown":
+		fake, err := kimmydb.New(ctx, misbehaving, kimmydb.WithToken("any"))
+		if err != nil {
+			return nil, err
+		}
+		refused, err := kimmydb.New(ctx, dead, kimmydb.WithToken("any"))
+		if err != nil {
+			return nil, err
+		}
+		_, write := fake.Insert(ctx, "shop", "unanswered", map[string]any{"_id": 1})
+		_, read := fake.Request(ctx, http.MethodGet, "/v1/db/shop/coll/unanswered/docs/1", nil, kimmydb.Idempotent)
+		_, answered := fake.Insert(ctx, "shop", "unknown", map[string]any{"_id": 1})
+		_, refusedWrite := refused.Insert(ctx, "shop", "orders", map[string]any{"_id": 1})
+		return map[string]any{
+			"unanswered_write": outcome(write),
+			"unanswered_read":  outcome(read),
+			"answered_unknown": outcome(answered),
+			"refused_write":    outcome(refusedWrite),
+		}, nil
+
 	case "capabilities":
 		db, err := connect(ctx, base)
 		if err != nil {
@@ -489,7 +548,9 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 		if _, err := db.Request(ctx, http.MethodDelete, "/v1/db/shop/coll/orders", nil, kimmydb.Idempotent); err != nil {
 			return nil, err
 		}
-		if err := recreate(ctx, db); err != nil {
+		// Refused collection_purging, retry wait, until the drop's purge is
+		// done (ADR-189); the client waits that out on the same node.
+		if err := seed(ctx, db, 0); err != nil {
 			return nil, err
 		}
 		if _, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": 99}); err != nil {
@@ -605,7 +666,7 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 		if _, err := db.Request(ctx, http.MethodDelete, "/v1/db/shop/coll/orders", nil, kimmydb.Idempotent); err != nil {
 			return nil, err
 		}
-		if err := recreate(ctx, db); err != nil {
+		if err := seed(ctx, db, 0); err != nil {
 			return nil, err
 		}
 

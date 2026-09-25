@@ -79,6 +79,22 @@
       "expect": { "first_id": 99 }
     },
     {
+      "id": "wait_is_ridden_out_on_one_node",
+      "why": "A create sent the moment a 2,000-document drop answers is refused `collection_purging`, `retry: wait`, until the purge is done. `wait` is answered only when nothing was done, so a client with one endpoint sends it again to that node after the Retry-After, and succeeds. Before, the Python and Go clients slept once and then moved on to a next node without asking this one again, and with only one gave up.",
+      "expect": { "created": true, "waited": true }
+    },
+    {
+      "id": "rate_limited_write_is_ridden_out",
+      "why": "A write refused `rate_limited` was not applied: the limiter answers before the handler runs, so `wait` holds for a write as for a read. A single-endpoint client sends it again to that node after the Retry-After. Before, all three clients returned the refusal for any write.",
+      "node": { "env": { "KIMMY_RATE_LIMIT_PER_PRINCIPAL": "3", "KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS": "3" } },
+      "expect": { "inserted": 4, "waited": true }
+    },
+    {
+      "id": "unanswered_write_is_outcome_unknown",
+      "why": "A write sent and never answered may have been applied, and so may one the node answers `outcome_unknown`. Each is the client's outcome-unknown error, never its transport error, which invites sending it again elsewhere. A read in the same position has no outcome to be unknown.",
+      "expect": { "unanswered_write": "outcome_unknown", "unanswered_read": "transport", "answered_unknown": "outcome_unknown", "refused_write": "transport" }
+    },
+    {
       "id": "stale_write_is_typed",
       "why": "A conditional write with the current stamp lands; the same stamp a second time is refused as `stale`, with nothing written. Check-then-act on one document needs exactly this and nothing more.",
       "expect": { "first_write_ok": true, "code": "stale", "retry": "no", "status": 409 }

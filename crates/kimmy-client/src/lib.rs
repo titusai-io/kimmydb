@@ -48,9 +48,15 @@
 //!   list comes from `/v1/topology`.
 //! - **Retries only what is safe to retry.** A read is repeated on another node
 //!   when the failure says `elsewhere`. **A write is not**, unless the caller
-//!   says it is idempotent: an insert that failed after the commit but before
-//!   the answer arrived would be applied twice by a helpful retry, and no
-//!   status code distinguishes that from one that never landed.
+//!   says it is idempotent: `elsewhere` says *this node* did not answer, not
+//!   that the work did not happen. `wait` is different: a node answers it only
+//!   when it did nothing, so any request, a write included, is sent to the
+//!   same node again after the `Retry-After`, within the builder's
+//!   `wait_budget`.
+//! - **Says when a write's outcome is unknown.** A write sent and never
+//!   answered, or answered `outcome_unknown`, is [`Error::OutcomeUnknown`]:
+//!   read it back before sending it again. Only a connection that was never
+//!   made counts as proof that a write was not sent.
 //! - **Pages with cursors**, which is the difference between reading a
 //!   collection and reading its first hundred documents.
 //! - **Resumes change streams.** A dropped socket reconnects from the last
@@ -191,6 +197,9 @@ struct Inner {
     /// The longest a download's body may go without a byte: the builder's
     /// `timeout`.
     idle: Duration,
+    /// How long one request may spend on `retry: wait` answers, across every
+    /// node it tries.
+    wait_budget: Duration,
     /// Node endpoints, this client's own first. Rotated on failover.
     endpoints: RwLock<Vec<String>>,
     credentials: Option<(String, String)>,
@@ -216,6 +225,7 @@ pub struct Builder {
     provider: Option<TokenProvider>,
     discover: bool,
     timeout: Duration,
+    wait_budget: Duration,
     accept_invalid_certs: bool,
 }
 
@@ -232,6 +242,7 @@ impl Client {
             provider: None,
             discover: false,
             timeout: Duration::from_secs(30),
+            wait_budget: Duration::from_secs(30),
             accept_invalid_certs: false,
         }
     }
@@ -879,16 +890,15 @@ impl Client {
         let mut tried = Vec::new();
         let mut last: Option<Error> = None;
         let mut relogged = false;
+        // Across every node, so a cluster of busy nodes cannot multiply it.
+        let mut waited = Duration::ZERO;
 
         for endpoint in &endpoints {
             tried.push(endpoint.clone());
-            // Per endpoint, because the bound is on how long *this* node is
-            // given to recover; the next one has said nothing yet.
-            let mut waited = false;
             loop {
                 let token = self.token().await;
                 let result = self
-                    .send_to(endpoint, method.clone(), path, body.clone(), token.as_deref())
+                    .send_to(endpoint, method.clone(), path, body.clone(), token.as_deref(), safety)
                     .await;
 
                 let error = match result {
@@ -933,22 +943,28 @@ impl Client {
                     // node will serve the request shortly, so failing over
                     // abandons the one node that told you how long to wait,
                     // and with a single endpoint there is nowhere to go at all.
+                    // A write too: the node answers `wait` only when it did
+                    // nothing.
                     //
-                    // Bounded to one wait per endpoint: a client that sleeps
-                    // repeatedly on a rate limit is an application that has
-                    // stopped responding. A second refusal falls through to the
-                    // next node, since this one has now said no twice.
-                    Retry::Wait if safety == Safety::Idempotent && !waited => {
+                    // Bounded by the wait budget, not by a count: a client that
+                    // sleeps without end on a rate limit is an application that
+                    // has stopped responding. Once it is spent, the next node.
+                    Retry::Wait => {
                         let Error::Api { retry_after, .. } = &error else { break };
-                        let delay = Duration::from_secs(retry_after.unwrap_or(1).min(30));
+                        // `Retry-After: 0` is read as absent, a second, as the
+                        // other two clients read it: a zero delay would never
+                        // spend the budget, and the node's own limiter never
+                        // sends one.
+                        let asked = retry_after.filter(|&secs| secs > 0).unwrap_or(1).min(30);
+                        let delay = Duration::from_secs(asked)
+                            .min(self.inner.wait_budget.saturating_sub(waited));
+                        last = Some(error);
+                        if delay.is_zero() {
+                            break;
+                        }
                         tokio::time::sleep(delay).await;
-                        waited = true;
-                        last = Some(error);
+                        waited += delay;
                         continue;
-                    }
-                    Retry::Wait if safety == Safety::Idempotent => {
-                        last = Some(error);
-                        break;
                     }
                     Retry::Elsewhere if safety == Safety::Idempotent => {
                         last = Some(error);
@@ -989,7 +1005,10 @@ impl Client {
 
         for endpoint in &endpoints {
             tried.push(endpoint.clone());
-            match self.send_to(endpoint, method.clone(), path, body.clone(), token).await {
+            match self
+                .send_to(endpoint, method.clone(), path, body.clone(), token, Safety::Idempotent)
+                .await
+            {
                 Ok(value) => {
                     self.promote(endpoint).await;
                     return Ok(value);
@@ -1001,6 +1020,14 @@ impl Client {
         Err(last.unwrap_or(Error::NoNodeAvailable { tried }))
     }
 
+    /// One request to one node.
+    ///
+    /// A write whose request failed after it was sent may have been applied,
+    /// so for an [`Safety::Unsafe`] request a transport failure is
+    /// [`Error::OutcomeUnknown`] unless there is positive evidence that it was
+    /// not sent: the connection was never made (`is_connect`, TLS included),
+    /// or the request could not be built. A failure reading the body, after
+    /// the status arrived, is unknown too: the node received the request.
     async fn send_to(
         &self,
         endpoint: &str,
@@ -1008,6 +1035,7 @@ impl Client {
         path: &str,
         body: Option<Value>,
         token: Option<&str>,
+        safety: Safety,
     ) -> Result<Value> {
         let mut builder = self.inner.http.request(method, format!("{endpoint}{path}"));
         if let Some(token) = token {
@@ -1017,10 +1045,21 @@ impl Client {
             builder = builder.json(&body);
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|source| Error::Transport { endpoint: endpoint.to_string(), source })?;
+        let failed = |source: reqwest::Error, not_sent: bool| {
+            let transport = Error::Transport { endpoint: endpoint.to_string(), source };
+            if safety == Safety::Unsafe && !not_sent {
+                Error::OutcomeUnknown {
+                    endpoint: endpoint.to_string(),
+                    source: Box::new(transport),
+                }
+            } else {
+                transport
+            }
+        };
+        let response = builder.send().await.map_err(|source| {
+            let not_sent = source.is_connect() || source.is_builder();
+            failed(source, not_sent)
+        })?;
 
         let status = response.status();
         let retry_after = response
@@ -1028,14 +1067,18 @@ impl Client {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
-        let text = response
-            .text()
-            .await
-            .map_err(|source| Error::Transport { endpoint: endpoint.to_string(), source })?;
+        let text = response.text().await.map_err(|source| failed(source, false))?;
 
         if !status.is_success() {
             let body = serde_json::from_str(&text).unwrap_or(Value::Null);
-            return Err(error::from_response(status.as_u16(), retry_after, &body));
+            let refusal = error::from_response(status.as_u16(), retry_after, &body);
+            if refusal.retry() == Retry::Verify {
+                return Err(Error::OutcomeUnknown {
+                    endpoint: endpoint.to_string(),
+                    source: Box::new(refusal),
+                });
+            }
+            return Err(refusal);
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
@@ -1130,6 +1173,17 @@ impl Builder {
         self
     }
 
+    /// How long one request may spend waiting on `retry: wait` answers, 30 s
+    /// unless set. The node answers `wait` only when it did nothing (a rate
+    /// limit, a busy writer, a drop still being purged), so the request goes
+    /// to the same node again after its `Retry-After`, writes included; once
+    /// the budget is spent, to the next node, and with none left the error is
+    /// returned. Spent across every node a request tries.
+    pub fn wait_budget(mut self, budget: Duration) -> Self {
+        self.wait_budget = budget;
+        self
+    }
+
     /// Accept any certificate. For a test against a self-signed node, and
     /// named so that it cannot be enabled without saying what it is.
     pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
@@ -1165,6 +1219,7 @@ impl Builder {
                 http,
                 download_http,
                 idle: self.timeout,
+                wait_budget: self.wait_budget,
                 endpoints: RwLock::new(self.endpoints),
                 credentials: self.credentials,
                 provider: self.provider,

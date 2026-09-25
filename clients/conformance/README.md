@@ -25,8 +25,16 @@ and prints its observations as JSON:
 
 ```
 driver list                                   → ["capabilities", ...]
-driver run <scenario> <base-url> [dead-url]   → {"documents_seen": 250, ...}
+driver run <scenario> <base-url> <dead-url> <misbehaving-url>
+                                              → {"documents_seen": 250, ...}
 ```
+
+`<dead-url>` is an address nothing listens on. `<misbehaving-url>` is the one
+fake in the suite, a server the runner starts that fails on purpose in the two
+ways a real node cannot be made to on demand: under `/coll/unanswered/` it reads
+the request and closes the connection unanswered, and under `/coll/unknown/` it
+answers `500 outcome_unknown`. A driver talks to it with any token, since it
+checks none.
 
 The runner starts a fresh node per scenario, runs the scenario against every
 driver, and compares. It checks two different things:
