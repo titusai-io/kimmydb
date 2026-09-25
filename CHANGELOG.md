@@ -32,6 +32,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   for a slot whose checksum does not verify, which is what raw byte damage to
   a header usually leaves.
 
+### Documented
+
+- **`docs/operations.md` says what redb 4.3 costs a single-document write on
+  a rotational disk, and recommends SSD or NVMe for write-heavy
+  single-document workloads.** Since redb 4.2, each durable commit also
+  rewrites a few of the storage engine's own pages into the lowest free space
+  in the file, usually near its start. A commit that also writes the growing
+  tail then spans the whole file, and the fsync pays a full-stroke seek. On a
+  rotational disk, the same ~2.5 GB store took +26% on the write hold and
+  +33% on the fdatasync per insert against 0.36.0. The lab cluster's 3.5 GB
+  members doubled both. SSD and NVMe show no cost. Nothing changes in the
+  code: no setting moves those pages.
+
 ## 0.37.0 - 2026-09-24
 
 **Roll the members one at a time: nothing on the wire changes, and each

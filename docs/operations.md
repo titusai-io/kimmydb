@@ -1663,6 +1663,33 @@ hold once per window that **still blocks the writer** while it flushes
 everything the window collected. It helps a member with many concurrent
 writers; it does not make a bulk load free for the writes queued behind it.
 
+**On a rotational disk, a single-document write's fsync gets slower as the
+store grows. Use SSD or NVMe for write-heavy single-document workloads.**
+Since 0.37.0, which moved to redb 4.3, each durable commit also rewrites a
+few of the storage engine's own pages (a change redb made in 4.2), and it puts
+them in the lowest free space in the file, which is usually near its start. A
+commit that also writes at the file's tail, as a growing store's inserts do,
+then spans the whole file, and on a spinning disk the fsync pays a full-stroke
+seek for it. The bytes written barely change: one more 4 KiB page per commit.
+
+- **Measured on a rotational disk against 0.36.0** (redb 4.1), with one fsync
+  per insert in both: the same store of about 2.5 GB, opened by each release,
+  took **+26% on the single writer's hold and +33% on the fdatasync** per
+  single-document insert. On the lab cluster's 3.5 GB members, the hold and
+  the fsync doubled, and insert-one throughput halved.
+- **On SSD or NVMe there is no cost.** A reproduction with redb alone measured
+  redb 4.3 equal to or faster than 4.1 there.
+- **A bulk amortises it.** A bulk is one commit however many documents it
+  carries: bulks of 100 were about 5% slower than on 0.36.0 on the same members.
+
+The hold meter shows it: per hold,
+`kimmy_write_lock_held_component_seconds_total{holder="write",component="sync"}`
+rises while `kimmy_write_lock_held_io_bytes_total{holder="write",io="write"}`
+stays flat. That's the same bytes, each fsync slower. No setting
+changes where the storage engine puts those pages. `storage.durability =
+coalesced` shares one fsync among concurrent commits, and so the seek, but it
+does nothing for a lone writer (see above).
+
 **Resident memory and the container limit.** `kimmy_process_resident_bytes`
 is the number a cgroup limit is enforced against and the only series that
 measures it. Alert on it at 80% of the limit, and on it climbing while
