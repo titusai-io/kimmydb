@@ -670,13 +670,24 @@ async fn a_schema_change_made_right_after_its_collection_reaches_every_member() 
     // confirmed them before the response.
     assert_eq!(created["confirmation"]["confirmed"].as_array().map(Vec::len), Some(2), "{created}");
     assert_eq!(created["confirmation"]["pending"].as_array().map(Vec::len), Some(0), "{created}");
-    // And counted as pushed where they were applied: the push hook records
-    // before the peer answers, so each peer's count is in place by the time
-    // the response is. The index at least came by push; the collection too,
-    // unless a sync round took it first.
+    // And counted where the push delivered them: the push hook records before
+    // the peer answers, so each peer's count is in place by the time the
+    // response is. The push always carries the index. Whether the peer
+    // applied it from the push or already held it depends on whether its own
+    // sync pull took the collection and the index first: a byte-identical
+    // duplicate is held, not applied (ADR-180's addendum). So the push is
+    // counted under one series or the other, and the two together are at
+    // least one.
     for node in [&b, &c] {
-        let pushed = node.gauge(&client, "kimmy_sync_ddl_applied_total{via=\"push\"}").await;
-        assert!(pushed >= Some(1), "{}'s pushed schema changes: {pushed:?}", node.name);
+        let applied = node.gauge(&client, "kimmy_sync_ddl_applied_total{via=\"push\"}").await;
+        let held = node.gauge(&client, "kimmy_sync_ddl_held_total{via=\"push\"}").await;
+        let (applied, held) =
+            (applied.expect("the applied series"), held.expect("the held series"));
+        assert!(
+            applied + held >= 1,
+            "{}'s pushed schema changes: applied {applied}, held {held}",
+            node.name
+        );
     }
 
     for node in [&b, &c] {
