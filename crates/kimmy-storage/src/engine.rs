@@ -699,6 +699,8 @@ impl WriteTxn<'_> {
             // The writer is free from here: what follows is the barrier,
             // whose leader opens a transaction of its own (ADR-088).
             self.release();
+            #[cfg(test)]
+            barrier_hooks::reach(barrier_hooks::Point::Released);
             if coalesced {
                 engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 engine.wait_for_flush(ticket)?;
@@ -736,6 +738,9 @@ pub(crate) mod barrier_hooks {
         /// The leader's flush has committed and let go of the writer, and
         /// the leader has not yet recorded what it covered.
         FlushedBeforeBookkeeping,
+        /// A committer has let go of the writer and not yet reached the
+        /// barrier.
+        Released,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -4985,6 +4990,46 @@ mod tests {
             fsyncs_when_acknowledged > fsyncs_at_gap.load(std::sync::atomic::Ordering::SeqCst),
             "the commit that landed in the gap was acknowledged before any flush that followed \
              it: {fsyncs_when_acknowledged} fsyncs"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_let_go_of_the_writer_before_a_flush_took_it_is_covered_by_that_flush() {
+        // The other half of taking the ticket under the writer: a commit that
+        // landed before a flush took the writer is counted by that flush, even
+        // when it reaches the barrier only after the flush is done. Taken after
+        // the release, its ticket would miss the flush that synced its pages,
+        // and it would wait out, and pay for, a second one.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        let coll = engine.create_collection("app", "c").unwrap();
+        let fsyncs_before = engine.fsyncs();
+
+        let other = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let (engine, coll, other) = (Arc::clone(&engine), coll.clone(), Arc::clone(&other));
+            barrier_hooks::at(barrier_hooks::Point::Released, move || {
+                // Parked between letting go of the writer and the barrier,
+                // while another committer lands, leads and flushes.
+                let leading = Arc::clone(&engine);
+                *other.lock() = Some(std::thread::spawn(move || {
+                    leading.insert(&coll, doc! {"_id": 2}).unwrap();
+                }));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while engine.fsyncs() == fsyncs_before {
+                    assert!(std::time::Instant::now() < deadline, "the other commit never flushed");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        engine.insert(&coll, doc! {"_id": 1}).unwrap();
+        other.lock().take().expect("the hook ran").join().unwrap();
+        assert_eq!(
+            engine.fsyncs() - fsyncs_before,
+            1,
+            "one flush covered both commits, since both had landed before it took the writer"
         );
     }
 
