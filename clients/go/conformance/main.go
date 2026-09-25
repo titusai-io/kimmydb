@@ -108,6 +108,35 @@ func seed(ctx context.Context, db *kimmydb.Client, n int) error {
 	return err
 }
 
+// recreate creates shop.orders again after it was dropped, waiting out the
+// drop's purge: until that is done the name is refused 503 collection_purging,
+// retry wait, with a Retry-After (ADR-189). On a tiny collection the purge
+// usually wins the race, which is why recreating at once passed until it
+// didn't.
+func recreate(ctx context.Context, db *kimmydb.Client) error {
+	giveUp := time.Now().Add(30 * time.Second)
+	for {
+		_, err := db.CreateCollection(ctx, "shop", "orders")
+		var apiErr *kimmydb.APIError
+		if err == nil || !errors.As(err, &apiErr) || apiErr.Code != "collection_purging" ||
+			time.Now().After(giveUp) {
+			return err
+		}
+		wait := time.Second
+		if apiErr.RetryAfter > 0 {
+			wait = time.Duration(apiErr.RetryAfter) * time.Second
+		}
+		if left := time.Until(giveUp); wait > left {
+			wait = left
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 func run(ctx context.Context, scenario, base, dead string) (map[string]any, error) {
 	switch scenario {
 	case "capabilities":
@@ -460,7 +489,7 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 		if _, err := db.Request(ctx, http.MethodDelete, "/v1/db/shop/coll/orders", nil, kimmydb.Idempotent); err != nil {
 			return nil, err
 		}
-		if err := seed(ctx, db, 0); err != nil {
+		if err := recreate(ctx, db); err != nil {
 			return nil, err
 		}
 		if _, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": 99}); err != nil {
@@ -576,7 +605,7 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 		if _, err := db.Request(ctx, http.MethodDelete, "/v1/db/shop/coll/orders", nil, kimmydb.Idempotent); err != nil {
 			return nil, err
 		}
-		if err := seed(ctx, db, 0); err != nil {
+		if err := recreate(ctx, db); err != nil {
 			return nil, err
 		}
 

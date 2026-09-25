@@ -62,6 +62,21 @@ def seed(db: Client, n: int) -> None:
         db.insert_many("shop", "orders", [{"_id": i, "qty": i} for i in range(n)])
 
 
+def recreate(db: Client, deadline: float = 30.0) -> None:
+    """Create `shop.orders` again after dropping it, waiting out the drop's
+    purge: until it is done the name is refused `503 collection_purging`,
+    `retry: wait`, with a `Retry-After` (ADR-189)."""
+    give_up = time.monotonic() + deadline
+    while True:
+        try:
+            db.create_collection("shop", "orders")
+            return
+        except KimmyError as e:
+            if e.code != "collection_purging" or time.monotonic() >= give_up:
+                raise
+            time.sleep(min(e.retry_after or 1, max(give_up - time.monotonic(), 0)))
+
+
 def next_event(stream, timeout: float = 15.0):
     """The next event, or a failure rather than a hang."""
     box: list = []
@@ -252,7 +267,7 @@ def run(scenario: str, base: str, dead: str) -> dict:
         db = connect(base)
         seed(db, 1)
         db.request("DELETE", "/v1/db/shop/coll/orders")
-        db.create_collection("shop", "orders")
+        recreate(db)
         db.insert("shop", "orders", {"_id": 99})
 
         stream = db.watch("shop", "orders", from_start=True)
@@ -304,7 +319,7 @@ def run(scenario: str, base: str, dead: str) -> dict:
         stream.close()
 
         db.request("DELETE", "/v1/db/shop/coll/orders")
-        db.create_collection("shop", "orders")
+        recreate(db)
 
         try:
             db.watch("shop", "orders", resume_after=token)
