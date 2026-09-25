@@ -345,7 +345,8 @@ async fn serve_connection<S>(
                 error = %e,
                 reason = ServeFailure::Unauthenticated.label(),
                 "peer connection failed: the peer did not complete the shared-secret handshake; \
-                 its cluster_secret likely differs from this node's, or it is not a member"
+                 its cluster_secret likely differs from this node's, it is not a member, or it \
+                 went away mid-handshake (e.g. shutting down)"
             );
             if let Some(hook) = on_failed {
                 hook(ServeFailure::Unauthenticated);
