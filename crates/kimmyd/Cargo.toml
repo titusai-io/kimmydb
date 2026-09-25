@@ -12,6 +12,13 @@ description = "The KimmyDB server daemon"
 name = "kimmyd"
 path = "src/main.rs"
 
+[features]
+# The storage engine's page-cache statistics on `/metrics` and the OTLP bridge
+# (`kimmy_storage_cache_*`), for a build that diagnoses memory. Off by default,
+# and off in the release artifacts: range reads served from the cache pay for
+# it, up to 17% of throughput at 64 concurrent clients (docs/operations.md).
+storage-cache-metrics = ["kimmy-api/storage-cache-metrics"]
+
 [dependencies]
 kimmy-core.workspace = true
 kimmy-task.workspace = true

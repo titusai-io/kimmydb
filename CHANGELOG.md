@@ -16,18 +16,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **`kimmy_storage_cache_bytes`**, **`kimmy_storage_cache_evictions_total`**
   and **`kimmy_storage_cache_reads_total{result}`** report the storage
-  engine's page cache: what it holds now (the read cache and the write buffer
-  together, bounded by `storage.cache_bytes`), the pages it has dropped to
-  make room or written out early from the write buffer, and its page reads
-  served from the cache (`hit`) or the file (`miss`). They are bridged as `kimmy.storage.cache.bytes`, `.evictions`,
-  `.reads.hit` and `.reads.miss`. The cache is most of a node's resident
-  memory, and it is heap, so the kernel's anonymous and file-backed split
-  cannot separate it from other heap growth; this gauge can. It needs redb's
-  cache statistics, now enabled. That costs nothing measurable on writes or
-  on reads served entirely from the cache, such as index range scans. The
-  benchmarks compared five interleaved rounds with the statistics off and
-  on: medians within ±1.2%, inside the run-to-run spread. See
-  [the metrics table](docs/operations.md).
+  engine's page cache, **in a build with the new `storage-cache-metrics`
+  feature** (`cargo build -p kimmyd --features storage-cache-metrics`). They
+  report what the cache holds now (the read cache and the write buffer
+  together, softly bounded by `storage.cache_bytes`), the pages it gave up (to
+  make room, or written out early from the write buffer), and its page reads
+  served from the cache (`hit`) or the file (`miss`). They are bridged as
+  `kimmy.storage.cache.bytes`, `.evictions`, `.reads.hit` and `.reads.miss`.
+  The cache is most of a node's resident memory, and it is heap, so the
+  kernel's anonymous and file-backed split cannot separate it from other heap
+  growth; this gauge can. **Off by default, and off in the release artifacts
+  and the Docker image**, because redb keeps the statistics in single global
+  counters that every page access updates. Measured end to end, range reads
+  served from the cache lose up to 17% of their throughput at 64 concurrent
+  clients, and 3–6% at 8. Point reads and writes lose nothing measurable.
+  Without the feature the series are absent, not zero. See
+  [the page cache's statistics](docs/operations.md#the-page-caches-statistics).
 - **`kimmy_sync_serve_failures_total{reason}`** counts the replication
   connections a peer opened to this node that ended in an error on this side,
   by reason: `io`, `timeout`, `malformed`, `local`, `unauthenticated`,

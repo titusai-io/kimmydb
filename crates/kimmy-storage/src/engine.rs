@@ -1447,6 +1447,10 @@ impl Engine {
     /// `used_bytes` is the read cache **and** the write buffer together: pages
     /// read from the file and kept, and pages a transaction wrote that have
     /// not yet reached it. The counters are since the database was opened.
+    ///
+    /// Only with the `cache-metrics` feature: without it redb reports zeros,
+    /// which would read as an empty cache, so the method does not exist.
+    #[cfg(feature = "cache-metrics")]
     pub fn cache_reading(&self) -> CacheReading {
         use redb::ReadableDatabase;
         let stats = self.db.cache_stats();
@@ -5397,6 +5401,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cache-metrics")]
     #[test]
     fn the_page_cache_reports_its_fill_its_hits_and_misses_and_its_evictions() {
         // redb reports all of this only with its `cache_metrics` feature, and
@@ -5435,6 +5440,7 @@ mod tests {
         assert!(after.used_bytes <= 2 * 64 * 1024, "held within about the bound: {after:?}");
     }
 
+    #[cfg(feature = "cache-metrics")]
     #[test]
     fn reading_the_cache_while_another_thread_commits_does_not_panic() {
         // redb 4.3 counts a write's cache hit before its total, and derives

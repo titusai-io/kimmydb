@@ -619,6 +619,20 @@ fn operations_lists_every_series_the_metrics_endpoint_exposes() {
         );
     }
     for name in documented.keys() {
+        // A series only a feature build has (`storage-cache-metrics`): its row
+        // must say so, and the build without it must not expose it.
+        if !exposed.contains_key(name) && !cfg!(feature = "storage-cache-metrics") {
+            let row = section
+                .iter()
+                .find(|line| line.starts_with(&format!("| `{name}")))
+                .expect("a documented series has a row");
+            assert!(
+                row.contains("storage-cache-metrics"),
+                "docs/operations.md#metrics documents `{name}` but the server does not expose \
+                 it, and its row does not name the feature that would"
+            );
+            continue;
+        }
         assert!(
             exposed.contains_key(name),
             "docs/operations.md#metrics documents `{name}` but the server does not expose it"

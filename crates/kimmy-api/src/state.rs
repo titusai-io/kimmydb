@@ -180,8 +180,12 @@ impl AppState {
             commits_grouped: self.engine.grouped_commits(),
             storage_bytes: self.engine.storage_bytes(),
             // redb's own counters for the cache `storage.cache_bytes` bounds:
-            // what it holds now, and how it has been doing since open.
+            // what it holds now, and how it has been doing since open. Only
+            // in a build that has them; the render then omits the series.
+            #[cfg(feature = "storage-cache-metrics")]
             storage_cache: self.engine.cache_reading(),
+            #[cfg(not(feature = "storage-cache-metrics"))]
+            storage_cache: kimmy_storage::CacheReading::default(),
             // An estimate from node count and width, not a heap measurement;
             // what the budget evicts against, so the two agree by construction.
             vector_index_cache_bytes: self.vectors.resident_bytes(),

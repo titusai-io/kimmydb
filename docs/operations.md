@@ -669,9 +669,9 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_embed_provider_errors_total{kind}` | Provider calls that failed before any response, by what failed: `connect` (DNS, TCP, TLS), `timeout`, `reset` (the far side closed an open connection), `other`. Where `kimmy_embed_failures_total` says a call failed, this says at which layer |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
-| `kimmy_storage_cache_bytes` | Bytes the storage engine's page cache holds now, from redb's own count: the **read cache and the write buffer together**, filled by reads **and by commits**. Bounded by `storage.cache_bytes`, but **softly**: it can briefly exceed the bound, and can count a page twice after a non-durable commit. Never released on a timer, so it climbs to the busiest period's working set and stays there. **Read it against `storage.cache_bytes` and `kimmy_process_resident_bytes`.** A step in resident memory **matched** by a step here is the cache filling, which is bounded and expected. **A rise in resident memory with this gauge flat is outside redb's page cache**: the rest of the heap — vector graphs, which `kimmy_vector_index_cache_bytes` estimates; requests in flight; memory the allocator keeps after a burst; evicted pages still held by an open reader. **The cache is heap too**, not a mapping of the file, so the kernel's anonymous and file-backed split cannot separate the two; this gauge can |
-| `kimmy_storage_cache_evictions_total` | Pages the page cache gave up, since the database was opened: **read-cache pages dropped to make room**, and **write-buffer pages written out early** once a transaction's writes pass half of `storage.cache_bytes`. Rising with reads while `kimmy_storage_cache_bytes` sits at the bound means the working set is larger than the cache, so reads that miss go to the file: the miss count below shows it, and so does `kimmy_write_lock_held_component_seconds_total{component="read"}` for the reads made under the writer. Rising with one large bulk write is the write buffer spilling |
-| `kimmy_storage_cache_reads_total{result}` | Page reads served from the cache (**`hit`**) or from the file (**`miss`**), since the database was opened. `rate(…{result="miss"}) / rate(…)` is the miss ratio: near 0 once a working set that fits is warm, and the first number to read when `storage.cache_bytes` is being sized |
+| `kimmy_storage_cache_bytes` | **Only in a build with the `storage-cache-metrics` feature** ([the page cache's statistics](#the-page-caches-statistics)); absent otherwise. Bytes the storage engine's page cache holds now, from redb's own count: the **read cache and the write buffer together**, filled by reads **and by commits**. Bounded by `storage.cache_bytes`, but **softly**: it can briefly exceed the bound, and can count a page twice after a non-durable commit. Never released on a timer, so it climbs to the busiest period's working set and stays there. **Read it against `storage.cache_bytes` and `kimmy_process_resident_bytes`.** A step in resident memory **matched** by a step here is the cache filling, which is bounded and expected. **A rise in resident memory with this gauge flat is outside redb's page cache**: the rest of the heap — vector graphs, which `kimmy_vector_index_cache_bytes` estimates; requests in flight; memory the allocator keeps after a burst; evicted pages still held by an open reader. **The cache is heap too**, not a mapping of the file, so the kernel's anonymous and file-backed split cannot separate the two; this gauge can |
+| `kimmy_storage_cache_evictions_total` | **Only in a build with the `storage-cache-metrics` feature** ([the page cache's statistics](#the-page-caches-statistics)); absent otherwise. Pages the page cache gave up, since the database was opened: **read-cache pages dropped to make room**, and **write-buffer pages written out early** once a transaction's writes pass half of `storage.cache_bytes`. Rising with reads while `kimmy_storage_cache_bytes` sits at the bound means the working set is larger than the cache, so reads that miss go to the file: the miss count below shows it, and so does `kimmy_write_lock_held_component_seconds_total{component="read"}` for the reads made under the writer. Rising with one large bulk write is the write buffer spilling |
+| `kimmy_storage_cache_reads_total{result}` | **Only in a build with the `storage-cache-metrics` feature** ([the page cache's statistics](#the-page-caches-statistics)); absent otherwise. Page reads served from the cache (**`hit`**) or from the file (**`miss`**), since the database was opened. `rate(…{result="miss"}) / rate(…)` is the miss ratio: near 0 once a working set that fits is warm, and the first number to read when `storage.cache_bytes` is being sized |
 | `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
 | `kimmy_process_resident_bytes` | Resident memory of the whole process as the kernel reports it (`VmRSS` from `/proc/self/status`) — the figure a container memory limit is enforced against, which neither `kimmy_storage_bytes` (a file size) nor `kimmy_vector_index_cache_bytes` (an estimate of one part of the heap) is. It holds `storage.cache_bytes`, the graphs, every request in flight and whatever heap the allocator keeps for reuse after a burst, so it does not follow the two byte gauges down; [Capacity](#capacity) says what to expect and what to do. **Alert on this** against the container's limit — at 80% of it, and on a reading still climbing while `kimmy_requests_total` is flat. 0 where there is no `/proc` ([ADR-147](decisions.md)) |
 | `kimmy_process_resident_peak_bytes` | The most the process has had resident at any moment since it started (`VmHWM`) — what a limit was reached *by*, readable after the current figure has come back down. Never falls within one process life; a restart resets it. 0 where there is no `/proc` |
@@ -786,6 +786,43 @@ A replication lag of 0 beside an age well past `cluster.sync_interval_secs` is
 not caught up. It means no round has completed recently, or ever, so the lag
 has not been measured. A member whose seeds are all unreachable reads exactly
 this from the moment it starts.
+
+### The page cache's statistics
+
+`kimmy_storage_cache_bytes`, `kimmy_storage_cache_evictions_total` and
+`kimmy_storage_cache_reads_total{result}` appear only in a `kimmyd` built with
+the `storage-cache-metrics` feature:
+
+```bash
+cargo build --release -p kimmyd --features storage-cache-metrics
+```
+
+**The release artifacts and the Docker image are built without it.**
+
+**Without the feature the series are absent, not zero.** The engine has no
+reading to give without it (redb reports zeros), and a zero would read as an
+empty cache on a node whose cache is full. A dashboard built on these series
+shows "no data" on a standard build, which is the truth.
+
+**Why it is off by default.** redb keeps these statistics in single global
+counters that every page access updates. So reads that touch many cached pages
+per request, from many clients at once, contend on them. The table below was
+measured end to end on one release `kimmyd`, over HTTP. The dataset was 20,000
+documents that fit the cache, and each figure is the median of 5 interleaved
+rounds, with the p99 in µs:
+
+| Workload | Clients | Throughput cost | p99, off → on |
+|---|---|---|---|
+| Point read by `_id` | 8 | −0.1% | 112 → 112 |
+| Point read by `_id` | 64 | −0.0% | 649 → 649 |
+| Indexed find, ~100 documents | 8 | −3.0% | 342 → 362 |
+| Indexed find, ~100 documents | 64 | −11.4% | 8,591 → 10,339 |
+| Count over an indexed filter | 8 | −6.3% | 270 → 293 |
+| Count over an indexed filter | 64 | −17.0% | 7,613 → 10,191 |
+
+Writes are unaffected: they are bounded by the fsync. **Build it for a node you
+are diagnosing**, where the question is how much of its resident memory is the
+cache, not for a node serving heavy range reads.
 
 ### The divergence check
 

@@ -8197,12 +8197,19 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
     .into_iter()
     .chain(hold)
     .chain(decomposition)
+    .chain(["kimmy_storage_bytes"])
+    // Only in a build with the page cache's statistics; absent otherwise.
+    .chain(if cfg!(feature = "storage-cache-metrics") {
+        vec![
+            "kimmy_storage_cache_bytes",
+            "kimmy_storage_cache_evictions_total",
+            "kimmy_storage_cache_reads_total",
+            "kimmy_storage_cache_reads_total",
+        ]
+    } else {
+        Vec::new()
+    })
     .chain([
-        "kimmy_storage_bytes",
-        "kimmy_storage_cache_bytes",
-        "kimmy_storage_cache_evictions_total",
-        "kimmy_storage_cache_reads_total",
-        "kimmy_storage_cache_reads_total",
         "kimmy_vector_index_cache_bytes",
         "kimmy_process_resident_bytes",
         "kimmy_process_resident_peak_bytes",
@@ -9783,8 +9790,19 @@ async fn metrics_text(server: &Server) -> String {
     raw.split("\r\n\r\n").nth(1).expect("a response body").to_string()
 }
 
+/// Without the page cache's statistics the series are absent, not zero: a
+/// zero would read as an empty cache.
+#[cfg(not(feature = "storage-cache-metrics"))]
+#[tokio::test]
+async fn without_the_feature_the_storage_cache_series_are_absent() {
+    let server = Server::start().await;
+    let text = metrics_text(&server).await;
+    assert!(!text.contains("kimmy_storage_cache"), "{text}");
+}
+
 /// The page-cache series read the node's own engine: after writes and a read
 /// through the API, the cache holds pages and has served reads from itself.
+#[cfg(feature = "storage-cache-metrics")]
 #[tokio::test]
 async fn the_storage_cache_series_read_this_nodes_engine() {
     let server = Server::start().await;

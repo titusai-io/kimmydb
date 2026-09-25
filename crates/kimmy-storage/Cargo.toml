@@ -9,6 +9,15 @@ authors.workspace = true
 description = "redb-backed storage engine, indexes, and oplog for KimmyDB"
 
 [features]
+# The page cache's statistics: `Engine::cache_reading`, from redb's
+# `cache_metrics`. Off by default, because redb keeps them in single global
+# counters that every page access updates, and range reads served from the
+# cache contend on them: measured end to end at up to 17% of throughput for
+# 64 concurrent indexed counts, and nothing on point reads or writes. A build
+# for diagnosing memory turns it on, through kimmyd's `storage-cache-metrics`.
+# The feature needs a target with 64-bit atomics; redb refuses to compile it
+# otherwise.
+cache-metrics = ["redb/cache_metrics"]
 # A control for the benchmarks behind ADR-174's addendum, and nothing else.
 #
 # Compiles the live-count and mark work out of the write path entirely, so a
