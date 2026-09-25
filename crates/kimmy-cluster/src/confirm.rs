@@ -988,6 +988,7 @@ mod tests {
             listener,
             SECRET.into(),
             Some(hook),
+            None,
             Arc::new(crate::tls::ClusterTls::new().unwrap()),
         ));
         Member { engine, addr, served, serving, _dir: dir }

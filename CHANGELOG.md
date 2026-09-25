@@ -14,6 +14,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy_sync_serve_failures_total{reason}`** counts the replication
+  connections a peer opened to this node that ended in an error on this side,
+  by reason: `io`, `timeout`, `malformed`, `unauthenticated`, `fault` and
+  `binding` (bridged as `kimmy.sync.serve_failures.<reason>`). The serving
+  side's failures, such as the `Broken pipe` of a pusher that stopped
+  waiting, reached only a `WARN` line before; the line now also names the
+  reason. A clean close and an unfinished TLS handshake are not counted. See
+  [the metrics table](docs/operations.md).
 - **`kimmy_sync_ddl_held_total{via}`** counts the replicated schema changes a
   window carried that the member already held, entry and all (bridged as
   `kimmy.sync.ddl_held.pull` and `.push`). They are not applied again, and

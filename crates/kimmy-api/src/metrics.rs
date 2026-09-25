@@ -307,6 +307,9 @@ pub struct MetricsSnapshot {
     /// them, whose ratio to the confirmations is the coalescing.
     pub ddl_confirmations: [u64; kimmy_cluster::ConfirmOutcome::COUNT],
     pub ddl_confirm_pushes: u64,
+    /// Peer connections this node failed to serve, by reason, in
+    /// `ServeFailure::ALL` order.
+    pub sync_serve_failures: [u64; kimmy_cluster::ServeFailure::COUNT],
     /// Schema changes a snapshot restore re-logged so that this node can
     /// serve them onward (ADR-180). One of the engine's readings.
     pub sync_ddl_relogged: u64,
@@ -420,6 +423,7 @@ pub struct Metrics {
     sync_ddl_held_push: AtomicU64,
     ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
     ddl_confirm_pushes: AtomicU64,
+    sync_serve_failures: [AtomicU64; kimmy_cluster::ServeFailure::COUNT],
     sync_divergent_collections: AtomicU64,
     /// The gauge above says how many collections disagree; these two say
     /// whether anything looked (ADR-135). Counters, unlike the gauge beside
@@ -535,6 +539,7 @@ impl Default for Metrics {
             sync_ddl_held_push: AtomicU64::new(0),
             ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
             ddl_confirm_pushes: AtomicU64::new(0),
+            sync_serve_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_divergent_collections: AtomicU64::new(0),
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
@@ -829,6 +834,11 @@ impl Metrics {
         self.ddl_confirmations[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One peer connection this node failed to serve, and why.
+    pub fn record_sync_serve_failure(&self, reason: kimmy_cluster::ServeFailure) {
+        self.sync_serve_failures[reason.slot()].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One window pushed to confirm schema changes (ADR-191).
     pub fn record_ddl_confirm_push(&self) {
         self.ddl_confirm_pushes.fetch_add(1, Ordering::Relaxed);
@@ -1095,6 +1105,9 @@ impl Metrics {
             sync_ddl_held_push: self.get(&self.sync_ddl_held_push),
             ddl_confirmations: std::array::from_fn(|slot| self.get(&self.ddl_confirmations[slot])),
             ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
+            sync_serve_failures: std::array::from_fn(|slot| {
+                self.get(&self.sync_serve_failures[slot])
+            }),
             sync_ddl_relogged: readings.sync_ddl_relogged,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
@@ -1199,6 +1212,17 @@ impl Metrics {
                     "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
                     outcome.label(),
                     self.get(&self.ddl_confirmations[outcome.slot()])
+                )
+            })
+            .collect::<String>();
+        // Likewise one line per reason, always.
+        let sync_serve_failures = kimmy_cluster::ServeFailure::ALL
+            .iter()
+            .map(|reason| {
+                format!(
+                    "kimmy_sync_serve_failures_total{{reason=\"{}\"}} {}\n",
+                    reason.label(),
+                    self.get(&self.sync_serve_failures[reason.slot()])
                 )
             })
             .collect::<String>();
@@ -1368,6 +1392,9 @@ impl Metrics {
              # TYPE kimmy_sync_ddl_held_total counter\n\
              kimmy_sync_ddl_held_total{{via=\"pull\"}} {sync_ddl_held_pull}\n\
              kimmy_sync_ddl_held_total{{via=\"push\"}} {sync_ddl_held_push}\n\
+             # HELP kimmy_sync_serve_failures_total Replication connections a peer opened to this node that ended in an error on this side, by reason. io: reading or writing the connection failed - a peer that went away mid-exchange, such as a pusher that stopped waiting (Broken pipe, Connection reset). timeout: the handshake ran out of time. malformed: a frame this node could not read or would not accept, or a local error answering one. unauthenticated: the peer failed the shared-secret proof. fault: the peer reported a fault of its own. binding: the TLS session gave no channel binding and the peer was refused. A clean close between requests is not counted, and neither is a TLS handshake that never completes, which anything that can reach the port can cause. Each is also logged at WARN, naming the peer.\n\
+             # TYPE kimmy_sync_serve_failures_total counter\n\
+             {sync_serve_failures}\
              # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.\n\
              # TYPE kimmy_ddl_confirmations_total counter\n\
              {ddl_confirmations}\
@@ -1964,6 +1991,13 @@ mod tests {
         // recorded under `via="pull"` would read 186 there.
         m.record_ddl_applied_push(97);
         m.record_ddl_held_push(58);
+        // A distinct count per reason: 140 for the first, one more for each
+        // after it, so a line under the wrong label cannot match.
+        for reason in kimmy_cluster::ServeFailure::ALL {
+            for _ in 0..(140 + reason.slot()) {
+                m.record_sync_serve_failure(reason);
+            }
+        }
         // A distinct count per outcome, so a line under the wrong label
         // cannot match: 120 for the first, one more for each after it.
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
@@ -2550,6 +2584,14 @@ kimmy_sync_ddl_applied_total{via=\"push\"} 97
 # TYPE kimmy_sync_ddl_held_total counter
 kimmy_sync_ddl_held_total{via=\"pull\"} 48
 kimmy_sync_ddl_held_total{via=\"push\"} 58
+# HELP kimmy_sync_serve_failures_total Replication connections a peer opened to this node that ended in an error on this side, by reason. io: reading or writing the connection failed - a peer that went away mid-exchange, such as a pusher that stopped waiting (Broken pipe, Connection reset). timeout: the handshake ran out of time. malformed: a frame this node could not read or would not accept, or a local error answering one. unauthenticated: the peer failed the shared-secret proof. fault: the peer reported a fault of its own. binding: the TLS session gave no channel binding and the peer was refused. A clean close between requests is not counted, and neither is a TLS handshake that never completes, which anything that can reach the port can cause. Each is also logged at WARN, naming the peer.
+# TYPE kimmy_sync_serve_failures_total counter
+kimmy_sync_serve_failures_total{reason=\"io\"} 140
+kimmy_sync_serve_failures_total{reason=\"timeout\"} 141
+kimmy_sync_serve_failures_total{reason=\"malformed\"} 142
+kimmy_sync_serve_failures_total{reason=\"unauthenticated\"} 143
+kimmy_sync_serve_failures_total{reason=\"fault\"} 144
+kimmy_sync_serve_failures_total{reason=\"binding\"} 145
 # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.
 # TYPE kimmy_ddl_confirmations_total counter
 kimmy_ddl_confirmations_total{outcome=\"confirmed\"} 120
@@ -2870,6 +2912,13 @@ kimmy_sync_serve_walk_seconds_count 1201
         ));
         expect(&format!("kimmy_sync_ddl_held_total{{via=\"pull\"}} {}\n", s.sync_ddl_held_pull));
         expect(&format!("kimmy_sync_ddl_held_total{{via=\"push\"}} {}\n", s.sync_ddl_held_push));
+        for reason in kimmy_cluster::ServeFailure::ALL {
+            expect(&format!(
+                "kimmy_sync_serve_failures_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                s.sync_serve_failures[reason.slot()]
+            ));
+        }
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
             expect(&format!(
                 "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
@@ -3165,6 +3214,8 @@ kimmy_sync_serve_walk_seconds_count 1201
                 + 2
                 // And those already held, pulled and pushed.
                 + 2
+                // Peer connections this node failed to serve, by reason.
+                + kimmy_cluster::ServeFailure::COUNT
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT

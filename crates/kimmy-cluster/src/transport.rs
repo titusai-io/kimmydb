@@ -123,6 +123,78 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// one that arrived by pull.
 pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 
+/// Called on the serving side once per peer connection that ended in an
+/// error on this side, with why, for `kimmy_sync_serve_failures_total`.
+pub type ServeFailHook = Arc<dyn Fn(ServeFailure) + Send + Sync>;
+
+/// Why this node failed to serve a peer's replication connection: a fixed
+/// set, so the series is always all of them.
+///
+/// A peer that disconnects cleanly between requests is not a failure, and is
+/// not here. Neither is a TLS handshake that never completes: anything that
+/// can open a TCP socket to the port can fail one, so counting them would
+/// count port scans, and the handshake is not yet a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ServeFailure {
+    /// Reading or writing the connection failed: a peer that went away
+    /// mid-exchange, the `Broken pipe` and `Connection reset` of a pusher that
+    /// gave up waiting (ProtocolError::Io).
+    Io,
+    /// A bounded wait ran out: the handshake (ProtocolError::TimedOut).
+    Timeout,
+    /// A frame this node could not read or would not accept, or a local error
+    /// answering one (ProtocolError::Malformed, TooLarge).
+    Malformed,
+    /// The peer failed the shared-secret proof (ProtocolError::Unauthenticated).
+    Unauthenticated,
+    /// The peer reported a fault of its own (ProtocolError::Fault).
+    Fault,
+    /// The TLS session gave no channel binding, so the peer was refused
+    /// before the handshake.
+    Binding,
+}
+
+impl ServeFailure {
+    pub const COUNT: usize = 6;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Io,
+        Self::Timeout,
+        Self::Malformed,
+        Self::Unauthenticated,
+        Self::Fault,
+        Self::Binding,
+    ];
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Timeout => "timeout",
+            Self::Malformed => "malformed",
+            Self::Unauthenticated => "unauthenticated",
+            Self::Fault => "fault",
+            Self::Binding => "binding",
+        }
+    }
+
+    /// What a serve that ended in `error` counts as, or `None` for the one
+    /// ending that is not a failure: the peer closed the connection between
+    /// requests. Exhaustive, so a new `ProtocolError` has to be placed.
+    pub fn of(error: &ProtocolError) -> Option<Self> {
+        match error {
+            ProtocolError::Closed => None,
+            ProtocolError::Io(_) => Some(Self::Io),
+            ProtocolError::TimedOut(_) => Some(Self::Timeout),
+            ProtocolError::Malformed(_) | ProtocolError::TooLarge { .. } => Some(Self::Malformed),
+            ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
+            ProtocolError::Fault(_) => Some(Self::Fault),
+        }
+    }
+}
+
 /// Serve peer requests until the listener fails, building the TLS here.
 ///
 /// For callers with no startup to fail — the tests, and the in-crate helpers.
@@ -132,7 +204,7 @@ pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
     let tls =
         Arc::new(crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"));
-    serve_with(engine, listener, secret, None, tls).await
+    serve_with(engine, listener, secret, None, None, tls).await
 }
 
 /// [`serve`], reporting each pushed batch's outcome to `on_pushed`.
@@ -156,6 +228,7 @@ pub async fn serve_with(
     listener: TcpListener,
     secret: String,
     on_pushed: Option<PushHook>,
+    on_failed: Option<ServeFailHook>,
     tls: Arc<crate::tls::ClusterTls>,
 ) {
     let local = listener.local_addr().ok();
@@ -173,6 +246,7 @@ pub async fn serve_with(
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
         let on_pushed = on_pushed.clone();
+        let on_failed = on_failed.clone();
         let acceptor = tls.acceptor();
         // One task per peer: a slow or hostile peer must not stall the others,
         // and a panic in one connection must not take the listener down. The
@@ -194,19 +268,52 @@ pub async fn serve_with(
                     Ok(b) => b,
                     Err(e) => {
                         warn!(%peer, error = %e, "no channel binding; refusing the peer");
+                        if let Some(hook) = &on_failed {
+                            hook(ServeFailure::Binding);
+                        }
                         return;
                     }
                 }
             };
-            if let Err(e) =
-                serve_peer(&engine, tls_stream, &secret, &binding, on_pushed.as_ref()).await
-            {
-                match e {
-                    ProtocolError::Closed => debug!(%peer, "peer disconnected"),
-                    other => warn!(%peer, error = %other, "peer connection failed"),
-                }
-            }
+            serve_connection(
+                &engine,
+                tls_stream,
+                &secret,
+                &binding,
+                on_pushed.as_ref(),
+                on_failed.as_ref(),
+                peer,
+            )
+            .await;
         });
+    }
+}
+
+/// Serve one authenticated-or-not peer connection to its end, and say how it
+/// ended: a clean close at `debug`, anything else at `WARN` and to
+/// `on_failed`, which is what makes a serve failure visible outside the log.
+async fn serve_connection<S>(
+    engine: &Engine,
+    stream: S,
+    secret: &str,
+    binding: &[u8],
+    on_pushed: Option<&PushHook>,
+    on_failed: Option<&ServeFailHook>,
+    peer: impl std::fmt::Display,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed).await else {
+        return;
+    };
+    match ServeFailure::of(&e) {
+        None => debug!(%peer, "peer disconnected"),
+        Some(reason) => {
+            warn!(%peer, error = %e, reason = reason.label(), "peer connection failed");
+            if let Some(hook) = on_failed {
+                hook(reason);
+            }
+        }
     }
 }
 
@@ -4133,6 +4240,113 @@ mod tests {
         let failed = matches!(answer, Ok(Message::Fault(_)));
         let seen = std::mem::take(&mut *seen.lock().unwrap());
         (seen, failed)
+    }
+
+    /// Serve one connection over an in-memory stream, driven from the other
+    /// end by `client`, and return the reasons the serve reported failing.
+    async fn serve_failures<F, Fut>(client: F) -> Vec<ServeFailure>
+    where
+        F: FnOnce(tokio::io::DuplexStream, Arc<Engine>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        const SECRET: &str = "a-serve-failure-secret";
+        const BINDING: &[u8] = b"a-serve-failure-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let client_dir = tempfile::tempdir().unwrap();
+        let peer = Arc::new(Engine::open(&client_dir.path().join("kimmy.redb")).unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |reason| seen.lock().unwrap().push(reason))
+        };
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = serve_connection(&engine, theirs, SECRET, BINDING, None, Some(&hook), "peer");
+        tokio::join!(serving, client(ours, peer));
+        std::mem::take(&mut *seen.lock().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_goes_away_mid_exchange_is_a_serve_failure_counted_as_io() {
+        // The pusher that stops waiting: its request arrives, and the answer
+        // meets a closed connection. This is the `Broken pipe` of rounds
+        // 0380-0400, which reached nothing but a WARN line.
+        let seen = serve_failures(|mut ours, peer| async move {
+            open_handshake(&peer, &mut ours, "a-serve-failure-secret", b"a-serve-failure-binding")
+                .await
+                .unwrap();
+            write_frame(&mut ours, &Message::AskVersions { witnessed: true }).await.unwrap();
+            drop(ours);
+        })
+        .await;
+        assert_eq!(seen, vec![ServeFailure::Io]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_proof_is_wrong_is_a_serve_failure_counted_as_unauthenticated() {
+        let seen = serve_failures(|mut ours, peer| async move {
+            write_frame(
+                &mut ours,
+                &Message::Hello { node: peer.node_id(), nonce: nonce(peer.node_id()) },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(read_frame(&mut ours).await.unwrap(), Message::Welcome { .. }));
+            write_frame(&mut ours, &Message::Confirm { proof: vec![0; 32] }).await.unwrap();
+            // Held open until the server has answered, so the failure is the
+            // proof and not a closed connection.
+            let _ = read_frame(&mut ours).await;
+        })
+        .await;
+        assert_eq!(seen, vec![ServeFailure::Unauthenticated]);
+    }
+
+    #[tokio::test]
+    async fn a_frame_the_server_cannot_read_is_a_serve_failure_counted_as_malformed() {
+        let seen = serve_failures(|mut ours, _| async move {
+            use tokio::io::AsyncWriteExt;
+            ours.write_all(&4u32.to_be_bytes()).await.unwrap();
+            ours.write_all(b"junk").await.unwrap();
+            let _ = read_frame(&mut ours).await;
+        })
+        .await;
+        assert_eq!(seen, vec![ServeFailure::Malformed]);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_closes_between_requests_is_not_a_serve_failure() {
+        let seen = serve_failures(|mut ours, peer| async move {
+            open_handshake(&peer, &mut ours, "a-serve-failure-secret", b"a-serve-failure-binding")
+                .await
+                .unwrap();
+            write_frame(&mut ours, &Message::AskVersions { witnessed: true }).await.unwrap();
+            let _ = read_frame(&mut ours).await.unwrap();
+            drop(ours);
+        })
+        .await;
+        assert_eq!(seen, Vec::new(), "a clean close is how every contact ends");
+    }
+
+    #[test]
+    fn every_protocol_error_but_a_clean_close_is_a_serve_failure_with_its_own_label() {
+        let cases = [
+            (ProtocolError::Closed, None),
+            (ProtocolError::Io(std::io::ErrorKind::BrokenPipe.into()), Some(ServeFailure::Io)),
+            (ProtocolError::TimedOut("handshake".into()), Some(ServeFailure::Timeout)),
+            (ProtocolError::Malformed("x".into()), Some(ServeFailure::Malformed)),
+            (ProtocolError::TooLarge { size: MAX_FRAME + 1 }, Some(ServeFailure::Malformed)),
+            (ProtocolError::Unauthenticated, Some(ServeFailure::Unauthenticated)),
+            (ProtocolError::Fault("x".into()), Some(ServeFailure::Fault)),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(ServeFailure::of(&error), expected, "{error}");
+        }
+        let labels: std::collections::HashSet<_> =
+            ServeFailure::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), ServeFailure::COUNT, "one label each");
+        for (slot, reason) in ServeFailure::ALL.iter().enumerate() {
+            assert_eq!(reason.slot(), slot, "ALL is in slot order");
+        }
     }
 
     /// The same window pushed twice is applied once: the second push finds
