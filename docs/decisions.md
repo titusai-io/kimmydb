@@ -4292,6 +4292,34 @@ class is per node, not per collection, and a field named `durability` on a
 collection description reads as something to set there. Still a field, not
 a capability, for the reason above.
 
+**Addendum, 2026-09-25: coverage is decided under the writer, on both
+sides.** "Every committer waits for a flush that *started after* its own
+commit" was the argument, and the code did not keep it. A committer took its
+ticket after releasing the writer, and the leader recorded what its flush
+covered as the count at the end, after the flush had let go of the writer. A
+commit that landed in that gap took a ticket the leader then marked flushed:
+it was acknowledged durable, and nothing had synced it. A crash before the
+next commit's sync lost an acknowledged write. That is exactly what this record
+promised could not happen. It was present from 0.12.0, which introduced the
+class, through 0.38.0. `durable` was never affected.
+
+Now a committer takes its ticket **before** it releases the writer, and a
+flush reads the highest ticket issued **once it holds the writer**, before its
+own commit. So the flush covers exactly the commits that landed before it, and
+every later commit holds a higher ticket, which only a later flush covers. A
+waiter whose ticket the finished flush did not cover leads the next one.
+
+**A failed flush** is final for the tickets it covered. Those committers get
+its error and do not try again, because their pages were written before a
+flush that failed. A commit that landed after the failed flush is not failed
+by it: its own flush decides it. Before this, a failed flush woke its waiters
+into a loop on a count that never moved. In `kimmyd` the process has already
+stopped (ADR-188), but any other user of the engine hung. The test
+`a_commit_landing_between_a_flush_and_its_bookkeeping_waits_for_a_flush_of_its_own`
+parks the leader in that gap and lands a commit there. It fails if the ticket
+is taken after the release, or if the coverage is read after the flush lets
+go.
+
 ## ADR-089 — The CLI is for people: `client_credentials` leaves `kimmy`
 
 **Decision.** `kimmy login --client-credentials` and `kimmy token

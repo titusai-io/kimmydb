@@ -47,6 +47,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   earlier version omits it, which reads as none held; that member still
   counts them in `ddl`. A mixed cluster confirms throughout a roll.
 
+### Fixed
+
+- **Under `storage.durability = coalesced`, a write could be acknowledged
+  durable when no fsync covered it, and lost on a crash.** A commit that
+  landed in a narrow window, after the shared flush had synced and before the
+  flush recorded what it covered, was counted as covered by it. It returned
+  success with nothing having made it durable, so a crash, kill or power loss
+  before the next commit's sync lost it. That broke the promise that no class
+  loses an acknowledged write (ADR-088). The class has had this since it was
+  introduced in 0.12.0. **`durable`, the default, was never affected.** A
+  commit's place at the barrier, and what each flush covers, are now both
+  decided while the writer is held, so a flush covers exactly the commits that
+  landed before it. A failed flush now fails the commits it covered with its
+  error. Before, their committers waited forever in any embedding other than
+  `kimmyd`, which stops on the error.
+
 ## 0.38.0 - 2026-09-25
 
 **Roll the members one at a time. This release is not a rollback boundary:
