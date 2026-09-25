@@ -4309,10 +4309,19 @@ own commit. So the flush covers exactly the commits that landed before it, and
 every later commit holds a higher ticket, which only a later flush covers. A
 waiter whose ticket the finished flush did not cover leads the next one.
 
-**A failed flush** is final for the tickets it covered. Those committers get
-its error and do not try again, because their pages were written before a
-flush that failed. A commit that landed after the failed flush is not failed
-by it: its own flush decides it. Before this, a failed flush woke its waiters
+**A failed flush** is final for the tickets it covered, unless a later flush
+succeeded over them, which is checked first, because that flush did sync
+their pages. Otherwise those committers get its error and do not try again,
+because their pages were written before a flush that failed. A commit that
+landed after the failed flush is not failed by it: its own flush decides it.
+Under redb a failed flush is an I/O error, which latches every later
+operation in the process, so a later flush cannot in fact succeed, and a
+success is never a wrong answer. A flush's coverage is recorded only on the
+barrier it was read from, since `set_durability` installs a barrier that
+numbers from 1 again. A leader that unwinds before recording hands the
+leadership back. Test builds count every coalesced commit acknowledged with
+no flush started after it landed. A sixteen-writer test that switches the
+class under load asserts none. Before this, a failed flush woke its waiters
 into a loop on a count that never moved. In `kimmyd` the process has already
 stopped (ADR-188), but any other user of the engine hung. The test
 `a_commit_landing_between_a_flush_and_its_bookkeeping_waits_for_a_flush_of_its_own`

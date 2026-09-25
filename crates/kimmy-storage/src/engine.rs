@@ -2652,14 +2652,18 @@ impl Engine {
     /// Wait until a barrier flush that started after this commit has landed,
     /// running the flush if nobody else is.
     ///
-    /// **A failed flush** is final for every ticket it covered: those
-    /// committers get its error, and do not try again. Their pages were
+    /// **A failed flush** is final for every ticket it covered, unless a
+    /// later flush succeeded over them, which is checked first: such a flush
+    /// did sync their pages, so success is then the true answer. Otherwise
+    /// those committers get its error and do not try again: their pages were
     /// written before a flush that failed, so whether they reached the disk is
     /// not known. A ticket it did not cover — a commit that landed after the
     /// failed flush took the writer — is not failed by it: that commit's
     /// durability is decided by a flush of its own, which this waiter runs or
-    /// joins. (Under redb, a failed flush latches every later operation to
-    /// `PreviousIo`, so that flush fails too; the rule does not depend on it.)
+    /// joins. Under redb a failed flush is an I/O error, which latches every
+    /// later operation to `PreviousIo`, so no later flush can in fact succeed
+    /// in the same process; the rule does not depend on that, and a success
+    /// here is never a wrong answer.
     fn wait_for_flush(&self, ticket: Option<Ticket>) -> std::result::Result<(), redb::CommitError> {
         let mut guard = self.coalescer.lock();
         loop {
@@ -5298,7 +5302,16 @@ mod tests {
             .ok()
             .and_then(|ms| ms.parse().ok())
             .unwrap_or(1500);
-        std::thread::sleep(std::time::Duration::from_millis(run_ms));
+        // At least that long, and until enough coalesced commits have been
+        // judged to mean something: on a machine busy with the rest of the
+        // suite, fsyncs are slow and a fixed time can judge almost none.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(run_ms)
+            || (engine.grouped_commits() < 200
+                && started.elapsed() < std::time::Duration::from_secs(60))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let written: i64 = writers.into_iter().map(|h| h.join().unwrap()).sum();
         let flips = flipper.join().unwrap();
@@ -5307,7 +5320,7 @@ mod tests {
         println!(
             "{written} writes, {grouped} coalesced, {flips} class switches, {violations} violations"
         );
-        assert!(grouped > 100 && flips > 100, "premise: the load and the switching both ran");
+        assert!(grouped >= 200 && flips > 100, "premise: the load and the switching both ran");
         assert_eq!(violations, 0, "coalesced commits acknowledged with no flush after them");
     }
 

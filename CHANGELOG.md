@@ -60,8 +60,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   commit's place at the barrier, and what each flush covers, are now both
   decided while the writer is held, so a flush covers exactly the commits that
   landed before it. A failed flush now fails the commits it covered with its
-  error. Before, their committers waited forever in any embedding other than
-  `kimmyd`, which stops on the error.
+  error, unless a later flush succeeded over them. Before, their committers
+  waited forever in any embedding other than `kimmyd`, which stops on the
+  error. A leader that panicked no longer leaves every later coalesced commit
+  waiting.
 
 ## 0.38.0 - 2026-09-25
 
