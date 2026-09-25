@@ -722,7 +722,7 @@ mod tests {
                 Some("ttl_seen".into()),
                 Some(120),
                 None,
-                crate::index::CreateOrigin::Replicated(Some(later)),
+                crate::index::CreateOrigin::Replicated { created: Some(later), logged: None },
                 &|_, _| false,
             )
             .unwrap();

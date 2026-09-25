@@ -41,7 +41,12 @@ pub struct SyncOutcome {
     /// not an error: peers resend overlapping ranges by design.
     pub superseded: usize,
     /// Schema changes applied: collections, indexes, vector configuration.
+    /// Not one this node already held as sent: see [`Self::ddl_held`].
     pub ddl: usize,
+    /// Schema changes a window carried that this node already held, byte for
+    /// byte, and so neither applied again nor committed: the overlap of a
+    /// push and a pull, or a third member relaying what the origin pushed.
+    pub ddl_held: usize,
     /// Batches this round stopped short at an entry for a collection this
     /// node does not hold and has no tombstone for (ADR-148). At most one
     /// per batch: the entry and everything after it are left for the next
@@ -1416,8 +1421,20 @@ impl<T> Ddl<T> {
 
 /// What a batch counts a schema change as, once [`Engine::apply_ddl`] has
 /// dealt with it.
+#[derive(Debug)]
 enum DdlOutcome {
     Applied,
+    /// The change is already held here as sent — its entry is in the oplog
+    /// under its stamp, byte for byte — so appending it would commit nothing
+    /// new: no writer is kept, nothing is committed, and it is counted as
+    /// held rather than applied. See `Engine::append_replicated_ddl`.
+    Held,
+    /// Applied, and final: its commit landed. What had to follow the commit
+    /// then failed — reporting a replicated unique index's backfill
+    /// collisions — and the batch fails with it. Counted as applied all the
+    /// same, because the count follows the commit (ADR-177): the
+    /// re-delivery finds the entry held and is not counted again.
+    AppliedThenFailed(crate::StorageError),
     /// It named a collection this node does not hold; `db.name` as the
     /// entry carried it, for the log line and the outcome.
     UnknownCollection(String),
@@ -1519,6 +1536,36 @@ pub(crate) fn settle<T>(result: Result<T>) -> Result<Ddl<T>> {
     }
 }
 
+/// What a replicated index creation left for its caller to do with the
+/// entry that carried it.
+enum RemoteIndex {
+    /// Built, or settled on the entry's stamp, with the entry appended in the
+    /// same commit (ADR-180's addendum), then witnessed and published.
+    /// Nothing is left to append. The result is what came of reporting the
+    /// backfill's unique collisions, which follows the commit: an error
+    /// there fails the batch, but the apply stands and is counted (ADR-177).
+    Logged(Result<()>),
+    /// The definition was already standing here and nothing was written. The
+    /// entry is appended if this node does not already hold it: a definition
+    /// held without its entry (ADR-180), or a stamp older than the one held.
+    Standing,
+    /// The creation is history — older than the drop that removed the index,
+    /// or than the definition this node holds under the same name — and
+    /// nothing was done. Counted as applied, and not appended.
+    History,
+}
+
+/// Whether `oplog` holds `sent` under `key`, byte for byte: what
+/// `Engine::append_replicated_ddl` asks, once before the writer and once
+/// under it.
+fn held_as_sent(
+    oplog: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    key: &[u8],
+    sent: &[u8],
+) -> Result<bool> {
+    Ok(oplog.get(key)?.is_some_and(|held| held.value() == sent))
+}
+
 /// What became of one entry in a batch: taken — applied, superseded, or
 /// skipped for a reason that is a fact about this node's data — or left,
 /// because it names a collection this node does not hold (ADR-148).
@@ -1608,6 +1655,11 @@ impl Engine {
             *memo = Memo::default();
             match self.apply_ddl(entry)? {
                 DdlOutcome::Applied => outcome.ddl += 1,
+                DdlOutcome::Held => outcome.ddl_held += 1,
+                DdlOutcome::AppliedThenFailed(e) => {
+                    outcome.ddl += 1;
+                    return Err(e);
+                }
                 DdlOutcome::UnknownCollection(name) => {
                     // A tombstone **at all** makes this history, whichever
                     // way the stamps fall (ADR-148). The collection was
@@ -1855,8 +1907,17 @@ impl Engine {
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
-                match settle(self.apply_remote_index(&target, entry.stamp))? {
-                    Ddl::Applied(true) => {}
+                match settle(self.apply_remote_index(&target, entry))? {
+                    // Built or settled with its entry in the same commit, and
+                    // witnessed and published already: nothing is left to
+                    // append (ADR-180's addendum).
+                    Ddl::Applied(RemoteIndex::Logged(Ok(()))) => return Ok(DdlOutcome::Applied),
+                    Ddl::Applied(RemoteIndex::Logged(Err(e))) => {
+                        return Ok(DdlOutcome::AppliedThenFailed(e));
+                    }
+                    // Already standing here: its entry is appended below, if
+                    // this node does not already hold it.
+                    Ddl::Applied(RemoteIndex::Standing) => {}
                     // History: older than the drop that removed the index, or
                     // than the definition this node holds under the same name.
                     // Counted as applied and *not* appended, exactly as a
@@ -1865,7 +1926,7 @@ impl Engine {
                     // is history. The drop's own entry, which is appended
                     // when applied, is what carries the ordering to a third
                     // member; nothing is lost by withholding the create.
-                    Ddl::Applied(false) => return Ok(DdlOutcome::Applied),
+                    Ddl::Applied(RemoteIndex::History) => return Ok(DdlOutcome::Applied),
                     Ddl::Gone => {
                         return Ok(DdlOutcome::UnknownCollection(format!(
                             "{}.{}",
@@ -2089,9 +2150,74 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        let txn = self.begin_write(WriterHolder::Replication)?;
-        crate::engine::append_oplog(&txn, entry)?;
-        txn.commit()?;
+        self.append_replicated_ddl(entry)
+    }
+
+    /// Append a replicated schema change's originating entry, unless this
+    /// node already holds it as sent. -> `Applied` when it committed the
+    /// entry, `Held` when there was nothing to commit.
+    ///
+    /// **Why the check.** Every window re-carries what the member it came from
+    /// cannot tell this node holds: a pull that read this node's vector before
+    /// a push landed, a third member relaying what the origin pushed. Each
+    /// such arrival used to take the writer and commit an append that
+    /// changed nothing — one fsync per duplicate, 11–26 per member in a burst
+    /// of 32 index creates. An entry held under its stamp with exactly these
+    /// bytes is left as it is: no writer is kept, nothing is committed.
+    ///
+    /// **Why bytes, not the key alone.** [`crate::engine::append_oplog`]
+    /// inserts unconditionally, so a different value under the stamp is
+    /// replaced by the arriving one, in either direction: the origin's entry
+    /// over a snapshot restore's rebuild of it (ADR-180), and a rebuild a
+    /// third member relays over the origin's. That is what happened before
+    /// this check and still does; only a write that would change nothing is
+    /// skipped. A definition held without its entry at all — restored, or
+    /// from a store older than ADR-180 — finds no key, and its entry is
+    /// appended as it always was.
+    ///
+    /// **Held marks.** An append releases a held mark (ADR-169) only under
+    /// `Position::InWindow`. Every replicated schema change is appended under
+    /// `Position::Raise`, over an existing key a pure rewrite of its value,
+    /// so skipping it cannot swallow a release. Should a schema change ever
+    /// be appended `InWindow`, this check must consult `OPLOG_HELD` first.
+    ///
+    /// **Why twice.** The first look is a read transaction and takes no
+    /// writer, which is the point. It can race: a push and a pull applying the
+    /// same entry both find it missing. So it is asked again under the
+    /// writer, and the loser aborts — an abort does not reach the disk — and
+    /// is held, not applied: the entry is applied once and counted once. The
+    /// entry cannot vanish between the two looks: rewind, the one remover
+    /// outside retention, runs only offline under `kimmyd restore --until`,
+    /// and retention removes only what is below the horizon, which re-adding
+    /// would be wrong anyway.
+    ///
+    /// Held, the entry is still witnessed and published: both are in memory
+    /// and cost nothing, and the publish covers an arrival whose first apply
+    /// committed and then failed before it woke the streams.
+    fn append_replicated_ddl(&self, entry: &OplogEntry) -> Result<DdlOutcome> {
+        let key = crate::codec::oplog_key(&entry.stamp);
+        let sent = crate::codec::encode_oplog_entry(entry);
+        let held = {
+            let txn = self.db().begin_read()?;
+            held_as_sent(&txn.open_table(crate::tables::OPLOG)?, &key, &sent)?
+        };
+        let outcome = if held {
+            DdlOutcome::Held
+        } else {
+            #[cfg(test)]
+            race_hooks::reach(race_hooks::Race::DdlAppend);
+            let txn = self.begin_write(WriterHolder::Replication)?;
+            if held_as_sent(&txn.open_table(crate::tables::OPLOG)?, &key, &sent)? {
+                txn.abort()?;
+                #[cfg(test)]
+                race_hooks::absorbed(race_hooks::Race::DdlAppend);
+                DdlOutcome::Held
+            } else {
+                crate::engine::append_oplog(&txn, entry)?;
+                txn.commit()?;
+                DdlOutcome::Applied
+            }
+        };
         self.witness(&entry.stamp);
         // Published, like a replicated *document* is (`apply_remote`). Without
         // this, a replicated schema change sat in the arrival index until some
@@ -2104,10 +2230,10 @@ impl Engine {
         // looked the same. Found by the cluster harness, which is the only
         // thing that could have: a single node applies its own drop directly.
         self.publish(vec![entry.clone()]);
-        Ok(DdlOutcome::Applied)
+        Ok(outcome)
     }
 
-    /// Create a replicated index, stamped `stamp` at its origin.
+    /// Create a replicated index from the `entry` that carried it.
     ///
     /// Idempotent through `create_index_inner`, which returns the existing
     /// definition when it matches. When the name is taken by a *different*
@@ -2123,11 +2249,14 @@ impl Engine {
     /// merged write's are (`report_remote_write`, ADR-020, ADR-029): count,
     /// warn, mint a `UniqueViolation` entry, publish.
     ///
-    /// `Ok(false)` means the creation is history — older than the drop that
-    /// removed the index, or older than the definition this node holds under
-    /// the same name — and nothing was done; the caller counts it as applied
-    /// and does not append it.
-    fn apply_remote_index(&self, target: &kimmy_core::IndexCreate, stamp: Stamp) -> Result<bool> {
+    /// What it returns is what the caller still has to do with `entry`; see
+    /// [`RemoteIndex`].
+    fn apply_remote_index(
+        &self,
+        target: &kimmy_core::IndexCreate,
+        entry: &OplogEntry,
+    ) -> Result<RemoteIndex> {
+        let stamp = entry.stamp;
         let meta = self.get_collection(&target.db, &target.collection)?;
 
         // A creation older than the drop that removed the index is history,
@@ -2149,7 +2278,7 @@ impl Engine {
                 index = %target.index.name,
                 "ignored an index creation from a life of the collection dropped since"
             );
-            return Ok(false);
+            return Ok(RemoteIndex::History);
         }
         if let Some(dropped_at) = self.index_dropped_at(meta.id, index_id)?
             && stamp < dropped_at
@@ -2160,7 +2289,7 @@ impl Engine {
                 index = %target.index.name,
                 "ignored an index creation older than the drop that removed it"
             );
-            return Ok(false);
+            return Ok(RemoteIndex::History);
         }
 
         // The entry's stamp is the definition's creation stamp: the origin
@@ -2184,15 +2313,31 @@ impl Engine {
             Some(target.index.name.clone()),
             target.index.expire_after_secs,
             target.index.partial_filter.clone(),
-            crate::index::CreateOrigin::Replicated(Some(created)),
+            crate::index::CreateOrigin::Replicated { created: Some(created), logged: Some(entry) },
             &|standing, dropped| {
                 below_floor(standing, stamp) || dropped.is_some_and(|dropped_at| stamp < dropped_at)
             },
         )?;
-        if !violations.is_empty() {
-            self.report_index_backfill_violations(&meta, &violations)?;
+        match created {
+            crate::index::IndexCreated::Built(_) => {}
+            crate::index::IndexCreated::Standing(_) => return Ok(RemoteIndex::Standing),
+            crate::index::IndexCreated::Older => return Ok(RemoteIndex::History),
         }
-        Ok(matches!(created, crate::index::IndexCreated::Built(_)))
+        // The entry committed with the definition. Witnessed and published
+        // now, before anything that can fail: every later arrival of it is
+        // held, and would never publish it (ADR-180's addendum).
+        self.witness(&stamp);
+        self.publish(vec![entry.clone()]);
+        #[cfg(test)]
+        if count_hooks::fails(count_hooks::Fail::ViolationReport) {
+            return Ok(RemoteIndex::Logged(Err(count_hooks::injected())));
+        }
+        if !violations.is_empty() {
+            return Ok(RemoteIndex::Logged(
+                self.report_index_backfill_violations(&meta, &violations),
+            ));
+        }
+        Ok(RemoteIndex::Logged(Ok(())))
     }
 }
 
@@ -2210,6 +2355,9 @@ pub mod count_hooks {
         BeforeLastCommit,
         /// After the commit, where reporting what it applied can fail.
         AfterLastCommit,
+        /// After a replicated index create's commit, where reporting its
+        /// backfill's unique collisions can fail.
+        ViolationReport,
     }
 
     thread_local! {
@@ -2288,6 +2436,9 @@ pub(crate) mod race_hooks {
         /// A replicated document judged not history, before its run's write
         /// transaction is open.
         DocumentRun,
+        /// A replicated schema change found its entry not held here, and has
+        /// not yet taken the writer to append it.
+        DdlAppend,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -3613,12 +3764,14 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_change_delivered_again_is_applied_and_counted_again() {
+    fn a_schema_change_delivered_again_is_held_and_counted_as_held() {
         // `SyncOutcome::ddl` is what `kimmy_sync_ddl_applied_total` sums, and
-        // it counts applies, not news: a window carrying a collection and an
-        // index this node already holds takes both again, and says so. That
-        // is the cost an overlapping push re-carrying earlier creates has,
-        // and the count must show it rather than hide it.
+        // it counts applies of what this node did not already hold. A window
+        // carrying a collection and an index this node already holds, entries
+        // and all, takes neither again and commits nothing for them; it counts
+        // both under `ddl_held`, so the overlap stays visible. It used to be
+        // counted as applied, each duplicate costing a commit that changed
+        // nothing: 11-26 per member in a burst of 32 creates.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -3634,12 +3787,283 @@ mod tests {
         assert_eq!(entries.iter().filter(|e| e.kind.is_ddl()).count(), 2, "{entries:?}");
 
         let first = b.apply_batch(&entries).unwrap();
-        assert_eq!(first.ddl, 2, "{first:?}");
+        assert_eq!((first.ddl, first.ddl_held), (2, 0), "{first:?}");
         let indexes = b.list_indexes("shop", "orders").unwrap();
+        let commits = b.commits();
         let again = b.apply_batch(&entries).unwrap();
-        assert_eq!(again.ddl, 2, "held already, and applied again: {again:?}");
-        // Applied, and nothing changed: the same indexes as before.
+        assert_eq!((again.ddl, again.ddl_held), (0, 2), "held already, and not again: {again:?}");
+        assert_eq!(
+            b.commits() - commits,
+            1,
+            "nothing for the changes, one for the batch's witnessed vector"
+        );
         assert_eq!(b.list_indexes("shop", "orders").unwrap(), indexes);
+    }
+
+    /// A collection `shop.orders` with an index `by_email` on `a`, and the
+    /// entries `b` needs for them: the collection's creation, and the index's.
+    fn index_entries(a: &Engine) -> (OplogEntry, OplogEntry) {
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let of = |kind| entries.iter().find(|e| e.kind == kind).cloned().unwrap();
+        (of(OpKind::CreateCollection), of(OpKind::CreateIndex))
+    }
+
+    /// What `engine`'s oplog holds under `stamp`, as stored.
+    fn held_bytes(engine: &Engine, stamp: &Stamp) -> Option<Vec<u8>> {
+        let txn = engine.db().begin_read().unwrap();
+        let oplog = txn.open_table(crate::tables::OPLOG).unwrap();
+        let key = crate::codec::oplog_key(stamp);
+        oplog.get(key.as_slice()).unwrap().map(|v| v.value().to_vec())
+    }
+
+    /// The definition `entry` carries, built on `engine` the way a snapshot
+    /// restores one from a build that logged nothing: held, without its entry.
+    fn hold_without_entry(engine: &Engine, entry: &OplogEntry) {
+        let target: kimmy_core::IndexCreate =
+            bson::deserialize_from_slice(entry.body.as_ref().unwrap()).unwrap();
+        engine
+            .create_index_inner(
+                &target.db,
+                &target.collection,
+                target.index.fields.clone(),
+                target.index.unique,
+                target.index.enforcement,
+                Some(target.index.name.clone()),
+                None,
+                None,
+                crate::index::CreateOrigin::Replicated { created: Some(entry.stamp), logged: None },
+                &|_, _| false,
+            )
+            .unwrap();
+        assert_eq!(held_bytes(engine, &entry.stamp), None, "premise: no entry");
+    }
+
+    #[test]
+    fn a_replicated_index_create_is_one_commit_with_its_entry_in_it() {
+        // The build and the entry used to be two commits, two fsyncs, for
+        // every index a peer created; the entry is now appended in the build.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, index) = index_entries(&a);
+        b.apply_batch(std::slice::from_ref(&collection)).unwrap();
+        let mut published = b.subscribe();
+        let commits = b.commits();
+        let writes = race_hooks::replication_writes_opened();
+        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert_eq!(b.commits() - commits, 1, "the build carries the entry");
+        assert_eq!(
+            race_hooks::replication_writes_opened() - writes,
+            0,
+            "no separate transaction for the append"
+        );
+        assert_eq!(
+            held_bytes(&b, &index.stamp),
+            Some(crate::codec::encode_oplog_entry(&index)),
+            "the origin's entry, as sent"
+        );
+        assert!(b.witnessed_vector().unwrap().get(index.stamp.node) >= index.stamp.hlc);
+        assert!(b.version_vector().unwrap().get(index.stamp.node) >= index.stamp.hlc);
+        assert_eq!(published.try_recv().unwrap().stamp, index.stamp, "and published");
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_some());
+    }
+
+    #[test]
+    fn a_schema_change_held_as_sent_takes_no_writer_and_is_still_published() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, index) = index_entries(&a);
+        b.apply_batch(&[collection.clone(), index.clone()]).unwrap();
+        let mut published = b.subscribe();
+        let commits = b.commits();
+        let writes = race_hooks::replication_writes_opened();
+        for entry in [&collection, &index] {
+            assert!(matches!(b.apply_ddl(entry).unwrap(), DdlOutcome::Held), "{:?}", entry.kind);
+            // Still woken: an earlier apply may have committed and failed
+            // before it published, and every later arrival is held.
+            assert_eq!(published.try_recv().unwrap().stamp, entry.stamp);
+        }
+        assert_eq!(b.commits() - commits, 0, "nothing committed");
+        assert_eq!(race_hooks::replication_writes_opened() - writes, 0, "no writer taken");
+    }
+
+    #[test]
+    fn a_definition_held_without_its_entry_has_the_entry_appended_when_it_arrives() {
+        // A definition restored without an entry (ADR-180), or from a store
+        // older than it: standing, so nothing is built, but its entry is not
+        // held, so it is appended and counted.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, index) = index_entries(&a);
+        b.apply_batch(std::slice::from_ref(&collection)).unwrap();
+        hold_without_entry(&b, &index);
+        let commits = b.commits();
+        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert_eq!(b.commits() - commits, 1, "the append");
+        assert_eq!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
+    }
+
+    #[test]
+    fn an_entry_held_with_other_bytes_is_replaced_by_the_one_that_arrives() {
+        // A restore's rebuild of an entry need not match the origin's bytes
+        // (ADR-180): an origin before it logged the multikey it observed. The
+        // arriving entry replaces it, as it always did; only a write that
+        // changes nothing is skipped.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, index) = index_entries(&a);
+        b.apply_batch(std::slice::from_ref(&collection)).unwrap();
+        hold_without_entry(&b, &index);
+        let mut rebuilt: kimmy_core::IndexCreate =
+            bson::deserialize_from_slice(index.body.as_ref().unwrap()).unwrap();
+        rebuilt.index.multikey = !rebuilt.index.multikey;
+        let rebuilt =
+            crate::engine::ddl_entry(index.stamp, OpKind::CreateIndex, index.collection, &rebuilt)
+                .unwrap();
+        let txn = b.begin_write(WriterHolder::Replication).unwrap();
+        assert!(crate::engine::relog(&txn, &rebuilt).unwrap());
+        txn.commit().unwrap();
+        assert_ne!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
+
+        let commits = b.commits();
+        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert_eq!(b.commits() - commits, 1);
+        assert_eq!(
+            held_bytes(&b, &index.stamp),
+            Some(crate::codec::encode_oplog_entry(&index)),
+            "the origin's bytes"
+        );
+    }
+
+    #[test]
+    fn a_replicated_create_whose_append_fails_leaves_neither_definition_nor_entry() {
+        // One transaction: the definition and its entry commit together or
+        // not at all. Two commits could leave the definition without it.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, index) = index_entries(&a);
+        b.apply_batch(std::slice::from_ref(&collection)).unwrap();
+        crate::index::append_hooks::fail_next();
+        assert!(b.apply_ddl(&index).is_err());
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_none());
+        assert_eq!(held_bytes(&b, &index.stamp), None);
+        assert!(b.witnessed_vector().unwrap().get(index.stamp.node) < index.stamp.hlc);
+    }
+
+    #[test]
+    fn a_replicated_create_that_settles_a_later_stamp_appends_its_entry_in_that_commit() {
+        // The same definition created on both members: the later stamp is
+        // adopted here (ADR-132), and the entry that carried it goes in the
+        // commit that adopts it.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let (_, index) = index_entries(&a);
+        let held = b.get_collection("shop", "orders").unwrap().index("by_email").unwrap().created;
+        assert!(index.stamp.wins_over(&held.unwrap()), "premise: the arriving stamp is later");
+        let commits = b.commits();
+        assert!(matches!(b.apply_ddl(&index).unwrap(), DdlOutcome::Applied));
+        assert_eq!(b.commits() - commits, 1, "one commit settles the stamp and logs the entry");
+        assert_eq!(held_bytes(&b, &index.stamp), Some(crate::codec::encode_oplog_entry(&index)));
+        let settled =
+            b.get_collection("shop", "orders").unwrap().index("by_email").unwrap().created;
+        assert_eq!(settled, Some(index.stamp));
+    }
+
+    #[test]
+    fn duplicate_collection_and_drop_changes_are_held_without_a_writer_for_the_append() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (collection, _) = index_entries(&a);
+        a.drop_index("shop", "orders", "by_email").unwrap();
+        a.create_collection("shop", "gone").unwrap();
+        a.drop_collection("shop", "gone").unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        b.apply_batch(&entries).unwrap();
+        let of = |kind| entries.iter().filter(|e| e.kind == kind).cloned().collect::<Vec<_>>();
+        let replays: Vec<OplogEntry> = [of(OpKind::DropIndex), of(OpKind::DropCollection)]
+            .concat()
+            .into_iter()
+            .chain([collection])
+            .collect();
+        assert_eq!(replays.len(), 3, "{entries:?}");
+        for entry in &replays {
+            let writes = race_hooks::replication_writes_opened();
+            assert!(matches!(b.apply_ddl(entry).unwrap(), DdlOutcome::Held), "{:?}", entry.kind);
+            assert_eq!(
+                race_hooks::replication_writes_opened() - writes,
+                0,
+                "{:?}: no append transaction",
+                entry.kind
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_that_fails_after_the_create_committed_counts_the_create_once() {
+        // The build and its entry are durable; reporting the backfill's unique
+        // collisions follows the commit and can fail. The batch fails, the
+        // create is counted as applied because it committed (ADR-177), it is
+        // published already, and its re-delivery is held, not counted again.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (_, index) = index_entries(&a);
+        let (theirs, window) = window_for(&b, &a);
+        assert_eq!(window.entries.len(), 2, "{window:?}");
+        let mut published = b.subscribe();
+        count_hooks::fail_next(count_hooks::Fail::ViolationReport);
+        let mut outcome = SyncOutcome::default();
+        assert!(
+            b.apply_peer_batch_into(
+                &theirs,
+                &window.entries,
+                window.scanned_to,
+                window.exhausted,
+                &mut outcome
+            )
+            .is_err()
+        );
+        assert_eq!(outcome.ddl, 2, "the collection and the index both committed: {outcome:?}");
+        let stamps: Vec<Stamp> =
+            std::iter::from_fn(|| published.try_recv().ok()).map(|e| e.stamp).collect();
+        assert!(stamps.contains(&index.stamp), "published before the report: {stamps:?}");
+
+        // Both entries were appended in their own commits and are witnessed,
+        // so it is a push or a relay that carries them again, not a pull.
+        let again = b
+            .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+            .unwrap();
+        assert_eq!((again.ddl, again.ddl_held), (0, 2), "{again:?}");
+    }
+
+    #[test]
+    fn two_applies_of_one_entry_that_both_find_it_missing_commit_it_once() {
+        // A push and a pull, or a third member's relay, applying one entry at
+        // once: both look before the writer and find it missing. The one that
+        // takes the writer second finds it held under the writer, aborts --
+        // which does not reach the disk -- and is held, not applied.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        let (collection, _) = index_entries(&a);
+        // The collection stands here without the entry, so the arm does
+        // nothing and each apply goes straight to the append.
+        b.create_collection("shop", "orders").unwrap();
+        let commits = b.commits();
+        let competing = (Arc::clone(&b), collection.clone());
+        let (outer, competitor) = race_hooks::race(
+            race_hooks::Race::DdlAppend,
+            move || competing.0.apply_ddl(&competing.1).unwrap(),
+            || b.apply_ddl(&collection).unwrap(),
+        );
+        assert!(matches!(competitor, DdlOutcome::Applied), "{competitor:?}");
+        assert!(matches!(outer, DdlOutcome::Held), "{outer:?}");
+        assert_eq!(b.commits() - commits, 1, "one commit between the two");
+        race_hooks::assert_absorbed(race_hooks::Race::DdlAppend);
     }
 
     #[test]
@@ -4652,7 +5076,7 @@ mod tests {
             .unwrap();
         let at = held.created.expect("a local create is stamped");
         for origin in [
-            crate::index::CreateOrigin::Replicated(Some(at)),
+            crate::index::CreateOrigin::Replicated { created: Some(at), logged: None },
             crate::index::CreateOrigin::Restored(at),
         ] {
             let (created, _) = a
@@ -4670,7 +5094,8 @@ mod tests {
                 )
                 .unwrap();
             match created {
-                crate::index::IndexCreated::Built(index) => {
+                crate::index::IndexCreated::Built(index)
+                | crate::index::IndexCreated::Standing(index) => {
                     assert_eq!(index.created, Some(at), "{origin:?}: the definition held")
                 }
                 crate::index::IndexCreated::Older => {
@@ -6708,7 +7133,13 @@ mod tests {
         let pulled = pulled.expect("the round that won applies the window");
         assert_eq!(pulled.ddl, 2, "{pulled:?}");
         let pushed = pushed.expect("the push that lost is answered, not refused");
-        assert_eq!(pushed.ddl, 2, "the collection counts as applied, and the index: {pushed:?}");
+        // The round that won appended both entries, so the push holds them:
+        // each change is applied, and counted, once between the two.
+        assert_eq!(
+            (pushed.ddl, pushed.ddl_held),
+            (0, 2),
+            "the collection and the index count as held: {pushed:?}"
+        );
         assert_eq!(pushed.ddl_refused, 0, "{pushed:?}");
         assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_some());
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pushed:?}");
@@ -6733,7 +7164,8 @@ mod tests {
             apply_racing(&b, &theirs, &window, race_hooks::Race::ReplicatedCreate);
         pushed.expect("the push that won applies the window");
         let pulled = pulled.expect("the pull that lost applies its window, not fails it");
-        assert_eq!(pulled.ddl, 1, "{pulled:?}");
+        // The push that won appended the creation, so the pull holds it.
+        assert_eq!((pulled.ddl, pulled.ddl_held), (0, 1), "{pulled:?}");
         assert_eq!(pulled.applied + pulled.superseded, 2, "{pulled:?}");
         assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 2);
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pulled:?}");
@@ -6894,7 +7326,7 @@ mod tests {
                     Some("by_a".into()),
                     None,
                     None,
-                    crate::index::CreateOrigin::Replicated(Some(later)),
+                    crate::index::CreateOrigin::Replicated { created: Some(later), logged: None },
                     &|_, _| false,
                 )
             },

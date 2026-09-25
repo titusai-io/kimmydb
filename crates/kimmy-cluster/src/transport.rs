@@ -400,6 +400,7 @@ where
                     &Message::Pushed {
                         applied: outcome.applied,
                         ddl: outcome.ddl,
+                        ddl_held: outcome.ddl_held,
                         ddl_refused: outcome.ddl_refused,
                         unknown_collection: outcome.unknown_collection,
                         ddl_declined: outcome.ddl_declined,
@@ -912,6 +913,7 @@ where
             // served again and counted then (ADR-177).
             let counted = &mut stalls.applied;
             counted.ddl_applied += outcome.ddl;
+            counted.ddl_held += outcome.ddl_held;
             counted.ddl_refused += outcome.ddl_refused;
             counted.ddl_declined += outcome.ddl_declined;
             counted.unknown_collection += outcome.unknown_collection;
@@ -1362,9 +1364,12 @@ pub struct PeerStalls {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppliedCounts {
     /// Schema-change entries the apply took as applied —
-    /// `SyncOutcome::ddl`, re-applies of a change already held here
-    /// included; see `RoundReport::ddl_applied`.
+    /// `SyncOutcome::ddl`, not those whose entry this node already held;
+    /// see `RoundReport::ddl_applied`.
     pub ddl_applied: usize,
+    /// Schema-change entries this node already held as sent —
+    /// `SyncOutcome::ddl_held`; see `RoundReport::ddl_held`.
+    pub ddl_held: usize,
     pub ddl_refused: usize,
     pub ddl_declined: usize,
     pub unknown_collection: usize,
@@ -4130,14 +4135,14 @@ mod tests {
         (seen, failed)
     }
 
-    /// The same window pushed twice is applied twice, and the second push
-    /// reports its schema changes as applied again: the member already holds
-    /// the collection and the index, and takes both entries as applied. That
-    /// is what `kimmy_sync_ddl_applied_total{via="push"}` counts, and why a
-    /// burst of overlapping windows shows on it (ADR-143). A count of only
-    /// the changes the member lacked would read 0 the second time.
+    /// The same window pushed twice is applied once: the second push finds
+    /// the collection and the index held, entries and all, commits nothing
+    /// for them, and reports them held rather than applied. Applied is what
+    /// `kimmy_sync_ddl_applied_total{via="push"}` counts, and held what
+    /// `kimmy_sync_ddl_held_total{via="push"}` does, so the overlap of a
+    /// burst's windows still shows (ADR-143) without reading as work done.
     #[tokio::test]
-    async fn a_window_pushed_twice_reports_its_schema_changes_applied_twice() {
+    async fn a_window_pushed_twice_reports_its_schema_changes_applied_then_held() {
         let a_dir = tempfile::tempdir().unwrap();
         let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
         let b_dir = tempfile::tempdir().unwrap();
@@ -4153,7 +4158,9 @@ mod tests {
         let hooked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let hook: PushHook = Arc::new({
             let hooked = Arc::clone(&hooked);
-            move |outcome: &SyncOutcome| hooked.lock().unwrap().push(outcome.ddl)
+            move |outcome: &SyncOutcome| {
+                hooked.lock().unwrap().push((outcome.ddl, outcome.ddl_held))
+            }
         });
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
         let serving = async { serve_peer(&b, theirs, SECRET, BINDING, Some(&hook)).await };
@@ -4169,7 +4176,7 @@ mod tests {
                 };
                 write_frame(&mut ours, &push).await.unwrap();
                 match read_frame(&mut ours).await.unwrap() {
-                    Message::Pushed { ddl, .. } => answered.push(ddl),
+                    Message::Pushed { ddl, ddl_held, .. } => answered.push((ddl, ddl_held)),
                     other => panic!("expected Pushed, got {other:?}"),
                 }
             }
@@ -4178,8 +4185,12 @@ mod tests {
         };
         let (_, answered) = tokio::join!(serving, pushing);
 
-        assert_eq!(answered, vec![2, 2], "the collection and the index, applied each time");
-        assert_eq!(*hooked.lock().unwrap(), vec![2, 2], "and counted each time");
+        assert_eq!(
+            answered,
+            vec![(2, 0), (0, 2)],
+            "the collection and the index, applied, then held"
+        );
+        assert_eq!(*hooked.lock().unwrap(), vec![(2, 0), (0, 2)], "and counted so");
     }
 
     /// The window a pull re-serves `into` from `from` after a push: above what

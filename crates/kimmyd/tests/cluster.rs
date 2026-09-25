@@ -704,8 +704,8 @@ async fn a_schema_change_made_right_after_its_collection_reaches_every_member() 
     }
 }
 
-/// A burst of index creates on one member is applied about once each on the
-/// others (ADR-191). Before, each create pushed its own window, and the
+/// A burst of index creates on one member is applied once each on the others
+/// (ADR-191, ADR-180). Before, each create pushed its own window, and the
 /// windows overlapped: a burst of N cost each peer up to about N²/2 applies,
 /// and the confirmations timed out behind them.
 #[tokio::test]
@@ -740,16 +740,24 @@ async fn a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_othe
         })
         .await;
     }
+    // Applied, pulled and pushed together: an entry a member already holds
+    // is held, not applied, whichever way it came.
     let pushed = |node: &Node| {
         let client = client.clone();
         let node_url = node.url("/metrics");
         async move {
             let body = client.get(node_url).send().await.unwrap().text().await.unwrap();
-            body.lines()
-                .find(|l| l.starts_with("kimmy_sync_ddl_applied_total{via=\"push\"} "))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0)
+            ["pull", "push"]
+                .iter()
+                .map(|via| {
+                    let prefix = format!("kimmy_sync_ddl_applied_total{{via=\"{via}\"}} ");
+                    body.lines()
+                        .find(|l| l.starts_with(&prefix))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .expect("the series is on the page")
+                })
+                .sum::<u64>()
         }
     };
     let before = (pushed(&b).await, pushed(&c).await);
@@ -782,16 +790,184 @@ async fn a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_othe
         );
     }
 
-    // The creates once each, plus at most one window that a member's own
-    // pull took first and the push then applied again: the one overlap a
-    // single push in flight leaves (ADR-191). Against up to about N²/2, 128
-    // here, before.
+    // The creates once each, however they arrived. A window that a
+    // member's own pull took first and a push then carried again, the one
+    // overlap a single push in flight leaves (ADR-191), is held rather than
+    // applied, and so is a relay of it from the third member; two applies
+    // racing on one entry commit and count it once (ADR-180's addendum).
+    // Against up to about N²/2, 128 here, before ADR-191.
     let after = (pushed(&b).await, pushed(&c).await);
     for (name, rise) in [("b", after.0 - before.0), ("c", after.1 - before.1)] {
-        assert!(rise <= (2 * N) as u64, "{name} applied {rise} pushed schema changes for {N}");
+        assert!(rise <= N as u64, "{name} applied {rise} schema changes for {N}");
     }
     let timeouts = a.gauge(&client, "kimmy_ddl_confirmations_total{outcome=\"timeout\"}").await;
     assert_eq!(timeouts, Some(0), "no confirmation timed out");
+}
+
+/// A burst of index creates on one member costs each other member one commit
+/// per create, plus one per window it applied: the build carries the
+/// originating entry, and an entry a window carries again that the member
+/// already holds commits nothing (ADR-180, ADR-119). Before, every create
+/// cost a peer a second commit to append its entry, and every duplicate a
+/// third — measured on a three-member cluster at 94–111 commits per peer for
+/// a burst of 32, nearly all of them an fsync.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_burst_of_creates_on_one_member_costs_the_others_one_commit_each() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "burst" }))
+        .send()
+        .await
+        .unwrap();
+    let tokens = (b.login(&client).await, c.login(&client).await);
+    let indexes = |node: &Node, token: &str| {
+        let client = client.clone();
+        let url = node.url("/v1/db/shop/coll/burst/indexes");
+        let token = token.to_string();
+        async move {
+            let Ok(res) = client.get(url).bearer_auth(&token).send().await else {
+                return None;
+            };
+            let body = res.json::<serde_json::Value>().await.ok()?;
+            let listed = body["indexes"].as_array()?;
+            Some(
+                listed
+                    .iter()
+                    .filter(|i| i["name"].as_str().is_some_and(|n| n.starts_with('f')))
+                    .count(),
+            )
+        }
+    };
+    for (node, token) in [(&b, &tokens.0), (&c, &tokens.1)] {
+        eventually("the collection to reach every member", || {
+            let indexes = indexes(node, token);
+            async move { indexes.await.is_some() }
+        })
+        .await;
+    }
+
+    /// Everything the bound is made of, on one member, at one moment.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Reading {
+        commits: u64,
+        embedding: u64,
+        pulls: u64,
+        applied: u64,
+        held: u64,
+        pushes: u64,
+    }
+    let read = |node: &Node| {
+        let client = client.clone();
+        let url = node.url("/metrics");
+        async move {
+            let body = client.get(url).send().await.unwrap().text().await.unwrap();
+            // A series missing from the page is a renamed metric, and would
+            // read as 0 and pass the bound; so it fails instead.
+            let value = |name: &str| {
+                let prefix = format!("{name} ");
+                body.lines()
+                    .find(|l| l.starts_with(&prefix))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("{name} is not on the metrics page"))
+            };
+            Reading {
+                commits: value("kimmy_commits"),
+                embedding: value("kimmy_write_lock_held_seconds_count{holder=\"embedding\"}"),
+                pulls: value("kimmy_sync_pull_seconds_count{phase=\"apply\"}"),
+                applied: value("kimmy_sync_ddl_applied_total{via=\"push\"}")
+                    + value("kimmy_sync_ddl_applied_total{via=\"pull\"}"),
+                held: value("kimmy_sync_ddl_held_total{via=\"push\"}")
+                    + value("kimmy_sync_ddl_held_total{via=\"pull\"}"),
+                pushes: value("kimmy_ddl_confirm_pushes_total"),
+            }
+        }
+    };
+    // Settled: nothing left to pull, as far as two sync intervals can tell.
+    let settle = || async {
+        let mut last = (read(&b).await.pulls, read(&c).await.pulls);
+        let mut quiet = 0;
+        let deadline = std::time::Instant::now() + patience();
+        while quiet < 2 {
+            assert!(std::time::Instant::now() < deadline, "pulls to settle");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let now = (read(&b).await.pulls, read(&c).await.pulls);
+            quiet = if now == last { quiet + 1 } else { 0 };
+            last = now;
+        }
+    };
+    settle().await;
+    let started = std::time::Instant::now();
+    let before = (read(&a).await, read(&b).await, read(&c).await);
+
+    const N: usize = 16;
+    let mut creates = tokio::task::JoinSet::new();
+    for i in 0..N {
+        let client = client.clone();
+        let url = a.url("/v1/db/shop/coll/burst/indexes");
+        let token = token.clone();
+        creates.spawn(async move {
+            client
+                .post(url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "name": format!("f{i}"), "fields": [{ "path": format!("f{i}") }] }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    while let Some(status) = creates.join_next().await {
+        assert!(status.unwrap().is_success());
+    }
+    for (node, token) in [(&b, &tokens.0), (&c, &tokens.1)] {
+        eventually("every index to reach every member", || {
+            let indexes = indexes(node, token);
+            async move { indexes.await.is_some_and(|n| n >= N) }
+        })
+        .await;
+    }
+    settle().await;
+    let window = started.elapsed();
+    let after = (read(&a).await, read(&b).await, read(&c).await);
+
+    // Pushes to both members: the counter names no member, so each is
+    // bounded by all of them.
+    let pushes = after.0.pushes - before.0.pushes;
+    let mut report = Vec::new();
+    let mut over = Vec::new();
+    for (name, before, after) in [("b", before.1, after.1), ("c", before.2, after.2)] {
+        let commits = after.commits - before.commits;
+        let embedding = after.embedding - before.embedding;
+        let pulls = after.pulls - before.pulls;
+        let applied = after.applied - before.applied;
+        let held = after.held - before.held;
+        // One build per create, which carries its entry; one witness commit
+        // per window applied, pushed or pulled; the vector worker's position
+        // writes, subtracted; and 2 for whatever else a quiet member commits.
+        let bound = N as u64 + pushes + pulls + 2;
+        let spent = commits - embedding;
+        report.push(format!(
+            "{name}: commits {commits} (embedding {embedding}) -> {spent} against bound {bound} \
+             = N {N} + pushes {pushes} + pulls {pulls} + 2; applied {applied}, held {held}; \
+             window {:.1}s",
+            window.as_secs_f64()
+        ));
+        if spent > bound {
+            over.push(name);
+        }
+        assert!(applied <= N as u64, "{name} applied {applied} schema changes for {N}");
+    }
+    let report = report.join("\n");
+    println!("{report}");
+    assert!(over.is_empty(), "commits over the bound on {over:?}:\n{report}");
 }
 
 // ---------------------------------------------------------------------------

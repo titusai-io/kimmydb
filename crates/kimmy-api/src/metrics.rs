@@ -291,10 +291,16 @@ pub struct MetricsSnapshot {
     pub sync_ddl_declined: u64,
     /// Replicated schema changes applied here, by the way they arrived: a
     /// pulled window, or a window a peer pushed to confirm a change
-    /// (ADR-140). Every entry the apply took as applied, a change already
-    /// held here included — see [`Metrics::record_ddl_applied_push`].
+    /// (ADR-140). Every entry the apply took as applied, not one whose entry
+    /// this node already held as sent — see
+    /// [`Metrics::record_ddl_applied_push`].
     pub sync_ddl_applied_pull: u64,
     pub sync_ddl_applied_push: u64,
+    /// Replicated schema changes a window carried that this node already
+    /// held, entry and all, by the same two ways: neither applied nor
+    /// committed. The overlap of windows, kept visible.
+    pub sync_ddl_held_pull: u64,
+    pub sync_ddl_held_push: u64,
     /// Schema-change confirmations on each member, by how each ended, in
     /// `ConfirmOutcome::ALL` order (ADR-191); and the windows pushed for
     /// them, whose ratio to the confirmations is the coalescing.
@@ -409,6 +415,8 @@ pub struct Metrics {
     sync_ddl_declined: AtomicU64,
     sync_ddl_applied_pull: AtomicU64,
     sync_ddl_applied_push: AtomicU64,
+    sync_ddl_held_pull: AtomicU64,
+    sync_ddl_held_push: AtomicU64,
     ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
     ddl_confirm_pushes: AtomicU64,
     sync_divergent_collections: AtomicU64,
@@ -522,6 +530,8 @@ impl Default for Metrics {
             sync_ddl_declined: AtomicU64::new(0),
             sync_ddl_applied_pull: AtomicU64::new(0),
             sync_ddl_applied_push: AtomicU64::new(0),
+            sync_ddl_held_pull: AtomicU64::new(0),
+            sync_ddl_held_push: AtomicU64::new(0),
             ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
             ddl_confirm_pushes: AtomicU64::new(0),
             sync_divergent_collections: AtomicU64::new(0),
@@ -742,6 +752,7 @@ impl Metrics {
         self.sync_ddl_refused.fetch_add(round.ddl_refused as u64, Ordering::Relaxed);
         self.sync_ddl_declined.fetch_add(round.ddl_declined as u64, Ordering::Relaxed);
         self.sync_ddl_applied_pull.fetch_add(round.ddl_applied as u64, Ordering::Relaxed);
+        self.sync_ddl_held_pull.fetch_add(round.ddl_held as u64, Ordering::Relaxed);
         self.sync_divergent_collections
             .store(round.divergent_collections as u64, Ordering::Relaxed);
         self.sync_divergence_checks.fetch_add(round.divergence_checks as u64, Ordering::Relaxed);
@@ -796,12 +807,14 @@ impl Metrics {
 
     /// Everything a window a peer pushed to this node did that its metrics
     /// count (ADR-140): what it refused, declined and skipped, on the series
-    /// a pulled window's land on, and what it applied, under `via="push"`.
+    /// a pulled window's land on, and what it applied and what it already
+    /// held, under `via="push"`.
     /// One call per pushed window, from the node's push hook.
     pub fn record_pushed(&self, outcome: &kimmy_storage::SyncOutcome) {
         self.record_ddl_refused(outcome.ddl_refused as u64);
         self.record_ddl_declined(outcome.ddl_declined as u64);
         self.record_ddl_applied_push(outcome.ddl as u64);
+        self.record_ddl_held_push(outcome.ddl_held as u64);
         self.record_entries_skipped(
             outcome.unknown_collection as u64,
             outcome.deferred as u64,
@@ -824,13 +837,18 @@ impl Metrics {
     /// (ADR-140), beside the pulled ones on the same series under
     /// `via="push"`. Unlike the refusal, which way the change arrived is the
     /// point here: a push that confirms one change carries the whole window
-    /// the member lacks (ADR-143), so a burst of N concurrent creates can
-    /// make each member apply up to about N²/2 of them, and the pushed count
-    /// is where that shows. A change already held here that a window carries
-    /// again comes back from the apply as applied, and is counted, because
-    /// that apply is the work being measured.
+    /// the member lacks (ADR-143), and the pushed count is where the work a
+    /// burst costs shows. A change whose entry this node already held as sent
+    /// is not applied again and is not counted here, but under
+    /// [`Self::record_ddl_held_push`].
     pub fn record_ddl_applied_push(&self, n: u64) {
         self.sync_ddl_applied_push.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count schema changes a peer pushed to this node that it already held,
+    /// entry and all, under `via="push"`: nothing applied, nothing committed.
+    pub fn record_ddl_held_push(&self, n: u64) {
+        self.sync_ddl_held_push.fetch_add(n, Ordering::Relaxed);
     }
 
     /// One backup produced, and how long the walk and the spill took
@@ -1071,6 +1089,8 @@ impl Metrics {
             sync_ddl_declined: self.get(&self.sync_ddl_declined),
             sync_ddl_applied_pull: self.get(&self.sync_ddl_applied_pull),
             sync_ddl_applied_push: self.get(&self.sync_ddl_applied_push),
+            sync_ddl_held_pull: self.get(&self.sync_ddl_held_pull),
+            sync_ddl_held_push: self.get(&self.sync_ddl_held_push),
             ddl_confirmations: std::array::from_fn(|slot| self.get(&self.ddl_confirmations[slot])),
             ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged: readings.sync_ddl_relogged,
@@ -1338,10 +1358,14 @@ impl Metrics {
              # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.\n\
              # TYPE kimmy_sync_ddl_declined_total counter\n\
              kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
-             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. A change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply up to about N squared over 2 through push; compare the increase over a burst, not the total.\n\
+             # HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is neither applied again nor committed and is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.\n\
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
+             # HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again, and nothing committed for them. Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; it costs a read, not a commit.\n\
+             # TYPE kimmy_sync_ddl_held_total counter\n\
+             kimmy_sync_ddl_held_total{{via=\"pull\"}} {sync_ddl_held_pull}\n\
+             kimmy_sync_ddl_held_total{{via=\"push\"}} {sync_ddl_held_push}\n\
              # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.\n\
              # TYPE kimmy_ddl_confirmations_total counter\n\
              {ddl_confirmations}\
@@ -1477,6 +1501,8 @@ impl Metrics {
             sync_ddl_declined = self.get(&self.sync_ddl_declined),
             sync_ddl_applied_pull = self.get(&self.sync_ddl_applied_pull),
             sync_ddl_applied_push = self.get(&self.sync_ddl_applied_push),
+            sync_ddl_held_pull = self.get(&self.sync_ddl_held_pull),
+            sync_ddl_held_push = self.get(&self.sync_ddl_held_push),
             ddl_confirm_pushes = self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged = readings.sync_ddl_relogged,
             sync_divergent = self.get(&self.sync_divergent_collections),
@@ -1894,6 +1920,7 @@ mod tests {
             failed: 20,
             backing_off: 99,
             ddl_applied: 83,
+            ddl_held: 43,
             ddl_refused: 21,
             ddl_declined: 28,
             divergent_collections: 12,
@@ -1913,6 +1940,7 @@ mod tests {
             failed: 3,
             backing_off: 24,
             ddl_applied: 6,
+            ddl_held: 5,
             ddl_refused: 4,
             ddl_declined: 8,
             divergent_collections: 5,
@@ -1933,6 +1961,7 @@ mod tests {
         // The pushed applies, on the series the pulled ones share: a push
         // recorded under `via="pull"` would read 186 there.
         m.record_ddl_applied_push(97);
+        m.record_ddl_held_push(58);
         // A distinct count per outcome, so a line under the wrong label
         // cannot match: 120 for the first, one more for each after it.
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
@@ -2511,10 +2540,14 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined as older than the index standing under the name here, and had not already recorded. A drop applied when it was current leaves a tombstone, so a re-served window carrying it past the recreation it preceded is a replay and is not counted. What is counted is a drop this member has never seen - a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member.
 # TYPE kimmy_sync_ddl_declined_total counter
 kimmy_sync_ddl_declined_total 36
-# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. A change already held here that a window carries again is applied again and counted, since that apply is the work this measures. A push carries everything the member lacks from the pusher, so a burst of N concurrent index changes on one member can make each peer apply up to about N squared over 2 through push; compare the increase over a burst, not the total.
+# HELP kimmy_sync_ddl_applied_total Replicated schema changes this node applied, by how they arrived: pull, a window this node pulled from a peer; push, a window a peer pushed to confirm a change it made (ADR-140). Counted per entry applied, not per entry received: a refused, declined or skipped entry is not counted here, and neither is a replayed drop this node had already recorded or a change for a collection dropped here, which no outcome series counts. Nor is a change whose entry this node already held as sent, which is neither applied again nor committed and is counted in kimmy_sync_ddl_held_total. A burst of N index changes on one member should read about N on each other member, summed over both labels; compare the increase over a burst, not the total.
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
+# HELP kimmy_sync_ddl_held_total Replicated schema changes a window carried that this node already held, entry and all, by how they arrived: pull or push, as for kimmy_sync_ddl_applied_total. Not applied again, and nothing committed for them. Windows overlap by design - a pull that read this node's position before a push landed, a third member relaying what the origin pushed - and this is how much; it costs a read, not a commit.
+# TYPE kimmy_sync_ddl_held_total counter
+kimmy_sync_ddl_held_total{via=\"pull\"} 48
+kimmy_sync_ddl_held_total{via=\"push\"} 58
 # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.
 # TYPE kimmy_ddl_confirmations_total counter
 kimmy_ddl_confirmations_total{outcome=\"confirmed\"} 120
@@ -2833,6 +2866,8 @@ kimmy_sync_serve_walk_seconds_count 1201
             "kimmy_sync_ddl_applied_total{{via=\"push\"}} {}\n",
             s.sync_ddl_applied_push
         ));
+        expect(&format!("kimmy_sync_ddl_held_total{{via=\"pull\"}} {}\n", s.sync_ddl_held_pull));
+        expect(&format!("kimmy_sync_ddl_held_total{{via=\"push\"}} {}\n", s.sync_ddl_held_push));
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
             expect(&format!(
                 "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
@@ -3126,6 +3161,8 @@ kimmy_sync_serve_walk_seconds_count 1201
                 + 1
                 // Replicated schema changes applied, pulled and pushed.
                 + 2
+                // And those already held, pulled and pushed.
+                + 2
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT
@@ -3254,6 +3291,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         let m = Metrics::default();
         m.record_pushed(&kimmy_storage::SyncOutcome {
             ddl: 2,
+            ddl_held: 3,
             ddl_refused: 1,
             ddl_declined: 1,
             unknown_collection: 1,
@@ -3264,6 +3302,7 @@ kimmy_sync_serve_walk_seconds_count 1201
         let s = m.snapshot();
         assert_eq!(s.sync_ddl_applied_push, 2);
         assert_eq!(s.sync_ddl_applied_pull, 0);
+        assert_eq!((s.sync_ddl_held_push, s.sync_ddl_held_pull), (3, 0));
         assert_eq!((s.sync_ddl_refused, s.sync_ddl_declined), (1, 1));
         assert_eq!(
             (
@@ -3290,6 +3329,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             failed: 1,
             backing_off: 1,
             ddl_applied: 0,
+            ddl_held: 0,
             ddl_refused: 0,
             ddl_declined: 0,
             divergent_collections: 0,
@@ -3309,6 +3349,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             failed: 2,
             backing_off: 0,
             ddl_applied: 7,
+            ddl_held: 0,
             ddl_refused: 3,
             ddl_declined: 0,
             divergent_collections: 6,
@@ -3517,6 +3558,7 @@ kimmy_sync_serve_walk_seconds_count 1201
             failed: 0,
             backing_off: 0,
             ddl_applied: 0,
+            ddl_held: 0,
             ddl_refused: 0,
             ddl_declined: 0,
             divergent_collections: 0,

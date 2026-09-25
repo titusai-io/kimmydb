@@ -1391,7 +1391,7 @@ impl Engine {
                 // node would serve windows across it that leave the index out.
                 match index.created {
                     Some(created) => crate::index::CreateOrigin::Restored(created),
-                    None => crate::index::CreateOrigin::Replicated(None),
+                    None => crate::index::CreateOrigin::Replicated { created: None, logged: None },
                 },
                 &|standing, _| earlier(standing),
             );

@@ -755,15 +755,24 @@ pub(crate) fn doc_key_for(id: &DocId) -> Result<Vec<u8>> {
 /// `replicated: Option<Stamp>` (ADR-123) — widened only because a replicated
 /// *create* may carry no stamp at all.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum CreateOrigin {
+pub(crate) enum CreateOrigin<'e> {
     /// A client's create on this node.
     Local,
     /// A peer's definition, stamped where it was created.
     ///
-    /// `None` is a definition from a build that recorded no creation stamp,
-    /// or one lifted out of a snapshot written by such a build; it reads as
-    /// older than every rival (ADR-132).
-    Replicated(Option<Stamp>),
+    /// `created: None` is a definition from a build that recorded no creation
+    /// stamp, or one lifted out of a snapshot written by such a build; it
+    /// reads as older than every rival (ADR-132).
+    ///
+    /// `logged` is the entry the definition arrived in, when it arrived in
+    /// one. It is appended — the origin's own, never a rebuild, and under
+    /// `Position::Raise` as every replicated schema change is — in the
+    /// transaction that builds or settles the definition, so the two commit
+    /// together or not at all, in one commit rather than two (ADR-180's
+    /// addendum). The caller witnesses and publishes it. A definition found
+    /// already standing appends nothing here (`IndexCreated::Standing`): the
+    /// caller decides whether its entry is still to be appended.
+    Replicated { created: Option<Stamp>, logged: Option<&'e kimmy_core::OplogEntry> },
     /// A definition a snapshot page restores, stamped where it was created.
     ///
     /// Decided exactly as `Replicated(Some(_))` is, and one thing more: the
@@ -831,6 +840,25 @@ fn relog_restored(
     Ok(crate::engine::relog(txn, &entry)?.then_some(entry))
 }
 
+/// A failure injected at the next replicated create's append on this thread,
+/// for the test that the entry commits with the definition or not at all.
+#[cfg(test)]
+pub(crate) mod append_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn fail_next() {
+        FAIL.with(|f| f.set(true));
+    }
+
+    pub(crate) fn fails() -> bool {
+        FAIL.with(|f| f.replace(false))
+    }
+}
+
 /// What a drop did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dropped {
@@ -852,8 +880,16 @@ pub struct Dropped {
 
 /// What a create decided.
 pub(crate) enum IndexCreated {
-    /// Built, or already here under this definition.
+    /// Built, or settled on a new creation stamp, with a replicated create's
+    /// `logged` entry appended in the same transaction; or, for a restore,
+    /// already here under this definition.
     Built(IndexMeta),
+    /// Already here under this definition, and nothing was written: the
+    /// idempotent answer to a local create, and to a replicated one whose
+    /// stamp does not settle a new one. A replicated create's `logged` entry
+    /// was **not** appended; the caller appends it if this node does not
+    /// already hold it (ADR-180).
+    Standing(IndexMeta),
     /// A definition under this name, created *later* than this one, is
     /// already here; nothing was done. Only reachable on the replicated
     /// path, where the caller counts it as history and does not append the
@@ -917,7 +953,7 @@ impl crate::Engine {
             "a local backfill refuses a collision, never reports one"
         );
         match created {
-            IndexCreated::Built(index) => Ok(index),
+            IndexCreated::Built(index) | IndexCreated::Standing(index) => Ok(index),
             // A local create is never resolved against another node's stamp:
             // the name is free, already this definition, or refused with
             // `IndexExists` (ADR-132).
@@ -978,7 +1014,7 @@ impl crate::Engine {
         mut requested_name: Option<String>,
         expire_after_secs: Option<i64>,
         mut partial_filter: Option<bson::Document>,
-        origin: CreateOrigin,
+        origin: CreateOrigin<'_>,
         history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> bool,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
         // **A loop, not a self-call.** Every retry passes the same arguments, so
@@ -1044,7 +1080,7 @@ impl crate::Engine {
             // without ever being served the index.
             let mut stamp = match origin {
                 CreateOrigin::Local => None,
-                CreateOrigin::Replicated(created) => created,
+                CreateOrigin::Replicated { created, .. } => created,
                 CreateOrigin::Restored(created) => Some(created),
             };
 
@@ -1164,7 +1200,15 @@ impl crate::Engine {
                                     None => txn.abort()?,
                                 }
                             }
-                            return Ok((IndexCreated::Built(existing), Vec::new()));
+                            return Ok((
+                                match origin {
+                                    CreateOrigin::Restored(_) => IndexCreated::Built(existing),
+                                    CreateOrigin::Local | CreateOrigin::Replicated { .. } => {
+                                        IndexCreated::Standing(existing)
+                                    }
+                                },
+                                Vec::new(),
+                            ));
                         };
                         let mut settled = existing;
                         settled.created = Some(merged);
@@ -1208,7 +1252,16 @@ impl crate::Engine {
                                 &logged_definition(db, collection, &index),
                                 created,
                             )?,
-                            CreateOrigin::Local | CreateOrigin::Replicated(_) => None,
+                            // The arriving entry, which settled the stamp, in the
+                            // stamp's own commit: a new key, since its stamp is
+                            // the one that won.
+                            CreateOrigin::Replicated { logged: Some(entry), .. } => {
+                                crate::engine::append_oplog(&txn, entry)?;
+                                None
+                            }
+                            CreateOrigin::Local | CreateOrigin::Replicated { logged: None, .. } => {
+                                None
+                            }
                         };
                         txn.commit()?;
                         if let Some(entry) = relogged {
@@ -1225,12 +1278,12 @@ impl crate::Engine {
                         // settle (ADR-020, ADR-132). The loser is removed in the
                         // transaction that builds the winner, below.
                         (
-                            CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
+                            CreateOrigin::Replicated { .. } | CreateOrigin::Restored(_),
                             Some(held),
                             Some(arriving),
                         ) if arriving.wins_over(&held) => Some(existing),
                         (
-                            CreateOrigin::Replicated(_) | CreateOrigin::Restored(_),
+                            CreateOrigin::Replicated { .. } | CreateOrigin::Restored(_),
                             Some(_),
                             Some(_),
                         ) => {
@@ -1442,7 +1495,21 @@ impl crate::Engine {
                     crate::engine::append_oplog(&txn, &entry)?;
                     Some(entry)
                 }
-                CreateOrigin::Replicated(_) => None,
+                // The origin's entry, in the transaction that builds the
+                // definition, for the reason a restore's is below. The caller
+                // witnesses and publishes it once this commits.
+                CreateOrigin::Replicated { logged, .. } => {
+                    if let Some(entry) = logged {
+                        #[cfg(test)]
+                        if append_hooks::fails() {
+                            return Err(StorageError::Database(
+                                "a failure injected at a replicated create's append".into(),
+                            ));
+                        }
+                        crate::engine::append_oplog(&txn, entry)?;
+                    }
+                    None
+                }
                 // In the transaction that builds the definition, so the entry and
                 // the state it describes commit together or not at all (ADR-180).
                 CreateOrigin::Restored(created) => relog_restored(
@@ -1456,7 +1523,9 @@ impl crate::Engine {
             if let Some(entry) = logged {
                 match origin {
                     CreateOrigin::Restored(_) => self.relogged(entry),
-                    CreateOrigin::Local | CreateOrigin::Replicated(_) => self.publish(vec![entry]),
+                    CreateOrigin::Local | CreateOrigin::Replicated { .. } => {
+                        self.publish(vec![entry])
+                    }
                 }
             }
             // Built just now, so nothing an expiry pass remembered under this id
@@ -2710,7 +2779,7 @@ mod tests {
     /// `z` again, arriving from elsewhere as `origin`.
     fn arriving(
         engine: &Engine,
-        origin: CreateOrigin,
+        origin: CreateOrigin<'_>,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
         engine.create_index_inner(
             "app",
@@ -2737,7 +2806,7 @@ mod tests {
             kimmy_core::NodeId::from_bytes([9; 16]),
         );
         crate::engine::definition_hooks::assert_exhausted("app.docs", || {
-            arriving(&engine, CreateOrigin::Replicated(Some(later)))
+            arriving(&engine, CreateOrigin::Replicated { created: Some(later), logged: None })
         });
         let coll = engine.get_collection("app", "docs").unwrap();
         assert_eq!(coll.index("z_1").unwrap().created, Some(held), "the stamp did not move");

@@ -276,7 +276,15 @@ pub enum Message {
     /// receiver turned away as older than the index it holds (ADR-141).
     Pushed {
         applied: usize,
+        /// Schema changes the receiver applied, not counting those whose
+        /// entry it already held as sent: those are `ddl_held`.
         ddl: usize,
+        /// Schema changes the window carried that the receiver already held,
+        /// entry and all, and so neither applied nor committed. Absent from a
+        /// receiver on a version before the field, which counted them in
+        /// `ddl`.
+        #[serde(default)]
+        ddl_held: usize,
         ddl_refused: usize,
         unknown_collection: usize,
         ddl_declined: usize,
@@ -650,6 +658,7 @@ mod tests {
             Message::Pushed {
                 applied: 1,
                 ddl: 2,
+                ddl_held: 6,
                 ddl_refused: 0,
                 unknown_collection: 0,
                 ddl_declined: 3,
@@ -801,6 +810,7 @@ mod tests {
         let current = Message::Pushed {
             applied: 1,
             ddl: 1,
+            ddl_held: 0,
             ddl_refused: 0,
             unknown_collection: 0,
             ddl_declined: 0,
@@ -822,6 +832,7 @@ mod tests {
             Message::Pushed {
                 applied: 1,
                 ddl: 1,
+                ddl_held: 0,
                 ddl_refused: 0,
                 unknown_collection: 0,
                 ddl_declined: 0,
@@ -831,6 +842,39 @@ mod tests {
                 stopped_at: None,
             },
             "an older receiver's reply must read as no stop"
+        );
+    }
+
+    /// `Pushed::ddl_held` is a backward-compatible addition: a receiver
+    /// before the field sends a `Pushed` without it, which reads as none
+    /// held -- that receiver counted them in `ddl`.
+    #[tokio::test]
+    async fn pushed_without_ddl_held_reads_as_none_held() {
+        let pushed = |ddl_held| Message::Pushed {
+            applied: 0,
+            ddl: 1,
+            ddl_held,
+            ddl_refused: 0,
+            unknown_collection: 0,
+            ddl_declined: 0,
+            deferred: 0,
+            purge_pending: 0,
+            refused: Vec::new(),
+            stopped_at: None,
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &pushed(2)).await.unwrap();
+        let mut body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let fields = body.get_document_mut("Pushed").expect("a struct variant");
+        assert!(fields.remove("ddl_held").is_some(), "the field is on the wire: {fields:?}");
+
+        let bytes = bson::serialize_to_vec(&body).unwrap();
+        let mut old = (bytes.len() as u32).to_be_bytes().to_vec();
+        old.extend_from_slice(&bytes);
+        assert_eq!(
+            read_frame(&mut old.as_slice()).await.unwrap(),
+            pushed(0),
+            "an older receiver's reply must read as none held"
         );
     }
 
@@ -845,6 +889,7 @@ mod tests {
         let current = Message::Pushed {
             applied: 0,
             ddl: 1,
+            ddl_held: 0,
             ddl_refused: 1,
             unknown_collection: 1,
             ddl_declined: 0,
@@ -867,6 +912,7 @@ mod tests {
             Message::Pushed {
                 applied: 0,
                 ddl: 1,
+                ddl_held: 0,
                 ddl_refused: 1,
                 unknown_collection: 1,
                 ddl_declined: 0,

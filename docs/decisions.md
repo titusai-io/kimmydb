@@ -6706,6 +6706,25 @@ transaction; it is a one-time path and is left as it is — until
 [ADR-152](#adr-152--a-snapshot-repair-pulls-one-collection-a-page-per-commit-and-resumes-where-it-stopped), which makes a snapshot page one transaction too, because a
 repair made the path a recurring one.
 
+**Addendum, 2026-09-25: a replicated index create is one commit, and a
+schema change already held is none.** A DDL entry still ends the run, and a
+replicated schema change still commits in transactions of its own; what
+changes is how many. A `CreateIndex` built or settled here appends its
+originating entry in the transaction that builds or settles the definition,
+rather than in a second one after it: one commit where there were two.
+Every other schema change, and a definition that was already standing,
+appends its entry through one shared step that first asks, in a read
+transaction, whether the oplog already holds it under its stamp byte for
+byte. If it does, nothing is written and no writer is taken; if it does not,
+the writer is taken and the question is asked again under it, and an apply
+that lost that race to another apply of the same entry aborts instead of
+committing. Measured on a three-member cluster before this, a burst of 32
+index creates on one member cost each other member 94-111 commits, nearly all
+an fsync: one build and one append per create, and one append for each
+re-delivery a pull or a relay carried. See
+[ADR-180](#adr-180--a-snapshot-restore-appends-the-entry-behind-each-index-definition-it-restores-and-that-entry-is-the-definition-as-every-member-stores-it)'s
+addendum for why the entry belongs in the build.
+
 ---
 
 ## ADR-120 — JSON object key order is preserved through the HTTP and MCP boundary
@@ -18291,6 +18310,46 @@ array, and a second test gives the receiver an array before it restores.
 stops being able to tell the two values apart fails as a fixture instead of
 passing as a test.
 
+**Addendum, 2026-09-25: the entries path appends in the settling
+transaction too, and an entry already held is left alone.** A replicated
+`CreateIndex` built or settled here now appends its originating entry — the
+origin's own bytes, under `Position::Raise` as every replicated schema
+change is — in the transaction that builds the definition or adopts its
+stamp, as a restored definition's rebuilt entry already was. The invariant
+this record set for the restore now holds on both paths: a definition and its
+entry commit together or not at all. Before, the entries path committed the
+build and then the entry, so a crash between them left the definition held
+without its entry; that state still repairs as it did, because a definition
+found standing (`IndexCreated::Standing`) has its entry appended when the
+oplog does not hold it, and that covers restored stores and stores older than
+this record alike.
+
+The entry is witnessed and published as soon as the build commits, before
+the backfill's unique collisions are reported, since that report takes
+writers of its own and can fail: the apply is then counted, because its
+commit landed (ADR-177), and the batch fails.
+
+A schema change whose entry this node already holds under its stamp, byte for
+byte, takes no writer and commits nothing; it is witnessed and published
+still, and counted in `kimmy_sync_ddl_held_total`, not as applied. **Bytes,
+not the key**: `append_oplog` replaces a different value under the stamp, so
+the origin's entry replaces a rebuild of it, and a rebuild relayed by a third
+member replaces the origin's; both still happen, and only a write that would
+change nothing is skipped. The check is made in a read transaction and made
+again under the writer, so two applies of one entry that both found it
+missing commit it once. No held mark is lost: a replicated schema change is
+appended under `Raise`, which releases none over an existing key; only
+`InWindow` does.
+
+**Tested**: a replicated create is one commit with its entry in it; a held
+entry takes no writer and is still published; a definition held without its
+entry has it appended; a rebuild with other bytes is replaced; an injected
+failure at the append leaves neither the definition nor the entry; stamp
+adoption appends in the one commit; duplicate collection and drop changes
+are held; a report that fails after the commit counts the create once; and a
+forced race between two applies of one entry commits it once. Each of these
+fails under the mutation that removes what it tests.
+
 ---
 
 ## ADR-181 — Expiry deletes a document only if its index's filter, read as `find` reads it, still selects it
@@ -19644,3 +19703,11 @@ member with the deferral and the stop rule and checks that nothing is
 confirmed that it did not take. The cluster harness's
 `a_burst_of_creates_on_one_member_is_applied_about_once_each_on_the_others`
 checks a burst of 16 end to end.
+
+**Addendum, 2026-09-25: the counters.** `kimmy_sync_ddl_applied_total` no
+longer counts a change the member already held, entry and all; those are
+`kimmy_sync_ddl_held_total`. A burst of N creates now reads about N applied on
+each other member, summed over `pull` and `push`, where it read N plus every
+re-delivery before
+([ADR-180](#adr-180--a-snapshot-restore-appends-the-entry-behind-each-index-definition-it-restores-and-that-entry-is-the-definition-as-every-member-stores-it)'s
+addendum). The cluster harness's burst test asserts at most N.
