@@ -123,13 +123,13 @@ jobs:
           fi
 
           # The storage-cache-metrics feature's tests recompile redb,
-          # kimmy-storage and kimmy-api cold, several minutes, so they run
-          # only when something they guard changed: those two crates, the
-          # manifests, or this workflow. Always on a push to main, so main
+          # kimmy-storage, kimmy-api and kimmyd cold, several minutes, so they
+          # run only when something they guard changed: those three crates,
+          # the manifests, or this workflow. Always on a push to main, so main
           # itself is never left untested with the feature.
           if [ "${GITHUB_EVENT_NAME}" = "push" ] \
              || printf '%s\n' "$changed" \
-                | grep -qE '^crates/kimmy-storage/|^crates/kimmy-api/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
+                | grep -qE '^crates/kimmy-storage/|^crates/kimmy-api/|^crates/kimmyd/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
             echo "cache_feature=true" >> "$GITHUB_OUTPUT"
           else
             echo "Nothing the storage-cache-metrics tests guard changed; skipping them."
@@ -253,18 +253,21 @@ jobs:
         run: cargo nextest run --workspace
 
       # The page cache's statistics are a build feature, off by default, so the
-      # run above never compiles them. These are the two crates that do: all of
+      # run above never compiles them. These are the crates that do: all of
       # kimmy-api, whose render, golden and documentation tests change with the
-      # feature, and kimmy-storage's cache tests, since the rest of that crate
-      # does not.
+      # feature; kimmy-storage's cache tests, since the rest of that crate
+      # does not; and kimmyd, whose OTLP bridge registers the cache instruments
+      # only with the feature, linted with it and checked by the bridge tests
+      # that compare every rendered series with the instruments.
       - name: Test the storage-cache-metrics feature
         if: >-
           needs.changes.outputs.docs_only != 'true'
           && needs.changes.outputs.cache_feature != 'false'
-        run: >-
-          cargo nextest run -p kimmy-storage -p kimmy-api
-          --features kimmy-storage/cache-metrics,kimmy-api/storage-cache-metrics
-          -E 'package(kimmy-api) | (package(kimmy-storage) & test(/cache/))'
+        run: |
+          cargo nextest run -p kimmy-storage -p kimmy-api -p kimmyd \
+            --features kimmy-storage/cache-metrics,kimmy-api/storage-cache-metrics,kimmyd/storage-cache-metrics \
+            -E 'package(kimmy-api) | (package(kimmy-storage) & test(/cache/)) | (package(kimmyd) & test(/bridge/))'
+          cargo clippy -p kimmyd --all-targets --features storage-cache-metrics -- -D warnings
 
       # Every test that reads a documentation file lives in `kimmy-api`, which
       # `documentation_tests_live_in_this_crate` holds true, so this is the
