@@ -79,7 +79,7 @@ impl RoleStore {
 
     pub fn get(&self, engine: &Engine, name: &str) -> Result<Option<Role>> {
         let id = DocId::String(name.to_string());
-        let Some(doc) = engine.get(&self.collection, &id).map_err(storage_error)? else {
+        let Some(doc) = engine.get(&self.collection, &id).map_err(AuthError::Storage)? else {
             return Ok(None);
         };
         bson::deserialize_from_document::<StoredRole>(doc)
@@ -94,7 +94,7 @@ impl RoleStore {
                 names.push(id.to_string());
                 Ok(true)
             })
-            .map_err(storage_error)?;
+            .map_err(AuthError::Storage)?;
         Ok(names)
     }
 
@@ -105,7 +105,7 @@ impl RoleStore {
         let role = Role { name: name.to_string(), grants };
         let doc = bson::serialize_to_document(&StoredRole::from(&role))
             .map_err(|e| AuthError::Hashing(format!("encoding role: {e}")))?;
-        engine.insert(&self.collection, doc).map_err(storage_error)?;
+        engine.insert(&self.collection, doc).map_err(AuthError::Storage)?;
         Ok(role)
     }
 
@@ -127,7 +127,7 @@ impl RoleStore {
         let doc = bson::serialize_to_document(&StoredRole::from(role))
             .map_err(|e| AuthError::Hashing(format!("encoding role: {e}")))?;
         let id = DocId::String(role.name.clone());
-        engine.replace(&self.collection, &id, doc, true).map_err(storage_error)?;
+        engine.replace(&self.collection, &id, doc, true).map_err(AuthError::Storage)?;
         Ok(())
     }
 
@@ -140,7 +140,7 @@ impl RoleStore {
     /// invalidate holders' tokens.
     pub fn delete(&self, engine: &Engine, name: &str) -> Result<bool> {
         let id = DocId::String(name.to_string());
-        engine.delete(&self.collection, &id).map_err(storage_error)
+        engine.delete(&self.collection, &id).map_err(AuthError::Storage)
     }
 
     /// The grants named by `roles`, concatenated.
@@ -157,8 +157,4 @@ impl RoleStore {
         }
         Ok(grants)
     }
-}
-
-fn storage_error(e: kimmy_storage::StorageError) -> AuthError {
-    AuthError::Hashing(format!("role store: {e}"))
 }

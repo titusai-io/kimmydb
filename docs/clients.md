@@ -42,9 +42,11 @@ when one stops answering. That keeps a connection warm, and it means load is not
 spread across the cluster by default — one node serves everything until it
 fails. But
 `retry: elsewhere` means *this node* did not answer, **not** that the work did
-not happen: repeating an insert that failed after its commit would apply it
-twice, and no status distinguishes the two. Reads move freely; writes are the
-caller's decision.
+not happen. A write whose outcome the server cannot know is answered
+`500 outcome_unknown` with `retry: verify`, and a write whose connection
+dropped after the request was sent is in the same state: see
+[retrying after an unknown outcome](#retrying-after-an-unknown-outcome). Reads
+move freely; writes are the caller's decision.
 
 **Resume change streams from the last token seen.** A token resumes on any node:
 exactly on the node that issued it, and on any other with every event the stream
@@ -65,6 +67,47 @@ can only fail the same way.
 **Ignore what it does not recognize.** Unknown response fields, unknown
 capabilities, unknown enum values. [Compatibility](compatibility.md) is the
 full contract.
+
+### Retrying after an unknown outcome
+
+A write has three outcomes, not two: it happened, it did not, or **it is not
+known whether it did**. The third comes two ways:
+
+- **`500 outcome_unknown`, `retry: verify`.** The write reached the storage
+  engine's durability step, and the step failed. The pages may be on disk, and
+  a node that restarts and repairs its file keeps them. So the write may be
+  there, and if it is, it replicates.
+- **A connection that closed after the request was fully sent, with no
+  answer.** This is the more common form. A node whose own fsync fails stops at
+  once (ADR-188), without answering. A crash, an OOM kill or a restart looks the
+  same. A connection that failed **before** the request was sent (refused, a
+  failed TLS handshake) is not this case: that request cannot have been applied.
+
+**What to do:**
+
+- **Retry only a write that is idempotent**, where applying it twice is the same
+  as once:
+  - an insert with a **client-assigned `_id`**, where the second attempt's
+    `duplicate_key` then means *it happened*;
+  - an update or delete carrying **`if_stamp`**, where `stale` then means *it
+    happened, or something else did: re-read*;
+  - a replace to a known, complete value.
+- **Otherwise read the target back first**, and decide from what you find.
+  Read it from **the same node once it serves again**, or from another member
+  once it has caught up. A read on another member that finds nothing is **not**
+  proof the write failed: the only copy may be on the node that stopped, until
+  it restarts and serves its peers.
+- **Never blindly resend** an insert with a server-assigned `_id`, or an
+  `$inc`: that is how one write becomes two.
+- **Proxies and service meshes:** a layer that retries a request on a `5xx` or
+  a reset must not retry non-idempotent writes. See
+  [Operations](operations.md#a-write-whose-outcome-is-unknown).
+
+**The planned cure** is server-side idempotency keys: a key the client sends
+with a write, so that the server applies any retry of it only once. With them,
+every write becomes safe to retry after an unknown outcome. They are planned,
+on the [roadmap](roadmap.md#planned-not-scheduled) with no version set, and not
+in this release.
 
 ---
 

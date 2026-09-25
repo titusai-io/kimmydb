@@ -903,3 +903,85 @@ async fn a_storage_io_error_exits_the_process_and_the_next_start_repairs_it() {
     second.signal("TERM");
     assert!(second.wait_exit().success());
 }
+
+/// A client write whose own fsync fails is never told it failed (ADR-188's
+/// addendum). `sync_data@write` fails the fsync of the first client write's
+/// commit, and the node stops inside that call: the client's request was sent,
+/// and the connection closes with no answer, which is an unknown outcome and
+/// not a refusal. After the restart the write is there, because its pages
+/// were written before the failed fsync.
+///
+/// The injection answers EIO in place of the fsync, and the kernel still
+/// holds the pages, so this shows what the client sees and what the repair
+/// keeps; it is not evidence of what a real failed fsync does to the platter.
+#[tokio::test]
+async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let url = |run: &Run, path: &str| {
+        format!("http://127.0.0.1:{}{path}", run.http.get().expect("a bound port"))
+    };
+    let login = |run: &Run| {
+        client
+            .post(url(run, "/v1/auth/login"))
+            .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+            .send()
+    };
+
+    let mut before = Run::spawn(dir.path(), "write-fsync-before");
+    before.wait_ready(&client).await;
+    let body: serde_json::Value = login(&before).await.unwrap().json().await.unwrap();
+    let token = body["token"].as_str().expect("a token").to_string();
+    let res = client
+        .post(url(&before, "/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await;
+    assert!(res.unwrap().status().is_success());
+    before.signal("TERM");
+    assert!(before.wait_exit().success());
+
+    let mut failing = Run::spawn_with(
+        dir.path(),
+        "write-fsync-fails",
+        &[("KIMMY_TEST_FAIL_STORAGE", "sync_data@write")],
+    );
+    failing.wait_ready(&client).await;
+    let body: serde_json::Value = login(&failing).await.unwrap().json().await.unwrap();
+    let token = body["token"].as_str().expect("a token").to_string();
+    let answered = client
+        .post(url(&failing, "/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 7, "item": "maybe" }))
+        .send()
+        .await;
+    match answered {
+        Err(e) => assert!(!e.is_connect(), "the request was sent, and the answer never came: {e}"),
+        Ok(res) => {
+            // Answered before the stop: then only as unknown, never as failed.
+            let status = res.status();
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            assert_eq!(body["error"], "outcome_unknown", "{status} {body}");
+            assert_eq!(body["retry"], "verify", "{body}");
+        }
+    }
+    let status = failing.wait_exit();
+    assert_eq!(status.code(), Some(70), "the fsync failure stops the node: {status:?}");
+    let log = failing.log();
+    assert!(log.contains("sync_data"), "the log names the call: {log}");
+
+    let mut after = Run::spawn(dir.path(), "write-fsync-after");
+    after.wait_ready(&client).await;
+    let body: serde_json::Value = login(&after).await.unwrap().json().await.unwrap();
+    let token = body["token"].as_str().expect("a token");
+    let kept = client
+        .get(url(&after, "/v1/db/shop/coll/orders/docs/7"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), 200, "the write whose fsync failed is there after the repair");
+    after.signal("TERM");
+    assert!(after.wait_exit().success());
+}

@@ -103,6 +103,13 @@ pub enum AuthError {
     #[error("password hashing failed: {0}")]
     Hashing(String),
 
+    /// The user or role store's storage failed. Kept whole rather than turned
+    /// into text, so that the API answers it as the storage error it is: a
+    /// write whose commit failed after its fsync began is `outcome_unknown`,
+    /// not an authentication failure to retry elsewhere.
+    #[error("user or role store: {0}")]
+    Storage(#[from] kimmy_storage::StorageError),
+
     #[error("could not issue token: {0}")]
     TokenIssue(String),
 }

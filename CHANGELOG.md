@@ -14,6 +14,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **A write whose outcome is unknown is answered as unknown.** A write whose
+  durability step began and then failed may have happened: after a failed
+  fsync the pages can survive the repair on the next start, and the write
+  replicates. It is now answered **`500 outcome_unknown`**, with the new retry
+  class **`retry: verify`**: read the target back before sending it again,
+  unless the write is idempotent. It was answered `500 internal`, which read as
+  "it failed", and a client that retried a non-idempotent write applied it
+  twice. **The set of retry classes is declared open**: a client treats a class
+  it does not know as `no`, which all three first-party clients already did.
+  Usually the node stops before it can answer (a storage I/O error stops the
+  process), and the client sees a dropped connection, which is the same unknown
+  outcome. See [retrying after an unknown outcome](docs/clients.md#retrying-after-an-unknown-outcome).
 - **`kimmy_storage_cache_bytes`**, **`kimmy_storage_cache_evictions_total`**
   and **`kimmy_storage_cache_reads_total{result}`** report the storage
   engine's page cache, **in a build with the new `storage-cache-metrics`
@@ -84,6 +96,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **An index create or drop is no longer answered `503 timeout` after it has
+  committed.** The request's deadline could pass while the node was waiting for
+  its members to confirm the change, and the client was told the request was
+  abandoned, although the index existed and replicated. The confirmation now
+  waits no longer than the request has left. Members that have not answered
+  by then are reported under `confirmation.pending`, as members that answer
+  too slowly always were. When the build itself used the whole deadline, as
+  on a large collection, the members are reported pending at once, with the
+  reason "the request's deadline left no time to wait for an answer", and
+  nothing is waited for.
+- **A user or role write whose storage failed is answered with the storage
+  error's own code.** The user and role stores turned every storage error into
+  an authentication failure, answered `500 internal` with `retry: elsewhere`.
+  A create, delete or password change whose commit failed after its fsync began
+  is now `500 outcome_unknown`, `retry: verify`, as a document write is, and
+  every other storage error keeps its code (a write that waited out the
+  deadline for the storage writer, for one, is `503 timeout`,
+  `retry: wait`).
 - **Under `storage.durability = coalesced`, a write could be acknowledged
   durable when no fsync covered it, and lost on a crash.** A commit that
   landed in a narrow window, after the shared flush had synced and before the

@@ -2434,7 +2434,7 @@ the intended cost: it is the mechanism, not friction around it.
 
 ---
 
-## ADR-057 — The error taxonomy is closed, and retryability is three-valued
+## ADR-057 — The error taxonomy is closed, and retryability is an open set of classes
 
 **Decision.** The error code set is a Rust enum, `kimmy_api::error::ErrorCode`,
 and every code carries a **retry class**: `no`, `wait`, or `elsewhere`. The
@@ -2534,6 +2534,22 @@ change; `ApiError.code` changed type, which touched six construction sites and
 four assertions and nothing else, because the sixty-one other sites go through
 named constructors. And every future error must be classified — deliberately,
 since that is the mechanism rather than an overhead beside it.
+
+**Addendum, 2026-09-25: a fourth class, `verify`, and the set of classes is
+open.** `retry: verify` means *read the target back before sending the request
+again*, because the request may already have been applied. The one code that
+carries it is `outcome_unknown`, a `500` for a write whose durability step began
+and then failed: after a failed fsync, the pages may be on disk and survive the
+repair, so the write may have happened and may replicate. Waiting does not tell
+the client whether it happened, and neither does moving to another node; a read
+does. So neither `wait` nor `elsewhere` fits.
+
+**The classes are declared an open set.** A client treats a class it does not
+know as `no`, the safe direction: a client that does not understand the advice
+does not act on it. All three first-party clients already did this, so `verify`
+reaches an older client as `no`. That is wrong only in being too cautious. The
+codes stay closed in the server, as before. The title says three-valued no
+longer.
 
 ---
 
@@ -5121,6 +5137,24 @@ comparison when the per-principal limit is off and one lock acquisition when
 it is on. The 429 counter is no longer a single-source number:
 `kimmy_rate_limited_total` counts both limiters, and
 `kimmy_rate_limited_principal_total` is how they are told apart.
+
+**Addendum, 2026-09-26: a committed change is never answered `timeout`.** The
+deadline is a timeout around the handler, and Tokio polls the handler before
+the timer, so the timer can answer only while the handler is pending at an
+`.await`. Every commit runs inside `block_in_place` within one poll, so a
+handler is never dropped mid-commit. **The invariant: between a write's commit
+and its response there is no `.await`, except a schema change's confirmation
+(ADR-140), and that one does not await once the deadline is near.** The
+confirmation waits at most the request's time left less 250 ms for writing the
+answer. When no time is left, typically because an index build over a large
+collection took it all, the confirmer answers in the same poll with every
+member pending, and nothing is awaited: an await then could return pending, and
+the timer, already overdue, would answer "abandoned" for an index that exists
+and replicates. A confirmer given no time is required to be ready when first
+polled (`DdlConfirmer`); one that is not is still not awaited, and the change
+is answered without a confirmation. An audit of every `.await` in the API and
+MCP crates found no other one after a commit. A new one after a commit breaks
+this, and must either come before the commit or be capped the same way.
 
 ---
 
@@ -19187,6 +19221,28 @@ A repair after the exit is cheap. It took 1.27 s for a 4 GiB file and 5.22 s for
 ### Test
 
 `a_storage_io_error_exits_the_process_and_the_next_start_repairs_it` drives a real `kimmyd` with `KIMMY_TEST_FAIL_STORAGE=sync_data`, which fails one fsync with EIO once the node is serving. It asserts exit 70, the log line and the marker naming the call, and then on the next start the announcement, the repair and a ready node. With the backend no longer recording the failure, the node keeps running and serving `PreviousIo`, and the test fails on "did not exit".
+
+**Addendum, 2026-09-25: what the writer's client sees.** A write caught by the
+stop is not told it failed, because it may not have. If the write's own
+`sync_data` is the first I/O error, the reaction runs inside that call and the
+process stops there: no answer is written, and the client sees its connection
+close after its request was sent. If the first error hit another thread, such as
+a reader, redb has not yet seen it while that thread reports, which is up to
+five seconds. A write whose own fsync fails in that window is answered, and it
+is answered `500 outcome_unknown` with `retry: verify` (ADR-057), not `internal`.
+
+The engine classifies by phase, conservatively. A commit that fails after a
+`sync_data` was attempted in it, including the file shrink redb makes after its
+final fsync and the frees that follow, is `StorageError::OutcomeUnknown`. A
+failure before any fsync (its writes, a growth) leaves the commit absent, and
+stays a plain failure. Under `coalesced`, a failed shared flush makes every
+commit it covered unknown.
+
+The test switch gains `sync_data@write`, which fails the fsync of a client
+write's own commit, so the end-to-end test watches the write it sent. The
+injection answers EIO in place of the fsync, and the pages are in the OS's
+cache, so the tests show the classification and the recovery, not what a real
+failed fsync does to the platter.
 
 ---
 

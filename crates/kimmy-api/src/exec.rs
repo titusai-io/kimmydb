@@ -1621,8 +1621,39 @@ pub async fn confirm_ddl(
     let Some(entry) = state.engine.oplog_entry(&stamp)? else {
         return Ok(None);
     };
-    Ok(Some(confirmation_to_json(&confirm(entry).await)))
+    // The change has committed. Whatever the confirmation has not heard when
+    // the request's deadline comes is reported as pending, with the margin
+    // left to write the answer: cut off by the deadline instead, the request
+    // was answered "abandoned" for a change that exists and replicates.
+    let cap = crate::limits::request_time_left().map(|left| left.saturating_sub(ANSWER_MARGIN));
+    if cap.is_some_and(|cap| cap.is_zero()) {
+        // No time left, typically because the change itself took it (an index
+        // build over a large collection). Nothing may be awaited now: pending
+        // at an `.await`, the handler lets the request's deadline, already
+        // passed, answer "abandoned" for a change that exists. So the
+        // confirmation is polled once, and a confirmer given no time answers
+        // at once (`DdlConfirmer`). One that did not would still not be
+        // awaited: the change is answered with no confirmation, which says
+        // nothing about the members rather than something false.
+        let mut waiting = confirm(entry, cap);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        return Ok(match std::future::Future::poll(waiting.as_mut(), &mut context) {
+            std::task::Poll::Ready(found) => Some(confirmation_to_json(&found)),
+            std::task::Poll::Pending => {
+                tracing::warn!(
+                    "a schema-change confirmation given no time did not answer at once; the \
+                     change is answered without one"
+                );
+                None
+            }
+        });
+    }
+    Ok(Some(confirmation_to_json(&confirm(entry, cap).await)))
 }
+
+/// What a schema change's confirmation leaves of the request's deadline for
+/// writing the answer.
+const ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A confirmation as a response carries it: node ids as strings, the way
 /// `/v1/topology` names them, and each pending member with its reason.

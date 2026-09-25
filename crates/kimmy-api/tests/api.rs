@@ -10341,7 +10341,7 @@ fn canned_confirmer(
     finding: kimmy_api::DdlConfirmation,
     seen: Arc<std::sync::Mutex<Vec<kimmy_core::OplogEntry>>>,
 ) -> kimmy_api::DdlConfirmer {
-    Arc::new(move |entry: kimmy_core::OplogEntry| {
+    Arc::new(move |entry: kimmy_core::OplogEntry, _cap: Option<std::time::Duration>| {
         let finding = finding.clone();
         let seen = Arc::clone(&seen);
         Box::pin(async move {
@@ -10349,6 +10349,211 @@ fn canned_confirmer(
             finding
         })
     })
+}
+
+/// A confirmer that waits as long as it is allowed, or ten seconds when it is
+/// given no cap, and then reports the one member as not having answered: a
+/// member that never answers, as the daemon's confirmer would find it. Given
+/// no time at all it answers at once, as `DdlConfirmer` requires. Every cap it
+/// is handed is kept in `caps`.
+fn silent_member_confirmer(
+    member: kimmy_core::NodeId,
+    caps: Arc<std::sync::Mutex<Vec<Option<std::time::Duration>>>>,
+) -> kimmy_api::DdlConfirmer {
+    Arc::new(move |_entry: kimmy_core::OplogEntry, cap: Option<std::time::Duration>| {
+        caps.lock().unwrap().push(cap);
+        let waited = cap.unwrap_or(std::time::Duration::from_secs(10));
+        let found = kimmy_api::DdlConfirmation {
+            pending: vec![(member, format!("no answer within {waited:?}"))],
+            ..Default::default()
+        };
+        if waited.is_zero() {
+            return Box::pin(std::future::ready(found));
+        }
+        Box::pin(async move {
+            tokio::time::sleep(waited).await;
+            found
+        })
+    })
+}
+
+/// A write that commits after the request's deadline has passed is still
+/// answered with its result. The commit runs inside `block_in_place` on the
+/// handler's own task, so the deadline cannot fire while it runs, and once it
+/// returns the deadline's timer is checked only after the handler, which is
+/// ready: a committed write is never answered `503 timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_whose_commit_outlasts_the_deadline_is_answered_with_its_result() {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(1),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let orders = server.state.engine.create_collection("shop", "orders").unwrap();
+    let mut outlasted = 0;
+    for id in 0..20i64 {
+        let started = std::time::Instant::now();
+        let res = server.post("/v1/db/shop/coll/orders/docs", None, json!({ "_id": id })).await;
+        let present =
+            server.state.engine.get(&orders, &kimmy_core::DocId::Int64(id)).unwrap().is_some();
+        if res.status == 503 {
+            // Refused before anything was written, waiting for the body.
+            assert!(!present, "a write answered abandoned was written: {:?}", res.body);
+            continue;
+        }
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        assert!(present);
+        if started.elapsed() > std::time::Duration::from_millis(1) {
+            outlasted += 1;
+        }
+    }
+    assert!(outlasted > 0, "premise: some commit outlasted the one-millisecond deadline");
+}
+
+#[tokio::test]
+async fn an_index_create_that_has_committed_is_never_answered_as_abandoned() {
+    // The request's deadline passes while its confirmation waits on a member
+    // that never answers. The index exists and replicates, so the answer is
+    // the index with that member pending, not a `503 timeout` saying the
+    // request was abandoned.
+    let server = Server::start_with_request_timeout(std::time::Duration::from_secs(1)).await;
+    let token = server.root().await;
+    let member = kimmy_core::NodeId::generate();
+    let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.state.set_ddl_confirmer(silent_member_confirmer(member, Arc::clone(&caps)));
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+
+    let started = std::time::Instant::now();
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "inside the deadline");
+    let cap = caps.lock().unwrap()[0].expect("a request with a deadline caps the wait");
+    assert!(
+        cap > std::time::Duration::ZERO && cap <= std::time::Duration::from_millis(750),
+        "the time left, less the margin for the answer: {cap:?}"
+    );
+    assert_eq!(
+        created.body["confirmation"]["pending"],
+        json!([{ "node": member.to_string(), "reason": format!("no answer within {cap:?}") }]),
+        "the member, and why"
+    );
+
+    let dropped = server.delete("/v1/db/shop/coll/orders/indexes/by_email", Some(&token)).await;
+    assert_eq!(dropped.status, 200, "and a drop the same way: {:?}", dropped.body);
+    let cap = caps.lock().unwrap()[1].expect("capped");
+    assert_eq!(
+        dropped.body["confirmation"]["pending"],
+        json!([{ "node": member.to_string(), "reason": format!("no answer within {cap:?}") }]),
+    );
+}
+
+/// A user or role write whose commit fails after its fsync began is answered
+/// as the storage error it is, `outcome_unknown`, like a document write: the
+/// user may exist. The stores once turned every storage error into an
+/// authentication failure, answered `500 internal`, `retry: elsewhere`.
+#[tokio::test]
+async fn a_user_or_role_write_whose_fsync_fails_is_answered_outcome_unknown() {
+    for (path, body) in [
+        ("/v1/users", json!({ "user": "alice", "password": "alice-password" })),
+        ("/v1/roles", json!({ "name": "clerk", "grants": [] })),
+    ] {
+        let server = Server::start().await;
+        let token = server.root().await;
+        assert!(server.state.engine.arm_test_storage_failure("sync_data"));
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 500, "{path}: {:?}", res.body);
+        assert_eq!(res.body["error"], "outcome_unknown", "{path}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "verify", "{path}");
+    }
+}
+
+/// The case the cap alone missed: the build itself uses the whole deadline.
+/// The backfill runs synchronously inside one poll, so by the time the
+/// confirmation is reached the deadline has passed and no time is left. Had it
+/// awaited anything then, the request's timer — overdue — answered `503
+/// timeout` for an index that exists. It must answer in the same poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_index_whose_build_outlasts_the_deadline_is_answered_with_the_index() {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(100),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let engine = &server.state.engine;
+    let orders = engine.create_collection("shop", "orders").unwrap();
+    for batch in 0..20 {
+        let docs = (0..1_000)
+            .map(|i| bson::doc! { "_id": batch * 1_000 + i, "email": format!("{batch}-{i}") })
+            .collect();
+        engine.insert_many(&orders, docs).unwrap();
+    }
+    let member = kimmy_core::NodeId::generate();
+    let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.state.set_ddl_confirmer(silent_member_confirmer(member, Arc::clone(&caps)));
+
+    let started = std::time::Instant::now();
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            None,
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert!(
+        started.elapsed() > std::time::Duration::from_millis(100),
+        "premise: the build outlasted the deadline"
+    );
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["name"], "by_email");
+    assert_eq!(caps.lock().unwrap()[0], Some(std::time::Duration::ZERO), "no time left");
+    assert_eq!(
+        created.body["confirmation"]["pending"],
+        json!([{ "node": member.to_string(), "reason": "no answer within 0ns" }]),
+    );
+    let meta = engine.get_collection("shop", "orders").unwrap();
+    assert!(meta.indexes.iter().any(|index| index.name == "by_email"), "and the index is there");
+}
+
+/// A confirmer given no time that does not answer at once is still not
+/// awaited: the change is answered, with no confirmation rather than a
+/// `503 timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmer_given_no_time_is_never_awaited() {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(100),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let engine = &server.state.engine;
+    let orders = engine.create_collection("shop", "orders").unwrap();
+    for batch in 0..20 {
+        let docs = (0..1_000)
+            .map(|i| bson::doc! { "_id": batch * 1_000 + i, "email": format!("{batch}-{i}") })
+            .collect();
+        engine.insert_many(&orders, docs).unwrap();
+    }
+    server.state.set_ddl_confirmer(Arc::new(|_entry, _cap| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            kimmy_api::DdlConfirmation::default()
+        })
+    }));
+
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            None,
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert!(created.body.get("confirmation").is_none(), "{}", created.body);
 }
 
 #[tokio::test]

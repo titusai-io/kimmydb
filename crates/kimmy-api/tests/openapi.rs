@@ -277,7 +277,10 @@ fn every_error_code_is_specified_with_the_retry_class_the_server_uses() {
         .iter()
         .map(|v| v.as_str().expect("a class is a string"))
         .collect();
-    assert_eq!(classes, BTreeSet::from(["no", "wait", "elsewhere"]));
+    // Every class the server sends, and no other: derived from the codes, so
+    // a class added to the enum and served is one the specification names.
+    let served: BTreeSet<&str> = ErrorCode::ALL.iter().map(|code| code.retry().as_str()).collect();
+    assert_eq!(classes, served);
 }
 
 /// The error table in `docs/http-api.md`, as `(status, code, retry)` per row.

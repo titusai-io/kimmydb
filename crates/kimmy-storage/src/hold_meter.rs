@@ -713,6 +713,9 @@ impl redb::StorageBackend for MeteredBackend {
     fn sync_data(&self) -> std::result::Result<(), std::io::Error> {
         #[cfg(test)]
         test_hooks::backend_call(Io::Sync);
+        // Before the call: a commit that attempted a sync and then failed,
+        // here or later, may have reached the disk.
+        self.health.sync_attempted();
         self.checked("sync_data", || io(Io::Sync, 0, || self.inner.sync_data()))
     }
 

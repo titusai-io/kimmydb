@@ -77,10 +77,12 @@ info:
     { "error": "duplicate_key", "message": "duplicate _id", "retry": "no" }
     ```
 
-    `retry` is three-valued — `no`, `wait`, `elsewhere` — because KimmyDB is
-    leaderless. Every node accepts writes, so "ask a different node" is a real
-    answer here, and it is the right one for a failure local to the node that
-    answered. `components.schemas.ErrorCode` is the complete set with the class
+    `retry` is `no`, `wait`, `elsewhere` or `verify`. It is several-valued
+    because KimmyDB is leaderless: every node accepts writes, so "ask a
+    different node" is a real answer here, and it is the right one for a
+    failure local to the node that answered. `verify` says the write may
+    already have happened: read it back before resending. **The set of classes
+    is open, and a client treats a class it does not know as `no`.** `components.schemas.ErrorCode` is the complete set with the class
     of each; it is closed in the server by an enum, so a code cannot be added
     without its class being decided at the same time.
 
@@ -2985,6 +2987,7 @@ components:
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
         | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
+        | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
       enum:
         - bad_request
         - payload_too_large
@@ -3006,6 +3009,7 @@ components:
         - stale
         - timeout
         - collection_purging
+        - outcome_unknown
 
     Capability:
       type: string
@@ -3064,8 +3068,11 @@ components:
     Retry:
       type: string
       description: |
-        What a client may do about a failure. **Three-valued rather than a
-        boolean, because KimmyDB is leaderless** — every node accepts writes,
+        What a client may do about a failure. **The set is open: a client
+        treats a class it does not know as `no`**, the safe direction, since a
+        client that does not understand the advice does not act on it
+        (ADR-057). **Several-valued rather than a boolean, because KimmyDB is
+        leaderless** — every node accepts writes,
         so "ask a different node" is an answer available here that a
         primary-based database cannot give, and it is the right answer for a
         node-local failure. Telling a client only "retryable" would have it
@@ -3078,11 +3085,12 @@ components:
       # Rust's reader parsed it as the string and PyYAML as `False`, so two
       # readers of this document disagreed about a value on the wire — found by
       # driving a real node with a second, independently written validator.
-      enum: ["no", "wait", "elsewhere"]
+      enum: ["no", "wait", "elsewhere", "verify"]
       x-kimmy-meanings:
         "no": Nothing to retry. The request must change, or the condition must.
         wait: The same node, after a delay — `Retry-After` when the server knows it, otherwise the client's own backoff.
         elsewhere: A different node. The failure is local to this one and a peer holds the same data.
+        verify: Read the target back before sending the request again — it may already have been applied. Only an idempotent write is safe to resend without reading.
 
     Document:
       type: object
