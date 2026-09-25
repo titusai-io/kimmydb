@@ -4316,9 +4316,12 @@ by it: its own flush decides it. Before this, a failed flush woke its waiters
 into a loop on a count that never moved. In `kimmyd` the process has already
 stopped (ADR-188), but any other user of the engine hung. The test
 `a_commit_landing_between_a_flush_and_its_bookkeeping_waits_for_a_flush_of_its_own`
-parks the leader in that gap and lands a commit there. It fails if the ticket
-is taken after the release, or if the coverage is read after the flush lets
-go.
+parks the leader in that gap and lands a commit there, and fails if the
+coverage is read after the flush lets go.
+`a_commit_that_let_go_of_the_writer_before_a_flush_took_it_is_covered_by_that_flush`
+fails if the ticket is taken after the release. A ticket taken late is safe
+but costly: it misses the flush that synced its pages and waits for a second
+one.
 
 ## ADR-089 — The CLI is for people: `client_credentials` leaves `kimmy`
 
