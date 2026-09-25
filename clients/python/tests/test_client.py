@@ -26,6 +26,25 @@ def seed(db, n):
     )
 
 
+def recreate(db, database, collection, deadline=30.0):
+    """Create a collection just dropped, waiting out the drop's purge.
+
+    A drop answers once the collection is buried, and a separate purger then
+    removes what it held. Until that is done, creating the name again is
+    refused `503 collection_purging` with `retry: wait` and a `Retry-After`
+    (ADR-189). On a tiny collection the purge usually wins the race, which is
+    why a test that recreated at once passed until it didn't.
+    """
+    give_up = time.monotonic() + deadline
+    while True:
+        try:
+            return db.create_collection(database, collection)
+        except KimmyError as e:
+            if e.code != "collection_purging" or time.monotonic() >= give_up:
+                raise
+            time.sleep(min(e.retry_after or 1, max(give_up - time.monotonic(), 0)))
+
+
 def test_a_client_built_with_credentials_holds_a_token(db):
     assert db.token is not None
     assert isinstance(db.request("GET", "/v1/databases")["databases"], list)
@@ -262,7 +281,7 @@ def test_a_recreated_collection_serves_only_its_own_history(db):
     db.insert("shop", "orders", {"_id": 1, "ghost": True})
     db.request("DELETE", "/v1/db/shop/coll/orders")
 
-    db.create_collection("shop", "orders")
+    recreate(db, "shop", "orders")
     db.insert("shop", "orders", {"_id": 99, "live": True})
 
     stream = db.watch("shop", "orders", from_start=True)
@@ -282,7 +301,7 @@ def test_a_resume_token_from_before_a_drop_is_refused(db):
     stream.close()
 
     db.request("DELETE", "/v1/db/shop/coll/orders")
-    db.create_collection("shop", "orders")
+    recreate(db, "shop", "orders")
 
     with pytest.raises(KimmyError) as caught:
         db.watch("shop", "orders", resume_after=token)

@@ -370,7 +370,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
             let client = connect(base).await?;
             seeded(&client, 1).await?;
             drop_collection(&client).await?;
-            seeded(&client, 0).await?;
+            recreated(&client).await?;
             client
                 .insert("shop", "orders", &json!({ "_id": 99 }))
                 .await
@@ -467,7 +467,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
             stream.close().await;
 
             drop_collection(&client).await?;
-            seeded(&client, 0).await?;
+            recreated(&client).await?;
 
             let refused = client
                 .watch("shop", "orders", WatchOptions::new().resume_after(token))
@@ -479,6 +479,37 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
         }
 
         other => Err(format!("unknown scenario {other:?}")),
+    }
+}
+
+/// Create `shop.orders` again after dropping it, waiting out the drop's purge:
+/// until that is done the name is refused `503 collection_purging`,
+/// `retry: wait`, with a `Retry-After` (ADR-189). On a tiny collection the purge
+/// usually wins the race, which is why recreating at once passed until it
+/// didn't.
+async fn recreated(client: &Client) -> Result<(), String> {
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let created = client
+            .request(
+                Method::Post,
+                "/v1/db/shop/collections",
+                Some(json!({ "name": "orders" })),
+                Safety::Idempotent,
+            )
+            .await;
+        match created {
+            Err(kimmy_client::Error::Api {
+                code: ErrorCode::CollectionPurging,
+                retry_after,
+                ..
+            }) if std::time::Instant::now() < give_up => {
+                let wait = std::time::Duration::from_secs(retry_after.unwrap_or(1))
+                    .min(give_up.saturating_duration_since(std::time::Instant::now()));
+                tokio::time::sleep(wait).await;
+            }
+            other => return other.map(|_| ()).map_err(|e| e.to_string()),
+        }
     }
 }
 
