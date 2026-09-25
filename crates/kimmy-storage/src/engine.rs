@@ -111,6 +111,17 @@ pub struct Engine {
     /// Wakes committers waiting at the barrier; beside the mutex rather than
     /// inside it so a wait can re-acquire the lock it released.
     coalesce_woken: Condvar,
+    /// Test builds only: flushes started, numbered as each takes the writer,
+    /// and the highest such number among flushes that succeeded. A coalesced
+    /// commit notes the first at its commit, under the writer; if it is
+    /// acknowledged while the second is not above that, no flush that
+    /// started after it had landed, and `durability_violations` counts it.
+    #[cfg(test)]
+    flush_starts: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    flushed_start: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    durability_violations: std::sync::atomic::AtomicU64,
     /// Commits that reached the disk with their own fsync, or the shared
     /// fsync of a barrier flush — the number of times the disk was asked to
     /// make something durable.
@@ -541,18 +552,87 @@ fn meter_writer_wait(waited: std::time::Duration) {
 /// during the window are *followers* and only wait. A committer always
 /// waits for a flush that started after its own commit, which is what makes
 /// "durable when the call returns" hold.
+///
+/// **Coverage is decided under the writer gate, on both sides.** A committer
+/// takes its ticket while it still holds the gate, after its commit has
+/// landed; a flush reads the highest ticket issued once it holds the gate,
+/// before its own commit. So a flush covers exactly the commits that landed
+/// before it, and a commit that lands after it takes a higher ticket. The
+/// barrier once read the count at the end instead, after the flush had let
+/// go of the gate, and a commit landing in that gap was marked covered by a
+/// flush that finished before it: acknowledged durable with nothing making it
+/// so. That was present from 0.12.0 through 0.38.0.
 struct Coalescer {
     window: std::time::Duration,
-    /// Commits so far that are waiting on, or have had, a flush.
-    requested: u64,
-    /// Commits covered by the last completed flush.
+    /// Tells a ticket from a barrier replaced by [`Engine::set_durability`]
+    /// apart from one of this barrier.
+    generation: u64,
+    /// Tickets issued: commits that landed and wait on a flush. Issued under
+    /// the writer gate.
+    issued: u64,
+    /// Every ticket at or below this is covered by a flush that succeeded.
     flushed: u64,
+    /// The last failed flush: the highest ticket it covered, and its error.
+    /// Final for those tickets, unless a later flush succeeded over them
+    /// (`flushed` is checked first): see [`Engine::wait_for_flush`]. Only
+    /// the last is kept; an earlier one's tickets are below it, and answered
+    /// by the same rule.
+    failed: Option<(u64, String)>,
     leader_running: bool,
 }
 
 impl Coalescer {
     fn new(window: std::time::Duration) -> Self {
-        Self { window, requested: 0, flushed: 0, leader_running: false }
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            window,
+            generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            issued: 0,
+            flushed: 0,
+            failed: None,
+            leader_running: false,
+        }
+    }
+}
+
+/// A committer's place at the barrier: which barrier, and which ticket.
+#[derive(Clone, Copy, Debug)]
+struct Ticket {
+    generation: u64,
+    number: u64,
+}
+
+/// What a flush covered: every ticket up to `covered` of the barrier
+/// `generation`, or nothing at all when there was no barrier.
+#[derive(Clone, Copy, Debug)]
+struct Coverage {
+    generation: Option<u64>,
+    covered: u64,
+}
+
+/// A committer leading its barrier's flush. If the leader unwinds before its
+/// bookkeeping, this hands the leadership back and wakes the waiters, one of
+/// whom leads next. Left set, `leader_running` would make every later commit
+/// on the barrier wait for a flush nobody runs.
+struct Leading<'a> {
+    engine: &'a Engine,
+    generation: u64,
+    done: bool,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut guard = self.engine.coalescer.lock();
+        if let Some(c) = guard.as_mut()
+            && c.generation == self.generation
+        {
+            c.leader_running = false;
+        }
+        drop(guard);
+        self.engine.coalesce_woken.notify_all();
     }
 }
 
@@ -658,12 +738,25 @@ impl WriteTxn<'_> {
         blocking(move || {
             txn.commit()?;
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The ticket is taken **before** the writer is let go: a flush
+            // reads the tickets issued once it holds the writer, so a commit
+            // that has landed is either counted by the flush that follows it
+            // or holds a ticket no earlier flush can claim.
+            let ticket = if coalesced { engine.issue_ticket() } else { None };
+            #[cfg(test)]
+            let landed_after = engine.flush_starts.load(std::sync::atomic::Ordering::SeqCst);
             // The writer is free from here: what follows is the barrier,
             // whose leader opens a transaction of its own (ADR-088).
             self.release();
+            #[cfg(test)]
+            barrier_hooks::reach(barrier_hooks::Point::Released);
             if coalesced {
                 engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                engine.wait_for_flush()?;
+                engine.wait_for_flush(ticket)?;
+                #[cfg(test)]
+                if engine.flushed_start.load(std::sync::atomic::Ordering::SeqCst) <= landed_after {
+                    engine.durability_violations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             } else {
                 engine.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -676,6 +769,61 @@ impl WriteTxn<'_> {
         let result = txn.abort();
         self.release();
         result
+    }
+}
+
+/// The error a waiter gets from a failed flush that covered its commit: the
+/// leader's own, as text, since a `CommitError` is not `Clone`.
+fn flush_failed(error: &str) -> redb::CommitError {
+    redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(format!(
+        "the shared flush covering this commit failed: {error}"
+    ))))
+}
+
+/// A test-only point in the barrier, for the test that a commit landing
+/// between a flush and its bookkeeping is not taken as covered by it.
+#[cfg(test)]
+pub(crate) mod barrier_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// The leader's flush has committed and let go of the writer, and
+        /// the leader has not yet recorded what it covered.
+        FlushedBeforeBookkeeping,
+        /// A committer has let go of the writer and not yet reached the
+        /// barrier.
+        Released,
+        /// The leader has recorded its flush and woken the waiters, and has
+        /// not yet gone round again.
+        AfterBookkeeping,
+    }
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOKS: RefCell<Vec<(Point, Hook)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Run `f` the first time this thread reaches `point`. One hook per
+    /// point; several points may be armed at once.
+    pub(crate) fn at(point: Point, f: impl FnOnce() + 'static) {
+        HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            h.retain(|(at, _)| *at != point);
+            h.push((point, Box::new(f)));
+        });
+    }
+
+    pub(crate) fn reach(point: Point) {
+        let hook = HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            let i = h.iter().position(|(at, _)| *at == point)?;
+            Some(h.remove(i).1)
+        });
+        if let Some(f) = hook {
+            f();
+        }
     }
 }
 
@@ -1020,6 +1168,12 @@ impl Engine {
             ),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
+            #[cfg(test)]
+            flush_starts: Default::default(),
+            #[cfg(test)]
+            flushed_start: Default::default(),
+            #[cfg(test)]
+            durability_violations: Default::default(),
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
             writer_gate: parking_lot::Mutex::new(()),
@@ -2461,8 +2615,10 @@ impl Engine {
 
     /// Choose how commits become durable. `window` is the coalescing window
     /// and is ignored for `Durable`. Set once at startup; switching while
-    /// writes are in flight is safe (each transaction reads the class when it
-    /// opens) but pointless.
+    /// writes are in flight is safe but pointless. Each transaction reads the
+    /// class when it opens, and a committer whose barrier has been replaced
+    /// flushes for itself. A leader of the old barrier records what its flush
+    /// covered only on the barrier it read that coverage from.
     pub fn set_durability(&self, class: DurabilityClass, window: std::time::Duration) {
         let mut coalescer = self.coalescer.lock();
         *coalescer = match class {
@@ -2483,54 +2639,110 @@ impl Engine {
         self.grouped_commits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A ticket for a commit that has just landed, taken while its
+    /// transaction still holds the writer; `None` if the class is no longer
+    /// `coalesced`.
+    fn issue_ticket(&self) -> Option<Ticket> {
+        let mut guard = self.coalescer.lock();
+        let c = guard.as_mut()?;
+        c.issued += 1;
+        Some(Ticket { generation: c.generation, number: c.issued })
+    }
+
     /// Wait until a barrier flush that started after this commit has landed,
     /// running the flush if nobody else is.
-    fn wait_for_flush(&self) -> std::result::Result<(), redb::CommitError> {
-        let window;
-        let my_ticket;
-        {
-            let mut guard = self.coalescer.lock();
+    ///
+    /// **A failed flush** is final for every ticket it covered, unless a
+    /// later flush succeeded over them, which is checked first: such a flush
+    /// did sync their pages, so success is then the true answer. Otherwise
+    /// those committers get its error and do not try again: their pages were
+    /// written before a flush that failed, so whether they reached the disk is
+    /// not known. A ticket it did not cover — a commit that landed after the
+    /// failed flush took the writer — is not failed by it: that commit's
+    /// durability is decided by a flush of its own, which this waiter runs or
+    /// joins. Under redb a failed flush is an I/O error, which latches every
+    /// later operation to `PreviousIo`, so no later flush can in fact succeed
+    /// in the same process; the rule does not depend on that, and a success
+    /// here is never a wrong answer.
+    fn wait_for_flush(&self, ticket: Option<Ticket>) -> std::result::Result<(), redb::CommitError> {
+        let mut guard = self.coalescer.lock();
+        loop {
             let Some(c) = guard.as_mut() else {
                 // The class changed to `durable` between open and commit:
                 // nothing will flush for us, so flush ourselves.
                 drop(guard);
-                return self.flush_now();
+                return self.flush_now().map(|_| ()).map_err(|(_, e)| e);
             };
-            c.requested += 1;
-            my_ticket = c.requested;
-            window = c.window;
-            if c.leader_running {
-                // A leader is collecting. Its flush starts after its window,
-                // which is after now, so it covers this ticket; if the class
-                // is switched off meanwhile the wait ends with nothing left
-                // to wait for.
-                while guard.as_ref().is_some_and(|c| c.flushed < my_ticket) {
-                    self.coalesce_woken.wait(&mut guard);
-                }
+            let Some(ticket) = ticket.filter(|t| t.generation == c.generation) else {
+                // Issued by a barrier since replaced, whose count this one
+                // does not share: a flush of our own is the one that covers
+                // it.
+                drop(guard);
+                return self.flush_now().map(|_| ()).map_err(|(_, e)| e);
+            };
+            if c.flushed >= ticket.number {
                 return Ok(());
             }
-            c.leader_running = true;
-        }
-
-        // Leader: give the window to whoever is about to commit, then flush.
-        std::thread::sleep(window);
-        let result = self.flush_now();
-        let mut guard = self.coalescer.lock();
-        if let Some(c) = guard.as_mut() {
-            if result.is_ok() {
-                c.flushed = c.requested;
+            if let Some((through, error)) = &c.failed
+                && *through >= ticket.number
+            {
+                return Err(flush_failed(error));
             }
-            c.leader_running = false;
+            if c.leader_running {
+                self.coalesce_woken.wait(&mut guard);
+                continue;
+            }
+
+            // Leader: give the window to whoever is about to commit, then
+            // flush. Every ticket issued before the flush holds the writer is
+            // covered by it, this one included.
+            c.leader_running = true;
+            let window = c.window;
+            let mut leading = Leading { engine: self, generation: c.generation, done: false };
+            drop(guard);
+            std::thread::sleep(window);
+            let result = self.flush_now();
+            #[cfg(test)]
+            barrier_hooks::reach(barrier_hooks::Point::FlushedBeforeBookkeeping);
+            guard = self.coalescer.lock();
+            if let Some(c) = guard.as_mut() {
+                // What the flush covered is a count of the barrier it was read
+                // from, and means nothing to another: a barrier installed
+                // since by `set_durability` numbers its tickets from 1 again.
+                let (coverage, failure) = match &result {
+                    Ok(coverage) => (coverage, None),
+                    Err((coverage, e)) => (coverage, Some(e)),
+                };
+                if coverage.generation == Some(c.generation) {
+                    match failure {
+                        None => c.flushed = c.flushed.max(coverage.covered),
+                        Some(e) => c.failed = Some((coverage.covered, e.to_string())),
+                    }
+                }
+                if c.generation == leading.generation {
+                    c.leader_running = false;
+                }
+            }
+            leading.done = true;
+            self.coalesce_woken.notify_all();
+            #[cfg(test)]
+            barrier_hooks::reach(barrier_hooks::Point::AfterBookkeeping);
+            if let Err((_, e)) = result {
+                return Err(e);
+            }
         }
-        self.coalesce_woken.notify_all();
-        result
     }
 
     /// One durable commit that also carries every earlier non-durable one to
     /// the disk. Writes a marker so the transaction is never empty — an
     /// empty commit is one redb could reasonably skip, and the point here is
     /// the fsync.
-    fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
+    ///
+    /// -> the highest ticket it covered, and the barrier that ticket count
+    /// belongs to, read once it holds the writer: every commit with a ticket
+    /// at or below it landed before this flush's own commit, and every later
+    /// one takes a higher ticket. On failure, the same with the error.
+    fn flush_now(&self) -> std::result::Result<Coverage, (Coverage, redb::CommitError)> {
         // The leader's own transaction queues like any other (ADR-151); the
         // committer it flushes for released the gate before it began to wait.
         // The gate is held for exactly as long as it always was — to the end
@@ -2542,28 +2754,35 @@ impl Engine {
         let gate = blocking(|| self.writer_gate.lock());
         meter_writer_wait(waited_from.elapsed());
         let mut gate = WriterHold::new(self, gate, WriterHolder::Durability);
-        let mut txn = blocking(|| self.db.begin_write()).map_err(|e| {
-            redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
-        })?;
+        // Read with the writer held, and before this flush's own commit:
+        // every ticket up to here belongs to a commit that has landed, and
+        // no commit can land until this flush lets go.
+        let covered =
+            self.coalescer.lock().as_ref().map_or(Coverage { generation: None, covered: 0 }, |c| {
+                Coverage { generation: Some(c.generation), covered: c.issued }
+            });
+        #[cfg(test)]
+        let started = self.flush_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let io = |e: String| {
+            redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e)))
+        };
+        let mut txn =
+            blocking(|| self.db.begin_write()).map_err(|e| (covered, io(e.to_string())))?;
         txn.set_durability(redb::Durability::Immediate).expect("Immediate is always permitted");
         {
-            let mut meta = txn.open_table(tables::META).map_err(|e| {
-                redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
+            let mut meta =
+                txn.open_table(tables::META).map_err(|e| (covered, io(e.to_string())))?;
             let n = self.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
-            meta.insert("durability_flush", n.to_be_bytes().as_slice()).map_err(|e| {
-                redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
+            meta.insert("durability_flush", n.to_be_bytes().as_slice())
+                .map_err(|e| (covered, io(e.to_string())))?;
         }
         gate.commit_from = Some(std::time::Instant::now());
-        txn.commit()?;
+        txn.commit().map_err(|e| (covered, e))?;
         self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.flushed_start.fetch_max(started, std::sync::atomic::Ordering::SeqCst);
         drop(gate);
-        Ok(())
+        Ok(covered)
     }
 
     /// Publish committed events to live subscribers.
@@ -4820,6 +5039,331 @@ mod tests {
         let reopened = Engine::open(&path).unwrap();
         let coll = reopened.get_collection("app", "c").unwrap();
         assert_eq!(reopened.count(&coll).unwrap(), 160, "durable when the call returned");
+    }
+
+    #[test]
+    fn a_commit_landing_between_a_flush_and_its_bookkeeping_waits_for_a_flush_of_its_own() {
+        // The leader's flush has committed and let go of the writer, and has
+        // not yet recorded what it covered. A commit that lands now was not
+        // in that flush, and must not be acknowledged until one that started
+        // after it lands: it used to be marked covered and returned at once,
+        // durable only whenever some later commit happened to sync.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        let coll = engine.create_collection("app", "c").unwrap();
+
+        let fsyncs_at_gap = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let competitor = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let (engine, coll) = (Arc::clone(&engine), coll.clone());
+            let (fsyncs_at_gap, competitor) = (Arc::clone(&fsyncs_at_gap), Arc::clone(&competitor));
+            barrier_hooks::at(barrier_hooks::Point::FlushedBeforeBookkeeping, move || {
+                let issued = engine.coalescer.lock().as_ref().unwrap().issued;
+                fsyncs_at_gap.store(engine.fsyncs(), std::sync::atomic::Ordering::SeqCst);
+                let landing = Arc::clone(&engine);
+                *competitor.lock() = Some(std::thread::spawn(move || {
+                    landing.insert(&coll, doc! {"_id": 2}).unwrap();
+                    landing.fsyncs()
+                }));
+                // Parked here until the competitor's commit has landed and
+                // holds its ticket, so it is waiting behind this leader.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while engine.coalescer.lock().as_ref().unwrap().issued == issued {
+                    assert!(std::time::Instant::now() < deadline, "the competitor never landed");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        engine.insert(&coll, doc! {"_id": 1}).unwrap();
+        let handle = competitor.lock().take().expect("the hook ran");
+        let fsyncs_when_acknowledged = handle.join().unwrap();
+        assert!(
+            fsyncs_when_acknowledged > fsyncs_at_gap.load(std::sync::atomic::Ordering::SeqCst),
+            "the commit that landed in the gap was acknowledged before any flush that followed \
+             it: {fsyncs_when_acknowledged} fsyncs"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_let_go_of_the_writer_before_a_flush_took_it_is_covered_by_that_flush() {
+        // The other half of taking the ticket under the writer: a commit that
+        // landed before a flush took the writer is counted by that flush, even
+        // when it reaches the barrier only after the flush is done. Taken after
+        // the release, its ticket would miss the flush that synced its pages,
+        // and it would wait out, and pay for, a second one.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        let coll = engine.create_collection("app", "c").unwrap();
+        let fsyncs_before = engine.fsyncs();
+
+        let other = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let (engine, coll, other) = (Arc::clone(&engine), coll.clone(), Arc::clone(&other));
+            barrier_hooks::at(barrier_hooks::Point::Released, move || {
+                // Parked between letting go of the writer and the barrier,
+                // while another committer lands, leads and flushes.
+                let leading = Arc::clone(&engine);
+                *other.lock() = Some(std::thread::spawn(move || {
+                    leading.insert(&coll, doc! {"_id": 2}).unwrap();
+                }));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while engine.fsyncs() == fsyncs_before {
+                    assert!(std::time::Instant::now() < deadline, "the other commit never flushed");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        engine.insert(&coll, doc! {"_id": 1}).unwrap();
+        other.lock().take().expect("the hook ran").join().unwrap();
+        assert_eq!(
+            engine.fsyncs() - fsyncs_before,
+            1,
+            "one flush covered both commits, since both had landed before it took the writer"
+        );
+    }
+
+    #[test]
+    fn a_leader_of_a_replaced_barrier_does_not_mark_the_new_barriers_tickets_flushed() {
+        // The leader's flush read its coverage from barrier 1. Before it
+        // records it, the class is switched: barrier 2 numbers its tickets
+        // from 1 again. C leads barrier 2 and sleeps its window; D waits
+        // behind it. Recorded on barrier 2, the old count would acknowledge D
+        // with no flush since it landed.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        let coll = engine.create_collection("app", "c").unwrap();
+        engine.insert(&coll, doc! {"_id": 0}).unwrap();
+
+        let d_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fsyncs_at_switch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let others = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let wait = |engine: &Engine, what: &str, done: &dyn Fn(&Coalescer) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done(engine.coalescer.lock().as_ref().unwrap()) {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        {
+            let (engine, coll, others) = (Arc::clone(&engine), coll.clone(), Arc::clone(&others));
+            let (d_done, fsyncs_at_switch) = (Arc::clone(&d_done), Arc::clone(&fsyncs_at_switch));
+            barrier_hooks::at(barrier_hooks::Point::FlushedBeforeBookkeeping, move || {
+                assert!(
+                    engine.coalescer.lock().as_ref().unwrap().issued >= 2,
+                    "premise: barrier 1's count reaches D's ticket on barrier 2"
+                );
+                engine.set_durability(
+                    DurabilityClass::Coalesced,
+                    std::time::Duration::from_millis(500),
+                );
+                let c = {
+                    let (engine, coll) = (Arc::clone(&engine), coll.clone());
+                    std::thread::spawn(move || {
+                        engine.insert(&coll, doc! {"_id": 2}).unwrap();
+                    })
+                };
+                wait(&engine, "C to lead barrier 2", &|c| c.issued == 1 && c.leader_running);
+                let d = {
+                    let (engine, coll, d_done) = (Arc::clone(&engine), coll.clone(), d_done);
+                    std::thread::spawn(move || {
+                        engine.insert(&coll, doc! {"_id": 3}).unwrap();
+                        d_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                };
+                wait(&engine, "D to land on barrier 2", &|c| c.issued == 2);
+                fsyncs_at_switch.store(engine.fsyncs(), std::sync::atomic::Ordering::SeqCst);
+                others.lock().extend([c, d]);
+            });
+        }
+        let acknowledged_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (engine, d_done, fsyncs_at_switch, early) = (
+                Arc::clone(&engine),
+                Arc::clone(&d_done),
+                Arc::clone(&fsyncs_at_switch),
+                Arc::clone(&acknowledged_early),
+            );
+            barrier_hooks::at(barrier_hooks::Point::AfterBookkeeping, move || {
+                // Long enough for a wrongly woken D to return, and well inside
+                // C's window, so a rightly waiting D cannot.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                while std::time::Instant::now() < deadline {
+                    if d_done.load(std::sync::atomic::Ordering::SeqCst)
+                        && engine.fsyncs()
+                            == fsyncs_at_switch.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        early.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+        engine.insert(&coll, doc! {"_id": 1}).unwrap();
+        for handle in std::mem::take(&mut *others.lock()) {
+            handle.join().unwrap();
+        }
+        assert!(
+            !acknowledged_early.load(std::sync::atomic::Ordering::SeqCst),
+            "D was acknowledged by the old barrier's bookkeeping, with no flush since it landed"
+        );
+        assert_eq!(engine.durability_violations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_leader_that_panics_hands_the_barrier_on_and_a_later_commit_completes() {
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(200));
+        let coll = engine.create_collection("app", "c").unwrap();
+
+        let leader = {
+            let (engine, coll) = (Arc::clone(&engine), coll.clone());
+            std::thread::spawn(move || {
+                barrier_hooks::at(barrier_hooks::Point::FlushedBeforeBookkeeping, || {
+                    panic!("a leader that dies before its bookkeeping")
+                });
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engine.insert(&coll, doc! {"_id": 1})
+                }))
+                .is_err()
+            })
+        };
+        // Lands in the leader's window, then waits behind it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (engine, coll) = (Arc::clone(&engine), coll.clone());
+            std::thread::spawn(move || {
+                tx.send(engine.insert(&coll, doc! {"_id": 2}).map(|_| ())).unwrap();
+            });
+        }
+        assert!(leader.join().unwrap(), "premise: the leader panicked");
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a commit behind a leader that panicked was left waiting")
+            .expect("and it completes");
+        // And the barrier is usable afterwards.
+        engine.insert(&coll, doc! {"_id": 3}).unwrap();
+    }
+
+    #[test]
+    fn switching_the_class_under_load_never_acknowledges_a_coalesced_commit_without_a_flush() {
+        // Sixteen writers, and the class flipped between the two every
+        // fraction of a millisecond. Every coalesced commit that returns must
+        // have been followed by a flush that started after it landed.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        let coll = engine.create_collection("app", "c").unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = {
+            let (engine, stop) = (Arc::clone(&engine), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let class = if n % 3 == 2 {
+                        DurabilityClass::Durable
+                    } else {
+                        DurabilityClass::Coalesced
+                    };
+                    engine.set_durability(
+                        class,
+                        std::time::Duration::from_micros(300 + (n % 5) * 200),
+                    );
+                    n += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(300 + (n % 7) * 120));
+                }
+                n
+            })
+        };
+        let writers: Vec<_> = (0..16i64)
+            .map(|w| {
+                let (engine, coll, stop) = (Arc::clone(&engine), coll.clone(), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut i = 0i64;
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        engine.insert(&coll, doc! {"_id": w * 1_000_000 + i}).unwrap();
+                        i += 1;
+                    }
+                    i
+                })
+            })
+            .collect();
+        // Longer on request, for a soak: `KIMMY_TEST_SWITCH_MS`.
+        let run_ms = std::env::var("KIMMY_TEST_SWITCH_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .unwrap_or(1500);
+        // At least that long, and until enough coalesced commits have been
+        // judged to mean something: on a machine busy with the rest of the
+        // suite, fsyncs are slow and a fixed time can judge almost none.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(run_ms)
+            || (engine.grouped_commits() < 200
+                && started.elapsed() < std::time::Duration::from_secs(60))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let written: i64 = writers.into_iter().map(|h| h.join().unwrap()).sum();
+        let flips = flipper.join().unwrap();
+        let grouped = engine.grouped_commits();
+        let violations = engine.durability_violations.load(std::sync::atomic::Ordering::SeqCst);
+        println!(
+            "{written} writes, {grouped} coalesced, {flips} class switches, {violations} violations"
+        );
+        assert!(grouped >= 200 && flips > 100, "premise: the load and the switching both ran");
+        assert_eq!(violations, 0, "coalesced commits acknowledged with no flush after them");
+    }
+
+    #[test]
+    fn a_failed_flush_fails_the_commits_it_covered_and_leaves_none_waiting() {
+        // A leader's flush fails with a waiter behind it. The waiter gets the
+        // flush's own error, promptly: it used to wait for ever, since the
+        // count it waited on never moved. And it does not try a flush of its
+        // own, since its pages were in the one that failed.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(300));
+        let coll = engine.create_collection("app", "c").unwrap();
+        assert!(engine.arm_test_storage_failure("sync_data"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (id, delay) in [(1, 0), (2, 50)] {
+            let (engine, coll, tx) = (Arc::clone(&engine), coll.clone(), tx.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                let result = engine.insert(&coll, doc! {"_id": id});
+                tx.send((id, result.map(|_| ()).map_err(|e| e.to_string()))).unwrap();
+            });
+        }
+        let mut errors = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let (id, result) = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a committer behind a failed flush was left waiting");
+            errors.insert(id, result.expect_err("covered by a failed flush"));
+        }
+        let (leader, waiter) = (&errors[&1], &errors[&2]);
+        assert!(
+            waiter.contains("the shared flush covering this commit failed"),
+            "the waiter is told the flush failed: {waiter}"
+        );
+        let (_, cause) =
+            waiter.split_once("the shared flush covering this commit failed: ").unwrap();
+        assert!(
+            leader.contains(cause) && cause.contains("os error 5"),
+            "and it is the leader's failure, not one of its own: {leader} / {waiter}"
+        );
     }
 
     #[test]
