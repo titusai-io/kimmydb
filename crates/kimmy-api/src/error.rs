@@ -75,11 +75,18 @@ pub enum ErrorCode {
     /// A collection cannot be created under this name yet: what a drop of an
     /// earlier collection of the name held is still being removed (ADR-189).
     CollectionPurging,
+    /// A write reached the storage engine's durability step and then failed:
+    /// it may or may not have been applied, and if it was it replicates.
+    OutcomeUnknown,
 }
 
 /// What a client may do about a failure.
 ///
-/// Three-valued rather than a boolean because KimmyDB is leaderless. Every
+/// **The set is open.** A class this build does not name may be added, and a
+/// client treats a class it does not know as `no`: the safe direction, since a
+/// client that does not understand the advice does not act on it (ADR-057).
+///
+/// Several-valued rather than a boolean because KimmyDB is leaderless. Every
 /// node accepts writes, so "ask a different node" is an answer available here
 /// that a primary-based database cannot give — and it is the *right* answer
 /// for a node-local failure, where telling a client "retryable" would have it
@@ -94,6 +101,10 @@ pub enum Retry {
     /// A different node. The failure is local to this one, and a peer holds
     /// the same data — replication is what makes this worth trying.
     Elsewhere,
+    /// Read the target back before deciding to send the request again: it may
+    /// already have been applied. Only an idempotent request is safe to
+    /// resend without reading first.
+    Verify,
 }
 
 impl Retry {
@@ -102,6 +113,7 @@ impl Retry {
             Self::No => "no",
             Self::Wait => "wait",
             Self::Elsewhere => "elsewhere",
+            Self::Verify => "verify",
         }
     }
 }
@@ -154,7 +166,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -175,6 +187,7 @@ impl ErrorCode {
         Self::Stale,
         Self::Timeout,
         Self::CollectionPurging,
+        Self::OutcomeUnknown,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -200,6 +213,7 @@ impl ErrorCode {
             Self::Stale => "stale",
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
+            Self::OutcomeUnknown => "outcome_unknown",
         }
     }
 
@@ -252,6 +266,9 @@ impl ErrorCode {
             // succeeds here; another member may still be removing its own copy
             // of the same drop, so moving does not help.
             Self::CollectionPurging => Retry::Wait,
+            // It may already have happened, and replicates if it did: read
+            // before resending, which neither waiting nor moving replaces.
+            Self::OutcomeUnknown => Retry::Verify,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -350,6 +367,9 @@ impl ErrorCode {
             // cannot happen did. Nothing a caller sends causes it and nothing
             // a caller changes fixes it.
             Self::Internal => Some(LogLevel::Error),
+            // The storage failed at or after a write's durability step: the
+            // same fault as `internal`, and the operator's.
+            Self::OutcomeUnknown => Some(LogLevel::Error),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -590,6 +610,17 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, ErrorCode::Forbidden, "not authorized for this operation")
     }
 
+    /// A write whose outcome is unknown: see [`ErrorCode::OutcomeUnknown`].
+    pub fn outcome_unknown() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::OutcomeUnknown,
+            "the write reached the storage engine's durability step and then failed, so it may \
+             or may not have been applied; if it was, it replicates. Read it back before sending \
+             it again, unless the write is idempotent",
+        )
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, message)
     }
@@ -767,6 +798,13 @@ impl From<StorageError> for ApiError {
             StorageError::CollectionPurging { db, name, .. } => {
                 ApiError::collection_purging(&db, &name)
             }
+            // Its durability step began and failed: the write may have
+            // happened, and if it did it replicates. Never "it failed". The
+            // cause names on-disk internals, so it is logged, not returned.
+            StorageError::OutcomeUnknown(cause) => {
+                error!(error = %cause, "a write failed at its durability step; its outcome is unknown");
+                ApiError::outcome_unknown()
+            }
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -871,7 +909,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 20] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 21] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -895,6 +933,7 @@ mod tests {
             (Timeout, Some(LogLevel::Warn)),
             // This node's own state, and the operator's to fix.
             (Internal, Some(LogLevel::Error)),
+            (OutcomeUnknown, Some(LogLevel::Error)),
             (Misconfigured, Some(LogLevel::Error)),
             (Snapshot, Some(LogLevel::Error)),
         ];
@@ -1243,6 +1282,20 @@ mod tests {
         let e: ApiError = StorageError::Database("/var/lib/kimmy/kimmy.redb page 42".into()).into();
         assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!e.message.contains("/var/lib"), "internal paths must not reach the client");
+    }
+
+    #[test]
+    fn a_write_whose_outcome_is_unknown_is_never_answered_as_failed() {
+        // Not `internal`, which reads as "it failed": the write may have
+        // happened, and the client must read before it resends.
+        let e: ApiError =
+            StorageError::OutcomeUnknown("sync_data: /var/lib/kimmy/kimmy.redb EIO".into()).into();
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(e.code.as_str(), "outcome_unknown");
+        assert_eq!(e.code.retry(), Retry::Verify);
+        assert_eq!(e.code.retry().as_str(), "verify");
+        assert!(!e.message.contains("/var/lib"), "the cause is logged, not returned");
     }
 
     #[test]

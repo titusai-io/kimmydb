@@ -97,6 +97,17 @@ pub enum StorageError {
     /// directory must leave that directory's lifecycle marker alone.
     #[error("{0}")]
     StoreInUse(String),
+
+    /// A commit failed after its durability step had begun: a `sync_data`
+    /// was attempted in it, or the barrier flush that was to make it durable
+    /// failed. Whether it reached the disk is not known. After a failed fsync
+    /// the pages may be there, and redb's repair on the next open keeps the
+    /// commit; after a failure following a successful fsync, such as the
+    /// shrink that follows the final sync, it is certainly there. So the
+    /// write may have happened, and may replicate: it must not be reported as
+    /// a write that failed (outcome unknown, ADR-057's `verify`).
+    #[error("the write may or may not have been applied: {0}")]
+    OutcomeUnknown(String),
 }
 
 /// What an operator can actually do about a stored partial filter this build

@@ -473,6 +473,7 @@ a provider this member cannot build is one only an operator can.
 | `error` | Level | What it means for an alert |
 |---|---|---|
 | `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
+| `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
@@ -626,6 +627,37 @@ it again. Your restart policy's backoff paces the loop (Docker's
 and the loop is the signal: a node that stayed up would answer every request
 with an error while its liveness probe read green. Free the space, and the
 next start serves as normal.
+
+#### A write whose outcome is unknown
+
+**A write caught by the stop may have happened.** When a commit's fsync fails,
+its pages may still be on disk, and the repair on the next start keeps them: the
+write is present, and it replicates. Its client learns this in one of two ways.
+
+- **Usually, from a dropped connection.** The node stops inside the failing
+  call, so it never answers. The client sees its connection close after its
+  request was sent.
+- **Sometimes, from `500 outcome_unknown`** with `retry: verify`. That is the
+  answer when the first I/O error hit another thread, such as a reader, and the
+  write's own fsync failed while that thread was still reporting (up to five
+  seconds). It is also the answer for any other failure after a commit's fsync
+  began, such as the file shrink redb makes after its final fsync.
+
+Either way the write **may or may not have happened**. Clients must read it back
+before resending it, unless it is idempotent: see
+[retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome).
+`outcome_unknown` is logged at `ERROR`.
+
+**Two things read the same way that are not a storage fault:**
+
+- A request cut off by a graceful shutdown or a restart also sees a dropped
+  connection. That is correct: its outcome is unknown too.
+- **A proxy or service mesh that retries on a `5xx` or a connection reset**
+  must not retry non-idempotent writes, or it turns one write into two. Envoy
+  retries only on the policies you configure (`retry_on`). Keep `reset` and
+  `5xx` off routes that carry writes, or limit them to idempotent methods.
+  nginx does not pass a non-idempotent request to the next upstream unless
+  `proxy_next_upstream non_idempotent` is set. Leave it unset.
 
 **The first start after upgrading warns once, on every node.** No release
 before this one wrote the marker, so a data directory written by 0.24.0 or

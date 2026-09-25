@@ -310,7 +310,8 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::Io(_)
         | E::WriterBusy { .. }
         | E::RefusedStore(_)
-        | E::StoreInUse(_) => true,
+        | E::StoreInUse(_)
+        | E::OutcomeUnknown(_) => true,
         E::Core(_)
         | E::Corrupt(_)
         | E::UnsupportedFormat { .. }

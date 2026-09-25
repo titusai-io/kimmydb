@@ -100,6 +100,25 @@ impl Default for RequestLimits {
     }
 }
 
+tokio::task_local! {
+    /// When the request this task serves must be answered by: set by
+    /// [`enforce_timeout`] for the handler it wraps.
+    static REQUEST_DEADLINE: std::time::Instant;
+}
+
+/// How long the request this task serves has left before [`enforce_timeout`]
+/// abandons it, or `None` outside a request with a deadline.
+///
+/// For a handler with work that can run after its change has committed, the
+/// confirmation of a schema change (ADR-140): capped by this, it answers with
+/// what it knows rather than being cut off, and a committed change is never
+/// reported as an abandoned request.
+pub fn request_time_left() -> Option<Duration> {
+    REQUEST_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok()
+}
+
 /// Abandon a request that is still pending at the deadline.
 ///
 /// An `axum::middleware::from_fn_with_state` function rather than
@@ -118,7 +137,11 @@ pub async fn enforce_timeout(
     // ends — a write that could not get the writer hung for as long as it
     // was held, and the client saw a transport timeout rather than the
     // documented refusal.
-    let handler = kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request));
+    let deadline = std::time::Instant::now() + limits.request_timeout;
+    let handler = REQUEST_DEADLINE.scope(
+        deadline,
+        kimmy_storage::with_write_wait_budget(limits.request_timeout, next.run(request)),
+    );
     match tokio::time::timeout(limits.request_timeout, handler).await {
         Ok(response) => response,
         Err(_elapsed) => ApiError::timeout(limits.request_timeout).into_response(),

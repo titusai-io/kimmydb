@@ -1085,8 +1085,10 @@ promises, what counts as additive, and what a correct client must tolerate.
 
 The status carries the class of failure, `error` is what a client branches on,
 and **`retry` is what a client library can act on without knowing the code**.
-The set is closed by an enum in the server ([ADR-057](decisions.md)), so a new
-failure cannot appear without its retry class being decided in the same commit.
+The set of codes is closed by an enum in the server ([ADR-057](decisions.md)),
+so a new failure cannot appear without its retry class being decided in the
+same commit. **The set of retry classes is open**: `no`, `wait`, `elsewhere`
+and `verify` today, and a client treats a class it does not know as `no`.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
@@ -1107,7 +1109,8 @@ failure cannot appear without its retry class being decided in the same commit.
 | 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |
 | 429 | `rate_limited` | wait | Too many failed logins from this caller, or an authenticated principal over its request budget (`server.rate_limit.per_principal`). Carries `Retry-After` in seconds |
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
-| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)) |
+| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)). **An index create or drop is never answered this way once it has committed**: members that have not confirmed it by the deadline are reported as pending instead ([ADR-140](decisions.md)) |
+| 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

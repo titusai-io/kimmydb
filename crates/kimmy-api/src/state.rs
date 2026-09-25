@@ -35,9 +35,15 @@ pub struct DdlConfirmation {
 /// of it. Installed by the daemon once clustering is up, since only it holds
 /// the member set and the cluster secret; a node with no confirmer says
 /// nothing about its peers rather than something false.
+///
+/// The second argument caps how long it may wait for the members, when the
+/// request has a deadline: whatever it has not heard by then it reports as
+/// pending, so a change that has already committed is never answered as a
+/// request the node abandoned.
 pub type DdlConfirmer = Arc<
     dyn Fn(
             kimmy_core::OplogEntry,
+            Option<std::time::Duration>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DdlConfirmation> + Send>>
         + Send
         + Sync,

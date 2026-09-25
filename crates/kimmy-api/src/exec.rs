@@ -1621,8 +1621,17 @@ pub async fn confirm_ddl(
     let Some(entry) = state.engine.oplog_entry(&stamp)? else {
         return Ok(None);
     };
-    Ok(Some(confirmation_to_json(&confirm(entry).await)))
+    // The change has committed. Whatever the confirmation has not heard when
+    // the request's deadline comes is reported as pending, with the margin
+    // left to write the answer: cut off by the deadline instead, the request
+    // was answered "abandoned" for a change that exists and replicates.
+    let cap = crate::limits::request_time_left().map(|left| left.saturating_sub(ANSWER_MARGIN));
+    Ok(Some(confirmation_to_json(&confirm(entry, cap).await)))
 }
+
+/// What a schema change's confirmation leaves of the request's deadline for
+/// writing the answer.
+const ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// A confirmation as a response carries it: node ids as strings, the way
 /// `/v1/topology` names them, and each pending member with its reason.

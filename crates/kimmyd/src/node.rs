@@ -1580,9 +1580,12 @@ fn ddl_confirmer(
     members: kimmy_cluster::Members,
     deadline: Duration,
 ) -> kimmy_api::DdlConfirmer {
-    Arc::new(move |entry: kimmy_core::OplogEntry| {
+    Arc::new(move |entry: kimmy_core::OplogEntry, cap: Option<Duration>| {
         let confirmer = Arc::clone(&confirmer);
         let members = members.clone();
+        // The request's own deadline, when it is sooner: what no member has
+        // answered by then is pending, not a request abandoned.
+        let deadline = cap.map_or(deadline, |cap| deadline.min(cap));
         Box::pin(async move {
             let mut asked = tokio::task::JoinSet::new();
             for (addr, node) in members.entries() {

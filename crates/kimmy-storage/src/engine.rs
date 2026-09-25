@@ -746,10 +746,24 @@ impl WriteTxn<'_> {
         crate::hold_meter::test_hooks::at_phase(crate::hold_meter::Phase::Commit);
         let engine = self.engine;
         let coalesced = self.coalesced;
+        let is_write = self.holder == WriterHolder::Write;
         // The fsync (or the wait at the barrier) is the blocking part; see
         // [`blocking`] for why it must not happen on an async worker.
         blocking(move || {
-            txn.commit()?;
+            // Read while the writer is still held, so the flag is this
+            // commit's: commits are serialized by the writer.
+            engine.health.begin_commit();
+            let committed = crate::health::committing(is_write, || txn.commit());
+            let synced = engine.health.synced();
+            // Cleared again once read, so the flag is only ever this commit's.
+            engine.health.begin_commit();
+            if let Err(e) = committed {
+                return Err(if synced {
+                    StorageError::OutcomeUnknown(e.to_string())
+                } else {
+                    e.into()
+                });
+            }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // The ticket is taken **before** the writer is let go: a flush
             // reads the tickets issued once it holds the writer, so a commit
@@ -765,7 +779,12 @@ impl WriteTxn<'_> {
             barrier_hooks::reach(barrier_hooks::Point::Released);
             if coalesced {
                 engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                engine.wait_for_flush(ticket)?;
+                // This commit is visible and not yet durable; a flush that
+                // was to make it durable failed. Whether its pages reached
+                // the disk is not known, whatever the flush got to.
+                engine
+                    .wait_for_flush(ticket)
+                    .map_err(|e| StorageError::OutcomeUnknown(e.to_string()))?;
                 #[cfg(test)]
                 if engine.flushed_start.load(std::sync::atomic::Ordering::SeqCst) <= landed_after {
                     engine.durability_violations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5473,6 +5492,211 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let writes = writer.join().expect("the writer did not panic");
         assert!(writes > 50 && readings > 1_000, "premise: both ran ({writes}, {readings})");
+    }
+
+    /// An engine on a fresh file with `app.c` created, and the file's path.
+    fn engine_with_collection()
+    -> (Engine, crate::CollectionMeta, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        let coll = engine.create_collection("app", "c").unwrap();
+        (engine, coll, dir, path)
+    }
+
+    /// Whether `_id` is in `app.c` after the file is reopened (and repaired).
+    fn present_after_reopen(path: &std::path::Path, id: i64) -> bool {
+        let reopened = Engine::open(path).unwrap();
+        let coll = reopened.get_collection("app", "c").unwrap();
+        reopened.get(&coll, &kimmy_core::DocId::Int64(id)).unwrap().is_some()
+    }
+
+    #[test]
+    fn a_commit_whose_fsync_fails_is_outcome_unknown_and_is_there_after_the_repair() {
+        use bson::doc;
+        let (engine, coll, _dir, path) = engine_with_collection();
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let failed = engine.insert(&coll, doc! {"_id": 1}).unwrap_err();
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+        assert_eq!(engine.storage_failed().unwrap().call, "sync_data");
+        drop(engine);
+        // The injection answers EIO in place of the fsync, and the pages
+        // are in the OS's cache, so this shows the classification and the
+        // repair, not what a real failed fsync does to the platter.
+        assert!(present_after_reopen(&path, 1), "the \"failed\" write is there");
+    }
+
+    #[test]
+    fn a_commit_whose_first_write_fails_is_a_plain_failure_and_is_absent() {
+        use bson::doc;
+        let (engine, coll, _dir, path) = engine_with_collection();
+        assert!(engine.arm_test_storage_failure("write"));
+        let failed = engine.insert(&coll, doc! {"_id": 1}).unwrap_err();
+        assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+        assert_eq!(engine.storage_failed().unwrap().call, "write");
+        drop(engine);
+        assert!(!present_after_reopen(&path, 1));
+    }
+
+    #[test]
+    fn a_growth_that_fails_before_the_commit_is_a_plain_failure() {
+        use bson::doc;
+        let (engine, coll, _dir, _path) = engine_with_collection();
+        assert!(engine.arm_test_storage_failure("set_len"));
+        // Large enough that the file has to grow to hold it.
+        let big = "x".repeat(8 << 20);
+        let failed = engine.insert(&coll, doc! {"_id": 1, "big": big}).unwrap_err();
+        assert_eq!(engine.storage_failed().unwrap().call, "set_len", "premise: it grew");
+        assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn a_failure_after_the_commits_fsync_is_outcome_unknown_too() {
+        // redb shrinks the file after the final fsync, when a commit leaves
+        // its tail free: a failure there comes back as the commit's error
+        // though the commit is durable. Classified by phase, it is unknown.
+        // Commit N frees the tail (a scratch table outside the oplog, which
+        // would otherwise keep a document's bytes); commit N+1 shrinks.
+        use bson::doc;
+        const SCRATCH: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("scratch");
+        let (engine, coll, _dir, _path) = engine_with_collection();
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        {
+            let mut table = txn.open_table(SCRATCH).unwrap();
+            let blob = vec![7u8; 1 << 20];
+            for i in 0..16u64 {
+                table.insert(i, blob.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        txn.delete_table(SCRATCH).unwrap();
+        txn.commit().unwrap();
+        let before = engine.storage_bytes();
+        assert!(engine.arm_test_storage_failure("set_len"));
+        let failed = engine.insert(&coll, doc! {"_id": 1}).unwrap_err();
+        assert_eq!(engine.storage_failed().unwrap().call, "set_len", "premise: it shrank");
+        assert!(before > 16 << 20, "premise: the tail was large and free");
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_commits_fsync_is_outcome_unknown() {
+        // After its final fsync, a commit frees what earlier commits
+        // released, reading the freed-pages table to do it, and that step's
+        // error is the commit's too. With a cache too small to hold that
+        // table, the read goes to the file.
+        use bson::doc;
+        const SCRATCH: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("scratch");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("app", "c").unwrap();
+            let txn = engine.begin_write(WriterHolder::Write).unwrap();
+            {
+                let mut table = txn.open_table(SCRATCH).unwrap();
+                for i in 0..20_000u64 {
+                    table.insert(i, [7u8; 64].as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        let engine = Engine::open_with_cache(&path, Some(16 * 1024)).unwrap();
+        let coll = engine.get_collection("app", "c").unwrap();
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        txn.delete_table(SCRATCH).unwrap();
+        txn.commit().unwrap();
+        assert!(engine.arm_test_storage_failure("read@after-sync"));
+        let mut failed = None;
+        for id in 1..6i64 {
+            if let Err(e) = engine.insert(&coll, doc! {"_id": id}) {
+                failed = Some(e);
+                break;
+            }
+        }
+        let failed = failed.expect("premise: a commit read the file after its fsync");
+        assert_eq!(engine.storage_failed().unwrap().call, "read");
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn a_coalesced_commit_whose_flush_fails_is_outcome_unknown() {
+        use bson::doc;
+        let (engine, coll, _dir, _path) = engine_with_collection();
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(1));
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let failed = engine.insert(&coll, doc! {"_id": 1}).unwrap_err();
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn a_sync_in_one_commit_does_not_make_the_next_commits_failure_unknown() {
+        use bson::doc;
+        let (engine, coll, _dir, _path) = engine_with_collection();
+        let fsyncs = engine.fsyncs();
+        engine.insert(&coll, doc! {"_id": 1}).unwrap();
+        assert_eq!(engine.fsyncs(), fsyncs + 1, "premise: that commit synced");
+        assert!(engine.arm_test_storage_failure("write"));
+        let failed = engine.insert(&coll, doc! {"_id": 2}).unwrap_err();
+        assert!(!matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn a_write_whose_fsync_fails_while_another_threads_failure_is_reported_is_outcome_unknown() {
+        // The first I/O error hits a reader, whose thread runs the reaction
+        // (ADR-188) and has not yet stopped the process. Until it does, redb
+        // has not seen that error, and a write goes on: if its own fsync then
+        // fails, it is answered, and it must be answered as unknown.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "c").unwrap();
+            let docs: Vec<_> =
+                (0..2_000i64).map(|i| doc! {"_id": i, "pad": "x".repeat(512)}).collect();
+            engine.insert_many(&coll, docs).unwrap();
+        }
+        // A cache far smaller than the collection, so a walk reads the file.
+        let engine = Arc::new(Engine::open_with_cache(&path, Some(64 * 1024)).unwrap());
+        let coll = engine.get_collection("app", "c").unwrap();
+        let (reporting, reported) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = parking_lot::Mutex::new(released);
+        engine.on_storage_failure(Box::new(move |_| {
+            reporting.send(()).unwrap();
+            // The report, still running: the process has not stopped.
+            let _ = released.lock().recv_timeout(std::time::Duration::from_secs(30));
+        }));
+        assert!(engine.arm_test_storage_failure("read"));
+        let reader = {
+            let (engine, coll) = (Arc::clone(&engine), coll.clone());
+            std::thread::spawn(move || engine.for_each_doc(&coll, |_, _| Ok(true)))
+        };
+        reported
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("premise: the reader's read failed first and the reaction is running");
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let failed = engine.insert(&coll, doc! {"_id": 99_999}).unwrap_err();
+        release.send(()).unwrap();
+        let _ = reader.join();
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+    }
+
+    #[test]
+    fn the_write_target_fails_only_a_client_writes_commit() {
+        use bson::doc;
+        let (engine, coll, _dir, _path) = engine_with_collection();
+        assert!(engine.arm_test_storage_failure("sync_data@write"));
+        assert!(!engine.arm_test_storage_failure("sync_data@nowhere"), "an unknown target");
+        assert!(engine.arm_test_storage_failure("sync_data@write"));
+        // A commit held as something else passes the armed switch by.
+        engine.create_collection("app", "other").unwrap();
+        assert!(engine.storage_failed().is_none(), "not a client write's commit");
+        let failed = engine.insert(&coll, doc! {"_id": 1}).unwrap_err();
+        assert!(matches!(failed, StorageError::OutcomeUnknown(_)), "{failed:?}");
+        assert_eq!(engine.storage_failed().unwrap().call, "sync_data");
     }
 
     #[test]

@@ -10341,7 +10341,7 @@ fn canned_confirmer(
     finding: kimmy_api::DdlConfirmation,
     seen: Arc<std::sync::Mutex<Vec<kimmy_core::OplogEntry>>>,
 ) -> kimmy_api::DdlConfirmer {
-    Arc::new(move |entry: kimmy_core::OplogEntry| {
+    Arc::new(move |entry: kimmy_core::OplogEntry, _cap: Option<std::time::Duration>| {
         let finding = finding.clone();
         let seen = Arc::clone(&seen);
         Box::pin(async move {
@@ -10349,6 +10349,85 @@ fn canned_confirmer(
             finding
         })
     })
+}
+
+/// A confirmer that waits as long as it is allowed, or ten seconds when it is
+/// given no cap, and then reports the one member as not having answered: a
+/// member that never answers, as the daemon's confirmer would find it.
+fn silent_member_confirmer(member: kimmy_core::NodeId) -> kimmy_api::DdlConfirmer {
+    Arc::new(move |_entry: kimmy_core::OplogEntry, cap: Option<std::time::Duration>| {
+        Box::pin(async move {
+            let waited = cap.unwrap_or(std::time::Duration::from_secs(10));
+            tokio::time::sleep(waited).await;
+            kimmy_api::DdlConfirmation {
+                pending: vec![(member, format!("no answer within {waited:?}"))],
+                ..Default::default()
+            }
+        })
+    })
+}
+
+/// A write that commits after the request's deadline has passed is still
+/// answered with its result. The commit runs inside `block_in_place` on the
+/// handler's own task, so the deadline cannot fire while it runs, and once it
+/// returns the deadline's timer is checked only after the handler, which is
+/// ready: a committed write is never answered `503 timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_whose_commit_outlasts_the_deadline_is_answered_with_its_result() {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(1),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let orders = server.state.engine.create_collection("shop", "orders").unwrap();
+    let mut outlasted = 0;
+    for id in 0..20i64 {
+        let started = std::time::Instant::now();
+        let res = server.post("/v1/db/shop/coll/orders/docs", None, json!({ "_id": id })).await;
+        let present =
+            server.state.engine.get(&orders, &kimmy_core::DocId::Int64(id)).unwrap().is_some();
+        if res.status == 503 {
+            // Refused before anything was written, waiting for the body.
+            assert!(!present, "a write answered abandoned was written: {:?}", res.body);
+            continue;
+        }
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        assert!(present);
+        if started.elapsed() > std::time::Duration::from_millis(1) {
+            outlasted += 1;
+        }
+    }
+    assert!(outlasted > 0, "premise: some commit outlasted the one-millisecond deadline");
+}
+
+#[tokio::test]
+async fn an_index_create_that_has_committed_is_never_answered_as_abandoned() {
+    // The request's deadline passes while its confirmation waits on a member
+    // that never answers. The index exists and replicates, so the answer is
+    // the index with that member pending, not a `503 timeout` saying the
+    // request was abandoned.
+    let server = Server::start_with_request_timeout(std::time::Duration::from_secs(1)).await;
+    let token = server.root().await;
+    let member = kimmy_core::NodeId::generate();
+    server.state.set_ddl_confirmer(silent_member_confirmer(member));
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+
+    let started = std::time::Instant::now();
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "inside the deadline");
+    let pending = &created.body["confirmation"]["pending"];
+    assert_eq!(pending[0]["node"], member.to_string(), "{}", created.body);
+
+    let dropped = server.delete("/v1/db/shop/coll/orders/indexes/by_email", Some(&token)).await;
+    assert_eq!(dropped.status, 200, "and a drop the same way: {:?}", dropped.body);
+    assert_eq!(dropped.body["confirmation"]["pending"][0]["node"], member.to_string());
 }
 
 #[tokio::test]
