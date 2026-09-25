@@ -14,6 +14,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy_storage_cache_bytes`**, **`kimmy_storage_cache_evictions_total`**
+  and **`kimmy_storage_cache_reads_total{result}`** report the storage
+  engine's page cache: what it holds now (the read cache and the write buffer
+  together, bounded by `storage.cache_bytes`), the pages it has dropped to
+  make room, and its page reads served from the cache (`hit`) or the file
+  (`miss`). They are bridged as `kimmy.storage.cache.bytes`, `.evictions`,
+  `.reads.hit` and `.reads.miss`. The cache is most of a node's resident
+  memory, and this gauge tells it apart from heap growth. It needs redb's
+  cache statistics, now enabled. That costs nothing measurable on writes or
+  on reads served entirely from the cache, such as index range scans. The
+  benchmarks compared five interleaved rounds with the statistics off and
+  on: medians within ±1.2%, inside the run-to-run spread. See
+  [the metrics table](docs/operations.md).
 - **`kimmy_sync_serve_failures_total{reason}`** counts the replication
   connections a peer opened to this node that ended in an error on this side,
   by reason: `io`, `timeout`, `malformed`, `local`, `unauthenticated`,

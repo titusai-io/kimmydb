@@ -543,6 +543,19 @@ fn meter_writer_wait(waited: std::time::Duration) {
     });
 }
 
+/// A reading of the storage engine's page cache: see [`Engine::cache_reading`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheReading {
+    /// Bytes held: the read cache and the write buffer together.
+    pub used_bytes: u64,
+    /// Pages dropped to make room, since open.
+    pub evictions: u64,
+    /// Page reads served from the cache, and those that went to the file,
+    /// since open.
+    pub read_hits: u64,
+    pub read_misses: u64,
+}
+
 /// The shared-fsync barrier behind [`DurabilityClass::Coalesced`].
 ///
 /// No background thread and no handle to the engine: the committers
@@ -1425,6 +1438,24 @@ impl Engine {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// What the storage engine's page cache holds and how it is doing, from
+    /// redb's own counters: the cache that `storage.cache_bytes` bounds, and
+    /// the largest single user of a node's memory.
+    ///
+    /// `used_bytes` is the read cache **and** the write buffer together: pages
+    /// read from the file and kept, and pages a transaction wrote that have
+    /// not yet reached it. The counters are since the database was opened.
+    pub fn cache_reading(&self) -> CacheReading {
+        use redb::ReadableDatabase;
+        let stats = self.db.cache_stats();
+        CacheReading {
+            used_bytes: stats.used_bytes() as u64,
+            evictions: stats.evictions(),
+            read_hits: stats.read_hits(),
+            read_misses: stats.read_misses(),
+        }
     }
 
     /// Size of the database file on disk, or zero if it cannot be read.
@@ -5364,6 +5395,45 @@ mod tests {
             leader.contains(cause) && cause.contains("os error 5"),
             "and it is the leader's failure, not one of its own: {leader} / {waiter}"
         );
+    }
+
+    #[test]
+    fn the_page_cache_reports_its_fill_its_hits_and_misses_and_its_evictions() {
+        // redb reports all of this only with its `cache_metrics` feature, and
+        // reads zeros without it: this is what holds the feature on.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "c").unwrap();
+            let docs: Vec<_> =
+                (0..2_000i64).map(|i| doc! {"_id": i, "pad": "x".repeat(512)}).collect();
+            engine.insert_many(&coll, docs).unwrap();
+            let warm = engine.cache_reading();
+            assert!(
+                warm.used_bytes > 0,
+                "a cache that has been written through holds pages: {warm:?}"
+            );
+            let before = engine.cache_reading();
+            assert_eq!(engine.count(&coll).unwrap(), 2_000);
+            engine.for_each_doc(&coll, |_, _| Ok(true)).unwrap();
+            let after = engine.cache_reading();
+            assert!(
+                after.read_hits > before.read_hits,
+                "a warm walk hits: {before:?} -> {after:?}"
+            );
+        }
+        // Reopened with a cache far smaller than the collection: a walk of it
+        // must go to the file, and push pages out to make room.
+        let engine = Engine::open_with_cache(&path, Some(64 * 1024)).unwrap();
+        let coll = engine.get_collection("app", "c").unwrap();
+        let before = engine.cache_reading();
+        engine.for_each_doc(&coll, |_, _| Ok(true)).unwrap();
+        let after = engine.cache_reading();
+        assert!(after.read_misses > before.read_misses, "a cold walk misses: {after:?}");
+        assert!(after.evictions > before.evictions, "and evicts to stay in bounds: {after:?}");
+        assert!(after.used_bytes <= 2 * 64 * 1024, "held within about the bound: {after:?}");
     }
 
     #[test]

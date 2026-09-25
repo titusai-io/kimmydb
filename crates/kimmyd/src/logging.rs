@@ -345,6 +345,34 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.storage.cache.bytes",
+            "By",
+            "Bytes the storage engine's page cache holds: the read cache and the write buffer together, bounded by storage.cache_bytes.",
+            |s| s.storage_cache.used_bytes
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.evictions",
+            "{page}",
+            "Pages the storage engine's page cache dropped to make room, since the database was opened.",
+            |s| s.storage_cache.evictions
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.reads.hit",
+            "{read}",
+            "Page reads the storage engine served from its page cache, since the database was opened.",
+            |s| s.storage_cache.read_hits
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.storage.cache.reads.miss",
+            "{read}",
+            "Page reads the storage engine went to the file for, since the database was opened.",
+            |s| s.storage_cache.read_misses
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.vector.index_cache.bytes",
             "By",
             "Estimated bytes of HNSW graphs held in memory across vector collections.",

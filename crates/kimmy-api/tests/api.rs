@@ -8199,6 +8199,10 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
     .chain(decomposition)
     .chain([
         "kimmy_storage_bytes",
+        "kimmy_storage_cache_bytes",
+        "kimmy_storage_cache_evictions_total",
+        "kimmy_storage_cache_reads_total",
+        "kimmy_storage_cache_reads_total",
         "kimmy_vector_index_cache_bytes",
         "kimmy_process_resident_bytes",
         "kimmy_process_resident_peak_bytes",

@@ -97,7 +97,10 @@ toml = "1"
 # Storage
 # Pinned to 4.3.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
-redb = "~4.3"
+# `cache_metrics` makes the page cache report its fill, evictions, and hits
+# and misses (`kimmy_storage_cache_*`). The cost is a few relaxed atomics per
+# page access, measured in the change that enabled it.
+redb = { version = "~4.3", features = ["cache_metrics"] }
 
 # HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
 # the two cannot drift apart on features -- `rustls-tls` matters, because the

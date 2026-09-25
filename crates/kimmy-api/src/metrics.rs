@@ -76,6 +76,10 @@ pub struct StorageReadings {
     pub fsyncs: u64,
     pub commits_grouped: u64,
     pub storage_bytes: u64,
+    /// The storage engine's page cache: its fill (read cache and write
+    /// buffer together), evictions, and page reads hit and missed, since the
+    /// database was opened (`Engine::cache_reading`).
+    pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
     /// This process's resident memory and its high-water mark, as the
     /// kernel reports them ([`ProcessMemory`], ADR-147). The figure a
@@ -225,6 +229,8 @@ pub struct MetricsSnapshot {
     pub fsyncs: u64,
     pub commits_grouped: u64,
     pub storage_bytes: u64,
+    /// The storage engine's page cache, as [`StorageReadings::storage_cache`].
+    pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
     /// Resident memory and its high-water mark, from the same reading
     /// (ADR-147).
@@ -1060,6 +1066,7 @@ impl Metrics {
             fsyncs: readings.fsyncs,
             commits_grouped: readings.commits_grouped,
             storage_bytes: readings.storage_bytes,
+            storage_cache: readings.storage_cache,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
             process_resident_bytes: readings.process_resident_bytes,
             process_resident_peak_bytes: readings.process_resident_peak_bytes,
@@ -1289,6 +1296,16 @@ impl Metrics {
              # HELP kimmy_storage_bytes Size of the database file on disk.\n\
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
+             # HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together. Bounded by storage.cache_bytes, it is filled by reads and not released on a timer, so it settles at the busiest period's level; it is most of a node's resident memory.\n\
+             # TYPE kimmy_storage_cache_bytes gauge\n\
+             kimmy_storage_cache_bytes {cache_bytes}\n\
+             # HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache dropped to make room, since the database was opened. Rising while kimmy_storage_cache_bytes sits at storage.cache_bytes means the working set is larger than the cache.\n\
+             # TYPE kimmy_storage_cache_evictions_total counter\n\
+             kimmy_storage_cache_evictions_total {cache_evictions}\n\
+             # HELP kimmy_storage_cache_reads_total Page reads the storage engine served from its page cache (hit) or from the file (miss), since the database was opened.\n\
+             # TYPE kimmy_storage_cache_reads_total counter\n\
+             kimmy_storage_cache_reads_total{{result=\"hit\"}} {cache_hits}\n\
+             kimmy_storage_cache_reads_total{{result=\"miss\"}} {cache_misses}\n\
              # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
              # TYPE kimmy_vector_index_cache_bytes gauge\n\
              kimmy_vector_index_cache_bytes {index_cache}\n\
@@ -1494,6 +1511,10 @@ impl Metrics {
             writer_wait_timeouts = readings.writer_wait_timeouts,
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
+            cache_bytes = readings.storage_cache.used_bytes,
+            cache_evictions = readings.storage_cache.evictions,
+            cache_hits = readings.storage_cache.read_hits,
+            cache_misses = readings.storage_cache.read_misses,
             index_cache = readings.vector_index_cache_bytes,
             resident = readings.process_resident_bytes,
             resident_peak = readings.process_resident_peak_bytes,
@@ -2066,6 +2087,12 @@ mod tests {
             fsyncs: 45,
             commits_grouped: 46,
             storage_bytes: 47,
+            storage_cache: kimmy_storage::CacheReading {
+                used_bytes: 9_101,
+                evictions: 9_102,
+                read_hits: 9_103,
+                read_misses: 9_104,
+            },
             vector_index_cache_bytes: 48,
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
@@ -2462,6 +2489,16 @@ kimmy_write_lock_held_cpu_unmeasured_total 99
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
+# HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together. Bounded by storage.cache_bytes, it is filled by reads and not released on a timer, so it settles at the busiest period's level; it is most of a node's resident memory.
+# TYPE kimmy_storage_cache_bytes gauge
+kimmy_storage_cache_bytes 9101
+# HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache dropped to make room, since the database was opened. Rising while kimmy_storage_cache_bytes sits at storage.cache_bytes means the working set is larger than the cache.
+# TYPE kimmy_storage_cache_evictions_total counter
+kimmy_storage_cache_evictions_total 9102
+# HELP kimmy_storage_cache_reads_total Page reads the storage engine served from its page cache (hit) or from the file (miss), since the database was opened.
+# TYPE kimmy_storage_cache_reads_total counter
+kimmy_storage_cache_reads_total{result=\"hit\"} 9103
+kimmy_storage_cache_reads_total{result=\"miss\"} 9104
 # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
 # TYPE kimmy_vector_index_cache_bytes gauge
 kimmy_vector_index_cache_bytes 48
@@ -2864,6 +2901,16 @@ kimmy_sync_serve_walk_seconds_count 1201
         expect(&format!("kimmy_fsyncs {}\n", s.fsyncs));
         expect(&format!("kimmy_commits_grouped_total {}\n", s.commits_grouped));
         expect(&format!("kimmy_storage_bytes {}\n", s.storage_bytes));
+        expect(&format!("kimmy_storage_cache_bytes {}\n", s.storage_cache.used_bytes));
+        expect(&format!("kimmy_storage_cache_evictions_total {}\n", s.storage_cache.evictions));
+        expect(&format!(
+            "kimmy_storage_cache_reads_total{{result=\"hit\"}} {}\n",
+            s.storage_cache.read_hits
+        ));
+        expect(&format!(
+            "kimmy_storage_cache_reads_total{{result=\"miss\"}} {}\n",
+            s.storage_cache.read_misses
+        ));
         expect(&format!("kimmy_vector_index_cache_bytes {}\n", s.vector_index_cache_bytes));
         expect(&format!("kimmy_process_resident_bytes {}\n", s.process_resident_bytes));
         expect(&format!("kimmy_process_resident_peak_bytes {}\n", s.process_resident_peak_bytes));
@@ -3220,6 +3267,9 @@ kimmy_sync_serve_walk_seconds_count 1201
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT
+                // The storage engine's page cache: its fill, its evictions,
+                // and its reads hit and missed.
+                + 4
                 + 1,
             "expected one sample per series: {out}"
         );

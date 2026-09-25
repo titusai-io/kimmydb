@@ -554,6 +554,12 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         fsyncs: 5,
         commits_grouped: 6,
         storage_bytes: 7,
+        storage_cache: kimmy_storage::CacheReading {
+            used_bytes: 22,
+            evictions: 23,
+            read_hits: 24,
+            read_misses: 25,
+        },
         vector_index_cache_bytes: 8,
         process_resident_bytes: 9,
         process_resident_peak_bytes: 10,
