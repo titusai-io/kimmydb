@@ -70,6 +70,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      # Whether the storage-cache-metrics feature's tests run: see that step
+      # in the `test` job.
+      cache_feature: ${{ steps.classify.outputs.cache_feature }}
     steps:
       # The whole history, because the classification is a diff against the
       # merge base and the default single-commit fetch cannot reach it. The
@@ -91,6 +94,7 @@ jobs:
              || ! git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
             echo "No usable range (${BASE:-none}...${HEAD:-none}); running the full gate."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "cache_feature=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -104,6 +108,7 @@ jobs:
           if [ -z "$changed" ]; then
             echo "An empty range tells us nothing; running the full gate."
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "cache_feature=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -115,6 +120,20 @@ jobs:
           else
             echo "Documentation only; fmt and clippy will report without compiling, and the test job will run the tests that read documentation files."
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The storage-cache-metrics feature's tests recompile redb,
+          # kimmy-storage and kimmy-api cold, several minutes, so they run
+          # only when something they guard changed: those two crates, the
+          # manifests, or this workflow. Always on a push to main, so main
+          # itself is never left untested with the feature.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] \
+             || printf '%s\n' "$changed" \
+                | grep -qE '^crates/kimmy-storage/|^crates/kimmy-api/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
+            echo "cache_feature=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing the storage-cache-metrics tests guard changed; skipping them."
+            echo "cache_feature=false" >> "$GITHUB_OUTPUT"
           fi
 
   # The pull-request gate is two jobs so that the cheap verdicts arrive first:
@@ -239,7 +258,9 @@ jobs:
       # feature, and kimmy-storage's cache tests, since the rest of that crate
       # does not.
       - name: Test the storage-cache-metrics feature
-        if: needs.changes.outputs.docs_only != 'true'
+        if: >-
+          needs.changes.outputs.docs_only != 'true'
+          && needs.changes.outputs.cache_feature != 'false'
         run: >-
           cargo nextest run -p kimmy-storage -p kimmy-api
           --features kimmy-storage/cache-metrics,kimmy-api/storage-cache-metrics
