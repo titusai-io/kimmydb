@@ -261,10 +261,14 @@ pub(crate) fn io<T>(
     let from = Instant::now();
     let cpu_from = if with_cpu { thread_cpu() } else { None };
     #[cfg(test)]
+    let true_cpu_from = test_hooks::true_cpu_from(cpu, kind);
+    #[cfg(test)]
     test_hooks::metered_call(kind);
     #[cfg(test)]
     test_hooks::inside_io(kind, write_calls);
     let result = call();
+    #[cfg(test)]
+    test_hooks::true_cpu_to(true_cpu_from);
     let cpu_spent = match cpu_from {
         Some(start) => thread_cpu().map(|end| end.saturating_sub(start)),
         None => None,
@@ -391,6 +395,10 @@ pub(crate) struct Decomposed {
     /// Wall time of the writes whose CPU was estimated rather than read: the
     /// most the split between `cpu` and `off_cpu` can be wrong by.
     pub write_estimated: Duration,
+    /// The CPU the estimate credited to those writes: `write_estimated` times
+    /// the sampled writes' share of CPU. Kept for the tests only.
+    #[cfg(test)]
+    pub estimated_write_cpu: Duration,
     pub read_bytes: u64,
     pub write_bytes: u64,
 }
@@ -430,6 +438,10 @@ pub(crate) fn decompose(
     } else {
         out.write_estimated.mul_f64(cpu_share(meter.write_sampled_cpu, meter.write_sampled))
     };
+    #[cfg(test)]
+    {
+        out.estimated_write_cpu = estimated_write_cpu;
+    }
     let cpu_in_io = meter.read_cpu
         + meter.len_cpu
         + meter.set_len_cpu
@@ -805,9 +817,28 @@ pub(crate) mod test_hooks {
         pub static CPU_CLOCK_STUCK_AT: Cell<Option<Duration>> = const { Cell::new(None) };
         /// Slept inside every write call from this index on.
         pub static SLEEP_IN_WRITES_FROM: Cell<Option<(u64, Duration)>> = const { Cell::new(None) };
+        /// What `SLEEP_IN_WRITES_FROM` asked to sleep, summed.
+        pub static SLEPT_IN_WRITES: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// The thread's CPU time inside every metered write call, read around
+        /// each one whether the meter sampled it or not: the truth the
+        /// meter's estimate for the unsampled writes stands in for.
+        pub static TRUE_WRITE_CPU: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// The last hold released on this thread.
+        pub static LAST_HOLD: Cell<Option<LastHold>> = const { Cell::new(None) };
         /// The backend call the next engine open on this thread fails once,
         /// armed before redb's open runs.
         pub static ARM_AT_OPEN: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// A released hold: who held it, what was metered, the CPU over the hold,
+    /// its length, and how it was decomposed.
+    #[derive(Clone, Copy, Debug)]
+    pub struct LastHold {
+        pub holder: crate::engine::WriterHolder,
+        pub meter: super::Meter,
+        pub cpu_over_hold: Option<Duration>,
+        pub held: Duration,
+        pub decomposed: super::Decomposed,
     }
 
     pub fn spin(d: Duration) {
@@ -880,6 +911,20 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// Where a metered write that reads CPU at all starts, for
+    /// [`TRUE_WRITE_CPU`].
+    pub fn true_cpu_from(cpu: bool, kind: Io) -> Option<Duration> {
+        if cpu && kind == Io::Write { super::thread_cpu() } else { None }
+    }
+
+    pub fn true_cpu_to(from: Option<Duration>) {
+        if let Some(from) = from
+            && let Some(to) = super::thread_cpu()
+        {
+            TRUE_WRITE_CPU.with(|c| c.set(c.get() + to.saturating_sub(from)));
+        }
+    }
+
     pub fn inside_io(kind: Io, write_calls: u64) {
         if kind == Io::Len {
             LEN_CALLS.with(|c| c.set(c.get() + 1));
@@ -893,6 +938,7 @@ pub(crate) mod test_hooks {
             && let Some((from, d)) = SLEEP_IN_WRITES_FROM.with(|s| s.get())
             && write_calls >= from
         {
+            SLEPT_IN_WRITES.with(|s| s.set(s.get() + d));
             std::thread::sleep(d);
         }
     }
@@ -904,6 +950,9 @@ pub(crate) mod test_hooks {
         SPIN_CPU_IN_WORK.with(|s| s.set(Duration::ZERO));
         SPIN_IN_IO.with(|s| s.set(Duration::ZERO));
         SLEEP_IN_WRITES_FROM.with(|s| s.set(None));
+        SLEPT_IN_WRITES.with(|s| s.set(Duration::ZERO));
+        TRUE_WRITE_CPU.with(|c| c.set(Duration::ZERO));
+        LAST_HOLD.with(|h| h.set(None));
         SLEEP_IN_FILE_SIZE.with(|s| s.set(Duration::ZERO));
         FILE_SIZE_CALLS.with(|c| c.set(0));
         LEN_CALLS.with(|c| c.set(0));
@@ -1305,33 +1354,86 @@ mod tests {
         // sleeps. The sleep is off the CPU inside a call whose CPU is estimated
         // for most of them, from a sample of calls that did not all sleep. The
         // time must land in `write` and not in `cpu`, and however wrong the
-        // estimate, `off_cpu` can move by no more than `write_estimated`.
-        let bulk = |engine: &Engine, coll: &crate::meta::CollectionMeta| {
-            let docs = (0..400).map(|i| doc! { "n": i, "body": "x".repeat(300) }).collect();
-            engine.insert_many(coll, docs).unwrap();
-        };
+        // estimate, `cpu` and `off_cpu` can be off by no more than
+        // `write_estimated`.
+        //
+        // Every claim is checked against this one hold's own clocks, never
+        // against a second bulk: under load, one bulk's time off the CPU
+        // outside the calls differs from the next one's by more than
+        // `write_estimated`, and a bound read across two runs failed on that
+        // noise. The hooks read the true CPU of every write call, which is
+        // what the estimate stands in for.
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
         let (engine, _dir) = fresh();
         let coll = engine.create_collection("shop", "orders").unwrap();
-        let base = during(&engine, WriterHolder::Bulk, || bulk(&engine, &coll));
-
+        // The open and the creation wrote too; only the bulk's writes count.
+        test_hooks::reset();
         let sleep = Duration::from_millis(1);
         test_hooks::SLEEP_IN_WRITES_FROM.with(|s| s.set(Some((WRITES_MEASURED, sleep))));
-        let row = during(&engine, WriterHolder::Bulk, || bulk(&engine, &coll));
+        let row = during(&engine, WriterHolder::Bulk, || {
+            let docs = (0..400).map(|i| doc! { "n": i, "body": "x".repeat(300) }).collect();
+            engine.insert_many(&coll, docs).unwrap();
+        });
+        let slept = test_hooks::SLEPT_IN_WRITES.with(|s| s.get());
+        let true_write_cpu = test_hooks::TRUE_WRITE_CPU.with(|c| c.get());
+        let test_hooks::LastHold { holder, meter, cpu_over_hold, held, decomposed: d } =
+            test_hooks::LAST_HOLD.with(|h| h.take()).expect("the bulk's hold was recorded");
         test_hooks::reset();
-
-        assert!(row.write_estimated > Duration::ZERO, "the bulk passed the sample: {row:?}");
-        let added_write = row.get(Component::Write).saturating_sub(base.get(Component::Write));
-        let added_cpu = row.get(Component::Cpu).saturating_sub(base.get(Component::Cpu));
-        let added_off = row.get(Component::OffCpu).saturating_sub(base.get(Component::OffCpu));
-        assert!(
-            added_write >= Duration::from_millis(20),
-            "the sleeps are write time: {row:?} vs {base:?}"
+        let cpu_over_hold = cpu_over_hold.expect("this platform reads a thread's CPU time");
+        let grain = CPU_CLOCK_GRAIN * (2 * (meter.cpu_reads as u32 + meter.write_calls as u32 + 1));
+        let context = format!(
+            "slept {slept:?}, true write CPU {true_write_cpu:?}, CPU over the hold \
+             {cpu_over_hold:?}, held {held:?}: {meter:?} {d:?}"
         );
-        assert!(added_cpu < added_write / 4, "the sleeps are not CPU: {row:?} vs {base:?}");
+
+        assert_eq!(row.holds, 1, "one bulk, one hold: {row:?}");
+        assert_eq!(holder, WriterHolder::Bulk, "the hold checked is the bulk's: {context}");
+        assert!(d.write_estimated > Duration::ZERO, "the bulk passed the sample: {context}");
+        assert!(slept >= Duration::from_millis(20), "the writes slept: {context}");
+
+        // The sleeps were off the CPU, inside the write calls: their CPU and
+        // the sleeps fit in the calls' wall time. A sleep overruns what it
+        // asked for and costs microseconds of CPU, so this holds with room;
+        // a hook that spun instead would put its CPU on both sides.
         assert!(
-            added_off <= row.write_estimated + base.get(Component::OffCpu),
-            "off_cpu moved {added_off:?}, past the {:?} bound: {row:?} vs {base:?}",
-            row.write_estimated
+            true_write_cpu + slept <= meter.write + grain,
+            "the write calls' CPU and their sleeps outran the calls: {context}"
+        );
+        assert!(row.get(Component::Write) >= slept, "the sleeps are write time: {row:?}");
+
+        // The estimate is the sampled writes' share of CPU applied to the
+        // unsampled writes' time, and the sample saw the sleeps, so that
+        // share is well under one: a whole unsampled write credited as CPU
+        // would read here.
+        let share = cpu_share(meter.write_sampled_cpu, meter.write_sampled);
+        assert!(share < 0.5, "the sample included sleeping writes: share {share}, {context}");
+        let expected = d.write_estimated.mul_f64(share);
+        // Large enough that an estimate forced to nothing reads here.
+        assert!(
+            expected >= Duration::from_millis(1),
+            "the sampled share of the unsampled writes is {expected:?}, too little for a \
+             missing estimate to show: {context}"
+        );
+        assert!(
+            d.estimated_write_cpu.abs_diff(expected) <= Duration::from_micros(1),
+            "the estimate is {:?}, the sampled share of {:?} is {expected:?}: {context}",
+            d.estimated_write_cpu,
+            d.write_estimated
+        );
+
+        // And the bound, exactly: the CPU outside the calls, as the true
+        // clocks say, against what the hold reported. The reported `cpu` also
+        // gives up any rounding past the hold, which the tolerance covers.
+        let true_cpu_in_calls =
+            meter.read_cpu + meter.len_cpu + meter.set_len_cpu + meter.sync_cpu + true_write_cpu;
+        let true_cpu = cpu_over_hold.saturating_sub(true_cpu_in_calls);
+        let error = d.components[Component::Cpu.slot()].abs_diff(true_cpu);
+        assert!(
+            error <= d.write_estimated + OVERCOUNT_TOLERANCE + held / 100 + grain,
+            "cpu is {error:?} from the truth, past the {:?} bound: {context}",
+            d.write_estimated
         );
         assert_adds_up(&row);
     }
