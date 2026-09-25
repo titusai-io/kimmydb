@@ -9783,6 +9783,30 @@ async fn metrics_text(server: &Server) -> String {
     raw.split("\r\n\r\n").nth(1).expect("a response body").to_string()
 }
 
+/// The page-cache series read the node's own engine: after writes and a read
+/// through the API, the cache holds pages and has served reads from itself.
+#[tokio::test]
+async fn the_storage_cache_series_read_this_nodes_engine() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "c"})).await;
+    for i in 0..20i64 {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": i})).await;
+    }
+    server.post("/v1/db/shop/coll/c/find", Some(&token), json!({})).await;
+    let text = metrics_text(&server).await;
+    let value = |name: &str| -> u64 {
+        let prefix = format!("{name} ");
+        text.lines()
+            .find(|l| l.starts_with(&prefix))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing from:\n{text}"))
+    };
+    assert!(value("kimmy_storage_cache_bytes") > 0, "{text}");
+    assert!(value("kimmy_storage_cache_reads_total{result=\"hit\"}") > 0, "{text}");
+}
+
 #[tokio::test]
 async fn a_document_an_index_cannot_key_is_stored_found_and_reported() {
     // The write that used to be refused with 400 — arrays at two of a
