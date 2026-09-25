@@ -1573,17 +1573,15 @@ fn ddl_confirmer(
         Box::pin(async move {
             let mut asked = tokio::task::JoinSet::new();
             for (addr, node) in members.entries() {
-                let confirmer = Arc::clone(&confirmer);
                 let entry = entry.clone();
-                // UNSUPERVISED: one wait per member in a JoinSet this request
-                // awaits. The push it waits on belongs to the confirmer's
-                // driver for that member, which the node's shutdown aborts; a
-                // panic here must not stop the node -- the loop below logs it
-                // and carries on, and anti-entropy carries the entry.
-                asked.spawn(async move {
-                    let resolution = confirmer.confirm(addr, node, entry, deadline).await;
-                    (addr, node, resolution)
-                });
+                // Made before it is spawned, so a request gone before the
+                // task first runs is still counted (ADR-191).
+                let waiting = confirmer.confirm(addr, node, entry, deadline);
+                // One wait per member in a JoinSet this request awaits. The
+                // push it waits on belongs to the confirmer's driver for that
+                // member, which the node's shutdown aborts.
+                // UNSUPERVISED: a panic here must not stop the node; the loop below logs it and anti-entropy carries the entry.
+                asked.spawn(async move { (addr, node, waiting.await) });
             }
             let mut found = kimmy_api::DdlConfirmation::default();
             while let Some(joined) = asked.join_next().await {

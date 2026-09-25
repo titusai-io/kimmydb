@@ -19549,7 +19549,9 @@ resolved by the first push to it whose *answered* window covers the change:
   fails before its snapshot, at the dial, the handshake or the read of the
   member's vector, flagged no one and reached no member: it resolves everyone
   queued as pending, since no push can have covered them.
-- A request that stops waiting, its client gone, is counted `cancelled`.
+- A request that stops waiting, its client gone, is counted `cancelled`, from the
+  moment its confirmation is made rather than when its task first runs, so one
+  dropped before it ever ran is counted too; a panic inside it counts `task_ended`.
 - A push is bounded end to end by the request timeout, the dial included. It
   belongs to the member's queue, not to any request: a request whose deadline
   passes answers `pending`, and the push goes on to its answer.

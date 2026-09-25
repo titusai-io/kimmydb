@@ -339,29 +339,38 @@ impl Confirmer {
     /// Confirm `entry` on the member at `addr`, which SWIM knows as `node`,
     /// waiting at most `deadline` (ADR-140). The push this waits on is not
     /// cancelled when the deadline passes; it belongs to the member's driver.
-    pub async fn confirm(
+    ///
+    /// Counted however the wait ends, and from the moment this is called, not
+    /// from the first poll: the future owns the count, so one dropped before it
+    /// ever runs (a request gone before its task started) is counted
+    /// `cancelled`, as is one dropped mid-wait; one that panics is counted
+    /// `task_ended`.
+    pub fn confirm(
         self: &Arc<Self>,
         addr: SocketAddr,
         node: NodeId,
         entry: OplogEntry,
         deadline: Duration,
-    ) -> Resolution {
-        // Counted however the wait ends: a request dropped mid-wait, when its
-        // client goes away, is counted `cancelled` rather than not at all.
-        let mut counted = Counted { hook: self.on_resolved.as_ref(), done: false };
-        let resolution = match self.enqueue(addr, node, entry) {
-            Err(now) => now,
-            Ok(answer) => match tokio::time::timeout(deadline, answer).await {
-                Ok(Ok(resolution)) => resolution,
-                Ok(Err(_)) => Resolution::pending(ConfirmOutcome::TaskEnded, "the push task ended"),
-                Err(_) => Resolution::pending(
-                    ConfirmOutcome::Timeout,
-                    format!("no answer within {deadline:?}"),
-                ),
-            },
-        };
-        counted.record(resolution.outcome());
-        resolution
+    ) -> impl std::future::Future<Output = Resolution> + Send + 'static {
+        let confirmer = Arc::clone(self);
+        let mut counted = Counted { hook: self.on_resolved.clone(), done: false };
+        async move {
+            let resolution = match confirmer.enqueue(addr, node, entry) {
+                Err(now) => now,
+                Ok(answer) => match tokio::time::timeout(deadline, answer).await {
+                    Ok(Ok(resolution)) => resolution,
+                    Ok(Err(_)) => {
+                        Resolution::pending(ConfirmOutcome::TaskEnded, "the push task ended")
+                    }
+                    Err(_) => Resolution::pending(
+                        ConfirmOutcome::Timeout,
+                        format!("no answer within {deadline:?}"),
+                    ),
+                },
+            };
+            counted.record(resolution.outcome());
+            resolution
+        }
     }
 
     /// Queue `entry` for `addr`, starting its driver if none runs; or answer
@@ -372,6 +381,8 @@ impl Confirmer {
         node: NodeId,
         entry: OplogEntry,
     ) -> Result<oneshot::Receiver<Resolution>, Resolution> {
+        #[cfg(test)]
+        assert!(!self.hooks.panic_on_enqueue.load(Ordering::SeqCst), "a panic made for a test");
         let now = Instant::now();
         let generation = self.members.generation(&addr);
         let mut peers = self.peers.lock();
@@ -753,26 +764,32 @@ impl Confirmer {
 
 /// Records one confirmation's outcome exactly once: as it ended, or as
 /// `cancelled` if the future is dropped first.
-struct Counted<'a> {
-    hook: Option<&'a ConfirmHook>,
+struct Counted {
+    hook: Option<ConfirmHook>,
     done: bool,
 }
 
-impl Counted<'_> {
+impl Counted {
     fn record(&mut self, outcome: ConfirmOutcome) {
         self.done = true;
-        if let Some(hook) = self.hook {
+        if let Some(hook) = &self.hook {
             hook(outcome);
         }
     }
 }
 
-impl Drop for Counted<'_> {
+impl Drop for Counted {
     fn drop(&mut self) {
         if !self.done
-            && let Some(hook) = self.hook
+            && let Some(hook) = &self.hook
         {
-            hook(ConfirmOutcome::Cancelled);
+            // A panic inside the confirmation is the task ending, not the
+            // request going away.
+            hook(if std::thread::panicking() {
+                ConfirmOutcome::TaskEnded
+            } else {
+                ConfirmOutcome::Cancelled
+            });
         }
     }
 }
@@ -885,6 +902,7 @@ mod test_hooks {
     pub struct Hooks {
         pub after_snapshot: Mutex<Option<Hook>>,
         pub after_mine: Mutex<Option<Hook>>,
+        pub panic_on_enqueue: std::sync::atomic::AtomicBool,
     }
 
     impl Hooks {
@@ -1748,6 +1766,32 @@ mod tests {
         waiting.abort();
         let _ = waiting.await;
         assert_eq!(*a.outcomes.lock(), vec![ConfirmOutcome::Cancelled]);
+    }
+
+    /// A confirmation dropped before it was ever polled is counted
+    /// `cancelled`: the count belongs to the future from the call.
+    #[tokio::test]
+    async fn a_confirmation_dropped_before_it_runs_is_counted() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        let waiting =
+            a.confirmer.confirm(b.addr, b.engine.node_id(), create(&a.engine, "e1"), DEADLINE);
+        drop(waiting);
+        assert_eq!(*a.outcomes.lock(), vec![ConfirmOutcome::Cancelled]);
+        assert!(a.confirmer.members_waiting().is_empty(), "and nothing was queued");
+    }
+
+    /// A panic inside a confirmation is counted `task_ended`, not `cancelled`.
+    #[tokio::test]
+    async fn a_panic_inside_a_confirmation_is_counted_as_the_task_ending() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        a.confirmer.hooks.panic_on_enqueue.store(true, Ordering::SeqCst);
+        let waiting =
+            a.confirmer.confirm(b.addr, b.engine.node_id(), create(&a.engine, "e1"), DEADLINE);
+        let ended = tokio::spawn(waiting).await;
+        assert!(ended.is_err_and(|e| e.is_panic()));
+        assert_eq!(*a.outcomes.lock(), vec![ConfirmOutcome::TaskEnded]);
     }
 
     // --- T18 ---
