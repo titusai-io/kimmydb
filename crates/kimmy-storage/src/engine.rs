@@ -5410,12 +5410,11 @@ mod tests {
             let docs: Vec<_> =
                 (0..2_000i64).map(|i| doc! {"_id": i, "pad": "x".repeat(512)}).collect();
             engine.insert_many(&coll, docs).unwrap();
-            let warm = engine.cache_reading();
-            assert!(
-                warm.used_bytes > 0,
-                "a cache that has been written through holds pages: {warm:?}"
-            );
             let before = engine.cache_reading();
+            assert!(
+                before.used_bytes > 0,
+                "a cache that has been written through holds pages: {before:?}"
+            );
             assert_eq!(engine.count(&coll).unwrap(), 2_000);
             engine.for_each_doc(&coll, |_, _| Ok(true)).unwrap();
             let after = engine.cache_reading();
@@ -5434,6 +5433,40 @@ mod tests {
         assert!(after.read_misses > before.read_misses, "a cold walk misses: {after:?}");
         assert!(after.evictions > before.evictions, "and evicts to stay in bounds: {after:?}");
         assert!(after.used_bytes <= 2 * 64 * 1024, "held within about the bound: {after:?}");
+    }
+
+    #[test]
+    fn reading_the_cache_while_another_thread_commits_does_not_panic() {
+        // redb 4.3 counts a write's cache hit before its total, and derives
+        // the misses as the difference, so a reading taken between the two
+        // increments underflows: a panic under overflow checks, which debug
+        // and test builds have. `[profile.dev.package.redb]` turns them off
+        // for redb alone; this is what holds that line in place.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "c").unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (engine, coll, stop) = (Arc::clone(&engine), coll.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut i = 0i64;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    engine.insert(&coll, doc! {"_id": i, "pad": "x".repeat(256)}).unwrap();
+                    i += 1;
+                }
+                i
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut readings = 0u64;
+        while started.elapsed() < std::time::Duration::from_secs(2) {
+            std::hint::black_box(engine.cache_reading());
+            readings += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let writes = writer.join().expect("the writer did not panic");
+        assert!(writes > 50 && readings > 1_000, "premise: both ran ({writes}, {readings})");
     }
 
     #[test]

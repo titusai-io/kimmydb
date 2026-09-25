@@ -347,14 +347,14 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.storage.cache.bytes",
             "By",
-            "Bytes the storage engine's page cache holds: the read cache and the write buffer together, bounded by storage.cache_bytes.",
+            "Bytes the storage engine's page cache holds: the read cache and the write buffer together, softly bounded by storage.cache_bytes.",
             |s| s.storage_cache.used_bytes
         );
         observe!(
             u64_observable_counter,
             "kimmy.storage.cache.evictions",
             "{page}",
-            "Pages the storage engine's page cache dropped to make room, since the database was opened.",
+            "Pages the storage engine's page cache gave up, since the database was opened: read-cache pages dropped to make room, and write-buffer pages written out early.",
             |s| s.storage_cache.evictions
         );
         observe!(

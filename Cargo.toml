@@ -98,8 +98,11 @@ toml = "1"
 # Pinned to 4.3.x: a redb minor may change allocator or system-table rules,
 # which is a format event for a store (ADR-190). A patch may not.
 # `cache_metrics` makes the page cache report its fill, evictions, and hits
-# and misses (`kimmy_storage_cache_*`). The cost is a few relaxed atomics per
-# page access, measured in the change that enabled it.
+# and misses (`kimmy_storage_cache_*`). The cost is an atomic fetch-add
+# (AcqRel or Release) on one of a few global counters per page access,
+# measured single- and multi-threaded in the change that enabled it. The
+# feature refuses to compile without 64-bit atomics (a `compile_error!` in
+# redb); every target built here has them.
 redb = { version = "~4.3", features = ["cache_metrics"] }
 
 # HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
@@ -219,6 +222,17 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 # The shipped binary is unaffected: `release` and `dist` set their own.
 [profile.dev]
 debug = "line-tables-only"
+
+# redb 4.3's cache statistics count a write's cache hit before its total and
+# subtract one from the other, so a reading taken between the two increments
+# underflows. With overflow checks, as in dev and test builds, that is a
+# panic on roughly one `/metrics` scrape in a hundred during writes; a release
+# build wraps a value this code never reads. Off for redb alone, and only
+# here. Reported upstream; this goes when a redb release fixes it, and
+# `reading_the_cache_while_another_thread_commits_does_not_panic` says when
+# that has happened.
+[profile.dev.package.redb]
+overflow-checks = false
 
 [profile.release]
 opt-level = 3

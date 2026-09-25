@@ -1296,10 +1296,10 @@ impl Metrics {
              # HELP kimmy_storage_bytes Size of the database file on disk.\n\
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
-             # HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together. Bounded by storage.cache_bytes, it is filled by reads and not released on a timer, so it settles at the busiest period's level; it is most of a node's resident memory.\n\
+             # HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together, filled by reads and by commits. Bounded by storage.cache_bytes, softly: it can briefly exceed it, and can count a page twice after a non-durable commit. It is not released on a timer, so it settles at the busiest period's level, and it is most of a node's resident memory.\n\
              # TYPE kimmy_storage_cache_bytes gauge\n\
              kimmy_storage_cache_bytes {cache_bytes}\n\
-             # HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache dropped to make room, since the database was opened. Rising while kimmy_storage_cache_bytes sits at storage.cache_bytes means the working set is larger than the cache.\n\
+             # HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache gave up, since the database was opened: read-cache pages dropped to make room, and write-buffer pages written out early once a transaction's writes pass half of storage.cache_bytes. Rising with reads while kimmy_storage_cache_bytes sits at the bound means the working set is larger than the cache; rising with a large bulk write is the write buffer spilling.\n\
              # TYPE kimmy_storage_cache_evictions_total counter\n\
              kimmy_storage_cache_evictions_total {cache_evictions}\n\
              # HELP kimmy_storage_cache_reads_total Page reads the storage engine served from its page cache (hit) or from the file (miss), since the database was opened.\n\
@@ -2489,10 +2489,10 @@ kimmy_write_lock_held_cpu_unmeasured_total 99
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
-# HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together. Bounded by storage.cache_bytes, it is filled by reads and not released on a timer, so it settles at the busiest period's level; it is most of a node's resident memory.
+# HELP kimmy_storage_cache_bytes Bytes the storage engine's page cache holds now: the read cache and the write buffer together, filled by reads and by commits. Bounded by storage.cache_bytes, softly: it can briefly exceed it, and can count a page twice after a non-durable commit. It is not released on a timer, so it settles at the busiest period's level, and it is most of a node's resident memory.
 # TYPE kimmy_storage_cache_bytes gauge
 kimmy_storage_cache_bytes 9101
-# HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache dropped to make room, since the database was opened. Rising while kimmy_storage_cache_bytes sits at storage.cache_bytes means the working set is larger than the cache.
+# HELP kimmy_storage_cache_evictions_total Pages the storage engine's page cache gave up, since the database was opened: read-cache pages dropped to make room, and write-buffer pages written out early once a transaction's writes pass half of storage.cache_bytes. Rising with reads while kimmy_storage_cache_bytes sits at the bound means the working set is larger than the cache; rising with a large bulk write is the write buffer spilling.
 # TYPE kimmy_storage_cache_evictions_total counter
 kimmy_storage_cache_evictions_total 9102
 # HELP kimmy_storage_cache_reads_total Page reads the storage engine served from its page cache (hit) or from the file (miss), since the database was opened.

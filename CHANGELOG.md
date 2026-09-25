@@ -18,10 +18,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and **`kimmy_storage_cache_reads_total{result}`** report the storage
   engine's page cache: what it holds now (the read cache and the write buffer
   together, bounded by `storage.cache_bytes`), the pages it has dropped to
-  make room, and its page reads served from the cache (`hit`) or the file
-  (`miss`). They are bridged as `kimmy.storage.cache.bytes`, `.evictions`,
+  make room or written out early from the write buffer, and its page reads
+  served from the cache (`hit`) or the file (`miss`). They are bridged as `kimmy.storage.cache.bytes`, `.evictions`,
   `.reads.hit` and `.reads.miss`. The cache is most of a node's resident
-  memory, and this gauge tells it apart from heap growth. It needs redb's
+  memory, and it is heap, so the kernel's anonymous and file-backed split
+  cannot separate it from other heap growth; this gauge can. It needs redb's
   cache statistics, now enabled. That costs nothing measurable on writes or
   on reads served entirely from the cache, such as index range scans. The
   benchmarks compared five interleaved rounds with the statistics off and
