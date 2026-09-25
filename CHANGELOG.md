@@ -26,7 +26,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **`kimmy_ddl_confirmations_total{outcome}`** counts each index create or
   drop's confirmation on each member by how it ended (`confirmed`, `refused`,
   `timeout`, `failed`, `unreached`, `purging`, `stopped_unknown`,
-  `other_member`, `task_ended`, `backoff`, `unattributable`), and
+  `other_member`, `task_ended`, `backoff`, `unattributable`, `cancelled`), and
   **`kimmy_ddl_confirm_pushes_total`** the windows pushed for them (bridged
   as `kimmy.ddl.confirmations.<outcome>` and `kimmy.ddl.confirm_pushes`).
 
@@ -53,8 +53,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   burst of N, holding its writer for the whole burst, and every confirmation
   timed out with a broken pipe on the peer. It now applies each create about
   once.
-
-### Fixed
 
 - **The refusal of a store whose commit slot points past the end of the file
   says the slot is damaged or names such a page.** It said only the second, as

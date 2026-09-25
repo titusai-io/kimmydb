@@ -885,6 +885,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.ddl.confirmations.cancelled",
+            "{confirmation}",
+            "Schema-change confirmations on a member that ended cancelled.",
+            |s| s.ddl_confirmations[ConfirmOutcome::Cancelled.slot()]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.ddl.confirm_pushes",
             "{push}",
             "Windows pushed to members to confirm schema changes; at most one in flight per member.",

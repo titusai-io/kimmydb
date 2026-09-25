@@ -1342,7 +1342,7 @@ impl Metrics {
              # TYPE kimmy_sync_ddl_applied_total counter\n\
              kimmy_sync_ddl_applied_total{{via=\"pull\"}} {sync_ddl_applied_pull}\n\
              kimmy_sync_ddl_applied_total{{via=\"push\"}} {sync_ddl_applied_push}\n\
-             # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes.\n\
+             # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.\n\
              # TYPE kimmy_ddl_confirmations_total counter\n\
              {ddl_confirmations}\
              # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.\n\
@@ -1940,7 +1940,7 @@ mod tests {
                 m.record_ddl_confirmation(outcome);
             }
         }
-        for _ in 0..131 {
+        for _ in 0..137 {
             m.record_ddl_confirm_push();
         }
         for _ in 0..20 {
@@ -2515,7 +2515,7 @@ kimmy_sync_ddl_declined_total 36
 # TYPE kimmy_sync_ddl_applied_total counter
 kimmy_sync_ddl_applied_total{via=\"pull\"} 89
 kimmy_sync_ddl_applied_total{via=\"push\"} 97
-# HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes.
+# HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.
 # TYPE kimmy_ddl_confirmations_total counter
 kimmy_ddl_confirmations_total{outcome=\"confirmed\"} 120
 kimmy_ddl_confirmations_total{outcome=\"refused\"} 121
@@ -2528,9 +2528,10 @@ kimmy_ddl_confirmations_total{outcome=\"other_member\"} 127
 kimmy_ddl_confirmations_total{outcome=\"task_ended\"} 128
 kimmy_ddl_confirmations_total{outcome=\"backoff\"} 129
 kimmy_ddl_confirmations_total{outcome=\"unattributable\"} 130
+kimmy_ddl_confirmations_total{outcome=\"cancelled\"} 131
 # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.
 # TYPE kimmy_ddl_confirm_pushes_total counter
-kimmy_ddl_confirm_pushes_total 131
+kimmy_ddl_confirm_pushes_total 137
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91

@@ -99,10 +99,13 @@ pub enum ConfirmOutcome {
     /// The member's answer cannot be attributed per change (a version before
     /// ADR-191's fields).
     Unattributable,
+    /// The request stopped waiting before any of the above: its client went
+    /// away, and the request with it.
+    Cancelled,
 }
 
 impl ConfirmOutcome {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Confirmed,
         Self::Refused,
@@ -115,6 +118,7 @@ impl ConfirmOutcome {
         Self::TaskEnded,
         Self::Backoff,
         Self::Unattributable,
+        Self::Cancelled,
     ];
 
     pub const fn slot(self) -> usize {
@@ -134,6 +138,7 @@ impl ConfirmOutcome {
             Self::TaskEnded => "task_ended",
             Self::Backoff => "backoff",
             Self::Unattributable => "unattributable",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -341,6 +346,9 @@ impl Confirmer {
         entry: OplogEntry,
         deadline: Duration,
     ) -> Resolution {
+        // Counted however the wait ends: a request dropped mid-wait, when its
+        // client goes away, is counted `cancelled` rather than not at all.
+        let mut counted = Counted { hook: self.on_resolved.as_ref(), done: false };
         let resolution = match self.enqueue(addr, node, entry) {
             Err(now) => now,
             Ok(answer) => match tokio::time::timeout(deadline, answer).await {
@@ -352,9 +360,7 @@ impl Confirmer {
                 ),
             },
         };
-        if let Some(hook) = &self.on_resolved {
-            hook(resolution.outcome());
-        }
+        counted.record(resolution.outcome());
         resolution
     }
 
@@ -724,7 +730,9 @@ impl Confirmer {
                     // doubling while the member keeps not answering (ADR-191).
                     let step = match &queue.backoff {
                         Some(previous) => (previous.step * 2).min(self.config.max_backoff),
-                        None => self.config.first_backoff,
+                        // Never above the longest step, or the next doubling
+                        // would shrink it.
+                        None => self.config.first_backoff.min(self.config.max_backoff),
                     };
                     queue.backoff =
                         Some(Backoff { until: Instant::now() + step, step, generation });
@@ -740,6 +748,32 @@ impl Confirmer {
             }
         }
         pause
+    }
+}
+
+/// Records one confirmation's outcome exactly once: as it ended, or as
+/// `cancelled` if the future is dropped first.
+struct Counted<'a> {
+    hook: Option<&'a ConfirmHook>,
+    done: bool,
+}
+
+impl Counted<'_> {
+    fn record(&mut self, outcome: ConfirmOutcome) {
+        self.done = true;
+        if let Some(hook) = self.hook {
+            hook(outcome);
+        }
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        if !self.done
+            && let Some(hook) = self.hook
+        {
+            hook(ConfirmOutcome::Cancelled);
+        }
     }
 }
 
@@ -1532,7 +1566,11 @@ mod tests {
     async fn a_member_seen_up_again_by_swim_ends_the_back_off() {
         let b = member().await;
         b.served.break_next.store(1, Ordering::SeqCst);
-        let config = ConfirmConfig { first_backoff: Duration::from_secs(30), ..quick() };
+        let config = ConfirmConfig {
+            first_backoff: Duration::from_secs(30),
+            max_backoff: Duration::from_secs(60),
+            ..quick()
+        };
         let a = pusher_for(&b, config);
         let node = b.engine.node_id();
         let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
@@ -1627,6 +1665,89 @@ mod tests {
         let two = queued.await.unwrap();
         assert_eq!(two.outcome(), ConfirmOutcome::Unreached, "{two:?}");
         assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no window stops short of a change");
+    }
+
+    /// A window cut by the batch cap between two changes queued before it:
+    /// the one inside it is confirmed, and the one past the cut is unreached,
+    /// resolved by that push rather than carried to another (ADR-191).
+    #[tokio::test]
+    async fn a_window_cut_between_two_queued_changes_confirms_one_and_pends_the_other() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        let node = b.engine.node_id();
+        let inside = create(&a.engine, "e1");
+        let orders = a.engine.get_collection("shop", "orders").unwrap();
+        for i in 0..MAX_BATCH {
+            a.engine.insert(&orders, bson::doc! { "_id": i as i64 }).unwrap();
+        }
+        let past = create(&a.engine, "e2");
+        let inside = a.confirmer.enqueue(b.addr, node, inside).unwrap();
+        let past = a.confirmer.enqueue(b.addr, node, past).unwrap();
+        assert_eq!(inside.await.unwrap(), Resolution::Confirmed);
+        let past = past.await.unwrap();
+        assert_eq!(past.outcome(), ConfirmOutcome::Unreached, "{past:?}");
+        assert_eq!(b.served.windows().len(), 1, "one window, cut at the cap");
+    }
+
+    /// A window cut by the frame limit rather than the batch cap: large
+    /// documents between two queued changes, re-read at the count that fits.
+    /// The change inside is confirmed, the one past the cut is unreached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_cut_by_the_frame_limit_confirms_what_fits() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        let node = b.engine.node_id();
+        let inside = create(&a.engine, "e1");
+        let orders = a.engine.get_collection("shop", "orders").unwrap();
+        let body = "x".repeat(4 * 1024 * 1024);
+        for i in 0..20i64 {
+            a.engine.insert(&orders, bson::doc! { "_id": i, "body": &body }).unwrap();
+        }
+        let past = create(&a.engine, "e2");
+        let inside = a.confirmer.enqueue(b.addr, node, inside).unwrap();
+        let past = a.confirmer.enqueue(b.addr, node, past).unwrap();
+        assert_eq!(inside.await.unwrap(), Resolution::Confirmed);
+        let past = past.await.unwrap();
+        assert_eq!(past.outcome(), ConfirmOutcome::Unreached, "{past:?}");
+    }
+
+    /// A first step configured above the longest is clamped to it, so the
+    /// next failure does not halve it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_back_off_step_is_never_above_the_longest() {
+        let b = member().await;
+        b.served.break_next.store(2, Ordering::SeqCst);
+        let config = ConfirmConfig {
+            first_backoff: Duration::from_millis(300),
+            max_backoff: Duration::from_millis(100),
+            ..quick()
+        };
+        let a = pusher_for(&b, config);
+        let node = b.engine.node_id();
+        let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
+        assert_eq!(one.outcome(), ConfirmOutcome::Failed);
+        assert_eq!(a.confirmer.backoff_step(b.addr), Some(Duration::from_millis(100)));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let two = a.confirmer.confirm(b.addr, node, create(&a.engine, "e2"), DEADLINE).await;
+        assert_eq!(two.outcome(), ConfirmOutcome::Failed);
+        assert_eq!(a.confirmer.backoff_step(b.addr), Some(Duration::from_millis(100)));
+    }
+
+    /// A request dropped mid-wait is counted `cancelled`, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_request_is_counted() {
+        let b = member().await;
+        *b.served.hold.lock() = Duration::from_millis(1000);
+        let a = pusher_for(&b, quick());
+        let node = b.engine.node_id();
+        let confirmer = Arc::clone(&a.confirmer);
+        let entry = create(&a.engine, "e1");
+        let waiting =
+            tokio::spawn(async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(*a.outcomes.lock(), vec![ConfirmOutcome::Cancelled]);
     }
 
     // --- T18 ---

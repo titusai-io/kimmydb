@@ -39,6 +39,6 @@ pub use peers::{
     RoundReport, replicate,
 };
 pub use transport::{
-    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, PushOutcome, REPAIR_ATTEMPTS,
-    REPAIR_COOLDOWN_ROUNDS, Repair, push_entry, serve, serve_with, sync_once, sync_once_with,
+    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
+    Repair, serve, serve_with, sync_once, sync_once_with,
 };

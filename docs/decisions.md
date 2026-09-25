@@ -10364,9 +10364,12 @@ change queued there, and may extend past the newest of them, to the batch cap
 or the tail of what the member lacks, exactly as a pulled window does. The
 entries past the newest waiter are applied and witnessed by the same coverage
 rule; they are nobody's confirmation. The invariant below and the coverage
-rule are unchanged. A change is confirmed only by a window that carried it,
+rule are unchanged. A change is confirmed by a window that carried it,
 within the vector the window was introduced with and before any stop, and
-that the member answered: so the member took it, through this rule.
+that the member answered: so the member took it, through this rule. The one
+other way is the early exit, unchanged: a member whose witnessed vector
+already covers the change when a push begins is confirmed with nothing sent,
+which is ADR-140's "holds or has refused".
 
 **The invariant, stated.** Nothing raises a node's witnessed vector for an
 origin except a window that starts at that node's own position for it, or a
@@ -19542,7 +19545,11 @@ resolved by the first push to it whose *answered* window covers the change:
 - A change queued before a push's snapshot, which is taken just before that
   push reads what this node can serve, is resolved by that push whatever its
   answer. A change queued after it is carried to the next push if this one does
-  not cover it. So every change is resolved by at most two pushes.
+  not cover it. So every change is resolved by at most two pushes. A push that
+  fails before its snapshot, at the dial, the handshake or the read of the
+  member's vector, flagged no one and reached no member: it resolves everyone
+  queued as pending, since no push can have covered them.
+- A request that stops waiting, its client gone, is counted `cancelled`.
 - A push is bounded end to end by the request timeout, the dial included. It
   belongs to the member's queue, not to any request: a request whose deadline
   passes answers `pending`, and the push goes on to its answer.
@@ -19571,7 +19578,9 @@ about once; a push that belongs to the queue is read to its answer.
 
 **Why covered is decided by the answered window.** A change is never reported
 confirmed on a member unless its entry was in a window the member answered,
-and the member took it. The window's entries are what was sent; the vector
+and the member took it; or, as before, the member's witnessed vector already
+covered it when the push began, the early exit that confirms with nothing sent
+and that ADR-140 calls "holds or has refused". The window's entries are what was sent; the vector
 bound excludes an entry minted between the read of the vector and the read of
 the window, which the member defers (ADR-148); the stop bound excludes what
 the batch never reached. What a taken entry can be is applied, refused,
@@ -19609,7 +19618,8 @@ up to two windows' applies, inside the same deadline; and a fast create can
 wait behind a slow window for another collection, where today's concurrent
 push might have fitted into a gap. `Pushed` gains two optional fields; a
 confirmation gains per-change attribution; `Members` gains a generation per
-address. The HTTP response does not change.
+address. `push_entry`, the one-change push, is removed; its tests drive the
+confirmer. The HTTP response does not change.
 
 **Tested.** In `kimmy-cluster`'s `confirm` module, against real members served
 over TLS: a burst of 32 creates applied once each; a change minted while a
