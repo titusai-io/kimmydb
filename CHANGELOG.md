@@ -10,7 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.38.0 - 2026-09-25
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the store format is unchanged and redb is still 4.3, so 0.37.0 opens a store
+0.38.0 has run on, and a member rolls back by starting it on 0.37.0. Index
+creates and drops are now confirmed with one push in flight per member, and a
+refusal names only the change refused. The push answer gains two optional
+fields, which each version reads when the other sends them and does without
+when it doesn't, so a cluster confirms throughout a mixed roll. New metrics
+count the schema changes a member applied, each confirmation by how it ended,
+and the windows pushed for them. The refusal of a damaged commit slot is
+reworded, and the operations guide now gives the single-document write cost on
+rotational disks.**
 
 ### Added
 
@@ -53,7 +65,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   burst of N, holding its writer for the whole burst, and every confirmation
   timed out with a broken pipe on the peer. It now applies each create about
   once.
-
 - **The refusal of a store whose commit slot points past the end of the file
   says the slot is damaged or names such a page.** It said only the second, as
   "its primary commit slot name a root page past the file's end", including
@@ -71,7 +82,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   rotational disk, the same ~2.5 GB store took +26% on the write hold and
   +33% on the fdatasync per insert against 0.36.0. The lab cluster's 3.5 GB
   members doubled both. SSD and NVMe show no cost. Nothing changes in the
-  code: no setting moves those pages.
+  code: no setting moves those pages. It has been reported upstream.
 
 ## 0.37.0 - 2026-09-24
 
