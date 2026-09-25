@@ -66,12 +66,17 @@ pub struct RoundReport {
     /// declined, unknown-collection or purge-pending one is not counted here.
     /// Nor is a replayed drop this node had already recorded, or a change for
     /// a collection dropped here (counted only as superseded); no outcome
-    /// series counts those two. A change already held here that the apply takes again
-    /// — a creation of a collection that stands, a definition or a drop that
-    /// is history — comes back from `apply_ddl` as applied and is counted:
-    /// it is one more apply this node did for one delivered entry, which is
-    /// what the count is for (`kimmy_sync_ddl_applied_total`).
+    /// series counts those two. Nor is a change whose entry this node
+    /// already held as sent: that is [`Self::ddl_held`]. A change applied
+    /// again with its entry not held — a definition standing here whose
+    /// entry is not, a creation or drop that is history — is counted
+    /// (`kimmy_sync_ddl_applied_total`).
     pub ddl_applied: usize,
+    /// Replicated schema changes the rounds in this tick carried that this
+    /// node already held, entry and all, and so did not apply again or
+    /// append — `SyncOutcome::ddl_held`, summed over the pulls
+    /// (`kimmy_sync_ddl_held_total`).
+    pub ddl_held: usize,
     /// Replicated schema changes the rounds in this tick could not apply to
     /// this node's state and skipped — `SyncOutcome::ddl_refused`, summed
     /// over the peers reached. Each one is an index this node now lacks and
@@ -696,6 +701,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // round went on to succeed (ADR-177).
                     let applied = stalls.take_applied();
                     report.ddl_applied += applied.ddl_applied;
+                    report.ddl_held += applied.ddl_held;
                     report.ddl_refused += applied.ddl_refused;
                     report.ddl_declined += applied.ddl_declined;
                     report.entries_skipped_unknown_collection += applied.unknown_collection;

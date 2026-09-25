@@ -793,15 +793,29 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.ddl_applied.pull",
             "{change}",
-            "Replicated schema changes this node applied from windows it pulled, a change already held here that a window carried again included.",
+            "Replicated schema changes this node applied from windows it pulled, not counting those whose entry it already held.",
             sync_ddl_applied_pull
         );
         observe!(
             u64_observable_counter,
             "kimmy.sync.ddl_applied.push",
             "{change}",
-            "Replicated schema changes this node applied from windows a peer pushed to confirm a change, a change already held here that a window carried again included.",
+            "Replicated schema changes this node applied from windows a peer pushed to confirm a change, not counting those whose entry it already held.",
             sync_ddl_applied_push
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.ddl_held.pull",
+            "{change}",
+            "Replicated schema changes in windows this node pulled that it already held, entry and all: not applied again, and their append committed nothing.",
+            sync_ddl_held_pull
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.ddl_held.push",
+            "{change}",
+            "Replicated schema changes in windows a peer pushed that this node already held, entry and all: not applied again, and their append committed nothing.",
+            sync_ddl_held_push
         );
         // Each way a schema-change confirmation ends, one instrument per
         // label value, in `ConfirmOutcome::ALL` order (ADR-191).
