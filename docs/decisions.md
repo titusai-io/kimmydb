@@ -17412,7 +17412,7 @@ each was broken on its own to watch its test fail for the stated reason.
     not `cpu`, and leaves `cpu` within `write_estimated` of the CPU the hold
     really spent outside its calls. It is read against that one hold's own
     clocks: test hooks read the true CPU of every write call, sampled or not.
-    The hooks also check that the sleeps were off the CPU inside the calls,
+    The test also checks that the sleeps were off the CPU inside the calls,
     and that the estimate is the sampled writes' share of CPU. An earlier form
     compared `off_cpu` with a second, baseline bulk, and on a loaded Linux
     runner the two bulks' time off the CPU outside the calls differed by more

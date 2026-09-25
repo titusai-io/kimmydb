@@ -1167,6 +1167,7 @@ impl Engine {
             #[cfg(test)]
             crate::hold_meter::test_hooks::LAST_HOLD.with(|h| {
                 h.set(Some(crate::hold_meter::test_hooks::LastHold {
+                    holder,
                     meter: metered,
                     cpu_over_hold: cpu,
                     held,

@@ -396,7 +396,8 @@ pub(crate) struct Decomposed {
     /// most the split between `cpu` and `off_cpu` can be wrong by.
     pub write_estimated: Duration,
     /// The CPU the estimate credited to those writes: `write_estimated` times
-    /// the sampled writes' share of CPU.
+    /// the sampled writes' share of CPU. Kept for the tests only.
+    #[cfg(test)]
     pub estimated_write_cpu: Duration,
     pub read_bytes: u64,
     pub write_bytes: u64,
@@ -437,7 +438,10 @@ pub(crate) fn decompose(
     } else {
         out.write_estimated.mul_f64(cpu_share(meter.write_sampled_cpu, meter.write_sampled))
     };
-    out.estimated_write_cpu = estimated_write_cpu;
+    #[cfg(test)]
+    {
+        out.estimated_write_cpu = estimated_write_cpu;
+    }
     let cpu_in_io = meter.read_cpu
         + meter.len_cpu
         + meter.set_len_cpu
@@ -826,10 +830,11 @@ pub(crate) mod test_hooks {
         pub static ARM_AT_OPEN: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
 
-    /// A released hold: what was metered, the CPU over the hold, its length,
-    /// and how it was decomposed.
+    /// A released hold: who held it, what was metered, the CPU over the hold,
+    /// its length, and how it was decomposed.
     #[derive(Clone, Copy, Debug)]
     pub struct LastHold {
+        pub holder: crate::engine::WriterHolder,
         pub meter: super::Meter,
         pub cpu_over_hold: Option<Duration>,
         pub held: Duration,
@@ -1363,6 +1368,8 @@ mod tests {
         }
         let (engine, _dir) = fresh();
         let coll = engine.create_collection("shop", "orders").unwrap();
+        // The open and the creation wrote too; only the bulk's writes count.
+        test_hooks::reset();
         let sleep = Duration::from_millis(1);
         test_hooks::SLEEP_IN_WRITES_FROM.with(|s| s.set(Some((WRITES_MEASURED, sleep))));
         let row = during(&engine, WriterHolder::Bulk, || {
@@ -1371,7 +1378,7 @@ mod tests {
         });
         let slept = test_hooks::SLEPT_IN_WRITES.with(|s| s.get());
         let true_write_cpu = test_hooks::TRUE_WRITE_CPU.with(|c| c.get());
-        let test_hooks::LastHold { meter, cpu_over_hold, held, decomposed: d } =
+        let test_hooks::LastHold { holder, meter, cpu_over_hold, held, decomposed: d } =
             test_hooks::LAST_HOLD.with(|h| h.take()).expect("the bulk's hold was recorded");
         test_hooks::reset();
         let cpu_over_hold = cpu_over_hold.expect("this platform reads a thread's CPU time");
@@ -1382,6 +1389,7 @@ mod tests {
         );
 
         assert_eq!(row.holds, 1, "one bulk, one hold: {row:?}");
+        assert_eq!(holder, WriterHolder::Bulk, "the hold checked is the bulk's: {context}");
         assert!(d.write_estimated > Duration::ZERO, "the bulk passed the sample: {context}");
         assert!(slept >= Duration::from_millis(20), "the writes slept: {context}");
 
@@ -1402,6 +1410,12 @@ mod tests {
         let share = cpu_share(meter.write_sampled_cpu, meter.write_sampled);
         assert!(share < 0.5, "the sample included sleeping writes: share {share}, {context}");
         let expected = d.write_estimated.mul_f64(share);
+        // Large enough that an estimate forced to nothing reads here.
+        assert!(
+            expected >= Duration::from_millis(1),
+            "the sampled share of the unsampled writes is {expected:?}, too little for a \
+             missing estimate to show: {context}"
+        );
         assert!(
             d.estimated_write_cpu.abs_diff(expected) <= Duration::from_micros(1),
             "the estimate is {:?}, the sampled share of {:?} is {expected:?}: {context}",
