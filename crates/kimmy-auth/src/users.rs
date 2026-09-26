@@ -6,7 +6,7 @@
 //! that nothing can collide with these.
 
 use kimmy_core::DocId;
-use kimmy_storage::{CollectionMeta, Engine};
+use kimmy_storage::{CollectionMeta, Engine, WriteScope, WriterHolder};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -63,6 +63,11 @@ impl User {
     }
 }
 
+/// A user record as the engine stores it.
+fn encode(user: &User) -> Result<bson::Document> {
+    bson::serialize_to_document(user).map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))
+}
+
 /// Reads and writes users against the storage engine.
 pub struct UserStore {
     collection: CollectionMeta,
@@ -98,50 +103,130 @@ impl UserStore {
     /// grants a role resolves to are embedded in the token at login, so without
     /// the bump a *narrowing* edit would do nothing until the token expired.
     pub fn set_roles(&self, engine: &Engine, name: &str, roles: Vec<String>) -> Result<()> {
-        let mut user =
-            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
-        user.roles = roles;
-        user.token_version = user.token_version.wrapping_add(1);
-        self.put(engine, &user)
+        self.edit(engine, name, |user| user.roles = roles)
     }
 
-    /// Invalidate every token held by a user carrying `role`, returning how many.
+    /// Replace a role's grants and invalidate every token held by a user
+    /// carrying it, returning those users.
     ///
-    /// **This is what keeps a role edit honest, and it is the easiest thing in
-    /// the feature to leave out.** A local user's grants are resolved at login
-    /// and embedded in its token, so narrowing a role changes nothing for
-    /// anyone already holding one until it expires — silently contradicting the
-    /// promise [`Self::set_grants`] has made since ADR-052.
+    /// **The invalidation is what keeps a role edit honest, and it is the
+    /// easiest thing in the feature to leave out.** A local user's grants are
+    /// resolved at login and embedded in its token, so narrowing a role changes
+    /// nothing for anyone already holding one until it expires — silently
+    /// contradicting the promise [`Self::set_grants`] has made since ADR-052.
     ///
-    /// A scan, because users are documents in a collection and there is no
-    /// index from role to holder. That is the honest cost of the storage shape;
-    /// a role edit is an administrative action, not a request-path one.
+    /// The names, not a count: bumping the stored version is only half of a
+    /// revocation, because the session check reads a cache in front of it
+    /// (ADR-052). The caller has to evict each holder from that cache, and it
+    /// cannot do that from a number.
+    ///
+    /// **One transaction** for the role and every holder (ADR-192). The role
+    /// was one commit and each holder another, so a failure part way answered
+    /// an error over a role already changed, and left the holders not yet
+    /// reached holding tokens with the old grants. And each holder was read
+    /// outside the writer and written back whole, so an edit that landed in
+    /// between — an account disabled a moment before — was reverted.
     ///
     /// Federated principals need nothing here and get nothing: they have no
     /// user record and no token version (ADR-065), and their grants are
     /// resolved from the mapping on every request, so a role edit already
     /// applies to them immediately.
-    pub fn invalidate_holders_of_role(&self, engine: &Engine, role: &str) -> Result<Vec<String>> {
-        let mut holders = Vec::new();
-        for name in self.list(engine)? {
-            if let Some(user) = self.get(engine, &name)?
-                && user.roles.iter().any(|held| held == role)
-            {
-                holders.push(user);
-            }
-        }
+    pub fn set_role_grants(
+        &self,
+        engine: &Engine,
+        role: &str,
+        grants: Vec<Grant>,
+    ) -> Result<Vec<String>> {
+        let roles = self.roles.collection().clone();
+        self.edit_role(engine, role, |scope| {
+            let id = DocId::String(role.to_string());
+            let Some(doc) = scope.get(&roles, &id)? else {
+                return Ok(Err(AuthError::RoleNotFound(role.into())));
+            };
+            let mut stored = match crate::roles::decode(role, doc) {
+                Ok(stored) => stored,
+                Err(e) => return Ok(Err(e)),
+            };
+            stored.grants = grants;
+            let doc = match crate::roles::encode(&stored) {
+                Ok(doc) => doc,
+                Err(e) => return Ok(Err(e)),
+            };
+            scope.replace(&roles, &id, doc, true)?;
+            Ok(Ok(()))
+        })
+        .map(|((), holders)| holders)
+    }
 
-        // The names, not a count: bumping the stored version is only half of a
-        // revocation, because the session check reads a cache in front of it
-        // (ADR-052). The caller has to evict each holder from that cache, and
-        // it cannot do that from a number.
-        let mut names = Vec::with_capacity(holders.len());
-        for mut user in holders {
-            user.token_version = user.token_version.wrapping_add(1);
-            self.put(engine, &user)?;
-            names.push(user.name);
-        }
-        Ok(names)
+    /// Delete a role and invalidate every token held by a user carrying it,
+    /// in one transaction (ADR-192); see [`Self::set_role_grants`]. Returns
+    /// whether the role existed, and the users invalidated.
+    ///
+    /// Holders keep the role *name* on their record, where it resolves to
+    /// nothing. That is deliberate: the alternative is editing every user
+    /// record's roles on a delete, and a dangling name that grants nothing is
+    /// the safe direction to fail in. Their tokens are bumped whether or not
+    /// the role still existed, so a delete sent again reaches every holder.
+    pub fn delete_role(&self, engine: &Engine, role: &str) -> Result<(bool, Vec<String>)> {
+        let roles = self.roles.collection().clone();
+        self.edit_role(engine, role, |scope| {
+            Ok(Ok(scope.delete(&roles, &DocId::String(role.to_string()))?))
+        })
+    }
+
+    /// Change a role through `change`, then bump the token version of every
+    /// user holding it, all in one scope: every record is read under the
+    /// writer, in the transaction that writes it.
+    ///
+    /// `change` answers the storage error that aborts the transaction outside,
+    /// and a refusal of its own inside; a refusal aborts it too, having
+    /// written nothing, because nothing is written after it.
+    fn edit_role<T>(
+        &self,
+        engine: &Engine,
+        role: &str,
+        change: impl FnOnce(&mut WriteScope<'_>) -> kimmy_storage::Result<Result<T>>,
+    ) -> Result<(T, Vec<String>)> {
+        let users = self.collection.clone();
+        let edited = engine.write_batch(WriterHolder::Write, |scope| {
+            let mut holders = Vec::new();
+            let mut undecodable = None;
+            scope.for_each_doc(&users, |id, doc| {
+                match bson::deserialize_from_document::<User>(doc.clone()) {
+                    Ok(user) if user.roles.iter().any(|held| held == role) => holders.push(user),
+                    Ok(_) => {}
+                    Err(e) => {
+                        undecodable = Some(AuthError::Hashing(format!("decoding user {id}: {e}")));
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if let Some(e) = undecodable {
+                return Ok(Err(e));
+            }
+            // Encoded before anything is written, so a refusal here leaves the
+            // scope unwritten and the transaction aborts whole.
+            let mut bumped = Vec::with_capacity(holders.len());
+            for mut user in holders {
+                user.token_version = user.token_version.wrapping_add(1);
+                match encode(&user) {
+                    Ok(doc) => bumped.push((user.name, doc)),
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+            let value = match change(scope)? {
+                Ok(value) => value,
+                Err(e) => return Ok(Err(e)),
+            };
+            let mut names = Vec::with_capacity(bumped.len());
+            for (name, doc) in bumped {
+                scope.replace(&users, &DocId::String(name.clone()), doc, true)?;
+                names.push(name);
+            }
+            Ok(Ok((value, names)))
+        });
+        edited.map_err(AuthError::Storage)?
     }
 
     /// Create the bootstrap superuser if the store is empty.
@@ -226,11 +311,10 @@ impl UserStore {
     /// after a suspected compromise: changing the password logs out everyone
     /// holding a token for this account, including whoever took it.
     pub fn set_password(&self, engine: &Engine, name: &str, password: &str) -> Result<()> {
-        let mut user =
-            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
-        user.password_hash = password::hash(password)?;
-        user.token_version = user.token_version.wrapping_add(1);
-        self.put(engine, &user)
+        // Hashed before the writer is taken: it is deliberately slow, and
+        // every other write on the node would wait behind it.
+        let hash = password::hash(password)?;
+        self.edit(engine, name, |user| user.password_hash = hash)
     }
 
     /// Replace a user's grants, taking effect immediately.
@@ -239,11 +323,7 @@ impl UserStore {
     /// *narrowing* one especially — would do nothing until the token expired.
     /// The cost is that there is no refresh flow, so this logs the user out.
     pub fn set_grants(&self, engine: &Engine, name: &str, grants: Vec<Grant>) -> Result<()> {
-        let mut user =
-            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
-        user.grants = grants;
-        user.token_version = user.token_version.wrapping_add(1);
-        self.put(engine, &user)
+        self.edit(engine, name, |user| user.grants = grants)
     }
 
     /// Disable or re-enable an account, taking effect immediately.
@@ -255,16 +335,43 @@ impl UserStore {
     /// logs the account out of every session it holds; **re-enabling does not
     /// restore them**, which is the point.
     pub fn set_disabled(&self, engine: &Engine, name: &str, disabled: bool) -> Result<()> {
-        let mut user =
-            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
-        user.disabled = disabled;
-        user.token_version = user.token_version.wrapping_add(1);
-        self.put(engine, &user)
+        self.edit(engine, name, |user| user.disabled = disabled)
+    }
+
+    /// Change one user record and bump its token version, reading it under
+    /// the writer in the transaction that writes it back (ADR-192).
+    ///
+    /// Every setter used to read the record, change it, and replace it whole
+    /// in a transaction of its own, so two edits racing on one user each
+    /// wrote back what the other had not seen: a grant change landing just
+    /// after an account was disabled re-enabled it.
+    fn edit(&self, engine: &Engine, name: &str, change: impl FnOnce(&mut User)) -> Result<()> {
+        let users = self.collection.clone();
+        let edited = engine.write_batch(WriterHolder::Write, |scope| {
+            let id = DocId::String(name.to_string());
+            let Some(doc) = scope.get(&users, &id)? else {
+                return Ok(Err(AuthError::UserNotFound(name.into())));
+            };
+            let mut user: User = match bson::deserialize_from_document(doc) {
+                Ok(user) => user,
+                Err(e) => {
+                    return Ok(Err(AuthError::Hashing(format!("decoding user {name:?}: {e}"))));
+                }
+            };
+            change(&mut user);
+            user.token_version = user.token_version.wrapping_add(1);
+            let doc = match encode(&user) {
+                Ok(doc) => doc,
+                Err(e) => return Ok(Err(e)),
+            };
+            scope.replace(&users, &id, doc, true)?;
+            Ok(Ok(()))
+        });
+        edited.map_err(AuthError::Storage)?
     }
 
     fn put(&self, engine: &Engine, user: &User) -> Result<()> {
-        let doc = bson::serialize_to_document(user)
-            .map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))?;
+        let doc = encode(user)?;
         let id = DocId::String(user.name.clone());
         engine.replace(&self.collection, &id, doc, true).map_err(AuthError::Storage)?;
         Ok(())
@@ -498,11 +605,11 @@ mod tests {
         let issued_at = store.authenticate(&engine, "ada", "hunter2").unwrap().token_version;
         let bystander = store.authenticate(&engine, "grace", "hunter2").unwrap().token_version;
 
-        store
-            .roles()
-            .set_grants(&engine, "wide", vec![Grant::new("sales", "*", vec![Action::Read])])
+        let before = engine.commits();
+        let invalidated = store
+            .set_role_grants(&engine, "wide", vec![Grant::new("sales", "*", vec![Action::Read])])
             .unwrap();
-        let invalidated = store.invalidate_holders_of_role(&engine, "wide").unwrap();
+        assert_eq!(engine.commits() - before, 1, "the role and its holders in one commit");
 
         assert_eq!(invalidated, vec!["ada".to_string()], "only the holder should be invalidated");
         let after = store.authenticate(&engine, "ada", "hunter2").unwrap();
@@ -546,5 +653,181 @@ mod tests {
         let after = store.authenticate(&engine, "ada", "hunter2").unwrap().token_version;
 
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn deleting_a_role_invalidates_its_holders_in_one_commit_and_a_resend_reaches_them_again() {
+        let (engine, store, _dir) = setup();
+        store.roles().create(&engine, "temp", vec![Grant::superuser()]).unwrap();
+        for name in ["ada", "grace", "linus"] {
+            store.create(&engine, name, "hunter2", Vec::new()).unwrap();
+        }
+        store.set_roles(&engine, "ada", vec!["temp".into()]).unwrap();
+        store.set_roles(&engine, "grace", vec!["temp".into()]).unwrap();
+
+        let before = engine.commits();
+        let (deleted, holders) = store.delete_role(&engine, "temp").unwrap();
+        assert!(deleted);
+        assert_eq!(holders, vec!["ada".to_string(), "grace".to_string()]);
+        assert_eq!(engine.commits() - before, 1, "the role and both holders together");
+
+        // The role is gone, and the holders still name it: a delete sent
+        // again bumps them again rather than stopping at "no such role".
+        let version = store.get(&engine, "ada").unwrap().unwrap().token_version;
+        let (deleted, holders) = store.delete_role(&engine, "temp").unwrap();
+        assert!(!deleted);
+        assert_eq!(holders.len(), 2);
+        assert_eq!(store.get(&engine, "ada").unwrap().unwrap().token_version, version + 1);
+    }
+
+    #[test]
+    fn a_role_edit_of_a_role_that_does_not_exist_writes_nothing() {
+        let (engine, store, _dir) = setup();
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.set_roles(&engine, "ada", vec!["ghost".into()]).unwrap();
+        let version = store.get(&engine, "ada").unwrap().unwrap().token_version;
+        let before = engine.commits();
+        assert!(matches!(
+            store.set_role_grants(&engine, "ghost", Vec::new()),
+            Err(AuthError::RoleNotFound(_))
+        ));
+        assert_eq!(engine.commits(), before, "nothing committed");
+        assert_eq!(store.get(&engine, "ada").unwrap().unwrap().token_version, version);
+    }
+
+    /// Queue `edits` behind a writer this test holds, each started a little
+    /// after the one before so that they queue in that order, then let go and
+    /// wait for all of them. Whatever an edit reads before it takes the
+    /// writer, it reads before any of the others has written.
+    fn queued_behind_the_writer(
+        engine: &std::sync::Arc<Engine>,
+        edits: Vec<Box<dyn FnOnce() + Send>>,
+    ) {
+        let hold = engine.hold_writer(WriterHolder::Write);
+        let handles: Vec<_> = edits
+            .into_iter()
+            .map(|edit| {
+                let handle = std::thread::spawn(edit);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                handle
+            })
+            .collect();
+        drop(hold);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn two_edits_racing_on_one_user_both_land() {
+        // Each setter read the record, changed it, and wrote it back whole in
+        // a transaction of its own, so the second to commit undid the first.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let store = std::sync::Arc::new(UserStore::open(&engine).unwrap());
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        let base = store.get(&engine, "ada").unwrap().unwrap().token_version;
+
+        let grants = vec![Grant::new("sales", "*", vec![Action::Read])];
+        let (e1, s1) = (std::sync::Arc::clone(&engine), std::sync::Arc::clone(&store));
+        let (e2, s2, g2) =
+            (std::sync::Arc::clone(&engine), std::sync::Arc::clone(&store), grants.clone());
+        queued_behind_the_writer(
+            &engine,
+            vec![
+                Box::new(move || s1.set_disabled(&e1, "ada", true).unwrap()),
+                Box::new(move || s2.set_grants(&e2, "ada", g2).unwrap()),
+            ],
+        );
+
+        let ada = store.get(&engine, "ada").unwrap().unwrap();
+        assert!(ada.disabled, "the grant edit re-enabled the account");
+        assert_eq!(ada.grants, grants, "the disable undid the grant edit");
+        assert_eq!(ada.token_version, base + 2, "a bump was lost");
+    }
+
+    #[test]
+    fn a_role_edit_racing_a_disable_leaves_the_account_disabled() {
+        // The HIGH finding: the role edit read each holder outside the writer
+        // and wrote it back whole, so an account disabled a moment before was
+        // enabled again. The disable queues first and commits first; the
+        // role edit, queued behind it, must see it.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let store = std::sync::Arc::new(UserStore::open(&engine).unwrap());
+        store.roles().create(&engine, "wide", vec![Grant::superuser()]).unwrap();
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.set_roles(&engine, "ada", vec!["wide".into()]).unwrap();
+        let base = store.get(&engine, "ada").unwrap().unwrap().token_version;
+
+        let (e1, s1) = (std::sync::Arc::clone(&engine), std::sync::Arc::clone(&store));
+        let (e2, s2) = (std::sync::Arc::clone(&engine), std::sync::Arc::clone(&store));
+        queued_behind_the_writer(
+            &engine,
+            vec![
+                Box::new(move || s1.set_disabled(&e1, "ada", true).unwrap()),
+                Box::new(move || {
+                    s2.set_role_grants(&e2, "wide", Vec::new()).unwrap();
+                }),
+            ],
+        );
+
+        let ada = store.get(&engine, "ada").unwrap().unwrap();
+        assert!(ada.disabled, "the role edit re-enabled an account an admin had just disabled");
+        assert_eq!(ada.token_version, base + 2, "a bump was lost");
+    }
+
+    /// How long a role edit holds the writer at 10,000 holders (ADR-192).
+    /// Run by hand, in two processes, so the OS page cache can be dropped
+    /// between them: `KIMMY_HOLD_BENCH=create` builds the store in
+    /// `KIMMY_HOLD_BENCH_DIR`, and `KIMMY_HOLD_BENCH=edit` opens it and edits
+    /// the role twice, printing the hold each time.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn a_role_edit_at_ten_thousand_holders_holds_the_writer_for() {
+        let dir = std::path::PathBuf::from(std::env::var("KIMMY_HOLD_BENCH_DIR").unwrap());
+        let path = dir.join("kimmy.redb");
+        match std::env::var("KIMMY_HOLD_BENCH").unwrap().as_str() {
+            "create" => {
+                let engine = Engine::open(&path).unwrap();
+                let store = UserStore::open(&engine).unwrap();
+                store.roles().create(&engine, "wide", vec![Grant::superuser()]).unwrap();
+                let hash = password::hash("hunter2").unwrap();
+                let users = store.collection.clone();
+                for batch in 0..10 {
+                    let docs = (0..1_000)
+                        .map(|i| {
+                            encode(&User {
+                                name: format!("user{:05}", batch * 1_000 + i),
+                                password_hash: hash.clone(),
+                                grants: Vec::new(),
+                                roles: vec!["wide".into()],
+                                disabled: false,
+                                token_version: 0,
+                            })
+                            .unwrap()
+                        })
+                        .collect();
+                    engine.insert_many(&users, docs).unwrap();
+                }
+            }
+            "edit" => {
+                // The engine's own cache is cold because the engine is new;
+                // the OS page cache is whatever the caller left it.
+                let engine = Engine::open(&path).unwrap();
+                let store = UserStore::open(&engine).unwrap();
+                for run in ["cold", "warm"] {
+                    let started = std::time::Instant::now();
+                    let holders = store.set_role_grants(&engine, "wide", Vec::new()).unwrap();
+                    println!(
+                        "{run}: {} holders, call {:?}, longest writer hold {:?}",
+                        holders.len(),
+                        started.elapsed(),
+                        engine.writer_hold_max()
+                    );
+                }
+            }
+            other => panic!("KIMMY_HOLD_BENCH={other}: create or edit"),
+        }
     }
 }

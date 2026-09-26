@@ -856,6 +856,13 @@ fn envelope(e: &ApiError) -> Value {
     if let Some(secs) = e.retry_after_secs {
         body["retry_after_secs"] = secs.into();
     }
+    // The fields a REST envelope carries beside those three, such as what a
+    // `partially_applied` request had applied (ADR-192), at the same level.
+    if let (Value::Object(fields), Some(extra)) = (&mut body, &e.extra) {
+        for (key, value) in extra.iter() {
+            fields.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
     body
 }
 
@@ -919,6 +926,24 @@ mod tests {
         assert_eq!(data["error"], "timeout");
         assert_eq!(data["retry"], "wait");
         assert_eq!(data["retry_after_secs"], 2, "Retry-After has no header to ride in here");
+    }
+
+    #[test]
+    fn a_partly_applied_request_is_a_tool_result_saying_what_landed() {
+        let applied = kimmy_storage::Applied::Modify {
+            matched: 1000,
+            modified: 1000,
+            commits: 1,
+            in_doubt: 0,
+        };
+        let e = ApiError::partially_applied(&applied, kimmy_storage::StorageError::Stopping);
+        let result = render(Err(e)).expect("a tool result, not an error");
+        assert_eq!(result.is_error, Some(true));
+        let envelope = result.structured_content.expect("the envelope rides in the result");
+        assert_eq!(envelope["error"], "partially_applied");
+        assert_eq!(envelope["retry"], "verify");
+        assert_eq!(envelope["applied"]["matched"], 1000);
+        assert_eq!(envelope["cause"]["code"], "stopping");
     }
 
     #[test]

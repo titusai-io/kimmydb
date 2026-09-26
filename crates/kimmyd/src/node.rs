@@ -705,7 +705,15 @@ async fn start_and_serve(config: Config) -> Result<()> {
              are read, write, sync_data, set_len and len"
         );
     }
-    let served = serve(listener, app, tls, shutdown.clone()).await;
+    // At the drain deadline, a request that commits in more than one
+    // transaction stops before its next one (ADR-192): not at the signal, so
+    // one that can finish inside the drain does.
+    let stopping = {
+        let engine = Arc::clone(&engine);
+        move || engine.set_stopping()
+    };
+    let served =
+        serve(listener, app, tls, announced(shutdown.clone()), DRAIN_TIMEOUT, stopping).await;
     // Before the aborts below, and before returning an error: from here on a
     // supervised task ending is a stop, not a death. `serve` has already
     // announced it on the signal path; this covers the path where serving
@@ -770,7 +778,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// How long in-flight requests get to finish once shutdown begins.
+/// How long in-flight requests get to finish once shutdown begins, on both
+/// the plain and the TLS listener. At its end a request that commits in more
+/// than one transaction stops before its next one (ADR-192).
 ///
 /// Only reached when a request is still running; an idle server stops
 /// immediately, which is what keeps `docker stop` returning in milliseconds.
@@ -1223,12 +1233,40 @@ async fn serve(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     tls: Option<RustlsConfig>,
-    shutdown: kimmy_task::Shutdown,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Duration,
+    on_drain_deadline: impl FnOnce() + Send + 'static,
 ) -> Result<()> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
+    // The drain begins at `signal` and ends `drain` after it, on both paths. Plain HTTP used to wait for every in-flight request
+    // however long it took, so a request that never finished held the
+    // process up until the supervisor killed it (ADR-192).
+    let (drain_begun, drain_started) = tokio::sync::oneshot::channel::<()>();
+    let signal = async move {
+        signal.await;
+        let _ = drain_begun.send(());
+    };
+    let deadline = async move {
+        // No signal ever came: serving itself ended, and there is no drain.
+        if drain_started.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(drain).await;
+    };
+
     let Some(tls) = tls else {
-        axum::serve(listener, service).with_graceful_shutdown(announced(shutdown.clone())).await?;
+        let serving = axum::serve(listener, service).with_graceful_shutdown(signal).into_future();
+        tokio::select! {
+            served = serving => served?,
+            () = deadline => {
+                on_drain_deadline();
+                warn!(
+                    drain_secs = drain.as_secs(),
+                    "requests still in flight at the drain deadline were cut off"
+                );
+            }
+        }
         return Ok(());
     };
 
@@ -1246,11 +1284,15 @@ async fn serve(
     // finish during the drain, which is exactly what a supervisor would cut short.
     tokio::spawn({
         let handle = handle.clone();
-        let shutdown = shutdown.clone();
         async move {
-            announced(shutdown).await;
-            handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
+            signal.await;
+            handle.graceful_shutdown(Some(drain));
         }
+    });
+    // UNSUPERVISED: the drain deadline, which acts once and only during shutdown.
+    tokio::spawn(async move {
+        deadline.await;
+        on_drain_deadline();
     });
 
     axum_server::from_tcp_rustls(std_listener, tls)
@@ -2187,6 +2229,55 @@ mod tests {
         assert_ne!(stamps(&cert, &key).await, present);
     }
 
+    /// The plain listener's drain is bounded, and the multi-transaction stop
+    /// comes at its end, not at the signal (ADR-192): a request that never
+    /// finishes no longer holds the process up, and one that can finish
+    /// inside the drain is not stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_plain_drain_is_bounded_and_the_stop_comes_at_its_end() {
+        async fn forever() -> &'static str {
+            std::future::pending::<()>().await;
+            "never"
+        }
+        let app = axum::Router::new().route("/forever", axum::routing::get(forever));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drain = Duration::from_millis(400);
+        let served = tokio::spawn({
+            let stopped = Arc::clone(&stopped);
+            serve(
+                listener,
+                app,
+                None,
+                async move {
+                    let _ = signalled.await;
+                },
+                drain,
+                move || stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+
+        // A request in flight that will never finish.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET /forever HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        signal.send(()).unwrap();
+        tokio::time::sleep(drain / 2).await;
+        assert!(
+            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the stop came at the signal, before the drain had run"
+        );
+        tokio::time::timeout(drain * 4, served)
+            .await
+            .expect("the drain did not end at its deadline")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "no stop at the deadline");
+    }
+
     /// Serve a router that reports the caller's address, and return where it is.
     async fn serve_echoing_peer(tls: Option<RustlsConfig>) -> SocketAddr {
         async fn peer(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
@@ -2198,7 +2289,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             // Nothing shuts this down: the test drops it when it is finished.
-            let _ = serve(listener, app, tls, kimmy_task::Shutdown::new()).await;
+            let signal = std::future::pending::<()>();
+            let _ = serve(listener, app, tls, signal, DRAIN_TIMEOUT, || {}).await;
         });
         addr
     }

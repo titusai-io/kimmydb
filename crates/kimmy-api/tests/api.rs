@@ -11872,3 +11872,249 @@ async fn a_database_drop_of_many_collections_answers_with_the_purge_held() {
         assert_eq!(server.state.engine.rows_under(id).unwrap(), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Requests that commit in more than one transaction (ADR-192)
+// ---------------------------------------------------------------------------
+
+/// A server with a short request budget and one-document chunks, and a
+/// collection of three documents to update or delete in three commits.
+async fn three_chunk_server() -> Server {
+    let limits = kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(200),
+        ..kimmy_api::RequestLimits::default()
+    };
+    let server = Server::build_with(true, kimmy_api::RateLimits::disabled(), limits).await;
+    let engine = &server.state.engine;
+    engine.set_multi_chunk_docs(1);
+    let orders = engine.create_collection("shop", "orders").unwrap();
+    let docs = (0..3i64).map(|i| bson::doc! { "_id": i, "n": 1i64 }).collect();
+    engine.insert_many(&orders, docs).unwrap();
+    server
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_update_waits_out_a_writer_held_between_chunks_past_the_deadline() {
+    // The finding over the wire: chunk two gave up after the request's budget
+    // and answered `503 timeout`, "nothing was written", over a committed
+    // chunk one. Now it waits, and the whole update lands. The hold is taken
+    // on the request's own thread, synchronously, between its commits.
+    let server = three_chunk_server().await;
+    let engine = Arc::clone(&server.state.engine);
+    server.state.engine.before_next_continuing_write(move || {
+        let (held, is_held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+    });
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            None,
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["commits"], 3, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 3, "{:?}", res.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_update_stopped_between_chunks_answers_what_landed_in_the_flat_envelope() {
+    let server = three_chunk_server().await;
+    let engine = Arc::clone(&server.state.engine);
+    server.state.engine.before_next_continuing_write(move || engine.set_stopping());
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            None,
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    // Flat: `error` is the code as a string, as every client parses it, and
+    // what landed rides beside it.
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "verify", "{:?}", res.body);
+    assert_eq!(
+        res.body["applied"],
+        json!({ "matched": 1, "modified": 1, "commits": 1, "in_doubt": 0 }),
+        "{:?}",
+        res.body
+    );
+    assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(!message.contains("nothing was written"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_update_refused_by_a_later_document_says_so_and_names_the_callers_cause() {
+    let server = three_chunk_server().await;
+    let orders = server.state.engine.get_collection("shop", "orders").unwrap();
+    server
+        .state
+        .engine
+        .replace(
+            &orders,
+            &kimmy_core::DocId::Int64(1),
+            bson::doc! { "_id": 1i64, "n": "one" },
+            false,
+        )
+        .unwrap();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            None,
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["applied"]["matched"], 1, "{:?}", res.body);
+    assert_eq!(res.body["cause"]["code"], "bad_request", "{:?}", res.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_update_that_cannot_get_the_writer_for_its_first_chunk_wrote_nothing() {
+    // Before the first commit nothing changed: the budget and its answer
+    // stand, and "nothing was written" is true.
+    let server = three_chunk_server().await;
+    let engine = Arc::clone(&server.state.engine);
+    let (held, is_held) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+        held.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        drop(guard);
+    });
+    is_held.recv().unwrap();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            None,
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    holder.join().unwrap();
+    assert_eq!(res.status, 503, "{:?}", res.body);
+    assert_eq!(res.body["error"], "timeout", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "wait", "{:?}", res.body);
+    let orders = server.state.engine.get_collection("shop", "orders").unwrap();
+    for i in 0..3i64 {
+        let doc = server.state.engine.get(&orders, &kimmy_core::DocId::Int64(i)).unwrap().unwrap();
+        assert_eq!(doc.get_i64("n").unwrap(), 1, "nothing was written");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_stopped_between_burials_says_which_collections_went() {
+    let server = three_chunk_server().await;
+    let engine = &server.state.engine;
+    engine.create_collection("shop", "returns").unwrap();
+    let stopper = Arc::clone(engine);
+    engine.before_next_continuing_write(move || stopper.set_stopping());
+    let res = server.delete("/v1/db/shop", None).await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["applied"]["dropped"], json!(["orders"]), "{:?}", res.body);
+    assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_waits_out_a_writer_held_between_burials() {
+    let server = three_chunk_server().await;
+    let engine = &server.state.engine;
+    engine.create_collection("shop", "returns").unwrap();
+    let holder = Arc::clone(engine);
+    engine.before_next_continuing_write(move || {
+        let (held, is_held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = holder.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+    });
+    let res = server.delete("/v1/db/shop", None).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(!server.state.engine.database_exists("shop").unwrap());
+}
+
+#[tokio::test]
+async fn turning_vectors_off_with_their_drop_answers_what_this_call_did() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+
+    let before = server.state.engine.commits();
+    let res = server.delete("/v1/db/shop/coll/docs/vector?drop_vectors=true", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body, json!({ "disabled": true, "droppedVectors": true }));
+    assert_eq!(server.state.engine.commits() - before, 1, "one commit for both");
+
+    // Sent again: nothing left to turn off or drop, and the answer says so.
+    let res = server.delete("/v1/db/shop/coll/docs/vector?drop_vectors=true", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body, json!({ "disabled": false, "droppedVectors": false }));
+}
+
+#[tokio::test]
+async fn a_webhook_and_its_starting_point_are_one_commit_and_a_failed_commit_stores_neither() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    let register = || {
+        server.post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&token),
+            json!({ "url": "https://example.com/hook", "operations": ["insert"] }),
+        )
+    };
+    // The first registration also creates the two system collections, which
+    // are the node's bookkeeping rather than the request's own commit.
+    assert_eq!(register().await.status, 200);
+
+    let before = server.state.engine.commits();
+    let res = register().await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.state.engine.commits() - before, 1, "subscription and seed together");
+    // And the seed is there: without it the subscription replays the whole
+    // retained oplog at its endpoint.
+    let id = res.body["id"].as_str().expect("an id");
+    let progress = server.state.engine.get_collection("__kimmy", "__webhook_progress").unwrap();
+    let seed = kimmy_core::DocId::String(format!("{id}:{}", server.state.engine.node_id()));
+    assert!(server.state.engine.get(&progress, &seed).unwrap().is_some(), "no starting point");
+
+    // A registration whose commit fails leaves no subscription behind to
+    // replay history from the start of the oplog.
+    assert!(server.state.engine.arm_test_storage_failure("write"));
+    let res = register().await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    let registry = server.state.engine.get_collection("__kimmy", "__webhooks").unwrap();
+    assert_eq!(server.state.engine.count(&registry).unwrap(), 2, "only the two that landed");
+}
+
+#[tokio::test]
+async fn deleting_a_role_twice_reaches_its_holders_both_times() {
+    // The rationale the one-transaction edit rests on: a delete sent again
+    // answers `deleted: false` and still bumps every holder.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/roles", Some(&token), json!({ "name": "clerk", "grants": [] })).await;
+    server
+        .post("/v1/users", Some(&token), json!({ "user": "alice", "password": "alice-password" }))
+        .await;
+    server.post("/v1/users/alice/roles", Some(&token), json!({ "roles": ["clerk"] })).await;
+
+    let first = server.delete("/v1/roles/clerk", Some(&token)).await;
+    assert_eq!(first.status, 200, "{:?}", first.body);
+    assert_eq!(first.body, json!({ "deleted": true, "invalidated": 1 }));
+    let again = server.delete("/v1/roles/clerk", Some(&token)).await;
+    assert_eq!(again.status, 200, "{:?}", again.body);
+    assert_eq!(again.body, json!({ "deleted": false, "invalidated": 1 }));
+}

@@ -2436,6 +2436,12 @@ the intended cost: it is the mechanism, not friction around it.
 
 ## ADR-057 — The error taxonomy is closed, and retryability is an open set of classes
 
+> **Amended by [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed).** The set gains
+> `partially_applied` (500, `verify`), and its envelope carries two more
+> top-level fields, `applied` and `cause`. They sit beside `error`,
+> `message` and `retry`, never around them: `error` stays the code as a
+> string, which is what every client parses.
+
 **Decision.** The error code set is a Rust enum, `kimmy_api::error::ErrorCode`,
 and every code carries a **retry class**: `no`, `wait`, or `elsewhere`. The
 class travels in the error envelope beside the code, and
@@ -4138,6 +4144,14 @@ topology entry, present only while the condition holds. The refusal is a
 behaviour change for a configuration nobody should have had.
 
 ## ADR-086 — A `multi` write commits in bounded chunks
+
+> **Amended by [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed).** "Why the failure answer is an error and not a
+> partial count" no longer holds. Once a chunk has committed, a later chunk
+> could give up waiting for the writer and answer `503 timeout`, "nothing was
+> written", over committed chunks, and a client that resent it applied them
+> twice. The later chunks now wait for the writer with no budget, and a
+> failure after the first commit answers `500 partially_applied`, `verify`,
+> with the counts of the committed chunks.
 
 **Decision.** `update` and `delete` with `multi: true` commit in chunks of
 `storage.multi_chunk_docs` documents (default 1,000; 1 to 10,000). Each chunk
@@ -11777,6 +11791,12 @@ for the aggregation sort, which sorts documents it is already holding, with
 the two comparisons to one ordering.
 
 ## ADR-151 — The retention pass never holds the writer for a walk, and a write waits a bounded time for it
+
+> **Amended by [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed).** The budget bounds a request's wait until its
+> first commit, and no longer. A request that has committed part of itself
+> waits for the writer as the background writers do, so `WriterBusy`, and the
+> "nothing was written" it is answered with, can only come before anything
+> of the request was written.
 
 > **Amended by [ADR-159](#adr-159--the-writer-hold-says-what-held-it).**
 > One clause below held for half of what it promised. **"logged at `WARN`
@@ -19810,3 +19830,124 @@ each other member, summed over `pull` and `push`, where it read N plus every
 re-delivery before
 ([ADR-180](#adr-180--a-snapshot-restore-appends-the-entry-behind-each-index-definition-it-restores-and-that-entry-is-the-definition-as-every-member-stores-it)'s
 addendum). The cluster harness's burst test asserts at most N.
+
+---
+
+## ADR-192 — A request that commits more than once keeps going after its first commit, and a failure after it says what landed
+
+**Decision.** A request whose effect takes more than one write transaction
+follows one rule, after MongoDB's for `updateMany` and `deleteMany`:
+
+- **Until its first commit** it waits for the writer within the request's
+  budget (ADR-151), and a refusal there is true: nothing was written. An
+  attempt that aborts without committing, such as a chunk that matched
+  nothing or a burial another drop already made, keeps the budget. So does
+  creating a system collection on first use, which is the node's bookkeeping
+  rather than the request's effect.
+- **After its first commit** each later transaction takes the writer with no
+  budget, as replication and TTL do. It checks, once it holds the writer,
+  whether the node is past its drain deadline or its storage has failed
+  (`Engine::is_stopping`), and stops there if so.
+- **Any failure after the first commit** answers `500 partially_applied`,
+  retry `verify`, with what landed in `applied` and why the rest did not in
+  `cause`. It is never `wait`, and never "nothing was written".
+
+Where the steps can be one transaction, they are:
+
+| Request | Transactions | Under this ADR |
+|---|---|---|
+| `update` or `delete` with `multi` | one per chunk (ADR-086) | the rule |
+| `DELETE /v1/db/{db}` | one burial per collection, then the row | the rule; the row is removed under the writer, and only if no collection stands |
+| role delete, role grants | the role, then one per holder | **one**: the role and every holder's token bump |
+| every user setter | one, but read outside it | **one, read inside it** |
+| `DELETE …/vector?drop_vectors=true` | the configuration, then the shadow | **one** |
+| webhook register | the subscription, then its progress seed | **one** |
+
+Everything else a client can reach was already one transaction.
+
+**The answer.**
+
+```json
+{"error": "partially_applied", "message": "…", "retry": "verify",
+ "applied": {"matched": 1000, "modified": 1000, "commits": 1, "in_doubt": 0},
+ "cause": {"code": "stopping", "message": "the node reached its shutdown deadline"}}
+```
+
+- **`applied`** counts committed transactions only; the counts are added
+  after `commit()`. **`in_doubt`** is the size of a chunk whose commit's
+  outcome is unknown (ADR-188's addendum), kept apart from the counts because
+  it may or may not be there. A database drop answers `dropped`, the
+  collections whose burial committed, and `in_doubt`, one whose burial's
+  outcome is unknown.
+- **`cause.code`** is the code the failure would have been answered with on
+  its own, or `stopping`, which has no code of its own. **`cause.message`**
+  is that answer's message, so never raw storage text.
+- **Logged** at `ERROR`, or at `WARN` when the cause is the caller's (a
+  `bad_request` from an operator a later document cannot take).
+- **Over MCP** it is a tool result with `isError`, like every `verify`
+  failure.
+
+**Why 500.** RFC 9110 §15.6.1: the server met a condition that prevented it
+from fulfilling the request, and part of a request is not the request. Not a
+4xx (§15.5), which says the client must change the request and which clients
+read as "nothing applied". Not 503 (§15.6.4), which invites a retry, the
+double-apply this prevents. Not 409 (§15.5.10), a conflict with the
+resource's state, which this rarely is, and which also invites a resend. Not
+207, a success. `outcome_unknown` set the precedent: 500 with `verify`.
+
+**Why keep going rather than give up.** A chunk that gave up after the budget
+left a request half done and answered as if nothing had happened. The chunk
+that waits holds the writer for one chunk once it has it, as before, so no
+hold grows. A request can now outlive its deadline between chunks; it
+already could, since the handler never yields while it writes, and a client
+whose own timeout fires reads the write as unknown, which is true.
+
+**Why a plain wait rather than a timed one in slices.** A waiter that times out
+on `parking_lot`'s mutex rejoins the queue at its tail, so it can be passed
+over indefinitely, and each slice would log the "gave up" warning and count
+a refusal.
+
+**The stop, and the drain.** The stop is set when the drain deadline passes,
+not at the signal: a rolling restart lets a request that can finish inside
+the drain finish. The plain listener's drain is now bounded like the TLS
+listener's, at 10 s; it waited for every in-flight request before. The
+storage-failure stop (ADR-188) stops a continuing request too, since its
+next transaction could only fail. A request stopped this way answers
+`partially_applied` if its connection is still open; if the drain closed it
+first, the client sees a dropped connection, which it reads as unknown. The
+stop bounds only the later transactions of these requests: not a first
+transaction, which on `/mcp` has no budget at all, and not one long hold.
+
+**What "verify" means.** The counts say how much, not which: chunks follow
+the internal key order. A `$set` to constants, and a delete, are safe to
+send again. A `$inc`, `$push` or any other operator that is not idempotent
+is not, and without a marker there is no recovery; with one, the request
+sent again touches exactly the documents not yet done:
+`{"$inc": {"n": 1}, "$addToSet": {"ops": "<uuid>"}}` with
+`{"ops": {"$ne": "<uuid>"}}` in the filter.
+
+**Role and user edits.** Each read its record outside the writer and wrote it
+back whole, so two edits racing on one user each undid the other; a role
+edit could re-enable an account an administrator had just disabled. Each now
+reads under the writer, in the transaction that writes it, through
+`WriteScope::get` and `WriteScope::for_each_doc`. A role edit's scan of every
+user and its bumps are one hold, whose size grows with the number of local
+users. Every role edit read every user already, and a large population signs
+in through federation, which needs no bump (ADR-064, ADR-065). A role delete
+sent again answers `deleted: false` and bumps the holders again, since they
+keep the name.
+
+**Rejected.** A holder bump per transaction with `partially_applied`: it
+leaves holders with the old grants until someone resends. Treating the
+first transaction of a request like the later ones: the budget is what
+answers a client whose write cannot start, with nothing written.
+
+**Tests.** In `kimmy-storage`, a hook between a request's commits: a writer
+held past the budget there is waited out (`multi` and a database drop); a
+stop there answers `partially_applied` with `Stopping`; an fsync failing
+there makes the next chunk `in_doubt`; a create landing before the row
+removal keeps its database. Over HTTP, `Engine::before_next_continuing_write`
+does the same. The vector drop and the webhook registration are one commit
+each; the user store's races are driven by queueing edits behind a held
+writer. A kimmyd test drives the bounded drain and checks the stop comes at
+its end, not at the signal.

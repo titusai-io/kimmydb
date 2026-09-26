@@ -261,35 +261,28 @@ pub fn forget_progress(state: &SharedState, subscription: &str) {
     }
 }
 
-/// Mark a subscription as already caught up to `now`.
+/// The progress collection, created on first use.
 ///
-/// Used at registration so a new webhook hears about what happens next rather
-/// than being answered with the whole retained oplog. Failure is logged rather
-/// than propagated: the subscription is already stored, and refusing to
-/// register because a progress record could not be written would be a worse
-/// outcome than the replay it prevents.
-pub fn seed_progress(state: &SharedState, subscription: &str, now: &VersionVector) {
-    if let Err(e) = record_progress(state, subscription, now) {
-        warn!(subscription, error = %e, "could not seed webhook progress; it will replay history");
+/// `__` is reserved for internal objects, so this takes the sanctioned way
+/// in, as the registry itself does. Creating it is the node's bookkeeping,
+/// not a client request's effect, so a registration that creates it has not
+/// yet committed anything of its own (ADR-192).
+pub(crate) fn progress_collection(
+    state: &SharedState,
+) -> Result<kimmy_storage::CollectionMeta, kimmy_storage::StorageError> {
+    match state.engine.get_collection(WEBHOOKS_DB, PROGRESS_COLLECTION) {
+        Ok(meta) => Ok(meta),
+        Err(_) => state.engine.create_system_collection(WEBHOOKS_DB, PROGRESS_COLLECTION),
     }
 }
 
-/// Record what this node has delivered.
-fn record_progress(
+/// The progress record of `subscription` on this node, delivered up to
+/// `progress`: its id, and the document.
+pub(crate) fn progress_record(
     state: &SharedState,
     subscription: &str,
     progress: &VersionVector,
-) -> Result<(), String> {
-    let meta = match state.engine.get_collection(WEBHOOKS_DB, PROGRESS_COLLECTION) {
-        Ok(meta) => meta,
-        // `__` is reserved for internal objects, so this takes the sanctioned
-        // way in, as the registry itself does.
-        Err(_) => state
-            .engine
-            .create_system_collection(WEBHOOKS_DB, PROGRESS_COLLECTION)
-            .map_err(|e| e.to_string())?,
-    };
-
+) -> (kimmy_core::DocId, Document) {
     let mut delivered = Document::new();
     for (node, hlc) in progress.iter() {
         delivered.insert(
@@ -300,14 +293,20 @@ fn record_progress(
             },
         );
     }
-
     let id = format!("{subscription}:{}", state.engine.node_id());
     let document = doc! { "_id": id.clone(), "delivered": delivered };
-    state
-        .engine
-        .replace(&meta, &kimmy_core::DocId::String(id), document, true)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    (kimmy_core::DocId::String(id), document)
+}
+
+/// Record what this node has delivered.
+fn record_progress(
+    state: &SharedState,
+    subscription: &str,
+    progress: &VersionVector,
+) -> Result<(), String> {
+    let meta = progress_collection(state).map_err(|e| e.to_string())?;
+    let (id, document) = progress_record(state, subscription, progress);
+    state.engine.replace(&meta, &id, document, true).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Stop a subscription whose history has been collected.

@@ -311,7 +311,11 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::WriterBusy { .. }
         | E::RefusedStore(_)
         | E::StoreInUse(_)
-        | E::OutcomeUnknown(_) => true,
+        | E::OutcomeUnknown(_)
+        | E::Stopping => true,
+        // A client request's answer, never an apply's; placed by what
+        // stopped it.
+        E::PartiallyApplied { cause, .. } => is_local_failure(cause),
         E::Core(_)
         | E::Corrupt(_)
         | E::UnsupportedFormat { .. }

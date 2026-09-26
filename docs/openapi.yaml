@@ -2954,6 +2954,26 @@ components:
           description: Human-readable. Not stable; do not parse it.
         retry:
           $ref: "#/components/schemas/Retry"
+        applied:
+          type: object
+          additionalProperties: true
+          description: |
+            `partially_applied` only (ADR-192): what the request committed
+            before it failed. For a `multi: true` update or delete,
+            `matched`, `modified`, `commits` and `in_doubt` (documents in a
+            chunk whose commit's outcome is unknown). For a database drop,
+            `dropped` (the collections whose drop committed) and `in_doubt`.
+        cause:
+          type: object
+          description: |
+            `partially_applied` only (ADR-192): why the rest did not land.
+            `code` is the code the failure would have been answered with on
+            its own, or `stopping`; `message` is that answer's message.
+          properties:
+            code:
+              type: string
+            message:
+              type: string
 
     ErrorCode:
       type: string
@@ -2988,6 +3008,7 @@ components:
         | `collection_purging` | 503 | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` |
         | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
+        | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
       enum:
         - bad_request
         - payload_too_large
@@ -3010,6 +3031,7 @@ components:
         - timeout
         - collection_purging
         - outcome_unknown
+        - partially_applied
 
     Capability:
       type: string

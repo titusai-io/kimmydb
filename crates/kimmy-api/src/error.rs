@@ -78,6 +78,10 @@ pub enum ErrorCode {
     /// A write reached the storage engine's durability step and then failed:
     /// it may or may not have been applied, and if it was it replicates.
     OutcomeUnknown,
+    /// A request that commits in more than one transaction failed after its
+    /// first commit: part of it landed, and the answer says how much
+    /// (ADR-192).
+    PartiallyApplied,
 }
 
 /// What a client may do about a failure.
@@ -166,7 +170,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 21] = [
+    pub const ALL: [ErrorCode; 22] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -188,6 +192,7 @@ impl ErrorCode {
         Self::Timeout,
         Self::CollectionPurging,
         Self::OutcomeUnknown,
+        Self::PartiallyApplied,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -214,6 +219,7 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::CollectionPurging => "collection_purging",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::PartiallyApplied => "partially_applied",
         }
     }
 
@@ -269,6 +275,11 @@ impl ErrorCode {
             // It may already have happened, and replicates if it did: read
             // before resending, which neither waiting nor moving replaces.
             Self::OutcomeUnknown => Retry::Verify,
+            // Part of it is there and replicates. Resending all of it
+            // re-applies that part; which part is not in the answer, so the
+            // client reads back, or resends a request built to skip what is
+            // done (ADR-192).
+            Self::PartiallyApplied => Retry::Verify,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -370,6 +381,11 @@ impl ErrorCode {
             // The storage failed at or after a write's durability step: the
             // same fault as `internal`, and the operator's.
             Self::OutcomeUnknown => Some(LogLevel::Error),
+            // By default the operator's: the storage failed, or the node
+            // stopped, part way through. A cause that is the caller's, such
+            // as an operator a later document cannot take, lowers it to
+            // `WARN` where the error is made.
+            Self::PartiallyApplied => Some(LogLevel::Error),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -438,6 +454,16 @@ pub struct ApiError {
     /// lifetime (ADR-096), where "invalid token" would send a client to
     /// refresh a token the provider will mint identically.
     pub challenge_description: Option<String>,
+    /// Fields the envelope carries beside `error`, `message` and `retry`,
+    /// for the one code whose answer is more than a code: `partially_applied`,
+    /// which says what landed (`applied`) and why the rest did not (`cause`).
+    ///
+    /// Siblings at the top level, never a nested object: `error` stays a
+    /// string, which is what every client already parses (ADR-057, ADR-192).
+    ///
+    /// Boxed, and absent on every other code, so an `ApiError` stays small
+    /// on the many paths that return one.
+    pub extra: Option<Box<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// The `error_description` a refusal asked for, riding on the response so the
@@ -455,6 +481,7 @@ impl ApiError {
             retry_override: None,
             level_override: None,
             challenge_description: None,
+            extra: None,
         }
     }
 
@@ -621,6 +648,68 @@ impl ApiError {
         )
     }
 
+    /// Part of a request that commits in more than one transaction landed,
+    /// and then it failed (ADR-192).
+    ///
+    /// `cause` is answered as the code and message it would have been on its
+    /// own, which are already reduced to what is safe to return; its storage
+    /// detail is logged by that mapping, never returned. A node stopping is
+    /// named `stopping`, a cause with no code of its own.
+    pub fn partially_applied(applied: &kimmy_storage::Applied, cause: StorageError) -> Self {
+        let (cause_code, cause_message, callers) = match cause {
+            StorageError::Stopping => {
+                ("stopping", "the node reached its shutdown deadline".to_string(), false)
+            }
+            other => {
+                let mapped = ApiError::from(other);
+                let callers = !mapped.status.is_server_error();
+                (mapped.code.as_str(), mapped.message, callers)
+            }
+        };
+        let (what, applied) = match applied {
+            kimmy_storage::Applied::Modify { matched, modified, commits, in_doubt } => (
+                format!(
+                    "{matched} matching documents in {commits} commits were written, and \
+                     {in_doubt} more may have been"
+                ),
+                json!({
+                    "matched": matched,
+                    "modified": modified,
+                    "commits": commits,
+                    "in_doubt": in_doubt,
+                }),
+            ),
+            kimmy_storage::Applied::DropDatabase { dropped, in_doubt } => (
+                format!(
+                    "{} collections were dropped{}",
+                    dropped.len(),
+                    in_doubt
+                        .as_ref()
+                        .map(|c| format!(", and {c} may have been"))
+                        .unwrap_or_default()
+                ),
+                json!({ "dropped": dropped, "in_doubt": in_doubt }),
+            ),
+        };
+        let mut e = Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::PartiallyApplied,
+            format!(
+                "the request was partly applied and then stopped ({cause_code}: {cause_message}): \
+                 {what}. What was written stands and replicates; read the target back before \
+                 sending the request again"
+            ),
+        );
+        let mut extra = serde_json::Map::new();
+        extra.insert("applied".into(), applied);
+        extra.insert("cause".into(), json!({ "code": cause_code, "message": cause_message }));
+        e.extra = Some(Box::new(extra));
+        if callers {
+            e.level_override = Some(LogLevel::Warn);
+        }
+        e
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, message)
     }
@@ -674,11 +763,16 @@ impl IntoResponse for ApiError {
         // specification, so a client meeting a code added after it was written
         // still knows what to do with it. That is what makes a new code an
         // additive change rather than one that needs every client updated.
-        let body = json!({
+        let mut body = json!({
             "error": self.code.as_str(),
             "message": self.message,
             "retry": self.retry().as_str(),
         });
+        if let (serde_json::Value::Object(fields), Some(extra)) = (&mut body, self.extra) {
+            for (key, value) in *extra {
+                fields.entry(key).or_insert(value);
+            }
+        }
         let mut response = (self.status, Json(body)).into_response();
         if let Some(description) = self.challenge_description {
             response.extensions_mut().insert(ChallengeDescription(description));
@@ -789,7 +883,9 @@ impl From<StorageError> for ApiError {
             // current stamp is the one thing they need to act.
             StorageError::Stale { current } => ApiError::stale(current),
             // The writer stayed held for the whole of the request's budget
-            // (ADR-151). Nothing was written; the documented `timeout`
+            // (ADR-151). Nothing was written: only a request that has not
+            // yet committed anything waits within a budget, and one that
+            // has waits without one (ADR-192). So the documented `timeout`
             // refusal, whose retry hint is to wait, is the honest answer.
             StorageError::WriterBusy { waited } => ApiError::writer_busy(waited),
             // A creation over a dropped life's rows, which the drop purger is
@@ -805,6 +901,14 @@ impl From<StorageError> for ApiError {
                 error!(error = %cause, "a write failed at its durability step; its outcome is unknown");
                 ApiError::outcome_unknown()
             }
+            StorageError::PartiallyApplied { applied, cause } => {
+                ApiError::partially_applied(&applied, *cause)
+            }
+            // Only ever the cause of a partial answer; answered alone it
+            // would mean a request stopped before writing anything, which a
+            // request past its first commit never is. Kept honest anyway:
+            // this node is going away, and another one serves.
+            StorageError::Stopping => ApiError::internal("the node is stopping"),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -913,7 +1017,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 21] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 22] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -938,6 +1042,7 @@ mod tests {
             // This node's own state, and the operator's to fix.
             (Internal, Some(LogLevel::Error)),
             (OutcomeUnknown, Some(LogLevel::Error)),
+            (PartiallyApplied, Some(LogLevel::Error)),
             (Misconfigured, Some(LogLevel::Error)),
             (Snapshot, Some(LogLevel::Error)),
         ];

@@ -399,10 +399,54 @@ document, every identifier filtered and every filter used, `$` not
 implemented — are in [Query language](query-language.md#positional-updates).
 
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
-> request: a failure in a later chunk leaves the earlier chunks committed and
-> answers with an error. Nothing is visited twice and the oplog reflects
-> exactly what landed, but a caller that needs the count reads it back. See
+> request. Once a chunk has committed, the later chunks wait for the writer
+> as long as it takes, so a busy writer does not split the request; but a
+> failure after the first chunk leaves the earlier chunks committed, and is
+> answered `500 partially_applied` with their counts (below). Nothing is
+> visited twice and the oplog reflects exactly what landed. See
 > [Storage](storage.md).
+
+#### A request that was partly applied
+
+A request that commits in more than one transaction — `update` or `delete`
+with `multi: true`, and `DELETE /v1/db/{db}` — and fails after its first commit
+is answered `500 partially_applied`, `retry: verify` ([ADR-192](decisions.md)).
+What landed stands, is published and replicates. The envelope carries it, as
+fields beside the usual three:
+
+```json
+{"error": "partially_applied", "message": "…", "retry": "verify",
+ "applied": {"matched": 1000, "modified": 1000, "commits": 1, "in_doubt": 0},
+ "cause": {"code": "stopping", "message": "the node reached its shutdown deadline"}}
+```
+
+- **`applied`** counts the committed chunks only. **`in_doubt`** is the size of
+  a chunk whose commit's outcome is unknown: it may be there. A database drop
+  answers `{"dropped": [names…], "in_doubt": name-or-null}`.
+- **`cause`** is the code and message the failure would have been answered
+  with on its own — `bad_request` for an operator a later document cannot
+  take, `internal` for a storage failure, `outcome_unknown` — or `stopping`,
+  the node's shutdown deadline.
+- **The counts say how many, not which.** Chunks follow an internal order.
+
+**Sending it again.** A `$set` to constants, or a delete, can be sent again as
+it is: it converges. **A `$inc`, `$push` or anything else that is not
+idempotent cannot, and without a marker there is no recovery**: nothing
+says which documents took it. So build such a request to carry one, a value
+unique to the request, and filter it out:
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
+  "filter": { "status": "open", "ops": { "$ne": "req-7f3a" } },
+  "update": { "$inc": { "reminders": 1 }, "$addToSet": { "ops": "req-7f3a" } },
+  "multi": true
+}'
+```
+
+Sent again after `partially_applied`, it touches exactly the documents the
+first attempt did not. `if_stamp` does not help here: it names one document,
+and cannot be combined with `multi`. **A client must never resend a
+multi-document write automatically**, on this code or any other.
 
 ### Describe
 
@@ -1111,6 +1155,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
 | 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)). **An index create or drop is never answered this way once it has committed**, even when building the index took the whole deadline: members that have not confirmed it by then are reported as pending instead ([ADR-140](decisions.md), and ADR-099's addendum) |
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
+| 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

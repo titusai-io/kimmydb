@@ -39,12 +39,15 @@ fn require_server_admin(auth: &Auth) -> Result<(), ApiError> {
 
 /// Bump the token version of every holder, and drop them from the session
 /// cache so the bump is visible to the very next request.
-fn invalidate_holders(state: &SharedState, role: &str) -> Result<usize, ApiError> {
-    let holders = state.users.invalidate_holders_of_role(&state.engine, role)?;
-    for holder in &holders {
+/// Evict each holder a role edit invalidated from the session cache, after
+/// the edit committed: the bump to each stored version is only half of a
+/// revocation, because the session check reads this cache in front of it
+/// (ADR-052).
+fn evict(state: &SharedState, holders: &[String]) -> usize {
+    for holder in holders {
         state.sessions.evict(holder);
     }
-    Ok(holders.len())
+    holders.len()
 }
 
 #[derive(Deserialize)]
@@ -91,11 +94,14 @@ pub async fn delete_role(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
-    let deleted = state.users.roles().delete(&state.engine, &name)?;
-    // Holders keep the name on their record, where it now resolves to nothing.
-    // Deliberate: the alternative is rewriting every user record on a delete,
-    // and a dangling name that grants nothing is the safe direction to fail in.
-    let invalidated = invalidate_holders(&state, &name)?;
+    // The role and every holder's token version in one transaction
+    // (ADR-192). Holders keep the name on their record, where it now resolves
+    // to nothing: the alternative is rewriting every user record's roles on a
+    // delete, and a dangling name that grants nothing is the safe direction
+    // to fail in. It is also what lets a delete sent again reach them.
+    let (deleted, holders) =
+        kimmy_storage::blocking(|| state.users.delete_role(&state.engine, &name))?;
+    let invalidated = evict(&state, &holders);
     Ok(Json(json!({ "deleted": deleted, "invalidated": invalidated })))
 }
 
@@ -112,8 +118,10 @@ pub async fn set_role_grants(
     JsonBody(body): JsonBody<GrantsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
-    state.users.roles().set_grants(&state.engine, &name, grants(body.grants))?;
-    let invalidated = invalidate_holders(&state, &name)?;
+    let holders = kimmy_storage::blocking(|| {
+        state.users.set_role_grants(&state.engine, &name, grants(body.grants))
+    })?;
+    let invalidated = evict(&state, &holders);
     Ok(Json(json!({ "updated": name, "invalidated": invalidated })))
 }
 

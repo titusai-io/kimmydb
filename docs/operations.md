@@ -42,7 +42,7 @@ fails fast on a bad volume mount.
 | `storage.durability` | — | `durable` | `durable` (every commit fsyncs before it returns) or `coalesced` (a commit waits for the next shared fsync, one per window, so concurrent writers share it). Both are durable when the response returns; there is no class that is not (ADR-088). The sharing is among *concurrent* committers: a lone writer gains nothing from `coalesced` and waits out a window for company that never comes — one writer measured 79 docs/s under `coalesced` against 170 under `durable`, 0.46× ([Benchmarks](benchmarks.md#coalesced-durability--the-flat-line-bends)). The embedding worker is a lone writer, so on a member that embeds, `coalesced` makes that member's own embedding slower per batch, not faster; the class is for a member's concurrent clients, and a member kept for embedding stays on `durable` |
 | `storage.commit_coalesce_ms` | — | `5` | The coalescing window for `coalesced`, 1–1000 ms. Ignored under `durable` |
 | `storage.ttl_interval_secs` | — | `60` | How often TTL indexes are checked for expired documents. Separate from `gc_interval_secs`: that reclaims *garbage*, this deletes *live documents* a policy says are due. `0` leaves any TTL index defined but inert |
-| `storage.multi_chunk_docs` | — | `1000` | Documents a `multi: true` update or delete commits per transaction, 1–10,000. The single writer is released between chunks, so this bounds how long one request can hold it and a failure loses at most the chunk in flight; larger amortises the per-commit fsync over more documents, smaller lets other writers in sooner ([ADR-086](decisions.md)) |
+| `storage.multi_chunk_docs` | — | `1000` | Documents a `multi: true` update or delete commits per transaction, 1–10,000. The single writer is released between chunks, so this bounds how long one request can hold it and a failure loses at most the chunk in flight; larger amortises the per-commit fsync over more documents, smaller lets other writers in sooner ([ADR-086](decisions.md)). After its first chunk a request waits for the writer with no time limit, and a failure after it is answered `partially_applied` ([ADR-192](decisions.md)) |
 | `cluster.sync_interval_secs` | — | `5` | How often to contact each peer for an anti-entropy round. A tick makes **several pulls** from a peer while it is behind: a pull that came back full at the 1,024-entry batch cap is followed by another, round-robin across the tick's peers, until every pull comes back short of the cap or the tick has spent this interval ([ADR-157](decisions.md)). So the interval is what bounds a tick's own length, not what bounds how fast a backlog drains: another pull is started only when the pull before it would have fitted in what is left of the interval, so a draining tick stops short of its own period rather than one pull past it. A tick that overruns anyway — one stuck behind the single writer, or a pull slower than every pull before it — is logged at `WARN` and the next follows a full interval after it |
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
@@ -474,6 +474,7 @@ a provider this member cannot build is one only an operator can.
 |---|---|---|
 | `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
 | `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
+| `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line as the answer's `cause`: a storage failure, or the shutdown deadline (`stopping`). **Page**, except for `stopping`. **One exception, which logs `WARN`**: a cause that is the caller's, such as an operator a later document cannot take |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
@@ -557,6 +558,20 @@ sets it aside as `kimmy.last-exit.previous` until it is serving. For a
 those fields. For an `error` it logs, at `WARN` with the error as `cause`,
 either `the previous start failed before it served` or `the previous run exited
 on an error` ([ADR-147](decisions.md)).
+
+**The drain is 10 seconds, on both listeners.** From the signal, requests in
+flight get 10 s to finish, and new connections are refused. At 10 s the node
+stops waiting: requests still running are cut off, and it logs `requests still
+in flight at the drain deadline were cut off` at `WARN`. The TLS listener has
+always worked this way. **The plain listener used to wait for every request in
+flight, with no limit**, so one that never finished held the process until its
+supervisor killed it; set the supervisor's grace period above 10 s (Docker's
+default is 10 s, Kubernetes' 30 s) so the drain can run its course. At the same
+deadline, a request that commits in more than one transaction — a `multi`
+update or delete, a database drop — stops before its next transaction and is
+answered `partially_applied` with what it had committed, if its connection is
+still open ([ADR-192](decisions.md)). One that can finish inside the drain is
+let finish.
 
 **A start that fails before it serves keeps what it inherited.** An older
 build refusing the store, a port already bound, a duty that cannot start: the
@@ -654,7 +669,8 @@ before resending it, unless it is idempotent: see
 **Two things read the same way that are not a storage fault:**
 
 - A request cut off by a graceful shutdown or a restart also sees a dropped
-  connection. That is correct: its outcome is unknown too.
+  connection. That is correct: its outcome is unknown too. This includes a
+  request still running at the 10-second drain deadline.
 - **A proxy or service mesh that retries on a `5xx` or a connection reset**
   must not retry non-idempotent writes, or it turns one write into two. Envoy
   retries only on the policies you configure (`retry_on`). Keep `reset` and

@@ -53,6 +53,19 @@ impl From<StoredRole> for Role {
     }
 }
 
+/// A role record as the engine stores it.
+pub(crate) fn encode(role: &Role) -> Result<bson::Document> {
+    bson::serialize_to_document(&StoredRole::from(role))
+        .map_err(|e| AuthError::Hashing(format!("encoding role: {e}")))
+}
+
+/// A stored role record, read back.
+pub(crate) fn decode(name: &str, doc: bson::Document) -> Result<Role> {
+    bson::deserialize_from_document::<StoredRole>(doc)
+        .map(Into::into)
+        .map_err(|e| AuthError::Hashing(format!("decoding role {name:?}: {e}")))
+}
+
 impl From<&Role> for StoredRole {
     fn from(role: &Role) -> Self {
         StoredRole { name: role.name.clone(), grants: role.grants.clone() }
@@ -109,20 +122,25 @@ impl RoleStore {
         Ok(role)
     }
 
-    /// Replace a role's grants.
+    /// The collection role records live in.
+    pub(crate) fn collection(&self) -> &CollectionMeta {
+        &self.collection
+    }
+
+    /// Replace a role's grants, **without** invalidating its holders' tokens.
     ///
-    /// **The caller must invalidate every holder's tokens afterwards** — see
-    /// [`crate::users::UserStore::invalidate_holders_of_role`] and the note on
-    /// [`Self::delete`]. This method deliberately does not do it itself: it
-    /// holds no reference to the user store, and hiding a scan of every user
-    /// record inside a setter is worse than making the caller say so.
-    pub fn set_grants(&self, engine: &Engine, name: &str, grants: Vec<Grant>) -> Result<()> {
+    /// For tests. The edit an administrator makes is
+    /// [`crate::users::UserStore::set_role_grants`], which changes the role
+    /// and every holder's token version in one transaction (ADR-192).
+    #[cfg(test)]
+    pub(crate) fn set_grants(&self, engine: &Engine, name: &str, grants: Vec<Grant>) -> Result<()> {
         let mut role =
             self.get(engine, name)?.ok_or_else(|| AuthError::RoleNotFound(name.into()))?;
         role.grants = grants;
         self.put(engine, &role)
     }
 
+    #[cfg(test)]
     fn put(&self, engine: &Engine, role: &Role) -> Result<()> {
         let doc = bson::serialize_to_document(&StoredRole::from(role))
             .map_err(|e| AuthError::Hashing(format!("encoding role: {e}")))?;
@@ -131,14 +149,12 @@ impl RoleStore {
         Ok(())
     }
 
-    /// Delete a role.
+    /// Delete a role, **without** invalidating its holders' tokens.
     ///
-    /// Holders keep the role *name* on their record, where it resolves to
-    /// nothing. That is deliberate: the alternative is editing every user
-    /// record on a delete, and a dangling name that grants nothing is the safe
-    /// direction to fail in. As with [`Self::set_grants`], the caller must
-    /// invalidate holders' tokens.
-    pub fn delete(&self, engine: &Engine, name: &str) -> Result<bool> {
+    /// For tests; the administrator's delete is
+    /// [`crate::users::UserStore::delete_role`].
+    #[cfg(test)]
+    pub(crate) fn delete(&self, engine: &Engine, name: &str) -> Result<bool> {
         let id = DocId::String(name.to_string());
         engine.delete(&self.collection, &id).map_err(AuthError::Storage)
     }

@@ -144,6 +144,14 @@ pub struct Engine {
     writer_wait_sum_us: std::sync::atomic::AtomicU64,
     /// Writes that gave up waiting for the writer inside their budget.
     writer_wait_timeouts: std::sync::atomic::AtomicU64,
+    /// Set once the node's drain deadline has passed (ADR-192): a request
+    /// that has already committed part of itself stops before its next
+    /// transaction rather than keeping the process alive to finish.
+    stopping: std::sync::atomic::AtomicBool,
+    /// Run once, the next time a request that has committed begins another
+    /// transaction; see [`Engine::before_next_continuing_write`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    continuing_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Entries held as state that a window released, since start (ADR-169's
     /// addendum). Added only after the run that released them commits.
     held_marks_released: std::sync::atomic::AtomicU64,
@@ -343,6 +351,25 @@ pub struct WriterHoldSnapshot {
     pub count: [u64; WriterHolder::COUNT],
     /// Microseconds the writer was held by each holder, since start.
     pub sum_us: [u64; WriterHolder::COUNT],
+}
+
+/// A burial made inside a transaction and not yet committed; see
+/// [`Engine::bury_in_txn`].
+pub(crate) struct Burial {
+    /// The parent's shadow, buried with it.
+    shadow: Option<String>,
+    /// Every id buried, whose rows are the purger's once committed.
+    buried: Vec<CollectionId>,
+    /// The entry to publish once committed, for a local drop.
+    logged: Option<OplogEntry>,
+}
+
+/// Whether a write transaction continues a request that has already
+/// committed one (ADR-192).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Continuing {
+    No,
+    Yes,
 }
 
 tokio::task_local! {
@@ -1213,6 +1240,9 @@ impl Engine {
             writer_wait_count: std::sync::atomic::AtomicU64::new(0),
             writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            continuing_hook: parking_lot::Mutex::new(None),
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1441,6 +1471,31 @@ impl Engine {
         reaction: Box<dyn Fn(&crate::health::StorageFailure) + Send + Sync>,
     ) -> bool {
         self.health.on_failure(reaction)
+    }
+
+    /// Stop every request that commits in more than one transaction before
+    /// its next one (ADR-192). The daemon calls this when its drain deadline
+    /// passes, not at the signal: a request that can finish inside the drain
+    /// is let finish. Irreversible for this engine's life.
+    pub fn set_stopping(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Run `hook` once, on the request's own thread, the next time a request
+    /// that has already committed begins another transaction (ADR-192):
+    /// between two chunks of a `multi` write, or two burials of a database
+    /// drop. For tests over HTTP, which cannot reach the storage crate's own
+    /// race hooks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn before_next_continuing_write(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.continuing_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Whether a continuing request must stop: the drain deadline passed, or
+    /// the storage has failed (ADR-188), in which case the next transaction
+    /// could only fail and the process is about to stop.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst) || self.storage_failed().is_some()
     }
 
     /// `KIMMY_TEST_FAIL_STORAGE`: fail the next backend `call` (`read`,
@@ -2606,7 +2661,35 @@ impl Engine {
     /// is: the attribution is a compile error to omit, which is the only way
     /// it stays complete (ADR-159).
     pub(crate) fn begin_write(&self, holder: WriterHolder) -> Result<WriteTxn<'_>> {
-        let budget = write_wait_budget();
+        self.begin_write_as(holder, Continuing::No)
+    }
+
+    /// Begin a later transaction of a request that has already committed one
+    /// (ADR-192).
+    ///
+    /// It waits for the writer with no budget, as the background writers do:
+    /// giving up now would leave the request half done and answered as if
+    /// nothing had happened. A plain `lock()` rather than a timed wait in
+    /// slices, because a timed-out waiter rejoins the queue at its tail and
+    /// can be passed over indefinitely. Once it holds the writer it checks
+    /// [`Self::is_stopping`], and refuses with [`StorageError::Stopping`],
+    /// having written nothing, if the node is past its drain deadline.
+    pub(crate) fn begin_write_continuing(&self, holder: WriterHolder) -> Result<WriteTxn<'_>> {
+        self.begin_write_as(holder, Continuing::Yes)
+    }
+
+    fn begin_write_as(&self, holder: WriterHolder, continuing: Continuing) -> Result<WriteTxn<'_>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if continuing == Continuing::Yes {
+            let hook = self.continuing_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let budget = match continuing {
+            Continuing::No => write_wait_budget(),
+            Continuing::Yes => None,
+        };
         let waited_from = std::time::Instant::now();
         // Waiting for the writer is the other blocking step. The queue is
         // this engine's gate (ADR-151), which a caller can wait at for a
@@ -2628,6 +2711,10 @@ impl Engine {
             );
             return Err(StorageError::WriterBusy { waited });
         };
+        if continuing == Continuing::Yes && self.is_stopping() {
+            drop(gate);
+            return Err(StorageError::Stopping);
+        }
         let mut txn = blocking(|| self.db.begin_write())?;
         // Counted here rather than at any one caller, so the guard that a
         // window of documents already held opens no write transaction is an
@@ -2905,13 +2992,32 @@ impl Engine {
         // Answer "did it exist" up front: dropping the last collection removes
         // the row, so the removal below finds nothing on the common path.
         let existed = self.database_exists(name)?;
-        let collections = self.list_collections(name)?;
-        for collection in &collections {
+        // A drop of several collections is several commits. Once one has
+        // landed the request is part done, and it keeps going (ADR-192): the
+        // later burials wait for the writer with no budget, and a failure
+        // after the first is answered with what was dropped.
+        let mut dropped: Vec<String> = Vec::new();
+        let bury = |dropped: &mut Vec<String>, collection: &str| -> Result<()> {
+            let continuing = if dropped.is_empty() { Continuing::No } else { Continuing::Yes };
+            #[cfg(test)]
+            if continuing == Continuing::Yes {
+                crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenBurials);
+            }
+            match self.bury_collection_as(name, collection, None, continuing) {
+                Ok(Some(_)) => {
+                    dropped.push(collection.to_string());
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(e) => Err(Self::partly_dropped(dropped, Some(collection), e)),
+            }
+        };
+        for collection in &self.list_collections(name)? {
             // Shadows go with their parents, in the parent's transaction.
             if vector_meta::is_shadow(&collection.name) {
                 continue;
             }
-            self.drop_collection(name, &collection.name)?;
+            bury(&mut dropped, &collection.name)?;
         }
 
         // What the parent loop leaves behind is a shadow with no parent to
@@ -2923,19 +3029,53 @@ impl Engine {
         // named; `drop_collection_inner` takes a shadow name directly and
         // mints its own `DropCollection` entry for it, which is how a peer
         // holding the same orphan learns to drop its copy.
-        for orphan in self.list_collections(name)? {
-            self.drop_collection(name, &orphan.name)?;
+        let orphans =
+            self.list_collections(name).map_err(|e| Self::partly_dropped(&dropped, None, e))?;
+        for orphan in orphans {
+            bury(&mut dropped, &orphan.name)?;
         }
 
         // A database with no collections (the row exists, nothing else) still
-        // has a row to remove.
-        let txn = self.begin_write(WriterHolder::Ddl)?;
-        {
-            let mut dbs = txn.open_table(tables::DATABASES)?;
-            dbs.remove(name)?;
-        }
-        txn.commit()?;
+        // has a row to remove. Decided under the writer, and only while the
+        // database holds no collection: a create that landed since the last
+        // burial made the row again, implicitly, and removing it would orphan
+        // that collection. Usually the last burial already removed it, and
+        // this commits nothing.
+        let continuing = if dropped.is_empty() { Continuing::No } else { Continuing::Yes };
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BeforeRowRemoval);
+        let remove_row = || -> Result<()> {
+            let txn = self.begin_write_as(WriterHolder::Ddl, continuing)?;
+            let empty = {
+                let collections = txn.open_table(tables::COLLECTIONS)?;
+                collections.range((name, "")..=(name, "\u{10FFFF}"))?.next().is_none()
+            };
+            let removed = empty && {
+                let mut dbs = txn.open_table(tables::DATABASES)?;
+                dbs.remove(name)?.is_some()
+            };
+            if removed { txn.commit() } else { Ok(txn.abort()?) }
+        };
+        remove_row().map_err(|e| Self::partly_dropped(&dropped, None, e))?;
         Ok(existed)
+    }
+
+    /// A database drop's failure: the error itself before the first burial
+    /// committed, and after it what was dropped (ADR-192). `failing` is the
+    /// collection whose burial failed; if its commit's outcome is unknown, it
+    /// is in doubt.
+    fn partly_dropped(dropped: &[String], failing: Option<&str>, e: StorageError) -> StorageError {
+        if dropped.is_empty() {
+            return e;
+        }
+        let in_doubt = match (&e, failing) {
+            (StorageError::OutcomeUnknown(_), Some(name)) => Some(name.to_string()),
+            _ => None,
+        };
+        StorageError::PartiallyApplied {
+            applied: crate::Applied::DropDatabase { dropped: dropped.to_vec(), in_doubt },
+            cause: Box::new(e),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3336,6 +3476,19 @@ impl Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Option<Vec<CollectionId>>> {
+        self.bury_collection_as(db, name, replicated, Continuing::No)
+    }
+
+    /// [`Self::bury_collection`], taking the writer as a request that has
+    /// `continuing` from an earlier commit (ADR-192): a database drop's
+    /// burials after its first.
+    fn bury_collection_as(
+        &self,
+        db: &str,
+        name: &str,
+        replicated: Option<Stamp>,
+        continuing: Continuing,
+    ) -> Result<Option<Vec<CollectionId>>> {
         // Nothing to bury, answered without taking the writer. Only that: what
         // is buried is read again under the writer below.
         match self.get_collection(db, name) {
@@ -3361,7 +3514,6 @@ impl Engine {
         // documents, in the same chunks and under the same guard: on the
         // measurement this change was made for, the shadow was the slower half.
 
-        let log = replicated.is_none();
         // `ddl` and not `drop`, and the split is the point of the pairing
         // (ADR-159): the holder names what the transaction writes, and this
         // one writes metadata — a definition removed, a tombstone, an entry —
@@ -3369,7 +3521,41 @@ impl Engine {
         // half is `purge_chunk`, and it is `drop`. Labelling the burial as a
         // drop would put an O(1) transaction in the row an operator reads to
         // find out what is churning through the writer.
-        let txn = self.begin_write(WriterHolder::Ddl)?;
+        let txn = self.begin_write_as(WriterHolder::Ddl, continuing)?;
+        let Some(burial) = self.bury_in_txn(&txn, db, name, replicated)? else {
+            txn.abort()?;
+            debug!(
+                db,
+                collection = name,
+                "the collection a drop read was buried, or buried and recreated, before the drop \
+                 took the writer; nothing of what stands now is the drop's to bury"
+            );
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
+            return Ok(None);
+        };
+        txn.commit()?;
+        Ok(Some(self.finish_burial(db, name, burial)))
+    }
+
+    /// The burial itself, inside a transaction that holds the writer: the
+    /// definition (and a parent's shadow with it) removed, the tombstone
+    /// recorded, the entry minted, and the database row removed with the last
+    /// collection. `None`, having written nothing, when nothing of what
+    /// stands under the name now is the drop's to bury. The caller commits,
+    /// then hands the result to [`Self::finish_burial`].
+    ///
+    /// A transaction of its own for a drop, and a vector removal's own for
+    /// its shadow, so that turning vectors off with `drop_vectors` is one
+    /// commit (ADR-192).
+    pub(crate) fn bury_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        db: &str,
+        name: &str,
+        replicated: Option<Stamp>,
+    ) -> Result<Option<Burial>> {
+        let log = replicated.is_none();
         // What is buried is what stands under the name **now**, read under the
         // writer, and not what the read above found. Between the two, another
         // burial of the name can land, or a burial and a recreation with
@@ -3406,15 +3592,6 @@ impl Engine {
             }
         };
         let Some((meta, shadow)) = standing else {
-            txn.abort()?;
-            debug!(
-                db,
-                collection = name,
-                "the collection a drop read was buried, or buried and recreated, before the drop \
-                 took the writer; nothing of what stands now is the drop's to bury"
-            );
-            #[cfg(test)]
-            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
             return Ok(None);
         };
         // Under the writer, as `create_collection_inner` mints (ADR-148).
@@ -3467,13 +3644,18 @@ impl Engine {
                 meta.id,
                 &kimmy_core::CollectionRef::new(db, name),
             )?;
-            append_oplog(&txn, &entry)?;
+            append_oplog(txn, &entry)?;
             Some(entry)
         } else {
             None
         };
+        Ok(Some(Burial { shadow: shadow.map(|s| s.name), buried, logged }))
+    }
 
-        txn.commit()?;
+    /// What follows a burial's commit: its entry published, expiry cursors
+    /// forgotten, and the rows handed to the purger. Returns the ids buried.
+    pub(crate) fn finish_burial(&self, db: &str, name: &str, burial: Burial) -> Vec<CollectionId> {
+        let Burial { shadow, buried, logged } = burial;
         if let Some(entry) = logged {
             self.publish(vec![entry]);
         }
@@ -3487,11 +3669,11 @@ impl Engine {
         self.hand_over_purges(&buried);
 
         if let Some(shadow) = &shadow {
-            info!(db, collection = name, shadow = %shadow.name, "dropped collection and its vectors");
+            info!(db, collection = name, shadow = %shadow, "dropped collection and its vectors");
         } else {
             info!(db, collection = name, "dropped collection");
         }
-        Ok(Some(buried))
+        buried
     }
 
     /// Remove what a dropped collection held, a chunk per commit, with the
@@ -4205,6 +4387,90 @@ mod tests {
         assert!(engine.list_collections("shop").unwrap().is_empty());
         assert!(!engine.database_exists("shop").unwrap());
         assert!(!engine.drop_database("shop").unwrap(), "already gone");
+    }
+
+    /// A database of three collections, over a shared engine, for the tests
+    /// of what happens between a drop's burials (ADR-192).
+    fn three_collections() -> (std::sync::Arc<super::Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::Engine::open(&dir.path().join("k.redb")).unwrap();
+        for name in ["a", "b", "c"] {
+            engine.create_collection("shop", name).unwrap();
+        }
+        (std::sync::Arc::new(engine), dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_burial_waits_out_a_writer_held_past_the_budget() {
+        // A drop that has buried one collection keeps going: the writer held
+        // past the budget between burials no longer answers "nothing was
+        // written" over a database already half gone.
+        let (engine, _dir) = three_collections();
+        let budget = std::time::Duration::from_millis(100);
+        let dropped = {
+            let engine = std::sync::Arc::clone(&engine);
+            super::with_write_wait_budget(budget, async move {
+                let holder = std::sync::Arc::clone(&engine);
+                crate::sync::race_hooks::at(
+                    crate::sync::race_hooks::Race::BetweenBurials,
+                    move || {
+                        let (held, is_held) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let guard = holder.hold_writer(super::WriterHolder::Bulk);
+                            held.send(()).unwrap();
+                            std::thread::sleep(budget * 3);
+                            drop(guard);
+                        });
+                        is_held.recv().unwrap();
+                    },
+                );
+                engine.drop_database("shop")
+            })
+            .await
+        };
+        assert!(dropped.expect("the later burials wait for the writer"));
+        assert!(engine.list_collections("shop").unwrap().is_empty());
+        assert!(!engine.database_exists("shop").unwrap());
+        assert_eq!(engine.writer_wait_timeouts(), 0);
+    }
+
+    #[test]
+    fn a_drop_that_stops_between_burials_says_which_collections_went() {
+        let (engine, _dir) = three_collections();
+        let stopper = std::sync::Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenBurials, move || {
+            stopper.set_stopping();
+        });
+        let failed = engine.drop_database("shop").unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a stop after a burial is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::DropDatabase { dropped: vec!["a".to_string()], in_doubt: None }
+        );
+        assert!(matches!(*cause, StorageError::Stopping), "{cause:?}");
+        let left: Vec<String> =
+            engine.list_collections("shop").unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(left, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn a_collection_created_during_a_database_drop_keeps_its_database() {
+        // The last burial removes the row; a create landing after it makes
+        // the row again, implicitly. The drop's final removal is decided
+        // under the writer and only while nothing stands in the database, so
+        // it no longer removes the row from under that collection.
+        let (engine, _dir) = three_collections();
+        let creator = std::sync::Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BeforeRowRemoval, move || {
+            creator.create_collection("shop", "late").unwrap();
+        });
+        assert!(engine.drop_database("shop").unwrap());
+        assert!(engine.database_exists("shop").unwrap(), "the late collection's database stands");
+        let left: Vec<String> =
+            engine.list_collections("shop").unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(left, vec!["late".to_string()]);
     }
 
     #[test]

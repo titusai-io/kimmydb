@@ -314,13 +314,18 @@ pub fn next_index_id(&self) -> u32 {
 | `update` / `delete` by filter | Operators applied **inside the write transaction**, on the image it holds; matched and written as one unit (ADR-083) |
 | `update` / `delete` with `multi: true` | **Chunked**: one transaction per `storage.multi_chunk_docs` documents (default 1,000), each chunk all or nothing, the writer released between chunks (ADR-086) |
 | Crash mid-request | Every chunk that committed stays; the chunk in flight is lost whole; the oplog reflects exactly what landed, and the response's `commits` says how many chunks did |
+| A failure after the first chunk | The later chunks wait for the writer with no time limit, so a busy writer no longer splits a request; any failure after the first commit answers `500 partially_applied` with the committed chunks' counts (ADR-192) |
 | `insert_many` | One transaction; all or nothing |
 | A sync batch from a peer | One transaction per run of consecutive document entries, the witnessed vector in the last one; a schema change in the batch ends a run. A DDL-free batch is one commit and one fsync on the replica, as the bulk insert it carries was on the writer (ADR-119) |
 
 > **Sharp edge.** A `multi: true` update or delete is atomic per *chunk*, not
-> per request: a failure in the third chunk leaves the first two committed and
-> the response is an error, so a caller that needs to know what landed reads
-> the collection (or a change stream) rather than assuming nothing did. Set
+> per request: a failure in the third chunk leaves the first two committed,
+> and the response is `500 partially_applied`, `retry: verify`, whose
+> `applied` counts them ([ADR-192](decisions.md)). It says how many, not
+> which: a caller that needs to know which documents took the change reads
+> the collection (or a change stream), or builds the request so that sending
+> it again touches only what is not done yet
+> ([HTTP API](http-api.md#a-request-that-was-partly-applied)). Set
 > `storage.multi_chunk_docs` to 10,000 to make requests up to that size
 > all-or-nothing again, at the price of holding the writer for the whole
 > request. There are still no transactions *across* requests.

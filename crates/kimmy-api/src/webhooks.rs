@@ -196,23 +196,36 @@ pub fn register(
         created_ms: kimmy_storage::physical_now_ms(),
     };
 
+    // Both system collections exist before the transaction: creating one is
+    // the node's bookkeeping, not this request's effect.
     let meta = registry(state)?;
-    state.engine.insert(&meta, subscription.to_document())?;
+    let progress = crate::dispatch::progress_collection(state)?;
 
-    // Start from *now*, not from the beginning of the retained oplog.
+    // The subscription and its progress in one transaction (ADR-192), and the
+    // progress starts from *now*, not from the beginning of the retained
+    // oplog.
     //
-    // Without this a webhook registered on a busy collection is answered with
-    // up to `oplog_retention_secs` of history the moment it is created — a
-    // surprise flood of events the caller did not ask for and, on a large
+    // Without the seed a webhook registered on a busy collection is answered
+    // with up to `oplog_retention_secs` of history the moment it is created —
+    // a surprise flood of events the caller did not ask for and, on a large
     // collection, a stampede at whatever endpoint they just wired up. Change
     // streams behave the same way: you subscribe to hear what happens next.
     //
     // Seeded by recording the current version vector as already-delivered,
     // which needs no special case in the dispatcher: it is simply a
-    // subscription that is already caught up.
-    if let Ok(now) = state.engine.version_vector() {
-        crate::dispatch::seed_progress(state, &subscription.id, &now);
-    }
+    // subscription that is already caught up. Read under the writer, so no
+    // commit lands between the reading and the seed; and in the same commit
+    // as the subscription, so the dispatcher never sees one without the
+    // other. The seed was its own commit, after the subscription's, and a
+    // failure in it was logged and answered `200`, leaving a subscription
+    // that replayed history.
+    state.engine.write_batch(kimmy_storage::WriterHolder::Write, |scope| {
+        let now = state.engine.version_vector()?;
+        let (id, seed) = crate::dispatch::progress_record(state, &subscription.id, &now);
+        scope.insert(&meta, subscription.to_document())?;
+        scope.replace(&progress, &id, seed, true)?;
+        Ok(())
+    })?;
 
     tracing::warn!(
         target: "kimmy::audit",

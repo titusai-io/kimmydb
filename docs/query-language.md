@@ -581,7 +581,8 @@ Narrow the filter, or add an index.
 so the same table applies to each chunk of them. The ceiling does not: a
 `multi: true` request commits in chunks of `storage.multi_chunk_docs`
 documents, releasing the writer between chunks, so any number of matches is
-allowed and the response reports `commits` (ADR-086).
+allowed and the response reports `commits` (ADR-086). A failure after the
+first chunk answers `partially_applied` with what landed (ADR-192).
 
 `update` and `delete` plan too, so an index applies to all three. Pass
 `"explain": true` on any of `find`, `count`, `update` or `delete` to see which

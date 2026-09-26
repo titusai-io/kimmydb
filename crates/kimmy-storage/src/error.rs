@@ -108,6 +108,49 @@ pub enum StorageError {
     /// a write that failed (outcome unknown, ADR-057's `verify`).
     #[error("the write may or may not have been applied: {0}")]
     OutcomeUnknown(String),
+
+    /// A later transaction of a request that has already committed one was
+    /// not begun, because the node is past its drain deadline or its storage
+    /// has failed (ADR-192). Nothing of that transaction was written. Only
+    /// ever the cause of a [`StorageError::PartiallyApplied`].
+    #[error("the node is stopping")]
+    Stopping,
+
+    /// A request that commits in more than one transaction failed after its
+    /// first commit (ADR-192). What `applied` counts is committed, published
+    /// and replicating; `cause` is why the request stopped there.
+    #[error("the request was partly applied ({applied}) and then failed: {cause}")]
+    PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+}
+
+/// What a request that commits in more than one transaction had committed
+/// when it failed (ADR-192).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// A `multi` update or delete (ADR-086). Counts are of committed chunks
+    /// only; `in_doubt` is the size of a chunk whose commit's outcome is
+    /// unknown, which is not in the other counts.
+    Modify { matched: u64, modified: u64, commits: u64, in_doubt: u64 },
+    /// A database drop: the collections whose burial committed, and the one
+    /// whose burial's outcome is unknown, if any.
+    DropDatabase { dropped: Vec<String>, in_doubt: Option<String> },
+}
+
+impl std::fmt::Display for Applied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Modify { matched, commits, in_doubt, .. } => {
+                write!(f, "{matched} matched in {commits} commits, {in_doubt} in doubt")
+            }
+            Self::DropDatabase { dropped, in_doubt } => {
+                write!(f, "{} collections dropped", dropped.len())?;
+                match in_doubt {
+                    Some(name) => write!(f, ", {name} in doubt"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
 }
 
 /// What an operator can actually do about a stored partial filter this build

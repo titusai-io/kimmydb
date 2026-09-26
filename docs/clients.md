@@ -99,6 +99,12 @@ known whether it did**. The third comes two ways:
   it restarts and serves its peers.
 - **Never blindly resend** an insert with a server-assigned `_id`, or an
   `$inc`: that is how one write becomes two.
+- **Never resend a multi-document write automatically**, whatever it was
+  answered: a `multi: true` update or delete, or a database drop. It commits
+  in several transactions, and a failure after the first is answered
+  `partially_applied` with what landed; a resend re-applies that part. Build a
+  non-idempotent one with a marker so it can be sent again safely: see
+  [a request that was partly applied](http-api.md#a-request-that-was-partly-applied).
 - **Proxies and service meshes:** a layer that retries a request on a `5xx` or
   a reset must not retry non-idempotent writes. See
   [Operations](operations.md#a-write-whose-outcome-is-unknown).
