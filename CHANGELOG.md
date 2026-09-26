@@ -41,6 +41,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   [Change streams](docs/change-streams.md#resuming-on-another-member). The
   embedding worker's backfill also no longer lists a collection's documents on
   a worker. ADR-153's addendum of 2026-09-26.
+- **A change-stream resume on a member that did not issue the token no longer
+  walks the whole retained oplog to find where to start.** A client that was
+  caught up with the member is now answered without reading the arrival index.
+  In general the member races a seek by stamp against the walk, and the first
+  to finish answers, which costs at most about twice the cheaper of the two.
+  Where the stream starts is unchanged. When a slow resume is logged, the line
+  now also carries `found_by`. The start-up check that rebuilds the arrival
+  index now covers both of its halves. ADR-173's addendum of 2026-09-26.
 
 ## 0.39.0 - 2026-09-26
 

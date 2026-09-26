@@ -1766,7 +1766,7 @@ impl Engine {
 
     /// Rebuild the arrival index if it does not cover the oplog exactly.
     ///
-    /// Cheap to check — two counts — and only pays the rebuild when something
+    /// Cheap to check — three counts — and only pays the rebuild when something
     /// is actually wrong: a database written before the index existed, or one
     /// an older build appended to after this one had created it. Comparing
     /// counts rather than contents is enough because the index is only ever
@@ -1781,6 +1781,7 @@ impl Engine {
             let txn = db.begin_read()?;
             let oplog = txn.open_table(tables::OPLOG)?;
             let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             // `len()` is the count redb keeps in each table's root header,
             // read without visiting a page of the table. This used to be
             // `iter().count()` on both, which walked the whole oplog and the
@@ -1788,7 +1789,12 @@ impl Engine {
             // file, the oplog twice over before the node served anything
             // (ADR-153's investigation; the third walk, the version vector's,
             // is recorded there as the one that remains).
-            if oplog.len()? == arrival.len()? {
+            //
+            // Both halves of the index: a change stream's resume reads the
+            // stamp half on its own (`Engine::first_arrival_beyond`), so a
+            // stamp half that lost rows would move where a stream starts.
+            let entries = oplog.len()?;
+            if entries == arrival.len()? && entries == by_stamp.len()? {
                 return Ok(());
             }
         }
