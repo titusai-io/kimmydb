@@ -76,6 +76,12 @@ pub struct StorageReadings {
     pub fsyncs: u64,
     pub commits_grouped: u64,
     pub storage_bytes: u64,
+    /// Entries in the oplog now (`Engine::oplog_entries`), and what the walk
+    /// that last verified the version vector read, which is zero with no
+    /// record: the next open walks (`Engine::version_vector_verified`,
+    /// ADR-173's addendum of 2026-09-26).
+    pub oplog_entries: u64,
+    pub oplog_verified: kimmy_storage::VerifiedWalk,
     /// The storage engine's page cache: its fill (read cache and write
     /// buffer together), evictions, and page reads hit and missed, since the
     /// database was opened (`Engine::cache_reading`).
@@ -229,6 +235,9 @@ pub struct MetricsSnapshot {
     pub fsyncs: u64,
     pub commits_grouped: u64,
     pub storage_bytes: u64,
+    /// As [`StorageReadings::oplog_entries`] and [`StorageReadings::oplog_verified`].
+    pub oplog_entries: u64,
+    pub oplog_verified: kimmy_storage::VerifiedWalk,
     /// The storage engine's page cache, as [`StorageReadings::storage_cache`].
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
@@ -1066,6 +1075,8 @@ impl Metrics {
             fsyncs: readings.fsyncs,
             commits_grouped: readings.commits_grouped,
             storage_bytes: readings.storage_bytes,
+            oplog_entries: readings.oplog_entries,
+            oplog_verified: readings.oplog_verified,
             storage_cache: readings.storage_cache,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
             process_resident_bytes: readings.process_resident_bytes,
@@ -1320,6 +1331,18 @@ impl Metrics {
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
              {storage_cache}\
+             # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.\n\
+             # TYPE kimmy_oplog_entries gauge\n\
+             kimmy_oplog_entries {oplog_entries}\n\
+             # HELP kimmy_oplog_verified_entries Oplog entries read by the walk that last verified the version vector, at an open or a rewind. 0 with no record, and then the next open walks.\n\
+             # TYPE kimmy_oplog_verified_entries gauge\n\
+             kimmy_oplog_verified_entries {oplog_verified_entries}\n\
+             # HELP kimmy_oplog_verified_logical_bytes Key and value bytes that walk read: logical bytes, not bytes of the file. 0 with no record.\n\
+             # TYPE kimmy_oplog_verified_logical_bytes gauge\n\
+             kimmy_oplog_verified_logical_bytes {oplog_verified_bytes}\n\
+             # HELP kimmy_oplog_verified_walk_seconds How long that walk took. 0 with no record.\n\
+             # TYPE kimmy_oplog_verified_walk_seconds gauge\n\
+             kimmy_oplog_verified_walk_seconds {oplog_verified_secs}\n\
              # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
              # TYPE kimmy_vector_index_cache_bytes gauge\n\
              kimmy_vector_index_cache_bytes {index_cache}\n\
@@ -1525,6 +1548,10 @@ impl Metrics {
             writer_wait_timeouts = readings.writer_wait_timeouts,
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
+            oplog_entries = readings.oplog_entries,
+            oplog_verified_entries = readings.oplog_verified.rows,
+            oplog_verified_bytes = readings.oplog_verified.logical_bytes,
+            oplog_verified_secs = readings.oplog_verified.elapsed_ms as f64 / 1e3,
             storage_cache = storage_cache,
             index_cache = readings.vector_index_cache_bytes,
             resident = readings.process_resident_bytes,
@@ -2098,6 +2125,13 @@ mod tests {
             fsyncs: 45,
             commits_grouped: 46,
             storage_bytes: 47,
+            // Values of their own, so no other series' line can match them.
+            oplog_entries: 1_301,
+            oplog_verified: kimmy_storage::VerifiedWalk {
+                rows: 1_302,
+                logical_bytes: 1_303,
+                elapsed_ms: 1_304,
+            },
             storage_cache: kimmy_storage::CacheReading {
                 used_bytes: 9_101,
                 evictions: 9_102,
@@ -2500,6 +2534,18 @@ kimmy_write_lock_held_cpu_unmeasured_total 99
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
+# HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.
+# TYPE kimmy_oplog_entries gauge
+kimmy_oplog_entries 1301
+# HELP kimmy_oplog_verified_entries Oplog entries read by the walk that last verified the version vector, at an open or a rewind. 0 with no record, and then the next open walks.
+# TYPE kimmy_oplog_verified_entries gauge
+kimmy_oplog_verified_entries 1302
+# HELP kimmy_oplog_verified_logical_bytes Key and value bytes that walk read: logical bytes, not bytes of the file. 0 with no record.
+# TYPE kimmy_oplog_verified_logical_bytes gauge
+kimmy_oplog_verified_logical_bytes 1303
+# HELP kimmy_oplog_verified_walk_seconds How long that walk took. 0 with no record.
+# TYPE kimmy_oplog_verified_walk_seconds gauge
+kimmy_oplog_verified_walk_seconds 1.304
 # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
 # TYPE kimmy_vector_index_cache_bytes gauge
 kimmy_vector_index_cache_bytes 48
@@ -3292,6 +3338,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 2
                 // Peer connections this node failed to serve, by reason.
                 + kimmy_cluster::ServeFailure::COUNT
+                // The oplog now, and the walk that last verified the version
+                // vector: entries, logical bytes and seconds (ADR-173's
+                // addendum of 2026-09-26).
+                + 4
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT

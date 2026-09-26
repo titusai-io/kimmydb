@@ -3639,11 +3639,15 @@ mod tests {
             e.version_vector().unwrap()
         };
 
-        // Remove the table entirely, as a database that never had one.
+        // Remove the table entirely, as a database that never had one. Such a
+        // database has no record that its vector was verified either -- an
+        // older build never wrote one, and a backup never carries it -- so
+        // that goes too, or the open would rightly trust it and not walk.
         {
             let db = redb::Database::create(&path).unwrap();
             let txn = db.begin_write().unwrap();
             txn.delete_table(crate::tables::OPLOG_HELD).unwrap();
+            txn.delete_table(crate::tables::VECTOR_VERIFIED).unwrap();
             {
                 let mut versions = txn.open_table(crate::tables::OPLOG_VERSIONS).unwrap();
                 versions.retain(|_, _| false).unwrap();

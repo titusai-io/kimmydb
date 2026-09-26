@@ -150,6 +150,14 @@ pub const INDEXES_DROPPED: TableDefinition<(u64, u32), &[u8]> =
 /// holds as state (`OPLOG_HELD`, ADR-160). So the oplog is a lower bound on
 /// coverage and not the whole of it: a completed snapshot's grant is not
 /// recoverable from the oplog, and discarding this table loses it.
+///
+/// **Invariant I** (ADR-173's addendum of 2026-09-26): every oplog entry is at
+/// or below this vector for its origin, or its key is in `OPLOG_HELD`. Every
+/// writer keeps it, and a change-stream resume and the open both rely on it:
+/// the open walks the oplog to raise this vector only when
+/// [`VECTOR_VERIFIED`] does not say I already holds. A writer of this table,
+/// the oplog, `OPLOG_HELD` or `OPLOG_WITNESSED` outside the audited ones fails
+/// a source guard (`verified::tests`).
 pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_versions");
 
 /// Newest stamp this node has **processed** per origin, appended or not.
@@ -212,7 +220,23 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// normally will. That is safe -- `Engine::open` merges and never lowers, so a
 /// mark can only withhold a raise -- but it is not nothing, and the rebuild is
 /// exactly the path that matters when the stored vector has been lost.
+///
+/// A mark is half of invariant I (see [`OPLOG_VERSIONS`]): an entry above the
+/// vector is allowed only while it is marked here. A backup does not carry this
+/// table, so a restored store can hold entries above its vector unmarked until
+/// the open's walk raises the vector over them; which is why a backup never
+/// carries [`VECTOR_VERIFIED`] either.
 pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
+
+/// `"verified" -> I_EPOCH ‖ schema ‖ rows ‖ logical bytes ‖ elapsed ms`: the
+/// record that the version vector covers the oplog (invariant I), so
+/// `Engine::open` need not walk the oplog to raise it (`crate::verified`).
+///
+/// Written only where I holds: after the open's walk, and by a rewind's reset.
+/// Counted only under this build's epoch and the store's schema. Its own table
+/// rather than a `META` key because no build's backup carries a table it does
+/// not list, so a restore, which can leave I broken, never carries it.
+pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_verified");
 
 /// `peer node id (16 bytes) -> the snapshot pull left to resume with it`.
 ///

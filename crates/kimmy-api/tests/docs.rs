@@ -554,6 +554,8 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         fsyncs: 5,
         commits_grouped: 6,
         storage_bytes: 7,
+        oplog_entries: 26,
+        oplog_verified: kimmy_storage::VerifiedWalk { rows: 27, logical_bytes: 28, elapsed_ms: 29 },
         storage_cache: kimmy_storage::CacheReading {
             used_bytes: 22,
             evictions: 23,

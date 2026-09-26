@@ -343,6 +343,37 @@ impl TelemetryGuard {
             "Size of the database file on disk.",
             storage_bytes
         );
+        // What an open that walks the oplog reads, and what the walk that last
+        // verified the version vector did read (ADR-173's addendum of
+        // 2026-09-26).
+        observe!(
+            u64_observable_gauge,
+            "kimmy.oplog.entries",
+            "{entry}",
+            "Entries in the oplog now, read from the count the table keeps.",
+            oplog_entries
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.oplog.verified.entries",
+            "{entry}",
+            "Oplog entries read by the walk that last verified the version vector; 0 with no record, and then the next open walks.",
+            |s| s.oplog_verified.rows
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.oplog.verified.logical_bytes",
+            "By",
+            "Key and value bytes that walk read: logical bytes, not bytes of the file.",
+            |s| s.oplog_verified.logical_bytes
+        );
+        observe!(
+            f64_observable_gauge,
+            "kimmy.oplog.verified.walk_seconds",
+            "s",
+            "How long that walk took; 0 with no record.",
+            |s| s.oplog_verified.elapsed_ms as f64 / 1e3
+        );
         // The page cache's statistics, only in a build that has them.
         #[cfg(feature = "storage-cache-metrics")]
         observe!(
