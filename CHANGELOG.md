@@ -10,7 +10,24 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.40.0 - 2026-09-26
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the schema is still 4 and redb still 4.3, so 0.39.0 opens a store 0.40.0 has
+run on, and a member rolls back by starting it on 0.39.0. Releases now ship
+`kimmyd` alone: the client libraries and the `kimmy` CLI moved out of this
+repository, and the container image is unchanged. A start no longer walks the
+whole retained oplog every time. It records that the version vector covers the
+oplog, and later starts skip the walk. The first start of 0.40.0 still walks
+once, as does the first after a restore; budget a cold walk for it on the
+startup probe (about 30 s per GB of oplog read on the lab host). Earlier
+releases ignore the new `vector_verified` table and walk at every start, so a
+member rolled back walks every time. New gauges: `kimmy_oplog_entries` and
+`kimmy_oplog_verified_entries`, `_logical_bytes` and `_walk_seconds`;
+`KIMMY_VERIFY_OPLOG_AT_OPEN=1` forces the walk. A change-stream resume on a
+member that did not issue the token no longer holds a request worker, is logged
+when slow, and finds where to start by stamp, so a client that was caught up no
+longer walks the arrival index from its start.**
 
 ### Removed
 
