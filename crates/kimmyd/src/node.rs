@@ -2717,6 +2717,33 @@ mod tests {
         assert_eq!(last.cause.as_deref(), Some("serving failed"));
     }
 
+    /// A write still open at the cap is not hidden by serving that failed
+    /// too: the cause names the write, and the runtime is not waited on.
+    #[test]
+    fn serving_that_fails_does_not_hide_a_write_left_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let writer = Arc::clone(&engine);
+        let (held, is_held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = writer.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+        let mut end = ended(dir.path(), engine, Duration::from_millis(200));
+        assert!(end.writes_open);
+        end.outcome = Err(anyhow::anyhow!("serving failed"));
+        let started = std::time::Instant::now();
+        let outcome = conclude_now(end);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("a write was still in progress"));
+    }
+
     #[test]
     fn the_stop_test_switch_parses_what_it_documents() {
         assert_eq!(TestStop::parse("hold_engine"), Some(TestStop::HoldEngine));
