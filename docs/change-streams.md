@@ -359,10 +359,19 @@ WebSocket client:
 
 ## Sharp edges
 
-**Cancel safety.** `ChangeStream::next()` is *not* cancel-safe with respect to
-the live channel: abandoning a call inside a `select!` you intend to resume may
-drop an event. The WebSocket pump only races it against socket-close, which is
-terminal, so this is safe there.
+**Cancel safety.** `ChangeStream::next()` may be abandoned at either of its
+awaits and called again without losing an event. It reads every event from the
+arrival index and uses the live channel only as a wake-up. When it waits on
+that wake-up, or at the budget point before each replay batch read, the last
+batch it read has been handed over in full, and where to read next is kept on
+the stream. An abandoned call costs a wake-up, which the next call makes up by
+reading the index again.
+
+The WebSocket pump relies on this. It races `next()` against the socket, so
+that it sees the client leave, and abandons the call whenever the client sends
+any frame, not only a close. Since the budget point, that can also happen
+between two batches of a long replay. The embedding worker's timed wait
+abandons it the same way.
 
 **Replicated writes reach subscribers.** This was once a real gap: an applied
 remote entry keeps its *originating* stamp, so it lands in the oplog behind the

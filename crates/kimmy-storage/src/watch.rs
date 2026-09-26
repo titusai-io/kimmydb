@@ -183,9 +183,14 @@ impl Engine {
         options: &WatchOptions,
         walked: &mut Walked,
     ) -> Result<Resolved> {
+        // Taken out of the lock before it runs, as `continuing_hook` is: a
+        // hook that sleeps must not hold the mutex while it does.
         #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = self.watch_resolve_hook.lock().take() {
-            hook();
+        {
+            let hook = self.watch_resolve_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
         // Streams follow *arrival* order, not stamp order. A replicated entry
@@ -821,9 +826,12 @@ pub struct ChangeStream {
 impl ChangeStream {
     /// The next change, or `None` once the engine is dropped.
     ///
-    /// Cancel-safe with respect to replay: an abandoned call may drop a live
-    /// event, so callers must not race this in a `select!` they intend to
-    /// resume.
+    /// Safe to abandon at either of its awaits, the wake-up channel and the
+    /// budget point before each replay read, and to call again: every event is
+    /// read from the arrival index, and at both awaits the last batch read has
+    /// been handed over in full and where to read next is kept on the stream.
+    /// An abandoned call costs a wake-up, which the next call makes up by
+    /// reading the index again (see below).
     ///
     /// # Why the broadcast channel is only a wake-up
     ///
@@ -893,8 +901,11 @@ impl ChangeStream {
             tokio::task::consume_budget().await;
             let read = crate::engine::blocking(|| {
                 #[cfg(any(test, feature = "test-hooks"))]
-                if let Some(hook) = engine.replay_read_hook.lock().take() {
-                    hook();
+                {
+                    let hook = engine.replay_read_hook.lock().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
                 }
                 engine.read_arrival_batch(from, REPLAY_BATCH)
             });
@@ -2554,6 +2565,57 @@ mod tests {
              worker",
             polled - finished
         );
+    }
+
+    /// A replay that passes over batch after batch gives its task up between
+    /// batches, rather than reading to the tail in one poll.
+    ///
+    /// A collection stream passes over every entry of another collection, so
+    /// with more batches of those than a task's budget allows, one poll of
+    /// `next` used to read them all before it first returned `Pending`. The
+    /// budget point stops it part way: the caller's `select!` gets to poll its
+    /// other branch, and the pump sees a client that has gone. Counted, not
+    /// timed: the poll either stopped short of the tail or it did not.
+    #[tokio::test]
+    async fn one_poll_of_a_long_replay_stops_before_the_tail() {
+        let (engine, coll, _dir) = setup();
+        let other = engine.create_collection("app", "other").unwrap();
+        // Comfortably more batches than tokio's per-task budget of 128.
+        let entries = REPLAY_BATCH * 160;
+        for chunk in 0..entries / 1_000 {
+            let docs = (0..1_000).map(|i| doc! { "_id": (chunk * 1_000 + i) as i64 }).collect();
+            engine.insert_many(&other, docs).unwrap();
+        }
+        let tail = engine.next_arrival_seq().unwrap();
+        let options = WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() };
+        let mut stream = engine.watch(WatchScope::Collection(coll.id), options).unwrap();
+
+        // One poll of the task: take what `next` delivers at once (the
+        // collection's own creation is in scope) until it first returns
+        // `Pending`, all under the one budget.
+        std::future::poll_fn(|cx| {
+            loop {
+                let next = std::pin::pin!(stream.next(&engine));
+                match next.poll(cx) {
+                    std::task::Poll::Ready(Some(_)) => continue,
+                    std::task::Poll::Ready(None) => panic!("the stream ended"),
+                    std::task::Poll::Pending => return std::task::Poll::Ready(()),
+                }
+            }
+        })
+        .await;
+        let reached = stream.next_replay_from.expect("the replay recorded where it got to");
+        assert!(
+            reached < tail,
+            "one poll read to position {reached} of {tail}: the replay did not yield between \
+             batches"
+        );
+
+        // And the abandoned call cost nothing: the stream carries on and
+        // delivers what comes next in scope.
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+        let events = take(&engine, &mut stream, 1).await;
+        assert_eq!(doc_ids_str(&events), vec!["after"]);
     }
 
     /// A resolve slow enough for a client to notice says so, with what it did.

@@ -12446,6 +12446,10 @@ Tests, in `kimmy-storage` `watch.rs`:
 - `a_task_spawned_during_a_resume_resolve_is_polled_before_the_resolve_ends`;
 - `a_task_spawned_during_a_replay_read_is_polled_before_the_read_ends`. Each
   runs on a one-worker runtime and fails with its wrap removed.
+- `one_poll_of_a_long_replay_stops_before_the_tail`: with more batches out of
+  scope than a task's budget, one poll of `next` stops short of the tail, and
+  the stream then delivers what comes next. It fails with the budget point
+  removed.
 - `a_slow_resolve_is_logged_with_what_it_walked`.
 
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
