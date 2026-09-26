@@ -3009,6 +3009,7 @@ components:
         | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
+        | `node_stopping` | 503 | elsewhere | This node is shutting down and did not begin the write: nothing was written. Send it to another member |
       enum:
         - bad_request
         - payload_too_large
@@ -3032,6 +3033,7 @@ components:
         - collection_purging
         - outcome_unknown
         - partially_applied
+        - node_stopping
 
     Capability:
       type: string

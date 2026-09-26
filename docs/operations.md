@@ -475,6 +475,7 @@ a provider this member cannot build is one only an operator can.
 | `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
 | `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
 | `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line: a storage failure (`internal`, `outcome_unknown`, or `storage_failed`, the storage failure that stops the node). **Page**. **One exception, which logs `WARN`**: a cause that is not this node's fault — the shutdown deadline (`stopping`), or the caller's, such as an operator a later document cannot take |
+| `node_stopping` | `WARN` | This node was shutting down and refused a write it had not begun; nothing was written, and the client is told to go to another member ([ADR-192](decisions.md)). Expected during every shutdown that meets a write after its drain. **Do not page**; a count that rises outside shutdowns is worth a look |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
@@ -566,7 +567,7 @@ the plain listener logs `requests still in flight at the drain deadline were
 cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
 one used to wait for every request in flight, with no limit**. Then, with its
 background work stopped, the node **closes its storage to writes**: a write
-that begins from then on is refused, answered `503 internal` with `retry:
+that begins from then on is refused, answered `503 node_stopping` with `retry:
 elsewhere` ("this node did not begin the write because it is shutting down"),
 logged at `WARN`, with nothing written, and a write already in
 progress is waited for, up to 10 s more. Only then is the clean-exit marker

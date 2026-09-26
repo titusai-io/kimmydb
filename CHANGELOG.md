@@ -89,8 +89,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   request that commits in more than one transaction stops before its next one
   and is answered `partially_applied`.
 - **A shutdown closes the storage to writes before it records a clean exit.**
-  After the drain, a write that begins is refused (`503 internal`, `retry:
-  elsewhere`, nothing written), and one in progress is waited for, up to 10 s; the clean-exit
+  After the drain, a write that begins is refused with the new code
+  **`503 node_stopping`**, `retry: elsewhere`, nothing written, and one in progress is waited for, up to 10 s; the clean-exit
   marker is written only then. Commits waiting on the `coalesced` barrier are
   flushed by the close itself. A write still in progress after that means no
   clean-exit marker, logged `exiting without a clean-exit marker` at `ERROR`,

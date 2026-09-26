@@ -82,6 +82,10 @@ pub enum ErrorCode {
     /// first commit: part of it landed, and the answer says how much
     /// (ADR-192).
     PartiallyApplied,
+    /// This node is shutting down and did not begin the write: nothing was
+    /// written, and another member serves (ADR-192). An expected refusal,
+    /// not a fault.
+    NodeStopping,
 }
 
 /// What a client may do about a failure.
@@ -170,7 +174,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 22] = [
+    pub const ALL: [ErrorCode; 23] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -193,6 +197,7 @@ impl ErrorCode {
         Self::CollectionPurging,
         Self::OutcomeUnknown,
         Self::PartiallyApplied,
+        Self::NodeStopping,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -220,6 +225,7 @@ impl ErrorCode {
             Self::CollectionPurging => "collection_purging",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::PartiallyApplied => "partially_applied",
+            Self::NodeStopping => "node_stopping",
         }
     }
 
@@ -280,6 +286,8 @@ impl ErrorCode {
             // client reads back, or resends a request built to skip what is
             // done (ADR-192).
             Self::PartiallyApplied => Retry::Verify,
+            // The node is going away; a peer holds the same data.
+            Self::NodeStopping => Retry::Elsewhere,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -386,6 +394,8 @@ impl ErrorCode {
             // as an operator a later document cannot take, lowers it to
             // `WARN` where the error is made.
             Self::PartiallyApplied => Some(LogLevel::Error),
+            // A shutdown doing its job: worth a line, not a page.
+            Self::NodeStopping => Some(LogLevel::Warn),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -718,20 +728,20 @@ impl ApiError {
     }
 
     /// A write this node did not begin, because it is stopping (ADR-192).
-    /// Nothing was written. `503`, and `elsewhere`: the node is going away,
-    /// and another member serves. `WARN` for the shutdown doing its job;
-    /// the storage failure behind the other reason is already an `ERROR`.
+    /// Nothing was written. `503 node_stopping`, and `elsewhere`: the node is
+    /// going away, and another member serves. Its own code, not `internal`,
+    /// so that a planned refusal does not read as a fault to anything keyed
+    /// on the code. `WARN`; the storage failure behind the other reason is
+    /// already an `ERROR` of its own.
     pub fn node_stopping(reason: kimmy_storage::StopReason) -> Self {
-        let mut e = Self::new(
+        Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Internal,
+            ErrorCode::NodeStopping,
             format!(
                 "this node did not begin the write because it is shutting down ({reason}); \
                  nothing was written. Send it to another member"
             ),
-        );
-        e.level_override = Some(LogLevel::Warn);
-        e
+        )
     }
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
@@ -1042,7 +1052,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 22] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 23] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1068,6 +1078,7 @@ mod tests {
             (Internal, Some(LogLevel::Error)),
             (OutcomeUnknown, Some(LogLevel::Error)),
             (PartiallyApplied, Some(LogLevel::Error)),
+            (NodeStopping, Some(LogLevel::Warn)),
             (Misconfigured, Some(LogLevel::Error)),
             (Snapshot, Some(LogLevel::Error)),
         ];
