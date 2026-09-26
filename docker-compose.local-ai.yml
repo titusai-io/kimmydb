@@ -63,6 +63,12 @@ services:
       # name — not the value — is what gets stored in collection metadata.
       OPENAI_API_KEY: local-no-key-needed
       KIMMY_CONFIG: /etc/kimmy/kimmy.toml
+    # The base file's, said again because this block replaces what it names:
+    # a stop takes up to about 25 s from the signal, plus the last coalesced
+    # flush and redb's close, which the margin to 30 s is for; Compose's
+    # default of 10 s would kill a node before it closes its store
+    # (docs/operations.md).
+    stop_grace_period: 30s
     depends_on:
       llama-embed:
         # Not required for correctness. Embedding is an oplog consumer, so a

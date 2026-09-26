@@ -48,7 +48,7 @@ pub use divergence::{
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{
-    CacheReading, DurabilityClass, Engine, WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN,
+    CacheReading, DurabilityClass, Engine, NotClosed, WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN,
     WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot, blocking,
     metered_writer_wait, with_write_wait_budget,
 };

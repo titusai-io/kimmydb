@@ -559,8 +559,11 @@ received, draining` and then `shutdown complete`. A start that fails — a port
 already bound, a certificate that will not parse — logs `exiting on an error`
 with the error's text, beside the one-line error on stderr. Both leave a
 marker, `kimmy.last-exit`, in the data directory beside `kimmy.redb`: how the
-run ended (`shutdown`, `error`, or `restore` for a directory `kimmyd restore`
-wrote), its pid, its build and the time, as TOML. The next start reads it and
+run ended (`shutdown`, `error`, `storage_not_closed`, or `restore` for a
+directory `kimmyd restore` wrote), its pid, its build and the time, as TOML.
+**`shutdown` means the store was closed cleanly**: from 0.40.1 it is written
+only after the node has closed `kimmy.redb` and read back that redb recorded
+the close, so the next start does not repair it. The next start reads it and
 sets it aside as `kimmy.last-exit.previous` until it is serving. For a
 `shutdown` or a `restore` it logs `previous run ended cleanly` at `INFO` with
 those fields. For an `error` it logs, at `WARN` with the error as `cause`,
@@ -568,7 +571,7 @@ either `the previous start failed before it served` or `the previous run exited
 on an error` ([ADR-147](decisions.md)).
 
 **The drain is 10 seconds, on both listeners, and the clean-exit marker waits
-for the last write.** From the signal, requests in flight get 10 s to finish,
+for the last write and for the store's close.** From the signal, requests in flight get 10 s to finish,
 and new connections are refused. At 10 s the node stops waiting for them, and
 the plain listener logs `requests still in flight at the drain deadline were
 cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
@@ -577,16 +580,47 @@ background work stopped, the node **closes its storage to writes**: a write
 that begins from then on is refused, answered `503 node_stopping` with `retry:
 elsewhere` ("this node did not begin the write because it is shutting down"),
 logged at `WARN`, with nothing written, and a write already in
-progress is waited for, up to 10 s more. Only then is the clean-exit marker
-written, so nothing can commit after it says the run ended cleanly. If a write
-is still in progress after those 10 s — or, under `storage.durability =
-coalesced`, the last flush of commits waiting to be made durable fails — the
-node logs `exiting without a clean-exit marker` at `ERROR` and exits with
-status **75**, without one, and the next start reports that the previous run
-did not shut down cleanly. Commits waiting on the coalescing barrier at the
-close are flushed by the close itself, before the marker. So a shutdown takes up to
-about 20 s when a request is stuck: set the supervisor's grace period to 25 s
-or more (Docker's default is 10 s, Kubernetes' 30 s).
+progress is waited for, up to 10 s more. Commits waiting on the coalescing
+barrier at that point are flushed then, before the marker. Then the node waits
+for its remaining work to end, up to **22 s from the signal** in all (at least
+3 s however long the drain and the close to writes took), and **closes the
+store**: it logs `engine closed` with `elapsed_ms`, checks that redb recorded
+the close, and only then writes the clean-exit marker and logs `shutdown
+complete`. Exported spans and metrics get 2 s more, after the marker.
+
+**A stop that cannot close the store says so, and exits 75.** Three things
+prevent the close, and each is logged at `ERROR` as `exiting without closing
+the storage engine; the next start repairs the database`, with the reason in
+`error`:
+- a thread still holds the store 22 s after the signal, such as a walk of the
+  oplog serving a peer's pull (`still held by a thread …`);
+- a write still in progress 10 s after the drain, or, under
+  `storage.durability = coalesced`, a last flush that failed (`a write was
+  still in progress …`);
+- a close that redb did not record, such as after a task panicked inside a
+  write transaction (`… needing recovery …`).
+
+The node writes the marker `storage_not_closed` with that reason as its
+`cause` and exits with status **75**. The next start logs `the previous
+shutdown could not close its storage; repairing the database` at `WARN`, with
+the cause, and repairs the store before it serves. Before 0.40.1 the first of
+these wrote `shutdown` and logged `shutdown complete` at once, and the process
+went on running until the walk ended or the supervisor killed it; the next
+start then repaired a store its marker called clean.
+
+**Give a stop 30 s or more, measured from the signal.** The phases above come
+to about 25.2 s at most: 22 s to the runtime's shutdown, 0.2 s more waiting
+for the store's last holder, and 2 s for telemetry. Two steps sit **outside**
+that budget, and the margin up to 30 s is for them: under `coalesced`, the
+last flush of commits waiting to be made durable, made when the node closes
+to writes, and redb's own close, which commits and fsyncs the allocator state
+(its time is the `elapsed_ms` on `engine closed`). Kubernetes' `terminationGracePeriodSeconds` (30 s by
+default) includes any `preStop` hook, so a hook's time comes out of it: raise
+the grace by as much. Docker's and Compose's default is 10 s, which is too
+short: use `docker stop --time 30` or `--stop-timeout 30`, or
+`stop_grace_period: 30s`, as both compose files here do. A node killed before
+it closes its store leaves no marker, and its next start reports an unclean
+stop and repairs.
 
 At the drain deadline, too, a request that commits in more than one
 transaction — a `multi` update or delete, a database drop — stops before its
@@ -1991,6 +2025,11 @@ cluster member wipe the data directory and let it catch up from its peers.
 data directory is refused as in use with nothing written, before the start
 reads anything it might act on. The lock also refuses, and is refused by, a
 0.36.x node on the same store.
+
+**Rolling back from 0.40.1 to 0.40.0 or earlier** after a stop that could not
+close its store: the older build does not know the marker `storage_not_closed`.
+It logs that the marker could not be read and removes it, then repairs the
+store as usual. Nothing else about the store differs.
 
 **Protection starts with 0.36.0.** Builds before 0.36.0 don't read
 `kimmy.format`. Rolling back to 0.35.0 or earlier still opens the store for

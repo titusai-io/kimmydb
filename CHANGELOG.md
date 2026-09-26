@@ -10,6 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A stop now closes the store before it says the node shut down cleanly.**
+  Since at least 0.39.0, a node stopped while a peer was pulling from it
+  logged `shutdown complete` and wrote the clean-exit marker at once, then
+  went on running until the walk serving the pull ended. A supervisor that
+  killed it first, at its stop timeout, left a store the next start repaired,
+  beside a marker that said the stop was clean. Now the node waits for its
+  remaining work until 22 s after the signal, closes the store on its main
+  thread, reads back that redb recorded the close, and only then writes
+  `shutdown` and logs `shutdown complete`, after `engine closed` with its
+  `elapsed_ms`. A stop that cannot close the store logs `exiting without
+  closing the storage engine` at `ERROR`, with the reason in `error`, writes
+  the new marker `storage_not_closed`, and exits **75**. The next start says
+  `the previous shutdown could not close its storage; repairing the database`
+  and repairs. A write still in progress at the close's cap, which used to
+  leave no marker, now writes this one too. Exported spans and metrics get 2 s
+  after the marker, whatever the collector does. **Give a stop 30 s or more
+  from the signal**; Docker's and Compose's default of 10 s is too short, and
+  both compose files here set `stop_grace_period: 30s`. A build before this
+  one reads `storage_not_closed` as an unreadable marker, removes it and
+  repairs. See [ADR-147](docs/decisions.md) and
+  [operations](docs/operations.md).
+
 ## 0.40.0 - 2026-09-26
 
 **Roll the members one at a time. This release is not a rollback boundary:

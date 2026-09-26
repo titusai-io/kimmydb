@@ -4,7 +4,9 @@
 //! # Every exit is named in the log
 //!
 //! A node has three ways out of `node::run`: a signal, which logs `shutdown
-//! signal received, draining` and then `shutdown complete`; an error, which
+//! signal received, draining` and then, once `node::conclude` has closed the
+//! store, `shutdown complete` (or, when it could not, an `ERROR` and the
+//! `storage_not_closed` marker, and exit 75); an error, which
 //! logs on the way out too; and **a supervised background task dying, which
 //! writes a `task_died` marker and calls `process::exit(70)`**
 //! ([ADR-184](../../../docs/decisions.md)) — that one is named here because
@@ -64,7 +66,8 @@ pub const PREVIOUS_FILE: &str = "kimmy.last-exit.previous";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Exit {
-    /// A signal was received and the drain completed.
+    /// A signal was received, the drain completed, and the storage engine
+    /// closed cleanly: the next open does not repair it.
     Shutdown,
     /// `node::run` returned an error, which it logged.
     Error,
@@ -80,6 +83,13 @@ pub enum Exit {
     /// marker names the call and the error.
     #[serde(rename = "storage_failed")]
     StorageFailed,
+    /// The run ended without closing the storage engine cleanly, so the next
+    /// open repairs it: a thread still held the engine when the stop's time
+    /// ran out, a write was still in progress at the cap, or the close
+    /// itself failed. `cause` on the marker says which. A build before this
+    /// one reads the marker as unreadable, and removes it.
+    #[serde(rename = "storage_not_closed")]
+    StorageNotClosed,
 }
 
 impl Exit {
@@ -90,6 +100,7 @@ impl Exit {
             Exit::Restore => "restore",
             Exit::TaskDied => "task_died",
             Exit::StorageFailed => "storage_failed",
+            Exit::StorageNotClosed => "storage_not_closed",
         }
     }
 }
@@ -352,6 +363,14 @@ pub fn record_storage_failure(data_dir: &Path, cause: &str) {
     record(data_dir, last);
 }
 
+/// Record that the run ended without closing the storage engine cleanly,
+/// with why as the cause.
+pub fn record_storage_not_closed(data_dir: &Path, cause: &str) {
+    let mut last = LastExit::now(Exit::StorageNotClosed);
+    last.cause = Some(cause.to_string());
+    record(data_dir, last);
+}
+
 /// Write the marker atomically: a temporary file renamed over the marker, so a
 /// crash mid-write leaves the whole marker or none, where it used to leave an
 /// unreadable one. The file and the directory are synced where that works, and
@@ -600,6 +619,22 @@ pub fn announce(data_dir: &Path, previous: &PreviousRun) {
                 announce_earlier(earlier);
             }
         }
+        // Not a clean end, though the process chose it: the store is repaired
+        // on this open, and this line says why it needs to be.
+        PreviousRun::Ended(last) if last.exit == Exit::StorageNotClosed => {
+            warn!(
+                exit = last.exit.name(),
+                cause = last.cause.as_deref().unwrap_or("unknown"),
+                previous_pid = last.pid,
+                previous_version = %last.version,
+                previous_commit = %last.commit,
+                ended_at_ms = last.at_ms,
+                "the previous shutdown could not close its storage; repairing the database"
+            );
+            if let Some(earlier) = &last.previous {
+                announce_earlier(earlier);
+            }
+        }
         // An error is not a clean end, and a start that failed before it
         // served is not a run at all: said as such, with the error.
         PreviousRun::Ended(last) if last.exit == Exit::Error => {
@@ -709,6 +744,7 @@ mod tests {
                     as &dyn Fn(&Path),
             ),
             (Exit::StorageFailed, &|d: &Path| record_storage_failure(d, "sync_data: EIO")),
+            (Exit::StorageNotClosed, &|d: &Path| record_storage_not_closed(d, "held")),
             (Exit::Error, &|d: &Path| record_error(d, "binding 127.0.0.1:1")),
         ] {
             let (dir, db) = dir_with_database();

@@ -89,43 +89,188 @@ fn remind_to_remove_previous_secret(ttl_secs: u64) {
 /// "now". See ADR-049.
 const CERT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Start the node, serve until told to stop, and say how it ended.
+/// Start the node and serve until told to stop; `main` then ends the run
+/// with [`conclude`].
 ///
-/// Both ways out are logged and both leave the exit marker `lifecycle`
-/// reads on the next start (ADR-147): the marker's absence is what tells
-/// that start the process was ended by something else. The error path logs
-/// at `INFO` with the error's text — `main` prints it to stderr as well, so
-/// the level is for naming the exit in the log, not for paging; the exit
-/// status already says it failed.
-pub async fn run(config: Config) -> Result<()> {
+/// The run's end is not recorded here. The exit marker says how a run ended
+/// (ADR-147), and `exit = "shutdown"` means redb closed cleanly, which only
+/// `main` can prove: the close must run on its own thread, after the runtime
+/// has shut down, when nothing else holds the engine.
+pub async fn run(config: Config) -> RunEnd {
     let data_dir = config.storage.data_dir.clone();
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
-    // Held until the last marker below is written. A directory another kimmyd
+    let mut end = RunEnd {
+        outcome: Ok(()),
+        engine: None,
+        held: None,
+        data_dir: data_dir.clone(),
+        stop_by: None,
+        writes_open: false,
+        test_stop: None,
+    };
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        end.outcome = Err(anyhow::Error::new(e)
+            .context(format!("creating data directory {}", data_dir.display())));
+        return end;
+    }
+    // Held until the last marker is written. A directory another kimmyd
     // holds is left exactly as it is: no marker is read, set aside or written.
-    let _held = match lifecycle::hold(&data_dir) {
+    end.held = match lifecycle::hold(&data_dir) {
         Ok(held) => held,
         Err(e) => {
             info!(error = %e, "exiting on an error");
-            return Err(e.into());
+            end.outcome = Err(e.into());
+            return end;
         }
     };
-    finish(&data_dir, start_and_serve(config).await, WRITES_CLOSE_CAP)
+    match start_and_serve(config).await {
+        Ok(served) => {
+            end.stop_by = served.stop_by.get().copied();
+            end.test_stop = served.test_stop;
+            // Closed to writes whether serving ended at the signal or on an
+            // error: either way the engine is closed next, and a commit must
+            // not land after the marker.
+            // Kept apart from the outcome, so a serving error cannot hide it.
+            let closed = close_for_exit(&served.engine, WRITES_CLOSE_CAP);
+            end.writes_open = closed.is_err();
+            end.outcome = served.outcome.and(closed);
+            end.engine = Some(served.engine);
+        }
+        Err(e) => end.outcome = Err(e),
+    }
+    end
 }
 
-/// The end of a run: close the engine to writes, then record how the run
-/// ended (ADR-192), in that order and in one place, so no path can write the
-/// marker first.
-///
-/// The drain ending does not end its requests — a connection outlives the
-/// server that accepted it, and an MCP tool runs in a task of its own — so
-/// without the close a handler could commit after the marker says the run
-/// ended cleanly. A write still open at `cap` means no clean marker.
-fn finish(data_dir: &std::path::Path, served: Result<Arc<Engine>>, cap: Duration) -> Result<()> {
-    let outcome = served.and_then(|engine| close_for_exit(&engine, cap));
-    record_outcome(data_dir, &outcome);
-    outcome
+/// A run that has returned from serving, for [`conclude`] to end.
+pub struct RunEnd {
+    /// `Ok` for a stop at the signal; otherwise what the run ended on.
+    outcome: Result<()>,
+    /// The engine, closed to writes, when the run got as far as serving.
+    /// `None` for a start that failed, whose engine, if it opened one, was
+    /// dropped on the way out, as before.
+    engine: Option<Arc<Engine>>,
+    /// The data directory's hold, released after the last marker.
+    held: Option<std::fs::File>,
+    data_dir: std::path::PathBuf,
+    /// When the stop's time runs out: [`STOP_BUDGET`] after the signal, or
+    /// after serving failed.
+    stop_by: Option<std::time::Instant>,
+    /// A write was still in progress at [`WRITES_CLOSE_CAP`], whatever the
+    /// run otherwise ended on: the engine is not closed.
+    writes_open: bool,
+    test_stop: Option<TestStop>,
 }
+
+/// From the signal, how long the stop has before the runtime is shut down
+/// without waiting further for a thread still running: the drain
+/// ([`DRAIN_TIMEOUT`]), closing the engine to writes ([`WRITES_CLOSE_CAP`]),
+/// and two seconds for everything else to end.
+const STOP_BUDGET: Duration = Duration::from_secs(22);
+
+/// The least time the runtime's shutdown waits, however much of the budget
+/// the drain and the close to writes used.
+pub const RUNTIME_SHUTDOWN_FLOOR: Duration = Duration::from_secs(3);
+
+/// How long the runtime's shutdown waits when a write was still in progress
+/// at the cap (ADR-192): that write's thread is blocked, and the engine will
+/// not be closed.
+const WRITES_OPEN_SHUTDOWN: Duration = Duration::from_millis(100);
+
+/// End a run: shut the runtime down within the stop's budget, close the
+/// engine on this thread, and only then record how the run ended.
+///
+/// `exit = "shutdown"` is written only when redb closed cleanly: the engine
+/// was dropped here by its last owner, which runs redb's close on this
+/// thread, and the file's header then says so ([`Engine::close`]). A thread
+/// still holding the engine at the deadline, such as a walk serving a peer,
+/// a close that failed, or a write still open at the cap means the next start
+/// repairs the store; the marker then says `storage_not_closed` and why, and
+/// the error returned is a [`StorageNotClosed`], which `main` exits 75 on.
+pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
+    let RunEnd { outcome, engine, held, data_dir, stop_by, writes_open, test_stop } = end;
+    let now = std::time::Instant::now();
+    let deadline = if writes_open {
+        now + WRITES_OPEN_SHUTDOWN
+    } else {
+        stop_by.unwrap_or(now).max(now + RUNTIME_SHUTDOWN_FLOOR)
+    };
+    runtime.shutdown_timeout(deadline - now);
+
+    let closed = match engine {
+        _ if writes_open => Err(format!(
+            "a write was still in progress {} s after the drain, or the last flush of commits \
+             waiting to be made durable failed",
+            WRITES_CLOSE_CAP.as_secs()
+        )),
+        None => Ok(()),
+        Some(engine) => close_engine(engine, deadline, stop_by, test_stop),
+    };
+    let result = record_outcome(&data_dir, outcome, closed);
+    drop(held);
+    result
+}
+
+/// Take the engine from its last owner and close it on this thread
+/// ([`Engine::close`]); `Err` with the reason it could not be.
+///
+/// The runtime is down, so no task holds the engine, but a thread the
+/// runtime stopped waiting for may, and so may one outside it for a moment
+/// (the metrics exporter reads through a weak reference it upgrades). This
+/// waits for the last of them until `deadline`, or a moment if that has
+/// passed. `Arc::try_unwrap` succeeds only when this is the one strong
+/// reference, atomically, so no other thread can be running the close, and
+/// a `Weak` cannot bring one back once it has gone; on failure it hands the
+/// reference back, so the next try keeps it. `Arc::into_inner` would give it
+/// up, and the close would then run on whichever thread let go last, where
+/// nothing could wait for it.
+fn close_engine(
+    engine: Arc<Engine>,
+    deadline: std::time::Instant,
+    stop_by: Option<std::time::Instant>,
+    test_stop: Option<TestStop>,
+) -> std::result::Result<(), String> {
+    let until = deadline.max(std::time::Instant::now() + LAST_HOLDER_WAIT);
+    let mut shared = engine;
+    let engine = loop {
+        match Arc::try_unwrap(shared) {
+            Ok(engine) => break engine,
+            Err(still) if std::time::Instant::now() < until => {
+                shared = still;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let since = stop_by.map_or(String::new(), |by| {
+                    let began = by.checked_sub(STOP_BUDGET).unwrap_or(by);
+                    format!(" {} s after the stop began", began.elapsed().as_secs())
+                });
+                return Err(format!("the storage engine was still held by a thread{since}"));
+            }
+        }
+    };
+    if let Some(TestStop::SlowClose(delay)) = test_stop {
+        std::thread::sleep(delay);
+    }
+    let started = std::time::Instant::now();
+    let closed = engine.close();
+    info!(elapsed_ms = started.elapsed().as_millis() as u64, "engine closed");
+    closed.map_err(|e| e.to_string())
+}
+
+/// How long the close waits for the engine's other holders when the stop's
+/// deadline has already passed.
+const LAST_HOLDER_WAIT: Duration = Duration::from_millis(200);
+
+/// The run's storage was not closed cleanly, so the next start repairs it.
+/// `main` exits [`kimmy_task::EXIT_UNCLEAN_SHUTDOWN`] on it.
+#[derive(Debug)]
+pub struct StorageNotClosed(pub String);
+
+impl std::fmt::Display for StorageNotClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exiting without closing the storage engine: {}", self.0)
+    }
+}
+
+impl std::error::Error for StorageNotClosed {}
 
 /// How long the embedding worker waits before retrying a storage error, and the
 /// ceiling that wait doubles up to (ADR-184).
@@ -145,7 +290,77 @@ const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
 const DROP_PURGER_RETRY_FIRST: Duration = Duration::from_secs(1);
 const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
 
-async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
+/// A run that served, and how serving ended.
+struct Served {
+    engine: Arc<Engine>,
+    /// `Ok` for a stop at the signal; the error serving ended on otherwise.
+    outcome: Result<()>,
+    /// Set when the stop began: see [`Stop::begin`].
+    stop_by: Arc<std::sync::OnceLock<std::time::Instant>>,
+    test_stop: Option<TestStop>,
+}
+
+/// The stop, announced once, at the signal or when serving fails.
+#[derive(Clone)]
+struct Stop {
+    shutdown: kimmy_task::Shutdown,
+    engine: Arc<Engine>,
+    by: Arc<std::sync::OnceLock<std::time::Instant>>,
+}
+
+impl Stop {
+    /// Announce the stop: to every supervised task, so one ending from here on
+    /// is a stop rather than a death, and to the engine's walks. The stop's
+    /// deadline is taken from the first call, so a second changes nothing.
+    fn begin(&self) {
+        let _ = self.by.set(std::time::Instant::now() + STOP_BUDGET);
+        self.engine.stop_walks();
+        self.shutdown.begin();
+    }
+}
+
+/// `KIMMY_TEST_STOP`: what a test asks of this run's stop.
+///
+/// **A test-only switch that is present in the shipped binary**, as
+/// `KIMMY_TEST_KILL_TASK` is and for the same reason: the tests drive the
+/// binary that ships and read its exit status and marker. Announced at `WARN`
+/// on every start where it is set, and it acts only once the node is serving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestStop {
+    /// `hold_engine`: a thread holds the engine, as a walk serving a peer
+    /// does, and never lets go, so the stop cannot close the store.
+    HoldEngine,
+    /// `panic_in_write`: a task panics inside a write transaction, which
+    /// leaves redb needing repair however cleanly the stop goes.
+    PanicInWrite,
+    /// `serve_error`: serving fails, with no signal.
+    ServeError,
+    /// `panic_in_run`: `node::run` panics once the node is serving, with a
+    /// thread holding the engine as `hold_engine` does, so that only a
+    /// bounded runtime shutdown lets the process end. The panic comes only
+    /// after that thread is running with the engine.
+    PanicInRun,
+    /// `slow_close:<ms>`: the close waits this long before dropping the
+    /// engine, so a test can see what waits for it.
+    SlowClose(Duration),
+}
+
+impl TestStop {
+    fn parse(value: &str) -> Option<Self> {
+        match value.split_once(':') {
+            None if value == "hold_engine" => Some(Self::HoldEngine),
+            None if value == "panic_in_write" => Some(Self::PanicInWrite),
+            None if value == "serve_error" => Some(Self::ServeError),
+            None if value == "panic_in_run" => Some(Self::PanicInRun),
+            Some(("slow_close", ms)) => {
+                ms.parse().ok().map(|ms| Self::SlowClose(Duration::from_millis(ms)))
+            }
+            _ => None,
+        }
+    }
+}
+
+async fn start_and_serve(config: Config) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
     })?;
@@ -200,6 +415,7 @@ async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
     // Announced at the signal, before anything drains, so that a supervised
     // task ending during the drain is a stop rather than a death.
     let shutdown = kimmy_task::Shutdown::new();
+    let stop = Stop { shutdown: shutdown.clone(), engine: Arc::clone(&engine), by: Arc::default() };
 
     // A test switch that stops a background task on purpose. It is in the
     // shipped binary so that the tests drive the binary that ships, so every
@@ -215,6 +431,17 @@ async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
              unset KIMMY_TEST_FAIL_STORAGE outside a test"
         );
     }
+    let test_stop = std::env::var("KIMMY_TEST_STOP").ok().map(|value| {
+        let parsed = TestStop::parse(&value);
+        warn!(
+            KIMMY_TEST_STOP = %value,
+            recognised = parsed.is_some(),
+            "a test switch is set that acts on this node's stop on purpose; unset \
+             KIMMY_TEST_STOP outside a test"
+        );
+        parsed
+    });
+    let test_stop = test_stop.flatten();
     if let Some(what) = kimmy_task::test_kill_requested() {
         // The line says what is set, and the value says what it will do -- which
         // may be nothing. The prefix used to promise "will stop a background
@@ -695,6 +922,32 @@ async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
     // act: armed later than startup so it can never turn a start into a crash
     // loop, and can never be mistaken for a startup failure.
     kimmy_task::arm_test_kills();
+    match test_stop {
+        // A test's stand-in for a walk serving a peer, which holds the engine
+        // on a blocking thread for as long as it runs. The run goes on only
+        // once that thread is running with the engine: a task not yet polled
+        // would be dropped by the runtime's shutdown, and its reference with
+        // it, and `panic_in_run` would then test a store that closed.
+        Some(TestStop::HoldEngine | TestStop::PanicInRun) => {
+            let engine = Arc::clone(&engine);
+            let (holding, held) = tokio::sync::oneshot::channel();
+            // UNSUPERVISED: a test switch whose task is meant never to end.
+            tokio::spawn(async move {
+                kimmy_storage::blocking(move || {
+                    let _held = engine;
+                    let _ = holding.send(());
+                    std::thread::sleep(Duration::from_secs(24 * 60 * 60));
+                });
+            });
+            let _ = held.await;
+        }
+        Some(TestStop::PanicInWrite) => {
+            let engine = Arc::clone(&engine);
+            // UNSUPERVISED: a test switch whose panic is the point of it.
+            tokio::spawn(async move { kimmy_storage::blocking(|| engine.panic_inside_a_write()) });
+        }
+        _ => {}
+    }
     if let Some(call) = &fail_storage
         && !engine.arm_test_storage_failure(call)
     {
@@ -711,14 +964,24 @@ async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
         let engine = Arc::clone(&engine);
         move || engine.set_stopping()
     };
-    let served =
-        serve(listener, app, tls, announced(shutdown.clone()), DRAIN_TIMEOUT, stopping).await;
-    // Before the aborts below, and before returning an error: from here on a
-    // supervised task ending is a stop, not a death. `serve` has already
-    // announced it on the signal path; this covers the path where serving
-    // itself failed, where no signal ever arrived.
-    shutdown.begin();
-    served.context("serving")?;
+    let serving = serve(listener, app, tls, announced(stop.clone()), DRAIN_TIMEOUT, stopping);
+    let served = match test_stop {
+        Some(TestStop::PanicInRun) => {
+            panic!("node::run panicked on purpose (KIMMY_TEST_STOP=panic_in_run)")
+        }
+        Some(TestStop::ServeError) => {
+            drop(serving);
+            Err(anyhow::anyhow!("serving failed on purpose (KIMMY_TEST_STOP=serve_error)"))
+        }
+        _ => serving.await,
+    };
+    // Before the aborts below: from here on a supervised task ending is a
+    // stop, not a death. `serve` has already announced it on the signal path;
+    // this covers the path where serving itself failed, where no signal ever
+    // arrived. The aborts run on both paths, and the engine is closed after
+    // either.
+    stop.begin();
+    let served = served.context("serving");
 
     // Nothing to drain: it holds no state beyond the mtimes it last saw, and
     // the certificate in use is already in the acceptor.
@@ -772,9 +1035,9 @@ async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
     // an aborted delivery is redelivered rather than lost.
     webhook_handle.abort();
 
-    // `run` closes the engine to writes and then writes the exit marker, in
-    // that order, in `finish`.
-    Ok(engine)
+    // `run` closes the engine to writes, and `conclude` closes it and then
+    // writes the exit marker, in that order.
+    Ok(Served { engine, outcome: served, stop_by: Arc::clone(&stop.by), test_stop })
 }
 
 /// Close the engine to writes, waiting up to `cap` for one in progress; an
@@ -792,8 +1055,8 @@ fn close_for_exit(engine: &Engine, cap: Duration) -> Result<()> {
 const WRITES_CLOSE_CAP: Duration = Duration::from_secs(10);
 
 /// A write transaction was still in progress `WRITES_CLOSE_CAP` after the
-/// drain ended. The run does not record a clean exit: the next start reads
-/// it as one that did not shut down cleanly, which it may not have.
+/// drain ended. The engine is not closed, and the run records
+/// `storage_not_closed`: the next start repairs the store.
 #[derive(Debug)]
 pub struct WritesStillOpen;
 
@@ -802,8 +1065,8 @@ impl std::fmt::Display for WritesStillOpen {
         write!(
             f,
             "a write was still in progress {} s after the shutdown drain ended, or the last \
-             flush of commits waiting to be made durable failed; exiting without recording a \
-             clean exit",
+             flush of commits waiting to be made durable failed; exiting without closing the \
+             storage engine",
             WRITES_CLOSE_CAP.as_secs()
         )
     }
@@ -811,27 +1074,49 @@ impl std::fmt::Display for WritesStillOpen {
 
 impl std::error::Error for WritesStillOpen {}
 
-/// Record how this run ended, from what serving it returned (ADR-147).
+/// Record how this run ended (ADR-147), once `closed` says whether the
+/// engine was closed cleanly, and return what `main` exits on.
 ///
-/// A shutdown whose writes did not close in time records nothing: the marker's
-/// absence is what tells the next start the run did not end cleanly, and a
-/// write may still have been committing as the process went.
-fn record_outcome(data_dir: &std::path::Path, outcome: &Result<()>) {
-    match outcome {
-        Ok(()) => {
+/// `exit = "shutdown"` needs both a stop at the signal and a clean close. A
+/// close that did not happen, whatever the run ended on, is recorded as
+/// `storage_not_closed` with its cause: the next start repairs the store, and
+/// says why.
+fn record_outcome(
+    data_dir: &std::path::Path,
+    outcome: Result<()>,
+    closed: std::result::Result<(), String>,
+) -> Result<()> {
+    match (outcome, closed) {
+        (outcome, Err(cause)) => {
+            if let Err(e) = &outcome
+                && e.downcast_ref::<WritesStillOpen>().is_none()
+            {
+                info!(error = format!("{e:#}"), "exiting on an error");
+            }
+            lifecycle::record_storage_not_closed(data_dir, &cause);
+            error!(
+                error = %cause,
+                "exiting without closing the storage engine; the next start repairs the database"
+            );
+            Err(StorageNotClosed(cause).into())
+        }
+        (Ok(()), Ok(())) => {
             lifecycle::record_exit(data_dir, lifecycle::Exit::Shutdown);
             info!("shutdown complete");
+            Ok(())
         }
-        Err(e) if e.downcast_ref::<WritesStillOpen>().is_some() => {
-            error!(error = format!("{e:#}"), "exiting without a clean-exit marker");
-        }
-        Err(e) if lifecycle::store_in_use(e) => {
+        // Another kimmyd holds the directory: nothing in it is ours to
+        // write, and `run` has already logged it.
+        (Err(e), Ok(())) if e.downcast_ref::<lifecycle::InUse>().is_some() => Err(e),
+        (Err(e), Ok(())) if lifecycle::store_in_use(&e) => {
             lifecycle::leave(data_dir);
             info!(error = format!("{e:#}"), "exiting on an error");
+            Err(e)
         }
-        Err(e) => {
+        (Err(e), Ok(())) => {
             lifecycle::record_error(data_dir, &format!("{e:#}"));
             info!(error = format!("{e:#}"), "exiting on an error");
+            Err(e)
         }
     }
 }
@@ -1866,9 +2151,9 @@ fn bootstrap_users(engine: &Engine, config: &Config) -> Result<()> {
 /// supervised task reads it to tell a stop from a death. Putting it here rather
 /// than after `serve` returns makes the ordering structural: there is no path
 /// from the signal to a drained server that skips it.
-async fn announced(shutdown: kimmy_task::Shutdown) {
+async fn announced(stop: Stop) {
     shutdown_signal().await;
-    shutdown.begin();
+    stop.begin();
 }
 
 /// Resolve on SIGINT or SIGTERM.
@@ -2287,10 +2572,42 @@ mod tests {
         assert_ne!(stamps(&cert, &key).await, present);
     }
 
+    /// A run's end as `run` hands it to `conclude`: the engine closed to
+    /// writes within `cap`, the stop begun now.
+    fn ended(dir: &std::path::Path, engine: Arc<Engine>, cap: Duration) -> RunEnd {
+        let outcome = close_for_exit(&engine, cap);
+        RunEnd {
+            writes_open: outcome.is_err(),
+            outcome,
+            engine: Some(engine),
+            held: None,
+            data_dir: dir.to_path_buf(),
+            stop_by: Some(std::time::Instant::now()),
+            test_stop: None,
+        }
+    }
+
+    fn conclude_now(end: RunEnd) -> Result<()> {
+        conclude(end, tokio::runtime::Builder::new_current_thread().build().unwrap())
+    }
+
+    /// The marker this run left, as the next start reads it.
+    fn marker(dir: &std::path::Path) -> lifecycle::LastExit {
+        match lifecycle::previous_run(dir, &dir.join(DATABASE_FILE)) {
+            lifecycle::PreviousRun::Ended(last) => last,
+            other => panic!("no readable marker: {other:?}"),
+        }
+    }
+
+    fn not_closed(outcome: &Result<()>) -> bool {
+        outcome.as_ref().is_err_and(|e| e.downcast_ref::<StorageNotClosed>().is_some())
+    }
+
     /// A write in progress at the end of the drain delays the clean-exit
     /// marker until it ends, and one that outlasts the cap means no clean
-    /// marker at all (ADR-192): the marker must never be written while a
-    /// commit can still land.
+    /// marker (ADR-192): the marker must never say `shutdown` while a commit
+    /// can still land. Past the cap it says `storage_not_closed`, and `main`
+    /// exits 75.
     #[test]
     fn the_clean_exit_marker_waits_for_the_write_in_progress_and_is_withheld_past_the_cap() {
         let hold = |engine: &Arc<Engine>, for_: Duration| {
@@ -2305,28 +2622,147 @@ mod tests {
             is_held.recv().unwrap();
         };
 
-        // Past the cap: an error, and no marker.
+        // Past the cap: storage_not_closed, promptly.
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
-        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        hold(&engine, Duration::from_secs(2));
-        let outcome = finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_millis(200));
-        assert!(outcome.is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some()));
-        assert!(!marker.exists(), "a clean-exit marker was written while a write could land");
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        hold(&engine, Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let outcome = conclude_now(ended(dir.path(), engine, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("a write was still in progress"));
 
-        // Inside the cap: the marker waits for the write, and is written.
+        // Inside the cap: the marker waits for the write, and the close.
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
-        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let path = dir.path().join(DATABASE_FILE);
+        let engine = Arc::new(Engine::open(&path).unwrap());
         hold(&engine, Duration::from_millis(300));
         let started = std::time::Instant::now();
-        finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_secs(5)).unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(250), "the marker did not wait");
-        assert!(marker.exists(), "a clean shutdown recorded no marker");
-        assert!(
-            engine.create_collection("db", "c").is_err(),
-            "the engine still took a write after the marker"
+        let end = ended(dir.path(), engine, Duration::from_secs(5));
+        assert!(started.elapsed() >= Duration::from_millis(250), "the close did not wait");
+        conclude_now(end).unwrap();
+        assert_eq!(marker(dir.path()).exit, lifecycle::Exit::Shutdown);
+        assert!(kimmy_storage::format::closed_cleanly(&path).unwrap());
+    }
+
+    /// `exit = "shutdown"` is written only after redb closed: the engine is
+    /// dropped by `conclude`, and the header then says the store is clean. A
+    /// holder that lets go inside the deadline is waited for.
+    #[test]
+    fn a_clean_stop_closes_the_store_before_its_marker_and_waits_for_a_late_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        engine.create_collection("db", "c").unwrap();
+        let late = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(late);
+        });
+        conclude_now(ended(dir.path(), engine, Duration::from_secs(1))).unwrap();
+        assert!(kimmy_storage::format::closed_cleanly(&path).unwrap());
+        assert_eq!(marker(dir.path()).exit, lifecycle::Exit::Shutdown);
+    }
+
+    /// A thread still holding the engine when the stop's time runs out, as a
+    /// walk serving a peer did (the 0.40.0 finding): no `shutdown` marker, and
+    /// the stop is still bounded.
+    #[test]
+    fn a_holder_past_the_deadline_is_storage_not_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let stuck = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(30));
+            drop(stuck);
+        });
+        let started = std::time::Instant::now();
+        let outcome = conclude_now(ended(dir.path(), engine, Duration::from_secs(1)));
+        let took = started.elapsed();
+        assert!(took < RUNTIME_SHUTDOWN_FLOOR + Duration::from_secs(3), "{took:?}");
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("still held by a thread"));
+    }
+
+    /// redb latches a need for repair when a write transaction is dropped
+    /// while its thread panics, and a clean close then leaves the header
+    /// dirty with no I/O error anywhere: the header is what is read, so the
+    /// marker says `storage_not_closed`, never `shutdown`.
+    #[test]
+    fn a_panic_inside_a_write_is_storage_not_closed_however_clean_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        let panicking = Arc::clone(&engine);
+        assert!(std::thread::spawn(move || panicking.panic_inside_a_write()).join().is_err());
+        let outcome = conclude_now(ended(dir.path(), engine, Duration::from_secs(1)));
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("needing recovery"));
+        assert!(!kimmy_storage::format::closed_cleanly(&path).unwrap());
+    }
+
+    /// Serving that fails ends as an error, not a shutdown, and the engine
+    /// is still closed first: the `error` marker comes after a clean close.
+    #[test]
+    fn serving_that_fails_closes_the_store_and_records_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        let mut end = ended(dir.path(), engine, Duration::from_secs(1));
+        end.outcome = Err(anyhow::anyhow!("serving failed"));
+        let outcome = conclude_now(end);
+        assert!(outcome.is_err() && !not_closed(&outcome), "{outcome:?}");
+        assert!(kimmy_storage::format::closed_cleanly(&path).unwrap());
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::Error);
+        assert_eq!(last.cause.as_deref(), Some("serving failed"));
+    }
+
+    /// A write still open at the cap is not hidden by serving that failed
+    /// too: the cause names the write, and the runtime is not waited on.
+    #[test]
+    fn serving_that_fails_does_not_hide_a_write_left_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let writer = Arc::clone(&engine);
+        let (held, is_held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = writer.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+        let mut end = ended(dir.path(), engine, Duration::from_millis(200));
+        assert!(end.writes_open);
+        end.outcome = Err(anyhow::anyhow!("serving failed"));
+        let started = std::time::Instant::now();
+        let outcome = conclude_now(end);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("a write was still in progress"));
+    }
+
+    #[test]
+    fn the_stop_test_switch_parses_what_it_documents() {
+        assert_eq!(TestStop::parse("hold_engine"), Some(TestStop::HoldEngine));
+        assert_eq!(TestStop::parse("panic_in_write"), Some(TestStop::PanicInWrite));
+        assert_eq!(TestStop::parse("serve_error"), Some(TestStop::ServeError));
+        assert_eq!(TestStop::parse("panic_in_run"), Some(TestStop::PanicInRun));
+        assert_eq!(
+            TestStop::parse("slow_close:1500"),
+            Some(TestStop::SlowClose(Duration::from_millis(1500)))
         );
+        assert_eq!(TestStop::parse("slow_close:soon"), None);
+        assert_eq!(TestStop::parse("hold_engine:1"), None);
     }
 
     /// The plain listener's drain is bounded, and the multi-transaction stop

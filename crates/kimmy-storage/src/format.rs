@@ -69,6 +69,10 @@ const SLOT_OFFSETS: [usize; 2] = [64, 192];
 const GOD_BYTE: usize = MAGIC.len();
 const PRIMARY_BIT: u8 = 1;
 const TWO_PHASE_COMMIT: u8 = 4;
+/// Set by redb when it opens a store for writing, and cleared only by a
+/// close that recorded the allocator state (redb 4.3,
+/// `page_manager.rs:begin_writable`, `flush_shutdown_header`).
+const RECOVERY_REQUIRED: u8 = 2;
 const PAGE_SIZE_OFFSET: usize = 12;
 const REGION_HEADER_PAGES_OFFSET: usize = 16;
 const REGION_MAX_DATA_PAGES_OFFSET: usize = 20;
@@ -207,6 +211,18 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
         sidecar_modified,
         build: build.clone(),
     })
+}
+
+/// Whether the store at `database`, closed, was closed cleanly: its header's
+/// recovery-required flag is clear, so the next open does not repair it.
+/// Read from the file, so only meaningful once no handle has it open.
+pub fn closed_cleanly(database: &Path) -> std::io::Result<bool> {
+    let mut header = [0u8; HEADER_LEN];
+    std::fs::File::open(database)?.read_exact(&mut header)?;
+    if header[..MAGIC.len()] != MAGIC {
+        return Err(std::io::Error::other("not a redb file: its magic number is wrong"));
+    }
+    Ok(header[GOD_BYTE] & RECOVERY_REQUIRED == 0)
 }
 
 fn read_header(file: &mut std::fs::File) -> Result<Vec<u8>> {

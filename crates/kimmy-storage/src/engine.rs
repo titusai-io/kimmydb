@@ -152,6 +152,9 @@ pub struct Engine {
     /// its shutdown: every write transaction, first or later, is refused.
     /// See [`Engine::close_writes`].
     writes_closed: std::sync::atomic::AtomicBool,
+    /// Set at the node's stop signal, for reads that walk: see
+    /// [`Engine::stop_walks`].
+    walks_stopping: std::sync::atomic::AtomicBool,
     /// Run once, the next time a request that has committed begins another
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -240,6 +243,41 @@ pub const WRITER_HOLD_WARN: std::time::Duration = std::time::Duration::from_secs
 /// outage — the retention passes ADR-151 measured ran ten to twelve.
 pub const WRITER_HOLD_BUCKETS_US: [u64; 7] =
     [1_000, 10_000, 100_000, 1_000_000, 5_000_000, 30_000_000, 300_000_000];
+
+/// Why [`Engine::close`] could not prove the store closed cleanly. Each
+/// means the next open repairs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotClosed {
+    /// A backend call failed, possibly the close's own (ADR-188).
+    StorageFailed(crate::health::StorageFailure),
+    /// The close left the header's recovery-required flag set: redb had
+    /// latched a need for repair, such as a write transaction dropped while
+    /// its thread panicked.
+    RecoveryRequired,
+    /// The header could not be read back after the close.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for NotClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotClosed::StorageFailed(failure) => write!(
+                f,
+                "the storage close failed: the backend's {} call failed: {}",
+                failure.call, failure.error
+            ),
+            NotClosed::RecoveryRequired => f.write_str(
+                "the storage close left the database marked as needing recovery, so a write \
+                 transaction was abandoned mid-way, most likely by a panic",
+            ),
+            NotClosed::Unreadable(error) => {
+                write!(f, "the database header could not be read back after the close: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotClosed {}
 
 /// What kind of work a transaction holding the single writer is doing
 /// (ADR-159).
@@ -1257,6 +1295,7 @@ impl Engine {
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             stopping: std::sync::atomic::AtomicBool::new(false),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
+            walks_stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1501,6 +1540,58 @@ impl Engine {
     /// is let finish. Irreversible for this engine's life.
     pub fn set_stopping(&self) {
         self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The node's stop signal has arrived: a walk of the store that serves
+    /// no request should end rather than hold the engine open past the
+    /// stop. Called beside every announcement of the stop. Irreversible for
+    /// this engine's life. Nothing reads it yet: the walks learn to stop in
+    /// a change of their own.
+    pub fn stop_walks(&self) {
+        self.walks_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `KIMMY_TEST_STOP=panic_in_write`: open a write transaction and panic
+    /// inside it. redb drops its transaction while unwinding and latches a
+    /// need for repair, which a clean close then refuses to record. In the
+    /// shipped binary, like the other test switches, so that a real node's
+    /// stop can be tested against it.
+    #[doc(hidden)]
+    pub fn panic_inside_a_write(&self) -> Result<()> {
+        let _txn = self.begin_write(WriterHolder::Write)?;
+        panic!("a panic inside a write transaction, on purpose (KIMMY_TEST_STOP=panic_in_write)");
+    }
+
+    /// Whether [`Self::stop_walks`] has been called.
+    pub fn walks_stopping(&self) -> bool {
+        self.walks_stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Close the store, and prove it closed cleanly: with this engine the
+    /// last owner of redb's `Database`, dropping it runs redb's close on this
+    /// thread, which records the allocator state and clears the header's
+    /// recovery-required flag. Then this reads the flag back from the file,
+    /// and the storage's health.
+    ///
+    /// An `Err` means the next open repairs the store: redb latched a need
+    /// for repair (a write transaction dropped mid-panic, or an abort that
+    /// failed), or a backend call failed, the close's own included.
+    ///
+    /// Take the engine out of its last `Arc` with `Arc::into_inner` to call
+    /// this: a close that another thread's drop may be running is one
+    /// nothing can wait for.
+    pub fn close(self) -> std::result::Result<(), NotClosed> {
+        let health = std::sync::Arc::clone(&self.health);
+        let path = self.path.clone();
+        drop(self);
+        if let Some(failure) = health.failed() {
+            return Err(NotClosed::StorageFailed(failure.clone()));
+        }
+        match crate::format::closed_cleanly(&path) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(NotClosed::RecoveryRequired),
+            Err(e) => Err(NotClosed::Unreadable(e.to_string())),
+        }
     }
 
     /// Run `hook` once, on the request's own thread, the next time a request
@@ -4568,6 +4659,26 @@ mod tests {
         fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), std::io::Error> {
             self.inner.write(offset, data)
         }
+    }
+
+    /// A close proves itself: clean after an ordinary run, and refused,
+    /// naming the call, when the close's own fsync fails.
+    #[test]
+    fn a_close_reports_whether_the_store_was_closed_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("app", "c").unwrap();
+        engine.close().unwrap();
+        assert!(crate::format::closed_cleanly(&path).unwrap());
+
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("app", "d").unwrap();
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let refused = engine.close().unwrap_err();
+        assert!(matches!(refused, NotClosed::StorageFailed(_)), "{refused}");
+        assert!(refused.to_string().contains("sync_data"), "{refused}");
+        assert!(!crate::format::closed_cleanly(&path).unwrap());
     }
 
     /// The arrival-index staleness check reads two table headers, not two
