@@ -327,10 +327,47 @@ The second paragraph matters as much as the first. Without it a model reads an
 authorization error as a malfunction and retries; with it, the refusal is a fact
 about its own permissions, and it moves on.
 
+### Errors
+
 Errors are returned with their message intact for anything that is the caller's
 fault — a rejected filter names the operator it did not recognize — so an agent
 can correct itself instead of retrying blindly. Storage faults return a generic
 message, as they do over REST.
+
+A failed call is a JSON-RPC error: `invalid_params` for the caller's fault,
+`internal_error` for the server's. Its `data` is the REST error envelope
+([ADR-057](decisions.md)), so an MCP client reads the same code and retry class
+a REST client does:
+
+```json
+{"code": -32602, "message": "unsupported operator \"$nope\"",
+ "data": {"error": "bad_request", "message": "unsupported operator \"$nope\"", "retry": "no"}}
+```
+
+`retry` is `no`, `wait`, `elsewhere` or `verify`, as in the
+[HTTP API](http-api.md), and a class a client does not know reads as `no`.
+`retry_after_secs` is present where REST would send a `Retry-After` header.
+
+**A write whose outcome is unknown is a tool result, not an error.** Its retry
+class is `verify`: the write may have been applied, and if it was, it
+replicates. Answered as a protocol error, it would reach the client, which
+often stops there; the MCP specification reports a tool's execution errors in
+its result so that the model sees them and can act. So it comes back with
+`isError: true`, text telling the model to read the target back before writing
+again, and the envelope as `structuredContent`:
+
+```json
+{"isError": true,
+ "content": [{"type": "text", "text": "the write reached the storage engine's durability step … (outcome_unknown, retry: verify). Do not repeat this write until you have read the target back and found that it was not applied."}],
+ "structuredContent": {"error": "outcome_unknown", "message": "…", "retry": "verify"}}
+```
+
+More often the node stops before it can answer (a storage I/O error stops the
+process, [ADR-188](decisions.md)), and the MCP client sees a transport error
+after it sent the call. **An agent must treat a write whose call failed in
+transport the same way**: its outcome is unknown, and it reads the target back
+before writing again. See [retrying after an unknown
+outcome](clients.md#retrying-after-an-unknown-outcome).
 
 An argument a tool does not define is refused the same way, by name: `limt`
 where `limit` was meant is an error result that names the field and lists the

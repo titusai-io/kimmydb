@@ -10,6 +10,7 @@
 //! tool is for and which other tool to reach for instead, not just what its
 //! arguments are named.
 
+use kimmy_api::error::Retry;
 use kimmy_api::{ApiError, SharedState, exec, schema, vectors};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -811,11 +812,51 @@ fn omit_internal(mut value: Value, key: &str, is_internal: fn(&str) -> bool) -> 
     value
 }
 
+/// Render a tool's outcome.
+///
+/// A failure whose retry class is `verify` is not a JSON-RPC error but a tool
+/// result with `isError` set. The write may have happened, and the one safe
+/// next step, reading it back, is the model's to take: the MCP specification
+/// reports a tool's execution errors in its result so that the model sees them
+/// and can act, where a protocol error goes to the client and often stops
+/// there. Every other failure stays a protocol error, carrying its code and
+/// class in `data`.
 pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, ErrorData> {
     match result {
         Ok(value) => Ok(ok(value)),
+        Err(e) if e.retry() == Retry::Verify => Ok(unknown(e)),
         Err(e) => Err(error(e)),
     }
+}
+
+/// A write whose outcome is not known, as a tool result the model reads.
+fn unknown(e: ApiError) -> CallToolResult {
+    let envelope = envelope(&e);
+    let text = format!(
+        "{} ({}, retry: {}). Do not repeat this write until you have read the target back \
+         and found that it was not applied.",
+        e.message,
+        e.code.as_str(),
+        e.retry().as_str(),
+    );
+    let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)]);
+    result.structured_content = Some(envelope);
+    result
+}
+
+/// The REST error envelope (ADR-057), so an MCP caller reads the same code,
+/// message and retry class a REST caller does.
+fn envelope(e: &ApiError) -> Value {
+    let mut body = serde_json::json!({
+        "error": e.code.as_str(),
+        "message": e.message,
+        "retry": e.retry().as_str(),
+    });
+    // REST sends this as a `Retry-After` header, which MCP has no place for.
+    if let Some(secs) = e.retry_after_secs {
+        body["retry_after_secs"] = secs.into();
+    }
+    body
 }
 
 pub(crate) fn ok(value: Value) -> CallToolResult {
@@ -832,10 +873,58 @@ pub(crate) fn ok(value: Value) -> CallToolResult {
 /// able to correct itself — needs to read the message, so those become
 /// `invalid_params` with the text intact. A storage fault is ours, and its text
 /// has already been reduced to something safe to return.
+///
+/// `data` carries the REST envelope — the code, the message and the retry
+/// class — because the JSON-RPC code alone cannot say whether to wait, go to
+/// another node, or stop (ADR-057).
 pub(crate) fn error(e: ApiError) -> ErrorData {
+    let data = Some(envelope(&e));
     if e.status.is_server_error() {
-        ErrorData::internal_error(e.message, None)
+        ErrorData::internal_error(e.message, data)
     } else {
-        ErrorData::invalid_params(e.message, None)
+        ErrorData::invalid_params(e.message, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_outcome_is_a_tool_result_the_model_reads() {
+        let result = render(Err(ApiError::outcome_unknown())).expect("a tool result, not an error");
+        assert_eq!(result.is_error, Some(true));
+        let envelope = result.structured_content.expect("the envelope rides in the result");
+        assert_eq!(envelope["error"], "outcome_unknown");
+        assert_eq!(envelope["retry"], "verify");
+        let text = result.content[0].as_text().expect("the result's content is text");
+        assert!(text.text.contains("read the target back"), "{}", text.text);
+    }
+
+    #[test]
+    fn every_other_failure_is_an_error_carrying_its_code_and_class() {
+        let refused = render(Err(ApiError::bad_request("no such operator $nope")))
+            .expect_err("a refusal stays a protocol error");
+        assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let data = refused.data.expect("the envelope rides in data");
+        assert_eq!(data["error"], "bad_request");
+        assert_eq!(data["retry"], "no");
+        assert_eq!(data["message"], "no such operator $nope");
+
+        let mut busy = ApiError::writer_busy(std::time::Duration::from_secs(30));
+        busy.retry_after_secs = Some(2);
+        let busy = render(Err(busy)).expect_err("a busy writer stays a protocol error");
+        assert_eq!(busy.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let data = busy.data.expect("the envelope rides in data");
+        assert_eq!(data["error"], "timeout");
+        assert_eq!(data["retry"], "wait");
+        assert_eq!(data["retry_after_secs"], 2, "Retry-After has no header to ride in here");
+    }
+
+    #[test]
+    fn a_retry_override_is_the_class_carried() {
+        let moved = ApiError::not_found("no collection here").with_retry(Retry::Elsewhere);
+        let data = render(Err(moved)).expect_err("a refusal").data.expect("data");
+        assert_eq!(data["retry"], "elsewhere");
     }
 }

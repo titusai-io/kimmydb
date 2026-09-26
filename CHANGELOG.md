@@ -96,6 +96,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **An MCP tool's error now says whether to retry.** Every error a tool
+  returned was a bare JSON-RPC error that dropped the retry class, so an agent
+  could not tell "wait and try again" from "try another node" from "stop". The
+  error's `data` now carries the REST envelope: `error` (the code), `message`
+  and `retry`, plus `retry_after_secs` where REST would send `Retry-After`. **A
+  write whose outcome is unknown is no longer a JSON-RPC error at all**: it is a
+  tool result with `isError: true`, whose text tells the model to read the
+  target back before writing again and whose `structuredContent` is the
+  envelope, so the model itself sees it rather than the client alone. See
+  [docs/mcp.md](docs/mcp.md#errors).
 - **An index create or drop is no longer answered `503 timeout` after it has
   committed.** The request's deadline could pass while the node was waiting for
   its members to confirm the change, and the client was told the request was
