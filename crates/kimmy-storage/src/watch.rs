@@ -439,23 +439,57 @@ impl Engine {
     }
 
     /// The first arrival position holding an entry above `delivered` for its
-    /// origin, or the position the next appended entry will take.
+    /// origin, or the position the next appended entry will take. Once per
+    /// stream opened from a token another member issued.
     ///
-    /// A walk of the arrival index's keys, once per stream opened from a
-    /// token another member issued.
+    /// Two ways to find it, raced a row at a time in one read transaction,
+    /// and the first to finish answers; both compute the same position over
+    /// the same snapshot (see [`Seek`]):
+    ///
+    /// - the **walk**, in arrival order from the oldest entry, which stops at
+    ///   the first entry above the vector. Its cost is the prefix before that
+    ///   entry, which for a client that was caught up is most of the retained
+    ///   oplog: past 30 s on a cold store in round 0420.
+    /// - the **seek**, in stamp order through `OPLOG_ARRIVAL_SEQ`, over only
+    ///   the entries stamped above the lowest vector component of an origin
+    ///   that can have anything above it. For a client caught up with this
+    ///   member it reads no row of the index, only the state marks (H of
+    ///   them: often none, but a caught-up node on a busy sender holds some,
+    ///   and a repair can leave tens of thousands, see `tables::OPLOG_HELD`),
+    ///   so a caught-up resume reads at most about 2·H rows between the two;
+    ///   it cannot stop early.
+    ///
+    /// So a resume costs at most about twice the cheaper of the two. The walk
+    /// wins where the seek's bound is low: a vector that names no position
+    /// for an origin this member holds, which is every stream opened with
+    /// `from_start`, `start_at` or an old single-stamp token until it catches
+    /// up, a vector cut at `MAX_TOKEN_ORIGINS`, or an origin that joined after
+    /// the vector was taken.
     fn first_arrival_beyond(&self, delivered: &VersionVector, walked: &mut Walked) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+        let held = txn.open_table(tables::OPLOG_HELD)?;
+        let servable = Engine::read_versions_in(&txn, tables::OPLOG_VERSIONS)?;
         walked.walks += 1;
-        for row in arrival.iter()? {
-            let (seq, key) = row?;
-            walked.rows += 1;
-            let stamp = codec::decode_oplog_key(key.value())?;
-            if stamp.hlc > delivered.get(stamp.node) {
-                return Ok(seq.value());
+        let mut walk = Walk::new(&arrival, delivered)?;
+        let mut seek = Seek::new(&by_stamp, &held, &servable, delivered)?;
+        let found = loop {
+            // The seek first: for a caught-up client it answers before the
+            // walk has read a row.
+            if let Some(found) = seek.step(walked)? {
+                walked.found_by = "seek";
+                break found;
             }
+            if let Some(found) = walk.step(walked)? {
+                walked.found_by = "walk";
+                break found;
+            }
+        };
+        match found {
+            Some(seq) => Ok(seq),
+            None => Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1)),
         }
-        Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
     }
 
     /// Whether retention has collected past `stamp`: it is older than the
@@ -718,14 +752,156 @@ struct Resolved {
 struct Walked {
     /// Which of the resolve's paths the open took.
     kind: &'static str,
-    /// Walks of the arrival index, and the rows they examined between them.
+    /// Walks of the arrival index, and the rows of the index they examined
+    /// between them, in arrival order and in stamp order alike.
     walks: u32,
     rows: u64,
+    /// State marks a seek read to find its bound.
+    held_rows: u64,
+    /// Which of [`Engine::first_arrival_beyond`]'s two answered, if it ran.
+    found_by: &'static str,
 }
 
 impl Default for Walked {
     fn default() -> Self {
-        Self { kind: "unresolved", walks: 0, rows: 0 }
+        Self { kind: "unresolved", walks: 0, rows: 0, held_rows: 0, found_by: "" }
+    }
+}
+
+/// [`Engine::first_arrival_beyond`] in arrival order: the first entry above
+/// the vector, one row per step.
+struct Walk<'t> {
+    rows: redb::Range<'t, u64, &'static [u8]>,
+    delivered: &'t VersionVector,
+}
+
+impl<'t> Walk<'t> {
+    fn new(
+        arrival: &'t redb::ReadOnlyTable<u64, &'static [u8]>,
+        delivered: &'t VersionVector,
+    ) -> Result<Self> {
+        Ok(Self { rows: arrival.iter()?, delivered })
+    }
+
+    /// `Some` once finished: the position found, or `None` for no entry
+    /// above the vector.
+    fn step(&mut self, walked: &mut Walked) -> Result<Option<Option<u64>>> {
+        let Some(row) = self.rows.next() else { return Ok(Some(None)) };
+        let (seq, key) = row?;
+        walked.rows += 1;
+        let stamp = codec::decode_oplog_key(key.value())?;
+        Ok((stamp.hlc > self.delivered.get(stamp.node)).then_some(Some(seq.value())))
+    }
+}
+
+/// [`Engine::first_arrival_beyond`] in stamp order, one row per step.
+///
+/// The answer is the lowest arrival position over the **candidates**, the
+/// entries with `hlc > v[origin]`. `OPLOG_ARRIVAL_SEQ` holds the same entries
+/// as `OPLOG_ARRIVAL`, keyed by stamp (`hlc ‖ node`), so every candidate lies
+/// at or above the key of `L`, the lowest `v[o]` over the origins that can
+/// have one, and the seek reads only from there.
+///
+/// Which origins can have one rests on invariant **I** (ADR-173's addendum of
+/// 2026-09-26): every entry in the oplog is at or below `OPLOG_VERSIONS` for
+/// its origin, or its key is in `OPLOG_HELD`. So a candidate's origin `o` has
+/// `V[o] > v[o]`, or the candidate is a held mark above `v[o]`. Those
+/// origins are the **active** ones. When there are none, no entry is above
+/// the vector and the seek answers without reading the index. It has read the
+/// H marks to know that, and the race has let the walk take one row of the
+/// index per mark meanwhile, so a caught-up resume reads at most about 2·H
+/// rows, and nothing with no marks. When the marks outnumber the index, the
+/// walk reaches the end of the index first and answers the same position.
+///
+/// A `V` that overstates what the oplog holds, or a mark left on no entry,
+/// only adds origins, which costs rows and never changes the answer.
+struct Seek<'t> {
+    by_stamp: &'t redb::ReadOnlyTable<&'static [u8], u64>,
+    servable: &'t VersionVector,
+    delivered: &'t VersionVector,
+    phase: SeekPhase<'t>,
+    /// The bound so far: the lowest `v[o]` over the active origins found.
+    bound: Option<Hlc>,
+    /// The lowest candidate position seen by the range.
+    best: Option<u64>,
+}
+
+enum SeekPhase<'t> {
+    /// Reading the state marks, for the active origins among them.
+    Held(redb::Range<'t, &'static [u8], ()>),
+    /// Reading the candidates' range.
+    Range(redb::Range<'t, &'static [u8], u64>),
+}
+
+impl<'t> Seek<'t> {
+    fn new(
+        by_stamp: &'t redb::ReadOnlyTable<&'static [u8], u64>,
+        held: &'t redb::ReadOnlyTable<&'static [u8], ()>,
+        servable: &'t VersionVector,
+        delivered: &'t VersionVector,
+    ) -> Result<Self> {
+        Ok(Self {
+            by_stamp,
+            servable,
+            delivered,
+            phase: SeekPhase::Held(held.iter()?),
+            bound: None,
+            best: None,
+        })
+    }
+
+    fn lower(&mut self, v: Hlc) {
+        self.bound = Some(self.bound.map_or(v, |b| b.min(v)));
+    }
+
+    /// `Some` once finished: the position found, or `None` for no entry
+    /// above the vector. Reads at most one row per step.
+    fn step(&mut self, walked: &mut Walked) -> Result<Option<Option<u64>>> {
+        match &mut self.phase {
+            SeekPhase::Held(marks) => {
+                if let Some(row) = marks.next() {
+                    let (key, _) = row?;
+                    walked.held_rows += 1;
+                    match codec::decode_oplog_key(key.value()) {
+                        Ok(stamp) => {
+                            let v = self.delivered.get(stamp.node);
+                            if stamp.hlc > v {
+                                self.lower(v);
+                            }
+                        }
+                        // A mark that does not decode names no origin to rule
+                        // out, and refusing every resume from another member's
+                        // token over it would be worse than the cost: the bound
+                        // drops to the start of the range, and the race keeps
+                        // the resume at the walk's price. Such keys are kept
+                        // on purpose (`release_held_under`).
+                        Err(_) => self.lower(Hlc::ZERO),
+                    }
+                    return Ok(None);
+                }
+                for (origin, servable) in self.servable.iter() {
+                    let v = self.delivered.get(origin);
+                    if servable > v {
+                        self.lower(v);
+                    }
+                }
+                let Some(bound) = self.bound else { return Ok(Some(None)) };
+                let lower = codec::oplog_key_lower_bound(bound);
+                self.phase = SeekPhase::Range(self.by_stamp.range(lower.as_slice()..)?);
+                Ok(None)
+            }
+            SeekPhase::Range(rows) => {
+                let Some(row) = rows.next() else { return Ok(Some(self.best)) };
+                let (key, seq) = row?;
+                walked.rows += 1;
+                let stamp = codec::decode_oplog_key(key.value())?;
+                if stamp.hlc > self.delivered.get(stamp.node) {
+                    let seq = seq.value();
+                    self.best = Some(self.best.map_or(seq, |b| b.min(seq)));
+                }
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -765,6 +941,8 @@ fn report_resolve(
             scope,
             walks = walked.walks,
             rows_examined = walked.rows,
+            held_rows = walked.held_rows,
+            found_by = walked.found_by,
             held = ?held,
             resolved,
             "a change stream was slow to find where it starts"
@@ -776,6 +954,8 @@ fn report_resolve(
             scope,
             walks = walked.walks,
             rows_examined = walked.rows,
+            held_rows = walked.held_rows,
+            found_by = walked.found_by,
             held = ?held,
             resolved,
             "a change stream took over 10 s to find where it starts; a client waiting on its \
@@ -2657,5 +2837,544 @@ mod tests {
             engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
         });
         assert!(!quiet.contains("find where it starts"), "{quiet}");
+    }
+
+    /// Where a stream resumed from another member's token starts: the race
+    /// between the walk and the seek against today's walk, over stores built
+    /// by every writer of the oplog, the arrival index and the vectors.
+    mod first_arrival {
+        use proptest::prelude::*;
+        use redb::ReadableTableMetadata;
+
+        use super::*;
+        use crate::engine::{Position, WriterHolder};
+
+        /// `first_arrival_beyond` as it was before the seek: the oracle.
+        fn oracle(engine: &Engine, delivered: &VersionVector) -> u64 {
+            let txn = engine.db().begin_read().unwrap();
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            for row in arrival.iter().unwrap() {
+                let (seq, key) = row.unwrap();
+                let stamp = codec::decode_oplog_key(key.value()).unwrap();
+                if stamp.hlc > delivered.get(stamp.node) {
+                    return seq.value();
+                }
+            }
+            arrival.last().unwrap().map_or(0, |(seq, _)| seq.value() + 1)
+        }
+
+        /// The race, as a resume runs it, and what it examined.
+        fn raced(engine: &Engine, delivered: &VersionVector) -> (u64, Walked) {
+            let mut walked = Walked::default();
+            let at = engine.first_arrival_beyond(delivered, &mut walked).unwrap();
+            (at, walked)
+        }
+
+        /// One side of the race run to its end alone.
+        fn alone(engine: &Engine, delivered: &VersionVector, seek: bool) -> u64 {
+            let txn = engine.db().begin_read().unwrap();
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+            let held = txn.open_table(tables::OPLOG_HELD).unwrap();
+            let servable = Engine::read_versions_in(&txn, tables::OPLOG_VERSIONS).unwrap();
+            let mut walked = Walked::default();
+            let found = if seek {
+                let mut side = Seek::new(&by_stamp, &held, &servable, delivered).unwrap();
+                loop {
+                    if let Some(found) = side.step(&mut walked).unwrap() {
+                        break found;
+                    }
+                }
+            } else {
+                let mut side = Walk::new(&arrival, delivered).unwrap();
+                loop {
+                    if let Some(found) = side.step(&mut walked).unwrap() {
+                        break found;
+                    }
+                }
+            };
+            found.unwrap_or_else(|| arrival.last().unwrap().map_or(0, |(seq, _)| seq.value() + 1))
+        }
+
+        /// Invariant I, read straight off the tables: every entry is at or
+        /// below `OPLOG_VERSIONS` for its origin, or held. And the two halves
+        /// of the arrival index name the same entries at the same positions.
+        fn audit(engine: &Engine) -> std::result::Result<(), String> {
+            let txn = engine.db().begin_read().unwrap();
+            let oplog = txn.open_table(tables::OPLOG).unwrap();
+            let held = txn.open_table(tables::OPLOG_HELD).unwrap();
+            let servable = Engine::read_versions_in(&txn, tables::OPLOG_VERSIONS).unwrap();
+            for row in oplog.iter().unwrap() {
+                let (key, _) = row.unwrap();
+                let stamp = codec::decode_oplog_key(key.value()).unwrap();
+                if stamp.hlc > servable.get(stamp.node) && held.get(key.value()).unwrap().is_none()
+                {
+                    return Err(format!("I is broken at {stamp:?}: above V and not held"));
+                }
+            }
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+            if arrival.len().unwrap() != by_stamp.len().unwrap() {
+                return Err("the arrival index's halves differ in length".into());
+            }
+            for row in arrival.iter().unwrap() {
+                let (seq, key) = row.unwrap();
+                let back = by_stamp.get(key.value()).unwrap().map(|s| s.value());
+                if back != Some(seq.value()) {
+                    return Err(format!("position {} maps back to {back:?}", seq.value()));
+                }
+            }
+            Ok(())
+        }
+
+        /// A store, and what the generator needs to keep building it.
+        struct Store {
+            _dirs: Vec<tempfile::TempDir>,
+            path: std::path::PathBuf,
+            engine: Option<Engine>,
+            coll: CollectionMeta,
+            origins: [NodeId; 3],
+            applied: Vec<OplogEntry>,
+            next_id: u64,
+        }
+
+        impl Store {
+            fn new() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("kimmy.redb");
+                let engine = Engine::open(&path).unwrap();
+                let coll = engine.create_collection("app", "docs").unwrap();
+                Self {
+                    _dirs: vec![dir],
+                    path,
+                    engine: Some(engine),
+                    coll,
+                    origins: [NodeId::generate(), NodeId::generate(), NodeId::generate()],
+                    applied: Vec::new(),
+                    next_id: 0,
+                }
+            }
+
+            fn engine(&self) -> &Engine {
+                self.engine.as_ref().unwrap()
+            }
+
+            fn id(&mut self) -> String {
+                self.next_id += 1;
+                format!("d{}", self.next_id)
+            }
+
+            fn remote(&mut self, origin: usize, wall: u64, position: Position) {
+                let id = self.id();
+                let entry = OplogEntry {
+                    stamp: Stamp::new(Hlc::new(wall, 0), self.origins[origin]),
+                    kind: OpKind::Insert,
+                    collection: self.coll.id,
+                    doc_id: Some(kimmy_core::DocId::String(id.clone())),
+                    body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+                };
+                self.apply(&entry, position);
+                self.applied.push(entry);
+            }
+
+            fn apply(&self, entry: &OplogEntry, position: Position) {
+                let engine = self.engine();
+                let txn = engine.begin_write(WriterHolder::Replication).unwrap();
+                engine.apply_remote_in_txn(&txn, &self.coll, entry, position).unwrap();
+                txn.commit().unwrap();
+            }
+
+            /// Close the engine, run `f` on the raw store, and open it again,
+            /// which runs every repair the open makes.
+            fn reopen(&mut self, f: impl FnOnce(&redb::Database)) {
+                drop(self.engine.take());
+                {
+                    let db = redb::Database::create(&self.path).unwrap();
+                    f(&db);
+                }
+                self.engine = Some(Engine::open(&self.path).unwrap());
+                self.coll = self.engine().get_collection("app", "docs").unwrap();
+            }
+
+            fn run(&mut self, op: &Op) {
+                match *op {
+                    Op::Local(n) => {
+                        for _ in 0..n {
+                            let id = self.id();
+                            self.engine().insert(&self.coll, doc! { "_id": id }).unwrap();
+                        }
+                    }
+                    Op::Remote { origin, wall, position } => {
+                        let position = match position {
+                            0 => Position::Raise,
+                            1 => Position::InWindow,
+                            _ => Position::Hold,
+                        };
+                        self.remote(origin, wall, position);
+                    }
+                    Op::Release(pick) => {
+                        if !self.applied.is_empty() {
+                            let entry = self.applied[pick % self.applied.len()].clone();
+                            self.apply(&entry, Position::InWindow);
+                        }
+                    }
+                    Op::Absorb { mask, wall } => {
+                        let mut granted = VersionVector::new();
+                        for (i, origin) in self.origins.iter().enumerate() {
+                            if mask & (1 << i) != 0 {
+                                granted.insert(*origin, Hlc::new(wall, 0));
+                            }
+                        }
+                        self.engine().absorb_version_vector(&granted).unwrap();
+                    }
+                    Op::Orphan { origin, wall } => {
+                        let stamp = Stamp::new(Hlc::new(wall, 7), self.origins[origin]);
+                        let db = self.engine().db();
+                        let txn = db.begin_write().unwrap();
+                        txn.open_table(tables::OPLOG_HELD)
+                            .unwrap()
+                            .insert(codec::oplog_key(&stamp).as_slice(), ())
+                            .unwrap();
+                        txn.commit().unwrap();
+                    }
+                    Op::Collect(wall) => {
+                        self.engine()
+                            .collect_garbage_at(wall, crate::gc::RetentionPolicy::new(0, 0))
+                            .unwrap();
+                    }
+                    Op::Rewind(pick) => {
+                        // To a local stamp, at or after the collection's
+                        // creation, so the rewind is one the engine takes.
+                        let local = self.engine().node_id();
+                        let stamps: Vec<Hlc> = self
+                            .engine()
+                            .read_oplog_from(Hlc::ZERO, usize::MAX)
+                            .unwrap()
+                            .into_iter()
+                            .filter(|e| e.stamp.node == local)
+                            .map(|e| e.stamp.hlc)
+                            .collect();
+                        let until = stamps[pick % stamps.len()];
+                        // Refusals leave the store as it was; either way I
+                        // must hold after.
+                        let _ = self.engine().rewind_to(until);
+                    }
+                    Op::Restore => {
+                        let mut backup = Vec::new();
+                        self.engine().backup_to(&mut backup).unwrap();
+                        drop(self.engine.take());
+                        let dir = tempfile::tempdir().unwrap();
+                        self.path = dir.path().join("kimmy.redb");
+                        crate::backup::restore(&self.path, &mut backup.as_slice()).unwrap();
+                        self._dirs.push(dir);
+                        self.engine = Some(Engine::open(&self.path).unwrap());
+                        self.coll = self.engine().get_collection("app", "docs").unwrap();
+                    }
+                    Op::WipeStampHalf => self.reopen(|db| {
+                        let txn = db.begin_write().unwrap();
+                        txn.open_table(tables::OPLOG_ARRIVAL_SEQ)
+                            .unwrap()
+                            .retain(|_, _| false)
+                            .unwrap();
+                        txn.commit().unwrap();
+                    }),
+                    Op::Reopen => self.reopen(|_| {}),
+                }
+            }
+
+            /// The vectors every step is checked with: empty, servable,
+            /// witnessed, each origin missing, lowered to one of its own
+            /// entries, just below it, and above everything, plus `random`.
+            fn vectors(&self, random: &[(usize, u8)]) -> Vec<VersionVector> {
+                let engine = self.engine();
+                let servable = engine.version_vector().unwrap();
+                let witnessed = engine.witnessed_vector().unwrap();
+                let entries = engine.read_oplog_from(Hlc::ZERO, usize::MAX).unwrap();
+                let mut all_origins: Vec<NodeId> = self.origins.to_vec();
+                all_origins.push(engine.node_id());
+                let of = |o: NodeId| -> Vec<Hlc> {
+                    entries.iter().filter(|e| e.stamp.node == o).map(|e| e.stamp.hlc).collect()
+                };
+                let mut out = vec![VersionVector::new(), servable.clone(), witnessed];
+                for &o in &all_origins {
+                    let mut missing = VersionVector::new();
+                    for (n, h) in servable.iter() {
+                        if n != o {
+                            missing.insert(n, h);
+                        }
+                    }
+                    out.push(missing);
+                    let hlcs = of(o);
+                    for pick in [0, hlcs.len() / 2, hlcs.len().saturating_sub(1)] {
+                        if let Some(&h) = hlcs.get(pick) {
+                            let mut exact = servable.clone();
+                            exact.insert(o, h);
+                            out.push(exact);
+                            if h > Hlc::ZERO {
+                                let mut below = servable.clone();
+                                below.insert(o, Hlc::new(h.wall_ms.saturating_sub(1), 0));
+                                out.push(below);
+                            }
+                        }
+                    }
+                }
+                let mut above = VersionVector::new();
+                for &o in &all_origins {
+                    above.insert(o, Hlc::new(u64::MAX / 2, 0));
+                }
+                out.push(above);
+                let mut chosen = VersionVector::new();
+                for &(origin, choice) in random {
+                    let o = all_origins[origin % all_origins.len()];
+                    let hlcs = of(o);
+                    let h = match choice % 5 {
+                        0 => continue,
+                        1 => Hlc::ZERO,
+                        2 => servable.get(o),
+                        3 => hlcs.get(origin % hlcs.len().max(1)).copied().unwrap_or(Hlc::ZERO),
+                        _ => Hlc::new(u64::MAX / 2, 0),
+                    };
+                    chosen.insert(o, h);
+                }
+                out.push(chosen);
+                out
+            }
+
+            /// A vector caught up with this member: at or above `V` and every
+            /// held mark, for every origin.
+            fn caught_up(&self) -> VersionVector {
+                let engine = self.engine();
+                let mut v = engine.version_vector().unwrap();
+                let txn = engine.db().begin_read().unwrap();
+                let held = txn.open_table(tables::OPLOG_HELD).unwrap();
+                for row in held.iter().unwrap() {
+                    let (key, _) = row.unwrap();
+                    v.observe(codec::decode_oplog_key(key.value()).unwrap());
+                }
+                v
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Local(u8),
+            Remote { origin: usize, wall: u64, position: u8 },
+            Release(usize),
+            Absorb { mask: u8, wall: u64 },
+            Orphan { origin: usize, wall: u64 },
+            Collect(u64),
+            Rewind(usize),
+            Restore,
+            WipeStampHalf,
+            Reopen,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            // Walls from a narrow range, so origins collide on equal stamps'
+            // hlcs and arrive out of stamp order.
+            prop_oneof![
+                4 => (1u8..4).prop_map(Op::Local),
+                8 => (0usize..3, 1u64..60, 0u8..3)
+                    .prop_map(|(origin, wall, position)| Op::Remote { origin, wall, position }),
+                2 => any::<usize>().prop_map(Op::Release),
+                2 => (1u8..8, 1u64..60).prop_map(|(mask, wall)| Op::Absorb { mask, wall }),
+                1 => (0usize..3, 1u64..60).prop_map(|(origin, wall)| Op::Orphan { origin, wall }),
+                1 => (1u64..60).prop_map(Op::Collect),
+                1 => any::<usize>().prop_map(Op::Rewind),
+                1 => Just(Op::Restore),
+                1 => Just(Op::WipeStampHalf),
+                1 => Just(Op::Reopen),
+            ]
+        }
+
+        fn check(store: &Store, random: &[(usize, u8)], after: &Op) {
+            let engine = store.engine();
+            audit(engine).unwrap_or_else(|e| panic!("after {after:?}: {e}"));
+            for v in store.vectors(random) {
+                let want = oracle(engine, &v);
+                let (got, _) = raced(engine, &v);
+                assert_eq!(got, want, "the race, after {after:?}, for {v:?}");
+                assert_eq!(alone(engine, &v, true), want, "the seek, after {after:?}, for {v:?}");
+                assert_eq!(alone(engine, &v, false), want, "the walk, after {after:?}, for {v:?}");
+            }
+            // Caught up: the seek answers once it has read the held marks,
+            // with no row of the index, and the walk took at most one row per
+            // mark meanwhile. With no marks, nothing is read at all.
+            let caught_up = store.caught_up();
+            let (got, walked) = raced(engine, &caught_up);
+            assert_eq!(got, oracle(engine, &caught_up));
+            // The seek answers, unless the marks outnumber the index and the
+            // walk reached its end first, answering the same position.
+            let index_rows = {
+                let txn = engine.db().begin_read().unwrap();
+                txn.open_table(tables::OPLOG_ARRIVAL).unwrap().len().unwrap()
+            };
+            assert!(
+                walked.found_by == "seek" || walked.rows == index_rows,
+                "a caught-up vector was answered by the walk before it read the index, after \
+                 {after:?}: {} of {index_rows} rows",
+                walked.rows
+            );
+            assert!(
+                walked.rows <= walked.held_rows,
+                "a caught-up vector read {} rows of the index past {} held marks, after {after:?}",
+                walked.rows,
+                walked.held_rows
+            );
+        }
+
+        proptest! {
+            // Each case builds a real store through up to 24 operations and
+            // checks some twenty vectors after every one.
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// Whatever wrote the store, the seek, the walk and the race all
+            /// find where the old walk found, and invariant I holds throughout.
+            #[test]
+            fn the_seek_and_the_race_find_what_the_walk_found(
+                ops in prop::collection::vec(op(), 1..24),
+                random in prop::collection::vec((0usize..4, 0u8..5), 0..4),
+            ) {
+                let mut store = Store::new();
+                for op in &ops {
+                    store.run(op);
+                    check(&store, &random, op);
+                }
+            }
+        }
+
+        /// A client caught up with this member, on a store with no held
+        /// marks, is answered without reading a row: round 0420's resume.
+        #[test]
+        fn a_caught_up_resume_reads_nothing() {
+            let mut store = Store::new();
+            store.run(&Op::Local(3));
+            for wall in 1..40 {
+                store.run(&Op::Remote { origin: (wall % 3) as usize, wall, position: 0 });
+            }
+            let engine = store.engine();
+            let v = engine.version_vector().unwrap();
+            let (got, walked) = raced(engine, &v);
+            assert_eq!(got, oracle(engine, &v));
+            assert_eq!((walked.rows, walked.held_rows, walked.found_by), (0, 0, "seek"));
+        }
+
+        /// A writer that appends without raising `V` or leaving a mark breaks
+        /// I, and the seek then misses the entry: the audit and the
+        /// comparison above are what would catch such a writer.
+        #[test]
+        fn an_entry_outside_the_invariant_is_what_the_seek_misses() {
+            let mut store = Store::new();
+            store.run(&Op::Local(3));
+            // A held append (a relog), then its mark removed by hand: the
+            // entry is in the oplog and the index, above `V`, and not held.
+            let stranger = NodeId::generate();
+            let entry = OplogEntry {
+                stamp: Stamp::new(Hlc::new(5, 0), stranger),
+                kind: OpKind::Insert,
+                collection: store.coll.id,
+                doc_id: Some(kimmy_core::DocId::String("stray".into())),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": "stray" }).unwrap()),
+            };
+            store.apply(&entry, Position::Hold);
+            let db = store.engine().db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::OPLOG_HELD)
+                .unwrap()
+                .remove(codec::oplog_key(&entry.stamp).as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+
+            let engine = store.engine();
+            assert!(audit(engine).is_err(), "the audit sees I broken");
+            // Caught up by `V`, which does not name the stranger: its entry is
+            // the only one above the vector, and outside every active origin.
+            let v = engine.version_vector().unwrap();
+            let want = oracle(engine, &v);
+            assert_ne!(
+                alone(engine, &v, true),
+                want,
+                "the seek alone misses the stray entry, so the comparison catches the writer"
+            );
+            assert_eq!(alone(engine, &v, false), want);
+        }
+
+        /// A stamp half that lost rows is rebuilt at open. Before the check
+        /// compared it, a store whose stamp half alone was short opened as it
+        /// was, and the seek would have missed what it lost.
+        #[test]
+        ///
+        /// From the positions, which stay: a remote entry stamped in 1970 arrived
+        /// after the local writes, so renumbering from the oplog in stamp order
+        /// would move every position, and with them this member's tokens.
+        fn a_short_stamp_half_is_rebuilt_at_open() {
+            let mut store = Store::new();
+            store.run(&Op::Local(3));
+            store.run(&Op::Remote { origin: 0, wall: 9, position: 0 });
+            let positions = |engine: &Engine| -> Vec<(u64, Vec<u8>)> {
+                let txn = engine.db().begin_read().unwrap();
+                let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+                arrival
+                    .iter()
+                    .unwrap()
+                    .map(|row| {
+                        let (seq, key) = row.unwrap();
+                        (seq.value(), key.value().to_vec())
+                    })
+                    .collect()
+            };
+            let before = positions(store.engine());
+            store.run(&Op::WipeStampHalf);
+            audit(store.engine()).unwrap();
+            assert_eq!(positions(store.engine()), before, "the positions stayed as they were");
+        }
+
+        /// More held marks than rows in the index: while the seek reads the
+        /// marks, the walk reaches the end of the index and answers first, with
+        /// the same position. The case that made the property test's caught-up
+        /// check flaky when it required the seek to answer.
+        #[test]
+        fn with_more_marks_than_entries_the_walk_answers_a_caught_up_resume() {
+            let mut store = Store::new();
+            for op in [Op::Orphan { origin: 0, wall: 1 }, Op::Orphan { origin: 0, wall: 2 }] {
+                store.run(&op);
+                check(&store, &[], &op);
+            }
+            let engine = store.engine();
+            let v = store.caught_up();
+            let (got, walked) = raced(engine, &v);
+            assert_eq!(got, oracle(engine, &v));
+            assert_eq!(walked.found_by, "walk");
+            assert!(
+                walked.rows <= walked.held_rows,
+                "{} rows, {} marks",
+                walked.rows,
+                walked.held_rows
+            );
+        }
+
+        /// A mark whose key does not decode does not fail the resume: the seek's
+        /// bound drops to the start, and the answer is the walk's.
+        #[test]
+        fn an_undecodable_mark_does_not_fail_a_resume() {
+            let mut store = Store::new();
+            store.run(&Op::Local(3));
+            store.run(&Op::Remote { origin: 1, wall: 9, position: 0 });
+            {
+                let db = store.engine().db();
+                let txn = db.begin_write().unwrap();
+                txn.open_table(tables::OPLOG_HELD)
+                    .unwrap()
+                    .insert(&b"\x01\x02\x03"[..], ())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+            let engine = store.engine();
+            for v in [VersionVector::new(), engine.version_vector().unwrap()] {
+                let want = oracle(engine, &v);
+                assert_eq!(raced(engine, &v).0, want, "the race, for {v:?}");
+                assert_eq!(alone(engine, &v, true), want, "the seek, for {v:?}");
+            }
+        }
     }
 }

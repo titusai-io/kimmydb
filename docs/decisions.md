@@ -16491,6 +16491,105 @@ the rebuild can resume past an entry the rebuild moved below the token's.
   test's bound. B sends all 25 events the client had seen, and 200 events for
   175 missed.
 
+**Addendum, 2026-09-26: finding the start by stamp, and the invariant it rests
+on.** A resume from another member's token starts at the first arrival position
+holding an entry above the token's vector `v`. That was found by walking the
+arrival index from its oldest entry, which for a client that was caught up is
+most of the retained oplog. In round 0420 the walk took 31–40 s on a cold store,
+before the upgrade was answered (ADR-153's addendum of the same date took it off
+the worker).
+
+**The seek.** The position is the lowest `seq` over the **candidates**, the
+entries with `hlc > v[origin]`. `OPLOG_ARRIVAL_SEQ` holds the same entries as
+`OPLOG_ARRIVAL`, keyed by stamp (`hlc ‖ node`). So every candidate lies at or
+above the key of `L`, the lowest `v[o]` over the origins that can have one, and
+a range from there finds the lowest `seq` among them.
+
+- **Which origins are active** comes from `OPLOG_VERSIONS` (`V`) and the state
+  marks: `o` with `V[o] > v[o]`, and the origin of each mark above `v`.
+- **When none is active**, nothing is above the vector, and the answer is the
+  next position, read without touching the index. That is the common case, a
+  client caught up with this member.
+- **A caught-up resume still reads the state marks** to find the active
+  origins. There are `H` of them: often none, but a caught-up node on a busy
+  sender normally holds some, and a repair can leave tens of thousands
+  (`tables::OPLOG_HELD`).
+  - While the seek reads them, the race lets the walk take one row of the
+    index per mark. So a caught-up resume reads at most about 2·H rows, and
+    nothing at all with no marks.
+  - When the marks outnumber the index, the walk reaches its end first and
+    answers, with the same position.
+- **A mark whose key does not decode** names no origin to rule out. It drops
+  the seek's bound to the start rather than failing the resume, and the race
+  keeps the cost at the walk's. Such keys are kept on purpose
+  (`release_held_under`).
+- **The seek cannot stop early**, because stamp order is not arrival order.
+
+**The race.** The walk and the seek run in one read transaction, a row at a
+time each, and the first to finish answers. Both compute the same position over
+the same snapshot. So a resume costs at most about twice the cheaper of the two.
+
+The walk wins where the seek's bound is low:
+- a vector with no position for an origin this member holds: every stream
+  opened with `from_start`, `start_at` or a single-stamp token, until it
+  catches up;
+- a vector cut at `MAX_TOKEN_ORIGINS`;
+- an origin that joined after the vector was taken.
+
+The single-stamp path (`first_arrival_stamped_after`) is unchanged.
+
+**Invariant I.** Every entry in the oplog is at or below `OPLOG_VERSIONS` for
+its origin, or its key is in `OPLOG_HELD`. The seek is correct exactly when I
+holds: a candidate whose origin is outside the active set is never read. Every
+writer of the oplog, the vectors or the marks must keep I:
+
+- **An append** (`append_oplog_at`) raises `V` in the entry's own transaction
+  (`Raise`, `InWindow`) or marks the key held (`Hold`).
+- **`V` only rises** (`raise_version`). An absorb and a release raise it before
+  or as they remove a mark.
+- **Retention and rewind remove entries.** Neither may leave `V` below an entry
+  it keeps.
+  - Retention never touches `V`.
+  - A rewind replaces `V` with the maximum over the non-held entries it keeps
+    (`reset_version_vector_to_oplog`). Its premise is that a rewind is
+    offline: the recompute and the replacement are separate transactions, and
+    no server holds the store between them to append.
+- **A restore** writes no marks (`OPLOG_HELD` is not backed up). The raise at
+  every open (`rebuild_version_vector_if_stale`) raises `V` over every entry
+  before anything reads it.
+
+`V` overstating what the oplog holds, or a mark on no entry, only adds active
+origins. That costs rows and never changes the answer.
+
+The open-time check that rebuilds the arrival index now compares both halves
+with the oplog. A stamp half that lost rows would otherwise have opened as it
+was, and the seek would have missed them.
+
+When only the stamp half is short, it is rebuilt from the positions, which stay
+as they are. Renumbering both halves from the oplog would move every position
+this member's tokens name. The full rebuild is kept for an index whose
+positions themselves do not cover the oplog.
+
+**Tests** (`watch.rs`, `first_arrival`):
+- **A property test** builds real stores through local writes and remote
+  appends under `Raise`, `InWindow` and `Hold`, over three origins with equal
+  and out-of-order stamps. It adds releases, partial absorbs, orphaned marks,
+  retention passes, rewinds with their reset, backup and restore with a
+  reopen, a wiped stamp half and plain reopens.
+- **After every step it checks I on the tables** (and that the halves agree).
+  For some twenty vectors, the race, the seek alone and the walk alone must
+  each equal the old walk: empty, servable, witnessed, each origin missing,
+  exact and just-below entry stamps, above everything, and random.
+- **A caught-up vector reads no more index rows than marks.** The seek answers
+  it, unless the marks outnumber the index and the walk reaches its end first
+  (`with_more_marks_than_entries_the_walk_answers_a_caught_up_resume`). With no
+  marks it reads nothing (`a_caught_up_resume_reads_nothing`).
+- **`an_undecodable_mark_does_not_fail_a_resume`.**
+- **`an_entry_outside_the_invariant_is_what_the_seek_misses`** writes an entry
+  above `V` with its mark removed. The audit reports I broken, and the seek
+  alone disagrees with the old walk. That is what would catch a future writer
+  that skips the raise.
+
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 
 > **Extends [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it)**,

@@ -1766,7 +1766,7 @@ impl Engine {
 
     /// Rebuild the arrival index if it does not cover the oplog exactly.
     ///
-    /// Cheap to check — two counts — and only pays the rebuild when something
+    /// Cheap to check — three counts — and only pays the rebuild when something
     /// is actually wrong: a database written before the index existed, or one
     /// an older build appended to after this one had created it. Comparing
     /// counts rather than contents is enough because the index is only ever
@@ -1781,6 +1781,7 @@ impl Engine {
             let txn = db.begin_read()?;
             let oplog = txn.open_table(tables::OPLOG)?;
             let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             // `len()` is the count redb keeps in each table's root header,
             // read without visiting a page of the table. This used to be
             // `iter().count()` on both, which walked the whole oplog and the
@@ -1788,8 +1789,22 @@ impl Engine {
             // file, the oplog twice over before the node served anything
             // (ADR-153's investigation; the third walk, the version vector's,
             // is recorded there as the one that remains).
-            if oplog.len()? == arrival.len()? {
+            //
+            // Both halves of the index: a change stream's resume reads the
+            // stamp half on its own (`Engine::first_arrival_beyond`), so a
+            // stamp half that lost rows would move where a stream starts.
+            let entries = oplog.len()?;
+            let positions_whole = entries == arrival.len()?;
+            if positions_whole && entries == by_stamp.len()? {
                 return Ok(());
+            }
+            // Only the stamp half is short: it is rebuilt from the positions,
+            // which stay as they are. Renumbering from the oplog would move
+            // every position this member's tokens name (ADR-173), for a
+            // repair that needs none of them to move.
+            if positions_whole {
+                drop((oplog, arrival, by_stamp, txn));
+                return Self::rebuild_stamp_half_from_positions(db);
             }
         }
 
@@ -1820,25 +1835,7 @@ impl Engine {
                 }
                 crate::index::ensure_removed(batch.len(), gone, "the arrival index")?;
             }
-            loop {
-                let batch: Vec<Vec<u8>> = by_stamp
-                    .iter()?
-                    .take(crate::index::CLEAR_BATCH)
-                    .map(|row| Ok(row?.0.value().to_vec()))
-                    .collect::<Result<_>>()?;
-                if batch.is_empty() {
-                    break;
-                }
-                let mut gone = 0;
-                for key in &batch {
-                    #[cfg(test)]
-                    if crate::index::clear_hooks::keeps("the arrival index by stamp") {
-                        continue;
-                    }
-                    gone += usize::from(by_stamp.remove(key.as_slice())?.is_some());
-                }
-                crate::index::ensure_removed(batch.len(), gone, "the arrival index by stamp")?;
-            }
+            Self::clear_stamp_half(&mut by_stamp)?;
 
             let mut seq = 0u64;
             for row in oplog.iter()? {
@@ -1854,6 +1851,51 @@ impl Engine {
         if rebuilt > 0 {
             info!(entries = rebuilt, "rebuilt the oplog arrival index");
         }
+        Ok(())
+    }
+
+    /// Empty the arrival index's stamp half, a batch at a time.
+    fn clear_stamp_half(by_stamp: &mut redb::Table<'_, &'static [u8], u64>) -> Result<()> {
+        loop {
+            let batch: Vec<Vec<u8>> = by_stamp
+                .iter()?
+                .take(crate::index::CLEAR_BATCH)
+                .map(|row| Ok(row?.0.value().to_vec()))
+                .collect::<Result<_>>()?;
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let mut gone = 0;
+            for key in &batch {
+                #[cfg(test)]
+                if crate::index::clear_hooks::keeps("the arrival index by stamp") {
+                    continue;
+                }
+                gone += usize::from(by_stamp.remove(key.as_slice())?.is_some());
+            }
+            crate::index::ensure_removed(batch.len(), gone, "the arrival index by stamp")?;
+        }
+    }
+
+    /// Rebuild the stamp half of the arrival index from its positions, which
+    /// are kept: every position this member has issued a token for still names
+    /// the entry it named.
+    fn rebuild_stamp_half_from_positions(db: &Database) -> Result<()> {
+        let txn = db.begin_write()?;
+        let rebuilt = {
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            Self::clear_stamp_half(&mut by_stamp)?;
+            let mut rebuilt = 0u64;
+            for row in arrival.iter()? {
+                let (seq, key) = row?;
+                by_stamp.insert(key.value(), seq.value())?;
+                rebuilt += 1;
+            }
+            rebuilt
+        };
+        txn.commit()?;
+        info!(entries = rebuilt, "rebuilt the oplog arrival index's stamp half from its positions");
         Ok(())
     }
 
