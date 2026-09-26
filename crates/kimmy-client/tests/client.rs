@@ -101,9 +101,8 @@ struct Stalling {
 impl Stalling {
     /// Refuse the first `refusals` requests with `429`, then answer them.
     ///
-    /// `Retry-After: 0` because the client honours the header and a test that
-    /// slept for the default second per attempt would pay for nothing: the
-    /// subject is which endpoint the retry goes to, not the arithmetic.
+    /// `Retry-After: 1`, the least a node sends: the client reads `0` as
+    /// absent, which is a second too.
     async fn start(refusals: usize) -> Self {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&hits);
@@ -115,7 +114,7 @@ impl Stalling {
                 if n < refusals {
                     (
                         axum::http::StatusCode::TOO_MANY_REQUESTS,
-                        [(axum::http::header::RETRY_AFTER, "0")],
+                        [(axum::http::header::RETRY_AFTER, "1")],
                         axum::Json(json!({
                             "error": "rate_limited",
                             "message": "slow down",
@@ -148,7 +147,13 @@ impl Stalling {
 /// A supplied token is never renewed on a schedule, so `authenticate` makes no
 /// request and every hit a stub counts is the request under test.
 async fn with_token(endpoints: &[&str]) -> Client {
-    let mut builder = Client::builder(endpoints[0]).token("opaque-to-this-client");
+    with_token_and_budget(endpoints, std::time::Duration::from_secs(30)).await
+}
+
+/// [`with_token`], with a wait budget other than the default.
+async fn with_token_and_budget(endpoints: &[&str], budget: std::time::Duration) -> Client {
+    let mut builder =
+        Client::builder(endpoints[0]).token("opaque-to-this-client").wait_budget(budget);
     for extra in &endpoints[1..] {
         builder = builder.endpoint(*extra);
     }
@@ -685,28 +690,26 @@ async fn a_wait_retries_the_same_node() {
     assert_eq!(stalling.hits(), 2, "the refusal, then the same node again after the delay");
 }
 
-/// And a `wait` that keeps refusing is bounded rather than infinite.
+/// And a `wait` that keeps refusing is bounded by the wait budget rather than
+/// infinite.
 ///
 /// The bound is what keeps a rate limit from turning a client into an
 /// application that has stopped responding. It gives up and reports the
 /// server's own error, which is more useful than a client-invented one.
 #[tokio::test]
-async fn a_wait_that_keeps_refusing_gives_up() {
-    // More refusals than any bounded client could absorb.
+async fn a_wait_that_keeps_refusing_gives_up_when_the_budget_is_spent() {
     let stalling = Stalling::start(100).await;
-    let client = with_token(&[&stalling.base]).await;
+    let client =
+        with_token_and_budget(&[&stalling.base], std::time::Duration::from_millis(1500)).await;
 
     let error = client.find("shop", "orders", &Query::new()).await.expect_err("still refusing");
 
     assert_eq!(error.retry(), Retry::Wait, "the class the server sent survives to the caller");
-    assert!(
-        stalling.hits() < 10,
-        "a bounded number of attempts, not a client that sleeps forever: {} hits",
-        stalling.hits()
-    );
+    assert_eq!(stalling.hits(), 3, "one attempt, then two within a 1.5 s budget of 1 s waits");
 }
 
-/// A node that has said `wait` twice is one the client moves on from.
+/// A node that is still saying `wait` when the budget is spent is one the
+/// client moves on from.
 ///
 /// The bound and the fall-through are one decision seen from two sides, and
 /// with a single endpoint they are indistinguishable — giving up and moving to
@@ -717,41 +720,41 @@ async fn a_wait_that_keeps_refusing_gives_up() {
 async fn a_node_that_keeps_saying_wait_is_left_for_one_that_answers() {
     let stalling = Stalling::start(100).await;
     let healthy = Stalling::start(0).await;
-    let client = with_token(&[&stalling.base, &healthy.base]).await;
+    let client = with_token_and_budget(
+        &[&stalling.base, &healthy.base],
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
 
     let page = client.find("shop", "orders", &Query::new()).await.expect("the second node answers");
 
     assert_eq!(page["served_by"], "stalling", "the answer came from a node, not from the client");
-    assert_eq!(stalling.hits(), 2, "the refusal and one wait, and then no more");
+    assert_eq!(stalling.hits(), 3, "the refusals within the budget, and then no more");
     assert_eq!(healthy.hits(), 1, "then the next node, asked once");
 }
 
-/// A write is never repeated on `wait` — not to this node, and not to another.
+/// A write refused with `wait` is sent to the same node again, and not to a
+/// peer.
 ///
-/// `429` is answered before the work in every case this stub produces, but
-/// nothing in the response says so, and no status distinguishes a request that
-/// failed before its commit from one that failed after. So the write goes
-/// exactly once and the caller decides.
+/// A node answers `wait` only when it did nothing — a rate limit, a busy
+/// writer, a drop still being purged — so sending the write again cannot apply
+/// it twice. And the same node, because that is what `wait` means.
 ///
-/// **The second endpoint is what makes this a test.** With one node, "reported
-/// the refusal" and "failed over and found nowhere to go" produce the same
-/// error, and the mutation pass showed the guard could be rewritten to fail
-/// over without anything noticing. A peer that receives a write the first node
-/// may already have committed is a duplicate, silently.
+/// **The second endpoint is what makes this a test.** With one node, "the same
+/// node again" and "failed over and found nowhere to go" can look alike.
 #[tokio::test]
-async fn a_wait_does_not_repeat_a_write_anywhere() {
+async fn a_wait_repeats_a_write_on_the_same_node() {
     let stalling = Stalling::start(1).await;
     let healthy = Stalling::start(0).await;
     let client = with_token(&[&stalling.base, &healthy.base]).await;
 
-    let error = client
+    client
         .request(Method::Post, "/v1/db/shop/coll/orders/insert", Some(json!({})), Safety::Unsafe)
         .await
-        .expect_err("an unsafe request reports the refusal rather than repeating it");
+        .expect("the refusal said nothing was done, and the same node then answers");
 
-    assert_eq!(error.retry(), Retry::Wait, "the class is reported, not acted on");
-    assert_eq!(stalling.hits(), 1, "sent once");
-    assert_eq!(healthy.hits(), 0, "and never to a peer that might commit it a second time");
+    assert_eq!(stalling.hits(), 2, "the refusal, then the same node again");
+    assert_eq!(healthy.hits(), 0, "never a peer");
 }
 
 /// The query builders and `collect_all`, which nothing else used.

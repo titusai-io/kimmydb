@@ -11,7 +11,7 @@ Three clients that each judged themselves would be three opinions, and what is
 wanted is one oracle and three answers.
 
     conformance_driver.py list
-    conformance_driver.py run <scenario> <base-url> [dead-url]
+    conformance_driver.py run <scenario> <base-url> [dead-url] [misbehaving-url]
 
 Output is a single JSON object on stdout. Anything else goes to stderr.
 """
@@ -26,7 +26,13 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from kimmydb import Client, KimmyError, Pages, TransportError  # noqa: E402
+from kimmydb import (  # noqa: E402
+    Client,
+    KimmyError,
+    OutcomeUnknown,
+    Pages,
+    TransportError,
+)
 
 SCENARIOS = [
     "capabilities",
@@ -47,6 +53,9 @@ SCENARIOS = [
     "stale_resume_token_is_refused",
     "stale_write_is_typed",
     "array_filters_address_one_element",
+    "wait_is_ridden_out_on_one_node",
+    "rate_limited_write_is_ridden_out",
+    "unanswered_write_is_outcome_unknown",
 ]
 
 PASSWORD = os.environ.get("KIMMY_ROOT_PASSWORD", "conformance-password")
@@ -60,21 +69,6 @@ def seed(db: Client, n: int) -> None:
     db.create_collection("shop", "orders")
     if n:
         db.insert_many("shop", "orders", [{"_id": i, "qty": i} for i in range(n)])
-
-
-def recreate(db: Client, deadline: float = 30.0) -> None:
-    """Create `shop.orders` again after dropping it, waiting out the drop's
-    purge: until it is done the name is refused `503 collection_purging`,
-    `retry: wait`, with a `Retry-After` (ADR-189)."""
-    give_up = time.monotonic() + deadline
-    while True:
-        try:
-            db.create_collection("shop", "orders")
-            return
-        except KimmyError as e:
-            if e.code != "collection_purging" or time.monotonic() >= give_up:
-                raise
-            time.sleep(min(e.retry_after or 1, max(give_up - time.monotonic(), 0)))
 
 
 def next_event(stream, timeout: float = 15.0):
@@ -94,7 +88,20 @@ def next_event(stream, timeout: float = 15.0):
     return box[0]
 
 
-def run(scenario: str, base: str, dead: str) -> dict:
+def outcome(call) -> str:
+    """How a failing call failed, in the suite's words."""
+    try:
+        call()
+    except OutcomeUnknown:
+        return "outcome_unknown"
+    except TransportError:
+        return "transport"
+    except KimmyError as e:
+        return e.code
+    return "succeeded"
+
+
+def run(scenario: str, base: str, dead: str, misbehaving: str) -> dict:
     if scenario == "capabilities":
         db = connect(base)
         return {
@@ -195,6 +202,41 @@ def run(scenario: str, base: str, dead: str) -> dict:
             answered = False
         return {"answered": answered, "live_endpoint_first_after": db.endpoints[0] == base}
 
+    if scenario == "wait_is_ridden_out_on_one_node":
+        db = connect(base)
+        seed(db, 0)
+        for start in (0, 1000):
+            db.insert_many(
+                "shop", "orders", [{"_id": i, "qty": i} for i in range(start, start + 1000)]
+            )
+        db.request("DELETE", "/v1/db/shop/coll/orders")
+        started = time.monotonic()
+        db.create_collection("shop", "orders")
+        return {"created": True, "waited": time.monotonic() - started >= 0.9}
+
+    if scenario == "rate_limited_write_is_ridden_out":
+        db = connect(base)
+        seed(db, 0)
+        started = time.monotonic()
+        inserted = 0
+        for i in range(4):
+            db.insert("shop", "orders", {"_id": i})
+            inserted += 1
+        return {"inserted": inserted, "waited": time.monotonic() - started >= 0.9}
+
+    if scenario == "unanswered_write_is_outcome_unknown":
+        fake = Client(misbehaving, token="any")
+        return {
+            "unanswered_write": outcome(
+                lambda: fake.insert("shop", "unanswered", {"_id": 1})
+            ),
+            "unanswered_read": outcome(lambda: fake.get("shop", "unanswered", 1)),
+            "answered_unknown": outcome(lambda: fake.insert("shop", "unknown", {"_id": 1})),
+            "refused_write": outcome(
+                lambda: Client(dead, token="any").insert("shop", "orders", {"_id": 1})
+            ),
+        }
+
     if scenario == "write_is_not_retried_elsewhere":
         live = connect(base)
         seed(live, 1)
@@ -267,7 +309,9 @@ def run(scenario: str, base: str, dead: str) -> dict:
         db = connect(base)
         seed(db, 1)
         db.request("DELETE", "/v1/db/shop/coll/orders")
-        recreate(db)
+        # Refused `collection_purging`, `retry: wait`, until the drop's purge
+        # is done (ADR-189); the client waits that out on the same node.
+        db.create_collection("shop", "orders")
         db.insert("shop", "orders", {"_id": 99})
 
         stream = db.watch("shop", "orders", from_start=True)
@@ -319,7 +363,7 @@ def run(scenario: str, base: str, dead: str) -> dict:
         stream.close()
 
         db.request("DELETE", "/v1/db/shop/coll/orders")
-        recreate(db)
+        db.create_collection("shop", "orders")
 
         try:
             db.watch("shop", "orders", resume_after=token)
@@ -337,8 +381,9 @@ def main() -> int:
     if len(sys.argv) >= 4 and sys.argv[1] == "run":
         scenario, base = sys.argv[2], sys.argv[3]
         dead = sys.argv[4] if len(sys.argv) > 4 else "http://127.0.0.1:1"
+        misbehaving = sys.argv[5] if len(sys.argv) > 5 else dead
         try:
-            print(json.dumps(run(scenario, base, dead)))
+            print(json.dumps(run(scenario, base, dead, misbehaving)))
             return 0
         except Exception as e:  # noqa: BLE001 - a driver reports, it does not judge
             print(json.dumps({"error": f"{type(e).__name__}: {e}"}))

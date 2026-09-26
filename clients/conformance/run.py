@@ -36,6 +36,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -45,6 +46,53 @@ ROOT = HERE.parents[1]
 SPEC = json.loads((HERE / "scenarios.json").read_text())
 PASSWORD = SPEC["password"]
 DEAD = "http://127.0.0.1:1"  # reserved; nothing listens there
+
+#: The misbehaving server's envelope for `/coll/unknown/`: what a node answers
+#: a write whose commit failed after its fsync began (ADR-188's addendum).
+OUTCOME_UNKNOWN = b'{"error":"outcome_unknown","message":"the write may or may not have been applied","retry":"verify"}'
+
+
+def start_misbehaving() -> str:
+    """A server that fails on purpose, in the two ways a real node cannot be
+    made to on demand; returns its base URL.
+
+    - Under `/coll/unanswered/` it reads the whole request and closes the
+      connection without a word: a request sent, and no answer.
+    - Under `/coll/unknown/` it answers `500 outcome_unknown`, `retry: verify`.
+
+    The one fake in the suite. It is here so that the three clients can be held
+    to one answer about a write they cannot know the outcome of; everything it
+    says is something the wire allows.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    def serve_one(conn: socket.socket) -> None:
+        with conn:
+            reader = conn.makefile("rb")
+            head = reader.readline()
+            length = 0
+            while (line := reader.readline()) not in (b"\r\n", b"\n", b""):
+                name, _, value = line.decode("latin-1").partition(":")
+                if name.strip().lower() == "content-length":
+                    length = int(value.strip())
+            reader.read(length)
+            if b"/coll/unknown/" in head:
+                conn.sendall(
+                    b"HTTP/1.1 500 Internal Server Error\r\n"
+                    b"Content-Type: application/json\r\nConnection: close\r\n"
+                    + f"Content-Length: {len(OUTCOME_UNKNOWN)}\r\n\r\n".encode()
+                    + OUTCOME_UNKNOWN
+                )
+
+    def serve() -> None:
+        while True:
+            conn, _ = listener.accept()
+            threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{listener.getsockname()[1]}"
 
 # Each driver is "how to invoke this client", and nothing else. Adding a fourth
 # language is a line here plus a driver that speaks the same two commands.
@@ -79,7 +127,9 @@ def free_port() -> int:
 class Node:
     """A real kimmyd, started fresh for one scenario."""
 
-    def __init__(self, directory: pathlib.Path, token_ttl: int = 3600) -> None:
+    def __init__(
+        self, directory: pathlib.Path, token_ttl: int = 3600, env: dict | None = None
+    ) -> None:
         binary = os.environ.get("KIMMYD_BINARY", str(ROOT / "target" / "release" / "kimmyd"))
         if not pathlib.Path(binary).exists():
             sys.exit(f"no kimmyd at {binary}; run `cargo build --release` first")
@@ -103,7 +153,7 @@ token_ttl_secs = {token_ttl}
         self.log = open(directory / "node.log", "w")
         self.process = subprocess.Popen(
             [binary, "--config", str(config)],
-            env={**os.environ, "KIMMY_ROOT_PASSWORD": PASSWORD},
+            env={**os.environ, "KIMMY_ROOT_PASSWORD": PASSWORD, **(env or {})},
             stdout=self.log,
             stderr=self.log,
         )
@@ -142,9 +192,9 @@ def driver_scenarios(client: str) -> list[str]:
     return json.loads(result.stdout)
 
 
-def run_scenario(client: str, scenario: str, base: str) -> dict:
+def run_scenario(client: str, scenario: str, base: str, misbehaving: str) -> dict:
     result = subprocess.run(
-        DRIVERS[client] + ["run", scenario, base, DEAD],
+        DRIVERS[client] + ["run", scenario, base, DEAD, misbehaving],
         capture_output=True,
         text=True,
         timeout=180,
@@ -211,6 +261,7 @@ def main() -> int:
             print(f"COVERAGE  {failure}")
         return 1
 
+    misbehaving = start_misbehaving()
     print(f"{len(scenarios)} scenarios x {len(clients)} clients: {', '.join(clients)}\n")
     results: dict[str, dict[str, list[str]]] = {}
 
@@ -219,9 +270,13 @@ def main() -> int:
         results[scenario["id"]] = {}
         for client in clients:
             directory = work / scenario["id"] / client
-            node = Node(directory, token_ttl=node_settings.get("token_ttl_secs", 3600))
+            node = Node(
+                directory,
+                token_ttl=node_settings.get("token_ttl_secs", 3600),
+                env=node_settings.get("env"),
+            )
             try:
-                observed = run_scenario(client, scenario["id"], node.base)
+                observed = run_scenario(client, scenario["id"], node.base, misbehaving)
             finally:
                 node.stop()
             problems = compare(scenario["expect"], observed)

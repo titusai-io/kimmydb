@@ -93,6 +93,34 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **The push answer gains an optional `ddl_held` field.** A member on an
   earlier version omits it, which reads as none held; that member still
   counts them in `ddl`. A mixed cluster confirms throughout a roll.
+- **The three clients report a write whose outcome is unknown as its own
+  error.** A write sent and never answered (a dropped connection, a reset, a
+  timeout once the request may have gone), or answered `500 outcome_unknown`,
+  may or may not have been applied: read it back before sending it again. It
+  was a transport error with `retry: elsewhere`, which invites exactly the
+  resend that applies a write twice. Now it is `Error::OutcomeUnknown` (Rust),
+  `OutcomeUnknown` (Python, not a `TransportError` subclass) and
+  `*OutcomeUnknownError` (Go, with `IsOutcomeUnknown`), with the retry class
+  `verify`. Only positive evidence that nothing was sent (a connection never
+  made, or a request write that failed) keeps a write's failure a transport
+  error. Reads, and writes the caller declares idempotent, are unchanged. See
+  [the retry table](docs/clients.md#retries-and-the-one-it-will-not-do-for-you).
+- **`retry: wait` is ridden out on the same node, writes included.** A node
+  answers `wait` only when it did nothing (a rate limit, a busy writer, a drop
+  still being purged), so each client now sends the request to that node
+  again after its `Retry-After` until a wait budget is spent (30 s per request
+  by default: `Builder::wait_budget`, `wait_budget=`, `WithWaitBudget`), then
+  moves to the next node. Before, a write on `wait` was returned to the
+  caller; for a read, the Rust client waited once and asked the same node
+  again, and the Python and Go clients waited once and moved on without
+  asking it again, so a single-endpoint client gave up after at most one
+  wait. The Rust client now reads `Retry-After: 0` as one second, as the
+  other two did.
+- **Rust client: `Error`, `Retry` and `ErrorCode` are `#[non_exhaustive]`.**
+  A `match` on any of them needs a wildcard arm. **Breaking for code that
+  matched exhaustively**; from now on a new variant is not. `Retry` gains
+  `Verify`, `ErrorCode` gains `OutcomeUnknown`, and `Error` gains
+  `OutcomeUnknown`.
 
 ### Fixed
 

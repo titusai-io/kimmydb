@@ -2,14 +2,16 @@ package kimmydb
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
 // Retry says what a client may do about a failure.
 //
-// Three-valued rather than a boolean because KimmyDB is leaderless: every node
-// accepts writes, so "ask a different node" is a real answer and the right one
-// for a failure local to the node that answered.
+// Several-valued rather than a boolean because KimmyDB is leaderless: every
+// node accepts writes, so "ask a different node" is a real answer and the right
+// one for a failure local to the node that answered. The set is open: a class
+// this package does not know reads as RetryNo.
 type Retry string
 
 const (
@@ -20,6 +22,9 @@ const (
 	RetryWait Retry = "wait"
 	// RetryElsewhere means a different node.
 	RetryElsewhere Retry = "elsewhere"
+	// RetryVerify means the request may already have been applied: read the
+	// target back before sending it again, unless it is idempotent.
+	RetryVerify Retry = "verify"
 )
 
 func parseRetry(value string) Retry {
@@ -28,6 +33,8 @@ func parseRetry(value string) Retry {
 		return RetryWait
 	case RetryElsewhere:
 		return RetryElsewhere
+	case RetryVerify:
+		return RetryVerify
 	default:
 		// An unknown class reads as `no`, the safe direction: a client that
 		// does not understand the advice does not act on it.
@@ -122,6 +129,38 @@ func (e *TransportError) Error() string {
 
 func (e *TransportError) Unwrap() error { return e.Err }
 
+// OutcomeUnknownError is a write that may or may not have been applied.
+//
+// Two things produce it. The server answered `500 outcome_unknown`: the
+// write's durability step began and failed, so it may be on disk, and if it is
+// it replicates. Or the request was sent and the connection ended with no
+// answer, which is the more common form: a node whose fsync fails stops
+// before it answers, and so does one that crashes. Either way the write must
+// not be treated as failed. Read the target back before sending it again,
+// unless the write is idempotent (docs/clients.md, "Retrying after an unknown
+// outcome").
+//
+// Err is the server's *APIError, or the transport's error.
+type OutcomeUnknownError struct {
+	Endpoint string
+	Err      error
+}
+
+func (e *OutcomeUnknownError) Error() string {
+	return fmt.Sprintf(
+		"the write to %s may or may not have been applied; read it back before sending it again: %v",
+		e.Endpoint, e.Err)
+}
+
+func (e *OutcomeUnknownError) Unwrap() error { return e.Err }
+
+// IsOutcomeUnknown reports whether err says a write may or may not have been
+// applied.
+func IsOutcomeUnknown(err error) bool {
+	var unknown *OutcomeUnknownError
+	return errors.As(err, &unknown)
+}
+
 // ErrNoNodeAvailable is returned when every endpoint was tried and none
 // answered.
 type ErrNoNodeAvailable struct {
@@ -142,6 +181,8 @@ func retryOf(err error) Retry {
 		return e.Retry
 	case *TransportError:
 		return RetryElsewhere
+	case *OutcomeUnknownError:
+		return RetryVerify
 	default:
 		return RetryNo
 	}

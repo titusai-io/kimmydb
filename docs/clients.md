@@ -146,10 +146,28 @@ not.
 
 | Failure | Reads | Writes |
 |---|---|---|
-| Transport — no answer at all | next node | returned to the caller |
+| Transport, before the request was sent (refused, a failed TLS handshake) | next node | returned to the caller: nothing was sent |
+| Transport, once the request may have been sent (dropped, reset, timed out) | next node | **outcome unknown**, returned to the caller |
 | `retry: elsewhere` | next node | returned to the caller |
-| `retry: wait` | one bounded wait, then the next node | returned to the caller |
+| `retry: wait` | the same node, after its `Retry-After`, until the wait budget is spent; then the next node | the same as a read: the node answers `wait` only when it did nothing |
+| `retry: verify` (`outcome_unknown`) | — | **outcome unknown**, returned to the caller |
 | `retry: no` | returned | returned |
+
+All three clients follow this table. **Outcome unknown** is its own error, never
+the transport error, because code that resends on a transport error must not
+resend this: `Error::OutcomeUnknown` (Rust, `is_outcome_unknown()`),
+`OutcomeUnknown` (Python), `*OutcomeUnknownError` (Go, `IsOutcomeUnknown`).
+Its retry class is `verify`, and what to do about it is
+[retrying after an unknown outcome](#retrying-after-an-unknown-outcome).
+**Only positive evidence counts as "not sent"**:
+a connection that was never made, or (Go, Python) a write of the request that
+failed. A failure with no evidence either way is unknown, so a write can be
+reported unknown when it was in fact never sent, and never the reverse.
+
+The **wait budget** is 30 seconds per request by default, spent across every
+node the request tries: `Builder::wait_budget` (Rust), `wait_budget=` (Python),
+`WithWaitBudget` (Go). A `Retry-After` of 0 or none is read as one second, and
+one over 30 as 30.
 
 A write can be moved to another node by declaring it idempotent —
 `Safety::Idempotent` — which is a claim only the caller can make. An insert
@@ -266,7 +284,9 @@ for document in db.documents("shop", "orders"):      # documents
 Errors are raised, not returned. `KimmyError` carries `.code`, `.retry`,
 `.status` and `.message`; `.code` is a **plain string** rather than an enum,
 because codes are additive and an enum would turn "a code I have not heard of"
-into an error in itself.
+into an error in itself. A write whose outcome is unknown raises
+`OutcomeUnknown`, deliberately **not** a `TransportError` subclass, carrying
+`.endpoint`, `.cause` and `.retry` (`Retry.VERIFY`).
 
 ### One thing that had to fight the idiom
 
@@ -324,7 +344,9 @@ for event, err := range db.Watch(...)     // events
 ```
 
 Errors are values, and `*APIError` carries `Status`, `Code`, `Retry` and
-`Message`. `Code` is a **plain string** rather than a set of constants, for the
+`Message`. A write whose outcome is unknown is an `*OutcomeUnknownError`, which
+`kimmydb.IsOutcomeUnknown(err)` recognizes through any wrapping; it unwraps to
+the node's `*APIError` or to the transport's error. `Code` is a **plain string** rather than a set of constants, for the
 same reason it is a string in Python: codes are additive, and making an
 unfamiliar one an error in itself is exactly what the retry class exists to
 prevent.

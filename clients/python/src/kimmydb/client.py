@@ -10,6 +10,7 @@ import httpx
 from .errors import (
     KimmyError,
     NoNodeAvailable,
+    OutcomeUnknown,
     ProtocolError,
     Retry,
     TransportError,
@@ -23,6 +24,14 @@ from .watch import ChangeStream
 #: reading it fails for a reason the client could have avoided; and not
 #: minutes, because it would spend most of a short lifetime refreshing.
 RENEW_BEFORE = 60.0
+
+#: The trace events that show a request's body was written in full. After one,
+#: a failure may come after the node received the request.
+_BODY_SENT = ("http11.send_request_body.complete", "http2.send_request_body.complete")
+
+#: The transport failures that say by their type that nothing was sent: the
+#: connection was never made (TLS included), or never taken from the pool.
+_NEVER_CONNECTED = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 class Client:
@@ -55,6 +64,7 @@ class Client:
         discover_nodes: bool = False,
         timeout: float = 30.0,
         verify: bool = True,
+        wait_budget: float = 30.0,
     ) -> None:
         self._endpoints: List[str] = [_normalize(endpoint)] + [
             _normalize(e) for e in endpoints
@@ -67,6 +77,9 @@ class Client:
         # obtain again.
         self._renew_at = float("inf") if token else 0.0
         self._http = httpx.Client(timeout=timeout, verify=verify)
+        # How long one request may spend on `retry: wait` answers, across
+        # every node it tries.
+        self._wait_budget = wait_budget
 
         if self._credentials:
             self._authenticate()
@@ -376,8 +389,15 @@ class Client:
         ``idempotent`` is the caller's claim that repeating the request cannot
         change the outcome. Reads set it; writes do not, because
         ``retry: elsewhere`` says *this node* did not answer, not that the work
-        did not happen — and no status distinguishes an insert that failed
-        before its commit from one that failed after it.
+        did not happen.
+
+        ``retry: wait`` is different: the node answers it only when it did
+        nothing, so any request, a write included, is sent to the same node
+        again after the delay its ``Retry-After`` gives, until ``wait_budget``
+        is spent; then to the next node, if there is one.
+
+        A write that may have been applied raises :class:`OutcomeUnknown`,
+        and is never sent again here.
         """
         self._authenticate()
         # GET is idempotent by definition, so a caller never has to say so.
@@ -386,12 +406,15 @@ class Client:
         tried: List[str] = []
         last: Optional[BaseException] = None
         relogged = False
+        waited = 0.0
 
         for endpoint in list(self._endpoints):
             tried.append(endpoint)
             while True:
                 try:
-                    body = self._send(endpoint, method, path, json)
+                    body = self._send(
+                        endpoint, method, path, json, idempotent=idempotent
+                    )
                     self._promote(endpoint)
                     return body
                 except (KimmyError, TransportError) as e:
@@ -414,11 +437,18 @@ class Client:
                         raise error from None
 
                 retry = error.retry
-                if retry is Retry.WAIT and idempotent:
-                    delay = min(getattr(error, "retry_after", None) or 1, 30)
-                    time.sleep(delay)
+                if retry is Retry.WAIT:
                     last = error
-                    break
+                    delay = min(
+                        getattr(error, "retry_after", None) or 1,
+                        30,
+                        self._wait_budget - waited,
+                    )
+                    if delay <= 0:
+                        break
+                    time.sleep(delay)
+                    waited += delay
+                    continue
                 if retry is Retry.ELSEWHERE and idempotent:
                     last = error
                     break
@@ -529,21 +559,39 @@ class Client:
         json: Any = None,
         *,
         token: Optional[str] = ...,  # type: ignore[assignment]
+        idempotent: bool = True,
     ) -> Any:
+        """One request to one node.
+
+        A write whose request failed after it was sent may have been applied,
+        so for a request that is not idempotent a transport failure is
+        :class:`OutcomeUnknown` unless there is positive evidence that it was
+        not sent (:func:`_not_sent`).
+        """
+        events: List[str] = []
         try:
             response = self._http.request(
-                method, f"{endpoint}{path}", json=json, headers=self._headers(token)
+                method,
+                f"{endpoint}{path}",
+                json=json,
+                headers=self._headers(token),
+                extensions={"trace": lambda name, info: events.append(name)},
             )
         except httpx.HTTPError as e:
-            raise TransportError(endpoint, e) from e
+            if idempotent or _not_sent(e, events):
+                raise TransportError(endpoint, e) from e
+            raise OutcomeUnknown(endpoint, e) from e
 
         if response.status_code >= 400:
             retry_after = response.headers.get("retry-after")
-            raise KimmyError.from_response(
+            error = KimmyError.from_response(
                 response.status_code,
                 _body(response),
                 int(retry_after) if retry_after and retry_after.isdigit() else None,
             )
+            if error.retry is Retry.VERIFY:
+                raise OutcomeUnknown(endpoint, error) from error
+            raise error
         if not response.content:
             return None
         try:
@@ -557,6 +605,20 @@ class Client:
         if self._endpoints and self._endpoints[0] == endpoint:
             return
         self._endpoints = [endpoint] + [e for e in self._endpoints if e != endpoint]
+
+
+def _not_sent(error: httpx.HTTPError, events: Sequence[str]) -> bool:
+    """Whether there is positive evidence that a failed request was not sent.
+
+    Either the failure's type says the connection was never made, or the trace
+    is known to be live for this request — it reported something — and never
+    reported the body written. No events at all is *not* evidence: a transport
+    that ignores the trace extension reports none, and reading its silence as
+    "not sent" would turn every dropped write back into a plain failure.
+    """
+    if isinstance(error, _NEVER_CONNECTED):
+        return True
+    return bool(events) and not any(name in _BODY_SENT for name in events)
 
 
 def _body(response: httpx.Response) -> Any:

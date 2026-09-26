@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! conformance list
-//! conformance run <scenario> <base-url> [dead-url]
+//! conformance run <scenario> <base-url> [dead-url] [misbehaving-url]
 //! ```
 //!
 //! Output is a single JSON object on stdout. Anything else — logs, progress —
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 /// Every scenario this driver implements. The runner checks this against the
 /// declared list, so a client that quietly stops covering one is a failure
 /// rather than a silence.
-const SCENARIOS: [&str; 18] = [
+const SCENARIOS: [&str; 21] = [
     "capabilities",
     "documents_round_trip",
     "unlimited_find_is_a_page",
@@ -44,6 +44,9 @@ const SCENARIOS: [&str; 18] = [
     "stale_resume_token_is_refused",
     "stale_write_is_typed",
     "array_filters_address_one_element",
+    "wait_is_ridden_out_on_one_node",
+    "rate_limited_write_is_ridden_out",
+    "unanswered_write_is_outcome_unknown",
 ];
 
 #[tokio::main]
@@ -58,7 +61,8 @@ async fn main() -> ExitCode {
             let scenario = args.get(1).cloned().unwrap_or_default();
             let base = args.get(2).cloned().unwrap_or_default();
             let dead = args.get(3).cloned().unwrap_or_else(|| "http://127.0.0.1:1".into());
-            match run(&scenario, &base, &dead).await {
+            let misbehaving = args.get(4).cloned().unwrap_or_else(|| dead.clone());
+            match run(&scenario, &base, &dead, &misbehaving).await {
                 Ok(observations) => {
                     println!("{observations}");
                     ExitCode::SUCCESS
@@ -70,7 +74,10 @@ async fn main() -> ExitCode {
             }
         }
         _ => {
-            eprintln!("usage: conformance list | conformance run <scenario> <base-url> [dead-url]");
+            eprintln!(
+                "usage: conformance list | conformance run <scenario> <base-url> [dead-url] \
+                 [misbehaving-url]"
+            );
             ExitCode::FAILURE
         }
     }
@@ -102,8 +109,78 @@ async fn seeded(client: &Client, n: i64) -> Result<(), String> {
     Ok(())
 }
 
-async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
+/// How a call that may fail failed, in the suite's words.
+fn outcome<T>(result: kimmy_client::Result<T>) -> String {
+    match result {
+        Ok(_) => "succeeded".into(),
+        Err(e) if e.is_outcome_unknown() => "outcome_unknown".into(),
+        Err(kimmy_client::Error::Transport { .. }) => "transport".into(),
+        Err(e) => e.code_str().unwrap_or("other").to_string(),
+    }
+}
+
+/// A client that sends any token and never logs in, for the misbehaving server
+/// and the dead address, which check none.
+async fn tokened(base: &str) -> Result<Client, String> {
+    Client::builder(base).token("any").connect().await.map_err(|e| e.to_string())
+}
+
+async fn run(scenario: &str, base: &str, dead: &str, misbehaving: &str) -> Result<Value, String> {
     match scenario {
+        "wait_is_ridden_out_on_one_node" => {
+            let client = connect(base).await?;
+            seeded(&client, 0).await?;
+            for start in [0i64, 1000] {
+                let documents: Vec<Value> =
+                    (start..start + 1000).map(|i| json!({ "_id": i, "qty": i })).collect();
+                client
+                    .insert_many("shop", "orders", &documents)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            drop_collection(&client).await?;
+            let started = std::time::Instant::now();
+            seeded(&client, 0).await?;
+            Ok(json!({
+                "created": true,
+                "waited": started.elapsed() >= std::time::Duration::from_millis(900),
+            }))
+        }
+
+        "rate_limited_write_is_ridden_out" => {
+            let client = connect(base).await?;
+            seeded(&client, 0).await?;
+            let started = std::time::Instant::now();
+            let mut inserted = 0;
+            for id in 0..4 {
+                client
+                    .insert("shop", "orders", &json!({ "_id": id }))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                inserted += 1;
+            }
+            Ok(json!({
+                "inserted": inserted,
+                "waited": started.elapsed() >= std::time::Duration::from_millis(900),
+            }))
+        }
+
+        "unanswered_write_is_outcome_unknown" => {
+            let fake = tokened(misbehaving).await?;
+            let refused = tokened(dead).await?;
+            Ok(json!({
+                "unanswered_write": outcome(fake.insert("shop", "unanswered", &json!({ "_id": 1 })).await),
+                "unanswered_read": outcome(fake.request(
+                    Method::Get,
+                    "/v1/db/shop/coll/unanswered/docs/1",
+                    None,
+                    Safety::Idempotent,
+                ).await),
+                "answered_unknown": outcome(fake.insert("shop", "unknown", &json!({ "_id": 1 })).await),
+                "refused_write": outcome(refused.insert("shop", "orders", &json!({ "_id": 1 })).await),
+            }))
+        }
+
         "capabilities" => {
             let client = connect(base).await?;
             let version = client.version().await.map_err(|e| e.to_string())?;
@@ -370,7 +447,10 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
             let client = connect(base).await?;
             seeded(&client, 1).await?;
             drop_collection(&client).await?;
-            recreated(&client).await?;
+            // Refused `collection_purging`, `retry: wait`, until the drop's
+            // purge is done (ADR-189); the client waits that out on the same
+            // node.
+            seeded(&client, 0).await?;
             client
                 .insert("shop", "orders", &json!({ "_id": 99 }))
                 .await
@@ -467,7 +547,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
             stream.close().await;
 
             drop_collection(&client).await?;
-            recreated(&client).await?;
+            seeded(&client, 0).await?;
 
             let refused = client
                 .watch("shop", "orders", WatchOptions::new().resume_after(token))
@@ -479,37 +559,6 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
         }
 
         other => Err(format!("unknown scenario {other:?}")),
-    }
-}
-
-/// Create `shop.orders` again after dropping it, waiting out the drop's purge:
-/// until that is done the name is refused `503 collection_purging`,
-/// `retry: wait`, with a `Retry-After` (ADR-189). On a tiny collection the purge
-/// usually wins the race, which is why recreating at once passed until it
-/// didn't.
-async fn recreated(client: &Client) -> Result<(), String> {
-    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let created = client
-            .request(
-                Method::Post,
-                "/v1/db/shop/collections",
-                Some(json!({ "name": "orders" })),
-                Safety::Idempotent,
-            )
-            .await;
-        match created {
-            Err(kimmy_client::Error::Api {
-                code: ErrorCode::CollectionPurging,
-                retry_after,
-                ..
-            }) if std::time::Instant::now() < give_up => {
-                let wait = std::time::Duration::from_secs(retry_after.unwrap_or(1))
-                    .min(give_up.saturating_duration_since(std::time::Instant::now()));
-                tokio::time::sleep(wait).await;
-            }
-            other => return other.map(|_| ()).map_err(|e| e.to_string()),
-        }
     }
 }
 
@@ -537,6 +586,9 @@ fn retry_name(retry: Retry) -> &'static str {
         Retry::No => "no",
         Retry::Wait => "wait",
         Retry::Elsewhere => "elsewhere",
+        Retry::Verify => "verify",
+        // The set is open: a class this driver does not know yet.
+        _ => "unknown",
     }
 }
 
