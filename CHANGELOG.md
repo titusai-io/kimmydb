@@ -66,9 +66,11 @@ longer walks the arrival index from its start.**
   answered. Just after a restart, on a multi-gigabyte store, that took over
   30 s, on an async worker, with nothing logged. The walk now runs off the
   workers, and so do the stream's replay reads after the upgrade. A walk over
-  1 s is logged at `info`, and one over 10 s at `warn`: `a change stream was
-  slow to find where it starts`, with `elapsed_ms`, `token_kind` and
-  `rows_examined`. The walk itself takes as long as before; see
+  1 s is logged at `info` as `a change stream was slow to find where it
+  starts`, and one over 10 s at `warn` as `a change stream took over 10 s to
+  find where it starts; a client waiting on its upgrade may have given up`,
+  both with `elapsed_ms`, `token_kind` and `rows_examined`. The walk itself
+  takes as long as before; see
   [Change streams](docs/change-streams.md#resuming-on-another-member). The
   embedding worker's backfill also no longer lists a collection's documents on
   a worker. ADR-153's addendum of 2026-09-26.
