@@ -23,6 +23,15 @@ use crate::engine::{WriteTxn, WriterHolder};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 
+/// What turning vectors off did; see [`Engine::disable_vectors_reporting`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VectorsOff {
+    /// The configuration was on and this call turned it off.
+    pub disabled: bool,
+    /// This call dropped the stored vectors.
+    pub dropped_vectors: bool,
+}
+
 /// One document's chunk set, encoded for its shadow collection ahead of any
 /// writer being taken.
 ///
@@ -272,7 +281,68 @@ impl crate::Engine {
     /// Keeping them by default means re-enabling with the same settings does
     /// not force a full re-embed, which for a remote provider is a real cost.
     pub fn disable_vectors(&self, db: &str, collection: &str, drop_vectors: bool) -> Result<bool> {
-        self.disable_vectors_inner(db, collection, drop_vectors, true, &|_| false)
+        Ok(self.disable_vectors_reporting(db, collection, drop_vectors)?.disabled)
+    }
+
+    /// [`Self::disable_vectors`], saying what this call did: whether it turned
+    /// the configuration off, and whether it dropped the stored vectors.
+    ///
+    /// With `drop_vectors` both happen in one transaction (ADR-192), so no
+    /// answer can report one without the other having landed. A call on a
+    /// collection whose vectors are already off drops a shadow that is still
+    /// there — what a partial disable by an earlier build left — and reports
+    /// that it did.
+    pub fn disable_vectors_reporting(
+        &self,
+        db: &str,
+        collection: &str,
+        drop_vectors: bool,
+    ) -> Result<VectorsOff> {
+        let off = self.disable_vectors_inner(db, collection, drop_vectors, true, &|_| false)?;
+        if off.disabled || !drop_vectors {
+            return Ok(off);
+        }
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::LeftoverShadow);
+        let dropped_vectors = self.drop_leftover_shadow(db, collection)?;
+        Ok(VectorsOff { disabled: false, dropped_vectors })
+    }
+
+    /// Drop the shadow of a collection whose vectors are off, in one
+    /// transaction that decides it under the writer: only while the parent
+    /// still stands with its configuration off. Decided outside it, a
+    /// configuration turned back on in between — which adopts the kept
+    /// shadow — lost its vectors, leaving vectors on and the shadow gone.
+    fn drop_leftover_shadow(&self, db: &str, collection: &str) -> Result<bool> {
+        let shadow = vector_meta::shadow_name(collection);
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        let off = {
+            let collections = txn.open_table(crate::tables::COLLECTIONS)?;
+            match collections.get((db, collection))? {
+                Some(raw) => {
+                    let parent: CollectionMeta = serde_json::from_slice(raw.value())?;
+                    parent.vector.is_none()
+                }
+                // A parent gone takes its shadow with it; nothing is left to
+                // this call.
+                None => false,
+            }
+        };
+        let burial = if off { self.bury_in_txn(&txn, db, &shadow, None) } else { Ok(None) };
+        let burial = match burial {
+            Ok(Some(burial)) => burial,
+            Ok(None) => {
+                txn.abort()?;
+                return Ok(false);
+            }
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        txn.commit()?;
+        self.finish_burial(db, &shadow, burial);
+        Ok(true)
     }
 
     pub(crate) fn disable_vectors_inner(
@@ -282,7 +352,7 @@ impl crate::Engine {
         drop_vectors: bool,
         log: bool,
         history: &dyn Fn(&CollectionMeta) -> bool,
-    ) -> Result<bool> {
+    ) -> Result<VectorsOff> {
         // **A loop, not a self-call.** Every retry passes the same arguments, so
         // a lost race is a `continue`. It was a self-call, which made an
         // unbounded retry a stack overflow — and a bound low enough to protect
@@ -298,10 +368,10 @@ impl crate::Engine {
             // As `configure_vectors_inner`: turning vectors off for a life that
             // has since been dropped and recreated here is history.
             if history(&meta) {
-                return Ok(false);
+                return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
             if meta.vector.is_none() {
-                return Ok(false);
+                return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
 
             meta.vector = None;
@@ -332,19 +402,35 @@ impl crate::Engine {
             } else {
                 None
             };
+            // The stored vectors go in the same transaction, buried as a drop
+            // of the shadow by name, with its own tombstone and its own
+            // `DropCollection` entry, so a peer drops its copy too. Its own
+            // commit used to follow this one, and a failure between the two
+            // answered an error for a configuration change that had landed
+            // (ADR-192).
+            let shadow = if drop_vectors {
+                let burial =
+                    self.bury_in_txn(&txn, db, &vector_meta::shadow_name(collection), None);
+                match burial {
+                    Ok(burial) => burial,
+                    Err(e) => {
+                        txn.abort()?;
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
             txn.commit()?;
             if let Some(entry) = logged {
                 self.publish(vec![entry]);
             }
-
-            // Deliberately after the config change and not replicated: discarding
-            // the stored vectors is a local reclamation choice, and the shadow
-            // collection is ordinary data that reconciles like any other.
-            if drop_vectors {
-                self.drop_collection(db, &vector_meta::shadow_name(collection))?;
+            let dropped_vectors = shadow.is_some();
+            if let Some(burial) = shadow {
+                self.finish_burial(db, &vector_meta::shadow_name(collection), burial);
             }
             info!(db, collection, drop_vectors, "disabled auto-embedding");
-            return Ok(true);
+            return Ok(VectorsOff { disabled: true, dropped_vectors });
         }
         // Unreachable under contention: see `MAX_DEFINITION_RETRIES`.
         Err(crate::Engine::retries_exhausted_error(db, collection))
@@ -771,7 +857,7 @@ fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {
 
 #[cfg(test)]
 mod tests {
-    use kimmy_core::{ProviderConfig, vector_meta};
+    use kimmy_core::{OpKind, ProviderConfig, vector_meta};
 
     use super::*;
     use crate::Engine;
@@ -984,6 +1070,72 @@ mod tests {
         // Nothing should have been created by the failed attempt.
         assert!(engine.get_collection("app", "docs.__vectors").is_err());
         assert!(engine.get_collection("app", "docs").unwrap().vector.is_none());
+    }
+
+    #[test]
+    fn turning_vectors_off_and_dropping_them_is_one_commit_and_a_resend_says_it_did_nothing() {
+        // Two commits used to follow each other, and a failure between them
+        // answered an error over a configuration change that had landed
+        // (ADR-192). The shadow now goes in the configuration's transaction.
+        let (engine, _dir) = engine();
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        let mut rx = engine.subscribe();
+
+        let before = engine.commits();
+        let off = engine.disable_vectors_reporting("app", "docs", true).unwrap();
+        assert_eq!(off, VectorsOff { disabled: true, dropped_vectors: true });
+        assert_eq!(engine.commits() - before, 1, "the configuration and the shadow together");
+        assert!(engine.get_collection("app", "docs.__vectors").is_err(), "the shadow is gone");
+
+        // Both changes replicate: the configuration's entry and the shadow's
+        // own drop, so a peer drops its copy of the vectors.
+        let mut kinds = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            kinds.push(entry.kind);
+        }
+        assert_eq!(kinds, vec![OpKind::ConfigureVectors, OpKind::DropCollection]);
+
+        let resend = engine.disable_vectors_reporting("app", "docs", true).unwrap();
+        assert_eq!(resend, VectorsOff { disabled: false, dropped_vectors: false });
+        assert_eq!(engine.commits() - before, 1, "a resend commits nothing");
+    }
+
+    #[test]
+    fn a_resend_drops_a_shadow_an_earlier_partial_disable_left() {
+        // What a failure between the two commits left behind before ADR-192:
+        // the configuration off and the vectors still stored. A resend with
+        // `drop_vectors` finishes the job and says so.
+        let (engine, _dir) = engine();
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        assert!(engine.disable_vectors("app", "docs", false).unwrap());
+        assert!(engine.get_collection("app", "docs.__vectors").is_ok());
+
+        let off = engine.disable_vectors_reporting("app", "docs", true).unwrap();
+        assert_eq!(off, VectorsOff { disabled: false, dropped_vectors: true });
+        assert!(engine.get_collection("app", "docs.__vectors").is_err());
+    }
+
+    #[test]
+    fn a_resend_does_not_drop_the_shadow_of_vectors_turned_back_on_meanwhile() {
+        // The resend used to find the configuration off, then drop the shadow
+        // in a transaction of its own. A configuration turned back on between
+        // the two adopts the kept shadow, and lost it: vectors on, shadow
+        // gone. The drop is now decided under the writer.
+        let (engine, _dir) = engine();
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        assert!(engine.disable_vectors("app", "docs", false).unwrap());
+        let engine = std::sync::Arc::new(engine);
+        let competitor = std::sync::Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::LeftoverShadow, move || {
+            competitor.configure_vectors("app", "docs", config(8)).unwrap();
+        });
+        let off = engine.disable_vectors_reporting("app", "docs", true).unwrap();
+        assert_eq!(off, VectorsOff { disabled: false, dropped_vectors: false });
+        assert!(engine.get_collection("app", "docs").unwrap().vector.is_some());
+        assert!(
+            engine.get_collection("app", "docs.__vectors").is_ok(),
+            "the shadow of vectors that are on was dropped"
+        );
     }
 
     #[test]

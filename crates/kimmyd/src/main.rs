@@ -163,6 +163,11 @@ fn main() -> Result<()> {
                 .build()
                 .context("building the tokio runtime")?;
             let outcome = runtime.block_on(node::run(config));
+            // A shutdown that gave up waiting for a write (ADR-192) leaves
+            // that write's thread blocked; the runtime is not waited on for it.
+            let writes_open = outcome
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<node::WritesStillOpen>().is_some());
             // Dropped *after* `node::run` returns, which is after every
             // background task has been aborted — the same shutdown discipline
             // the end of `node::run` already follows, for the same reason: a
@@ -170,6 +175,13 @@ fn main() -> Result<()> {
             // would throw away the last few seconds of spans, which is exactly
             // the part anybody debugging a shutdown wants to see.
             drop(telemetry_guard);
+            if writes_open {
+                runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+                if let Err(e) = &outcome {
+                    eprintln!("Error: {e:#}");
+                }
+                std::process::exit(kimmy_task::EXIT_UNCLEAN_SHUTDOWN);
+            }
             outcome
         }
     }

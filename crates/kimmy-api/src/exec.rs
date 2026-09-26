@@ -237,11 +237,14 @@ pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value
         .filter(|c| kimmy_core::vector_meta::is_shadow(&c.name))
         .map(|c| c.id)
         .collect();
-    let dropped = kimmy_storage::blocking(|| state.engine.drop_database(db))?;
+    let dropped = kimmy_storage::blocking(|| state.engine.drop_database(db));
+    // Forgotten whether or not every burial landed: a drop that stopped part
+    // way has still taken some of them (ADR-192), and forgetting a graph
+    // whose collection still stands costs a rebuild, never a wrong answer.
     for shadow in shadows {
         state.vectors.invalidate(shadow);
     }
-    Ok(json!({ "dropped": dropped }))
+    Ok(json!({ "dropped": dropped? }))
 }
 
 pub fn drop_collection(

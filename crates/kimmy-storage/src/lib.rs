@@ -50,7 +50,7 @@ pub use engine::{
     WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot, blocking,
     metered_writer_wait, with_write_wait_budget,
 };
-pub use error::{Result, StorageError};
+pub use error::{Applied, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use hold_meter::{
@@ -69,7 +69,7 @@ pub use sync::{
     EntryWait, MarkedRange, PullTiming, SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to,
     lacks_collected, lag_behind_ms, lag_beyond_horizon_ms,
 };
-pub use vectors::VectorWrite;
+pub use vectors::{VectorWrite, VectorsOff};
 pub use watch::{
     ChangeEvent, ChangeStream, InvalidateReason, OplogWindow, WatchOptions, WatchScope,
 };

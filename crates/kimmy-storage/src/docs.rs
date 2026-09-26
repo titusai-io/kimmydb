@@ -133,6 +133,50 @@ impl WriteScope<'_> {
         Ok(outcome)
     }
 
+    /// [`Engine::insert`], into this scope's transaction.
+    pub fn insert(&mut self, coll: &CollectionMeta, doc: Document) -> Result<DocId> {
+        self.refuse_if_poisoned()?;
+        let (id, entry) =
+            self.engine.insert_in_txn(&self.txn, coll, doc).map_err(|e| self.poison(e))?;
+        self.wrote = true;
+        self.entries.push(entry);
+        Ok(id)
+    }
+
+    /// [`Engine::get`], read in this scope's transaction: under the writer,
+    /// so nothing can change the document between this read and a write of
+    /// it in the same scope, and seeing what the scope has already written.
+    pub fn get(&self, coll: &CollectionMeta, id: &DocId) -> Result<Option<Document>> {
+        let key = doc_key(id)?;
+        let docs = self.txn.open_table(tables::DOCS)?;
+        match docs.get((coll.id.0, key.as_slice()))? {
+            Some(raw) => Ok(codec::decode_doc_record(raw.value())?.document()?),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Engine::for_each_doc`], read in this scope's transaction, as
+    /// [`Self::get`] is. Return `false` from `f` to stop.
+    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, mut f: F) -> Result<()>
+    where
+        F: FnMut(DocId, Document) -> Result<bool>,
+    {
+        let docs = self.txn.open_table(tables::DOCS)?;
+        for entry in docs.range(doc_range_after(coll.id, None))? {
+            let (_, value) = entry?;
+            let record = codec::decode_doc_record(value.value())?;
+            if record.deleted {
+                continue;
+            }
+            let doc: Document = bson::deserialize_from_slice(&record.body)?;
+            let id = extract_id(&doc)?;
+            if !f(id, doc)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// [`Engine::delete`], into this scope's transaction.
     pub fn delete(&mut self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
         self.refuse_if_poisoned()?;

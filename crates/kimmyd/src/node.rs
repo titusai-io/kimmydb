@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use kimmy_auth::{JwkSet, OidcVerifier, TokenIssuer, UserStore};
 use kimmy_storage::{Engine, RetentionPolicy};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthConfig, Config, OidcConfig};
 use crate::lifecycle;
@@ -110,21 +110,20 @@ pub async fn run(config: Config) -> Result<()> {
             return Err(e.into());
         }
     };
-    let outcome = start_and_serve(config).await;
-    match &outcome {
-        Ok(()) => {
-            lifecycle::record_exit(&data_dir, lifecycle::Exit::Shutdown);
-            info!("shutdown complete");
-        }
-        Err(e) if lifecycle::store_in_use(e) => {
-            lifecycle::leave(&data_dir);
-            info!(error = format!("{e:#}"), "exiting on an error");
-        }
-        Err(e) => {
-            lifecycle::record_error(&data_dir, &format!("{e:#}"));
-            info!(error = format!("{e:#}"), "exiting on an error");
-        }
-    }
+    finish(&data_dir, start_and_serve(config).await, WRITES_CLOSE_CAP)
+}
+
+/// The end of a run: close the engine to writes, then record how the run
+/// ended (ADR-192), in that order and in one place, so no path can write the
+/// marker first.
+///
+/// The drain ending does not end its requests — a connection outlives the
+/// server that accepted it, and an MCP tool runs in a task of its own — so
+/// without the close a handler could commit after the marker says the run
+/// ended cleanly. A write still open at `cap` means no clean marker.
+fn finish(data_dir: &std::path::Path, served: Result<Arc<Engine>>, cap: Duration) -> Result<()> {
+    let outcome = served.and_then(|engine| close_for_exit(&engine, cap));
+    record_outcome(data_dir, &outcome);
     outcome
 }
 
@@ -146,7 +145,7 @@ const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
 const DROP_PURGER_RETRY_FIRST: Duration = Duration::from_secs(1);
 const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
 
-async fn start_and_serve(config: Config) -> Result<()> {
+async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
     })?;
@@ -705,7 +704,15 @@ async fn start_and_serve(config: Config) -> Result<()> {
              are read, write, sync_data, set_len and len"
         );
     }
-    let served = serve(listener, app, tls, shutdown.clone()).await;
+    // At the drain deadline, a request that commits in more than one
+    // transaction stops before its next one (ADR-192): not at the signal, so
+    // one that can finish inside the drain does.
+    let stopping = {
+        let engine = Arc::clone(&engine);
+        move || engine.set_stopping()
+    };
+    let served =
+        serve(listener, app, tls, announced(shutdown.clone()), DRAIN_TIMEOUT, stopping).await;
     // Before the aborts below, and before returning an error: from here on a
     // supervised task ending is a stop, not a death. `serve` has already
     // announced it on the signal path; this covers the path where serving
@@ -765,12 +772,73 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // an aborted delivery is redelivered rather than lost.
     webhook_handle.abort();
 
-    // `run` writes the exit marker and says "shutdown complete", after this
-    // returns, so the last line of the log is the last thing done.
-    Ok(())
+    // `run` closes the engine to writes and then writes the exit marker, in
+    // that order, in `finish`.
+    Ok(engine)
 }
 
-/// How long in-flight requests get to finish once shutdown begins.
+/// Close the engine to writes, waiting up to `cap` for one in progress; an
+/// error when it did not end in time, which `run` records as no clean exit.
+fn close_for_exit(engine: &Engine, cap: Duration) -> Result<()> {
+    if kimmy_storage::blocking(|| engine.close_writes(cap)) {
+        Ok(())
+    } else {
+        Err(WritesStillOpen.into())
+    }
+}
+
+/// How long a shutdown waits, after the drain, for a write transaction still
+/// in progress to end before it gives up on a clean exit (ADR-192).
+const WRITES_CLOSE_CAP: Duration = Duration::from_secs(10);
+
+/// A write transaction was still in progress `WRITES_CLOSE_CAP` after the
+/// drain ended. The run does not record a clean exit: the next start reads
+/// it as one that did not shut down cleanly, which it may not have.
+#[derive(Debug)]
+pub struct WritesStillOpen;
+
+impl std::fmt::Display for WritesStillOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a write was still in progress {} s after the shutdown drain ended, or the last \
+             flush of commits waiting to be made durable failed; exiting without recording a \
+             clean exit",
+            WRITES_CLOSE_CAP.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for WritesStillOpen {}
+
+/// Record how this run ended, from what serving it returned (ADR-147).
+///
+/// A shutdown whose writes did not close in time records nothing: the marker's
+/// absence is what tells the next start the run did not end cleanly, and a
+/// write may still have been committing as the process went.
+fn record_outcome(data_dir: &std::path::Path, outcome: &Result<()>) {
+    match outcome {
+        Ok(()) => {
+            lifecycle::record_exit(data_dir, lifecycle::Exit::Shutdown);
+            info!("shutdown complete");
+        }
+        Err(e) if e.downcast_ref::<WritesStillOpen>().is_some() => {
+            error!(error = format!("{e:#}"), "exiting without a clean-exit marker");
+        }
+        Err(e) if lifecycle::store_in_use(e) => {
+            lifecycle::leave(data_dir);
+            info!(error = format!("{e:#}"), "exiting on an error");
+        }
+        Err(e) => {
+            lifecycle::record_error(data_dir, &format!("{e:#}"));
+            info!(error = format!("{e:#}"), "exiting on an error");
+        }
+    }
+}
+
+/// How long in-flight requests get to finish once shutdown begins, on both
+/// the plain and the TLS listener. At its end a request that commits in more
+/// than one transaction stops before its next one (ADR-192).
 ///
 /// Only reached when a request is still running; an idle server stops
 /// immediately, which is what keeps `docker stop` returning in milliseconds.
@@ -1223,12 +1291,40 @@ async fn serve(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     tls: Option<RustlsConfig>,
-    shutdown: kimmy_task::Shutdown,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Duration,
+    on_drain_deadline: impl FnOnce() + Send + 'static,
 ) -> Result<()> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
+    // The drain begins at `signal` and ends `drain` after it, on both paths. Plain HTTP used to wait for every in-flight request
+    // however long it took, so a request that never finished held the
+    // process up until the supervisor killed it (ADR-192).
+    let (drain_begun, drain_started) = tokio::sync::oneshot::channel::<()>();
+    let signal = async move {
+        signal.await;
+        let _ = drain_begun.send(());
+    };
+    let deadline = async move {
+        // No signal ever came: serving itself ended, and there is no drain.
+        if drain_started.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(drain).await;
+    };
+
     let Some(tls) = tls else {
-        axum::serve(listener, service).with_graceful_shutdown(announced(shutdown.clone())).await?;
+        let serving = axum::serve(listener, service).with_graceful_shutdown(signal).into_future();
+        tokio::select! {
+            served = serving => served?,
+            () = deadline => {
+                on_drain_deadline();
+                warn!(
+                    drain_secs = drain.as_secs(),
+                    "requests still in flight at the drain deadline were cut off"
+                );
+            }
+        }
         return Ok(());
     };
 
@@ -1246,11 +1342,15 @@ async fn serve(
     // finish during the drain, which is exactly what a supervisor would cut short.
     tokio::spawn({
         let handle = handle.clone();
-        let shutdown = shutdown.clone();
         async move {
-            announced(shutdown).await;
-            handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
+            signal.await;
+            handle.graceful_shutdown(Some(drain));
         }
+    });
+    // UNSUPERVISED: the drain deadline, which acts once and only during shutdown.
+    tokio::spawn(async move {
+        deadline.await;
+        on_drain_deadline();
     });
 
     axum_server::from_tcp_rustls(std_listener, tls)
@@ -2187,6 +2287,97 @@ mod tests {
         assert_ne!(stamps(&cert, &key).await, present);
     }
 
+    /// A write in progress at the end of the drain delays the clean-exit
+    /// marker until it ends, and one that outlasts the cap means no clean
+    /// marker at all (ADR-192): the marker must never be written while a
+    /// commit can still land.
+    #[test]
+    fn the_clean_exit_marker_waits_for_the_write_in_progress_and_is_withheld_past_the_cap() {
+        let hold = |engine: &Arc<Engine>, for_: Duration| {
+            let (held, is_held) = std::sync::mpsc::channel();
+            let engine = Arc::clone(engine);
+            std::thread::spawn(move || {
+                let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+                held.send(()).unwrap();
+                std::thread::sleep(for_);
+                drop(guard);
+            });
+            is_held.recv().unwrap();
+        };
+
+        // Past the cap: an error, and no marker.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        hold(&engine, Duration::from_secs(2));
+        let outcome = finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_millis(200));
+        assert!(outcome.is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some()));
+        assert!(!marker.exists(), "a clean-exit marker was written while a write could land");
+
+        // Inside the cap: the marker waits for the write, and is written.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        hold(&engine, Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250), "the marker did not wait");
+        assert!(marker.exists(), "a clean shutdown recorded no marker");
+        assert!(
+            engine.create_collection("db", "c").is_err(),
+            "the engine still took a write after the marker"
+        );
+    }
+
+    /// The plain listener's drain is bounded, and the multi-transaction stop
+    /// comes at its end, not at the signal (ADR-192): a request that never
+    /// finishes no longer holds the process up, and one that can finish
+    /// inside the drain is not stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_plain_drain_is_bounded_and_the_stop_comes_at_its_end() {
+        async fn forever() -> &'static str {
+            std::future::pending::<()>().await;
+            "never"
+        }
+        let app = axum::Router::new().route("/forever", axum::routing::get(forever));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drain = Duration::from_millis(400);
+        let served = tokio::spawn({
+            let stopped = Arc::clone(&stopped);
+            serve(
+                listener,
+                app,
+                None,
+                async move {
+                    let _ = signalled.await;
+                },
+                drain,
+                move || stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+
+        // A request in flight that will never finish.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET /forever HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        signal.send(()).unwrap();
+        tokio::time::sleep(drain / 2).await;
+        assert!(
+            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "the stop came at the signal, before the drain had run"
+        );
+        tokio::time::timeout(drain * 4, served)
+            .await
+            .expect("the drain did not end at its deadline")
+            .unwrap()
+            .unwrap();
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "no stop at the deadline");
+    }
+
     /// Serve a router that reports the caller's address, and return where it is.
     async fn serve_echoing_peer(tls: Option<RustlsConfig>) -> SocketAddr {
         async fn peer(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
@@ -2198,7 +2389,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             // Nothing shuts this down: the test drops it when it is finished.
-            let _ = serve(listener, app, tls, kimmy_task::Shutdown::new()).await;
+            let signal = std::future::pending::<()>();
+            let _ = serve(listener, app, tls, signal, DRAIN_TIMEOUT, || {}).await;
         });
         addr
     }

@@ -248,16 +248,24 @@ pub async fn disable_vectors(
     // Resolved *before* the call: dropping the vectors also drops the shadow
     // collection, and afterwards there is no id left to forget the graph under.
     let shadow = state.engine.vector_collection(&db, &coll).ok().flatten().map(|s| s.id);
-    // With `drop_vectors`, a drop of the shadow collection: off the worker.
-    let disabled =
-        kimmy_storage::blocking(|| state.engine.disable_vectors(&db, &coll, q.drop_vectors))?;
+    // With `drop_vectors`, a burial of the shadow collection in the same
+    // transaction as the configuration (ADR-192): off the worker.
+    let off = kimmy_storage::blocking(|| {
+        state.engine.disable_vectors_reporting(&db, &coll, q.drop_vectors)
+    })?;
     if let Some(id) = shadow {
         state.vectors.invalidate(id);
     }
-    if disabled {
+    // Recorded whenever this call changed something: turning the
+    // configuration off, or dropping vectors a partial disable left behind.
+    if off.disabled {
         crate::audit::record_vectors(auth.principal(), "DisableVectors", &db, &coll, None);
+    } else if off.dropped_vectors {
+        crate::audit::record_vectors(auth.principal(), "DropVectors", &db, &coll, None);
     }
-    Ok(Json(json!({ "disabled": disabled, "droppedVectors": q.drop_vectors })))
+    // What this call did, not what it asked for: a disable sent again finds
+    // nothing to turn off, and drops vectors only if some were left.
+    Ok(Json(json!({ "disabled": off.disabled, "droppedVectors": off.dropped_vectors })))
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **A request that was partly applied says so, and says how much.** A request
+  that commits in more than one transaction — an `update` or `delete` with
+  `multi: true`, and a database drop — and fails after its first commit is
+  answered **`500 partially_applied`**, `retry: verify`, with what landed in
+  `applied` (`matched`, `modified`, `commits` and `in_doubt`; for a drop,
+  `dropped`) and why the rest did not in `cause`. Both are fields beside
+  `error`, `message` and `retry`, which are unchanged. It was answered with
+  the later failure alone: `503 timeout`, `retry: wait`, "nothing was
+  written", over chunks already committed, and a client that retried it
+  applied them twice. Over MCP it is a tool result, as `outcome_unknown` is.
+  **Never resend a multi-document write automatically.** See
+  [a request that was partly applied](docs/http-api.md#a-request-that-was-partly-applied),
+  which also gives the marker that makes a `$inc` over many documents safe to
+  send again.
 - **A write whose outcome is unknown is answered as unknown.** A write whose
   durability step began and then failed may have happened: after a failed
   fsync the pages can survive the repair on the next start, and the write
@@ -66,6 +80,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **The plain HTTP listener's shutdown drain is bounded at 10 seconds**, as the
+  TLS listener's always was. From the signal, requests in flight get 10 s to
+  finish; then the node stops waiting for them, and the plain listener logs
+  `requests still in flight at the drain deadline were cut off` at `WARN`. It
+  waited for every request in flight with no limit, so one that never finished
+  held the process until its supervisor killed it. At the same deadline a
+  request that commits in more than one transaction stops before its next one
+  and is answered `partially_applied`.
+- **A shutdown closes the storage to writes before it records a clean exit.**
+  After the drain, a write that begins is refused with the new code
+  **`503 node_stopping`**, `retry: elsewhere`, nothing written, and one in progress is waited for, up to 10 s; the clean-exit
+  marker is written only then. Commits waiting on the `coalesced` barrier are
+  flushed by the close itself. A write still in progress after that means no
+  clean-exit marker, logged `exiting without a clean-exit marker` at `ERROR`,
+  exit status **75**, and a next start that reports an unclean shutdown. A shutdown can therefore take up
+  to about 20 s: give the supervisor a grace period of 25 s or more. See
+  [Operations](docs/operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
+- **Once a `multi: true` update or delete, or a database drop, has committed
+  its first transaction, the rest wait for the writer with no time limit.**
+  They gave up after `server.request_timeout_secs`, as a request that has not
+  yet written anything still does. A busy writer no longer splits a request.
 - **A member whose `cluster_secret` differs is now logged as an
   authentication failure when it connects.** It hangs up on reading this
   node's proof, which was logged at `debug` as an ordinary disconnect. It is
@@ -96,6 +131,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A role edit, or an edit to a user, no longer undoes a concurrent edit to
+  the same user.** Each read the user record outside the writer and wrote it
+  back whole, so a role's grants changed a moment after an administrator
+  disabled a holder re-enabled that account, and two edits to one user each
+  undid the other. Each now reads the record in the transaction that writes
+  it. **A role delete or grant change is now one transaction** with every
+  holder's token bump: a failure part way left some holders with tokens
+  carrying the old grants.
+- **Turning vectors off with `drop_vectors=true` is one transaction.** The
+  configuration change and the vectors' drop were two, and a failure between
+  them answered an error for a change that had landed, and skipped its audit
+  record. `droppedVectors` now says whether this call dropped them; it echoed
+  the query parameter, so a call sent again answered `true` having done
+  nothing.
+- **A webhook's registration and its starting point are one transaction.** The
+  starting point was written after the subscription, and a failure there was
+  logged and answered `200`, leaving a subscription that replayed the retained
+  history.
+- **A database drop no longer removes the database from under a collection
+  created while it ran.** Its last step, removing the database row, is now
+  decided under the writer and only while the database holds nothing.
 - **An MCP tool's error now says whether to retry.** Every error a tool
   returned was a bare JSON-RPC error that dropped the retry class, so an agent
   could not tell "wait and try again" from "try another node" from "stop". The

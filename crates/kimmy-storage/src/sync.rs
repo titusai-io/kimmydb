@@ -2451,6 +2451,19 @@ pub(crate) mod race_hooks {
         /// A replicated schema change found its entry not held here, and has
         /// not yet taken the writer to append it.
         DdlAppend,
+        /// A `multi` write committed a chunk and has not yet taken the writer
+        /// for the next one: not a race, the point between a request's
+        /// commits (ADR-192).
+        BetweenChunks,
+        /// A database drop buried a collection and has not yet taken the
+        /// writer for the next burial, likewise.
+        BetweenBurials,
+        /// A database drop buried every collection it found and has not yet
+        /// taken the writer to decide whether the database row goes.
+        BeforeRowRemoval,
+        /// Turning vectors off found them already off and has not yet taken
+        /// the writer to drop the shadow a partial disable left.
+        LeftoverShadow,
     }
 
     type Hook = Box<dyn FnOnce()>;

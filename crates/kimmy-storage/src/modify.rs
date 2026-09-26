@@ -190,6 +190,13 @@ impl Engine {
     /// A failure in a later chunk leaves the earlier ones committed — the
     /// oplog reflects exactly what landed.
     ///
+    /// Once a chunk has committed, the request is part done, and it keeps
+    /// going rather than give up half way (ADR-192): the later chunks wait
+    /// for the writer with no budget, and stop only if the node is past its
+    /// drain deadline. Any failure after the first commit is
+    /// [`StorageError::PartiallyApplied`], counting the committed chunks, so
+    /// nothing that landed is answered as if it had not.
+    ///
     /// A single-document request (`stop_after = Some(1)`) is one chunk of
     /// one, and behaves exactly as before.
     pub fn modify_where(
@@ -219,61 +226,57 @@ impl Engine {
                 break;
             }
 
-            let txn = self.begin_write(holder)?;
-            let (matches, examined) = match self.collect_matches(
-                &txn,
+            let continuing = outcome.commits > 0;
+            #[cfg(test)]
+            if continuing {
+                crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenChunks);
+            }
+            match self.modify_chunk(
+                holder,
+                continuing,
                 coll,
                 candidates,
                 spec,
-                Some(budget),
+                budget,
                 after.as_deref(),
             ) {
-                Ok(found) => found,
-                Err(e) => {
-                    txn.abort()?;
-                    return Err(e);
+                Ok((examined, None)) => {
+                    outcome.examined += examined;
+                    break;
                 }
-            };
-            outcome.examined += examined;
+                Ok((examined, Some((matched, entries, last_key)))) => {
+                    outcome.examined += examined;
+                    outcome.commits += 1;
+                    outcome.matched += matched as u64;
+                    outcome.modified += entries.len() as u64;
+                    outcome.stamp = entries.last().map(|e| e.stamp);
+                    // Published per chunk, after its commit: a subscriber
+                    // sees a chunk whole before the next one begins.
+                    self.publish(entries);
 
-            let Some((_, last)) = matches.last() else {
-                // Nothing (more) matched: a no-op must not commit, mint or
-                // publish.
-                txn.abort()?;
-                break;
-            };
-            let last_key = match extract_id(last).and_then(|id| crate::docs::doc_key(&id)) {
-                Ok(key) => key,
-                Err(e) => {
-                    txn.abort()?;
-                    return Err(e);
-                }
-            };
-
-            let mut entries = Vec::with_capacity(matches.len());
-            for (stamp, before) in &matches {
-                match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
-                    Ok((_, entry)) => entries.push(entry),
-                    Err(e) => {
-                        txn.abort()?;
-                        return Err(e);
+                    after = Some(last_key);
+                    if matched < budget {
+                        break;
                     }
                 }
-            }
-
-            txn.commit()?;
-            outcome.commits += 1;
-            outcome.matched += matches.len() as u64;
-            outcome.modified += entries.len() as u64;
-            outcome.stamp = entries.last().map(|e| e.stamp);
-            // Published per chunk, after its commit: a subscriber sees a
-            // chunk whole before the next one begins.
-            self.publish(entries);
-
-            let short = matches.len() < budget;
-            after = Some(last_key);
-            if short {
-                break;
+                // Before the first commit a failure is the request's whole
+                // answer: nothing of it was written.
+                Err((e, _)) if outcome.commits == 0 => return Err(e),
+                // After it, what the earlier chunks wrote stands, is
+                // published, and replicates, and the answer has to say so
+                // (ADR-192). A commit whose outcome is unknown is counted
+                // apart: it may be there, and may not.
+                Err((e, in_doubt)) => {
+                    return Err(StorageError::PartiallyApplied {
+                        applied: crate::Applied::Modify {
+                            matched: outcome.matched,
+                            modified: outcome.modified,
+                            commits: outcome.commits,
+                            in_doubt,
+                        },
+                        cause: Box::new(e),
+                    });
+                }
             }
         }
 
@@ -282,6 +285,75 @@ impl Engine {
             return Err(StorageError::Stale { current: None });
         }
         Ok(outcome)
+    }
+
+    /// One chunk of [`Self::modify_where`]: match up to `budget` documents
+    /// strictly after `after`, change them, and commit. `None` when nothing
+    /// (more) matched, which commits nothing. Otherwise how many matched, the
+    /// entries to publish, and the key the next chunk resumes after; with,
+    /// either way, how many documents the scan examined.
+    ///
+    /// `continuing` is whether the request has already committed a chunk,
+    /// which decides how it waits for the writer (ADR-192). A failure comes
+    /// with the number of documents whose write is in doubt: the chunk's, if
+    /// its commit's outcome is unknown, and otherwise none.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn modify_chunk(
+        &self,
+        holder: WriterHolder,
+        continuing: bool,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        budget: usize,
+        after: Option<&[u8]>,
+    ) -> std::result::Result<(u64, Option<(usize, Vec<OplogEntry>, Vec<u8>)>), (StorageError, u64)>
+    {
+        fn none(e: impl Into<StorageError>) -> (StorageError, u64) {
+            (e.into(), 0)
+        }
+        let txn =
+            if continuing { self.begin_write_continuing(holder) } else { self.begin_write(holder) }
+                .map_err(none)?;
+        let (matches, examined) =
+            match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after) {
+                Ok(found) => found,
+                Err(e) => {
+                    txn.abort().map_err(none)?;
+                    return Err(none(e));
+                }
+            };
+
+        let Some((_, last)) = matches.last() else {
+            // Nothing (more) matched: a no-op must not commit, mint or
+            // publish.
+            txn.abort().map_err(none)?;
+            return Ok((examined, None));
+        };
+        let last_key = match extract_id(last).and_then(|id| crate::docs::doc_key(&id)) {
+            Ok(key) => key,
+            Err(e) => {
+                txn.abort().map_err(none)?;
+                return Err(none(e));
+            }
+        };
+
+        let mut entries = Vec::with_capacity(matches.len());
+        for (stamp, before) in &matches {
+            match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
+                Ok((_, entry)) => entries.push(entry),
+                Err(e) => {
+                    txn.abort().map_err(none)?;
+                    return Err(none(e));
+                }
+            }
+        }
+
+        match txn.commit() {
+            Ok(()) => Ok((examined, Some((matches.len(), entries, last_key)))),
+            Err(e @ StorageError::OutcomeUnknown(_)) => Err((e, entries.len() as u64)),
+            Err(e) => Err(none(e)),
+        }
     }
 
     /// Find one document, change it, and return it — atomically.
@@ -1246,7 +1318,17 @@ mod tests {
             upsert: None,
         };
         let before = engine.commits();
-        assert!(engine.modify_where(&coll, &Candidates::Scan, &spec, None).is_err());
+        let failed = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap_err();
+        // Answered with what landed, never as a failure that wrote nothing
+        // (ADR-192).
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a failure after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 4, modified: 4, commits: 1, in_doubt: 0 }
+        );
+        assert!(matches!(*cause, StorageError::Core(_)), "the apply's own error: {cause:?}");
         assert_eq!(engine.commits() - before, 1, "chunk one committed, chunk two aborted");
         for id in 0..4i64 {
             let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
@@ -1417,5 +1499,160 @@ mod tests {
         }
         let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|w| *w).count();
         assert_eq!(wins, 1, "every racer named the same version; one may win");
+    }
+
+    /// Three single-document chunks over a shared engine, for the tests of
+    /// what happens between a request's commits (ADR-192).
+    fn three_chunks() -> (std::sync::Arc<Engine>, CollectionMeta, tempfile::TempDir) {
+        let (engine, coll, dir) = engine();
+        engine.set_multi_chunk_docs(1);
+        let batch: Vec<Document> =
+            (0..3i64).map(|id| doc! {"_id": id, "created": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        (std::sync::Arc::new(engine), coll, dir)
+    }
+
+    fn claimed(engine: &Engine, coll: &CollectionMeta) -> Vec<i64> {
+        (0..3i64)
+            .filter(|id| {
+                let doc = engine.get(coll, &DocId::Int64(*id)).unwrap().unwrap();
+                doc.get_str("status").unwrap() == "claimed"
+            })
+            .collect()
+    }
+
+    /// Hold the writer from another thread for `hold`, returning once it is
+    /// held.
+    fn hold_writer_for(engine: &std::sync::Arc<Engine>, hold: std::time::Duration) {
+        let (held, is_held) = std::sync::mpsc::channel();
+        let engine = std::sync::Arc::clone(engine);
+        std::thread::spawn(move || {
+            let guard = engine.hold_writer(WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_chunk_waits_out_a_writer_held_past_the_budget() {
+        // The finding: chunk two used to give up after the request's budget
+        // and answer "nothing was written" over a committed chunk one. Once a
+        // chunk has landed, the request keeps going (ADR-192).
+        let (engine, coll, _dir) = three_chunks();
+        let budget = std::time::Duration::from_millis(100);
+        let out = {
+            let engine = std::sync::Arc::clone(&engine);
+            let coll = coll.clone();
+            crate::engine::with_write_wait_budget(budget, async move {
+                let holder = std::sync::Arc::clone(&engine);
+                crate::sync::race_hooks::at(
+                    crate::sync::race_hooks::Race::BetweenChunks,
+                    move || {
+                        hold_writer_for(&holder, budget * 3);
+                    },
+                );
+                engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None)
+            })
+            .await
+        };
+        let out = out.expect("a later chunk waits for the writer without the budget");
+        assert_eq!(out.commits, 3);
+        assert_eq!(out.matched, 3);
+        assert_eq!(engine.writer_wait_timeouts(), 0, "no wait gave up");
+        assert_eq!(claimed(&engine, &coll), vec![0, 1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_chunk_that_cannot_get_the_writer_wrote_nothing() {
+        // Before the first commit the budget still applies, and its refusal
+        // is still true: nothing was written.
+        let (engine, coll, _dir) = three_chunks();
+        let budget = std::time::Duration::from_millis(100);
+        hold_writer_for(&engine, budget * 3);
+        let refused = {
+            let engine = std::sync::Arc::clone(&engine);
+            let coll = coll.clone();
+            crate::engine::with_write_wait_budget(budget, async move {
+                engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None)
+            })
+            .await
+        };
+        assert!(matches!(refused, Err(StorageError::WriterBusy { .. })), "{refused:?}");
+        assert!(claimed(&engine, &coll).is_empty());
+    }
+
+    #[test]
+    fn a_node_past_its_drain_deadline_stops_between_chunks_and_says_what_landed() {
+        let (engine, coll, _dir) = three_chunks();
+        let stopper = std::sync::Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+            stopper.set_stopping();
+        });
+        let failed = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a stop after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
+        );
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
+        assert_eq!(claimed(&engine, &coll), vec![0], "chunk one stands, and nothing after it");
+    }
+
+    #[test]
+    fn a_stop_does_not_touch_a_request_that_has_committed_nothing() {
+        // The flag bounds the later transactions of a request, not its first.
+        let (engine, coll, _dir) = three_chunks();
+        engine.set_stopping();
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(1)).unwrap();
+        assert_eq!(out.commits, 1);
+    }
+
+    #[test]
+    fn a_later_chunk_whose_commit_outcome_is_unknown_is_counted_in_doubt() {
+        // Armed after the first commit, the next fsync fails: that chunk may
+        // or may not be on disk, and the answer keeps it apart from what is.
+        let (engine, coll, _dir) = three_chunks();
+        let armer = std::sync::Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+            assert!(armer.arm_test_storage_failure("sync_data"));
+        });
+        let failed = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("an unknown commit after a known one is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 1 }
+        );
+        assert!(matches!(*cause, StorageError::OutcomeUnknown(_)), "{cause:?}");
+    }
+
+    #[test]
+    fn a_multi_write_that_starts_past_the_drain_deadline_commits_one_chunk_and_says_so() {
+        // The stop bounds a request's later transactions, not its first: one
+        // begun after the deadline commits its first chunk, then stops.
+        let (engine, coll, _dir) = three_chunks();
+        engine.set_stopping();
+        let failed =
+            engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(2)).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a stop after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
+        );
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
+        assert_eq!(claimed(&engine, &coll), vec![0]);
     }
 }

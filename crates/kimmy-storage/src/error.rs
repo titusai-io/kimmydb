@@ -108,6 +108,69 @@ pub enum StorageError {
     /// a write that failed (outcome unknown, ADR-057's `verify`).
     #[error("the write may or may not have been applied: {0}")]
     OutcomeUnknown(String),
+
+    /// A write transaction was not begun because the node is stopping, for
+    /// the reason given (ADR-192): a later transaction of a request that has
+    /// already committed one, which then answers
+    /// [`StorageError::PartiallyApplied`] with this as its cause; or any
+    /// transaction once the engine is closed to writes at the end of a
+    /// shutdown. Nothing of that transaction was written.
+    #[error("the node is stopping: {0}")]
+    Stopping(StopReason),
+
+    /// A request that commits in more than one transaction failed after its
+    /// first commit (ADR-192). What `applied` counts is committed, published
+    /// and replicating; `cause` is why the request stopped there.
+    #[error("the request was partly applied ({applied}) and then failed: {cause}")]
+    PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+}
+
+/// Why a continuing request was stopped; see [`StorageError::Stopping`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// The node's shutdown drain reached its deadline.
+    DrainDeadline,
+    /// The storage failed (ADR-188), and the process is stopping.
+    StorageFailed,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DrainDeadline => "the node reached its shutdown deadline",
+            Self::StorageFailed => "the node's storage failed, and it is stopping",
+        })
+    }
+}
+
+/// What a request that commits in more than one transaction had committed
+/// when it failed (ADR-192).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// A `multi` update or delete (ADR-086). Counts are of committed chunks
+    /// only; `in_doubt` is the size of a chunk whose commit's outcome is
+    /// unknown, which is not in the other counts.
+    Modify { matched: u64, modified: u64, commits: u64, in_doubt: u64 },
+    /// A database drop: the collections whose burial committed, and the one
+    /// whose burial's outcome is unknown, if any.
+    DropDatabase { dropped: Vec<String>, in_doubt: Option<String> },
+}
+
+impl std::fmt::Display for Applied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Modify { matched, commits, in_doubt, .. } => {
+                write!(f, "{matched} matched in {commits} commits, {in_doubt} in doubt")
+            }
+            Self::DropDatabase { dropped, in_doubt } => {
+                write!(f, "{} collections dropped", dropped.len())?;
+                match in_doubt {
+                    Some(name) => write!(f, ", {name} in doubt"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
 }
 
 /// What an operator can actually do about a stored partial filter this build
