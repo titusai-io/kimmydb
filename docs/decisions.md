@@ -16509,12 +16509,20 @@ a range from there finds the lowest `seq` among them.
   marks: `o` with `V[o] > v[o]`, and the origin of each mark above `v`.
 - **When none is active**, nothing is above the vector, and the answer is the
   next position, read without touching the index. That is the common case, a
-  client caught up with this member. Finding the active origins reads the state
-  marks. These are usually none, since a mark lasts only from a snapshot
-  document's append until coverage over it is granted (ADR-160). With none, a
-  caught-up resume reads nothing at all. While the seek reads marks, the race lets the walk
-  take one row of the index per mark, so a caught-up resume reads at most that
-  many rows.
+  client caught up with this member.
+- **A caught-up resume still reads the state marks** to find the active
+  origins. There are `H` of them: often none, but a caught-up node on a busy
+  sender normally holds some, and a repair can leave tens of thousands
+  (`tables::OPLOG_HELD`).
+  - While the seek reads them, the race lets the walk take one row of the
+    index per mark. So a caught-up resume reads at most about 2·H rows, and
+    nothing at all with no marks.
+  - When the marks outnumber the index, the walk reaches its end first and
+    answers, with the same position.
+- **A mark whose key does not decode** names no origin to rule out. It drops
+  the seek's bound to the start rather than failing the resume, and the race
+  keeps the cost at the walk's. Such keys are kept on purpose
+  (`release_held_under`).
 - **The seek cannot stop early**, because stamp order is not arrival order.
 
 **The race.** The walk and the seek run in one read transaction, a row at a
@@ -16557,6 +16565,11 @@ The open-time check that rebuilds the arrival index now compares both halves
 with the oplog. A stamp half that lost rows would otherwise have opened as it
 was, and the seek would have missed them.
 
+When only the stamp half is short, it is rebuilt from the positions, which stay
+as they are. Renumbering both halves from the oplog would move every position
+this member's tokens name. The full rebuild is kept for an index whose
+positions themselves do not cover the oplog.
+
 **Tests** (`watch.rs`, `first_arrival`):
 - **A property test** builds real stores through local writes and remote
   appends under `Raise`, `InWindow` and `Hold`, over three origins with equal
@@ -16567,9 +16580,11 @@ was, and the seek would have missed them.
   For some twenty vectors, the race, the seek alone and the walk alone must
   each equal the old walk: empty, servable, witnessed, each origin missing,
   exact and just-below entry stamps, above everything, and random.
-- **A caught-up vector:** the seek answers, reading no index row beyond one
-  per held mark. With no marks it reads nothing
-  (`a_caught_up_resume_reads_nothing`).
+- **A caught-up vector reads no more index rows than marks.** The seek answers
+  it, unless the marks outnumber the index and the walk reaches its end first
+  (`with_more_marks_than_entries_the_walk_answers_a_caught_up_resume`). With no
+  marks it reads nothing (`a_caught_up_resume_reads_nothing`).
+- **`an_undecodable_mark_does_not_fail_a_resume`.**
 - **`an_entry_outside_the_invariant_is_what_the_seek_misses`** writes an entry
   above `V` with its mark removed. The audit reports I broken, and the seek
   alone disagrees with the old walk. That is what would catch a future writer

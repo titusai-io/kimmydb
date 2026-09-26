@@ -453,9 +453,11 @@ impl Engine {
     /// - the **seek**, in stamp order through `OPLOG_ARRIVAL_SEQ`, over only
     ///   the entries stamped above the lowest vector component of an origin
     ///   that can have anything above it. For a client caught up with this
-    ///   member it reads no row of the index, only the state marks, which
-    ///   are usually none (a mark lasts from a snapshot document's append
-    ///   until coverage over it is granted, ADR-160); it cannot stop early.
+    ///   member it reads no row of the index, only the state marks (H of
+    ///   them: often none, but a caught-up node on a busy sender holds some,
+    ///   and a repair can leave tens of thousands, see `tables::OPLOG_HELD`),
+    ///   so a caught-up resume reads at most about 2·H rows between the two;
+    ///   it cannot stop early.
     ///
     /// So a resume costs at most about twice the cheaper of the two. The walk
     /// wins where the seek's bound is low: a vector that names no position
@@ -806,8 +808,10 @@ impl<'t> Walk<'t> {
 /// `V[o] > v[o]`, or the candidate is a held mark above `v[o]`. Those
 /// origins are the **active** ones. When there are none, no entry is above
 /// the vector and the seek answers without reading the index. It has read the
-/// marks to know that, and the race has let the walk take one row of the
-/// index per mark meanwhile; with no marks, the answer reads nothing.
+/// H marks to know that, and the race has let the walk take one row of the
+/// index per mark meanwhile, so a caught-up resume reads at most about 2·H
+/// rows, and nothing with no marks. When the marks outnumber the index, the
+/// walk reaches the end of the index first and answers the same position.
 ///
 /// A `V` that overstates what the oplog holds, or a mark left on no entry,
 /// only adds origins, which costs rows and never changes the answer.
@@ -858,10 +862,20 @@ impl<'t> Seek<'t> {
                 if let Some(row) = marks.next() {
                     let (key, _) = row?;
                     walked.held_rows += 1;
-                    let stamp = codec::decode_oplog_key(key.value())?;
-                    let v = self.delivered.get(stamp.node);
-                    if stamp.hlc > v {
-                        self.lower(v);
+                    match codec::decode_oplog_key(key.value()) {
+                        Ok(stamp) => {
+                            let v = self.delivered.get(stamp.node);
+                            if stamp.hlc > v {
+                                self.lower(v);
+                            }
+                        }
+                        // A mark that does not decode names no origin to rule
+                        // out, and refusing every resume from another member's
+                        // token over it would be worse than the cost: the bound
+                        // drops to the start of the range, and the race keeps
+                        // the resume at the walk's price. Such keys are kept
+                        // on purpose (`release_held_under`).
+                        Err(_) => self.lower(Hlc::ZERO),
                     }
                     return Ok(None);
                 }
@@ -3189,7 +3203,18 @@ mod tests {
             let caught_up = store.caught_up();
             let (got, walked) = raced(engine, &caught_up);
             assert_eq!(got, oracle(engine, &caught_up));
-            assert_eq!(walked.found_by, "seek", "after {after:?}");
+            // The seek answers, unless the marks outnumber the index and the
+            // walk reached its end first, answering the same position.
+            let index_rows = {
+                let txn = engine.db().begin_read().unwrap();
+                txn.open_table(tables::OPLOG_ARRIVAL).unwrap().len().unwrap()
+            };
+            assert!(
+                walked.found_by == "seek" || walked.rows == index_rows,
+                "a caught-up vector was answered by the walk before it read the index, after \
+                 {after:?}: {} of {index_rows} rows",
+                walked.rows
+            );
             assert!(
                 walked.rows <= walked.held_rows,
                 "a caught-up vector read {} rows of the index past {} held marks, after {after:?}",
@@ -3278,12 +3303,78 @@ mod tests {
         /// compared it, a store whose stamp half alone was short opened as it
         /// was, and the seek would have missed what it lost.
         #[test]
+        ///
+        /// From the positions, which stay: a remote entry stamped in 1970 arrived
+        /// after the local writes, so renumbering from the oplog in stamp order
+        /// would move every position, and with them this member's tokens.
         fn a_short_stamp_half_is_rebuilt_at_open() {
             let mut store = Store::new();
             store.run(&Op::Local(3));
             store.run(&Op::Remote { origin: 0, wall: 9, position: 0 });
+            let positions = |engine: &Engine| -> Vec<(u64, Vec<u8>)> {
+                let txn = engine.db().begin_read().unwrap();
+                let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+                arrival
+                    .iter()
+                    .unwrap()
+                    .map(|row| {
+                        let (seq, key) = row.unwrap();
+                        (seq.value(), key.value().to_vec())
+                    })
+                    .collect()
+            };
+            let before = positions(store.engine());
             store.run(&Op::WipeStampHalf);
             audit(store.engine()).unwrap();
+            assert_eq!(positions(store.engine()), before, "the positions stayed as they were");
+        }
+
+        /// More held marks than rows in the index: while the seek reads the
+        /// marks, the walk reaches the end of the index and answers first, with
+        /// the same position. The case that made the property test's caught-up
+        /// check flaky when it required the seek to answer.
+        #[test]
+        fn with_more_marks_than_entries_the_walk_answers_a_caught_up_resume() {
+            let mut store = Store::new();
+            for op in [Op::Orphan { origin: 0, wall: 1 }, Op::Orphan { origin: 0, wall: 2 }] {
+                store.run(&op);
+                check(&store, &[], &op);
+            }
+            let engine = store.engine();
+            let v = store.caught_up();
+            let (got, walked) = raced(engine, &v);
+            assert_eq!(got, oracle(engine, &v));
+            assert_eq!(walked.found_by, "walk");
+            assert!(
+                walked.rows <= walked.held_rows,
+                "{} rows, {} marks",
+                walked.rows,
+                walked.held_rows
+            );
+        }
+
+        /// A mark whose key does not decode does not fail the resume: the seek's
+        /// bound drops to the start, and the answer is the walk's.
+        #[test]
+        fn an_undecodable_mark_does_not_fail_a_resume() {
+            let mut store = Store::new();
+            store.run(&Op::Local(3));
+            store.run(&Op::Remote { origin: 1, wall: 9, position: 0 });
+            {
+                let db = store.engine().db();
+                let txn = db.begin_write().unwrap();
+                txn.open_table(tables::OPLOG_HELD)
+                    .unwrap()
+                    .insert(&b"\x01\x02\x03"[..], ())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+            let engine = store.engine();
+            for v in [VersionVector::new(), engine.version_vector().unwrap()] {
+                let want = oracle(engine, &v);
+                assert_eq!(raced(engine, &v).0, want, "the race, for {v:?}");
+                assert_eq!(alone(engine, &v, true), want, "the seek, for {v:?}");
+            }
         }
     }
 }

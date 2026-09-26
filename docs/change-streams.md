@@ -322,7 +322,8 @@ first to finish answers ([ADR-173](decisions.md)'s addendum of 2026-09-26):
 
 - **a seek by stamp**, over only the entries stamped above the vector. For a
   client that was caught up with the member there are none, and it answers
-  without reading the index;
+  having read only the member's state marks (`kimmy_sync_held_marks`): nothing,
+  when there are none, and about twice their number at most otherwise;
 - **a walk in arrival order** from the oldest retained entry, which wins when
   the vector names no position for an origin the member holds. Every stream
   opened with `from_start` or `start_at` is like that until it catches up.

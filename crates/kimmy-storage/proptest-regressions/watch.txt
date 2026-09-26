@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a3e3537da82f823b275666ccbdea14e2b6e90cff0100b4fbd1676f20db7a6399 # shrinks to ops = [Remote { origin: 0, wall: 1, position: 2 }], random = []
+cc 648717a501805b5143cffa72fa49e1c2b25b4daa6d541a378bc6419ea9862d54 # shrinks to ops = [Orphan { origin: 0, wall: 1 }, Orphan { origin: 0, wall: 2 }], random = []
