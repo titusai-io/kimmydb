@@ -316,6 +316,18 @@ witnessed vector already claimed ([ADR-148](decisions.md)), and a token issued
 after that claim passes over them wherever it resumes. A repair follows a
 divergence the check has already reported (`kimmy_sync_divergent_collections`).
 
+**How long a resume takes to answer.** On the member that issued the token,
+finding the start is one lookup. On any other member it is a walk of that
+member's arrival index from its oldest retained entry to the first entry above
+the vector: for a client that was caught up, most of the retained oplog. The
+walk runs before the upgrade is answered, off the request workers. It is
+milliseconds with the index in the page cache, and it measured over 30 s on a
+multi-gigabyte store just after a restart. A walk over 1 s is logged at
+`info`, and one over 10 s at `warn`: `a change stream was slow to find where
+it starts`, with `elapsed_ms`, the kind of open (`token_kind`) and
+`rows_examined`. A client whose upgrade timeout is shorter than that gives up
+and retries, and the retry walks again.
+
 **Tokens from before 0.30.0** name only an entry. They are guaranteed to be
 accepted through 0.30.x and have been accepted since; a later minor may refuse
 them, and its release notes will say so. Where accepted, they resume as before
@@ -347,10 +359,19 @@ WebSocket client:
 
 ## Sharp edges
 
-**Cancel safety.** `ChangeStream::next()` is *not* cancel-safe with respect to
-the live channel: abandoning a call inside a `select!` you intend to resume may
-drop an event. The WebSocket pump only races it against socket-close, which is
-terminal, so this is safe there.
+**Cancel safety.** `ChangeStream::next()` may be abandoned at either of its
+awaits and called again without losing an event. It reads every event from the
+arrival index and uses the live channel only as a wake-up. When it waits on
+that wake-up, or at the budget point before each replay batch read, the last
+batch it read has been handed over in full, and where to read next is kept on
+the stream. An abandoned call costs a wake-up, which the next call makes up by
+reading the index again.
+
+The WebSocket pump relies on this. It races `next()` against the socket, so
+that it sees the client leave, and abandons the call whenever the client sends
+any frame, not only a close. Since the budget point, that can also happen
+between two batches of a long replay. The embedding worker's timed wait
+abandons it the same way.
 
 **Replicated writes reach subscribers.** This was once a real gap: an applied
 remote entry keeps its *originating* stamp, so it lands in the oplog behind the

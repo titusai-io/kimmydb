@@ -22,6 +22,12 @@
 //! row of the collection there, about 120 s for 400,000 documents, holding the
 //! worker the whole time. So `kimmy-cluster` is read too, and applying a batch
 //! is a walk.
+//!
+//! **So is the embedding worker.** `kimmy-vector` runs on the same runtime, and
+//! its backfill listed a whole collection inline; it is read too. A change
+//! stream is not in `WALKS`: `Engine::watch` and `ChangeStream::next` run their
+//! own reads under `blocking`, since a resume on a member that did not issue the
+//! token walks the arrival index (round 0420), so no caller can leave them out.
 
 mod source;
 
@@ -200,6 +206,7 @@ fn every_walk_reached_from_a_request_or_a_round_runs_under_blocking() {
         crates.join("kimmy-api/src"),
         crates.join("kimmy-mcp/src"),
         crates.join("kimmy-cluster/src"),
+        crates.join("kimmy-vector/src"),
     ] {
         let found = uncovered(&dir);
         let mut files: Vec<&str> = found.iter().map(|(f, _, _)| f.as_str()).collect();

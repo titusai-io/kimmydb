@@ -691,10 +691,20 @@ impl EmbeddingWorker {
             // Timed rather than a plain await, so a partial batch and a held
             // position go out on schedule and deferred documents are still
             // re-checked on a cluster that has gone quiet. `next` is safe to
-            // cancel here: its only await is the wake-up channel, and it
-            // records where to resume *before* waiting, so a dropped future
-            // costs a notification and not a position. The re-read from the
-            // arrival index on the next call is what recovers it.
+            // cancel here. It has two awaits:
+            //
+            // - the wake-up channel, reached once nothing new is on disk;
+            // - a budget point (`tokio::task::consume_budget`) before each
+            //   replay batch read.
+            //
+            // At either, every entry of the last batch read has been handed
+            // over, what that batch's read covered has been merged into the
+            // stream's delivered vector, and where to read next is kept in
+            // `next_replay_from`, from which the next call recomputes it. So a
+            // dropped future costs a wake-up at most, never a position: the
+            // next call reads the arrival index again from there. The budget
+            // point means this timeout can now also fire between two batches
+            // of a long replay, which the next call carries on from.
             let wait = pending.deadline(self.batching.max_wait).map_or(DEFERRAL_TICK, |due| {
                 due.saturating_duration_since(Instant::now()).min(DEFERRAL_TICK)
             });
@@ -1284,10 +1294,13 @@ impl EmbeddingWorker {
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
         // document in memory would make backfill cost O(collection).
+        // Off the async worker (ADR-153): the walk is the whole collection.
         let mut ids = Vec::new();
-        self.engine.for_each_doc(collection, |id, _| {
-            ids.push(id);
-            Ok(true)
+        kimmy_storage::blocking(|| {
+            self.engine.for_each_doc(collection, |id, _| {
+                ids.push(id);
+                Ok(true)
+            })
         })?;
 
         let total = ids.len();
