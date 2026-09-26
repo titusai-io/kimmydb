@@ -1355,6 +1355,8 @@ impl Engine {
     /// a transaction; a caller with a budget gives up inside it. For a test
     /// that needs the writer busy, and for nothing on a request path — so
     /// the holder it is given is the one whose hold it is standing in for.
+    /// It writes nothing, and so does not check whether the engine is closed
+    /// to writes (ADR-192).
     pub fn hold_writer(&self, holder: WriterHolder) -> WriterHold<'_> {
         let gate = blocking(|| self.writer_gate.lock());
         WriterHold::new(self, gate, holder)
@@ -1506,12 +1508,45 @@ impl Engine {
     /// Once this returns `true` no transaction is open and none can begin, so
     /// nothing the marker describes can change after it. `false` means one
     /// was still open at the cap: the caller must not record a clean exit.
+    ///
+    /// Under `coalesced` durability, commits that landed and wait on the
+    /// barrier are made durable here, by a last flush run while the writer
+    /// is held, and their committers are answered before this returns. A
+    /// leader woken after it finds the writes closed and flushes nothing: a
+    /// flush after the proof would be a commit after the marker. `false`
+    /// too when that last flush fails, since what it covered is then not
+    /// known to be on disk.
     pub fn close_writes(&self, cap: std::time::Duration) -> bool {
         self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         self.writes_closed.store(true, std::sync::atomic::Ordering::SeqCst);
         // Taking the writer proves no transaction holds it; the flag above,
-        // read under the writer by every `begin_write`, keeps it that way.
-        blocking(|| self.writer_gate.try_lock_for(cap)).is_some()
+        // read under the writer by every `begin_write` and by a barrier's
+        // flush, keeps it that way.
+        let Some(gate) = blocking(|| self.writer_gate.try_lock_for(cap)) else {
+            return false;
+        };
+        let pending = self.coalescer.lock().as_ref().is_some_and(|c| c.flushed < c.issued);
+        if !pending {
+            return true;
+        }
+        let result = self.flush_holding(gate);
+        let mut guard = self.coalescer.lock();
+        let ok = result.is_ok();
+        if let Some(c) = guard.as_mut() {
+            let (coverage, failure) = match &result {
+                Ok(coverage) => (coverage, None),
+                Err((coverage, e)) => (coverage, Some(e)),
+            };
+            if coverage.generation == Some(c.generation) {
+                match failure {
+                    None => c.flushed = c.flushed.max(coverage.covered),
+                    Some(e) => c.failed = Some((coverage.covered, e.to_string())),
+                }
+            }
+        }
+        drop(guard);
+        self.coalesce_woken.notify_all();
+        ok
     }
 
     /// Whether a continuing request must stop: the drain deadline passed, or
@@ -2748,7 +2783,8 @@ impl Engine {
         };
         if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
             drop(gate);
-            return Err(StorageError::Stopping(crate::StopReason::DrainDeadline));
+            let reason = self.stop_reason().unwrap_or(crate::StopReason::DrainDeadline);
+            return Err(StorageError::Stopping(reason));
         }
         if continuing == Continuing::Yes
             && let Some(reason) = self.stop_reason()
@@ -2935,6 +2971,36 @@ impl Engine {
         let waited_from = std::time::Instant::now();
         let gate = blocking(|| self.writer_gate.lock());
         meter_writer_wait(waited_from.elapsed());
+        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            // Closed (ADR-192): `close_writes` ran the last flush under the
+            // writer, and no ticket can have been issued since. Commit
+            // nothing, and report what that flush made durable.
+            drop(gate);
+            let c = self.coalescer.lock();
+            // No barrier at all: the class changed under a waiting commit,
+            // which no last flush covered.
+            let (generation, flushed, issued) =
+                c.as_ref().map_or((None, 0, 1), |c| (Some(c.generation), c.flushed, c.issued));
+            let coverage = Coverage { generation, covered: flushed };
+            return if flushed >= issued {
+                Ok(coverage)
+            } else {
+                Err((
+                    coverage,
+                    redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+                        "the storage was closed to writes before this commit was flushed",
+                    ))),
+                ))
+            };
+        }
+        self.flush_holding(gate)
+    }
+
+    /// [`Self::flush_now`] once the writer is held.
+    fn flush_holding(
+        &self,
+        gate: parking_lot::MutexGuard<'_, ()>,
+    ) -> std::result::Result<Coverage, (Coverage, redb::CommitError)> {
         let mut gate = WriterHold::new(self, gate, WriterHolder::Durability);
         // Read with the writer held, and before this flush's own commit:
         // every ticket up to here belongs to a commit that has landed, and
@@ -5398,6 +5464,38 @@ mod tests {
             matches!(Engine::open(&path), Err(StorageError::UnsupportedFormat { found: 99, .. })),
             "opening must refuse rather than misread the records"
         );
+    }
+
+    #[test]
+    fn closing_writes_flushes_a_commit_waiting_on_the_barrier_and_nothing_commits_after() {
+        // A commit that landed under `coalesced` and waits on the barrier is
+        // not durable yet. Closing makes it durable, under the writer, and
+        // answers its committer; the leader that wakes after flushes nothing
+        // (ADR-192).
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let meta = engine.create_collection("db", "c").unwrap();
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(600));
+
+        let writer = {
+            let engine = Arc::clone(&engine);
+            let meta = meta.clone();
+            std::thread::spawn(move || engine.insert(&meta, bson::doc! { "_id": 1 }))
+        };
+        // The commit has landed and its committer sleeps the window as leader.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let fsyncs = engine.fsyncs();
+        let started = std::time::Instant::now();
+        assert!(engine.close_writes(std::time::Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "the close waited out the window instead of flushing"
+        );
+        assert_eq!(engine.fsyncs(), fsyncs + 1, "the last flush made the waiting commit durable");
+
+        writer.join().unwrap().expect("its committer is answered: durable");
+        assert_eq!(engine.fsyncs(), fsyncs + 1, "the leader committed after the proof");
+        assert!(engine.get(&meta, &kimmy_core::DocId::Int64(1)).unwrap().is_some());
     }
 
     #[test]

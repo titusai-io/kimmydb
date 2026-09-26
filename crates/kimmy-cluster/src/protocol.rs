@@ -351,6 +351,12 @@ pub enum ProtocolError {
     /// their time.
     #[error("local storage: {0}")]
     Local(String),
+    /// This node has closed its storage to writes at the end of a shutdown
+    /// (ADR-192), so a pushed window was not applied. Not a failure: the
+    /// window stays the pusher's, and anti-entropy carries it to this node
+    /// once it runs again.
+    #[error("this node is shutting down: {0}")]
+    Stopping(String),
 }
 
 /// Write one length-prefixed frame.

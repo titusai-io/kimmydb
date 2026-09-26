@@ -566,13 +566,17 @@ the plain listener logs `requests still in flight at the drain deadline were
 cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
 one used to wait for every request in flight, with no limit**. Then, with its
 background work stopped, the node **closes its storage to writes**: a write
-that begins from then on is refused, answered `500 internal`, "the node
-reached its shutdown deadline", with nothing written, and a write already in
+that begins from then on is refused, answered `503 internal` with `retry:
+elsewhere` ("this node did not begin the write because it is shutting down"),
+logged at `WARN`, with nothing written, and a write already in
 progress is waited for, up to 10 s more. Only then is the clean-exit marker
 written, so nothing can commit after it says the run ended cleanly. If a write
-is still in progress after those 10 s, the node logs `exiting without a
-clean-exit marker` at `ERROR` and exits without one, and the next start reports
-that the previous run did not shut down cleanly. So a shutdown takes up to
+is still in progress after those 10 s — or, under `storage.durability =
+coalesced`, the last flush of commits waiting to be made durable fails — the
+node logs `exiting without a clean-exit marker` at `ERROR` and exits with
+status **75**, without one, and the next start reports that the previous run
+did not shut down cleanly. Commits waiting on the coalescing barrier at the
+close are flushed by the close itself, before the marker. So a shutdown takes up to
 about 20 s when a request is stuck: set the supervisor's grace period to 25 s
 or more (Docker's default is 10 s, Kubernetes' 30 s).
 

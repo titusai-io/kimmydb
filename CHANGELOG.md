@@ -89,11 +89,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   request that commits in more than one transaction stops before its next one
   and is answered `partially_applied`.
 - **A shutdown closes the storage to writes before it records a clean exit.**
-  After the drain, a write that begins is refused (`500 internal`, nothing
-  written), and one in progress is waited for, up to 10 s; the clean-exit
-  marker is written only then. A write still in progress after that means no
-  clean-exit marker, logged `exiting without a clean-exit marker` at `ERROR`, and
-  the next start reports an unclean shutdown. A shutdown can therefore take up
+  After the drain, a write that begins is refused (`503 internal`, `retry:
+  elsewhere`, nothing written), and one in progress is waited for, up to 10 s; the clean-exit
+  marker is written only then. Commits waiting on the `coalesced` barrier are
+  flushed by the close itself. A write still in progress after that means no
+  clean-exit marker, logged `exiting without a clean-exit marker` at `ERROR`,
+  exit status **75**, and a next start that reports an unclean shutdown. A shutdown can therefore take up
   to about 20 s: give the supervisor a grace period of 25 s or more. See
   [Operations](docs/operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
 - **Once a `multi: true` update or delete, or a database drop, has committed

@@ -717,6 +717,23 @@ impl ApiError {
         e
     }
 
+    /// A write this node did not begin, because it is stopping (ADR-192).
+    /// Nothing was written. `503`, and `elsewhere`: the node is going away,
+    /// and another member serves. `WARN` for the shutdown doing its job;
+    /// the storage failure behind the other reason is already an `ERROR`.
+    pub fn node_stopping(reason: kimmy_storage::StopReason) -> Self {
+        let mut e = Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Internal,
+            format!(
+                "this node did not begin the write because it is shutting down ({reason}); \
+                 nothing was written. Send it to another member"
+            ),
+        );
+        e.level_override = Some(LogLevel::Warn);
+        e
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, message)
     }
@@ -911,11 +928,11 @@ impl From<StorageError> for ApiError {
             StorageError::PartiallyApplied { applied, cause } => {
                 ApiError::partially_applied(&applied, *cause)
             }
-            // Only ever the cause of a partial answer; answered alone it
-            // would mean a request stopped before writing anything, which a
-            // request past its first commit never is. Kept honest anyway:
-            // this node is going away, and another one serves.
-            StorageError::Stopping(reason) => ApiError::internal(reason.to_string()),
+            // A write refused because the node has closed its storage at the
+            // end of a shutdown (ADR-192), or a later transaction refused on
+            // its own. Nothing was written, as with a busy writer, and this
+            // node is going away: another member serves.
+            StorageError::Stopping(reason) => ApiError::node_stopping(reason),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.

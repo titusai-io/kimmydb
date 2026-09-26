@@ -177,6 +177,10 @@ fn main() -> Result<()> {
             drop(telemetry_guard);
             if writes_open {
                 runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+                if let Err(e) = &outcome {
+                    eprintln!("Error: {e:#}");
+                }
+                std::process::exit(kimmy_task::EXIT_UNCLEAN_SHUTDOWN);
             }
             outcome
         }

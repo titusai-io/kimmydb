@@ -109,10 +109,12 @@ pub enum StorageError {
     #[error("the write may or may not have been applied: {0}")]
     OutcomeUnknown(String),
 
-    /// A later transaction of a request that has already committed one was
-    /// not begun, because the node is stopping, for the reason given
-    /// (ADR-192). Nothing of that transaction was written. Only ever the
-    /// cause of a [`StorageError::PartiallyApplied`].
+    /// A write transaction was not begun because the node is stopping, for
+    /// the reason given (ADR-192): a later transaction of a request that has
+    /// already committed one, which then answers
+    /// [`StorageError::PartiallyApplied`] with this as its cause; or any
+    /// transaction once the engine is closed to writes at the end of a
+    /// shutdown. Nothing of that transaction was written.
     #[error("the node is stopping: {0}")]
     Stopping(StopReason),
 

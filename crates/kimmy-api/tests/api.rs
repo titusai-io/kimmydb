@@ -3456,11 +3456,87 @@ async fn listing_hides_what_the_caller_cannot_read() {
 #[tokio::test]
 async fn the_last_user_cannot_be_deleted() {
     // Otherwise the server becomes unadministrable with no way back in short of
-    // editing the data directory.
+    // editing the data directory. Without authentication, so that the caller
+    // is not the account deleted and the request reaches the last-user guard
+    // rather than the self-delete one.
+    let server = Server::start_with(true).await;
+    server.state.users.create(&server.state.engine, "alice", "alice-password", vec![]).unwrap();
+    let res = server.delete("/v1/users/alice", None).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "conflict");
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("last remaining user"),
+        "{:?}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn the_last_enabled_user_cannot_be_disabled() {
+    let server = Server::start_with(true).await;
+    server.state.users.create(&server.state.engine, "alice", "alice-password", vec![]).unwrap();
+    let res = server.post("/v1/users/alice/disabled", None, json!({ "disabled": true })).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "conflict");
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("last remaining enabled user"),
+        "{:?}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn a_write_refused_after_the_close_answers_503_elsewhere_and_writes_nothing() {
+    let server = Server::start_with(true).await;
+    let orders = server.state.engine.create_collection("shop", "orders").unwrap();
+    assert!(server.state.engine.close_writes(std::time::Duration::from_millis(100)));
+    let res = server.post("/v1/db/shop/coll/orders/docs", None, json!({ "n": 1 })).await;
+    assert_eq!(res.status, 503, "{:?}", res.body);
+    assert_eq!(res.body["error"], "internal", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "elsewhere", "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("shutting down"));
+    assert_eq!(server.state.engine.count(&orders).unwrap(), 0);
+}
+
+/// Captures what a subscriber formats, for tests that read log lines.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn dropping_vectors_a_partial_disable_left_behind_is_audited() {
+    // On the current-thread runtime the server runs on this thread, so a
+    // subscriber set here sees its audit line.
+    let captured = CapturedLog::default();
+    let subscriber =
+        tracing_subscriber::fmt().with_writer(captured.clone()).with_ansi(false).finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let server = Server::start().await;
     let token = server.root().await;
-    let res = server.delete("/v1/users/root", Some(&token)).await;
-    assert_eq!(res.status, 409);
+    configure_vectors(&server, &token, "shop", "docs").await;
+    assert!(server.state.engine.disable_vectors("shop", "docs", false).unwrap());
+
+    let res = server.delete("/v1/db/shop/coll/docs/vector?drop_vectors=true", Some(&token)).await;
+    assert_eq!(res.body, json!({ "disabled": false, "droppedVectors": true }));
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("action=DropVectors"), "no audit line for the drop:\n{log}");
 }
 
 #[tokio::test]

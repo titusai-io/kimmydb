@@ -110,8 +110,20 @@ pub async fn run(config: Config) -> Result<()> {
             return Err(e.into());
         }
     };
-    let outcome = start_and_serve(config).await;
-    record_outcome(&data_dir, &outcome);
+    finish(&data_dir, start_and_serve(config).await, WRITES_CLOSE_CAP)
+}
+
+/// The end of a run: close the engine to writes, then record how the run
+/// ended (ADR-192), in that order and in one place, so no path can write the
+/// marker first.
+///
+/// The drain ending does not end its requests — a connection outlives the
+/// server that accepted it, and an MCP tool runs in a task of its own — so
+/// without the close a handler could commit after the marker says the run
+/// ended cleanly. A write still open at `cap` means no clean marker.
+fn finish(data_dir: &std::path::Path, served: Result<Arc<Engine>>, cap: Duration) -> Result<()> {
+    let outcome = served.and_then(|engine| close_for_exit(&engine, cap));
+    record_outcome(data_dir, &outcome);
     outcome
 }
 
@@ -133,7 +145,7 @@ const EMBEDDING_RETRY_MAX: Duration = Duration::from_secs(120);
 const DROP_PURGER_RETRY_FIRST: Duration = Duration::from_secs(1);
 const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
 
-async fn start_and_serve(config: Config) -> Result<()> {
+async fn start_and_serve(config: Config) -> Result<Arc<Engine>> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
     })?;
@@ -760,16 +772,9 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // an aborted delivery is redelivered rather than lost.
     webhook_handle.abort();
 
-    // The last thing done to the engine, and the condition for a clean exit
-    // (ADR-192): no write can begin after this, and one in progress is let
-    // finish. The drain ending does not end its requests — a connection
-    // outlives the server that accepted it — so without this a handler could
-    // commit after the marker below says the run ended cleanly.
-    close_for_exit(&engine, WRITES_CLOSE_CAP)?;
-
-    // `run` writes the exit marker and says "shutdown complete", after this
-    // returns, so the last line of the log is the last thing done.
-    Ok(())
+    // `run` closes the engine to writes and then writes the exit marker, in
+    // that order, in `finish`.
+    Ok(engine)
 }
 
 /// Close the engine to writes, waiting up to `cap` for one in progress; an
@@ -796,8 +801,9 @@ impl std::fmt::Display for WritesStillOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "a write was still in progress {} s after the shutdown drain ended; exiting \
-             without recording a clean exit",
+            "a write was still in progress {} s after the shutdown drain ended, or the last \
+             flush of commits waiting to be made durable failed; exiting without recording a \
+             clean exit",
             WRITES_CLOSE_CAP.as_secs()
         )
     }
@@ -2287,11 +2293,9 @@ mod tests {
     /// commit can still land.
     #[test]
     fn the_clean_exit_marker_waits_for_the_write_in_progress_and_is_withheld_past_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        let hold = |for_: Duration| {
+        let hold = |engine: &Arc<Engine>, for_: Duration| {
             let (held, is_held) = std::sync::mpsc::channel();
-            let engine = Arc::clone(&engine);
+            let engine = Arc::clone(engine);
             std::thread::spawn(move || {
                 let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
                 held.send(()).unwrap();
@@ -2300,33 +2304,29 @@ mod tests {
             });
             is_held.recv().unwrap();
         };
-        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
 
         // Past the cap: an error, and no marker.
-        hold(Duration::from_secs(2));
-        let outcome = close_for_exit(&engine, Duration::from_millis(200));
-        assert!(outcome.as_ref().is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some()));
-        record_outcome(dir.path(), &outcome);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        hold(&engine, Duration::from_secs(2));
+        let outcome = finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_millis(200));
+        assert!(outcome.is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some()));
         assert!(!marker.exists(), "a clean-exit marker was written while a write could land");
 
-        // Inside the cap: the marker waits for the write.
-        std::thread::sleep(Duration::from_secs(2));
-        let engine2 = Arc::new(Engine::open(&dir.path().join("second.redb")).unwrap());
-        let (held, is_held) = std::sync::mpsc::channel();
-        let holder = Arc::clone(&engine2);
-        std::thread::spawn(move || {
-            let guard = holder.hold_writer(kimmy_storage::WriterHolder::Bulk);
-            held.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-            drop(guard);
-        });
-        is_held.recv().unwrap();
+        // Inside the cap: the marker waits for the write, and is written.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        hold(&engine, Duration::from_millis(300));
         let started = std::time::Instant::now();
-        let outcome = close_for_exit(&engine2, Duration::from_secs(5));
-        assert!(outcome.is_ok());
-        assert!(started.elapsed() >= Duration::from_millis(250), "it did not wait for the write");
-        record_outcome(dir.path(), &outcome);
+        finish(dir.path(), Ok(Arc::clone(&engine)), Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250), "the marker did not wait");
         assert!(marker.exists(), "a clean shutdown recorded no marker");
+        assert!(
+            engine.create_collection("db", "c").is_err(),
+            "the engine still took a write after the marker"
+        );
     }
 
     /// The plain listener's drain is bounded, and the multi-transaction stop

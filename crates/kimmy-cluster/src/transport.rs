@@ -198,6 +198,9 @@ impl ServeFailure {
             ProtocolError::TimedOut(_) => Some(Self::Timeout),
             ProtocolError::Malformed(_) | ProtocolError::TooLarge { .. } => Some(Self::Malformed),
             ProtocolError::Local(_) => Some(Self::Local),
+            // Handled before this is asked: a node shutting down refuses
+            // pushes, which is not a failure to count.
+            ProtocolError::Stopping(_) => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
             ProtocolError::Fault(_) => Some(Self::Fault),
         }
@@ -342,6 +345,12 @@ async fn serve_connection<S>(
     let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed).await else {
         return;
     };
+    // One line per connection, not a warning per push: the refusal ends the
+    // connection, and a node shutting down is doing what it was told.
+    if let ProtocolError::Stopping(_) = &e {
+        info!(%peer, "refused a pushed window: this node is shutting down");
+        return;
+    }
     match ServeFailure::of(&e) {
         None => debug!(%peer, "peer disconnected"),
         Some(ServeFailure::Unauthenticated) => {
@@ -547,7 +556,9 @@ where
                 if let Err(e) = applied {
                     let reason = format!("the pushed window could not be applied: {e}");
                     let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
-                    return Err(if is_local_failure(&e) {
+                    return Err(if matches!(e, kimmy_storage::StorageError::Stopping(_)) {
+                        ProtocolError::Stopping(reason)
+                    } else if is_local_failure(&e) {
                         ProtocolError::Local(reason)
                     } else {
                         ProtocolError::Malformed(reason)

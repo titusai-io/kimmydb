@@ -98,6 +98,13 @@ pub fn on_death(reporter: Box<dyn OnDeath>) -> bool {
 /// daemon uses the same number where it installs its own reporter.
 pub const EXIT_RESTART_WORTHY: i32 = 70;
 
+/// The exit status for a shutdown that could not close its storage cleanly:
+/// a write still in progress, or a last flush that failed, at the end of the
+/// drain (ADR-192). `EX_TEMPFAIL`: distinct from 1, a configuration error,
+/// and from 70, a failure found while serving. The run recorded no
+/// clean-exit marker.
+pub const EXIT_UNCLEAN_SHUTDOWN: i32 = 75;
+
 /// How long a report before an exit may take before the exit happens without it.
 pub const EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
