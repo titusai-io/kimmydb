@@ -426,7 +426,9 @@ fields beside the usual three:
 - **`cause`** is the code and message the failure would have been answered
   with on its own — `bad_request` for an operator a later document cannot
   take, `internal` for a storage failure, `outcome_unknown` — or `stopping`,
-  the node's shutdown deadline.
+  the node's shutdown deadline, or `storage_failed`, a storage failure that is
+  stopping the node (ADR-188). A request that begins after the deadline still
+  commits its first chunk, and then answers this with `stopping`.
 - **The counts say how many, not which.** Chunks follow an internal order.
 
 **Sending it again.** A `$set` to constants, or a delete, can be sent again as

@@ -474,7 +474,7 @@ a provider this member cannot build is one only an operator can.
 |---|---|---|
 | `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
 | `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
-| `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line as the answer's `cause`: a storage failure, or the shutdown deadline (`stopping`). **Page**, except for `stopping`. **One exception, which logs `WARN`**: a cause that is the caller's, such as an operator a later document cannot take |
+| `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line: a storage failure (`internal`, `outcome_unknown`, or `storage_failed`, the storage failure that stops the node). **Page**. **One exception, which logs `WARN`**: a cause that is not this node's fault — the shutdown deadline (`stopping`), or the caller's, such as an operator a later document cannot take |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
@@ -559,19 +559,29 @@ those fields. For an `error` it logs, at `WARN` with the error as `cause`,
 either `the previous start failed before it served` or `the previous run exited
 on an error` ([ADR-147](decisions.md)).
 
-**The drain is 10 seconds, on both listeners.** From the signal, requests in
-flight get 10 s to finish, and new connections are refused. At 10 s the node
-stops waiting: requests still running are cut off, and it logs `requests still
-in flight at the drain deadline were cut off` at `WARN`. The TLS listener has
-always worked this way. **The plain listener used to wait for every request in
-flight, with no limit**, so one that never finished held the process until its
-supervisor killed it; set the supervisor's grace period above 10 s (Docker's
-default is 10 s, Kubernetes' 30 s) so the drain can run its course. At the same
-deadline, a request that commits in more than one transaction — a `multi`
-update or delete, a database drop — stops before its next transaction and is
-answered `partially_applied` with what it had committed, if its connection is
-still open ([ADR-192](decisions.md)). One that can finish inside the drain is
-let finish.
+**The drain is 10 seconds, on both listeners, and the clean-exit marker waits
+for the last write.** From the signal, requests in flight get 10 s to finish,
+and new connections are refused. At 10 s the node stops waiting for them, and
+the plain listener logs `requests still in flight at the drain deadline were
+cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
+one used to wait for every request in flight, with no limit**. Then, with its
+background work stopped, the node **closes its storage to writes**: a write
+that begins from then on is refused, answered `500 internal`, "the node
+reached its shutdown deadline", with nothing written, and a write already in
+progress is waited for, up to 10 s more. Only then is the clean-exit marker
+written, so nothing can commit after it says the run ended cleanly. If a write
+is still in progress after those 10 s, the node logs `exiting without a
+clean-exit marker` at `ERROR` and exits without one, and the next start reports
+that the previous run did not shut down cleanly. So a shutdown takes up to
+about 20 s when a request is stuck: set the supervisor's grace period to 25 s
+or more (Docker's default is 10 s, Kubernetes' 30 s).
+
+At the drain deadline, too, a request that commits in more than one
+transaction — a `multi` update or delete, a database drop — stops before its
+next transaction and is answered `partially_applied` with what it had
+committed, if its connection is still open ([ADR-192](decisions.md)). One that
+can finish inside the drain is let finish. Change streams are read-only, so
+their upgraded connections are not waited for.
 
 **A start that fails before it serves keeps what it inherited.** An older
 build refusing the store, a port already bound, a duty that cannot start: the

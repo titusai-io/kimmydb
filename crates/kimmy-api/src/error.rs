@@ -1444,4 +1444,28 @@ mod tests {
         assert_eq!(e.status, StatusCode::FORBIDDEN);
         assert!(!e.message.contains("collection"));
     }
+
+    #[test]
+    fn a_partial_answer_names_why_the_node_stopped_and_logs_by_whose_fault_it_is() {
+        let applied =
+            kimmy_storage::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 };
+        let cause_of = |e: &ApiError| e.extra.as_ref().unwrap()["cause"]["code"].clone();
+
+        // The shutdown doing its job: `stopping`, not a page.
+        let drain = ApiError::partially_applied(
+            &applied,
+            StorageError::Stopping(kimmy_storage::StopReason::DrainDeadline),
+        );
+        assert_eq!(cause_of(&drain), "stopping");
+        assert_eq!(drain.log_level(), Some(LogLevel::Warn));
+
+        // The storage failing is not the shutdown deadline, and is a page.
+        let failed = ApiError::partially_applied(
+            &applied,
+            StorageError::Stopping(kimmy_storage::StopReason::StorageFailed),
+        );
+        assert_eq!(cause_of(&failed), "storage_failed");
+        assert_eq!(failed.log_level(), Some(LogLevel::Error));
+        assert!(!failed.message.contains("shutdown deadline"), "{}", failed.message);
+    }
 }

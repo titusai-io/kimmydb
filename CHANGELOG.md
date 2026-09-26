@@ -82,12 +82,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **The plain HTTP listener's shutdown drain is bounded at 10 seconds**, as the
   TLS listener's always was. From the signal, requests in flight get 10 s to
-  finish; any still running then are cut off, and `requests still in flight at
-  the drain deadline were cut off` is logged at `WARN`. It waited for every
-  request in flight with no limit, so one that never finished held the process
-  until its supervisor killed it. At the same deadline a request that commits
-  in more than one transaction stops before its next one and is answered
-  `partially_applied`. See [Operations](docs/operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
+  finish; then the node stops waiting for them, and the plain listener logs
+  `requests still in flight at the drain deadline were cut off` at `WARN`. It
+  waited for every request in flight with no limit, so one that never finished
+  held the process until its supervisor killed it. At the same deadline a
+  request that commits in more than one transaction stops before its next one
+  and is answered `partially_applied`.
+- **A shutdown closes the storage to writes before it records a clean exit.**
+  After the drain, a write that begins is refused (`500 internal`, nothing
+  written), and one in progress is waited for, up to 10 s; the clean-exit
+  marker is written only then. A write still in progress after that means no
+  clean-exit marker, logged `exiting without a clean-exit marker` at `ERROR`, and
+  the next start reports an unclean shutdown. A shutdown can therefore take up
+  to about 20 s: give the supervisor a grace period of 25 s or more. See
+  [Operations](docs/operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
 - **Once a `multi: true` update or delete, or a database drop, has committed
   its first transaction, the rest wait for the writer with no time limit.**
   They gave up after `server.request_timeout_secs`, as a request that has not

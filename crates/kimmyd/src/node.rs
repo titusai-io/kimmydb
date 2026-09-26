@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use kimmy_auth::{JwkSet, OidcVerifier, TokenIssuer, UserStore};
 use kimmy_storage::{Engine, RetentionPolicy};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthConfig, Config, OidcConfig};
 use crate::lifecycle;
@@ -111,20 +111,7 @@ pub async fn run(config: Config) -> Result<()> {
         }
     };
     let outcome = start_and_serve(config).await;
-    match &outcome {
-        Ok(()) => {
-            lifecycle::record_exit(&data_dir, lifecycle::Exit::Shutdown);
-            info!("shutdown complete");
-        }
-        Err(e) if lifecycle::store_in_use(e) => {
-            lifecycle::leave(&data_dir);
-            info!(error = format!("{e:#}"), "exiting on an error");
-        }
-        Err(e) => {
-            lifecycle::record_error(&data_dir, &format!("{e:#}"));
-            info!(error = format!("{e:#}"), "exiting on an error");
-        }
-    }
+    record_outcome(&data_dir, &outcome);
     outcome
 }
 
@@ -773,9 +760,74 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // an aborted delivery is redelivered rather than lost.
     webhook_handle.abort();
 
+    // The last thing done to the engine, and the condition for a clean exit
+    // (ADR-192): no write can begin after this, and one in progress is let
+    // finish. The drain ending does not end its requests — a connection
+    // outlives the server that accepted it — so without this a handler could
+    // commit after the marker below says the run ended cleanly.
+    close_for_exit(&engine, WRITES_CLOSE_CAP)?;
+
     // `run` writes the exit marker and says "shutdown complete", after this
     // returns, so the last line of the log is the last thing done.
     Ok(())
+}
+
+/// Close the engine to writes, waiting up to `cap` for one in progress; an
+/// error when it did not end in time, which `run` records as no clean exit.
+fn close_for_exit(engine: &Engine, cap: Duration) -> Result<()> {
+    if kimmy_storage::blocking(|| engine.close_writes(cap)) {
+        Ok(())
+    } else {
+        Err(WritesStillOpen.into())
+    }
+}
+
+/// How long a shutdown waits, after the drain, for a write transaction still
+/// in progress to end before it gives up on a clean exit (ADR-192).
+const WRITES_CLOSE_CAP: Duration = Duration::from_secs(10);
+
+/// A write transaction was still in progress `WRITES_CLOSE_CAP` after the
+/// drain ended. The run does not record a clean exit: the next start reads
+/// it as one that did not shut down cleanly, which it may not have.
+#[derive(Debug)]
+pub struct WritesStillOpen;
+
+impl std::fmt::Display for WritesStillOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a write was still in progress {} s after the shutdown drain ended; exiting \
+             without recording a clean exit",
+            WRITES_CLOSE_CAP.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for WritesStillOpen {}
+
+/// Record how this run ended, from what serving it returned (ADR-147).
+///
+/// A shutdown whose writes did not close in time records nothing: the marker's
+/// absence is what tells the next start the run did not end cleanly, and a
+/// write may still have been committing as the process went.
+fn record_outcome(data_dir: &std::path::Path, outcome: &Result<()>) {
+    match outcome {
+        Ok(()) => {
+            lifecycle::record_exit(data_dir, lifecycle::Exit::Shutdown);
+            info!("shutdown complete");
+        }
+        Err(e) if e.downcast_ref::<WritesStillOpen>().is_some() => {
+            error!(error = format!("{e:#}"), "exiting without a clean-exit marker");
+        }
+        Err(e) if lifecycle::store_in_use(e) => {
+            lifecycle::leave(data_dir);
+            info!(error = format!("{e:#}"), "exiting on an error");
+        }
+        Err(e) => {
+            lifecycle::record_error(data_dir, &format!("{e:#}"));
+            info!(error = format!("{e:#}"), "exiting on an error");
+        }
+    }
 }
 
 /// How long in-flight requests get to finish once shutdown begins, on both
@@ -2227,6 +2279,54 @@ mod tests {
         std::fs::remove_file(&cert).unwrap();
         assert_eq!(stamps(&cert, &key).await, None);
         assert_ne!(stamps(&cert, &key).await, present);
+    }
+
+    /// A write in progress at the end of the drain delays the clean-exit
+    /// marker until it ends, and one that outlasts the cap means no clean
+    /// marker at all (ADR-192): the marker must never be written while a
+    /// commit can still land.
+    #[test]
+    fn the_clean_exit_marker_waits_for_the_write_in_progress_and_is_withheld_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let hold = |for_: Duration| {
+            let (held, is_held) = std::sync::mpsc::channel();
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
+                held.send(()).unwrap();
+                std::thread::sleep(for_);
+                drop(guard);
+            });
+            is_held.recv().unwrap();
+        };
+        let marker = dir.path().join(lifecycle::LAST_EXIT_FILE);
+
+        // Past the cap: an error, and no marker.
+        hold(Duration::from_secs(2));
+        let outcome = close_for_exit(&engine, Duration::from_millis(200));
+        assert!(outcome.as_ref().is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some()));
+        record_outcome(dir.path(), &outcome);
+        assert!(!marker.exists(), "a clean-exit marker was written while a write could land");
+
+        // Inside the cap: the marker waits for the write.
+        std::thread::sleep(Duration::from_secs(2));
+        let engine2 = Arc::new(Engine::open(&dir.path().join("second.redb")).unwrap());
+        let (held, is_held) = std::sync::mpsc::channel();
+        let holder = Arc::clone(&engine2);
+        std::thread::spawn(move || {
+            let guard = holder.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = close_for_exit(&engine2, Duration::from_secs(5));
+        assert!(outcome.is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(250), "it did not wait for the write");
+        record_outcome(dir.path(), &outcome);
+        assert!(marker.exists(), "a clean shutdown recorded no marker");
     }
 
     /// The plain listener's drain is bounded, and the multi-transaction stop

@@ -148,6 +148,10 @@ pub struct Engine {
     /// that has already committed part of itself stops before its next
     /// transaction rather than keeping the process alive to finish.
     stopping: std::sync::atomic::AtomicBool,
+    /// Set once the node has stopped taking writes for good, at the end of
+    /// its shutdown: every write transaction, first or later, is refused.
+    /// See [`Engine::close_writes`].
+    writes_closed: std::sync::atomic::AtomicBool,
     /// Run once, the next time a request that has committed begins another
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1241,6 +1245,7 @@ impl Engine {
             writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
             writer_wait_timeouts: std::sync::atomic::AtomicU64::new(0),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            writes_closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
@@ -1489,6 +1494,24 @@ impl Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn before_next_continuing_write(&self, hook: impl FnOnce() + Send + 'static) {
         *self.continuing_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Refuse every write transaction from now on, and wait up to `cap` for
+    /// the one holding the writer, if any, to end. Returns whether it ended.
+    ///
+    /// The last thing a shutdown does to the engine before it records a clean
+    /// exit (ADR-192). A request still running after the drain — its
+    /// connection outlives the server that accepted it — can otherwise begin
+    /// and commit a write after the exit marker says the run ended cleanly.
+    /// Once this returns `true` no transaction is open and none can begin, so
+    /// nothing the marker describes can change after it. `false` means one
+    /// was still open at the cap: the caller must not record a clean exit.
+    pub fn close_writes(&self, cap: std::time::Duration) -> bool {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.writes_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Taking the writer proves no transaction holds it; the flag above,
+        // read under the writer by every `begin_write`, keeps it that way.
+        blocking(|| self.writer_gate.try_lock_for(cap)).is_some()
     }
 
     /// Whether a continuing request must stop: the drain deadline passed, or
@@ -2723,6 +2746,10 @@ impl Engine {
             );
             return Err(StorageError::WriterBusy { waited });
         };
+        if self.writes_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(gate);
+            return Err(StorageError::Stopping(crate::StopReason::DrainDeadline));
+        }
         if continuing == Continuing::Yes
             && let Some(reason) = self.stop_reason()
         {
@@ -4412,6 +4439,50 @@ mod tests {
             engine.create_collection("shop", name).unwrap();
         }
         (std::sync::Arc::new(engine), dir)
+    }
+
+    #[test]
+    fn closing_writes_refuses_every_write_after_it() {
+        let (engine, _dir) = three_collections();
+        let meta = engine.get_collection("shop", "a").unwrap();
+        assert!(engine.close_writes(std::time::Duration::from_millis(100)));
+        let refused = engine.insert(&meta, bson::doc! { "n": 1 });
+        assert!(
+            matches!(refused, Err(StorageError::Stopping(crate::StopReason::DrainDeadline))),
+            "{refused:?}"
+        );
+        assert_eq!(engine.count(&meta).unwrap(), 0);
+    }
+
+    /// Hold the writer from another thread for `hold`; returns once held.
+    fn hold_for(engine: &std::sync::Arc<super::Engine>, hold: std::time::Duration) {
+        let (held, is_held) = std::sync::mpsc::channel();
+        let holder = std::sync::Arc::clone(engine);
+        std::thread::spawn(move || {
+            let guard = holder.hold_writer(super::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(guard);
+        });
+        is_held.recv().unwrap();
+    }
+
+    #[test]
+    fn closing_writes_waits_for_the_transaction_in_progress() {
+        // A write in progress at the end of the drain is let finish, and the
+        // clean exit is recorded only after it.
+        let (engine, _dir) = three_collections();
+        hold_for(&engine, std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(engine.close_writes(std::time::Duration::from_secs(5)));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250), "it did not wait");
+    }
+
+    #[test]
+    fn closing_writes_says_so_when_a_transaction_outlasts_the_cap() {
+        let (engine, _dir) = three_collections();
+        hold_for(&engine, std::time::Duration::from_secs(2));
+        assert!(!engine.close_writes(std::time::Duration::from_millis(200)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

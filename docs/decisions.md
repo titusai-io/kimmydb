@@ -19880,10 +19880,14 @@ Everything else a client can reach was already one transaction.
   collections whose burial committed, and `in_doubt`, one whose burial's
   outcome is unknown.
 - **`cause.code`** is the code the failure would have been answered with on
-  its own, or `stopping`, which has no code of its own. **`cause.message`**
-  is that answer's message, so never raw storage text.
-- **Logged** at `ERROR`, or at `WARN` when the cause is the caller's (a
-  `bad_request` from an operator a later document cannot take).
+  its own, or `stopping` (the drain deadline) or `storage_failed` (ADR-188),
+  which have no code of their own. **`cause.message`** is that answer's
+  message, so never raw storage text.
+- **Logged** at `ERROR`, or at `WARN` when the cause is not this node's fault:
+  the drain deadline, or the caller's (a `bad_request` from an operator a
+  later document cannot take). A request that begins after the deadline
+  commits its first chunk, since the stop bounds only later ones, and then
+  answers this.
 - **Over MCP** it is a tool result with `isError`, like every `verify`
   failure.
 
@@ -19912,11 +19916,26 @@ not at the signal: a rolling restart lets a request that can finish inside
 the drain finish. The plain listener's drain is now bounded like the TLS
 listener's, at 10 s; it waited for every in-flight request before. The
 storage-failure stop (ADR-188) stops a continuing request too, since its
-next transaction could only fail. A request stopped this way answers
-`partially_applied` if its connection is still open; if the drain closed it
-first, the client sees a dropped connection, which it reads as unknown. The
-stop bounds only the later transactions of these requests: not a first
-transaction, which on `/mcp` has no budget at all, and not one long hold.
+next transaction could only fail; its `cause` is `storage_failed`, logged at
+`ERROR`, where the deadline's is `stopping`, at `WARN`. A request stopped this
+way answers `partially_applied` if its connection is still open; if the drain
+closed it first, the client sees a dropped connection, which it reads as
+unknown. The stop bounds only the later transactions of these requests: not
+a first transaction, which on `/mcp` has no budget at all, and not one long
+hold.
+
+**The clean-exit marker waits for the last write.** Ending the drain does not
+end its requests: a connection outlives the server that accepted it, and an
+MCP tool runs in a task of its own. So a bounded drain alone would let a
+handler commit after the marker (ADR-147) said the run ended cleanly. After
+the drain and the background tasks, `Engine::close_writes` refuses every write
+transaction that begins from then on, checked under the writer, and takes the
+writer, up to 10 s, which proves the one in progress, if any, has ended. Only
+then is the marker written. A write that outlasts that wait means no marker,
+an `ERROR` line, and a process that does not wait for the blocked thread: the
+next start reads an unclean exit, which is true. Tracking requests instead
+would miss the tool task and the upgraded connection; the writer is the one
+thing every commit passes through.
 
 **What "verify" means.** The counts say how much, not which: chunks follow
 the internal key order. A `$set` to constants, and a delete, are safe to
