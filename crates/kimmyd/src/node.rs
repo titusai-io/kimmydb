@@ -337,7 +337,8 @@ enum TestStop {
     ServeError,
     /// `panic_in_run`: `node::run` panics once the node is serving, with a
     /// thread holding the engine as `hold_engine` does, so that only a
-    /// bounded runtime shutdown lets the process end.
+    /// bounded runtime shutdown lets the process end. The panic comes only
+    /// after that thread is running with the engine.
     PanicInRun,
     /// `slow_close:<ms>`: the close waits this long before dropping the
     /// engine, so a test can see what waits for it.
@@ -923,16 +924,22 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     kimmy_task::arm_test_kills();
     match test_stop {
         // A test's stand-in for a walk serving a peer, which holds the engine
-        // on a blocking thread for as long as it runs.
+        // on a blocking thread for as long as it runs. The run goes on only
+        // once that thread is running with the engine: a task not yet polled
+        // would be dropped by the runtime's shutdown, and its reference with
+        // it, and `panic_in_run` would then test a store that closed.
         Some(TestStop::HoldEngine | TestStop::PanicInRun) => {
             let engine = Arc::clone(&engine);
+            let (holding, held) = tokio::sync::oneshot::channel();
             // UNSUPERVISED: a test switch whose task is meant never to end.
             tokio::spawn(async move {
                 kimmy_storage::blocking(move || {
                     let _held = engine;
+                    let _ = holding.send(());
                     std::thread::sleep(Duration::from_secs(24 * 60 * 60));
                 });
             });
+            let _ = held.await;
         }
         Some(TestStop::PanicInWrite) => {
             let engine = Arc::clone(&engine);
