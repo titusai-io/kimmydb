@@ -1029,6 +1029,16 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    /// A first back-off for a test that asserts a confirmation sent straight
+    /// after a failure lands inside it. `quick()`'s 200 ms is an upper bound a
+    /// starved runner can overrun between the two calls; this one it cannot.
+    const WIDE_BACKOFF: Duration = Duration::from_secs(2);
+
+    /// [`quick`], with the first back-off [`WIDE_BACKOFF`].
+    fn wide() -> ConfirmConfig {
+        ConfirmConfig { first_backoff: WIDE_BACKOFF, max_backoff: WIDE_BACKOFF * 2, ..quick() }
+    }
+
     fn quick() -> ConfirmConfig {
         ConfirmConfig {
             first_backoff: Duration::from_millis(200),
@@ -1403,7 +1413,7 @@ mod tests {
     async fn a_failed_push_leaves_its_window_pending_and_the_member_backs_off() {
         let b = member().await;
         b.served.break_next.store(1, Ordering::SeqCst);
-        let a = pusher_for(&b, quick());
+        let a = pusher_for(&b, wide());
         let node = b.engine.node_id();
         let first = create(&a.engine, "e1");
         let one = a.confirmer.confirm(b.addr, node, first, DEADLINE).await;
@@ -1415,7 +1425,8 @@ mod tests {
         assert_eq!(during.outcome(), ConfirmOutcome::Backoff);
         assert_eq!(a.pushes.load(Ordering::SeqCst), pushed, "nothing sent during the back-off");
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Past the back-off: a lower bound, which a slow runner only lengthens.
+        tokio::time::sleep(WIDE_BACKOFF + Duration::from_millis(50)).await;
         let after = a.confirmer.confirm(b.addr, node, create(&a.engine, "e3"), DEADLINE).await;
         assert_eq!(after, Resolution::Confirmed);
         eventually("the member's queue emptied", || a.confirmer.members_waiting().is_empty()).await;
@@ -1513,7 +1524,7 @@ mod tests {
     async fn a_push_that_times_out_backs_off_and_the_driver_does_not_wedge() {
         let b = member().await;
         *b.served.hold.lock() = Duration::from_millis(1500);
-        let config = ConfirmConfig { request_timeout: Duration::from_millis(500), ..quick() };
+        let config = ConfirmConfig { request_timeout: Duration::from_millis(500), ..wide() };
         let a = pusher_for(&b, config);
         let node = b.engine.node_id();
         let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
@@ -1522,7 +1533,9 @@ mod tests {
         let during = a.confirmer.confirm(b.addr, node, create(&a.engine, "e2"), DEADLINE).await;
         assert_eq!(during.outcome(), ConfirmOutcome::Backoff);
         *b.served.hold.lock() = Duration::ZERO;
-        tokio::time::sleep(Duration::from_millis(1300)).await;
+        // Past the back-off, and past the member's held answer (1.5 s from
+        // when the window arrived, 0.5 s before the timeout): lower bounds.
+        tokio::time::sleep(WIDE_BACKOFF + Duration::from_millis(50)).await;
         let after = a.confirmer.confirm(b.addr, node, create(&a.engine, "e3"), DEADLINE).await;
         assert_eq!(after, Resolution::Confirmed);
 
