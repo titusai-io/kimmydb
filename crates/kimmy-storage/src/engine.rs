@@ -4670,6 +4670,26 @@ mod tests {
     /// opened with a 1 MiB cache, so a walk cannot be hidden in it, and the
     /// bytes the backend was asked for are asserted to be a small fraction of
     /// the table rather than the table.
+
+    /// A close proves itself: clean after an ordinary run, and refused,
+    /// naming the call, when the close's own fsync fails.
+    #[test]
+    fn a_close_reports_whether_the_store_was_closed_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("app", "c").unwrap();
+        engine.close().unwrap();
+        assert!(crate::format::closed_cleanly(&path).unwrap());
+
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("app", "d").unwrap();
+        assert!(engine.arm_test_storage_failure("sync_data"));
+        let refused = engine.close().unwrap_err();
+        assert!(matches!(refused, NotClosed::StorageFailed(_)), "{refused}");
+        assert!(refused.to_string().contains("sync_data"), "{refused}");
+        assert!(!crate::format::closed_cleanly(&path).unwrap());
+    }
     #[test]
     fn the_arrival_index_check_reads_headers_not_tables() {
         let dir = tempfile::tempdir().unwrap();
