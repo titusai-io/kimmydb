@@ -26,8 +26,8 @@ member rolled back walks every time. New gauges: `kimmy_oplog_entries` and
 `kimmy_oplog_verified_entries`, `_logical_bytes` and `_walk_seconds`;
 `KIMMY_VERIFY_OPLOG_AT_OPEN=1` forces the walk. A change-stream resume on a
 member that did not issue the token no longer holds a request worker, is logged
-when slow, and finds where to start by stamp, so a client that was caught up is
-answered without reading the arrival index.**
+when slow, and finds where to start by stamp, so a client that was caught up no
+longer walks the arrival index from its start.**
 
 ### Removed
 
