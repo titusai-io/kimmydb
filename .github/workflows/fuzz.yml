@@ -52,7 +52,7 @@ jobs:
       # Pinned to a release of the installer rather than its floating tag, as
       # ci.yml does for nextest.
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2.87.13
+        uses: taiki-e/install-action@v2.87.16
         with:
           tool: cargo-fuzz
 
