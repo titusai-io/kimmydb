@@ -330,11 +330,13 @@ first to finish answers ([ADR-173](decisions.md)'s addendum of 2026-09-26):
 
 Either runs before the upgrade is answered, off the request workers. The walk
 measured over 30 s on a multi-gigabyte store just after a restart, before the
-seek existed. A search over 1 s is logged at `info`, and one over 10 s at
-`warn`: `a change stream was slow to find where it starts`, with `elapsed_ms`,
-the kind of open (`token_kind`), `rows_examined`, and which search answered
-(`found_by`). A client whose upgrade timeout is shorter than that gives up and
-retries, and the retry searches again.
+seek existed. A search over 1 s is logged at `info` as `a change stream was
+slow to find where it starts`, and one over 10 s at `warn` as `a change stream
+took over 10 s to find where it starts; a client waiting on its upgrade may
+have given up`. Both carry `elapsed_ms`, the kind of open (`token_kind`),
+`rows_examined`, and which search answered (`found_by`). A client whose upgrade
+timeout is shorter than that gives up and retries, and the retry searches
+again.
 
 **Tokens from before 0.30.0** name only an entry. They are guaranteed to be
 accepted through 0.30.x and have been accepted since; a later minor may refuse
