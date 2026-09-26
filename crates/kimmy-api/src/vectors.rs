@@ -256,8 +256,12 @@ pub async fn disable_vectors(
     if let Some(id) = shadow {
         state.vectors.invalidate(id);
     }
+    // Recorded whenever this call changed something: turning the
+    // configuration off, or dropping vectors a partial disable left behind.
     if off.disabled {
         crate::audit::record_vectors(auth.principal(), "DisableVectors", &db, &coll, None);
+    } else if off.dropped_vectors {
+        crate::audit::record_vectors(auth.principal(), "DropVectors", &db, &coll, None);
     }
     // What this call did, not what it asked for: a disable sent again finds
     // nothing to turn off, and drops vectors only if some were left.

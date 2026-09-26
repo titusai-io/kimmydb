@@ -653,17 +653,26 @@ impl ApiError {
     ///
     /// `cause` is answered as the code and message it would have been on its
     /// own, which are already reduced to what is safe to return; its storage
-    /// detail is logged by that mapping, never returned. A node stopping is
-    /// named `stopping`, a cause with no code of its own.
+    /// detail is logged by that mapping, never returned. A node stopping has
+    /// no code of its own: `stopping` names the drain deadline, and
+    /// `storage_failed` the storage failure that stops the process (ADR-188).
     pub fn partially_applied(applied: &kimmy_storage::Applied, cause: StorageError) -> Self {
-        let (cause_code, cause_message, callers) = match cause {
-            StorageError::Stopping => {
-                ("stopping", "the node reached its shutdown deadline".to_string(), false)
+        // Who the cause belongs to decides the level: a stop at the drain
+        // deadline is a shutdown doing its job (`WARN`), a caller's refusal
+        // is the caller's (`WARN`), and everything else is this node's
+        // (`ERROR`), a storage failure included.
+        let (cause_code, cause_message, level) = match cause {
+            StorageError::Stopping(reason @ kimmy_storage::StopReason::DrainDeadline) => {
+                ("stopping", reason.to_string(), LogLevel::Warn)
+            }
+            StorageError::Stopping(reason @ kimmy_storage::StopReason::StorageFailed) => {
+                ("storage_failed", reason.to_string(), LogLevel::Error)
             }
             other => {
                 let mapped = ApiError::from(other);
-                let callers = !mapped.status.is_server_error();
-                (mapped.code.as_str(), mapped.message, callers)
+                let level =
+                    if mapped.status.is_server_error() { LogLevel::Error } else { LogLevel::Warn };
+                (mapped.code.as_str(), mapped.message, level)
             }
         };
         let (what, applied) = match applied {
@@ -704,9 +713,7 @@ impl ApiError {
         extra.insert("applied".into(), applied);
         extra.insert("cause".into(), json!({ "code": cause_code, "message": cause_message }));
         e.extra = Some(Box::new(extra));
-        if callers {
-            e.level_override = Some(LogLevel::Warn);
-        }
+        e.level_override = Some(level);
         e
     }
 
@@ -908,7 +915,7 @@ impl From<StorageError> for ApiError {
             // would mean a request stopped before writing anything, which a
             // request past its first commit never is. Kept honest anyway:
             // this node is going away, and another one serves.
-            StorageError::Stopping => ApiError::internal("the node is stopping"),
+            StorageError::Stopping(reason) => ApiError::internal(reason.to_string()),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.
@@ -939,9 +946,10 @@ impl From<AuthError> for ApiError {
             AuthError::UserNotFound(_) | AuthError::RoleNotFound(_) => {
                 ApiError::not_found(e.to_string())
             }
-            AuthError::UserExists(_) | AuthError::RoleExists(_) => {
-                ApiError::conflict(e.to_string())
-            }
+            AuthError::UserExists(_)
+            | AuthError::RoleExists(_)
+            | AuthError::LastUser
+            | AuthError::LastEnabledUser => ApiError::conflict(e.to_string()),
             // Both are configuration refusals raised before the server ever
             // serves, so neither can reach a request. Mapped rather than
             // matched loosely so that adding a variant stays a compile error

@@ -1598,7 +1598,10 @@ mod tests {
             applied,
             crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
         );
-        assert!(matches!(*cause, StorageError::Stopping), "{cause:?}");
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
         assert_eq!(claimed(&engine, &coll), vec![0], "chunk one stands, and nothing after it");
     }
 
@@ -1629,5 +1632,27 @@ mod tests {
             crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 1 }
         );
         assert!(matches!(*cause, StorageError::OutcomeUnknown(_)), "{cause:?}");
+    }
+
+    #[test]
+    fn a_multi_write_that_starts_past_the_drain_deadline_commits_one_chunk_and_says_so() {
+        // The stop bounds a request's later transactions, not its first: one
+        // begun after the deadline commits its first chunk, then stops.
+        let (engine, coll, _dir) = three_chunks();
+        engine.set_stopping();
+        let failed =
+            engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(2)).unwrap_err();
+        let StorageError::PartiallyApplied { applied, cause } = failed else {
+            panic!("a stop after a commit is partly applied: {failed:?}");
+        };
+        assert_eq!(
+            applied,
+            crate::Applied::Modify { matched: 1, modified: 1, commits: 1, in_doubt: 0 }
+        );
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
+        assert_eq!(claimed(&engine, &coll), vec![0]);
     }
 }

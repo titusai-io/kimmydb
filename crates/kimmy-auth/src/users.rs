@@ -334,8 +334,51 @@ impl UserStore {
     /// assert. As with every other edit here, the bump to `token_version`
     /// logs the account out of every session it holds; **re-enabling does not
     /// restore them**, which is the point.
+    ///
+    /// Disabling the last enabled account is refused ([`AuthError::LastEnabledUser`]),
+    /// decided under the writer in the transaction that would disable it: two
+    /// administrators disabling each other at once used to both pass a check
+    /// made outside it, and leave no enabled account (ADR-192).
     pub fn set_disabled(&self, engine: &Engine, name: &str, disabled: bool) -> Result<()> {
-        self.edit(engine, name, |user| user.disabled = disabled)
+        let users = self.collection.clone();
+        self.edit_checked(
+            engine,
+            name,
+            |scope, user| {
+                if !disabled || user.disabled {
+                    return Ok(Ok(()));
+                }
+                let mut enabled_others = 0usize;
+                scope.for_each_doc(&users, |id, doc| {
+                    let other_enabled = doc.get_bool("disabled").map(|d| !d).unwrap_or(true);
+                    if other_enabled && id != DocId::String(user.name.clone()) {
+                        enabled_others += 1;
+                    }
+                    Ok(enabled_others == 0)
+                })?;
+                Ok(if enabled_others == 0 { Err(AuthError::LastEnabledUser) } else { Ok(()) })
+            },
+            |user| user.disabled = disabled,
+        )
+    }
+
+    /// Delete a user unless it is the last one, decided under the writer in
+    /// the transaction that deletes it ([`AuthError::LastUser`], ADR-192).
+    /// Returns whether it existed.
+    pub fn delete_unless_last(&self, engine: &Engine, name: &str) -> Result<bool> {
+        let users = self.collection.clone();
+        let deleted = engine.write_batch(WriterHolder::Write, |scope| {
+            let mut count = 0usize;
+            scope.for_each_doc(&users, |_, _| {
+                count += 1;
+                Ok(count < 2)
+            })?;
+            if count <= 1 {
+                return Ok(Err(AuthError::LastUser));
+            }
+            Ok(Ok(scope.delete(&users, &DocId::String(name.to_string()))?))
+        });
+        deleted.map_err(AuthError::Storage)?
     }
 
     /// Change one user record and bump its token version, reading it under
@@ -346,6 +389,18 @@ impl UserStore {
     /// wrote back what the other had not seen: a grant change landing just
     /// after an account was disabled re-enabled it.
     fn edit(&self, engine: &Engine, name: &str, change: impl FnOnce(&mut User)) -> Result<()> {
+        self.edit_checked(engine, name, |_, _| Ok(Ok(())), change)
+    }
+
+    /// [`Self::edit`], refused by `check` — which reads, in the same
+    /// transaction, whatever it needs to decide — before anything is written.
+    fn edit_checked(
+        &self,
+        engine: &Engine,
+        name: &str,
+        check: impl FnOnce(&WriteScope<'_>, &User) -> kimmy_storage::Result<Result<()>>,
+        change: impl FnOnce(&mut User),
+    ) -> Result<()> {
         let users = self.collection.clone();
         let edited = engine.write_batch(WriterHolder::Write, |scope| {
             let id = DocId::String(name.to_string());
@@ -358,6 +413,9 @@ impl UserStore {
                     return Ok(Err(AuthError::Hashing(format!("decoding user {name:?}: {e}"))));
                 }
             };
+            if let Err(e) = check(scope, &user)? {
+                return Ok(Err(e));
+            }
             change(&mut user);
             user.token_version = user.token_version.wrapping_add(1);
             let doc = match encode(&user) {
@@ -726,6 +784,8 @@ mod tests {
         let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         let store = std::sync::Arc::new(UserStore::open(&engine).unwrap());
         store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        // Someone else enabled, so disabling ada is allowed.
+        store.create(&engine, "grace", "hunter2", Vec::new()).unwrap();
         let base = store.get(&engine, "ada").unwrap().unwrap().token_version;
 
         let grants = vec![Grant::new("sales", "*", vec![Action::Read])];
@@ -757,6 +817,7 @@ mod tests {
         let store = std::sync::Arc::new(UserStore::open(&engine).unwrap());
         store.roles().create(&engine, "wide", vec![Grant::superuser()]).unwrap();
         store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.create(&engine, "grace", "hunter2", Vec::new()).unwrap();
         store.set_roles(&engine, "ada", vec!["wide".into()]).unwrap();
         let base = store.get(&engine, "ada").unwrap().unwrap().token_version;
 
@@ -775,6 +836,69 @@ mod tests {
         let ada = store.get(&engine, "ada").unwrap().unwrap();
         assert!(ada.disabled, "the role edit re-enabled an account an admin had just disabled");
         assert_eq!(ada.token_version, base + 2, "a bump was lost");
+    }
+
+    /// Two edits, each queued behind a held writer, that must not both land.
+    /// Returns what each answered.
+    fn racing(
+        engine: &std::sync::Arc<Engine>,
+        store: &std::sync::Arc<UserStore>,
+        first: fn(&UserStore, &Engine) -> Result<()>,
+        second: fn(&UserStore, &Engine) -> Result<()>,
+    ) -> (Result<()>, Result<()>) {
+        let answers = std::sync::Arc::new(std::sync::Mutex::new((None, None)));
+        let (e1, s1, a1) =
+            (std::sync::Arc::clone(engine), std::sync::Arc::clone(store), answers.clone());
+        let (e2, s2, a2) =
+            (std::sync::Arc::clone(engine), std::sync::Arc::clone(store), answers.clone());
+        queued_behind_the_writer(
+            engine,
+            vec![
+                Box::new(move || a1.lock().unwrap().0 = Some(first(&s1, &e1))),
+                Box::new(move || a2.lock().unwrap().1 = Some(second(&s2, &e2))),
+            ],
+        );
+        let (a, b) = std::mem::take(&mut *answers.lock().unwrap());
+        (a.unwrap(), b.unwrap())
+    }
+
+    fn two_users() -> (std::sync::Arc<Engine>, std::sync::Arc<UserStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let store = std::sync::Arc::new(UserStore::open(&engine).unwrap());
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.create(&engine, "grace", "hunter2", Vec::new()).unwrap();
+        (engine, store, dir)
+    }
+
+    #[test]
+    fn two_admins_disabling_each_other_at_once_leave_one_enabled() {
+        // The last-enabled guard was checked outside the writer, so both
+        // disables passed it and no account was left enabled.
+        let (engine, store, _dir) = two_users();
+        let (a, b) = racing(
+            &engine,
+            &store,
+            |s, e| s.set_disabled(e, "ada", true),
+            |s, e| s.set_disabled(e, "grace", true),
+        );
+        assert!(a.is_ok(), "{a:?}");
+        assert!(matches!(b, Err(AuthError::LastEnabledUser)), "{b:?}");
+        assert!(!store.get(&engine, "grace").unwrap().unwrap().disabled);
+    }
+
+    #[test]
+    fn two_deletes_at_once_leave_one_user() {
+        let (engine, store, _dir) = two_users();
+        let (a, b) = racing(
+            &engine,
+            &store,
+            |s, e| s.delete_unless_last(e, "ada").map(|_| ()),
+            |s, e| s.delete_unless_last(e, "grace").map(|_| ()),
+        );
+        assert!(a.is_ok(), "{a:?}");
+        assert!(matches!(b, Err(AuthError::LastUser)), "{b:?}");
+        assert_eq!(store.count(&engine).unwrap(), 1);
     }
 
     /// How long a role edit holds the writer at 10,000 holders (ADR-192).

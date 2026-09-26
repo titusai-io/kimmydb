@@ -50,7 +50,7 @@ pub use engine::{
     WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot, blocking,
     metered_writer_wait, with_write_wait_budget,
 };
-pub use error::{Applied, Result, StorageError};
+pub use error::{Applied, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use hold_meter::{

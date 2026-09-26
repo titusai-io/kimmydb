@@ -1495,7 +1495,19 @@ impl Engine {
     /// the storage has failed (ADR-188), in which case the next transaction
     /// could only fail and the process is about to stop.
     pub fn is_stopping(&self) -> bool {
-        self.stopping.load(std::sync::atomic::Ordering::SeqCst) || self.storage_failed().is_some()
+        self.stop_reason().is_some()
+    }
+
+    /// Why a continuing request must stop, if it must; see
+    /// [`Self::is_stopping`].
+    pub fn stop_reason(&self) -> Option<crate::StopReason> {
+        if self.storage_failed().is_some() {
+            Some(crate::StopReason::StorageFailed)
+        } else if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(crate::StopReason::DrainDeadline)
+        } else {
+            None
+        }
     }
 
     /// `KIMMY_TEST_FAIL_STORAGE`: fail the next backend `call` (`read`,
@@ -2711,9 +2723,11 @@ impl Engine {
             );
             return Err(StorageError::WriterBusy { waited });
         };
-        if continuing == Continuing::Yes && self.is_stopping() {
+        if continuing == Continuing::Yes
+            && let Some(reason) = self.stop_reason()
+        {
             drop(gate);
-            return Err(StorageError::Stopping);
+            return Err(StorageError::Stopping(reason));
         }
         let mut txn = blocking(|| self.db.begin_write())?;
         // Counted here rather than at any one caller, so the guard that a
@@ -4449,7 +4463,10 @@ mod tests {
             applied,
             crate::Applied::DropDatabase { dropped: vec!["a".to_string()], in_doubt: None }
         );
-        assert!(matches!(*cause, StorageError::Stopping), "{cause:?}");
+        assert!(
+            matches!(*cause, StorageError::Stopping(crate::StopReason::DrainDeadline)),
+            "{cause:?}"
+        );
         let left: Vec<String> =
             engine.list_collections("shop").unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(left, vec!["b".to_string(), "c".to_string()]);

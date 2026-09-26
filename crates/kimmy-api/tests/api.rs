@@ -11901,7 +11901,10 @@ async fn a_multi_update_waits_out_a_writer_held_between_chunks_past_the_deadline
     // on the request's own thread, synchronously, between its commits.
     let server = three_chunk_server().await;
     let engine = Arc::clone(&server.state.engine);
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_ran = Arc::clone(&ran);
     server.state.engine.before_next_continuing_write(move || {
+        hook_ran.store(true, std::sync::atomic::Ordering::SeqCst);
         let (held, is_held) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
@@ -11921,6 +11924,9 @@ async fn a_multi_update_waits_out_a_writer_held_between_chunks_past_the_deadline
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["commits"], 3, "{:?}", res.body);
     assert_eq!(res.body["matched"], 3, "{:?}", res.body);
+    // The hold was taken where it matters, between two of the request's
+    // commits, and not merely never reached.
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "no chunk after the first waited");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

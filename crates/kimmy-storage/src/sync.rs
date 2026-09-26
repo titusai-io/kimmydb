@@ -2461,6 +2461,9 @@ pub(crate) mod race_hooks {
         /// A database drop buried every collection it found and has not yet
         /// taken the writer to decide whether the database row goes.
         BeforeRowRemoval,
+        /// Turning vectors off found them already off and has not yet taken
+        /// the writer to drop the shadow a partial disable left.
+        LeftoverShadow,
     }
 
     type Hook = Box<dyn FnOnce()>;

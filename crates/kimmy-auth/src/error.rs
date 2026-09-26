@@ -30,6 +30,17 @@ pub enum AuthError {
     #[error("role {0:?} already exists")]
     RoleExists(String),
 
+    /// Deleting the only user left would leave a server nobody can sign in
+    /// to. Decided under the writer, in the transaction that would delete it.
+    #[error("cannot delete the last remaining user")]
+    LastUser,
+
+    /// Disabling the only enabled user left would leave a server nobody can
+    /// administer. Decided under the writer, in the transaction that would
+    /// disable it.
+    #[error("cannot disable the last remaining enabled user")]
+    LastEnabledUser,
+
     #[error("the JWT secret must be at least {min} bytes")]
     WeakSecret { min: usize },
 

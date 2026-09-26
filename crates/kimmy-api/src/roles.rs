@@ -37,8 +37,6 @@ fn require_server_admin(auth: &Auth) -> Result<(), ApiError> {
     auth.require(Action::Admin, "*", None)
 }
 
-/// Bump the token version of every holder, and drop them from the session
-/// cache so the bump is visible to the very next request.
 /// Evict each holder a role edit invalidated from the session cache, after
 /// the edit committed: the bump to each stored version is only half of a
 /// revocation, because the session check reads this cache in front of it

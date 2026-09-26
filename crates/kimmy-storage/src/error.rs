@@ -110,17 +110,35 @@ pub enum StorageError {
     OutcomeUnknown(String),
 
     /// A later transaction of a request that has already committed one was
-    /// not begun, because the node is past its drain deadline or its storage
-    /// has failed (ADR-192). Nothing of that transaction was written. Only
-    /// ever the cause of a [`StorageError::PartiallyApplied`].
-    #[error("the node is stopping")]
-    Stopping,
+    /// not begun, because the node is stopping, for the reason given
+    /// (ADR-192). Nothing of that transaction was written. Only ever the
+    /// cause of a [`StorageError::PartiallyApplied`].
+    #[error("the node is stopping: {0}")]
+    Stopping(StopReason),
 
     /// A request that commits in more than one transaction failed after its
     /// first commit (ADR-192). What `applied` counts is committed, published
     /// and replicating; `cause` is why the request stopped there.
     #[error("the request was partly applied ({applied}) and then failed: {cause}")]
     PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+}
+
+/// Why a continuing request was stopped; see [`StorageError::Stopping`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// The node's shutdown drain reached its deadline.
+    DrainDeadline,
+    /// The storage failed (ADR-188), and the process is stopping.
+    StorageFailed,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DrainDeadline => "the node reached its shutdown deadline",
+            Self::StorageFailed => "the node's storage failed, and it is stopping",
+        })
+    }
 }
 
 /// What a request that commits in more than one transaction had committed

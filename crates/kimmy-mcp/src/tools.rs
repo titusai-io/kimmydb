@@ -936,7 +936,10 @@ mod tests {
             commits: 1,
             in_doubt: 0,
         };
-        let e = ApiError::partially_applied(&applied, kimmy_storage::StorageError::Stopping);
+        let e = ApiError::partially_applied(
+            &applied,
+            kimmy_storage::StorageError::Stopping(kimmy_storage::StopReason::DrainDeadline),
+        );
         let result = render(Err(e)).expect("a tool result, not an error");
         assert_eq!(result.is_error, Some(true));
         let envelope = result.structured_content.expect("the envelope rides in the result");

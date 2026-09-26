@@ -111,16 +111,14 @@ pub async fn delete_user(
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
 
-    // Removing the last administrator would leave the server unadministrable
-    // with no way back in short of editing the data directory.
-    if state.users.list(&state.engine)?.len() <= 1 {
-        return Err(ApiError::conflict("cannot delete the last remaining user"));
-    }
     if name == auth.principal().user {
         return Err(ApiError::conflict("cannot delete the account you are signed in as"));
     }
-
-    let deleted = state.users.delete(&state.engine, &name)?;
+    // Removing the last administrator would leave the server unadministrable
+    // with no way back in short of editing the data directory. Decided in
+    // the transaction that deletes, so two deletes at once cannot both pass
+    // it (ADR-192).
+    let deleted = kimmy_storage::blocking(|| state.users.delete_unless_last(&state.engine, &name))?;
     // The account is gone, so the absence is the revocation — but only once
     // this node stops remembering the version it used to have (ADR-052).
     state.sessions.evict(&name);
@@ -197,25 +195,13 @@ pub async fn set_disabled(
         .get(&state.engine, &name)?
         .ok_or_else(|| ApiError::not_found(format!("no user {name:?}")))?;
 
-    if body.disabled && !user.disabled {
-        if name == auth.principal().user {
-            return Err(ApiError::conflict("cannot disable the account you are signed in as"));
-        }
-        let enabled_others = state
-            .users
-            .list(&state.engine)?
-            .iter()
-            // `list` returns names; each candidate needs its record to know
-            // whether it is currently enabled. User counts are small.
-            .filter_map(|n| state.users.get(&state.engine, n).ok().flatten())
-            .filter(|u| !u.disabled && u.name != name)
-            .count();
-        if enabled_others == 0 {
-            return Err(ApiError::conflict("cannot disable the last remaining enabled user"));
-        }
+    if body.disabled && !user.disabled && name == auth.principal().user {
+        return Err(ApiError::conflict("cannot disable the account you are signed in as"));
     }
-
-    state.users.set_disabled(&state.engine, &name, body.disabled)?;
+    // The last enabled user is refused inside the store, under the writer, in
+    // the transaction that disables: checked out here, two administrators
+    // disabling each other at once both passed, and left none (ADR-192).
+    kimmy_storage::blocking(|| state.users.set_disabled(&state.engine, &name, body.disabled))?;
     state.sessions.evict(&name);
     Ok(Json(json!({ "updated": name, "disabled": body.disabled })))
 }
