@@ -1101,6 +1101,17 @@ mod tests {
         }
     }
 
+    /// Wait until `n` windows have reached the member. Its hook records a
+    /// window before it holds the answer, so from then until the hold ends the
+    /// push is in flight: a test that needs one in flight waits for this, not
+    /// a fixed sleep, which a loaded runner can outlast before the push starts.
+    async fn windows_reached(member: &Member, n: usize) {
+        eventually(&format!("{n} window(s) reached the member"), || {
+            member.served.windows().len() >= n
+        })
+        .await;
+    }
+
     // --- T1 ---
 
     /// A burst of 32 creates confirmed concurrently is applied once each on
@@ -1139,7 +1150,8 @@ mod tests {
         let confirmer = Arc::clone(&a.confirmer);
         let one =
             tokio::spawn(async move { confirmer.confirm(b.addr, node, first, DEADLINE).await });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // e1's window is at the member, held there: e2 is minted after it.
+        windows_reached(&b, 1).await;
         let second = create(&a.engine, "e2");
         let two = a.confirmer.confirm(b.addr, node, second, DEADLINE).await;
         assert_eq!(one.await.unwrap(), Resolution::Confirmed);
@@ -1783,7 +1795,8 @@ mod tests {
         let entry = create(&a.engine, "e1");
         let waiting =
             tokio::spawn(async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Mid-wait: the window is at the member, whose answer is held.
+        windows_reached(&b, 1).await;
         waiting.abort();
         let _ = waiting.await;
         assert_eq!(*a.outcomes.lock(), vec![ConfirmOutcome::Cancelled]);
@@ -1831,7 +1844,8 @@ mod tests {
         let confirmer = Arc::clone(&a.confirmer);
         let waiting =
             tokio::spawn(async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A driver is running: its window is at the member, answer held.
+        windows_reached(&b, 1).await;
         a.confirmer.abort_all();
         let resolution = waiting.await.unwrap();
         assert_eq!(resolution.outcome(), ConfirmOutcome::TaskEnded, "{resolution:?}");
