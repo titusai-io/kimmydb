@@ -2212,3 +2212,94 @@ async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_cl
     // The drop purger runs on every node, clustered or not (ADR-189).
     assert_eq!(rows, ["drop_purger", "replication", "stall_probe", "webhook_dispatcher"]);
 }
+
+/// A stop with every duty running ends clean on every member: replication,
+/// webhook dispatch, change streams open, a vector index built, a backup
+/// served, and an exporter pointed at a collector that never answers. Each
+/// member closes its store on the main thread, which it can only do when
+/// nothing else holds the engine, so an `Arc` held past the runtime's
+/// shutdown, a cycle among them, shows here as exit 75 and
+/// `storage_not_closed` rather than as a repair on some later start.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_stop_with_every_duty_running_closes_every_members_store() {
+    let client = reqwest::Client::new();
+    // Connections complete into the backlog and are never read.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // The storage section's text ends it, so a section of its own follows.
+    let telemetry =
+        format!("\n[telemetry]\nendpoint = \"http://{}\"\n", silent.local_addr().unwrap());
+    let (a, b, c) = three_nodes_with(&client, &telemetry).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    let post = |node: &Node, path: &str, body: serde_json::Value| {
+        client.post(node.url(path)).bearer_auth(&token).json(&body).send()
+    };
+    for name in ["feed", "vec"] {
+        let res = post(&a, "/v1/db/shop/collections", serde_json::json!({ "name": name })).await;
+        assert!(res.unwrap().status().is_success(), "{name}");
+    }
+    let (hook_addr, _seen) = receiver().await;
+    let hook = serde_json::json!({ "url": format!("http://{hook_addr}/hook") });
+    assert!(post(&a, "/v1/db/shop/coll/feed/webhooks", hook).await.unwrap().status().is_success());
+    let vectors =
+        serde_json::json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 });
+    assert!(post(&a, "/v1/db/shop/coll/vec/vector", vectors).await.unwrap().status().is_success());
+    for i in 0..20 {
+        let doc = serde_json::json!({ "_id": i, "note": "n" });
+        assert!(post(&a, "/v1/db/shop/coll/vec/docs", doc).await.unwrap().status().is_success());
+        let res = client
+            .put(a.url(&format!("/v1/db/shop/coll/vec/docs/{i}/vectors")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!([{ "chunk": 0, "vector": [1.0, i as f32, 0.0], "text": "n" }]))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success(), "{:?}", res.text().await);
+    }
+    pulls_settle(&client, &[&a, &b, &c]).await;
+
+    let mut feeds = Vec::new();
+    for node in [&a, &b, &c] {
+        let bearer = node.login(&client).await;
+        let search = client
+            .post(node.url("/v1/db/shop/coll/vec/vector_search"))
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({ "vector": [1.0, 0.0, 0.0], "k": 3 }))
+            .send()
+            .await
+            .unwrap();
+        assert!(search.status().is_success(), "{}: {:?}", node.name, search.text().await);
+        feeds.push(open_feed(node, &bearer, None).await);
+    }
+    let backup = client.get(a.url("/v1/admin/backup")).bearer_auth(&token).send().await.unwrap();
+    assert!(backup.status().is_success());
+    assert!(!backup.bytes().await.unwrap().is_empty());
+    for i in 0..50 {
+        let doc = serde_json::json!({ "_id": format!("f{i}") });
+        assert!(post(&a, "/v1/db/shop/coll/feed/docs", doc).await.unwrap().status().is_success());
+    }
+
+    for node in [&a, &b, &c] {
+        node.signal("TERM");
+    }
+    for node in [&a, &b, &c] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let status = loop {
+            if let Some(status) = node.child.lock().unwrap().try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{} did not exit", node.name);
+            tokio::time::sleep(POLL).await;
+        };
+        let log = std::fs::read_to_string(node.dir.path().join("stdout.log")).unwrap_or_default();
+        assert!(status.success(), "{}: {status:?}\n{log}", node.name);
+        assert!(log.contains("engine closed"), "{}: {log}", node.name);
+        let marker =
+            std::fs::read_to_string(node.dir.path().join("data").join("kimmy.last-exit")).unwrap();
+        assert!(marker.contains("exit = \"shutdown\""), "{}: {marker}", node.name);
+    }
+    drop(feeds);
+    drop(silent);
+}

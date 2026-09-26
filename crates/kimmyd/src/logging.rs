@@ -1299,6 +1299,37 @@ impl TelemetryGuard {
     }
 }
 
+/// How long the exporters get, together, to send what they hold on the way
+/// out.
+pub const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl TelemetryGuard {
+    /// Flush and shut the exporters down, giving up after `within`, for both
+    /// together. On a thread of its own, because the deadline has to hold
+    /// whatever the exporter does: the meter provider's own
+    /// `shutdown_with_timeout` does not use its timeout, and an unreachable
+    /// collector would otherwise hold the process up. A flush still running
+    /// at the deadline is abandoned with the process.
+    pub fn shutdown_within(self, within: std::time::Duration) {
+        if self.tracer.is_none() && self.meter.is_none() {
+            return;
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        let flushing =
+            // UNSUPERVISED: the exporters' last flush, abandoned at its deadline.
+            std::thread::Builder::new().name("telemetry-shutdown".into()).spawn(move || {
+                drop(self);
+                let _ = done.send(());
+            });
+        if flushing.is_ok() && finished.recv_timeout(within).is_err() {
+            tracing::warn!(
+                within_ms = within.as_millis() as u64,
+                "the collector did not take the last spans and metrics in time; exiting without them"
+            );
+        }
+    }
+}
+
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
         // Errors are logged rather than propagated: this runs on the way out,

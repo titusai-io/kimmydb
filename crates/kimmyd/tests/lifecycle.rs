@@ -985,3 +985,212 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
     after.signal("TERM");
     assert!(after.wait_exit().success());
 }
+
+/// Signal `run`, and wait for it to end: its status, and how long it took.
+fn stop(run: &mut Run) -> (std::process::ExitStatus, Duration) {
+    let started = Instant::now();
+    run.signal("TERM");
+    let status = run.wait_exit();
+    (status, started.elapsed())
+}
+
+/// Start the next run on `dir`, wait for it to serve, and return its log
+/// after stopping it cleanly.
+async fn next_start_log(dir: &Path, name: &str, client: &reqwest::Client) -> String {
+    let mut next = Run::spawn(dir, name);
+    next.wait_ready(client).await;
+    let log = next.log();
+    let (status, _) = stop(&mut next);
+    assert!(status.success(), "{status:?}");
+    log
+}
+
+/// `exit = "shutdown"` is written only after redb closed (the 0.40.0
+/// finding): a close slowed on purpose is waited for, `engine closed` comes
+/// before `shutdown complete`, and the next start repairs nothing.
+#[tokio::test]
+async fn a_clean_stop_closes_the_store_before_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run =
+        Run::spawn_with(dir.path(), "slow-close", &[("KIMMY_TEST_STOP", "slow_close:1500")]);
+    run.wait_ready(&client).await;
+    let (status, took) = stop(&mut run);
+    assert!(status.success(), "{status:?}");
+    assert!(took >= Duration::from_millis(1500), "the exit did not wait for the close: {took:?}");
+    let log = run.log();
+    assert!(log.contains("a test switch is set that acts on this node's stop"), "{log}");
+    let closed = log.find("engine closed").unwrap_or_else(|| panic!("no close logged: {log}"));
+    let complete = log.find("shutdown complete").unwrap_or_else(|| panic!("{log}"));
+    assert!(closed < complete, "the marker came before the close: {log}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+
+    let log = next_start_log(dir.path(), "slow-close-next", &client).await;
+    assert!(log.contains("previous run ended cleanly"), "{log}");
+    assert!(!log.contains("repairing the database"), "{log}");
+}
+
+/// A thread still holding the engine when the stop's time runs out, as a
+/// walk serving a peer did in 0.40.0: the process exits 75 inside the stop's
+/// budget instead of waiting for a supervisor's SIGKILL, and says why; the
+/// marker says `storage_not_closed`, never `shutdown`; the next start says
+/// the shutdown could not close its storage, and repairs it.
+#[tokio::test]
+async fn a_stop_with_the_engine_still_held_exits_75_and_the_next_start_repairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "held", &[("KIMMY_TEST_STOP", "hold_engine")]);
+    run.wait_ready(&client).await;
+    let (status, took) = stop(&mut run);
+    assert_eq!(status.code(), Some(75), "{status:?}");
+    assert!(took < Duration::from_secs(27), "the stop was not bounded: {took:?}");
+    let log = run.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("exiting without closing the storage engine"))
+        .unwrap_or_else(|| panic!("no error line: {log}"));
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(line.contains("still held by a thread"), "{line}");
+    assert!(!log.contains("shutdown complete"), "{log}");
+    let marker = marker(dir.path()).expect("a marker");
+    assert!(marker.contains("exit = \"storage_not_closed\""), "{marker}");
+    assert!(marker.contains("still held by a thread"), "{marker}");
+
+    let log = next_start_log(dir.path(), "held-next", &client).await;
+    assert!(log.contains("the previous shutdown could not close its storage"), "{log}");
+    assert!(log.contains("repairing the database after an unclean stop"), "{log}");
+}
+
+/// redb latches a need for repair when a write transaction is dropped while
+/// its thread panics; the close then leaves the header dirty with no I/O
+/// error for the storage's health to see. The stop reads the header, so the
+/// marker says `storage_not_closed`, and the next start repairs.
+#[tokio::test]
+async fn a_panic_inside_a_write_is_never_recorded_as_a_clean_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "panicked", &[("KIMMY_TEST_STOP", "panic_in_write")]);
+    run.wait_ready(&client).await;
+    let deadline = Instant::now() + PATIENCE;
+    while !run.log().contains("a panic inside a write transaction, on purpose") {
+        assert!(Instant::now() < deadline, "the switch never panicked: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    let (status, _) = stop(&mut run);
+    assert_eq!(status.code(), Some(75), "{status:?}");
+    let log = run.log();
+    assert!(!log.contains("shutdown complete"), "{log}");
+    let marker = marker(dir.path()).expect("a marker");
+    assert!(marker.contains("exit = \"storage_not_closed\""), "{marker}");
+    assert!(marker.contains("needing recovery"), "{marker}");
+
+    let log = next_start_log(dir.path(), "panicked-next", &client).await;
+    assert!(log.contains("the previous shutdown could not close its storage"), "{log}");
+    assert!(log.contains("repairing the database after an unclean stop"), "{log}");
+}
+
+/// Serving that fails with no signal ends bounded, as an error, with the
+/// store closed first: the marker says `error`, and the next start repairs
+/// nothing.
+#[tokio::test]
+async fn serving_that_fails_closes_the_store_and_records_the_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "serve-error", &[("KIMMY_TEST_STOP", "serve_error")]);
+    let status = run.wait_exit();
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    let log = run.log();
+    assert!(log.contains("engine closed"), "{log}");
+    assert!(log.contains("serving failed on purpose"), "{log}");
+    let marker = marker(dir.path()).expect("a marker");
+    assert!(marker.contains("exit = \"error\""), "{marker}");
+
+    let log = next_start_log(dir.path(), "serve-error-next", &client).await;
+    assert!(log.contains("the previous run exited on an error"), "{log}");
+    assert!(!log.contains("repairing the database"), "{log}");
+}
+
+/// A second SIGTERM during the stop changes nothing: the stop goes on as it
+/// was, and ends clean.
+#[tokio::test]
+async fn a_second_signal_during_the_stop_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "twice", &[("KIMMY_TEST_STOP", "slow_close:1500")]);
+    run.wait_ready(&client).await;
+    run.signal("TERM");
+    std::thread::sleep(Duration::from_millis(500));
+    run.signal("TERM");
+    let status = run.wait_exit();
+    assert!(status.success(), "{status:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+    assert_eq!(run.log().matches("shutdown signal received").count(), 1, "{}", run.log());
+}
+
+/// A collector that accepts and never answers holds nothing up: the
+/// exporters get two seconds between them, after the marker is written.
+#[tokio::test]
+async fn a_collector_that_never_answers_does_not_hold_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    // Connections complete into the backlog and are never read.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", silent.local_addr().unwrap());
+    let mut run = Run::spawn_with(dir.path(), "silent-otlp", &[("KIMMY_OTLP_ENDPOINT", &endpoint)]);
+    run.wait_ready(&client).await;
+    let (status, took) = stop(&mut run);
+    assert!(status.success(), "{status:?}");
+    assert!(took < Duration::from_secs(6), "the exporters held the stop: {took:?}");
+    let log = run.log();
+    assert!(log.contains("the collector did not take the last spans and metrics in time"), "{log}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+    drop(silent);
+}
+
+/// Pinned as it is, and out of the stop's scope: a SIGTERM before the node
+/// serves finds no handler yet, and ends the process with the signal and no
+/// marker.
+#[tokio::test]
+async fn a_signal_during_start_up_ends_the_process_with_no_marker() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::spawn(dir.path(), "early");
+    run.signal("TERM");
+    let status = run.wait_exit();
+    assert_eq!(status.signal(), Some(15), "{status:?}: {}", run.log());
+    assert!(marker_absent(dir.path()));
+}
+
+/// The TLS listener's stop closes the store too: its drain and its
+/// certificate reloader hold nothing past the runtime's shutdown.
+#[tokio::test]
+async fn a_stop_over_tls_closes_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert, key) = (dir.path().join("server.crt"), dir.path().join("server.key"));
+    std::fs::write(&cert, issued.cert.pem()).unwrap();
+    std::fs::write(&key, issued.signing_key.serialize_pem()).unwrap();
+    let (cert, key) = (cert.display().to_string(), key.display().to_string());
+    let mut run = Run::spawn_with(
+        dir.path(),
+        "tls",
+        &[("KIMMY_TLS_CERT", cert.as_str()), ("KIMMY_TLS_KEY", key.as_str())],
+    );
+    let client = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let ports::Bound::Port(port) =
+            ports::bound_http_port(&run.stdout, "serving HTTPS", run.pid, &[])
+            && let Ok(res) = client.get(format!("https://localhost:{port}/healthz")).send().await
+            && res.status().is_success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never served over TLS: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    let (status, _) = stop(&mut run);
+    assert!(status.success(), "{status:?}: {}", run.log());
+    assert!(run.log().contains("engine closed"), "{}", run.log());
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}

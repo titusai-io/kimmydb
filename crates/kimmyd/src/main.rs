@@ -162,27 +162,22 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
-            let outcome = runtime.block_on(node::run(config));
-            // A shutdown that gave up waiting for a write (ADR-192) leaves
-            // that write's thread blocked; the runtime is not waited on for it.
-            let writes_open = outcome
-                .as_ref()
-                .is_err_and(|e| e.downcast_ref::<node::WritesStillOpen>().is_some());
-            // Dropped *after* `node::run` returns, which is after every
-            // background task has been aborted — the same shutdown discipline
-            // the end of `node::run` already follows, for the same reason: a
-            // batch processor buffers, so shutting the exporter down first
-            // would throw away the last few seconds of spans, which is exactly
-            // the part anybody debugging a shutdown wants to see.
-            drop(telemetry_guard);
-            if writes_open {
-                runtime.shutdown_timeout(std::time::Duration::from_millis(100));
-                if let Err(e) = &outcome {
-                    eprintln!("Error: {e:#}");
-                }
+            let end = runtime.block_on(node::run(config));
+            // The runtime's shutdown is bounded, the engine is closed on this
+            // thread, and only then is the exit marker written (ADR-147).
+            let concluded = node::conclude(end, runtime);
+            // Last, so the spans of the stop itself, `shutdown complete`
+            // among them, are exported: a batch processor buffers, and the
+            // last seconds before an exit are the part anybody debugging it
+            // wants. Bounded, as everything after the signal is.
+            telemetry_guard.shutdown_within(logging::TELEMETRY_SHUTDOWN);
+            if let Err(e) = &concluded
+                && e.downcast_ref::<node::StorageNotClosed>().is_some()
+            {
+                eprintln!("Error: {e:#}");
                 std::process::exit(kimmy_task::EXIT_UNCLEAN_SHUTDOWN);
             }
-            outcome
+            concluded
         }
     }
 }

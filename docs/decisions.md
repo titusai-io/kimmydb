@@ -11257,6 +11257,69 @@ start puts back any marker it set aside and writes none. Tested by
 `a_second_start_on_a_live_directory_leaves_its_markers_alone` and
 `a_start_that_finds_the_store_held_leaves_the_marker_as_it_was`.
 
+**`shutdown` means the store closed (0.40.1).** Until 0.40.1, `node::run`
+wrote `exit = "shutdown"` and logged `shutdown complete` as soon as the engine
+was closed to writes, and then returned to `main`, whose runtime drop waited,
+with no bound, for every blocking thread. A walk of the oplog serving a peer's
+pull runs on one, holding an `Arc<Engine>`, so redb's `Database` was dropped
+only when the walk ended. A supervisor that killed the process first left a
+store the next start repaired, beside a marker that called the stop clean.
+Present since at least 0.39.0.
+
+Now `run` records nothing on its way out. It returns the engine, and `main`:
+1. shuts the runtime down with `shutdown_timeout`, until 22 s after the signal
+   (`STOP_BUDGET`, taken where the stop is announced: at the signal, or when
+   serving fails), and never less than 3 s;
+2. waits, until that deadline, to be the engine's last owner, then takes it
+   with `Arc::into_inner` and drops it on its own thread, which runs redb's
+   close there, and logs `engine closed` with `elapsed_ms`;
+3. requires that the storage's health recorded no failed backend call, and
+   that the header's recovery-required flag is clear in the file. redb clears
+   it only in a close that recorded the allocator state, and skips that when
+   it has latched a need for repair, as it does when a write transaction is
+   dropped while its thread panics. Nothing else reports that case;
+4. only then writes `shutdown`, logs `shutdown complete`, and releases the
+   data directory;
+5. shuts the exporters down last, with one 2 s deadline for both, on a thread
+   of its own: the meter provider's `shutdown_with_timeout` does not use its
+   timeout.
+
+Any other ending writes the new marker, `storage_not_closed`, with the reason
+as `cause`: the engine still held at the deadline, a write still open at the
+cap (which used to leave no marker), or a close that did not record. It logs
+`exiting without closing the storage engine; the next start repairs the
+database` at `ERROR`, with the reason in `error`, and exits 75. Serving that
+fails is closed the same way and still records `error`.
+
+| Marker | Written when | The next start says |
+|---|---|---|
+| `shutdown` | a signal, and redb recorded the close | `previous run ended cleanly` (`INFO`) |
+| `storage_not_closed` | a stop that could not close the store | `the previous shutdown could not close its storage; repairing the database` (`WARN`), with the cause |
+| `error` | an error, from a start or from serving | `the previous start failed before it served` or `the previous run exited on an error` (`WARN`) |
+| `task_died` | a supervised task ended (ADR-184) | `the previous run stopped itself because a background task ended` (`WARN`) |
+| `storage_failed` | a storage I/O error (ADR-188) | `the previous run stopped itself because its storage engine hit an I/O error` (`WARN`) |
+| `restore` | `kimmyd restore` | `previous run ended cleanly` (`INFO`) |
+| none | a kill, or a panic out of `main` | `previous run did not shut down cleanly` (`WARN`) |
+
+**Rolling back.** A build before 0.40.1 does not know `storage_not_closed`,
+reads the marker as unreadable, removes it, and repairs the store as for any
+unclean stop.
+
+**What this does not do.** It bounds the stop and makes the marker honest; it
+does not make a walk stop. A stop that finds a peer's pull being served is
+still `storage_not_closed` if the walk outlasts the deadline. Walks that end
+at the stop are a change of their own. A signal before the node serves
+installs no handler yet, and ends the process with the signal and no marker,
+as before; `a_signal_during_start_up_ends_the_process_with_no_marker` pins it.
+
+Tested by `node`'s unit tests (a late holder waited for, a holder past the
+deadline, a panic inside a write, a write open past the cap, serving that
+fails), and by `crates/kimmyd/tests/lifecycle.rs` on the shipped binary with
+`KIMMY_TEST_STOP` (a slowed close before the marker, a held engine exiting 75
+and repaired, a panic inside a write, serving that fails, a second signal, a
+collector that never answers, TLS) and the cluster harness's
+`a_stop_with_every_duty_running_closes_every_members_store`.
+
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 
 > **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
