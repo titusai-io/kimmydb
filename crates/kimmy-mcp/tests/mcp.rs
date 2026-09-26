@@ -1059,6 +1059,28 @@ async fn a_malformed_filter_is_reported_to_the_caller() {
 }
 
 #[tokio::test]
+async fn a_refusal_carries_its_code_and_retry_class_in_data() {
+    // The JSON-RPC code says only whose problem it is. Whether to wait, move to
+    // another node or stop is the retry class, and an agent gets it the way a
+    // REST client does (ADR-057).
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    let body = server
+        .call(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"x":{"$nope":1}}}),
+        )
+        .await;
+    let data = &body["error"]["data"];
+    assert_eq!(data["error"], "bad_request", "{body}");
+    assert_eq!(data["retry"], "no", "{body}");
+    assert!(data["message"].as_str().unwrap_or_default().contains("$nope"), "{body}");
+}
+
+#[tokio::test]
 async fn an_argument_the_tool_does_not_define_is_refused_by_name() {
     // ADR-121, the tool side. A model that misspells `limit` and is answered
     // with every document has no way to notice; one told the name it used is
