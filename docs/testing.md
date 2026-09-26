@@ -41,8 +41,6 @@ What each crate is *for* does not rot, so that is what the table keeps.
 | `kimmy-api` | Unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics, ownership, session revocation) plus end-to-end over a real socket, webhook delivery against a real receiver, and one binary of its own that measures what a read *holds* ([What a read holds](#what-a-read-holds)) |
 | `kimmy-mcp` | Unit (resource URIs, internal-object filter) plus end-to-end JSON-RPC over a real socket |
 | `kimmyd` | Config layering and validation, TLS termination, certificate reload, and the serving stack |
-| `kimmy-cli` | Target parsing, JSON argument errors, and that no `--password` flag exists |
-| `kimmy-client` | Typed refusals, token refresh and federated tokens, cursor paging and its end conditions, change streams and resume tokens, node failover and the writes deliberately not retried elsewhere |
 | `kimmy-cluster` | Discovery including SRV resolution against a local DNS server, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 | `kimmy-fuzz-harness` | Every seed in every fuzz corpus runs clean; the degenerate inputs a fuzzer finds first; the signed token paths are reachable ([Fuzzing](#fuzzing)) |
 
@@ -1036,249 +1034,15 @@ that is what a default run relies on.
 
 ---
 
-## The client is tested against a real server
+## The clients' suites moved with the clients
 
-`crates/kimmy-client/tests/client.rs` runs a node in-process and talks to it
-over a socket. Nothing calls a handler directly: the client's whole job is to
-be correct about what comes back over a connection, so a test that skipped the
-connection would exercise the half that was never in doubt.
-
-| Property | Test |
-|---|---|
-| A client with credentials logs in and the token works | `a_client_built_with_credentials_holds_a_token` |
-| An expired token is replaced without the caller noticing | `an_expired_token_is_replaced_without_the_caller_noticing` |
-| A dead first endpoint does not stop the client — including at login | `an_unreachable_node_is_skipped_for_one_that_answers` |
-| A write is not moved to another node automatically | `a_write_is_not_retried_elsewhere_automatically` |
-| A walk sees every document exactly once, in order | `paging_walks_the_whole_collection` |
-| A walk ends on an empty page, not a missing token | `a_walk_ends_on_an_empty_page_not_a_missing_token` |
-| A refusal arrives with its code and retry class | `a_refusal_arrives_typed` |
-| A change stream resumes from where it stopped | `a_change_stream_resumes_from_where_it_stopped` |
-| The crate depends on no server crate | `the_shipped_crate_depends_on_no_kimmy_crate` |
-
-The last one is a manifest check rather than a behaviour, and it is the one
-that keeps the rest meaningful: a client sharing a type with the server could
-rely on something the specification never promised, and the tests would still
-pass.
-
-Two of these found real defects on their first run — a login that could not
-fail over, and a public API that forced consumers to depend on `reqwest`.
-
----
-
-## The Python client, tested the same way
-
-`clients/python/tests` spawns a real `kimmyd` and talks to it over a socket —
-the same arrangement as the Rust client's tests, and deliberately the **same
-scenario list**. Two clients that pass the same scenarios independently are
-evidence about the protocol; two clients tested differently are two opinions.
-
-```bash
-cargo build --release            # the tests drive a real node
-cd clients/python && uv run --extra dev pytest
-```
-
-Seventeen tests, about nine seconds. `pytest-timeout` caps a test at 60 s,
-which is not a formality: a change stream that never delivers hangs rather than
-fails, and the first version of the invalidate test ran for ten minutes before
-anyone learned anything.
-
-Two of these found real defects on their first run — a change stream that
-connected lazily and so missed everything written before the first read, and
-the discovery that **a dropped collection left a stream open and silent**. The
-second was a server behaviour rather than a client one, and fixing it turned up
-a third: a replicated schema change was never published, so a drop ended
-streams on the node that performed it and nowhere else. Both are closed, both
-are tested at three levels, and the cluster harness is what caught the second
-one — see [Deviations](deviations.md).
-
----
-
-## The Go client, tested the same way again
-
-`clients/go/kimmydb` spawns a real `kimmyd` and talks to it over a socket — the
-third suite to do so, running deliberately the **same scenario list** as the
-Rust and Python ones.
-
-```bash
-cargo build --release
-cd clients/go && go test ./...
-```
-
-Eighteen tests, about five seconds, each bounded by a `context.WithTimeout` so
-a change stream that never delivers fails rather than stalling the package.
-
-It found nothing new, which is the point: the roadmap put Go third because it
-was least likely to surface a gap the other two had missed, and that turned out
-to be true. Three independent implementations agreeing about one specification
-is the evidence the conformance suite is built on.
-
----
-
-## M10: a mutation pass over the client, and what it left
-
-`cargo mutants --in-diff` over the milestone's diff, split by test scope
-because the client's suite runs in seconds while the storage suite runs in
-minutes — running every client mutant against the storage tests was a
-nine-hour job and a twenty-minute one after the split.
-
-**The client: 190 mutants, 133 caught, 34 missed, 20 unviable, 3 timeouts** —
-after new tests. The first pass caught 101 and missed 66; what the difference
-bought is worth naming, because it was not subtle:
-
-- **Seven convenience methods had no test at all.** `find`, `update`,
-  `delete`, `aggregate`, `replace_document`, `delete_document` and `download`
-  could each be replaced with a stub returning a default and nothing failed —
-  the suite reached the server through `pages`, `insert`, `count` and
-  `request`. Wrappers are exactly where a wrong path or verb hides, because
-  each is one line and looks obviously right.
-- **Topology filtering was untested.** With one node and nothing advertised
-  there is nothing to filter, so inverting every comparison in
-  `refresh_topology` changed nothing observable. It has three nodes to choose
-  between now.
-- **Thirteen of the seventeen error codes were never produced**, so each could
-  have been renamed silently. They are public surface.
-- **The query builders and `collect_all` were unreachable** from any test.
-
-### The server-side pass was started and abandoned
-
-The M10 diff also touches `kimmy-api`, `kimmy-storage` and `kimmy-auth` — 90
-mutants. That pass was **not completed**, and the reason is worth recording so
-the next person does not repeat it.
-
-Run against all three crates' suites, each mutant costs a build plus a ~78s
-test run. At `-j 8` on a machine already busy, the wall time per mutant blew
-through the 300s cap: after 47 mutants the result was **3 caught, 0 missed and
-15 timeouts** — nearly no information, and every timeout was a mutant whose
-`cargo test` had not finished linking, not a hang in the code.
-
-**The lesson is the same one that made the client pass cheap: scope the tests
-to the mutant.** A `kimmy-api` mutant does not need `kimmy-storage`'s suite to
-run. `-- -p kimmy-api` alone, at `-j 4`, with a timeout set from a *contended*
-baseline rather than an idle one.
-
-These crates had full mutation passes in M7 and M8, and the M10 diff over them
-is small next to the client and specification work. Redoing it properly is
-worth an hour of someone's time, not an emergency.
-
-### Redone properly
-
-**2026-08-14.** The scope splits 76 `kimmy-api` / 12 `kimmy-storage` / 2
-`kimmy-auth` — exactly the 90 recorded. All three are done.
-
-| Crate | Result |
-|---|---|
-| `kimmy-auth` | 2 caught. Both first read as misses; both were scoping artefacts |
-| `kimmy-storage` | 10 caught, 2 unviable, 0 missed. One real gap, now fixed |
-| `kimmy-api` | 36 caught, 32 unviable, 8 missed. Six were real and are fixed; two are artefacts |
-
-**"Missed" turned out to be three different things**, and telling them apart
-was most of the value:
-
-| | What it means | What to do |
-|---|---|---|
-| **A real gap** | No test anywhere produces the behaviour | Write the test |
-| **Covered only by an `#[ignore]`d test** | The cluster harness has it, but a mutation run — like `cargo test --workspace` — never sees it | Decide whether the property is local enough to test in process. Often part of it is |
-| **A cross-crate artefact** | The killer lives in a crate outside the test scope | Widen the scope, re-run, classify. Do not chase |
-
-**The `kimmy-api` gaps, in order of how much they mattered:**
-
-- **`capabilities()` could return `vec![]` and every check passed.** The
-  contract test compared the wire against the same function that produced it,
-  then asserted the list does *not* contain `local-embeddings` — vacuous when
-  the list is empty. ADR-058 makes capabilities the thing clients branch on
-  instead of a version number, so a node silently claiming to support nothing
-  is precisely the failure the mechanism exists to prevent. The
-  unconditionally-present capabilities are now named and required, and the
-  fixture is asserted non-empty so it cannot go vacuous again.
-- **`register` claimed to be silent when nothing changed, and nothing tested
-  it.** The docstring says a node restarting twice an hour must not append to a
-  replicated log — and the harness structurally cannot check it, because it
-  starts each node once and never restarts one on an unchanged address. Now
-  covered in process, along with the `me_seen` bookkeeping that was dead code
-  in the whole default suite because no in-process test had ever called
-  `register` at all.
-- **`render` stays uncovered in this crate, deliberately.** The contract test
-  checks the `101` handshake and never reads a frame; the Rust, Python and Go
-  client suites and the conformance runner all drive it. Confirmed by re-running
-  with `-p kimmy-client` in scope, where both mutants die.
-
-**Run the verification twice when the tree moved under you.** The first widened
-run here was confounded — the test files were edited while it was in flight, so
-it could not separate "the wider scope caught it" from "the new tests caught
-it". The clean re-run at the natural scope is what established the result.
-
-**The real gap was `InvalidateReason::as_str`**, which could return `""` or
-`"xyzzy"` unnoticed. The method exists so that renaming a variant cannot
-silently rename a value clients branch on — and yet the strings were asserted
-only downstream (three client suites, the cluster harness, the conformance
-scenarios) and only for `CollectionDropped`. The other two reasons were held by
-prose in `docs/openapi.yaml`. All three are pinned now in the crate that
-chooses them, exhaustively, so a new variant does not compile until its wire
-name is decided.
-
-**Scoping to the mutant's crate hides cross-crate killers, and that cuts both
-ways.** It is what makes these runs affordable, but both `kimmy-auth` "misses"
-were caught the moment `-p kimmy-api` joined the scope: `ttl_secs` is asserted
-by its consumer, not its owner. **A miss in a crate whose surface another crate
-consumes may only mean the test lives one crate up — widen the scope and re-run
-before believing it.** The local test was added anyway, on the principle that a
-crate's public accessor should not rely on a consumer to pin it.
-
-**And the contention lesson repeated itself, in the other direction.** Running
-the `kimmy-api` pass beside an ordinary `cargo test --workspace` stretched that
-suite from ~2 minutes to over 10. Contention does not only ruin the mutation
-run; it ruins whatever shares the machine with it. Run these alone.
-
-### What is left, and why it is left
-
-| Class | Count | |
-|---|---:|---|
-| Change-stream reconnect internals | 17 | Attempt counters and backoff arithmetic. Killing them needs a server that refuses a controlled number of times — which **now exists**: `Stalling` was built to close the `wait` row below and is the same shape. Still open, but no longer blocked on a harness. The *observable* behaviour — reconnect resumes, an expired token is not retried — is tested |
-| ~~The `retry: wait` path in `send`~~ | ~~4~~ | **Closed.** All nine mutants in the branch are caught. Writing the test found the branch was also *wrong* — it failed over instead of waiting, so `wait` and `elsewhere` behaved alike; see [Deviations](deviations.md). The lesson generalizes: an untested branch is not only unverified, it is where a claim goes to stop being true |
-| Genuinely equivalent | ~6 | `promote`'s early return when the endpoint is already first; the far-future expiry a supplied token gets, where `*`, `+` and `/` are all still far future |
-| Renewal arithmetic | 1 | The one-second-lifetime test clamps to the floor either way, so `-` and `+` agree there |
-
-The rule from M7 holds: **some escapes are equivalent mutants no test can kill
-— prove it, do not chase it.** The ones above that are *not* equivalent are
-named rather than absorbed, which is the difference between a residue and a
-blind spot.
-
----
-
-## Conformance: the only test that compares clients
-
-`clients/conformance/run.py` is the one place where the three clients are held
-to the *same* claims rather than to three sets of their own.
-
-```bash
-cargo build --release --bin kimmyd
-cargo build --release --example conformance -p kimmy-client
-(cd clients/go && go build -o conformance-driver ./conformance)
-./clients/conformance/run.py
-```
-
-Sixteen scenarios, three clients, forty-eight runs, about two minutes. Each
-scenario gets a **fresh node**, so nothing inherits another's data — a lesson
-learned by not doing it, when a reused work directory made every client appear
-to fail at creating a collection.
-
-Two checks:
-
-| | |
-|---|---|
-| **Coverage** | Every declared scenario must be implemented by every driver. A client that quietly stops covering one fails rather than falls silent |
-| **Behaviour** | Observations must match what is declared. This is what a per-language suite cannot do: three suites can each have a `failover` test and disagree about what failover means |
-
-**It has been shown to go red.** Breaking the Python driver so its walk stopped
-one page early produced `documents_seen: expected 250, observed 200` while the
-other two passed. A suite that has never failed is a suite nobody has tested,
-which is the same reason the route scanner asserts it matched something.
-
-**And it found a defect on its first full run:** the specification had claimed
-collection creation was idempotent since M10 task 1, while the server has
-always returned `409`. Nothing had caught it because **nothing ever created a
-collection twice** — the contract test's coverage assertion checks that every
-operation is exercised, not that every documented outcome is.
+The Rust, Python and Go clients, their suites, the M10 mutation pass over them
+and their conformance drivers moved to their own repositories with the clients
+([ADR-193](decisions.md)); what this page said about them is in its git history.
+The scenarios they are held to stay here as the protocol's contract,
+[`clients/conformance/scenarios.json`](../clients/conformance/scenarios.json),
+and this repository's CI no longer runs them. The server's side of the
+contract is still tested here: [The protocol contract](#the-protocol-contract).
 
 ---
 
@@ -1311,12 +1075,11 @@ PROPTEST_CASES=10000 cargo test -p kimmy-core   # deeper property search
 ```
 
 CI runs fmt, clippy, and tests, with the cluster harness and the vector
-reachability check in their own jobs. A `build` job compiles `kimmyd` and the
-Rust conformance driver once — as the release does, the static musl binary
-under dist's profile and flags, so the dependency cache it saves from `main`
-is the one a tag's release build restores (ADR-118) — and uploads them as a
-one-day artifact; the Python client, Go client, conformance, and Docker jobs
-download that binary rather than each compiling their own. The Docker job passes
+reachability check in their own jobs. A `build` job compiles `kimmyd` once —
+as the release does, the static musl binary under dist's profile and flags, so
+the dependency cache it saves from `main` is the one a tag's release build
+restores (ADR-118) — and uploads it as a one-day artifact, which the Docker
+job downloads rather than compiling its own. The Docker job passes
 `KIMMYD_SOURCE=prebuilt` so the Dockerfile copies the binary in instead of
 building it, then smoke-tests the image with `check-config`.
 

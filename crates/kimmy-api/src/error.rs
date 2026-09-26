@@ -34,14 +34,16 @@ pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 
 /// Every code the API can return, and nothing else.
 ///
-/// **Adding a variant here also means editing `kimmy-client`.** That crate
-/// depends on no `kimmy-*` crate by design — it has to see what the Python and
-/// Go clients see — so its own `ErrorCode`, its `parse`, its `Display` and the
-/// code list in its round-trip test are hand-copied from this one and nothing
-/// ties them together. The tests in this workspace fail on a code the *server*
-/// documents and does not serve, or serves and does not document, so a new
-/// variant is caught here and prompts its author; nothing points that author at
-/// `crates/kimmy-client/src/error.rs`, which is what this comment is for. A
+/// **Adding a variant here also means a change in the client libraries**, which
+/// live in their own repositories (ADR-193). Each keeps its own code list — the
+/// Rust client's `ErrorCode`, its `parse`, its `Display` and the list in its
+/// round-trip test among them — hand-copied from this one, because a client
+/// depends on no server crate by design: it has to see what an application
+/// sees. The tests in this workspace fail on a code the *server* documents and
+/// does not serve, or serves and does not document, so a new variant is caught
+/// here and prompts its author; nothing here can reach the clients' lists, and
+/// the clients are frozen until they are updated together, so name the new code
+/// in the CHANGELOG, which is what that update reads. A
 /// client meeting an unknown code is not broken — it reads the `retry` class
 /// from the envelope, which is exactly why that field exists (ADR-057), and it
 /// keeps the string — but the code reaches it as `ErrorCode::Unknown` rather

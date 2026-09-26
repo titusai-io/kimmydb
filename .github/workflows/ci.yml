@@ -403,12 +403,12 @@ jobs:
 
   # One build of `kimmyd`, shared — and it is the build the release makes.
   #
-  # Shared: the Python, Go, conformance, and docker jobs all drive a real
-  # server, and each used to compile its own — four identical release builds
-  # per push, the docker one from cold inside BuildKit where no Rust cache
-  # reaches. This job builds once against the warm cache and the others
-  # download the result. The artifact is deleted after a day: it is a
-  # hand-off between jobs, not a release.
+  # Shared: the docker job puts this binary in the image rather than
+  # compiling its own from cold inside BuildKit, where no Rust cache reaches.
+  # (The client and conformance jobs that also drove it moved out with the
+  # clients, ADR-193.) This job builds once against the warm cache and the
+  # docker job downloads the result. The artifact is deleted after a day: it
+  # is a hand-off between jobs, not a release.
   #
   # The release's build: the same target, profile, toolchain, RUSTFLAGS and
   # runner as dist's `build-local-artifacts` for x86_64-unknown-linux-musl
@@ -462,31 +462,17 @@ jobs:
       # dependency is compiled once with the workspace's unioned features),
       # and the RUSTFLAGS dist sets for a musl target, on this step only.
       # Cargo records RUSTFLAGS in every artifact's fingerprint, so a
-      # dependency built without them is a dependency the tag rebuilds. The
-      # second command adds the conformance driver. It does not keep the
-      # feature set: an example is built with its package's dev-dependencies,
-      # and features unify across the workspace, so it rebuilds part of the
-      # graph (tokio among it) with more features on, and a plain workspace
-      # build after it rebuilds them back. `kimmyd` is not in what it builds,
-      # so the server in the artifact is the first command's, the build the
-      # release makes; only the driver carries the wider set.
-      - name: Build the server and the Rust conformance driver
+      # dependency built without them is a dependency the tag rebuilds.
+      - name: Build the server
         env:
           RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
-        run: |
-          cargo build --profile dist --target x86_64-unknown-linux-musl --workspace
-          cargo build --profile dist --target x86_64-unknown-linux-musl --workspace --example conformance
+        run: cargo build --profile dist --target x86_64-unknown-linux-musl --workspace
 
-      # The artifact's root is the paths' common ancestor, so this unpacks as
-      # `kimmyd` and `examples/conformance` — the layout the jobs below
-      # download into `target/release`, unchanged from when the build was a
-      # native one.
+      # One file, so the artifact unpacks as `kimmyd` alone.
       - uses: actions/upload-artifact@v7
         with:
           name: kimmyd
-          path: |
-            target/x86_64-unknown-linux-musl/dist/kimmyd
-            target/x86_64-unknown-linux-musl/dist/examples/conformance
+          path: target/x86_64-unknown-linux-musl/dist/kimmyd
           if-no-files-found: error
           retention-days: 1
 
@@ -534,98 +520,6 @@ jobs:
         env:
           RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
         run: cargo build --profile dist --target aarch64-unknown-linux-musl --workspace
-
-  python-client:
-    name: python client
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-
-      # The Python tests drive a real `kimmyd`, the same way the Rust client's
-      # do. A mocked server would only assert what the client already
-      # believes, which is the half that was never in doubt. The binary lands
-      # where the tests already look; artifacts do not keep the execute bit.
-      - uses: actions/download-artifact@v8
-        with:
-          name: kimmyd
-          path: target/release
-      - run: chmod +x target/release/kimmyd
-
-      - uses: astral-sh/setup-uv@v7
-
-      - name: Test
-        working-directory: clients/python
-        run: uv run --extra dev pytest -q
-
-  go-client:
-    name: go client
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-
-      # Same reasoning as the Python job: the tests drive a real `kimmyd`,
-      # because a mocked server asserts only what the client already believes.
-      - uses: actions/download-artifact@v8
-        with:
-          name: kimmyd
-          path: target/release
-      - run: chmod +x target/release/kimmyd
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-          cache-dependency-path: clients/go/go.sum
-
-      - name: Format
-        working-directory: clients/go
-        run: test -z "$(gofmt -l .)" || { gofmt -d .; exit 1; }
-
-      - name: Vet
-        working-directory: clients/go
-        run: go vet ./...
-
-      - name: Test
-        working-directory: clients/go
-        run: go test ./...
-
-  conformance:
-    name: client conformance
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: kimmyd
-          path: target/release
-      - run: chmod +x target/release/kimmyd target/release/examples/conformance
-
-      - uses: astral-sh/setup-uv@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-          cache-dependency-path: clients/go/go.sum
-
-      # One set of scenarios, three clients. This is the job that would catch
-      # the day one client starts paging differently from the other two —
-      # which no per-language suite can, because each would still pass its own.
-      - name: Build the Go driver
-        working-directory: clients/go
-        run: go build -o conformance-driver ./conformance
-
-      - name: Conformance
-        run: ./clients/conformance/run.py
-
-      # The example applications, run against a real node. An example nobody
-      # runs rots into a document that used to be true, and this one is the
-      # answer to "what does using KimmyDB look like" — so it fails the build
-      # rather than the reader.
-      - name: Examples
-        run: ./examples/run-all.sh
 
   docker:
     name: docker build

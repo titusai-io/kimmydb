@@ -76,11 +76,13 @@ ignore = [
 [licenses]
 # Everything the graph carries today, enumerated with `cargo deny list`. All
 # permissive except MPL-2.0 (file-level copyleft, carried by `foca`, the SWIM
-# implementation), which is compatible with both the AGPL-3.0 server and the
+# implementation), which is compatible with the AGPL-3.0 server and with the
 # Apache-2.0 clients. No GPL-family license is on the list: the server could
-# legally take a GPL dependency, but `kimmy-client` is Apache-2.0
-# (LICENSING.md) and must never pull one, and one allowlist for one lockfile
-# cannot say "for some roots but not others" — so nothing may.
+# legally take a GPL dependency, but the rule was set while the Apache-2.0
+# `kimmy-client` shared this lockfile and must never pull one, and one
+# allowlist for one lockfile cannot say "for some roots but not others" — so
+# nothing may. It stands now that the clients live in their own repositories
+# (ADR-193).
 allow = [
     "Apache-2.0",
     "MIT",
@@ -96,10 +98,11 @@ allow = [
 ]
 # The workspace's own license, permitted for the workspace's own crates by
 # name and for nothing else: a third-party AGPL crate is refused like any
-# other unlisted license. `kimmy-client` is deliberately absent — it is
-# Apache-2.0 and is covered by the allowlist above. What this cannot say is
-# that the client must not *depend* on any of these; an allowlist is per
-# lockfile, not per dependent. scripts/check-license-boundary.sh says it.
+# other unlisted license. Every workspace member takes that license: the
+# Apache-2.0 client libraries live in their own repositories (ADR-193), and
+# scripts/check-license-boundary.sh fails if an Apache-2.0 crate becomes a
+# member here, because an allowlist is per lockfile, not per dependent, and
+# could not keep it off these crates.
 exceptions = [
     { crate = "kimmy-core", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-storage", allow = ["AGPL-3.0-only"] },
@@ -111,7 +114,6 @@ exceptions = [
     { crate = "kimmy-mcp", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-api", allow = ["AGPL-3.0-only"] },
     { crate = "kimmyd", allow = ["AGPL-3.0-only"] },
-    { crate = "kimmy-cli", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-task", allow = ["AGPL-3.0-only"] },
     # A workspace member that ships in nothing: the fuzz harness bodies, built
     # by the PR gate and by `cargo fuzz`. Listed for the same reason as the

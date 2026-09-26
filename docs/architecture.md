@@ -118,7 +118,6 @@ graph TB
 | `kimmy-vector` | Embedding providers, the worker, HNSW, index selection, search | Sit on the write path |
 | `kimmy-mcp` | MCP tools and resources | Re-implement authorization — it calls `kimmy_api::exec`, where the check lives |
 | `kimmyd` | Configuration, wiring, lifecycle | — |
-| `kimmy-cli` | Terminal client (M5) | — |
 
 ### Two rules that keep the layering honest
 

@@ -83,8 +83,7 @@ graph TD
 | [Query Language](query-language.md) | Filter and update operators, array semantics, Mongo compatibility |
 | [HTTP API](http-api.md) | Endpoint reference, request and response shapes, status codes |
 | [`openapi.yaml`](openapi.yaml) | The protocol *specification* — OpenAPI 3.1, checked against the running server by a contract test |
-| [Clients](clients.md) | The first-party client libraries, and what they do for you |
-| [`examples/`](../examples/README.md) | One application, written three times — documents, paging, aggregation, vector search and a change stream |
+| [Clients](clients.md) | What a client is expected to do, and where the first-party libraries went |
 | [Compatibility](compatibility.md) | What `/v1` promises, what counts as additive, what forces `/v2` |
 | [Security](security.md) | Authentication, RBAC, TLS, the supply chain, what is and is not defended against |
 | [Threat model](threat-model.md) | The assets, each trust boundary with its threats and the control in place, what is out of scope, and the operational assumptions the controls rest on |
@@ -94,7 +93,7 @@ graph TD
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
 | [Aggregation](aggregation.md) | The pipeline: stages, accumulators, `$lookup`, and the memory ceiling |
 | [Webhooks](webhooks.md) | Registering endpoints, verifying deliveries, and what happens when one stops answering |
-| [CLI](cli.md) | The `kimmy` terminal client |
+| [CLI](cli.md) | The `kimmy` terminal client: moved out, not currently distributed |
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
@@ -130,7 +129,7 @@ running server, not merely compiled.
 | Webhooks | ✅ Working | Register a URL; the cluster pushes change events, signed, with failover |
 | Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
 | Backup / restore | ✅ Working | Online snapshot endpoint, offline restore, and point-in-time rewind |
-| `kimmy` CLI | ✅ Working | One-shot commands over the HTTP API. [CLI](cli.md) |
+| `kimmy` CLI and client libraries | ⛔ Not distributed | Moved to their own repositories and frozen until they are updated together (ADR-193). [CLI](cli.md) · [Clients](clients.md) |
 
 Replication has been driven on real daemons and in containers, not only in
 tests: a collection, a unique index and documents converging in both directions
@@ -201,8 +200,7 @@ kimmydb/
 │   ├── kimmy-task/      supervision for long-lived background tasks
 │   ├── kimmy-vector/    embeddings, HNSW, index cache, search
 │   ├── kimmy-mcp/       MCP server
-│   ├── kimmyd/          the server binary
-│   └── kimmy-cli/       terminal client (M5)
+│   └── kimmyd/          the server binary
 ├── docs/                this directory
 ├── Dockerfile
 ├── docker-compose.yml

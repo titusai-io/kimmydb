@@ -1,38 +1,34 @@
 #!/usr/bin/env bash
 #
-# Fail when the Apache-2.0 client depends on an AGPL crate.
+# Fail when a workspace crate does not take the workspace licence, or when
+# deny.toml's per-crate licence exceptions and those crates disagree.
 #
 # Why this exists
 # ---------------
-# LICENSING.md draws one line through the workspace: the server and the CLI
-# are AGPL-3.0-only, `kimmy-client` is Apache-2.0, so that an application
-# author never has to think about the AGPL. That holds only while the client's
-# shipped dependency graph contains none of the server crates — and a
-# convenience `use kimmy_core::...` in the client is the easiest edit in the
-# repository to make without thinking about it.
+# LICENSING.md draws the line: everything built here is AGPL-3.0-only, and the
+# client libraries an application links are Apache-2.0, so that an application
+# author never has to think about the AGPL. The clients were once members of
+# this workspace, and this script resolved the Rust client's shipped
+# dependency graph to prove it reached no server crate -- a convenience
+# `use kimmy_core::...` in the client was the easiest edit in the repository to
+# make without thinking about it.
 #
-# deny.toml cannot state the rule. Its license allowlist is per lockfile, not
-# per dependent: it can permit the AGPL for the server crates by name (it
-# does) but cannot say "and nothing Apache-2.0 may depend on them". Its
-# `wrappers` mechanism can, but warns on every wrapper it does not encounter
-# on every run — most of them, by construction — which is noise a policy file
-# cannot afford. So the rule lives here, as a check, beside the one for native
-# code.
+# The clients now live in their own repositories (ADR-193), so the rule here is
+# the simpler one that keeps that true: **no member takes any licence but the
+# workspace's.** An Apache-2.0 crate added back would be one `path` dependency
+# away from linking the server, and nothing below could see it do so.
 #
-# What it does
-# ------------
-# Resolves the client's **normal** dependency graph — what a downstream
-# `cargo add kimmy-client` gets — and fails if a crate under the workspace
-# license is in it. Dev-dependencies are excluded on purpose: the client's
-# tests start a real server, which makes the server a dependency of the
-# tests and of nothing anyone ships.
+# deny.toml cannot state either rule. Its license allowlist is per lockfile,
+# not per dependent: it permits the AGPL for the workspace's crates by name and
+# cannot say what may depend on them. So the rules live here, as a check,
+# beside the one for native code.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 # Every crate that takes the workspace license (`license.workspace = true` in
-# its Cargo.toml). `kimmy-client` is the one that does not.
+# its Cargo.toml), and every one that states a licence of its own.
 #
 # **Derived, not written out.** This was a literal list, while the sentence above
 # it described a derivation -- and the two had drifted: `kimmy-egress` and
@@ -83,6 +79,7 @@ if [ -z "$members" ]; then
 fi
 
 names=''
+own=''
 for member in $members; do
   # Globs are expanded, so a `crates/*` style entry still resolves; a literal
   # path expands to itself.
@@ -108,7 +105,9 @@ for member in $members; do
       names="$names$name
 "
     elif grep -qE '^license[[:space:]]*=[[:space:]]*"' "$manifest"; then
-      : # Its own licence string, so not the workspace's.
+      # Its own licence string, so not the workspace's.
+      own="$own$name
+"
     else
       echo "cannot tell which licence $manifest takes, so $name cannot be classified:" >&2
       grep -n '^license' "$manifest" >&2 || echo "  it states no licence" >&2
@@ -187,33 +186,22 @@ fi
 echo "deny.toml's exceptions match the $(printf '%s' "$names" | grep -c .) crates under the \
 workspace licence"
 
-AGPL="^($(printf '%s' "$names" | tr '\n' '|' | sed 's/|$//')) "
-
-found=$(
-  cargo tree -p kimmy-client -e normal --prefix none 2>/dev/null |
-    grep -E "$AGPL" |
-    awk '{print $1}' |
-    sort -u || true
-)
-
-if [ -z "$found" ]; then
-  echo "kimmy-client (Apache-2.0) depends on no AGPL-3.0-only crate"
+own=$(printf '%s' "$own" | sed '/^$/d' | sort -u)
+if [ -z "$own" ]; then
+  echo "every workspace member takes the workspace licence"
   exit 0
 fi
 
-echo "kimmy-client is Apache-2.0 and now depends on AGPL-3.0-only crates:"
+echo "these workspace members state a licence other than the workspace's:"
 echo
-while read -r crate; do
-  [ -z "$crate" ] && continue
-  echo "  $crate — reached through:"
-  cargo tree -p kimmy-client -e normal -i "$crate" 2>/dev/null |
-    sed -n '1,6p' | sed 's/^/      /'
-  echo
-done <<<"$found"
+printf '  %s\n' $own
 cat <<'MSG'
-An Apache-2.0 library that links an AGPL crate hands the AGPL's obligations to
-every application that uses it, which is the outcome LICENSING.md promises
-application authors will not happen. Move what the client needs into the
-client, or into a crate that is itself Apache-2.0.
+
+Everything in this workspace is AGPL-3.0-only (LICENSING.md). A crate under
+another licence here is one `path` dependency away from linking the server,
+and an Apache-2.0 library that links an AGPL crate hands the AGPL's
+obligations to every application that uses it. The Apache-2.0 client
+libraries live in their own repositories (ADR-193); a crate like them belongs
+there too.
 MSG
 exit 1

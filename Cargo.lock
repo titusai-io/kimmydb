@@ -2432,43 +2432,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kimmy-cli"
-version = "0.39.0"
-dependencies = [
- "anyhow",
- "clap",
- "kimmy-client",
- "kimmy-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "kimmy-client"
-version = "0.39.0"
-dependencies = [
- "axum",
- "bson",
- "futures",
- "kimmy-api",
- "kimmy-auth",
- "kimmy-cluster",
- "kimmy-core",
- "kimmy-storage",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite 0.30.0",
- "webpki-roots",
-]
-
-[[package]]
 name = "kimmy-cluster"
 version = "0.39.0"
 dependencies = [

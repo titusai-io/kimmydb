@@ -77,9 +77,9 @@ jobs:
           command: check
           arguments: ""
 
-      # The one licensing rule the allowlist in deny.toml cannot state: the
-      # Apache-2.0 `kimmy-client` depends on no AGPL crate. Same trigger,
-      # because it reads the same lockfile; `cargo tree` resolves without
-      # compiling anything.
+      # The licensing rules the allowlist in deny.toml cannot state: every
+      # workspace member takes the workspace licence, and deny.toml's
+      # exceptions name exactly those crates. Same trigger, because it reads
+      # the same manifests; it compiles nothing.
       - name: License boundary
         run: ./scripts/check-license-boundary.sh
