@@ -242,7 +242,7 @@ jobs:
       # runs them with `cargo test --doc`, against the same build artifacts.
       # Pinned to a release of the installer rather than its floating tag.
       - name: Install nextest
-        uses: taiki-e/install-action@v2.87.13
+        uses: taiki-e/install-action@v2.87.16
         with:
           tool: nextest
 
