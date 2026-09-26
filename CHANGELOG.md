@@ -10,7 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.39.0 - 2026-09-26
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the store format is unchanged and redb is still 4.3, so 0.38.0 opens a store
+0.39.0 has run on, and a member rolls back by starting it on 0.38.0. Give the
+process supervisor a stop grace period of 25 s or more: a shutdown now closes
+the storage to writes before it records a clean exit, and can take up to about
+20 s. Three answers are new: `500 partially_applied` for a request that
+committed part of its work, `500 outcome_unknown` for a write that may have
+happened, both with the new retry class `verify`, and `503 node_stopping` for a
+write refused during a shutdown. Two High fixes: under `coalesced` durability a
+write could be acknowledged with no fsync covering it, and a role or user edit
+could undo a concurrent edit to the same user, such as re-enabling an account
+an administrator had just disabled. `kimmy_sync_ddl_applied_total` no longer
+counts changes a member already held, which move to the new
+`kimmy_sync_ddl_held_total`; the push answer gains one optional field, so a
+cluster confirms throughout a mixed roll.**
 
 ### Added
 
