@@ -316,6 +316,18 @@ witnessed vector already claimed ([ADR-148](decisions.md)), and a token issued
 after that claim passes over them wherever it resumes. A repair follows a
 divergence the check has already reported (`kimmy_sync_divergent_collections`).
 
+**How long a resume takes to answer.** On the member that issued the token,
+finding the start is one lookup. On any other member it is a walk of that
+member's arrival index from its oldest retained entry to the first entry above
+the vector: for a client that was caught up, most of the retained oplog. The
+walk runs before the upgrade is answered, off the request workers. It is
+milliseconds with the index in the page cache, and it measured over 30 s on a
+multi-gigabyte store just after a restart. A walk over 1 s is logged at
+`info`, and one over 10 s at `warn`: `a change stream was slow to find where
+it starts`, with `elapsed_ms`, the kind of open (`token_kind`) and
+`rows_examined`. A client whose upgrade timeout is shorter than that gives up
+and retries, and the retry walks again.
+
 **Tokens from before 0.30.0** name only an entry. They are guaranteed to be
 accepted through 0.30.x and have been accepted since; a later minor may refuse
 them, and its release notes will say so. Where accepted, they resume as before

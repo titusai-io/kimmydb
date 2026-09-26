@@ -12403,6 +12403,51 @@ changes and the applies beside the walks. It reads each file with its test
 modules removed, rather than cutting at the first `#[cfg(test)]`, which had
 hidden the rest of `sessions.rs` and would have hidden most of `transport.rs`.
 
+**Addendum, 2026-09-26: change streams.** Opening a stream resolves where it
+starts before `Engine::watch` returns, and the WebSocket handler answers the
+upgrade only after that. A resume from a token another member issued walks
+this member's arrival index from its oldest entry to the first entry above the
+token's vector: for a client that was caught up, most of the retained oplog.
+`start_at` and a pre-0.30 token for an entry the member lacks walk too. All of
+it ran on the async worker. In round 0420, just after the members restarted,
+such resumes took about 31 s and 35–40 s by the request-duration histogram,
+past the client's 20 s handshake, and nothing was logged. The same resumes
+took 0.1 s once the index was in the page cache.
+
+The replay after the upgrade had the same shape. `ChangeStream::next` reads
+batch after batch without awaiting while it passes over entries: everything
+a resumed stream's token covers, and everything out of a scoped stream's scope.
+
+Now under `blocking`:
+- the resolve, inside `Engine::watch`;
+- each replay batch read, inside `ChangeStream::next`, which also counts each
+  batch against the task's budget (`tokio::task::consume_budget`), so a caller
+  racing it against its client in a `select!` sees the client go between
+  batches.
+
+Both are wrapped in the storage crate rather than in the handler. The handler
+is not the only caller: the embedding worker opens and reads a cluster stream
+through the same two functions. Wrapping the handler would have missed it, the
+alternative this decision rejected for scans.
+
+A resolve over 1 s is logged at `info`, and one over 10 s at `warn`, with
+`elapsed_ms`, the kind of open, the scope, the walks and rows examined, and
+the held-mark count. No deadline is set. The walk cannot be cancelled part
+way, and a refusal would throw the work away, with every retry walking again.
+
+The walk's length is unchanged here. This takes it off the worker and makes it
+visible; shortening it is a change to how the start is found.
+
+The guard now also reads `kimmy-vector`, and found one walk there: the
+backfill's listing of a collection's document ids, now under `blocking`. A
+change stream is not in its list, because the two functions cover themselves.
+
+Tests, in `kimmy-storage` `watch.rs`:
+- `a_task_spawned_during_a_resume_resolve_is_polled_before_the_resolve_ends`;
+- `a_task_spawned_during_a_replay_read_is_polled_before_the_read_ends`. Each
+  runs on a one-worker runtime and fails with its wrap removed.
+- `a_slow_resolve_is_logged_with_what_it_walked`.
+
 ## ADR-154 — The divergence-check age is computed when it is read, so a stuck loop cannot freeze it
 
 > **Refined by [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age):** the age reads the time since the process started before the first check, not 0.

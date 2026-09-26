@@ -1284,10 +1284,13 @@ impl EmbeddingWorker {
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
         // document in memory would make backfill cost O(collection).
+        // Off the async worker (ADR-153): the walk is the whole collection.
         let mut ids = Vec::new();
-        self.engine.for_each_doc(collection, |id, _| {
-            ids.push(id);
-            Ok(true)
+        kimmy_storage::blocking(|| {
+            self.engine.for_each_doc(collection, |id, _| {
+                ids.push(id);
+                Ok(true)
+            })
         })?;
 
         let total = ids.len();

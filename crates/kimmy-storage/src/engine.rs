@@ -156,6 +156,14 @@ pub struct Engine {
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
     continuing_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once, inside the next change stream's resolve of where it starts;
+    /// see [`Engine::during_next_watch_resolve`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) watch_resolve_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once, inside the next replay read of any change stream; see
+    /// [`Engine::during_next_replay_read`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) replay_read_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Entries held as state that a window released, since start (ADR-169's
     /// addendum). Added only after the run that released them commits.
     held_marks_released: std::sync::atomic::AtomicU64,
@@ -1248,6 +1256,10 @@ impl Engine {
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            watch_resolve_hook: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            replay_read_hook: parking_lot::Mutex::new(None),
             held_marks_released: std::sync::atomic::AtomicU64::new(0),
             writer_hold_max_us: std::sync::atomic::AtomicU64::new(0),
             writer_hold_buckets: std::array::from_fn(|_| {
@@ -1496,6 +1508,22 @@ impl Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn before_next_continuing_write(&self, hook: impl FnOnce() + Send + 'static) {
         *self.continuing_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once, on the resolving thread, inside the next
+    /// [`Engine::watch`]'s resolve of where the stream starts: where a resume
+    /// walks the arrival index. For tests of what that walk holds while it
+    /// runs, which a small store cannot make slow.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn during_next_watch_resolve(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.watch_resolve_hook.lock() = Some(Box::new(hook));
+    }
+
+    /// Run `hook` once, on the reading thread, inside the next replay read of
+    /// any change stream: [`crate::watch::ChangeStream::next`]'s batch read.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn during_next_replay_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.replay_read_hook.lock() = Some(Box::new(hook));
     }
 
     /// Refuse every write transaction from now on, and wait up to `cap` for

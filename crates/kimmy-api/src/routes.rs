@@ -113,12 +113,14 @@ fn routes(state: SharedState, limits: RequestLimits) -> Router {
 /// surface, and it is exempt by being merged after the deadline is applied —
 /// see [`router_with_limits`]. Every other route answers in one piece.
 ///
-/// For the upgrade, the exemption is the contract rather than a mechanism it
-/// needs today: axum hands the upgraded socket to a task of its own once the
-/// `101` is written, so the handler future the deadline wraps has already
-/// finished when the stream begins. Registering the route here is what keeps
-/// that true if the upgrade ever moves into the handler, and what a test can
-/// hold.
+/// For the upgrade, the stream itself is outside the handler: axum hands the
+/// upgraded socket to a task of its own once the `101` is written. What runs
+/// inside the handler future is resolving where the stream starts
+/// (`Engine::watch`), before the `101`, and a resume on a member that did not
+/// issue the token walks the arrival index to do it: past 30 s on a large store
+/// with a cold page cache (round 0420). A deadline would refuse that resume
+/// and every retry would walk again, so the resolve runs off the worker and is
+/// logged when slow instead (ADR-153).
 ///
 /// For the backup it is the mechanism. The walk runs on a blocking thread and
 /// the handler awaits it, so the handler is pending for as long as the store

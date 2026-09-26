@@ -26,7 +26,7 @@ use kimmy_core::{
 };
 use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::engine::Engine;
@@ -144,6 +144,50 @@ impl Engine {
         // lines reintroduces the gap this whole module exists to avoid.
         let rx = self.subscribe();
 
+        // Step 2: find where the stream starts. A resume on a member that did
+        // not issue the token walks the arrival index, and with a large oplog
+        // on a cold page cache that walk ran for 30 s and more before a
+        // client's upgrade was answered (round 0420). So it runs off the async
+        // worker (ADR-153), here rather than in each caller, and a slow one is
+        // logged: nothing else on the member records it.
+        let began = std::time::Instant::now();
+        let mut walked = Walked::default();
+        let resolved =
+            crate::engine::blocking(|| self.resolve_start(&scope, &options, &mut walked));
+        report_resolve(self, began.elapsed(), &scope, &walked, resolved.is_ok());
+        let Resolved { opened, start, incarnation_floor } = resolved?;
+
+        Ok(ChangeStream {
+            rx,
+            scope,
+            next_replay_from: Some(start),
+            resume_floor: start,
+            replay: Vec::new().into_iter(),
+            last_delivered: None,
+            issuer: self.node_id(),
+            delivered: opened.delivered,
+            pending: None,
+            skip: opened.skip,
+            incarnation_floor,
+            db_of_collection: HashMap::new(),
+            finished: false,
+        })
+    }
+
+    /// Where a stream opened with `options` starts, what it may claim, and the
+    /// floor of its collection's incarnation: every read [`Engine::watch`]
+    /// makes before it returns, and so all of what it runs off the worker.
+    fn resolve_start(
+        &self,
+        scope: &WatchScope,
+        options: &WatchOptions,
+        walked: &mut Walked,
+    ) -> Result<Resolved> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.watch_resolve_hook.lock().take() {
+            hook();
+        }
+
         // Streams follow *arrival* order, not stamp order. A replicated entry
         // keeps its origin stamp and so lands behind the local tail; following
         // stamp order would mean a subscriber already past that point never
@@ -151,16 +195,22 @@ impl Engine {
         let opened = match (&options.resume_after, options.start_at) {
             // Resuming is exclusive of the token itself, so a client never sees
             // the last event it already acknowledged twice.
-            (Some(token), _) => self.resume_point(token)?,
+            (Some(token), _) => self.resume_point(token, walked)?,
             // Nothing delivered yet, so nothing is claimed: a token issued
             // before this stream first reaches the tail says so.
-            (None, Some(at)) => Opened {
-                start: self.first_arrival_at_or_after(at)?,
-                delivered: VersionVector::new(),
-                skip: None,
-            },
+            (None, Some(at)) => {
+                walked.kind = if at == Hlc::ZERO { "from_start" } else { "start_at" };
+                Opened {
+                    start: self.first_arrival_at_or_after(at, walked)?,
+                    delivered: VersionVector::new(),
+                    skip: None,
+                }
+            }
             // No resume point: start live, skipping all history.
-            (None, None) => self.tail_open()?,
+            (None, None) => {
+                walked.kind = "tail";
+                self.tail_open()?
+            }
         };
         let start = opened.start;
 
@@ -178,25 +228,10 @@ impl Engine {
         // was and where this collection begins, and hiding a gap is the thing
         // `Invalidate` exists to avoid.
         let (start, incarnation_floor) = match scope {
-            WatchScope::Collection(id) => self.clamp_to_incarnation(id, start, &options)?,
+            WatchScope::Collection(id) => self.clamp_to_incarnation(*id, start, options, walked)?,
             _ => (start, None),
         };
-
-        Ok(ChangeStream {
-            rx,
-            scope,
-            next_replay_from: Some(start),
-            resume_floor: start,
-            replay: Vec::new().into_iter(),
-            last_delivered: None,
-            issuer: self.node_id(),
-            delivered: opened.delivered,
-            pending: None,
-            skip: opened.skip,
-            incarnation_floor,
-            db_of_collection: HashMap::new(),
-            finished: false,
-        })
+        Ok(Resolved { opened, start, incarnation_floor })
     }
 
     /// Move a start position forward past a drop of this collection.
@@ -223,6 +258,7 @@ impl Engine {
         id: CollectionId,
         start: u64,
         options: &WatchOptions,
+        walked: &mut Walked,
     ) -> Result<(u64, Option<(CollectionId, Stamp)>)> {
         let Some(dropped_at) = self.collection_dropped_at(id)? else {
             return Ok((start, None));
@@ -256,7 +292,7 @@ impl Engine {
                     Err(kimmy_core::Error::ResumeTokenExpired.into())
                 }
                 Some(_) => Ok((start, None)),
-                None => Ok((self.first_arrival_stamped_after(start, dropped_at)?, None)),
+                None => Ok((self.first_arrival_stamped_after(start, dropped_at, walked)?, None)),
             };
         };
         // The incarnation begins just after the drop entry.
@@ -284,11 +320,18 @@ impl Engine {
     /// appended after the walk. The walk starts at `from`, so a tail open reads
     /// nothing; a replay from the start walks the prefix older than the drop,
     /// which retention bounds, once per stream.
-    fn first_arrival_stamped_after(&self, from: u64, stamp: Stamp) -> Result<u64> {
+    fn first_arrival_stamped_after(
+        &self,
+        from: u64,
+        stamp: Stamp,
+        walked: &mut Walked,
+    ) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        walked.walks += 1;
         for row in arrival.range(from..)? {
             let (seq, key) = row?;
+            walked.rows += 1;
             if codec::decode_oplog_key(key.value())? > stamp {
                 return Ok(seq.value());
             }
@@ -317,9 +360,15 @@ impl Engine {
     /// A token naming an entry a rewind discarded, and that this member does not
     /// hold again, is refused in every case: the client saw history this member
     /// no longer has.
-    fn resume_point(&self, token: &ResumeToken) -> Result<Opened> {
+    fn resume_point(&self, token: &ResumeToken, walked: &mut Walked) -> Result<Opened> {
         let stamp = token.to_stamp();
         let held = self.arrival_of(&stamp)?;
+        walked.kind = match (&token.issued, held) {
+            (Some(issued), _) if issued.by == self.node_id() => "issuer",
+            (Some(_), _) => "foreign_vector",
+            (None, Some(_)) => "single_stamp_held",
+            (None, None) => "single_stamp_not_held",
+        };
         if held.is_none() && self.rewinds()?.iter().any(|rewind| rewind.discarded(&stamp)) {
             return Err(expired());
         }
@@ -352,7 +401,7 @@ impl Engine {
                     return Err(expired());
                 }
                 Ok(Opened {
-                    start: self.first_arrival_beyond(&issued.delivered)?,
+                    start: self.first_arrival_beyond(&issued.delivered, walked)?,
                     delivered: issued.delivered.clone(),
                     skip: Some(issued.delivered.clone()),
                 })
@@ -361,7 +410,7 @@ impl Engine {
                 let start = match held {
                     Some(seq) => seq + 1,
                     None if self.stamp_collected(&stamp)? => return Err(expired()),
-                    None => self.first_arrival_stamped_after(0, stamp)?,
+                    None => self.first_arrival_stamped_after(0, stamp, walked)?,
                 };
                 Ok(Opened { start, delivered: VersionVector::new(), skip: None })
             }
@@ -389,11 +438,13 @@ impl Engine {
     ///
     /// A walk of the arrival index's keys, once per stream opened from a
     /// token another member issued.
-    fn first_arrival_beyond(&self, delivered: &VersionVector) -> Result<u64> {
+    fn first_arrival_beyond(&self, delivered: &VersionVector, walked: &mut Walked) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        walked.walks += 1;
         for row in arrival.iter()? {
             let (seq, key) = row?;
+            walked.rows += 1;
             let stamp = codec::decode_oplog_key(key.value())?;
             if stamp.hlc > delivered.get(stamp.node) {
                 return Ok(seq.value());
@@ -419,11 +470,13 @@ impl Engine {
     /// `start_at` is expressed in logical time, so it has to be resolved
     /// against arrival order. Scanning is acceptable because this runs once per
     /// stream and only for the explicit `start_at` form.
-    fn first_arrival_at_or_after(&self, at: Hlc) -> Result<u64> {
+    fn first_arrival_at_or_after(&self, at: Hlc, walked: &mut Walked) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        walked.walks += 1;
         for row in arrival.iter()? {
             let (seq, key) = row?;
+            walked.rows += 1;
             if codec::decode_oplog_key(key.value())?.hlc >= at {
                 return Ok(seq.value());
             }
@@ -646,6 +699,86 @@ pub struct OplogWindow {
     pub exhausted: bool,
 }
 
+/// Where a stream starts, as [`Engine::watch`]'s resolve found it.
+struct Resolved {
+    opened: Opened,
+    /// The arrival position of the first entry the stream reads, after the
+    /// incarnation's clamp.
+    start: u64,
+    /// See `ChangeStream::incarnation_floor`.
+    incarnation_floor: Option<(CollectionId, Stamp)>,
+}
+
+/// What a stream's resolve of where it starts did, for [`report_resolve`].
+struct Walked {
+    /// Which of the resolve's paths the open took.
+    kind: &'static str,
+    /// Walks of the arrival index, and the rows they examined between them.
+    walks: u32,
+    rows: u64,
+}
+
+impl Default for Walked {
+    fn default() -> Self {
+        Self { kind: "unresolved", walks: 0, rows: 0 }
+    }
+}
+
+/// A resolve this long is logged at `info`.
+const SLOW_RESOLVE: std::time::Duration = std::time::Duration::from_secs(1);
+/// And this long at `warn`: a client waiting on its upgrade may have given up.
+const STALLED_RESOLVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Log a resolve that took long enough for a client to notice.
+///
+/// Until the resolve ends, a client that asked for an upgrade sees nothing at
+/// all, and one that gives up leaves no trace on the member but one long
+/// request in the duration histogram. So the line is written here, where what
+/// the resolve did is known. The held-mark count is read only for a line that
+/// is written.
+fn report_resolve(
+    engine: &Engine,
+    elapsed: std::time::Duration,
+    scope: &WatchScope,
+    walked: &Walked,
+    resolved: bool,
+) {
+    if elapsed < SLOW_RESOLVE {
+        return;
+    }
+    let scope = match scope {
+        WatchScope::Cluster => "cluster".to_string(),
+        WatchScope::Database(db) => format!("database {db}"),
+        WatchScope::Collection(id) => format!("collection {id}"),
+    };
+    let held = engine.held_marks().ok();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if elapsed < STALLED_RESOLVE {
+        info!(
+            elapsed_ms,
+            token_kind = walked.kind,
+            scope,
+            walks = walked.walks,
+            rows_examined = walked.rows,
+            held = ?held,
+            resolved,
+            "a change stream was slow to find where it starts"
+        );
+    } else {
+        warn!(
+            elapsed_ms,
+            token_kind = walked.kind,
+            scope,
+            walks = walked.walks,
+            rows_examined = walked.rows,
+            held = ?held,
+            resolved,
+            "a change stream took over 10 s to find where it starts; a client waiting on its \
+             upgrade may have given up"
+        );
+    }
+}
+
 /// A gap-free stream of changes.
 pub struct ChangeStream {
     rx: broadcast::Receiver<Arc<OplogEntry>>,
@@ -750,7 +883,22 @@ impl ChangeStream {
             }
 
             // Phase 3: read whatever has arrived since we last looked.
-            match engine.read_arrival_batch(from, REPLAY_BATCH) {
+            //
+            // One call can read batch after batch without awaiting: a stream
+            // resumed from another member's token passes over every entry its
+            // token covers, and a scoped stream over every entry out of scope.
+            // So each read runs off the worker (ADR-153), and each counts
+            // against the task's budget, so that a caller racing this against
+            // its client in a `select!` sees the client go between batches.
+            tokio::task::consume_budget().await;
+            let read = crate::engine::blocking(|| {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Some(hook) = engine.replay_read_hook.lock().take() {
+                    hook();
+                }
+                engine.read_arrival_batch(from, REPLAY_BATCH)
+            });
+            match read {
                 Ok((batch, witnessed, last)) => {
                     // Past the last position the read reached, not past as
                     // many positions as it returned entries: a hole left by a
@@ -2280,5 +2428,172 @@ mod tests {
             ),
             "e2 was collected before the client was sent it"
         );
+    }
+
+    /// What `body` logs on this thread.
+    fn logs_of(body: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let writer = out.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, body);
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A token another member issued, covering nothing: the resume that walks
+    /// the arrival index (round 0420's stall).
+    fn foreign_token(engine: &Engine) -> ResumeToken {
+        let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
+        ResumeToken::issued(first.stamp, NodeId::generate(), VersionVector::new())
+    }
+
+    /// Run `step` on the runtime's one worker, with `hook` installed to hold the
+    /// storage read it reaches, and return when a task spawned while the read
+    /// was held was polled, and when `step` finished.
+    ///
+    /// One worker, as in ADR-153's own test: the smallest runtime on which
+    /// "the other task ran during the read" and "it ran after" are different
+    /// observations. `started` is raised inside the held read, so once the test
+    /// body sees it the worker is in the read, not before it.
+    async fn polled_and_finished<F>(
+        install: impl FnOnce(Box<dyn FnOnce() + Send>),
+        step: F,
+    ) -> (std::time::Instant, std::time::Instant)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let started = Arc::new(AtomicBool::new(false));
+        install(Box::new({
+            let started = Arc::clone(&started);
+            move || {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }));
+        let stepping = tokio::spawn(async move {
+            step.await;
+            std::time::Instant::now()
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let bystander = tokio::spawn(async { std::time::Instant::now() });
+        let polled = bystander.await.unwrap();
+        let finished = stepping.await.unwrap();
+        (polled, finished)
+    }
+
+    /// Resolving where a stream starts gives its worker up while it reads.
+    ///
+    /// A resume on a member that did not issue the token walks the arrival
+    /// index before `watch` returns, and the HTTP handler answers the upgrade
+    /// only after that. Inline on the worker, a walk of a large cold index held
+    /// it for 30 s and more in round 0420, and every task queued behind it with
+    /// it. The walk runs under `blocking` inside `watch`, so every caller —
+    /// the handler and the embedding worker alike — gets it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_task_spawned_during_a_resume_resolve_is_polled_before_the_resolve_ends() {
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        let engine = Arc::new(engine);
+        let token = foreign_token(&engine);
+
+        let (polled, finished) =
+            polled_and_finished(|hook| engine.during_next_watch_resolve(hook), {
+                let engine = Arc::clone(&engine);
+                async move {
+                    let options = WatchOptions { resume_after: Some(token), ..Default::default() };
+                    engine.watch(WatchScope::Collection(coll.id), options).unwrap();
+                }
+            })
+            .await;
+        assert!(
+            polled < finished,
+            "the bystander was polled {:?} after the resolve ended: the resolve held the only \
+             worker",
+            polled - finished
+        );
+    }
+
+    /// A replay read gives its worker up too.
+    ///
+    /// One call of `next` can read batch after batch without awaiting: a stream
+    /// resumed from another member's token passes over everything its token
+    /// covers, and a scoped stream everything out of scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_task_spawned_during_a_replay_read_is_polled_before_the_read_ends() {
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        let engine = Arc::new(engine);
+        let options = WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() };
+        let mut stream = engine.watch(WatchScope::Collection(coll.id), options).unwrap();
+
+        let (polled, finished) =
+            polled_and_finished(|hook| engine.during_next_replay_read(hook), {
+                let engine = Arc::clone(&engine);
+                async move {
+                    assert!(stream.next(&engine).await.is_some(), "the insert is replayed");
+                }
+            })
+            .await;
+        assert!(
+            polled < finished,
+            "the bystander was polled {:?} after the replay read ended: the read held the only \
+             worker",
+            polled - finished
+        );
+    }
+
+    /// A resolve slow enough for a client to notice says so, with what it did.
+    ///
+    /// Before the upgrade is answered the client sees nothing, and one that
+    /// gives up left no trace on the member in round 0420.
+    #[test]
+    fn a_slow_resolve_is_logged_with_what_it_walked() {
+        let (engine, coll, _dir) = setup();
+        for id in 0..3 {
+            engine.insert(&coll, doc! { "_id": id }).unwrap();
+        }
+        let token = foreign_token(&engine);
+        engine.during_next_watch_resolve(|| {
+            std::thread::sleep(SLOW_RESOLVE + std::time::Duration::from_millis(50))
+        });
+
+        let logged = logs_of(|| {
+            let options = WatchOptions { resume_after: Some(token), ..Default::default() };
+            engine.watch(WatchScope::Collection(coll.id), options).unwrap();
+        });
+
+        assert!(logged.contains("a change stream was slow to find where it starts"), "{logged}");
+        assert!(logged.contains("INFO"), "{logged}");
+        for field in [
+            "elapsed_ms=",
+            "token_kind=\"foreign_vector\"",
+            &format!("scope=\"collection {}\"", coll.id),
+            "walks=1",
+            "rows_examined=",
+            "held=Some(0)",
+            "resolved=true",
+        ] {
+            assert!(logged.contains(field), "the line carries {field}: {logged}");
+        }
+
+        // A resolve that is not slow writes nothing.
+        let quiet = logs_of(|| {
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+        });
+        assert!(!quiet.contains("find where it starts"), "{quiet}");
     }
 }
