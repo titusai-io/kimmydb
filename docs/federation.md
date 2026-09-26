@@ -17,8 +17,8 @@ notes, and what to check when it does not work.
 
 ## The five-minute version
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 Four things, all of them settable through environment variables (compose,
 swarm, kubernetes) or the config file:
@@ -61,8 +61,8 @@ that never reached the node. See [Troubleshooting](#troubleshooting).
 
 ## The audience is the load-bearing string
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 `aud` is compared byte for byte, and the same string must appear in **three**
 places:
@@ -176,8 +176,8 @@ Rules worth internalizing:
 
 ## A readable subject: `subject_claim`
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 A provider's `sub` is stable and opaque — a GUID, an `00u…` string — which is
 what makes it a good identity and a bad thing to read in an audit line.
@@ -213,8 +213,8 @@ token — before choosing, since the claim has to be in the token the node sees.
 
 ## Troubleshooting
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 Work down this list; each step is observable from outside the node.
 

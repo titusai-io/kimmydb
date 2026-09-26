@@ -44,8 +44,9 @@ What to expect:
 In scope: `kimmyd`, the container image at `ghcr.io/titusai-io/kimmydb`, the
 release archives, and the workflows that build them. The `kimmy` CLI and the
 client libraries moved to their own repositories and are not currently
-distributed ([ADR-193](docs/decisions.md)). A vulnerability in a dependency counts when it is reachable from
-one of these; tell us, and the release that closes it is ours to make.
+distributed ([ADR-193](docs/decisions.md)). A vulnerability in a dependency
+counts when it is reachable from one of these; tell us, and the release that
+closes it is ours to make.
 
 Out of scope, because they are configuration rather than defects:
 

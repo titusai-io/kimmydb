@@ -20000,8 +20000,9 @@ What goes with them, and what stays:
   of materials leave `dist-workspace.toml` and `scripts/sbom.sh`, and the CLI
   gets no release workflow elsewhere. The Homebrew formula was the CLI's, so
   the tap is no longer this repository's (this amends ADR-063 and ADR-156).
-- **CI** loses the Python client, Go client and conformance jobs, and the
-  `build kimmyd` job no longer builds the Rust conformance driver. Dependabot
+- **CI** loses the Python client and Go client jobs and the conformance job
+  that M10 task 11 put in CI, and the `build kimmyd` job no longer builds the
+  Rust conformance driver. Dependabot
   loses its `gomod` and `uv` entries.
 - **`clients/conformance/`** — `scenarios.json` and `run.py` — stays,
   unchanged, as the protocol's contract. The drivers live with the clients.

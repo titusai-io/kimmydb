@@ -112,8 +112,8 @@ Refused at startup, each because of what it would otherwise break:
 
 ### Naming this node: the audience is the resource identifier
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 A provider signs tokens for everything that trusts it, so `audience` is what
 stops a token minted for the company wiki from working here. **But an audience
@@ -428,8 +428,8 @@ name than its subject ([ADR-100](decisions.md)).
 
 ### Getting a token
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 When the node names itself as a resource, the client id is the only thing the
 CLI cannot work out for itself:
@@ -496,8 +496,8 @@ expires on its own.
 
 ## Local login is a mode
 
-> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md)); the
-> steps describe the flow it performs.
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 `POST /v1/auth/login` is the one unauthenticated route that accepts a guess
 from anywhere and spends Argon2 work on each one. A node whose people all
@@ -1479,8 +1479,9 @@ GPL-family license permitted at all. That rule was set while the Apache-2.0
 allowlist over one lockfile cannot permit a license for some crates'
 dependents and not others, so it permitted it for none — and it stands now
 that the client libraries live in their own repositories
-([ADR-193](decisions.md)). OpenSSL, `native-tls` and `aws-lc-rs` are banned outright — the
-build has one TLS and crypto stack, rustls on `ring` ([ADR-039](decisions.md)),
+([ADR-193](decisions.md)). OpenSSL, `native-tls` and `aws-lc-rs` are banned
+outright — the build has one TLS and crypto stack, rustls on `ring`
+([ADR-039](decisions.md)),
 and a second one arriving as somebody's feature default is how "we use
 rustls" quietly stops being true. Crates come from crates.io only. Where an
 advisory is ignored, the reason is written beside it in the file; read it

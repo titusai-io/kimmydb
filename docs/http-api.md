@@ -785,8 +785,9 @@ curl localhost:7878/.well-known/oauth-protected-resource
 
 Unauthenticated, necessarily: a client that has no token is exactly who needs
 it. It is what lets `kimmy login --url https://kimmydb.example.com` work
-with nothing else configured, and it is how a conformant MCP client discovers
-where to authenticate — see [mcp.md](mcp.md).
+with nothing else configured (the `kimmy` CLI is not currently distributed;
+see [cli.md](cli.md)), and it is how a conformant MCP client discovers where
+to authenticate — see [mcp.md](mcp.md).
 
 `scopes_supported` is deliberately **absent**. Authorization here is roles
 carried in the token, not scopes; advertising a scope vocabulary would describe

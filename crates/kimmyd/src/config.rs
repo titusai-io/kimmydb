@@ -1771,7 +1771,7 @@ pub const PLACEHOLDER_SECRETS: &[&str] = &[
     "change-me",
     // The quick starts in README.md and docs/, before they generated a key.
     "a-long-random-secret",
-    // examples/ and the client examples.
+    // The examples and client examples that used to live here.
     "a-secret-long-enough-for-the-examples",
     "example-password",
     "conformance-password",

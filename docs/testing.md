@@ -1036,13 +1036,107 @@ that is what a default run relies on.
 
 ## The clients' suites moved with the clients
 
-The Rust, Python and Go clients, their suites, the M10 mutation pass over them
+The Rust, Python and Go clients, their suites, the client's M10 mutation pass
 and their conformance drivers moved to their own repositories with the clients
-([ADR-193](decisions.md)); what this page said about them is in its git history.
-The scenarios they are held to stay here as the protocol's contract,
+([ADR-193](decisions.md)); what this page said about them is in its git
+history. The scenarios they are held to stay here as the protocol's contract,
 [`clients/conformance/scenarios.json`](../clients/conformance/scenarios.json),
 and this repository's CI no longer runs them. The server's side of the
 contract is still tested here: [The protocol contract](#the-protocol-contract).
+
+---
+
+## M10: the server-side mutation pass
+
+### The server-side pass was started and abandoned
+
+The M10 diff also touches `kimmy-api`, `kimmy-storage` and `kimmy-auth` — 90
+mutants. That pass was **not completed**, and the reason is worth recording so
+the next person does not repeat it.
+
+Run against all three crates' suites, each mutant costs a build plus a ~78s
+test run. At `-j 8` on a machine already busy, the wall time per mutant blew
+through the 300s cap: after 47 mutants the result was **3 caught, 0 missed and
+15 timeouts** — nearly no information, and every timeout was a mutant whose
+`cargo test` had not finished linking, not a hang in the code.
+
+**The lesson is the same one that made the client pass cheap: scope the tests
+to the mutant.** A `kimmy-api` mutant does not need `kimmy-storage`'s suite to
+run. `-- -p kimmy-api` alone, at `-j 4`, with a timeout set from a *contended*
+baseline rather than an idle one.
+
+These crates had full mutation passes in M7 and M8, and the M10 diff over them
+is small next to the client and specification work. Redoing it properly is
+worth an hour of someone's time, not an emergency.
+
+### Redone properly
+
+**2026-08-14.** The scope splits 76 `kimmy-api` / 12 `kimmy-storage` / 2
+`kimmy-auth` — exactly the 90 recorded. All three are done.
+
+| Crate | Result |
+|---|---|
+| `kimmy-auth` | 2 caught. Both first read as misses; both were scoping artefacts |
+| `kimmy-storage` | 10 caught, 2 unviable, 0 missed. One real gap, now fixed |
+| `kimmy-api` | 36 caught, 32 unviable, 8 missed. Six were real and are fixed; two are artefacts |
+
+**"Missed" turned out to be three different things**, and telling them apart
+was most of the value:
+
+| | What it means | What to do |
+|---|---|---|
+| **A real gap** | No test anywhere produces the behaviour | Write the test |
+| **Covered only by an `#[ignore]`d test** | The cluster harness has it, but a mutation run — like `cargo test --workspace` — never sees it | Decide whether the property is local enough to test in process. Often part of it is |
+| **A cross-crate artefact** | The killer lives in a crate outside the test scope | Widen the scope, re-run, classify. Do not chase |
+
+**The `kimmy-api` gaps, in order of how much they mattered:**
+
+- **`capabilities()` could return `vec![]` and every check passed.** The
+  contract test compared the wire against the same function that produced it,
+  then asserted the list does *not* contain `local-embeddings` — vacuous when
+  the list is empty. ADR-058 makes capabilities the thing clients branch on
+  instead of a version number, so a node silently claiming to support nothing
+  is precisely the failure the mechanism exists to prevent. The
+  unconditionally-present capabilities are now named and required, and the
+  fixture is asserted non-empty so it cannot go vacuous again.
+- **`register` claimed to be silent when nothing changed, and nothing tested
+  it.** The docstring says a node restarting twice an hour must not append to a
+  replicated log — and the harness structurally cannot check it, because it
+  starts each node once and never restarts one on an unchanged address. Now
+  covered in process, along with the `me_seen` bookkeeping that was dead code
+  in the whole default suite because no in-process test had ever called
+  `register` at all.
+- **`render` stays uncovered in this crate, deliberately.** The contract test
+  checks the `101` handshake and never reads a frame; the Rust, Python and Go
+  client suites and the conformance runner all drive it. Confirmed by re-running
+  with `-p kimmy-client` in scope, where both mutants die.
+
+**Run the verification twice when the tree moved under you.** The first widened
+run here was confounded — the test files were edited while it was in flight, so
+it could not separate "the wider scope caught it" from "the new tests caught
+it". The clean re-run at the natural scope is what established the result.
+
+**The real gap was `InvalidateReason::as_str`**, which could return `""` or
+`"xyzzy"` unnoticed. The method exists so that renaming a variant cannot
+silently rename a value clients branch on — and yet the strings were asserted
+only downstream (three client suites, the cluster harness, the conformance
+scenarios) and only for `CollectionDropped`. The other two reasons were held by
+prose in `docs/openapi.yaml`. All three are pinned now in the crate that
+chooses them, exhaustively, so a new variant does not compile until its wire
+name is decided.
+
+**Scoping to the mutant's crate hides cross-crate killers, and that cuts both
+ways.** It is what makes these runs affordable, but both `kimmy-auth` "misses"
+were caught the moment `-p kimmy-api` joined the scope: `ttl_secs` is asserted
+by its consumer, not its owner. **A miss in a crate whose surface another crate
+consumes may only mean the test lives one crate up — widen the scope and re-run
+before believing it.** The local test was added anyway, on the principle that a
+crate's public accessor should not rely on a consumer to pin it.
+
+**And the contention lesson repeated itself, in the other direction.** Running
+the `kimmy-api` pass beside an ordinary `cargo test --workspace` stretched that
+suite from ~2 minutes to over 10. Contention does not only ruin the mutation
+run; it ruins whatever shares the machine with it. Run these alone.
 
 ---
 

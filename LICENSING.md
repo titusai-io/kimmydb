@@ -10,7 +10,7 @@ is a guide, not a substitute.
 | Component | License | In practice |
 |---|---|---|
 | The server — `kimmyd` and the crates it is built from (`kimmy-core`, `kimmy-storage`, `kimmy-query`, `kimmy-vector`, `kimmy-auth`, `kimmy-cluster`, `kimmy-api`, `kimmy-mcp`, `kimmy-task`) | [GNU Affero General Public License v3.0](LICENSE) | Free to run, self-host, and modify — personally or at a business. If you modify it and let others use it over a network, you must make your modified source available under the same license. |
-| Documentation, examples, and the conformance suite | Apache License 2.0 | Same as the clients. |
+| Documentation and the conformance suite | Apache License 2.0 | Same as the clients. |
 | Commercial license | Contact <licensing@titusai.io> | For anyone who wants to embed, redistribute, or build on the server without the AGPL's obligations. |
 
 ## What the AGPL means for you

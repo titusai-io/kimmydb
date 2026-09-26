@@ -341,8 +341,9 @@ login = "always"
 # only work when this node has a name an authorization server knows —
 #
 #   - RFC 9728 metadata at /.well-known/oauth-protected-resource, which is what
-#     lets `kimmy login --oidc --url <this node>` work with nothing else set,
-#     and what a conformant MCP client reads to find where to authenticate;
+#     lets `kimmy login --oidc --url <this node>` work with nothing else set
+#     (the `kimmy` CLI is not currently distributed; see docs/cli.md), and
+#     what a conformant MCP client reads to find where to authenticate;
 #   - a `resource_metadata` pointer on every 401, so a client that gets refused
 #     can find out where to go.
 #
@@ -389,8 +390,9 @@ login = "always"
 
 
 # A claim whose string value is carried as a federated principal's DISPLAY
-# name — in `kimmy whoami` and in the audit record (as `display`, when it
-# differs from the subject). A provider's `sub` is stable and opaque (a GUID,
+# name — in `kimmy whoami` (the `kimmy` CLI is not currently distributed; see
+# docs/cli.md) and in the audit record (as `display`, when it differs from the
+# subject). A provider's `sub` is stable and opaque (a GUID,
 # an `00u…` string), which makes it a good identity and a bad thing to read in
 # a log; `preferred_username`, `email` or `upn` is what a person recognises.
 #

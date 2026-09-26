@@ -107,7 +107,8 @@ curl http://localhost:7878/.well-known/oauth-protected-resource
 ```
 
 `kimmy login --url <node>` uses exactly the same path, so what an MCP
-client does automatically is what the CLI does for a person. Full detail:
+client does automatically is what the CLI does for a person (the `kimmy` CLI
+is not currently distributed; see [cli.md](cli.md)). Full detail:
 [http-api.md](http-api.md#protected-resource-metadata) and
 [security.md](security.md#naming-this-node-the-audience-is-the-resource-identifier).
 

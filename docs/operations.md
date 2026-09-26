@@ -1912,12 +1912,8 @@ command, which is not the question being asked.
 > `dist-workspace.toml` at the same time. Every release from then on carries
 > both.
 
-Homebrew had its own check built in — the formula pins each archive's
-SHA-256, so `brew install titusai-io/tap/kimmy` refuses a download that does
-not match what the release workflow published. No release publishes a formula
-at present ([ADR-156](decisions.md)), so the tap's newest version is the last
-one that did, and the checks above are the ones a current release is verified
-by.
+The Homebrew tap is frozen at the last release that published a formula,
+and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 
 ---
 
