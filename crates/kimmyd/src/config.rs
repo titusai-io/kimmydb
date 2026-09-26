@@ -1771,7 +1771,7 @@ pub const PLACEHOLDER_SECRETS: &[&str] = &[
     "change-me",
     // The quick starts in README.md and docs/, before they generated a key.
     "a-long-random-secret",
-    // examples/ and the client examples.
+    // The examples and client examples that used to live here.
     "a-secret-long-enough-for-the-examples",
     "example-password",
     "conformance-password",
@@ -3468,9 +3468,7 @@ fn advise() -> &'static str {{
         // A scan that has gone blind over one crate reports no offenders in
         // it, which looks exactly like a clean crate. Every crate that names
         // a setting in a message today has to still be naming one.
-        for crate_name in
-            ["kimmy-api", "kimmy-auth", "kimmy-cli", "kimmy-storage", "kimmy-vector", "kimmyd"]
-        {
+        for crate_name in ["kimmy-api", "kimmy-auth", "kimmy-storage", "kimmy-vector", "kimmyd"] {
             assert!(
                 crates_scanned.contains_key(crate_name),
                 "no setting was found in {crate_name}, which names one in a message today — \

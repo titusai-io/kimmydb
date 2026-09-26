@@ -20,7 +20,7 @@ API reference, operations, and the decision record.
 > queries and aggregation, secondary indexes, live change streams over
 > WebSocket, signed webhooks, automatic embeddings with vector and hybrid
 > search, an in-process MCP server at `/mcp`, OIDC federation, and a
-> versioned `/v1` contract with Rust, Python and Go clients all work.
+> versioned `/v1` contract all work.
 > **Clustering works too** — every node accepts writes, membership is SWIM and
 > convergence is anti-entropy over the oplog; `docker-compose.yml` brings up
 > three nodes. Pre-1.0: a minor release may break things and the
@@ -43,8 +43,8 @@ seen a peer.
 
 ## Install
 
-Releases are cut by tag. The server ships as a container image; the CLI ships
-as a prebuilt Linux tarball, and from source anywhere else.
+Releases are cut by tag. The server ships as a container image, and as a
+prebuilt Linux tarball.
 
 ```bash
 # The server — multi-arch (amd64 + arm64) image on GHCR. Pick a root password
@@ -57,23 +57,23 @@ docker run --rm -p 7878:7878 \
   -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
   -v kimmy-data:/var/lib/kimmy \
   ghcr.io/titusai-io/kimmydb:latest
-
-# The CLI — from source, on any platform. From a clone of this repository,
-# `cargo install --path crates/kimmy-cli` does the same thing.
-cargo install --git https://github.com/titusai-io/kimmydb kimmy-cli
 ```
 
-Prebuilt tarballs with SHA256 checksums for both binaries — Linux arm64 and
-x86_64, statically linked against musl, so they run on any distribution — are
-on the [releases page](https://github.com/titusai-io/kimmydb/releases).
+Prebuilt `kimmyd` tarballs with SHA256 checksums — Linux arm64 and x86_64,
+statically linked against musl, so they run on any distribution — are on the
+[releases page](https://github.com/titusai-io/kimmydb/releases).
 
-**macOS archives and the Homebrew tap are not being published at present.**
-A release builds only what the container image needs
-([ADR-156](docs/decisions.md)), so no `aarch64-apple-darwin` archive is
-attached and `titusai-io/homebrew-tap` still carries the formula from the
-last release that published one — `brew install titusai-io/tap/kimmy` gets
-that version and no newer. On a Mac, build the CLI from source as above, and
-run the server from the container image, which is its channel either way.
+**macOS archives are not being published at present.** A release builds only
+what the container image needs ([ADR-156](docs/decisions.md)), so no
+`aarch64-apple-darwin` archive is attached. On a Mac, run the server from the
+container image, which is its channel either way.
+
+**The `kimmy` CLI and the client libraries are not currently distributed.**
+They moved out of this repository ([ADR-193](docs/decisions.md)) and are
+frozen until the server is ready for all of them to be updated together. The
+HTTP API is the interface: [HTTP API](docs/http-api.md), with the contract in
+[`docs/openapi.yaml`](docs/openapi.yaml) and what a client is expected to do in
+[Clients](docs/clients.md).
 
 Versioning policy is in [Compatibility](docs/compatibility.md): pre-1.0, a
 minor may break things and the [changelog](CHANGELOG.md) says so; a patch
@@ -334,7 +334,6 @@ Where the build departs from what was planned — and why — is tracked in
 | `kimmy-mcp` | MCP tools and resources — calls the same executor the REST routes do, so authorization cannot diverge |
 | `kimmy-api` | axum router, REST handlers, change-stream WebSocket, and the executor both edges share |
 | `kimmyd` | The server binary |
-| `kimmy-cli` | Terminal client |
 
 ## Development
 
@@ -372,7 +371,7 @@ wrong answers rather than crashes. These are property-tested:
 | [Query Language](docs/query-language.md) · [HTTP API](docs/http-api.md) | Using it |
 | [Vectors](docs/vectors.md) · [MCP](docs/mcp.md) | Embeddings, search, and the agent surface |
 | [Security](docs/security.md) · [Threat model](docs/threat-model.md) · [Federation](docs/federation.md) · [Operations](docs/operations.md) | Running it — and what is and is not defended against |
-| [CLI](docs/cli.md) · [Clients](docs/clients.md) · [Compatibility](docs/compatibility.md) | The `kimmy` terminal client, the first-party libraries, and what `/v1` promises |
+| [Clients](docs/clients.md) · [Compatibility](docs/compatibility.md) | What a client is expected to do, and what `/v1` promises |
 | [Benchmarks](docs/benchmarks.md) | What has been measured, with method |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |
 
@@ -382,7 +381,5 @@ KimmyDB is developed by [Titus AI LLC](https://titusai.io).
 
 - **Server** (`kimmyd` and the crates it is built from): [GNU AGPL-3.0](LICENSE).
   Run it anywhere, including commercially, under the terms of that license.
-- **Client libraries** (`kimmy-client` for Rust, `clients/go`, `clients/python`):
-  [Apache-2.0](LICENSE-APACHE). Use them in anything.
 - **Commercial license**: for embedding or distributing KimmyDB without the
   AGPL's obligations, write to <licensing@titusai.io>.

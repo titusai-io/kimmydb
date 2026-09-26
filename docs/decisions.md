@@ -2894,6 +2894,11 @@ announce.
 
 ## ADR-063 — cargo-dist builds the release; the container image is the server's channel
 
+> **Amended by [ADR-193](#adr-193--the-client-libraries-and-the-cli-live-in-their-own-repositories-frozen-and-fuzzing-stays).**
+> A tag builds `kimmyd` alone. The `kimmy` CLI moved to its own repository and
+> is not currently distributed, so the CLI archives, their bills of materials
+> and the Homebrew half of this record are no longer this repository's.
+
 > **Amended by [ADR-156](#adr-156--the-release-builds-only-what-the-container-image-needs).**
 > The four targets below are two. A tag builds the
 > `*-unknown-linux-musl` pair only: `x86_64-apple-darwin` went in August, and
@@ -13088,6 +13093,11 @@ which pass unchanged through the move of the predicate they exercise.
 
 ## ADR-156 — The release builds only what the container image needs
 
+> **Amended by [ADR-193](#adr-193--the-client-libraries-and-the-cli-live-in-their-own-repositories-frozen-and-fuzzing-stays).**
+> The four macOS paths are two, `kimmyd`'s, and there is no Homebrew to
+> restore: the formula was the `kimmy` CLI's, which no longer builds here.
+> Bringing macOS back is the `targets` line and those two paths.
+
 **Decision.** A tag builds the two `*-unknown-linux-musl` targets and nothing
 else. `aarch64-apple-darwin` is **paused**: commented out in
 `dist-workspace.toml`'s `targets` and in the four macOS paths of
@@ -19970,3 +19980,69 @@ does the same. The vector drop and the webhook registration are one commit
 each; the user store's races are driven by queueing edits behind a held
 writer. A kimmyd test drives the bounded drain and checks the stop comes at
 its end, not at the signal.
+
+---
+
+## ADR-193 — The client libraries and the CLI live in their own repositories, frozen, and fuzzing stays
+
+**Decision.** The Rust client (`crates/kimmy-client`), the Python client
+(`clients/python`), the Go client (`clients/go`) and the `kimmy` CLI
+(`crates/kimmy-cli`) move out of this repository into one repository each,
+with their history, cut at `6405b64`. Each keeps its licence text verbatim:
+the libraries Apache-2.0, the CLI AGPL-3.0-only. They are **frozen**: moved as
+they are, not updated for server changes, with no CI and no gate against the
+current server, until the server is stable and performing well, when all of
+them are updated together. None of them is currently distributed.
+
+What goes with them, and what stays:
+
+- **Releases build `kimmyd` alone.** The `kimmy-cli` archives and their bills
+  of materials leave `dist-workspace.toml` and `scripts/sbom.sh`, and the CLI
+  gets no release workflow elsewhere. The Homebrew formula was the CLI's, so
+  the tap is no longer this repository's (this amends ADR-063 and ADR-156).
+- **CI** loses the Python client and Go client jobs and the conformance job
+  that M10 task 11 put in CI, and the `build kimmyd` job no longer builds the
+  Rust conformance driver. Dependabot
+  loses its `gomod` and `uv` entries.
+- **`clients/conformance/`** — `scenarios.json` and `run.py` — stays,
+  unchanged, as the protocol's contract. The drivers live with the clients.
+- **`examples/`** goes: `shelf.py` and `shelf.go` moved with their clients (the
+  Rust `shelf` was already the client crate's), and `run-all.sh` drove all
+  three.
+- **Fuzzing stays** — `fuzz/`, `crates/kimmy-fuzz-harness` and the weekly
+  `fuzz.yml`. ADR-111 is unchanged.
+- **The licence boundary.** With no Apache-2.0 crate in the workspace,
+  `scripts/check-license-boundary.sh` no longer walks `kimmy-client`'s graph;
+  it fails if any member states a licence other than the workspace's, and
+  still requires `deny.toml`'s exceptions to name exactly the workspace's
+  crates, which drops `kimmy-cli`'s. `LICENSING.md` and `NOTICE` lose the rows
+  for what is no longer here; no licence changes.
+- **Docs.** [Clients](clients.md) keeps what a client is expected to do,
+  which the error and retry references link to. [CLI](cli.md) is a stub that
+  says where the CLI went, so its inbound links still land.
+
+**Why.** Build time and release cadence. Every pull request compiled the two
+crates and their tests, which start a node in process, and `main` ran three
+toolchains for the clients. Updating the clients is not the priority while the
+server is being made stable, and in the workspace every server change that
+reached the wire was client work too.
+
+**Why fuzzing stays.** It tests the server rather than consuming it. As a
+workspace member, `kimmy-fuzz-harness` runs every corpus seed on every pull
+request, and the weekly run is free on a public repository; moved, both would
+be lost, and a frozen copy would fuzz the server as of the split rather than
+as it changes. The testkit was considered as a home — fuzzing per round at no
+Actions cost — but it would lose the pull-request guard and add a nightly Rust
+toolchain to a small Python tool.
+
+**Rejected.** A release workflow for the CLI in its new repository: real work
+and paid minutes for a tool that is frozen. Building the CLI from here through
+a git dependency: that is the split undone. Moving fuzzing: above.
+
+**Cost.** No client suite and no conformance run holds a server change to the
+protocol any more. What does is here: the contract test against
+`openapi.yaml`, the documented error codes, and the `/v1` compatibility
+promise; and a change that reaches the wire is named in the CHANGELOG, which is
+where the clients' update starts. Anyone using the CLI or a client library has
+no current release of it; the releases before this one carried the CLI's
+archives.

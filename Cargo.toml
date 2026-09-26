@@ -11,9 +11,7 @@ members = [
     "crates/kimmy-cluster",
     "crates/kimmy-mcp",
     "crates/kimmy-api",
-    "crates/kimmy-client",
     "crates/kimmyd",
-    "crates/kimmy-cli",
     # The fuzz harness bodies, as a plain crate so they compile on stable under
     # the ordinary PR gate. The libFuzzer entry points that call them are in
     # `fuzz/`, below, which needs nightly and so stays out (ADR-111).
@@ -45,7 +43,6 @@ kimmy-auth = { path = "crates/kimmy-auth" }
 kimmy-cluster = { path = "crates/kimmy-cluster" }
 kimmy-mcp = { path = "crates/kimmy-mcp" }
 kimmy-api = { path = "crates/kimmy-api" }
-kimmy-client = { path = "crates/kimmy-client" }
 
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros"] }
@@ -101,8 +98,9 @@ toml = "1"
 # feature turns it on, for a build that wants `kimmy_storage_cache_*`.
 redb = "~4.3"
 
-# HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
-# the two cannot drift apart on features -- `rustls-tls` matters, because the
+# HTTP client, for every request the node makes outward: webhook deliveries,
+# the remote embedding providers, and OIDC discovery and JWKS. One spec, so
+# they cannot drift apart on features -- `rustls-tls` matters, because the
 # default would pull OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

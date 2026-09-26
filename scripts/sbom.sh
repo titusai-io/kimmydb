@@ -4,8 +4,8 @@
 #
 # Why this exists
 # ---------------
-# A release is two binaries on every target it builds — two of them today,
-# with macOS paused (ADR-156) — each linking a few hundred crates. Which
+# A release is the server binary, `kimmyd`, on every target it builds — two of
+# them today, with macOS paused (ADR-156) — linking a few hundred crates. Which
 # crates, at which versions, under which licences, is knowable from
 # `Cargo.lock` — but only by whoever has the source at the right commit and a
 # Rust toolchain. An SBOM beside each archive answers the question for
@@ -14,16 +14,15 @@
 #
 # What it does
 # ------------
-# For every target triple given on the command line, and for each of the two
-# shipped binaries, runs `cargo cyclonedx` against that binary's crate with
-# the dependency graph filtered to that target, and writes
+# For every target triple given on the command line, and for each shipped
+# binary (only `kimmyd` since the `kimmy` CLI moved out, ADR-193), runs
+# `cargo cyclonedx` against that binary's crate with the dependency graph
+# filtered to that target, and writes
 #
 #     target/sbom/kimmyd-<target>.cdx.json
-#     target/sbom/kimmy-cli-<target>.cdx.json
 #
-# named exactly as dist names the archives (`kimmyd-<target>.tar.xz`,
-# `kimmy-cli-<target>.tar.xz`), so the archive and the bill that describes it
-# sort together on the Release page.
+# named exactly as dist names the archive (`kimmyd-<target>.tar.xz`), so the
+# archive and the bill that describes it sort together on the Release page.
 # One file per binary per target rather than one for the workspace, because
 # the dependency graph is not the same on every platform and a scanner fed
 # the union would flag Windows-only crates against a Linux image.
@@ -61,7 +60,7 @@ CYCLONEDX_BASE_URL="https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/d
 SPEC_VERSION=1.5
 
 # app name (what dist calls the archive) → the crate that builds it
-APPS=("kimmyd:crates/kimmyd" "kimmy-cli:crates/kimmy-cli")
+APPS=("kimmyd:crates/kimmyd")
 
 usage() {
     echo "usage: $0 <target-triple> [<target-triple>...]" >&2

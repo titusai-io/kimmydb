@@ -1874,7 +1874,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.39.0; A=kimmy-cli-x86_64-unknown-linux-musl.tar.xz
+V=0.39.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -1891,7 +1891,7 @@ signing key, because there is none to copy. `gh` performs the check:
 
 ```bash
 # A release archive
-gh attestation verify kimmy-cli-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
+gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
 gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.39.0 -R titusai-io/kimmydb
@@ -1912,12 +1912,8 @@ command, which is not the question being asked.
 > `dist-workspace.toml` at the same time. Every release from then on carries
 > both.
 
-Homebrew had its own check built in — the formula pins each archive's
-SHA-256, so `brew install titusai-io/tap/kimmy` refuses a download that does
-not match what the release workflow published. No release publishes a formula
-at present ([ADR-156](decisions.md)), so the tap's newest version is the last
-one that did, and the checks above are the ones a current release is verified
-by.
+The Homebrew tap is frozen at the last release that published a formula,
+and the CLI it installed is not currently distributed ([ADR-193](decisions.md)).
 
 ---
 
@@ -2080,19 +2076,23 @@ targets (`aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl`):
 
 | File | |
 |---|---|
-| `kimmyd-<target>.tar.xz`, `kimmy-cli-<target>.tar.xz` | The server and the CLI, each with a `.sha256` beside it and listed in `sha256.sum` |
-| `kimmyd-<target>.cdx.json`, `kimmy-cli-<target>.cdx.json` | The CycloneDX software bill of materials for that binary — every crate compiled into it, with versions, licences and package hashes — each with its own `.sha256` |
+| `kimmyd-<target>.tar.xz` | The server, with a `.sha256` beside it and listed in `sha256.sum` |
+| `kimmyd-<target>.cdx.json` | The CycloneDX software bill of materials for that binary — every crate compiled into it, with versions, licences and package hashes — with its own `.sha256` |
 
 Plus `source.tar.gz` and the multi-arch image at
 `ghcr.io/titusai-io/kimmydb` built from the same tag.
 
-`aarch64-apple-darwin` and the Homebrew formula `kimmy.rb` are **paused, not
-retired** ([ADR-156](decisions.md)): a release builds only what the container
-image needs, so it carries no macOS archive, no macOS bill of materials and no
-formula, and nothing pushes to `titusai-io/homebrew-tap`. Everything above is
+`aarch64-apple-darwin` is **paused, not retired** ([ADR-156](decisions.md)):
+a release builds only what the container image needs, so it carries no macOS
+archive and no macOS bill of materials. Everything above is
 unchanged, because the image is built from the Linux archives and they are
 what a release is now for. Restoring the macOS target is an edit to
 `dist-workspace.toml` and `dist generate`; the ADR says exactly which lines.
+
+The `kimmy` CLI's archives, its bills of materials and its Homebrew formula are
+no longer part of a release at all: the CLI moved to its own repository with
+the client libraries, and is not currently distributed
+([ADR-193](decisions.md)).
 
 Before an upgrade, the two checks worth the thirty seconds:
 

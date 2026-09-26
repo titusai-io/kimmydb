@@ -112,6 +112,9 @@ Refused at startup, each because of what it would otherwise break:
 
 ### Naming this node: the audience is the resource identifier
 
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
+
 A provider signs tokens for everything that trusts it, so `audience` is what
 stops a token minted for the company wiki from working here. **But an audience
 only narrows anything if the provider can actually mint a token for *this*
@@ -425,6 +428,9 @@ name than its subject ([ADR-100](decisions.md)).
 
 ### Getting a token
 
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
+
 When the node names itself as a resource, the client id is the only thing the
 CLI cannot work out for itself:
 
@@ -489,6 +495,9 @@ expires on its own.
 ---
 
 ## Local login is a mode
+
+> **The `kimmy` CLI used here is not currently distributed** ([CLI](cli.md));
+> the steps describe the flow it performs.
 
 `POST /v1/auth/login` is the one unauthenticated route that accepts a guess
 from anywhere and spends Argon2 work on each one. A node whose people all
@@ -1465,11 +1474,14 @@ because advisories are published against crates that are already in the
 lockfile. A known vulnerability anywhere in the graph fails the check.
 Licenses are an allowlist of exactly what the graph carries, with the
 workspace's own AGPL permitted for the server crates by name and no
-GPL-family license permitted at all: `kimmy-client` is Apache-2.0
-([LICENSING.md](../LICENSING.md)), and one allowlist over one lockfile cannot
-permit a license for some crates' dependents and not others, so it permits it
-for none. OpenSSL, `native-tls` and `aws-lc-rs` are banned outright — the
-build has one TLS and crypto stack, rustls on `ring` ([ADR-039](decisions.md)),
+GPL-family license permitted at all. That rule was set while the Apache-2.0
+`kimmy-client` shared this lockfile ([LICENSING.md](../LICENSING.md)) — one
+allowlist over one lockfile cannot permit a license for some crates'
+dependents and not others, so it permitted it for none — and it stands now
+that the client libraries live in their own repositories
+([ADR-193](decisions.md)). OpenSSL, `native-tls` and `aws-lc-rs` are banned
+outright — the build has one TLS and crypto stack, rustls on `ring`
+([ADR-039](decisions.md)),
 and a second one arriving as somebody's feature default is how "we use
 rustls" quietly stops being true. Crates come from crates.io only. Where an
 advisory is ignored, the reason is written beside it in the file; read it
@@ -1544,9 +1556,9 @@ kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256
 One per binary per target rather than one for the workspace: the dependency
 graph is not the same on every platform, and a bill that listed the Windows
 crates against a Linux image would have a scanner reporting advisories for
-code that is not there. Four per release today — `kimmyd` and `kimmy-cli` on
-each of the two Linux musl targets — with the macOS pair paused alongside the
-build that produced it ([ADR-156](decisions.md)). The container image ships
+code that is not there. Two per release today — `kimmyd` on each of the two
+Linux musl targets — with the macOS one paused alongside the build that
+produced it ([ADR-156](decisions.md)). The container image ships
 the musl `kimmyd`, so its bill is the one for that target.
 
 The bills are generated from `Cargo.lock` at the release commit by

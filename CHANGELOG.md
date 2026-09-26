@@ -10,6 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Removed
+
+- **The `kimmy` CLI and the client libraries are no longer in this
+  repository, and releases no longer ship the CLI.** The Rust, Python and Go
+  clients and the CLI moved to their own repositories, frozen: they are not
+  updated for server changes, and they will be brought up to date together
+  once the server is stable. None is currently distributed. A release now
+  attaches `kimmyd` archives and their bills of materials only; the
+  `kimmy-cli-<target>` archives and SBOMs are gone, and the Homebrew formula
+  went with the CLI. The container image is unchanged. **The HTTP API is the
+  interface**; [Clients](docs/clients.md) keeps what a client is expected to
+  do, and `clients/conformance/scenarios.json` stays as the protocol's
+  contract. The `examples/` directory went with the clients. Fuzzing stays.
+  See ADR-193.
+
 ## 0.39.0 - 2026-09-26
 
 **Roll the members one at a time. This release is not a rollback boundary:

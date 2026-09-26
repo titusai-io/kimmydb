@@ -2,10 +2,12 @@
 members = ["cargo:."]
 
 # Release engineering, generated and driven by `dist` (cargo-dist). See
-# ADR-063: pushing a `v*` tag builds both binaries for every target below,
-# checksums them, drafts the GitHub Release from CHANGELOG.md, and calls the
-# GHCR publish workflow. The Homebrew half of ADR-063 is paused with the macOS
-# target it needs (ADR-156), which is what the commented lines below are.
+# ADR-063: pushing a `v*` tag builds the server, `kimmyd`, for every target
+# below, checksums it, drafts the GitHub Release from CHANGELOG.md, and calls
+# the GHCR publish workflow. The `kimmy` CLI, the other binary ADR-063 shipped
+# and the one its Homebrew half was for, moved to its own repository and is
+# not currently distributed (ADR-193). The macOS target is paused (ADR-156),
+# which is what the commented lines below are.
 #
 # `.github/workflows/release.yml` is GENERATED from this file. Do not edit it
 # by hand — change this file and run `dist generate`. The `plan` job that runs
@@ -15,19 +17,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app. Homebrew is paused with the macOS
-# build it needs (ADR-156): the tap carries `kimmy` for macOS, and a formula
-# generated from a release that built no macOS binary would pin Linux musl
-# archives and install nothing a Mac can run, which is worse than publishing
-# nothing. crates/kimmyd/Cargo.toml opts the server out with
-# `installers = []` either way — the server distributes as the GHCR container
-# image (ADR-063).
+# The installers to generate for each app: none. The server distributes as the
+# GHCR container image (ADR-063), and crates/kimmyd/Cargo.toml opts it out
+# with `installers = []` either way. The Homebrew formula was the `kimmy`
+# CLI's, and went with it (ADR-193); the tap is no longer this repository's.
 installers = []
-# A GitHub repo to push Homebrew formulas to
-# tap = "titusai-io/homebrew-tap"
-# Publish jobs to run in CI. `homebrew` is paused with the macOS build
-# (ADR-156); put it back at the front of this list when the target returns.
-# `./publish-ghcr` is ours:
+# Publish jobs to run in CI. `./publish-ghcr` is ours:
 # .github/workflows/publish-ghcr.yml, the multi-arch container image. dist
 # runs publish jobs after `host`, which runs after every build job, so the
 # image job can take the Linux archives from the run's own workflow artifacts
@@ -60,8 +55,7 @@ github-build-setup = "../release-build-setup.yml"
 # times the Linux rate, so that one job was about four fifths of a release's
 # billed minutes. The two musl targets stay because the image is built from
 # their archives (ADR-107). To bring macOS back: uncomment the line below and
-# the four macOS paths in `[[dist.extra-artifacts]]`, restore Homebrew above,
-# then run `dist generate`.
+# the two macOS paths in `[[dist.extra-artifacts]]`, then run `dist generate`.
 targets = [
     # "aarch64-apple-darwin",
     "aarch64-unknown-linux-musl",
@@ -86,16 +80,10 @@ build = [
 artifacts = [
     # "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json",
     # "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json.sha256",
-    # "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json",
-    # "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json.sha256",
     "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json",
     "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json.sha256",
-    "target/sbom/kimmy-cli-aarch64-unknown-linux-musl.cdx.json",
-    "target/sbom/kimmy-cli-aarch64-unknown-linux-musl.cdx.json.sha256",
     "target/sbom/kimmyd-x86_64-unknown-linux-musl.cdx.json",
     "target/sbom/kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256",
-    "target/sbom/kimmy-cli-x86_64-unknown-linux-musl.cdx.json",
-    "target/sbom/kimmy-cli-x86_64-unknown-linux-musl.cdx.json.sha256",
 ]
 
 # Native runners for both Linux architectures. Without the arm mapping dist

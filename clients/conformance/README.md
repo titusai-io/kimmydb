@@ -2,6 +2,13 @@
 
 One set of scenarios, run three ways, compared against one oracle.
 
+> **The drivers are not in this repository any more.** The Rust, Python and Go
+> clients, and the driver each ships, moved to their own repositories and are
+> frozen until they are updated together ([ADR-193](../../docs/decisions.md)).
+> `scenarios.json` and `run.py` stay here unchanged as the protocol's contract,
+> and this repository's CI no longer runs them. The commands below are as they
+> were, and need the drivers built from the client repositories.
+
 ```bash
 cargo build --release --bin kimmyd
 cargo build --release --example conformance -p kimmy-client
