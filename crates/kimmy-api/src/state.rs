@@ -191,6 +191,11 @@ impl AppState {
             fsyncs: self.engine.fsyncs(),
             commits_grouped: self.engine.grouped_commits(),
             storage_bytes: self.engine.storage_bytes(),
+            // What an open that walks would read, and what the last walk that
+            // verified the vector did read (ADR-173's addendum of 2026-09-26).
+            // A count from the table's root and one `get`.
+            oplog_entries: self.engine.oplog_entries()?,
+            oplog_verified: self.engine.version_vector_verified()?.unwrap_or_default(),
             // redb's own counters for the cache `storage.cache_bytes` bounds:
             // what it holds now, and how it has been doing since open. Only
             // in a build that has them; the render then omits the series.

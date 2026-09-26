@@ -8245,6 +8245,10 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         Vec::new()
     })
     .chain([
+        "kimmy_oplog_entries",
+        "kimmy_oplog_verified_entries",
+        "kimmy_oplog_verified_logical_bytes",
+        "kimmy_oplog_verified_walk_seconds",
         "kimmy_vector_index_cache_bytes",
         "kimmy_process_resident_bytes",
         "kimmy_process_resident_peak_bytes",

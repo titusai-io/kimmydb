@@ -37,6 +37,8 @@ mod store_lock;
 pub mod sync;
 pub mod tables;
 pub mod vectors;
+pub mod verified;
+pub use verified::VerifiedWalk;
 pub mod watch;
 
 pub use divergence::{

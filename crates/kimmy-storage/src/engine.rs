@@ -1136,6 +1136,9 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_HELD)?;
             let _ = txn.open_table(tables::LIVE_COUNTS)?;
             let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
+            // Created with the others, so reading the record never meets a
+            // missing table (`crate::verified`).
+            let _ = txn.open_table(tables::VECTOR_VERIFIED)?;
         }
         txn.commit()?;
 
@@ -1156,7 +1159,7 @@ impl Engine {
         // version bump: there is no state here that the oplog does not already
         // determine.
         Self::rebuild_arrival_index_if_stale(&db)?;
-        Self::rebuild_version_vector_if_stale(&db)?;
+        Self::verify_version_vector_at_open(&db)?;
         Self::seed_collected_if_untracked(&db)?;
         // A filter created with a generic `Binary` before ADR-182 was stored
         // as an array, and nothing records which arrays those were, so every
@@ -1788,7 +1791,8 @@ impl Engine {
             // whole index through the page cache on every open — at a 4 GiB
             // file, the oplog twice over before the node served anything
             // (ADR-153's investigation; the third walk, the version vector's,
-            // is recorded there as the one that remains).
+            // is recorded there as the one that remains, and since ADR-173's
+            // addendum of 2026-09-26 it runs once per verification).
             //
             // Both halves of the index: a change stream's resume reads the
             // stamp half on its own (`Engine::first_arrival_beyond`), so a
@@ -1912,7 +1916,11 @@ impl Engine {
     ///
     /// What it still does is repair a vector that has fallen behind: a database
     /// written before the vector existed, or one an older build appended to.
-    pub(crate) fn rebuild_version_vector_if_stale(db: &Database) -> Result<()> {
+    pub(crate) fn rebuild_version_vector_if_stale(
+        db: &Database,
+    ) -> Result<(bool, crate::verified::VerifiedWalk)> {
+        let started = std::time::Instant::now();
+        let mut walk = crate::verified::VerifiedWalk::default();
         let mut actual = kimmy_core::VersionVector::new();
         {
             let txn = db.begin_read()?;
@@ -1939,13 +1947,16 @@ impl Engine {
             // database. Empty is the overwhelmingly common case.
             let any_held = !held.is_empty()?;
             for row in oplog.iter()? {
-                let (key, _) = row?;
+                let (key, value) = row?;
+                walk.rows += 1;
+                walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
                 if any_held && held.get(key.value())?.is_some() {
                     continue;
                 }
                 actual.observe(codec::decode_oplog_key(key.value())?);
             }
         }
+        walk.elapsed_ms = started.elapsed().as_millis() as u64;
 
         let mut stored = Self::read_versions(db, tables::OPLOG_VERSIONS)?;
         let before = stored.clone();
@@ -1959,12 +1970,12 @@ impl Engine {
         let witnessed_before = witnessed.clone();
         witnessed.merge(&stored);
 
-        if stored == before && witnessed == witnessed_before {
-            return Ok(());
-        }
-
+        let raised = stored != before || witnessed != witnessed_before;
+        // The raise and the record in one transaction: the record says I
+        // holds, and it does only once the raise has landed.
+        let schema = Self::current_schema(db)?;
         let txn = db.begin_write()?;
-        {
+        if raised {
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             for (node, hlc) in stored.iter() {
                 versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
@@ -1974,13 +1985,65 @@ impl Engine {
                 seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
+        crate::verified::write(&txn, schema, &walk)?;
+        // A failure before the raise commits, for the test that the record
+        // cannot land without the raise it describes.
+        #[cfg(test)]
+        if crate::verified::test_support::fails_before_the_raise_commits() {
+            return Err(StorageError::Database(
+                "a failure injected before the raise commits".into(),
+            ));
+        }
         txn.commit()?;
 
+        if raised {
+            info!(
+                nodes = stored.len(),
+                "raised the version vector to cover the oplog entries appended in position"
+            );
+        }
+        Ok((raised, walk))
+    }
+
+    /// Check the version vector against the oplog at open, unless the record
+    /// says it already covers it (ADR-173's addendum of 2026-09-26).
+    ///
+    /// The walk reads every oplog entry, keys and values: about 30 s per GB
+    /// read on a cold page cache on the lab host (round 0420). On a store where
+    /// invariant I holds it raises nothing, and every writer of every build
+    /// that can open the store keeps I, so once a walk has written the record
+    /// the next opens skip it. `KIMMY_VERIFY_OPLOG_AT_OPEN=1` walks anyway.
+    ///
+    /// What a skip gives up: the walk decoded every oplog key, so an
+    /// undecodable one failed the open. Skipped, it surfaces at the first read
+    /// that reaches it.
+    fn verify_version_vector_at_open(db: &Database) -> Result<()> {
+        let schema = Self::current_schema(db)?;
+        if !crate::verified::forced()
+            && let Some(walk) = crate::verified::read_db(db, schema)?
+        {
+            info!(
+                rows = walk.rows,
+                logical_bytes = walk.logical_bytes,
+                walk_ms = walk.elapsed_ms,
+                "skipped the oplog walk: the version vector is verified"
+            );
+            return Ok(());
+        }
+        let (raised, walk) = Self::rebuild_version_vector_if_stale(db)?;
         info!(
-            nodes = stored.len(),
-            "raised the version vector to cover the oplog entries appended in position"
+            elapsed_ms = walk.elapsed_ms,
+            rows = walk.rows,
+            logical_bytes = walk.logical_bytes,
+            raised,
+            "checked the version vector against the oplog"
         );
         Ok(())
+    }
+
+    /// The store's schema version, as the record is keyed by it.
+    fn current_schema(db: &Database) -> Result<u8> {
+        Ok(crate::migrate::stored_version(db)?.unwrap_or(crate::migrate::SCHEMA_VERSION))
     }
 
     /// Replace the version vector with exactly what the oplog now covers.
@@ -1996,6 +2059,8 @@ impl Engine {
     /// range again — the node would be permanently missing writes and would
     /// look caught up.
     pub(crate) fn reset_version_vector_to_oplog(db: &Database) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut walk = crate::verified::VerifiedWalk::default();
         let mut actual = kimmy_core::VersionVector::new();
         {
             let txn = db.begin_read()?;
@@ -2011,14 +2076,18 @@ impl Engine {
             let held = txn.open_table(tables::OPLOG_HELD)?;
             let any_held = !held.is_empty()?;
             for row in oplog.iter()? {
-                let (key, _) = row?;
+                let (key, value) = row?;
+                walk.rows += 1;
+                walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
                 if any_held && held.get(key.value())?.is_some() {
                     continue;
                 }
                 actual.observe(codec::decode_oplog_key(key.value())?);
             }
         }
+        walk.elapsed_ms = started.elapsed().as_millis() as u64;
 
+        let schema = Self::current_schema(db)?;
         let txn = db.begin_write()?;
         {
             // **Both** vectors. If witnessed stayed high, the node would
@@ -2041,6 +2110,12 @@ impl Engine {
                 versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
+        // The reset leaves invariant I holding exactly: the vector is now the
+        // maximum over the entries it keeps that are not held. So it records
+        // that, as a walk at open would, and the next open skips the walk.
+        // Deleting the record instead would also be safe, but would cost the
+        // first open after a `restore --until` a second cold walk.
+        crate::verified::write(&txn, schema, &walk)?;
         txn.commit()?;
 
         info!(nodes = actual.len(), "reset the version vector to the rewound oplog");
@@ -2461,6 +2536,20 @@ impl Engine {
     pub fn held_marks(&self) -> Result<u64> {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(tables::OPLOG_HELD)?.len()?)
+    }
+
+    /// Entries in the oplog now, for the `kimmy_oplog_entries` gauge: the
+    /// count redb keeps in the table's root, read without visiting a row.
+    pub fn oplog_entries(&self) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(tables::OPLOG)?.len()?)
+    }
+
+    /// What the walk that last verified the version vector found, when the
+    /// record counts: the open skips the walk while it does
+    /// (`crate::verified`). One `get`.
+    pub fn version_vector_verified(&self) -> Result<Option<crate::verified::VerifiedWalk>> {
+        crate::verified::read_db(&self.db, Self::current_schema(&self.db)?)
     }
 
     /// Drop the state marks (ADR-160) on every entry `granted` now covers.

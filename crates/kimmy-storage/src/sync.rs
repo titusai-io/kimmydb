@@ -3545,6 +3545,9 @@ mod tests {
                 let mut versions = txn.open_table(crate::tables::OPLOG_VERSIONS).unwrap();
                 versions.retain(|_, _| false).unwrap();
             }
+            // A database written before the vector existed has no record that
+            // it was verified, so the open walks (`crate::verified`).
+            txn.delete_table(crate::tables::VECTOR_VERIFIED).unwrap();
             txn.commit().unwrap();
         }
 

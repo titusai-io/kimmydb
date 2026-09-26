@@ -395,11 +395,31 @@ jobs:
       # sized against a 16-dimensional fixture, held there, and was wrong at
       # every width a real embedding uses — discarding and rebuilding every
       # healthy graph, then reporting it as incomplete.
+      #
+      # `cargo test --exact` passes having run nothing when the name matches no
+      # test, so each of these steps also requires that one test ran and
+      # passed. `shell: bash` sets pipefail, so a failed run fails the step
+      # through the `tee` as well.
       - name: Reachability at a realistic width
-        run: >
-          cargo test -p kimmy-vector --release --lib --
-          --ignored --exact
-          index::tests::a_healthy_graph_at_a_realistic_width_is_not_rebuilt
+        shell: bash
+        run: |
+          cargo test -p kimmy-vector --release --lib -- \
+            --ignored --exact \
+            index::tests::a_healthy_graph_at_a_realistic_width_is_not_rebuilt 2>&1 | tee reachability.log
+          grep -q 'test result: ok. 1 passed' reachability.log
+
+      # An open that finds the version vector verified reads a fixed amount of
+      # the store, and one that walks reads the oplog (ADR-173's addendum of
+      # 2026-09-26). Release only: a debug build of redb reads every allocated
+      # page at open, so the difference cannot be metered there. Not ignored in
+      # release, so `--include-ignored`.
+      - name: A skipping open reads a fixed amount
+        shell: bash
+        run: |
+          cargo test -p kimmy-storage --release --lib -- \
+            --include-ignored --exact \
+            verified::tests::a_skipping_open_reads_a_fixed_amount_and_a_walking_one_reads_the_oplog 2>&1 | tee skipping-open.log
+          grep -q 'test result: ok. 1 passed' skipping-open.log
 
   # One build of `kimmyd`, shared — and it is the build the release makes.
   #

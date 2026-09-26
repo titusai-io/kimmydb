@@ -12293,7 +12293,11 @@ change, from the same 227 MiB idle, and stayed there — the retention ADR-117
 and ADR-147 record, spread over more heaps. The version vector's walk at
 open is left as it is: removing it means either trusting the stored vector
 outright, which ADR-054's repair case forbids, or keeping a per-origin
-high-water mark the oplog does not hold, which is a format change. `kimmy_runtime_stall_seconds`
+high-water mark the oplog does not hold, which is a format change. (Since
+ADR-173's addendum of 2026-09-26 it runs once per verification rather than at
+every open: a record says the vector covers the oplog, and ADR-054's repair
+case -- a restore, a store from before the vector -- is exactly where no record
+is.) `kimmy_runtime_stall_seconds`
 no longer reports a scan as a stall, which is correct: a scan no longer stalls
 the runtime. The test is `crates/kimmy-api/tests/scan_yields.rs`: on a
 one-worker runtime, a task spawned while a `count` over 30,000 documents is
@@ -16589,6 +16593,98 @@ positions themselves do not cover the oplog.
   above `V` with its mark removed. The audit reports I broken, and the seek
   alone disagrees with the old walk. That is what would catch a future writer
   that skips the raise.
+
+**Addendum, 2026-09-26: the open walks the oplog once, not every time.** Every
+open walked every oplog entry, keys and values, to raise the version vector over
+what it did not cover (`rebuild_version_vector_if_stale`, ADR-054). On a store
+where I holds that walk raises nothing. On a cold page cache it cost about 30 s
+per GB of oplog read on the lab host: a 1.08 GB read took 32.3–32.7 s at open,
+and the round 0420 members took 16–52 s from container start to `storage engine
+open`.
+
+**The record.** A table of its own, `VECTOR_VERIFIED`, holds one key whose value
+is `I_EPOCH ‖ schema ‖ rows ‖ logical bytes ‖ elapsed ms`: what the walk that
+verified the vector found.
+- **Where it is written:** after the open's walk, in the transaction that
+  raises the vector; and by a rewind's reset, which leaves I holding exactly.
+- **When it counts:** only at exactly its length, this build's `I_EPOCH` and
+  the store's current schema. Anything else is no record: the open walks, then
+  rewrites it. No node id, redb or build version is in it.
+- **What an open does with it:** an open that finds a record that counts skips
+  the walk. `KIMMY_VERIFY_OPLOG_AT_OPEN=1` walks anyway.
+- **Why a table and not a `META` key:** every build's backup lists its tables by
+  hand and none copies tables wholesale, so no backup carries the record. That
+  holds for an older build restoring a newer backup too. A restore omits
+  `OPLOG_HELD` and can leave I broken, and it never carries the record, so the
+  first open after it walks.
+
+**Why the record stays true.** Every writer of every build that can open the
+store keeps I.
+- **Which builds can open it:** 0.34.0, 0.34.1 and 0.35.0 open a current store
+  read-write, unprotected by ADR-190. 0.36.x refuses it. 0.37.0–0.39.0 open it
+  too.
+- **Their writers do the same to `OPLOG`, the two vectors and `OPLOG_HELD`
+  as this build's**, from 0.34.0 on: `append_oplog_at`, `raise_version`,
+  `release_held_in_position`, `absorb_version_vector_in_txn`,
+  `release_held_under` and `relog` are byte-identical. `reset_version_vector_to_oplog`
+  and `rebuild_version_vector_if_stale` differ only in also writing the record,
+  which an older build does not do.
+- **They do not touch a table they do not know**, so a rollback to any of them
+  and a roll forward leave the record true.
+- **A migration** changes the schema, so the record stops counting and the
+  next open walks.
+- **Which starts walk:** the first of this release, and of any later one that
+  raises the schema or `I_EPOCH`; the first after a restore; and every start of
+  a release before this one, which reads no record. A rollback to 0.39 or
+  earlier therefore walks at every start, as those releases did.
+
+**The `I_EPOCH` rule.**
+- A change that only **weakens** what the vector must cover may keep the epoch.
+- A change that **strengthens** I must bump it **and** ship with a rollback
+  boundary: a schema bump under ADR-190 that excludes every build that does not
+  keep the new I. Without the boundary, an older build could write under the old
+  I while a record written by the newer one claims the new.
+
+**What a skip gives up.** The walk decoded every oplog key and every vector
+row, so damage there failed the open. A skipping open reads neither, and such
+damage is found by the first read that reaches it. redb's page checksums still
+apply.
+
+**Guards and tests**, in `kimmy-storage`'s `verified.rs`:
+- **`every_writer_of_the_invariants_tables_is_an_audited_one`** fails on any
+  change to the oplog, either vector or the marks outside the audited writers,
+  with "keep invariant I or bump I_EPOCH with a rollback boundary".
+  - **What counts as a change:** a mutable binding or `&mut` borrow of the
+    table, any method on it but a reader (`get`, `iter`, `range`, `len`,
+    `is_empty`, `first`, `last`), `insert_reserve`, or `delete_table`. The same
+    holds for a table opened through a lowercase variable, since a helper can be
+    handed any of them.
+  - **How it reads the source:** statements are read whole across wrapped lines.
+    The enclosing function is found under any visibility and any `const`,
+    `async`, `unsafe` or `extern`.
+  - **The audited writers** are (file, function) pairs: the engine's six, gc's
+    `remove_oplog_entries`, `rewind_to`, `restore_with` and migrate's
+    `rewrite_oplog`. `faults.rs`, test code, is exempt as a file.
+  - **Its mutants:** `the_guard_finds_a_new_writer` covers a `pub(super)`
+    writer, a wrapped `let mut`, a renamed table parameter and an audited name
+    outside its file.
+- **`skipping_the_walk_gives_the_vector_walking_gives`** is a property test. It
+  builds stores through remote appends under each position, releases, absorbs,
+  orphaned marks, retention, rewinds, restores, stale-schema records and
+  pre-vector writes. After every step it reopens and checks two things: the
+  record stands only where a walk would raise nothing, and a skipping open's
+  vectors equal a walking one's.
+- **`a_skipping_open_reads_a_fixed_amount_and_a_walking_one_reads_the_oplog`**
+  meters the storage backend:
+  - In a release build, a skipping open read 69,961 bytes at every oplog size
+    tried. A walking one read the oplog: 0.76, 4.2 and 8.4 MB for 500, 3,000 and
+    6,000 documents.
+  - It runs in CI's release job, which also checks that exactly one test ran
+    and passed. In a debug build, redb's own open reads every allocated page
+    (`mark_allocated_page_for_debug`), whatever this code does.
+- **`the_record_cannot_land_without_its_raise`** fails the walk's transaction
+  just before it commits, and checks that neither the record nor the raise
+  landed.
 
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 
