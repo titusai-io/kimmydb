@@ -609,7 +609,12 @@ went on running until the walk ended or the supervisor killed it; the next
 start then repaired a store its marker called clean.
 
 **Give a stop 30 s or more, measured from the signal.** The phases above come
-to about 25 s at most. Kubernetes' `terminationGracePeriodSeconds` (30 s by
+to about 25.2 s at most: 22 s to the runtime's shutdown, 0.2 s more waiting
+for the store's last holder, and 2 s for telemetry. Two steps sit **outside**
+that budget, and the margin up to 30 s is for them: under `coalesced`, the
+last flush of commits waiting to be made durable, made when the node closes
+to writes, and redb's own close, which commits and fsyncs the allocator state
+(its time is the `elapsed_ms` on `engine closed`). Kubernetes' `terminationGracePeriodSeconds` (30 s by
 default) includes any `preStop` hook, so a hook's time comes out of it: raise
 the grace by as much. Docker's and Compose's default is 10 s, which is too
 short: use `docker stop --time 30` or `--stop-timeout 30`, or

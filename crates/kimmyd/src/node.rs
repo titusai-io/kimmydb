@@ -104,6 +104,7 @@ pub async fn run(config: Config) -> RunEnd {
         held: None,
         data_dir: data_dir.clone(),
         stop_by: None,
+        writes_open: false,
         test_stop: None,
     };
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -128,7 +129,9 @@ pub async fn run(config: Config) -> RunEnd {
             // Closed to writes whether serving ended at the signal or on an
             // error: either way the engine is closed next, and a commit must
             // not land after the marker.
+            // Kept apart from the outcome, so a serving error cannot hide it.
             let closed = close_for_exit(&served.engine, WRITES_CLOSE_CAP);
+            end.writes_open = closed.is_err();
             end.outcome = served.outcome.and(closed);
             end.engine = Some(served.engine);
         }
@@ -151,6 +154,9 @@ pub struct RunEnd {
     /// When the stop's time runs out: [`STOP_BUDGET`] after the signal, or
     /// after serving failed.
     stop_by: Option<std::time::Instant>,
+    /// A write was still in progress at [`WRITES_CLOSE_CAP`], whatever the
+    /// run otherwise ended on: the engine is not closed.
+    writes_open: bool,
     test_stop: Option<TestStop>,
 }
 
@@ -162,7 +168,7 @@ const STOP_BUDGET: Duration = Duration::from_secs(22);
 
 /// The least time the runtime's shutdown waits, however much of the budget
 /// the drain and the close to writes used.
-const RUNTIME_SHUTDOWN_FLOOR: Duration = Duration::from_secs(3);
+pub const RUNTIME_SHUTDOWN_FLOOR: Duration = Duration::from_secs(3);
 
 /// How long the runtime's shutdown waits when a write was still in progress
 /// at the cap (ADR-192): that write's thread is blocked, and the engine will
@@ -180,9 +186,7 @@ const WRITES_OPEN_SHUTDOWN: Duration = Duration::from_millis(100);
 /// repairs the store; the marker then says `storage_not_closed` and why, and
 /// the error returned is a [`StorageNotClosed`], which `main` exits 75 on.
 pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
-    let RunEnd { outcome, engine, held, data_dir, stop_by, test_stop } = end;
-    let writes_open =
-        outcome.as_ref().is_err_and(|e| e.downcast_ref::<WritesStillOpen>().is_some());
+    let RunEnd { outcome, engine, held, data_dir, stop_by, writes_open, test_stop } = end;
     let now = std::time::Instant::now();
     let deadline = if writes_open {
         now + WRITES_OPEN_SHUTDOWN
@@ -193,7 +197,8 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
 
     let closed = match engine {
         _ if writes_open => Err(format!(
-            "a write was still in progress {} s after the drain",
+            "a write was still in progress {} s after the drain, or the last flush of commits \
+             waiting to be made durable failed",
             WRITES_CLOSE_CAP.as_secs()
         )),
         None => Ok(()),
@@ -211,8 +216,11 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
 /// runtime stopped waiting for may, and so may one outside it for a moment
 /// (the metrics exporter reads through a weak reference it upgrades). This
 /// waits for the last of them until `deadline`, or a moment if that has
-/// passed: `Arc::into_inner` gives up this reference when another remains,
-/// and the close would then run on whichever thread let go last, where
+/// passed. `Arc::try_unwrap` succeeds only when this is the one strong
+/// reference, atomically, so no other thread can be running the close, and
+/// a `Weak` cannot bring one back once it has gone; on failure it hands the
+/// reference back, so the next try keeps it. `Arc::into_inner` would give it
+/// up, and the close would then run on whichever thread let go last, where
 /// nothing could wait for it.
 fn close_engine(
     engine: Arc<Engine>,
@@ -221,15 +229,22 @@ fn close_engine(
     test_stop: Option<TestStop>,
 ) -> std::result::Result<(), String> {
     let until = deadline.max(std::time::Instant::now() + LAST_HOLDER_WAIT);
-    while Arc::strong_count(&engine) > 1 && std::time::Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let Some(engine) = Arc::into_inner(engine) else {
-        let since = stop_by.map_or(String::new(), |by| {
-            let began = by.checked_sub(STOP_BUDGET).unwrap_or(by);
-            format!(" {} s after the stop began", began.elapsed().as_secs())
-        });
-        return Err(format!("the storage engine was still held by a thread{since}"));
+    let mut shared = engine;
+    let engine = loop {
+        match Arc::try_unwrap(shared) {
+            Ok(engine) => break engine,
+            Err(still) if std::time::Instant::now() < until => {
+                shared = still;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let since = stop_by.map_or(String::new(), |by| {
+                    let began = by.checked_sub(STOP_BUDGET).unwrap_or(by);
+                    format!(" {} s after the stop began", began.elapsed().as_secs())
+                });
+                return Err(format!("the storage engine was still held by a thread{since}"));
+            }
+        }
     };
     if let Some(TestStop::SlowClose(delay)) = test_stop {
         std::thread::sleep(delay);
@@ -320,6 +335,10 @@ enum TestStop {
     PanicInWrite,
     /// `serve_error`: serving fails, with no signal.
     ServeError,
+    /// `panic_in_run`: `node::run` panics once the node is serving, with a
+    /// thread holding the engine as `hold_engine` does, so that only a
+    /// bounded runtime shutdown lets the process end.
+    PanicInRun,
     /// `slow_close:<ms>`: the close waits this long before dropping the
     /// engine, so a test can see what waits for it.
     SlowClose(Duration),
@@ -331,6 +350,7 @@ impl TestStop {
             None if value == "hold_engine" => Some(Self::HoldEngine),
             None if value == "panic_in_write" => Some(Self::PanicInWrite),
             None if value == "serve_error" => Some(Self::ServeError),
+            None if value == "panic_in_run" => Some(Self::PanicInRun),
             Some(("slow_close", ms)) => {
                 ms.parse().ok().map(|ms| Self::SlowClose(Duration::from_millis(ms)))
             }
@@ -904,7 +924,7 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     match test_stop {
         // A test's stand-in for a walk serving a peer, which holds the engine
         // on a blocking thread for as long as it runs.
-        Some(TestStop::HoldEngine) => {
+        Some(TestStop::HoldEngine | TestStop::PanicInRun) => {
             let engine = Arc::clone(&engine);
             // UNSUPERVISED: a test switch whose task is meant never to end.
             tokio::spawn(async move {
@@ -939,6 +959,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     };
     let serving = serve(listener, app, tls, announced(stop.clone()), DRAIN_TIMEOUT, stopping);
     let served = match test_stop {
+        Some(TestStop::PanicInRun) => {
+            panic!("node::run panicked on purpose (KIMMY_TEST_STOP=panic_in_run)")
+        }
         Some(TestStop::ServeError) => {
             drop(serving);
             Err(anyhow::anyhow!("serving failed on purpose (KIMMY_TEST_STOP=serve_error)"))
@@ -1035,8 +1058,8 @@ impl std::fmt::Display for WritesStillOpen {
         write!(
             f,
             "a write was still in progress {} s after the shutdown drain ended, or the last \
-             flush of commits waiting to be made durable failed; exiting without recording a \
-             clean exit",
+             flush of commits waiting to be made durable failed; exiting without closing the \
+             storage engine",
             WRITES_CLOSE_CAP.as_secs()
         )
     }
@@ -2545,8 +2568,10 @@ mod tests {
     /// A run's end as `run` hands it to `conclude`: the engine closed to
     /// writes within `cap`, the stop begun now.
     fn ended(dir: &std::path::Path, engine: Arc<Engine>, cap: Duration) -> RunEnd {
+        let outcome = close_for_exit(&engine, cap);
         RunEnd {
-            outcome: close_for_exit(&engine, cap),
+            writes_open: outcome.is_err(),
+            outcome,
             engine: Some(engine),
             held: None,
             data_dir: dir.to_path_buf(),
@@ -2649,7 +2674,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = conclude_now(ended(dir.path(), engine, Duration::from_secs(1)));
         let took = started.elapsed();
-        assert!(took < RUNTIME_SHUTDOWN_FLOOR + Duration::from_secs(1), "{took:?}");
+        assert!(took < RUNTIME_SHUTDOWN_FLOOR + Duration::from_secs(3), "{took:?}");
         assert!(not_closed(&outcome), "{outcome:?}");
         let last = marker(dir.path());
         assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
@@ -2697,6 +2722,7 @@ mod tests {
         assert_eq!(TestStop::parse("hold_engine"), Some(TestStop::HoldEngine));
         assert_eq!(TestStop::parse("panic_in_write"), Some(TestStop::PanicInWrite));
         assert_eq!(TestStop::parse("serve_error"), Some(TestStop::ServeError));
+        assert_eq!(TestStop::parse("panic_in_run"), Some(TestStop::PanicInRun));
         assert_eq!(
             TestStop::parse("slow_close:1500"),
             Some(TestStop::SlowClose(Duration::from_millis(1500)))

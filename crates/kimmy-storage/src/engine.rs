@@ -1556,6 +1556,7 @@ impl Engine {
     /// need for repair, which a clean close then refuses to record. In the
     /// shipped binary, like the other test switches, so that a real node's
     /// stop can be tested against it.
+    #[doc(hidden)]
     pub fn panic_inside_a_write(&self) -> Result<()> {
         let _txn = self.begin_write(WriterHolder::Write)?;
         panic!("a panic inside a write transaction, on purpose (KIMMY_TEST_STOP=panic_in_write)");
@@ -4660,17 +4661,6 @@ mod tests {
         }
     }
 
-    /// The arrival-index staleness check reads two table headers, not two
-    /// tables (ADR-153's investigation).
-    ///
-    /// It compared the lengths by iterating both tables to the end, which on
-    /// every open walked the whole oplog and the whole index through the page
-    /// cache before the node served anything. Sixteen thousand kilobyte
-    /// documents make an oplog of over 16 MiB; the check is run on a database
-    /// opened with a 1 MiB cache, so a walk cannot be hidden in it, and the
-    /// bytes the backend was asked for are asserted to be a small fraction of
-    /// the table rather than the table.
-
     /// A close proves itself: clean after an ordinary run, and refused,
     /// naming the call, when the close's own fsync fails.
     #[test]
@@ -4690,6 +4680,17 @@ mod tests {
         assert!(refused.to_string().contains("sync_data"), "{refused}");
         assert!(!crate::format::closed_cleanly(&path).unwrap());
     }
+
+    /// The arrival-index staleness check reads two table headers, not two
+    /// tables (ADR-153's investigation).
+    ///
+    /// It compared the lengths by iterating both tables to the end, which on
+    /// every open walked the whole oplog and the whole index through the page
+    /// cache before the node served anything. Sixteen thousand kilobyte
+    /// documents make an oplog of over 16 MiB; the check is run on a database
+    /// opened with a 1 MiB cache, so a walk cannot be hidden in it, and the
+    /// bytes the backend was asked for are asserted to be a small fraction of
+    /// the table rather than the table.
     #[test]
     fn the_arrival_index_check_reads_headers_not_tables() {
         let dir = tempfile::tempdir().unwrap();

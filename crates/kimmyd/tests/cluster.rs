@@ -2246,9 +2246,13 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
     let vectors =
         serde_json::json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 });
     assert!(post(&a, "/v1/db/shop/coll/vec/vector", vectors).await.unwrap().status().is_success());
-    for i in 0..20 {
-        let doc = serde_json::json!({ "_id": i, "note": "n" });
-        assert!(post(&a, "/v1/db/shop/coll/vec/docs", doc).await.unwrap().status().is_success());
+    // Above the 500 vectors below which a search is exact, so each member's
+    // search builds a graph, which the index cache gauge then shows.
+    const VECTORS: usize = 600;
+    let docs: Vec<_> = (0..VECTORS).map(|i| serde_json::json!({ "_id": i, "note": "n" })).collect();
+    let res = post(&a, "/v1/db/shop/coll/vec/bulk", serde_json::json!(docs)).await.unwrap();
+    assert!(res.status().is_success(), "{:?}", res.text().await);
+    for i in 0..VECTORS {
         let res = client
             .put(a.url(&format!("/v1/db/shop/coll/vec/docs/{i}/vectors")))
             .bearer_auth(&token)
@@ -2271,6 +2275,8 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
             .await
             .unwrap();
         assert!(search.status().is_success(), "{}: {:?}", node.name, search.text().await);
+        let graph = node.gauge(&client, "kimmy_vector_index_cache_bytes").await;
+        assert!(graph.is_some_and(|bytes| bytes > 0), "{}: no graph built: {graph:?}", node.name);
         feeds.push(open_feed(node, &bearer, None).await);
     }
     let backup = client.get(a.url("/v1/admin/backup")).bearer_auth(&token).send().await.unwrap();

@@ -162,7 +162,22 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
-            let end = runtime.block_on(node::run(config));
+            // A panic out of `run` loses the run's end with the future that
+            // held it, so there is no engine to close. The runtime's shutdown
+            // is bounded all the same, and the panic then goes on out of
+            // `main`: exit 101, and no marker, which the next start reads as
+            // unclean, as it is.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(node::run(config))
+            }));
+            let end = match run {
+                Ok(end) => end,
+                Err(panic) => {
+                    runtime.shutdown_timeout(node::RUNTIME_SHUTDOWN_FLOOR);
+                    telemetry_guard.shutdown_within(logging::TELEMETRY_SHUTDOWN);
+                    std::panic::resume_unwind(panic);
+                }
+            };
             // The runtime's shutdown is bounded, the engine is closed on this
             // thread, and only then is the exit marker written (ADR-147).
             let concluded = node::conclude(end, runtime);

@@ -1015,7 +1015,23 @@ async fn a_clean_stop_closes_the_store_before_its_marker() {
     let mut run =
         Run::spawn_with(dir.path(), "slow-close", &[("KIMMY_TEST_STOP", "slow_close:1500")]);
     run.wait_ready(&client).await;
-    let (status, took) = stop(&mut run);
+    // Watched from the signal to the exit: the marker must never say
+    // `shutdown` while the close has not been logged. The close is slowed by
+    // 1.5 s, so a marker written before it would be seen.
+    let started = Instant::now();
+    run.signal("TERM");
+    let status = loop {
+        let marker = marker(dir.path()).unwrap_or_default();
+        if marker.contains("exit = \"shutdown\"") {
+            assert!(run.log().contains("engine closed"), "the marker came first: {}", run.log());
+        }
+        if let Some(status) = run.child.get_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(started.elapsed() < PATIENCE, "did not exit: {}", run.log());
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let took = started.elapsed();
     assert!(status.success(), "{status:?}");
     assert!(took >= Duration::from_millis(1500), "the exit did not wait for the close: {took:?}");
     let log = run.log();
@@ -1193,4 +1209,26 @@ async fn a_stop_over_tls_closes_the_store() {
     assert!(status.success(), "{status:?}: {}", run.log());
     assert!(run.log().contains("engine closed"), "{}", run.log());
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
+/// A panic out of `node::run` loses the engine with the future that held it,
+/// so nothing can be closed: the runtime's shutdown is bounded all the same
+/// (a thread holds the engine here, and would hold an unbounded one up for a
+/// day), the process exits 101, and no marker is written, so the next start
+/// calls the run unclean, and repairs.
+#[tokio::test]
+async fn a_panic_out_of_the_run_exits_bounded_and_leaves_no_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let started = Instant::now();
+    let mut run = Run::spawn_with(dir.path(), "panic-run", &[("KIMMY_TEST_STOP", "panic_in_run")]);
+    let status = run.wait_exit();
+    assert_eq!(status.code(), Some(101), "{status:?}: {}", run.log());
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    assert!(run.log().contains("node::run panicked on purpose"), "{}", run.log());
+    assert!(marker_absent(dir.path()), "{:?}", marker(dir.path()));
+
+    let log = next_start_log(dir.path(), "panic-run-next", &client).await;
+    assert!(log.contains("previous run did not shut down cleanly"), "{log}");
+    assert!(log.contains("repairing the database after an unclean stop"), "{log}");
 }

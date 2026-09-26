@@ -11284,6 +11284,12 @@ Now `run` records nothing on its way out. It returns the engine, and `main`:
    of its own: the meter provider's `shutdown_with_timeout` does not use its
    timeout.
 
+The bound is about 25.2 s from the signal: 22 s, 0.2 s for the last holder,
+and 2 s of telemetry. The last coalesced flush and redb's close are outside
+it, and a 30 s grace leaves them the difference. A panic out of `node::run`
+loses the engine with the future that held it; `main` still bounds the
+runtime's shutdown, then lets the panic go on: exit 101 and no marker.
+
 Any other ending writes the new marker, `storage_not_closed`, with the reason
 as `cause`: the engine still held at the deadline, a write still open at the
 cap (which used to leave no marker), or a close that did not record. It logs

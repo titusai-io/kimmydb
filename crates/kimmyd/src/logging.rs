@@ -1321,6 +1321,9 @@ impl TelemetryGuard {
                 drop(self);
                 let _ = done.send(());
             });
+        // A thread that cannot be spawned drops the closure, and with it the
+        // guard, here: the flush then runs unbounded on this thread. Left so,
+        // since a process that cannot start a thread is failing already.
         if flushing.is_ok() && finished.recv_timeout(within).is_err() {
             tracing::warn!(
                 within_ms = within.as_millis() as u64,
