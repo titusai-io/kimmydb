@@ -18,6 +18,8 @@
 
 use redb::{ReadTransaction, ReadableDatabase, WriteTransaction};
 
+use tracing::warn;
+
 use crate::error::Result;
 use crate::tables;
 
@@ -75,16 +77,35 @@ fn decode(raw: &[u8], schema: u8) -> Option<VerifiedWalk> {
 
 /// The record, read inside `txn`, if it counts for `schema`.
 ///
-/// Never fails for a missing table: the table is created with the others at
-/// open, and a store an older build wrote has none until then, which is no
-/// record. A storage error is still an error, as it is on every other read.
+/// **Never fails.** A missing table is no record: the table is created with the
+/// others at open, and a store an older build wrote has none until then. Any
+/// other error reading it is no record too, logged: the record only ever lets
+/// an open skip work, so an open that cannot read it walks, which is always
+/// correct, rather than refusing to start over a table that exists to save
+/// time.
 pub(crate) fn read(txn: &ReadTransaction, schema: u8) -> Result<Option<VerifiedWalk>> {
+    let unreadable = |error: &dyn std::fmt::Display| {
+        warn!(
+            %error,
+            "could not read the record that the version vector is verified; the open walks \
+             the oplog instead"
+        );
+    };
     let table = match txn.open_table(tables::VECTOR_VERIFIED) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            unreadable(&e);
+            return Ok(None);
+        }
     };
-    Ok(table.get(KEY)?.and_then(|raw| decode(raw.value(), schema)))
+    match table.get(KEY) {
+        Ok(raw) => Ok(raw.and_then(|raw| decode(raw.value(), schema))),
+        Err(e) => {
+            unreadable(&e);
+            Ok(None)
+        }
+    }
 }
 
 /// [`read`] on a database, in a transaction of its own.
@@ -108,6 +129,22 @@ pub(crate) fn forced() -> bool {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_BEFORE_THE_RAISE_COMMITS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fail the next open's walk on this thread just before the transaction
+    /// carrying its raise commits.
+    pub(crate) fn fail_before_the_raise_commits() {
+        FAIL_BEFORE_THE_RAISE_COMMITS.with(|f| f.set(true));
+    }
+
+    pub(crate) fn fails_before_the_raise_commits() -> bool {
+        FAIL_BEFORE_THE_RAISE_COMMITS.with(|f| f.replace(false))
+    }
+
     /// Write raw bytes as the record, for the tests of what does not count.
     pub(crate) fn write_raw(db: &redb::Database, raw: &[u8]) {
         let txn = db.begin_write().unwrap();
@@ -423,6 +460,53 @@ mod tests {
         assert!(!skipped.contains("checked the version vector"), "{skipped}");
     }
 
+    /// A record that cannot be read is no record, not a failed open: here a
+    /// table of the name with other types, read directly, since the open's
+    /// ensure-tables step would refuse it first (and is why the types must
+    /// never change, `tables::VECTOR_VERIFIED`).
+    #[test]
+    fn an_unreadable_record_is_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("raw.redb")).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let other: redb::TableDefinition<u64, u64> =
+                redb::TableDefinition::new("vector_verified");
+            txn.open_table(other).unwrap().insert(1, 2).unwrap();
+            txn.commit().unwrap();
+        }
+        let logged = logs_of(|| {
+            assert_eq!(read_db(&db, crate::migrate::SCHEMA_VERSION).unwrap(), None);
+        });
+        assert!(logged.contains("could not read the record"), "{logged}");
+    }
+
+    /// The record and the raise it describes land together or not at all: a
+    /// record committed ahead of its raise would stand over a vector the walk
+    /// had not yet raised, and a crash between the two would leave it there.
+    #[test]
+    fn the_record_cannot_land_without_its_raise() {
+        let (_dir, path, vector) = store(3);
+        raw(&path, |txn| {
+            wipe_vector(txn);
+            txn.delete_table(tables::VECTOR_VERIFIED).unwrap();
+        });
+        test_support::fail_before_the_raise_commits();
+        assert!(Engine::open(&path).is_err(), "the injected failure fails the open");
+        assert_eq!(record_of(&path), None, "no record landed");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_read().unwrap();
+            assert!(
+                txn.open_table(tables::OPLOG_VERSIONS).unwrap().is_empty().unwrap(),
+                "no raise landed"
+            );
+        }
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(engine.version_vector().unwrap(), vector, "the next open walks and raises");
+        assert!(engine.version_vector_verified().unwrap().is_some());
+    }
+
     // --- the break: a writer that does not keep I, with the record present ---
 
     /// An entry appended without raising the vector or marking it held, as a
@@ -493,6 +577,8 @@ mod tests {
         Restore,
         /// A record from before a schema raise: the next open must walk.
         StaleSchema,
+        /// A record under another `I_EPOCH`: the next open must walk.
+        OtherEpoch,
         /// A store from before the vector was kept: no record, and an entry
         /// above the vector, unmarked.
         PreVector {
@@ -514,6 +600,7 @@ mod tests {
             1 => any::<usize>().prop_map(Op::Rewind),
             1 => Just(Op::Restore),
             1 => Just(Op::StaleSchema),
+            1 => Just(Op::OtherEpoch),
             1 => (0usize..3, 1u64..60).prop_map(|(origin, wall)| Op::PreVector { origin, wall }),
             2 => Just(Op::Reopen),
         ]
@@ -649,6 +736,21 @@ mod tests {
                     drop(db);
                     self.open();
                 }
+                Op::OtherEpoch => {
+                    self.close();
+                    let mut other = test_support::encode(
+                        crate::migrate::SCHEMA_VERSION,
+                        &VerifiedWalk::default(),
+                    );
+                    other[0] = I_EPOCH.wrapping_add(1);
+                    let db = redb::Database::create(&self.path).unwrap();
+                    test_support::write_raw(&db, &other);
+                    drop(db);
+                    self.open();
+                    // It walked and rewrote the record: a record counts only
+                    // under this build's epoch.
+                    assert!(self.engine().version_vector_verified().unwrap().is_some());
+                }
                 Op::PreVector { origin, wall } => {
                     // A store from before the vector was kept has no record.
                     self.close();
@@ -716,29 +818,34 @@ mod tests {
     // --- (e) the guard ---
 
     /// Tables whose writers invariant I depends on.
-    const WATCHED: [&str; 5] = [
-        "tables::OPLOG)",
-        "tables::OPLOG_VERSIONS)",
-        "tables::OPLOG_HELD)",
-        "tables::OPLOG_WITNESSED)",
-        // `raise_version`'s parameter.
-        "open_table(table)",
+    const WATCHED: [&str; 4] = [
+        "tables::OPLOG",
+        "tables::OPLOG_VERSIONS",
+        "tables::OPLOG_HELD",
+        "tables::OPLOG_WITNESSED",
     ];
 
-    /// Files every one of whose writers is audited for I, and the functions
-    /// in the others that are.
-    const AUDITED_FILES: [&str; 4] = ["gc.rs", "rewind.rs", "backup.rs", "faults.rs"];
-    const AUDITED_FNS: [(&str, &str); 7] = [
+    /// What may be called on a watched table without changing it.
+    const READERS: [&str; 7] = ["get", "iter", "range", "len", "is_empty", "first", "last"];
+
+    /// The writers audited for I, as (file, function). `faults.rs` is test
+    /// and `test-hooks` code as a whole, so it is exempt as a file.
+    const AUDITED_FILES: [&str; 1] = ["faults.rs"];
+    const AUDITED_FNS: [(&str, &str); 10] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "raise_version"),
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
         ("engine.rs", "reset_version_vector_to_oplog"),
+        ("gc.rs", "remove_oplog_entries"),
+        ("rewind.rs", "rewind_to"),
+        ("backup.rs", "restore_with"),
         ("migrate.rs", "rewrite_oplog"),
     ];
 
-    /// `body` with its `#[cfg(test)]` modules removed.
+    /// `body` with its `#[cfg(test)]` modules blanked, line for line, so the
+    /// line numbers reported are the file's.
     fn without_test_modules(body: &str) -> String {
         let lines: Vec<&str> = body.lines().collect();
         let mut out = String::new();
@@ -749,10 +856,12 @@ mod tests {
                 && next.ends_with('{');
             if lines[i].trim() == "#[cfg(test)]" && opens_a_module {
                 let mut depth = 0i64;
+                out.push('\n');
                 i += 1;
                 loop {
                     depth += lines[i].matches('{').count() as i64;
                     depth -= lines[i].matches('}').count() as i64;
+                    out.push('\n');
                     i += 1;
                     if depth <= 0 || i >= lines.len() {
                         break;
@@ -767,16 +876,142 @@ mod tests {
         out
     }
 
-    /// The function a line is in, from the last `fn` declared above it.
+    /// The name a function declaration on this line gives, for any
+    /// visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`) and any of
+    /// `const`, `async`, `unsafe` and `extern "…"` before `fn`.
     fn fn_name(line: &str) -> Option<String> {
-        let t = line.trim_start();
-        let rest = ["pub(crate) fn ", "pub fn ", "fn ", "pub(crate) async fn ", "async fn "]
-            .iter()
-            .find_map(|p| t.strip_prefix(p))?;
-        Some(rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect())
+        let mut rest = line.trim_start();
+        if let Some(after) = rest.strip_prefix("pub") {
+            rest = after.trim_start();
+            if rest.starts_with('(') {
+                rest = rest[rest.find(')')? + 1..].trim_start();
+            }
+        }
+        loop {
+            let before = rest;
+            for qualifier in ["const ", "async ", "unsafe ", "default "] {
+                if let Some(after) = rest.strip_prefix(qualifier) {
+                    rest = after.trim_start();
+                }
+            }
+            if let Some(after) = rest.strip_prefix("extern ") {
+                rest = after.trim_start();
+                if rest.starts_with('"') {
+                    rest = rest[1..][rest[1..].find('"')? + 1..].trim_start();
+                }
+            }
+            if rest == before {
+                break;
+            }
+        }
+        let name: String = rest
+            .strip_prefix("fn ")?
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
     }
 
-    /// Lines outside the audited writers that can change a watched table.
+    /// The statements of `body`, each with the line it starts on: lines
+    /// joined until one ends a statement or opens or closes a block, so a
+    /// call rustfmt wrapped across lines is read whole.
+    fn statements(body: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut first = 0;
+        for (n, line) in body.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("").trim();
+            if code.is_empty() {
+                continue;
+            }
+            // An attribute is a statement of its own, so the declaration it
+            // sits on is read from its own first line.
+            if code.starts_with("#[") && current.is_empty() {
+                out.push((n + 1, code.to_string()));
+                continue;
+            }
+            if current.is_empty() {
+                first = n + 1;
+            }
+            current.push_str(code);
+            current.push(' ');
+            if code.ends_with(';') || code.ends_with('{') || code.ends_with('}') {
+                out.push((first, std::mem::take(&mut current)));
+            }
+        }
+        if !current.is_empty() {
+            out.push((first, current));
+        }
+        out
+    }
+
+    /// Whether `statement` can change a watched table: `delete_table` of
+    /// one, a mutable binding, a borrow `&mut`, or any method but a reader
+    /// called on one; and the same for a table opened through a variable
+    /// (a helper handed the definition under any name), since that can be
+    /// any of them.
+    fn changes_a_watched_table(statement: &str) -> bool {
+        let compact: String = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+        if WATCHED.iter().any(|t| compact.contains(&format!("delete_table({t})")))
+            || (compact.contains("delete_table(") && compact.contains("::OPLOG"))
+        {
+            return true;
+        }
+        if compact.contains(".insert_reserve(") {
+            return true;
+        }
+        let mut at = 0;
+        while let Some(found) = compact[at..].find("open_table(") {
+            let open = at + found;
+            let arg_start = open + "open_table(".len();
+            let Some(close) = compact[arg_start..].find(')') else { break };
+            let arg = compact[arg_start..arg_start + close].trim();
+            at = arg_start + close + 1;
+            // A watched table under any path (`tables::OPLOG`,
+            // `crate::tables::OPLOG`), or a variable: a parameter or a local,
+            // lowercase, which can be any of them. A constant is uppercase.
+            let last = arg.rsplit("::").next().unwrap_or(arg);
+            let named = WATCHED.iter().any(|t| t.rsplit("::").next() == Some(last));
+            let variable = last.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+            if !(named || variable) {
+                continue;
+            }
+            let before = &compact[..open];
+            let bound_mut = before
+                .rfind("let ")
+                .is_some_and(|l| before[l..].starts_with("let mut ") && !before[l..].contains(';'));
+            let borrowed_mut = before.trim_end().ends_with("&mut txn.")
+                || before.trim_end().ends_with("&mut self.")
+                || before.trim_end().ends_with("&mut");
+            // The first method called on the table itself, past `?`,
+            // `.unwrap()` and `.expect(…)`.
+            let mut tail = compact[at..].trim_start();
+            loop {
+                if let Some(rest) = tail.strip_prefix('?') {
+                    tail = rest.trim_start();
+                } else if let Some(rest) = tail.strip_prefix(".unwrap()") {
+                    tail = rest.trim_start();
+                } else if tail.starts_with(".expect(") {
+                    tail = tail[tail.find(')').map_or(tail.len(), |i| i + 1)..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            let method: String = tail
+                .strip_prefix('.')
+                .map(|m| m.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect())
+                .unwrap_or_default();
+            let mutates = !method.is_empty() && !READERS.contains(&method.as_str());
+            if bound_mut || borrowed_mut || mutates {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Statements outside the audited writers that can change a watched
+    /// table.
     fn offenders_in(dir: &Path) -> Vec<String> {
         let mut found = Vec::new();
         let mut paths: Vec<_> =
@@ -790,22 +1025,16 @@ mod tests {
             }
             let body = without_test_modules(&std::fs::read_to_string(&path).unwrap());
             let mut current = String::new();
-            for (n, line) in body.lines().enumerate() {
-                if let Some(f) = fn_name(line) {
+            for (line, statement) in statements(&body) {
+                if let Some(f) = fn_name(&statement) {
                     current = f;
                 }
-                let watched = WATCHED.iter().any(|w| line.contains(w));
-                if !watched {
+                if !changes_a_watched_table(&statement) {
                     continue;
                 }
-                let changes = line.contains("delete_table(")
-                    || (line.contains("open_table(") && line.contains("let mut "))
-                    || [".insert(", ".remove(", ".retain", ".pop_", ".drain", ".extract"]
-                        .iter()
-                        .any(|m| line.contains(m));
                 let audited = AUDITED_FNS.iter().any(|(f, func)| *f == name && *func == current);
-                if changes && !audited {
-                    found.push(format!("{name}:{} in {current}: {}", n + 1, line.trim()));
+                if !audited {
+                    found.push(format!("{name}:{line} in {current}: {}", statement.trim()));
                 }
             }
         }
@@ -827,26 +1056,89 @@ mod tests {
         );
     }
 
-    /// The guard's own mutant: a new writer of the vector, and an audited
-    /// function's name in a file it is not audited in, are both found.
+    /// The guard's own mutants, each a shape a new writer could take, and one
+    /// shape that is not a writer.
     #[test]
     fn the_guard_finds_a_new_writer() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("mutant.rs"),
-            "fn sneak(txn: &WriteTxn) -> Result<()> {\n    \
-             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;\n    \
-             versions.remove(key)?;\n    Ok(())\n}\n\n\
-             fn append_oplog_at(txn: &WriteTxn) {\n    \
-             txn.open_table(tables::OPLOG_HELD).unwrap().insert(k, ()).unwrap();\n}\n\n\
-             #[cfg(test)]\nmod tests {\n    fn t() {\n        \
-             let mut oplog = txn.open_table(tables::OPLOG).unwrap();\n    }\n}\n",
+            r#"fn sneak(txn: &WriteTxn) -> Result<()> {
+    let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+    versions.remove(key)?;
+    Ok(())
+}
+
+fn append_oplog_at(txn: &WriteTxn) {
+    txn.open_table(tables::OPLOG_HELD).unwrap().insert(k, ()).unwrap();
+}
+
+pub(super) fn after_the_release(txn: &WriteTxn) {
+    txn.open_table(tables::OPLOG_WITNESSED)?.retain(|_, _| false)?;
+}
+
+#[allow(dead_code)]
+pub(crate) async fn wrapped(txn: &WriteTxn) -> Result<()> {
+    let mut oplog =
+        txn.open_table(tables::OPLOG)?;
+    oplog.insert(k, v)?;
+    Ok(())
+}
+
+fn helper(txn: &WriteTxn, def: TableDefinition<&[u8], &[u8]>) {
+    txn.open_table(def)
+        .unwrap()
+        .pop_first()
+        .unwrap();
+}
+
+fn reader(txn: &ReadTxn) -> Result<u64> {
+    let oplog = txn.open_table(tables::OPLOG)?;
+    Ok(txn.open_table(tables::OPLOG_HELD)?.len()?)
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let mut oplog = txn.open_table(tables::OPLOG).unwrap();
+    }
+}
+"#,
         )
         .unwrap();
         let found = offenders_in(dir.path());
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert!(found[0].contains("in sneak"), "{found:?}");
-        assert!(found[1].contains("in append_oplog_at"), "not audited outside engine.rs");
+        let in_ = |f: &str| found.iter().any(|o| o.contains(&format!(" in {f}:")));
+        assert!(in_("sneak"), "a mutable binding: {found:?}");
+        assert!(in_("append_oplog_at"), "an audited name, but not in engine.rs: {found:?}");
+        assert!(in_("after_the_release"), "a pub(super) fn (g1): {found:?}");
+        assert!(
+            in_("wrapped"),
+            "a `let mut` rustfmt wrapped (g2), in a pub(crate) async fn: {found:?}"
+        );
+        assert!(in_("helper"), "a table handed in under another name: {found:?}");
+        assert!(!in_("reader"), "readers are not writers: {found:?}");
+        assert!(!in_("t"), "a test module is not read: {found:?}");
+        assert_eq!(found.len(), 5, "{found:?}");
+        // Reported at the file's own line numbers.
+        assert!(found.iter().any(|o| o.starts_with("mutant.rs:2 in sneak")), "{found:?}");
+    }
+
+    #[test]
+    fn the_guard_reads_every_kind_of_function_header() {
+        for (line, name) in [
+            ("fn a() {", "a"),
+            ("    pub fn b(x: u8) {", "b"),
+            ("pub(crate) fn c<T>() {", "c"),
+            ("pub(super) fn d() {", "d"),
+            ("pub(in crate::x) async fn e() {", "e"),
+            ("const fn f() -> u8 {", "f"),
+            ("pub unsafe fn g() {", "g"),
+            ("pub(crate) const unsafe fn h() {", "h"),
+            ("extern \"C\" fn i() {", "i"),
+        ] {
+            assert_eq!(fn_name(line).as_deref(), Some(name), "{line}");
+        }
+        assert_eq!(fn_name("let f = fn_pointer;"), None);
     }
 
     /// No backup carries the record: the tables a backup writes are the ones

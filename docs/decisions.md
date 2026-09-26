@@ -16623,14 +16623,20 @@ store keeps I.
 - **Which builds can open it:** 0.34.0, 0.34.1 and 0.35.0 open a current store
   read-write, unprotected by ADR-190. 0.36.x refuses it. 0.37.0–0.39.0 open it
   too.
-- **Their writers are byte-identical to this build's**, from 0.34.0 on:
-  `append_oplog_at`, `raise_version`, `release_held_in_position`,
-  `absorb_version_vector_in_txn`, `release_held_under`, `relog`,
-  `reset_version_vector_to_oplog` and `rebuild_version_vector_if_stale`.
+- **Their writers do the same to `OPLOG`, the two vectors and `OPLOG_HELD`
+  as this build's**, from 0.34.0 on: `append_oplog_at`, `raise_version`,
+  `release_held_in_position`, `absorb_version_vector_in_txn`,
+  `release_held_under` and `relog` are byte-identical. `reset_version_vector_to_oplog`
+  and `rebuild_version_vector_if_stale` differ only in also writing the record,
+  which an older build does not do.
 - **They do not touch a table they do not know**, so a rollback to any of them
   and a roll forward leave the record true.
 - **A migration** changes the schema, so the record stops counting and the
   next open walks.
+- **Which starts walk:** the first of this release, and of any later one that
+  raises the schema or `I_EPOCH`; the first after a restore; and every start of
+  a release before this one, which reads no record. A rollback to 0.39 or
+  earlier therefore walks at every start, as those releases did.
 
 **The `I_EPOCH` rule.**
 - A change that only **weakens** what the vector must cover may keep the epoch.
@@ -16646,10 +16652,22 @@ apply.
 
 **Guards and tests**, in `kimmy-storage`'s `verified.rs`:
 - **`every_writer_of_the_invariants_tables_is_an_audited_one`** fails on any
-  insert, remove, retain, pop, drain, extract, mutable open or `delete_table` of
-  the oplog, either vector or the marks outside the audited writers, with "keep
-  invariant I or bump I_EPOCH with a rollback boundary".
-  `the_guard_finds_a_new_writer` is its mutant.
+  change to the oplog, either vector or the marks outside the audited writers,
+  with "keep invariant I or bump I_EPOCH with a rollback boundary".
+  - **What counts as a change:** a mutable binding or `&mut` borrow of the
+    table, any method on it but a reader (`get`, `iter`, `range`, `len`,
+    `is_empty`, `first`, `last`), `insert_reserve`, or `delete_table`. The same
+    holds for a table opened through a lowercase variable, since a helper can be
+    handed any of them.
+  - **How it reads the source:** statements are read whole across wrapped lines.
+    The enclosing function is found under any visibility and any `const`,
+    `async`, `unsafe` or `extern`.
+  - **The audited writers** are (file, function) pairs: the engine's six, gc's
+    `remove_oplog_entries`, `rewind_to`, `restore_with` and migrate's
+    `rewrite_oplog`. `faults.rs`, test code, is exempt as a file.
+  - **Its mutants:** `the_guard_finds_a_new_writer` covers a `pub(super)`
+    writer, a wrapped `let mut`, a renamed table parameter and an audited name
+    outside its file.
 - **`skipping_the_walk_gives_the_vector_walking_gives`** is a property test. It
   builds stores through remote appends under each position, releases, absorbs,
   orphaned marks, retention, rewinds, restores, stale-schema records and
@@ -16661,8 +16679,12 @@ apply.
   - In a release build, a skipping open read 69,961 bytes at every oplog size
     tried. A walking one read the oplog: 0.76, 4.2 and 8.4 MB for 500, 3,000 and
     6,000 documents.
-  - It runs in CI's release job. In a debug build, redb's own open reads every
-    allocated page (`mark_allocated_page_for_debug`), whatever this code does.
+  - It runs in CI's release job, which also checks that exactly one test ran
+    and passed. In a debug build, redb's own open reads every allocated page
+    (`mark_allocated_page_for_debug`), whatever this code does.
+- **`the_record_cannot_land_without_its_raise`** fails the walk's transaction
+  just before it commits, and checks that neither the record nor the raise
+  landed.
 
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 

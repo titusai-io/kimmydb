@@ -236,6 +236,13 @@ pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_h
 /// Counted only under this build's epoch and the store's schema. Its own table
 /// rather than a `META` key because no build's backup carries a table it does
 /// not list, so a restore, which can leave I broken, never carries it.
+///
+/// **Its redb key and value types must never change.** `Engine::open` opens it
+/// with the others in its ensure-tables step, and redb refuses a table opened
+/// under other types, so a change would stop every store that has the table
+/// from opening. Version what it holds through `I_EPOCH` or the value's length
+/// instead: a value of any other length is no record, and the open walks. A
+/// read that fails for any other reason is no record too, logged.
 pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("vector_verified");
 
 /// `peer node id (16 bytes) -> the snapshot pull left to resume with it`.

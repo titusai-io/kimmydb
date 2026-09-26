@@ -1986,6 +1986,14 @@ impl Engine {
             }
         }
         crate::verified::write(&txn, schema, &walk)?;
+        // A failure before the raise commits, for the test that the record
+        // cannot land without the raise it describes.
+        #[cfg(test)]
+        if crate::verified::test_support::fails_before_the_raise_commits() {
+            return Err(StorageError::Database(
+                "a failure injected before the raise commits".into(),
+            ));
+        }
         txn.commit()?;
 
         if raised {

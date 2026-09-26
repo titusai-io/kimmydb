@@ -32,9 +32,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **A restart no longer reads the whole oplog.** Every start walked every
   retained oplog entry to check the version vector. Cold, that took about 30 s
   per GB of oplog read on the lab host, and 16–52 s on the round 0420 members.
-  A start now records that the vector is verified and later starts skip the
-  walk, so it runs once: at the first start after an upgrade, a restore or a
-  migration. Each start logs which it did. New gauges: `kimmy_oplog_entries`,
+  A start now records that the vector is verified, and later starts skip the
+  walk. It still runs at the first start of this release, and of a later one
+  that raises the schema or `I_EPOCH`, and at the first start after a restore.
+  A release before this one reads no record, so after a rollback to 0.39 or
+  earlier every start walks, as it always did. Each start logs which it did. New gauges: `kimmy_oplog_entries`,
   and `kimmy_oplog_verified_entries`, `_logical_bytes` and `_walk_seconds`,
   which describe the last walk. `KIMMY_VERIFY_OPLOG_AT_OPEN=1` forces the walk.
   Rolling back is unaffected: 0.34.0–0.35.0 and 0.37.0–0.39.0 keep the vector
