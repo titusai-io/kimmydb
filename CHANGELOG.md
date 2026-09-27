@@ -66,6 +66,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     `unauthenticated` may now fire during a roll.
   - A peer that completes TLS and hangs up before saying anything is logged
     at `DEBUG` as `peer disconnected`, not counted.
+- **`unsupported operator "…"` quotes the operator, and the reason follows
+  it.** A partial index's filter refused `$or` as `unsupported operator "$or
+  cannot appear in a partialFilterExpression: …"`: a sentence where the
+  template, as the query language documents it, puts an operator for a client
+  to match or log. It is now `unsupported operator "$or": it cannot appear in
+  a partialFilterExpression: …`, and the same holds for the filter's other
+  refused operators, an unknown expression operator (`"$toDecimal": not an
+  expression operator`) and a system variable (`"$$NOW": …`). Two refusals
+  that were never about an operator, a `Decimal128` index key or `_id` and a
+  `$dateToString` specifier, are `invalid query: …` instead. Every one is
+  still a `400 bad_request`, retry `no`.
 
 ## 0.40.2 - 2026-09-27
 
