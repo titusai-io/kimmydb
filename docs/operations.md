@@ -1491,7 +1491,7 @@ rather than silently inert:
 | `protocol` | `KIMMY_OTLP_PROTOCOL` | `http/protobuf` | Or `http/json`. **No gRPC** ([ADR-069](decisions.md)) |
 | `sample_ratio` | `KIMMY_OTLP_SAMPLE_RATIO` | `1.0` | Parent-based; `0.0` is refused rather than treated as off |
 | `include_names` | `KIMMY_TELEMETRY_INCLUDE_NAMES` | `false` | See below and [Security](security.md) |
-| `service_name` | `KIMMY_OTLP_SERVICE_NAME` | `kimmydb` | One name for the deployment, not one per node |
+| `service_name` | `KIMMY_OTLP_SERVICE_NAME` | `kimmydb` | One name for the deployment, not one per node. Nodes are told apart by `service.instance.id`, a random UUID per process that changes at every restart; the start logs it beside the node id as `telemetry instance` |
 | `export_timeout_secs` | — | `10` | Bounds an exporter thread, never a request |
 
 **Plaintext only, and refused rather than silently broken.** The exporter is
@@ -1505,6 +1505,21 @@ processor on its own threads, exports are bounded by `export_timeout_secs`, and
 nothing on the request path waits for either. A node configured against a dead
 port serves at unchanged latency and keeps serving — verified, not asserted;
 the numbers are in [Benchmarks](benchmarks.md).
+
+**A failed export is retried.** One that cannot connect, or that the collector
+answers 429, 502, 503 or 504, is tried again up to three more times, with
+backoff, and a `Retry-After` on a 429 or 503 is honoured. A retry starts only
+while time is left in `export_timeout_secs`, and a `Retry-After` that would
+run past it ends the export instead; but each attempt may itself take the
+whole of it, so one export against a slow collector can take up to about twice
+`export_timeout_secs` (20 s at the default), on an exporter thread. Each failed
+export logs its retries at `WARN` on the `opentelemetry` target
+(`Export.Failed.*`), and a throttled one at `INFO`. **The stop is bounded
+regardless:** the exporters get two seconds between them on the way out, on a
+thread of their own, and are abandoned after that. A collector that refuses
+connections now uses most of those two seconds where it used to fail at once,
+and one that throttles with a short `Retry-After` all of them, when the node
+logs that it exited without the last spans and metrics.
 
 #### What you get
 

@@ -1030,11 +1030,16 @@ pub struct TelemetryConfig {
     pub include_names: bool,
     /// What `service.name` this node reports itself as.
     ///
-    /// One name for the whole deployment, not one per node — the node is
-    /// distinguished by `service.instance.id`, and a per-node service name
-    /// makes a three-node cluster look like three unrelated systems.
+    /// One name for the whole deployment, not one per node: a per-node
+    /// service name makes a three-node cluster look like three unrelated
+    /// systems. A node is told apart by `service.instance.id`, a random UUID
+    /// for each process, which changes at every restart. It is not the node
+    /// id; the start logs the two together (`telemetry instance`).
     pub service_name: String,
-    /// How long one export may take before it is abandoned.
+    /// The time an export has for its attempts. A retry starts only while
+    /// some is left, but an attempt may itself take all of it, so one export
+    /// against a slow collector can take up to about twice this. On an
+    /// exporter thread either way, never a request.
     pub export_timeout_secs: u64,
 }
 
