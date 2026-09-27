@@ -10,7 +10,16 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.40.2 - 2026-09-27
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the schema is still 4 and redb still 4.3, so 0.40.1, 0.40.0 and 0.39.0 open a
+store 0.40.2 has run on. A stop no longer logs a panic when a replication
+round is mid-apply: the node now waits for its tasks to end before it shuts
+its runtime down, within the stop's unchanged bound. Plain HTTP now ends its
+drain at the 10 s deadline as TLS does, a listener that cannot accept a
+connection logs it on both, and the start that skips the oplog walk adds
+`oplog_entries`, what the oplog holds now.**
 
 ### Fixed
 
