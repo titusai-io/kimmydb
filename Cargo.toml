@@ -179,7 +179,7 @@ mimalloc = "0.1"
 # JWKS refresh counters exist for. The events go to the `opentelemetry` target
 # and are raised from the exporter's own threads, where no span is open, so
 # they reach the log and cannot feed back into the exporter.
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "internal-logs"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
 opentelemetry-semantic-conventions = "0.32"
