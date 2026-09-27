@@ -1563,6 +1563,18 @@ impl Engine {
         self.walks_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Lift both stops, and the stops armed to come after so many rows: for a
+    /// test that stops the same engine's walks again at another row. No
+    /// engine that serves is ever un-stopped.
+    #[cfg(test)]
+    pub(crate) fn lift_stops_for_test(&self) {
+        use std::sync::atomic::Ordering;
+        self.walks_stopping.store(false, Ordering::SeqCst);
+        self.stopping.store(false, Ordering::SeqCst);
+        self.stop_after_rows.store(0, Ordering::SeqCst);
+        self.stopping_after_rows.store(0, Ordering::SeqCst);
+    }
+
     /// `KIMMY_TEST_STOP=panic_in_write`: open a write transaction and panic
     /// inside it. redb drops its transaction while unwinding and latches a
     /// need for repair, which a clean close then refuses to record. In the

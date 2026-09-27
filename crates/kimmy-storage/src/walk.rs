@@ -337,6 +337,72 @@ pub(crate) fn open_walk_table_in<'t, 'e, K: Key + 'static, V: Value + 'static>(
     Ok(WalkTable { table: txn.open_table(table)?, walk })
 }
 
+/// Test support: a walk stopped at each row it checks.
+#[cfg(test)]
+pub(crate) mod every_row {
+    use super::*;
+
+    /// What `f` answers, and how many rows the stop-aware walks of `engine`
+    /// check while it runs.
+    pub(crate) fn rows_checked<T>(engine: &Engine, f: impl FnOnce() -> T) -> (T, u64) {
+        use std::sync::atomic::Ordering;
+        engine.lift_stops_for_test();
+        engine.stop_after_rows.store(u64::MAX, Ordering::SeqCst);
+        let out = f();
+        let left = engine.stop_after_rows.swap(0, Ordering::SeqCst);
+        (out, u64::MAX - left)
+    }
+
+    /// Run `walk` once unstopped, to count the rows it checks; then stop it,
+    /// in `scope`'s way, at each of those rows, first to last, and hold it to
+    /// answering `Stopping` every time. The rows it returns.
+    ///
+    /// A walk that `writes` gets a new `fixture` for each stop, since a
+    /// finished write changes what the next run reads; the rest share one.
+    /// The count is exact, not a bound: a run checks the same rows each time,
+    /// so every stop is reached, and a stop that was not says so.
+    pub(crate) fn assert_stops_at_every_row<F, T: std::fmt::Debug>(
+        name: &str,
+        scope: WalkScope,
+        writes: bool,
+        fixture: impl Fn() -> F,
+        engine_of: impl Fn(&F) -> &Engine,
+        walk: impl Fn(&F) -> Result<T>,
+    ) -> u64 {
+        let counting = fixture();
+        let (answer, rows) = rows_checked(engine_of(&counting), || walk(&counting));
+        assert!(answer.is_ok(), "{name} ({scope:?}) unstopped: {answer:?}");
+        for row in 1..=rows {
+            let own;
+            let f = match writes {
+                true => {
+                    own = fixture();
+                    &own
+                }
+                false => &counting,
+            };
+            let engine = engine_of(f);
+            engine.lift_stops_for_test();
+            match scope {
+                WalkScope::Background => engine.stop_walks_after_rows(row),
+                WalkScope::Request => engine.set_stopping_after_rows(row),
+            }
+            let answer = walk(f);
+            let stopped = match scope {
+                WalkScope::Background => engine.walks_stopping(),
+                WalkScope::Request => engine.is_stopping(),
+            };
+            assert!(stopped, "{name} ({scope:?}) never reached row {row} of {rows}: {answer:?}");
+            assert!(
+                matches!(answer, Err(StorageError::Stopping(_))),
+                "{name} ({scope:?}) stopped at row {row} of {rows} and answered {answer:?}"
+            );
+            engine.lift_stops_for_test();
+        }
+        rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,19 +516,64 @@ mod tests {
         assert!(rows.next().is_none(), "one error, then the end");
     }
 
-    /// Every public walk that stops, called once its scope's stop has come:
-    /// each answers `Stopping`, rather than a partial answer. A walk that
-    /// is stop-aware in its tables but ended some other way on the stop, or
-    /// swallowed the error, fails here whatever the source looks like.
+    /// Every public walk that stops, stopped at each row it checks, first to
+    /// last: each answers `Stopping`, rather than a partial answer. A walk
+    /// that is stop-aware in its tables but ended some other way on the stop,
+    /// or swallowed the error and answered what it had read so far, fails
+    /// here whatever the source looks like. Every row, not a sample: a call
+    /// made of several walks, such as retention's oplog and then its
+    /// tombstones, or a candidate scan's sentinel seeks and then its runs,
+    /// is stopped inside each of them.
     #[test]
-    fn every_stop_aware_walk_answers_stopping_once_its_stop_has_come() {
+    fn every_stop_aware_walk_answers_stopping_at_every_row_it_reads() {
+        type Fixture = (Engine, crate::CollectionMeta, tempfile::TempDir);
         type Walk = fn(&Engine, &crate::CollectionMeta) -> Result<()>;
         // A peer's marks, as a snapshot leaves them, so the marks' walk has
         // rows to be stopped among.
         const HELD_ORIGIN: kimmy_core::NodeId = kimmy_core::NodeId::from_bytes([7; 16]);
-        let unique = |engine: &Engine| {
-            let field = crate::IndexField { path: "_id".into(), descending: false };
-            engine.create_index("shop", "orders", vec![field], true, Some("by_n".into())).unwrap();
+        // Documents, a unique index over them, a compound one that cannot key
+        // the documents with two arrays and a partial one that cannot decide
+        // those with a Decimal128 (ADR-185), deleted documents for
+        // retention's tombstones, and the marks.
+        let fixture = || -> Fixture {
+            let (engine, _, dir) = engine_with(10);
+            let orders = engine.get_collection("shop", "orders").unwrap();
+            for n in 10..13 {
+                engine.insert(&orders, doc! { "_id": n, "a": [1, 2], "b": [3, 4] }).unwrap();
+            }
+            for n in 13..16 {
+                let k = bson::Bson::Decimal128("1".parse().unwrap());
+                engine.insert(&orders, doc! { "_id": n, "k": k }).unwrap();
+            }
+            for n in [1, 4, 7] {
+                assert!(engine.delete(&orders, &kimmy_core::DocId::Int64(n)).unwrap());
+            }
+            let field = |path: &str| crate::IndexField { path: path.into(), descending: false };
+            engine
+                .create_index("shop", "orders", vec![field("_id")], true, Some("by_n".into()))
+                .unwrap();
+            engine
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![field("a"), field("b")],
+                    false,
+                    Some("ab".into()),
+                )
+                .unwrap();
+            // A partial filter a Decimal128 leaves undecided (ADR-185).
+            engine
+                .create_index_with(
+                    "shop",
+                    "orders",
+                    vec![field("_id")],
+                    false,
+                    Default::default(),
+                    Some("partial".into()),
+                    None,
+                    Some(doc! { "k": { "$gt": 5 } }),
+                )
+                .unwrap();
             let db = engine.db();
             let txn = db.begin_write().unwrap();
             {
@@ -473,7 +584,27 @@ mod tests {
                 }
             }
             txn.commit().unwrap();
+            let coll = engine.get_collection("shop", "orders").unwrap();
+            (engine, coll, dir)
         };
+        // Each order of a candidate scan, by the plan the planner makes.
+        fn candidates(
+            e: &Engine,
+            c: &crate::CollectionMeta,
+            filter: bson::Document,
+            order: crate::CandidateOrder<'_>,
+        ) -> Result<()> {
+            let filter = kimmy_query::filter::parse(&filter).unwrap();
+            let plan = kimmy_query::plan::choose(&filter, &c.indexes).expect("an index plan");
+            let scan = crate::IndexScan {
+                index_id: plan.index_id,
+                ranges: &plan.ranges,
+                both_bounds: plan.both_bounds,
+                exact: plan.exact,
+            };
+            e.visit_index_candidates(c, &scan, order, WalkScope::Request, |_, _, _| Ok(true))
+                .map(drop)
+        }
         let background: &[(&str, Walk)] = &[
             ("serve_entries_to_peer", |e, _| {
                 e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[]).map(drop)
@@ -515,51 +646,46 @@ mod tests {
                 let index = c.index("by_n").unwrap();
                 e.index_candidates(c, index.id, &[], &[0xFF; 8]).map(drop)
             }),
-            ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("by_n").unwrap().id).map(drop)),
+            ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("ab").unwrap().id).map(drop)),
             ("undecidable_count", |e, c| {
-                e.undecidable_count(c, c.index("by_n").unwrap().id).map(drop)
+                e.undecidable_count(c, c.index("partial").unwrap().id).map(drop)
+            }),
+            // The candidate walks: in index order, one exact run, exact runs
+            // merged, and an inexact range put in key order.
+            ("in_index_order", |e, c| {
+                candidates(e, c, doc! { "_id": { "$gte": 2 } }, crate::CandidateOrder::Any)
+            }),
+            ("one_run", |e, c| {
+                let by_id = crate::CandidateOrder::ById { after: None, want: None };
+                candidates(e, c, doc! { "_id": 3 }, by_id)
+            }),
+            ("merged_runs", |e, c| {
+                let by_id = crate::CandidateOrder::ById { after: None, want: None };
+                candidates(e, c, doc! { "_id": { "$in": [2, 5, 8] } }, by_id)
+            }),
+            ("in_key_order", |e, c| {
+                let by_id = crate::CandidateOrder::ById { after: None, want: None };
+                candidates(e, c, doc! { "_id": { "$gte": 2, "$lte": 9 } }, by_id)
             }),
             ("a client's index build", |e, _| {
                 let field = crate::IndexField { path: "m".into(), descending: false };
                 e.create_index("shop", "orders", vec![field], false, None).map(drop)
             }),
         ];
+        // The walks that write when they finish, so each stop needs a store
+        // the last run did not change.
+        let writes = ["collect_garbage", "a client's index build"];
         for (scope, walks) in [(WalkScope::Background, background), (WalkScope::Request, request)] {
             for (name, walk) in walks {
-                // Before the walk begins, and then part of the way through
-                // it: a walk that ends its loop on the stop and answers what
-                // it had is a short answer taken for a whole one, and only a
-                // stop in the middle shows it.
-                let mut midway = 0;
-                for rows in [0, 1, 2, 3, 5, 8] {
-                    let (engine, _coll, _dir) = engine_with(10);
-                    unique(&engine);
-                    let coll = engine.get_collection("shop", "orders").unwrap();
-                    let stopped = || match scope {
-                        WalkScope::Background => engine.walks_stopping(),
-                        WalkScope::Request => engine.is_stopping(),
-                    };
-                    match (scope, rows) {
-                        (WalkScope::Background, 0) => engine.stop_walks(),
-                        (WalkScope::Request, 0) => engine.set_stopping(),
-                        (WalkScope::Background, n) => engine.stop_walks_after_rows(n),
-                        (WalkScope::Request, n) => engine.set_stopping_after_rows(n),
-                    }
-                    let answer = walk(&engine, &coll);
-                    if !stopped() {
-                        // The walk read fewer rows than that, and finished.
-                        assert!(answer.is_ok(), "{name} ({scope:?}) at row {rows}: {answer:?}");
-                        continue;
-                    }
-                    midway += usize::from(rows > 0);
-                    assert!(
-                        matches!(answer, Err(StorageError::Stopping(_))),
-                        "{name} ({scope:?}) stopped at row {rows} and answered {answer:?}"
-                    );
-                }
-                // Every walk here reads rows: each is stopped in the middle at
-                // least once.
-                assert!(midway > 0, "{name} ({scope:?}) was never stopped mid-walk");
+                let rows = every_row::assert_stops_at_every_row(
+                    name,
+                    scope,
+                    writes.contains(name),
+                    fixture,
+                    |f| &f.0,
+                    |f| walk(&f.0, &f.1),
+                );
+                assert!(rows > 1, "{name} ({scope:?}) read {rows} rows: nothing to stop among");
             }
         }
     }

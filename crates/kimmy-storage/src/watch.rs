@@ -608,7 +608,7 @@ impl Engine {
                 };
                 out.push(codec::decode_oplog_entry(raw.value())?);
                 if out.len() >= limit {
-                    reached_tail = arrival.range(seq.value() + 1..)?.next().is_none();
+                    reached_tail = arrival.range(seq.value() + 1..)?.next().transpose()?.is_none();
                     break;
                 }
             }
@@ -1281,6 +1281,66 @@ mod tests {
         assert!(matches!(at, Err(StorageError::Stopping(_))), "{at:?}");
         let batch = engine.read_arrival_batch(0, 100);
         assert!(matches!(batch, Err(StorageError::Stopping(_))), "{batch:?}");
+    }
+
+    /// And each is stopped at every row it reads, not only before its first:
+    /// one that ended its loop on the stop would answer a position or a batch
+    /// from what it had read, and a stream would resume from there. The
+    /// resume's race stops inside both of its walks, its seek through the
+    /// marks and then the range, and a batch inside its look past the limit.
+    #[test]
+    fn a_resumes_walks_end_at_the_signal_on_every_row() {
+        type Fixture = (Engine, tempfile::TempDir, Stamp);
+        let fixture = || -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            for n in 0..12 {
+                engine.insert(&coll, bson::doc! { "_id": n }).unwrap();
+            }
+            // A peer's marks, for the seek's first phase.
+            let peer = NodeId::from_bytes([7; 16]);
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut held = txn.open_table(tables::OPLOG_HELD).unwrap();
+                for wall_ms in 1..=4 {
+                    let stamp = Stamp::new(Hlc::new(wall_ms, 0), peer);
+                    held.insert(codec::oplog_key(&stamp).as_slice(), ()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+            let entries =
+                engine.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Request).unwrap();
+            let middle = entries[entries.len() - 4].stamp;
+            (engine, dir, middle)
+        };
+        type Walk = fn(&Fixture) -> Result<()>;
+        let walks: &[(&str, Walk)] = &[
+            ("first_arrival_beyond", |(e, _, middle)| {
+                let delivered: VersionVector = [(middle.node, middle.hlc)].into_iter().collect();
+                e.first_arrival_beyond(&delivered, &mut Walked::default()).map(drop)
+            }),
+            ("first_arrival_at_or_after", |(e, _, middle)| {
+                e.first_arrival_at_or_after(middle.hlc, &mut Walked::default()).map(drop)
+            }),
+            ("first_arrival_stamped_after", |(e, _, middle)| {
+                e.first_arrival_stamped_after(0, *middle, &mut Walked::default()).map(drop)
+            }),
+            ("read_arrival_batch to the tail", |(e, _, _)| e.read_arrival_batch(0, 100).map(drop)),
+            ("read_arrival_batch short of it", |(e, _, _)| e.read_arrival_batch(0, 5).map(drop)),
+        ];
+        for (name, walk) in walks {
+            let rows = crate::walk::every_row::assert_stops_at_every_row(
+                name,
+                crate::WalkScope::Background,
+                false,
+                fixture,
+                |f| &f.0,
+                walk,
+            );
+            assert!(rows > 3, "{name} read {rows} rows: nothing to stop among");
+        }
     }
 
     /// Every invalidate reason's wire name, pinned where the choice is made.

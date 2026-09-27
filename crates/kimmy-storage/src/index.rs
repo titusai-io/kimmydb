@@ -759,9 +759,8 @@ where
     use std::ops::Bound;
     let start = Bound::Included((coll.0, index_id, key, [].as_slice()));
     let mut range = table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))?;
-    Ok(match range.next() {
-        Some(entry) => {
-            let (found, _) = entry?;
+    Ok(match range.next().transpose()? {
+        Some((found, _)) => {
             let (c, i, k, _) = found.value();
             c == coll.0 && i == index_id && k == key
         }
@@ -1512,6 +1511,8 @@ impl crate::Engine {
                     index.multikey = observed;
                     (violations, unkeyed, undecidable)
                 }
+                // The build's own answer, the stop's included, aborts the write.
+                // not a row: what the build returned, propagated just below.
                 Err(e) => {
                     txn.abort()?;
                     return Err(e);
@@ -2233,9 +2234,8 @@ where
         let ranges = self.ranges;
         let mut next = |i: usize, outcome: &mut IndexScanOutcome| -> Result<Option<Vec<u8>>> {
             let upper = ranges[i].1.as_slice();
-            match runs[i].next() {
-                Some(entry) => {
-                    let (found, _) = entry?;
+            match runs[i].next().transpose()? {
+                Some((found, _)) => {
                     let (c, ix, k, doc_key) = found.value();
                     if c != coll || ix != index_id || k > upper {
                         return Ok(None);
@@ -5149,6 +5149,101 @@ mod clearing {
             .expect("the clear re-read keys it could not remove, and never returned");
         let err = outcome.expect_err("a clear that removed nothing reports it");
         assert!(err.contains("clearing index entries"), "{err}");
+    }
+
+    /// With no way from a walk table to redb's own walks, the clear of a
+    /// superseded definition inside the winner's build reads through the
+    /// build's stop: a replicated build's, which ends at the signal. The
+    /// clear's rows are among those it checks, and wherever the stop lands,
+    /// in the clear or in the fill after it, the build commits nothing: the
+    /// loser stands with its entries and no drop is recorded, so the batch is
+    /// delivered again, and then applies.
+    #[test]
+    fn a_superseding_build_stopped_in_the_losers_clear_commits_nothing() {
+        const DOCS: i64 = 12;
+        let fixture = || {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = crate::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let t = engine.create_collection("shop", "t").unwrap();
+            engine.insert_many(&t, (0..DOCS).map(|i| doc! {"_id": i, "x": i}).collect()).unwrap();
+            let x = vec![IndexField::ascending("x")];
+            engine.create_index("shop", "t", x, false, Some("by_x".into())).unwrap();
+            (engine, dir)
+        };
+        // A peer's definition under `name`, created after this node's.
+        fn rival(engine: &crate::Engine, name: &str) -> kimmy_core::OplogEntry {
+            let t = engine.get_collection("shop", "t").unwrap();
+            let later =
+                Stamp::new(engine.next_stamp().hlc, kimmy_core::NodeId::from_bytes([9; 16]));
+            let create = kimmy_core::IndexCreate {
+                db: "shop".into(),
+                collection: "t".into(),
+                index: IndexMeta {
+                    id: IndexMeta::derive_id(name),
+                    name: name.into(),
+                    fields: vec![IndexField::ascending("x")],
+                    unique: false,
+                    enforcement: Enforcement::Local,
+                    multikey: false,
+                    expire_after_secs: None,
+                    partial_filter: Some(doc! {"never": true}),
+                    created: Some(later),
+                },
+            };
+            crate::engine::ddl_entry(later, kimmy_core::OpKind::CreateIndex, t.id, &create).unwrap()
+        }
+        let loser_stands = |engine: &crate::Engine| {
+            let t = engine.get_collection("shop", "t").unwrap();
+            assert_eq!(t.index("by_x").unwrap().partial_filter, None, "the loser stands");
+            assert_eq!(entries_of(engine, "by_x"), DOCS as usize, "with its entries");
+            let dropped = engine.index_dropped_at(t.id, IndexMeta::derive_id("by_x")).unwrap();
+            assert_eq!(dropped, None, "and no drop of it is recorded");
+        };
+
+        // The clear's rows: a rival under a new name supersedes nothing, and
+        // its build reads the documents alone.
+        use crate::walk::every_row;
+        let (beside, _d) = fixture();
+        let (_, fill) = every_row::rows_checked(&beside, || {
+            beside.apply_batch(&[rival(&beside, "by_z")]).unwrap();
+        });
+        let (over, _d) = fixture();
+        let (_, clear_and_fill) = every_row::rows_checked(&over, || {
+            over.apply_batch(&[rival(&over, "by_x")]).unwrap();
+        });
+        assert!(
+            clear_and_fill >= fill + DOCS as u64,
+            "the loser's clear reads its {DOCS} entries through the stop: {clear_and_fill} rows \
+             checked, against {fill} for the fill alone"
+        );
+
+        every_row::assert_stops_at_every_row(
+            "a superseding build",
+            crate::WalkScope::Background,
+            true,
+            fixture,
+            |f| &f.0,
+            |(engine, _)| {
+                let answer = engine.apply_batch(&[rival(engine, "by_x")]);
+                // The count's run, unstopped, applies.
+                if answer.is_err() {
+                    loser_stands(engine);
+                }
+                answer.map(drop)
+            },
+        );
+
+        // Delivered again once the node is back, it applies.
+        let (engine, _d) = fixture();
+        let entry = rival(&engine, "by_x");
+        engine.stop_walks_after_rows(1);
+        assert!(engine.apply_batch(std::slice::from_ref(&entry)).is_err());
+        loser_stands(&engine);
+        engine.lift_stops_for_test();
+        engine.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        let t = engine.get_collection("shop", "t").unwrap();
+        assert_eq!(t.index("by_x").unwrap().partial_filter, Some(doc! {"never": true}));
+        assert_eq!(entries_of(&engine, "by_x"), 0, "the loser's entries are gone");
     }
 
     #[test]
