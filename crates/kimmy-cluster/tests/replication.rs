@@ -3211,8 +3211,14 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
 /// moves nothing — ADR-157's residual.
 ///
 /// **The interval is priced, not chosen**, for the reason the drain-budget
-/// test above gives: a pull's cost belongs to the machine. One pull against
-/// the fake is timed, and the interval set to three ceilings' worth of them.
+/// test above gives: a pull's cost belongs to the machine. Here the budget
+/// must never be what ends the contact, so the price is the slowest of
+/// `PRICED_PULLS` pulls against the fake, and the interval `margin`
+/// ceilings' worth of it. No margin survives every change of load between
+/// the pricing and the tick: one pull priced at three ceilings, on a machine
+/// that got busier, saw the tick's pulls come to 3.6 times the one timed,
+/// and the budget ended the contact at 107 pulls. So [`held_to_the_ceiling`]
+/// checks the premise and prices again when it failed.
 struct CeilingTick {
     pulls: usize,
     failed: usize,
@@ -3220,7 +3226,25 @@ struct CeilingTick {
     ceiling_warns: usize,
 }
 
-async fn a_tick_at_the_pull_ceiling(fresh: bool) -> CeilingTick {
+/// The tick at the ceiling, with the budget out of the way: a tick that
+/// ended short of the ceiling with no ceiling line was ended by its budget,
+/// so it tested nothing, and the fixture runs again at twice the margin. A
+/// tick past the ceiling is returned as it is: that is what a missing
+/// ceiling looks like.
+async fn held_to_the_ceiling(fresh: bool) -> CeilingTick {
+    let mut margin = 6;
+    for _ in 0..4 {
+        let tick = a_tick_at_the_pull_ceiling(fresh, margin).await;
+        let lines = tick.ceiling_infos + tick.ceiling_warns;
+        if tick.pulls >= kimmy_cluster::MAX_PULLS_PER_CONTACT || lines > 0 || tick.failed > 0 {
+            return tick;
+        }
+        margin *= 2;
+    }
+    panic!("every tick's budget ran out before the ceiling, up to {} ceilings' worth", margin / 2);
+}
+
+async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
     use kimmy_cluster::protocol::prove;
     use kimmy_cluster::{
         MAX_PULLS_PER_CONTACT, ReplicationConfig, RoundReport, SeedSource, replicate,
@@ -3297,10 +3321,15 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool) -> CeilingTick {
         }
     });
 
-    let priced = std::time::Instant::now();
-    let one = sync_once(&b.engine, fake, SECRET, None).await.expect("one pull to price");
-    let interval = priced.elapsed() * (3 * MAX_PULLS_PER_CONTACT as u32);
-    assert!(one.truncated, "the fake must read as truncated, or this tests nothing: {one:?}");
+    const PRICED_PULLS: usize = 8;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..PRICED_PULLS {
+        let priced = std::time::Instant::now();
+        let one = sync_once(&b.engine, fake, SECRET, None).await.expect("a pull to price");
+        slowest = slowest.max(priced.elapsed());
+        assert!(one.truncated, "the fake must read as truncated, or this tests nothing: {one:?}");
+    }
+    let interval = slowest * (margin * MAX_PULLS_PER_CONTACT as u32);
     let priced_pulls = pulls.load(Ordering::SeqCst);
 
     let lines = CeilingLines::default();
@@ -3394,10 +3423,10 @@ impl tracing::field::Visit for CeilingLine {
 /// deadline. The ceiling ends the contact at `MAX_PULLS_PER_CONTACT`, and
 /// because nothing was applied in any of those pulls the line is a warning.
 /// Reverting the ceiling in `peers.rs` lets the tick pull until its deadline:
-/// about three times the ceiling.
+/// several times the ceiling.
 #[tokio::test]
 async fn a_peer_serving_windows_that_move_nothing_is_held_to_the_pull_ceiling() {
-    let tick = a_tick_at_the_pull_ceiling(false).await;
+    let tick = held_to_the_ceiling(false).await;
     assert_eq!(tick.failed, 0, "a ceiling is not a failure");
     assert_eq!(
         tick.pulls,
@@ -3413,7 +3442,7 @@ async fn a_peer_serving_windows_that_move_nothing_is_held_to_the_pull_ceiling() 
 /// suspect, so the line is at info, not a warning.
 #[tokio::test]
 async fn a_drain_deeper_than_the_ceiling_spills_to_the_next_tick_without_a_warning() {
-    let tick = a_tick_at_the_pull_ceiling(true).await;
+    let tick = held_to_the_ceiling(true).await;
     assert_eq!(tick.failed, 0, "a ceiling is not a failure");
     assert_eq!(tick.pulls, kimmy_cluster::MAX_PULLS_PER_CONTACT, "held to the ceiling as well");
     assert_eq!((tick.ceiling_warns, tick.ceiling_infos), (0, 1), "entries applied: one info line");
