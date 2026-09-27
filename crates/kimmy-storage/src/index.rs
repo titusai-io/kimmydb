@@ -277,6 +277,9 @@ pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<Documen
         match keyenc::encode_compound_ordered(key) {
             Ok(bytes) => encoded.push(bytes),
             // Only `Decimal128`, which has no exact key encoding (ADR-005).
+            // Its sentence alone: the refusal that carries it is prefixed
+            // once, where it is raised.
+            Err(CoreError::InvalidQuery(why)) => return unkeyed(why),
             Err(e) => return unkeyed(e.to_string()),
         }
     }
