@@ -9136,6 +9136,44 @@ mod budget_tests {
         );
     }
 
+    /// A partial window that carries an entry for a collection this node
+    /// lacks ends before that entry, not at `p`: the batch stops there, and
+    /// a claim through `p` would cover the entries after it that were never
+    /// applied (ADR-148's hole). The stop's arm must come before the partial
+    /// window's.
+    #[test]
+    fn a_partial_window_stopped_at_a_collection_this_node_lacks_ends_before_it() {
+        let (requester, _dir) = engine();
+        let held = requester.create_collection("db", "c").unwrap();
+        let lacked = CollectionId::derive("db", "lacked");
+        let base =
+            requester.version_vector().unwrap().iter().map(|(_, h)| h.wall_ms).max().unwrap() + 1;
+        let (a, b, c) = (origin(0x10), origin(0x80), origin(0xf0));
+        let before = insert(held.id, a, Hlc::new(base, 0));
+        let stop = insert(lacked, b, Hlc::new(base + 1, 0));
+        let after = insert(held.id, a, Hlc::new(base + 2, 0));
+        let p = Stamp::new(Hlc::new(base + 3, 0), c);
+        let theirs: VersionVector =
+            [(a, after.stamp.hlc), (b, stop.stamp.hlc), (c, p.hlc)].into_iter().collect();
+        let window = PeerWindow {
+            scanned_to: p.hlc,
+            exhausted: false,
+            passed_through: Some(p),
+            asked_partial: true,
+        };
+        let entries = [before.clone(), stop.clone(), after];
+        let mut outcome = SyncOutcome::default();
+        requester.apply_peer_window_into(&theirs, &entries, window, &mut outcome).unwrap();
+        assert_eq!(outcome.unknown.as_ref().map(|u| u.stamp), Some(stop.stamp), "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "only the entry before the stop");
+        let witnessed = requester.witnessed_vector().unwrap();
+        for node in [a, b, c] {
+            let reached = Stamp::new(witnessed.get(node), node);
+            assert!(reached < stop.stamp, "{node} is covered to {reached:?}, past the stop");
+        }
+        assert!(witnessed.get(a) >= before.stamp.hlc, "the entry before the stop is covered");
+    }
+
     /// A pull that names a span below where it asks from, and one that only
     /// names spans, asking from the highest stamp the sender advertises: the
     /// scan starts at the lowest span, and the floor is measured from there.

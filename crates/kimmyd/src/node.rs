@@ -482,7 +482,7 @@ async fn start_and_serve(config: Config) -> Result<Served> {
                 value = %value,
                 recognised = parsed.is_some(),
                 "a test switch is set that changes the budget of every window this node serves \
-                 on purpose; unset it outside a test"
+                 and every schema-change push it makes, on purpose; unset it outside a test"
             );
             parsed
         })

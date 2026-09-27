@@ -5417,7 +5417,9 @@ mod partial_windows_never_skip {
         /// Writes landing on the sender inside pull `n`, between its vectors
         /// and its window.
         within: Vec<(usize, Write)>,
-        /// Each pull's budget in rows, cycled.
+        /// Each pull's budget, cycled: rows with no time limit, or 0 for a
+        /// pull whose time is spent at once, so it ends at the progress
+        /// floor.
         budgets: Vec<u64>,
     }
 
@@ -5434,7 +5436,7 @@ mod partial_windows_never_skip {
             proptest::collection::vec(0..32usize, 0..4),
             proptest::collection::vec((0..16usize, write()), 0..6),
             proptest::collection::vec((0..16usize, write()), 0..4),
-            proptest::collection::vec(1..=5u64, 1..6),
+            proptest::collection::vec(0..=40u64, 1..6),
         )
             .prop_map(|(origins, initial, held, marks, between, within, budgets)| Case {
                 origins,
@@ -5557,23 +5559,35 @@ mod partial_windows_never_skip {
         (requester, dir)
     }
 
+    /// The serve budget for a case's `budgets` entry: `rows` examined with
+    /// no time limit, or, for 0, a time already spent, which ends a window
+    /// at its progress floor whatever the rows.
+    fn budget(rows: u64) -> kimmy_storage::ExamineBudget {
+        match rows {
+            0 => kimmy_storage::ExamineBudget { time: Duration::ZERO, rows: u64::MAX },
+            rows => kimmy_storage::ExamineBudget { time: Duration::MAX, rows },
+        }
+    }
+
+    /// No budget at all: the comparison requester of oracle (c).
+    const UNBUDGETED: kimmy_storage::ExamineBudget =
+        kimmy_storage::ExamineBudget { time: Duration::MAX, rows: u64::MAX };
+
     /// One pull as a node makes it, handshake and round, against the
-    /// sender's serve with `rows` of budget and no time; `within` lands on
-    /// the sender once it has answered the vectors, before its window. The
-    /// outcome, and where the request asked the scan to start.
+    /// sender's serve with `partial` as the budget a partial window gets;
+    /// `within` lands on the sender once it has answered the vectors,
+    /// before its window. The outcome, and where the request asked the scan
+    /// to start.
     async fn pull(
         requester: &Engine,
         sender: &Engine,
         stalls: &mut PeerStalls,
-        rows: u64,
+        partial: kimmy_storage::ExamineBudget,
         within: impl FnOnce(),
     ) -> (Result<kimmy_storage::SyncOutcome, ProtocolError>, Option<Hlc>) {
         let (mut ours, near) = tokio::io::duplex(MAX_FRAME);
         let (far, theirs) = tokio::io::duplex(MAX_FRAME);
-        let budgets = ServeBudgets {
-            partial: kimmy_storage::ExamineBudget { time: Duration::ZERO, rows },
-            whole: REQUEST_TIMEOUT,
-        };
+        let budgets = ServeBudgets { partial, whole: REQUEST_TIMEOUT };
         let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets);
         let asked: std::cell::Cell<Option<Hlc>> = std::cell::Cell::new(None);
         let relaying = async {
@@ -5705,7 +5719,7 @@ mod partial_windows_never_skip {
         let mut pulls = 0usize;
         loop {
             let theirs = sender.version_vector().unwrap();
-            let rows = case.budgets[pulls % case.budgets.len()];
+            let rows = budget(case.budgets[pulls % case.budgets.len()]);
             let within: Vec<Write> =
                 case.within.iter().filter(|(n, _)| *n == pulls).map(|(_, w)| w.clone()).collect();
             let (outcome, start) = pull(&requester, &sender, &mut stalls, rows, || {
@@ -5754,7 +5768,7 @@ mod partial_windows_never_skip {
         // (c): the same sender, pulled whole by a requester placed the same.
         let mut whole = PeerStalls::new();
         loop {
-            let (outcome, _) = pull(&unbudgeted, &sender, &mut whole, u64::MAX, || {}).await;
+            let (outcome, _) = pull(&unbudgeted, &sender, &mut whole, UNBUDGETED, || {}).await;
             if outcome.map_err(|e| format!("an unbudgeted pull failed: {e}"))?.exhausted {
                 break;
             }
@@ -5840,7 +5854,8 @@ mod partial_windows_never_skip {
             let mut stalls = PeerStalls::new();
             let mut empty_partials = 0;
             for pull_no in 0..200 {
-                let (outcome, start) = pull(&requester, &sender, &mut stalls, 1, || {}).await;
+                let (outcome, start) =
+                    pull(&requester, &sender, &mut stalls, budget(1), || {}).await;
                 let outcome = outcome.unwrap();
                 if outcome.exhausted {
                     break;

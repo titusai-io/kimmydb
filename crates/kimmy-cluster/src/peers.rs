@@ -487,7 +487,8 @@ pub struct ReplicationConfig {
 /// read still counts: in round 0430 the gauge read 0 on a member missing
 /// another's writes, because only successful rounds reported. A round that
 /// fails before it reads them leaves the last one standing. An entry goes
-/// when membership forgets the peer. The gauge never freezes, since it is
+/// when membership no longer lists the peer as live, a member SWIM marked
+/// down included. The gauge never freezes, since it is
 /// computed against the clock and this node's current witnessed vector, and
 /// it clears as soon as the entries arrive by any route, a third member's
 /// included.
@@ -646,8 +647,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     }
                     _ => discovered.clone(),
                 };
-                // A peer membership has forgotten counts no more towards the
-                // lag gauge.
+                // A peer membership no longer lists as live, one SWIM marked
+                // down included, counts no more towards the lag gauge.
                 if let Some(lag) = &config.lag_vectors {
                     lag.retain(&peers);
                 }
@@ -1302,8 +1303,8 @@ mod tests {
     /// The lag gauge's source (ADR-175's addendum): what a peer advertised,
     /// against what this node has witnessed now. It grows with the clock
     /// while the entries are missing, whatever became of the rounds that read
-    /// the vector, clears once they arrive by any route, and forgets a peer
-    /// membership forgets.
+    /// the vector, clears once they arrive by any route, and drops a peer
+    /// membership no longer lists as live.
     #[test]
     fn the_lag_is_computed_from_each_peers_last_vector_when_read() {
         use kimmy_core::{Hlc, NodeId, VersionVector};
@@ -1325,7 +1326,7 @@ mod tests {
         assert_eq!(lag.lag_ms(&caught_up, 25_000), 0, "cleared once the entries are here");
 
         lag.retain(&std::collections::BTreeSet::new());
-        assert_eq!(lag.lag_ms(&mine, 25_000), 0, "a forgotten peer no longer counts");
+        assert_eq!(lag.lag_ms(&mine, 25_000), 0, "a peer no longer live no longer counts");
     }
 
     use super::*;

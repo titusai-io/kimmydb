@@ -17558,7 +17558,8 @@ missed another's writes for minutes, every pull timing out.
 - **What is kept:** whenever a round has read a peer's vectors, whether it then
   succeeds or fails, the loop stores that peer's advertised vector. A round
   that fails before its vectors keeps the one stored last. The entry is
-  dropped when membership forgets the peer, which the loop checks every tick.
+  dropped when membership no longer lists the peer as live, a member SWIM
+  marked down included, which the loop checks every tick.
 - **What is read:** at each scrape or export, the gauge is the maximum over the
   stored peers of `lag_behind_ms(this node's witnessed vector now, that peer's
   stored vector, now)`. It is computed at the read, as ADR-187's gauges are.
@@ -20595,7 +20596,7 @@ and answers with where it stopped. The requester takes that as coverage.
 
 **The test switches.** `KIMMY_TEST_SERVE_WALK_ROWS` and
 `KIMMY_TEST_SERVE_WALK_MS` set the budget for every window this process
-serves. They ship in the binary, like `KIMMY_TEST_WALK_ROW_MS`, and every
+serves and every confirmation push it makes. They ship in the binary, like `KIMMY_TEST_WALK_ROW_MS`, and every
 start where either is set logs a `WARN` naming it, with whether the value was
 understood.
 
@@ -20715,9 +20716,11 @@ start rises through a finite oplog. Safety does not depend on this measure.
 - **At unit level, time zero** (`kimmy-storage`, `sync.rs`, `budget_tests`).
   Every window ends at the first row past its floor; a drain rises on every
   pull and ends with everything; the floor is measured from the lowest span,
-  not from `from`; an end nobody asked for claims nothing. In
-  `kimmy-cluster`, `transport.rs`: the three checks, and a zero-entry partial
-  window with a span.
+  not from `from`; an end nobody asked for claims nothing; a partial window
+  that carries an entry for a collection the requester lacks ends before that
+  entry, not at `p`, so the stop's arm must come before the partial window's.
+  In `kimmy-cluster`, `transport.rs`: the three checks, and a zero-entry
+  partial window with a span.
 - **Mixed versions** (`protocol.rs`): both fields cross a version boundary in
   both directions, and read back as `false` and `None` when absent.
 - **The property** (`transport.rs`, `partial_windows_never_skip`, 48 cases).
@@ -20726,14 +20729,22 @@ start rises through a finite oplog. Safety does not depend on this measure.
   requester with random `held`, held marks and a modelled snapshot grant: the
   grant applies entries in the held position and raises the witnessed vector.
   Writes land between pulls, and inside a pull between the sender's vectors
-  and its window through a relay. Budgets of 1 to 5 rows are driven until the
-  drain ends. After every pull it checks (a) nothing at or below the
-  requester's position is missing, against the sender's final oplog, outside
-  the grant; (b) the next scan start rose, against that pull's `theirs`; and
-  that a partial window was treated as truncated. At the end it checks (c) the
-  requester equals an unbudgeted one, and that every mark was released. It
-  does not generate a collection the requester lacks.
-- **Mutants**, run under bash with each suite on a timeout. All 11 are killed,
+  and its window through a relay. Each pull's budget is 1 to 40 rows with no
+  time limit, or a time already spent, which ends the window at its progress
+  floor. The drain runs until it ends. After every pull it checks (a) every
+  insert in the sender's final oplog at or below the requester's position is
+  held there as a document (a granted entry is, since the grant applied it);
+  (b) the next scan start rose, against that pull's `theirs`; and that a
+  partial window was treated as truncated. At the end it checks (c) the
+  requester equals one placed the same and pulled with no budget at all, and
+  that every mark was released. It does not generate a collection the
+  requester lacks; the storage test above covers that stop.
+- **The push** (`confirm.rs`,
+  `a_push_whose_walk_runs_past_its_budget_sends_nothing`): a member 40
+  entries behind, well under the batch cap, and a push budget of 5 rows, set
+  through the confirmer's test hooks rather than the process-wide switch. The
+  push resolves pending for the budget, and no window is sent.
+- **Mutants**, run under bash with each suite on a timeout. All 13 are killed,
   and the unmutated control passes:
 
   | # | Mutant | Killed by |
@@ -20745,10 +20756,12 @@ start rises through a finite oplog. Safety does not depend on this measure.
   | 5 | the skip applied inside named spans | the property's marks-released check |
   | 6 | `passed_through` accepted without `partial` | `an_end_nobody_asked_for_claims_nothing` |
   | 7 | `window_truncated` left at the old condition | the property's partial ⇒ truncated check |
-  | 8 | coverage not capped by `theirs` | property (a) |
+  | 8 | coverage not capped by `theirs` | property (c) |
   | 9 | `theirs` read after the window | property (a), six transport unit tests |
   | 10 | span resume from `p` without the tie rule | the property's marks-released check, `peer_stalls_resume_each_span_past_what_the_peer_served` |
   | 11 | `marks_served` keeps the last entry | the zero-entry span test |
+  | 12 | the partial window's arm matched before the stop's | `a_partial_window_stopped_at_a_collection_this_node_lacks_ends_before_it` |
+  | 13 | the push sends a window its walk's budget ended | `a_push_whose_walk_runs_past_its_budget_sends_nothing` |
 
   Three differ from the design. **Mutant 5** survived (a), because an entry
   inside a span is one the requester holds as state. It needed the modelled
@@ -20761,7 +20774,7 @@ start rises through a finite oplog. Safety does not depend on this measure.
   over a span carries nothing and only `p` can move the span on.
 - **The lag gauge, the cap, the switches and the stop.** The lag is computed
   from each peer's last vector, grows with the clock, clears when the entries
-  arrive, and forgets a peer membership has forgotten. A round that fails after
+  arrive, and drops a peer membership no longer lists as live. A round that fails after
   the vectors still records them. A whole window past the cap ends the
   connection with no serve failure counted. A start with either switch set
   says so. The walk-stop guard (`walks_stop.rs`) names the budgeted walk.

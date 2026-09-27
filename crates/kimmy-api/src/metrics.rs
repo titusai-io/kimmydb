@@ -425,8 +425,9 @@ pub struct Metrics {
     /// `replication_lag_source` is installed.
     replication_lag_ms: AtomicU64,
     /// The gauge computed when it is read, from each peer's last advertised
-    /// vector (ADR-175's addendum): what a node that replicates installs.
-    replication_lag_source: parking_lot::RwLock<Option<LagSource>>,
+    /// vector (ADR-175's addendum): what a node that replicates installs,
+    /// once. A `OnceLock`, so a scrape calls it with no lock held.
+    replication_lag_source: std::sync::OnceLock<LagSource>,
     /// Every sync tick's [`kimmy_cluster::PullReport`], summed (ADR-175). A
     /// mutex over the loop's own shape rather than an atomic per bucket: some
     /// fifty numbers arrive together once a tick and are read together once
@@ -551,7 +552,7 @@ impl Default for Metrics {
             backup_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_sum_us: AtomicU64::new(0),
             replication_lag_ms: AtomicU64::new(0),
-            replication_lag_source: parking_lot::RwLock::new(None),
+            replication_lag_source: std::sync::OnceLock::new(),
             sync_pulls: parking_lot::Mutex::new(kimmy_cluster::PullReport::default()),
             sync_failures: AtomicU64::new(0),
             sync_peers_backing_off: AtomicU64::new(0),
@@ -734,9 +735,10 @@ impl Metrics {
     /// read, in place of the value [`Self::set_replication_lag_ms`] pushes
     /// (ADR-175's addendum): from each peer's last advertised vector, so a
     /// peer whose rounds fail still counts, and the reading moves with the
-    /// clock between rounds.
+    /// clock between rounds. Installed once, when the node starts
+    /// replicating; a second source is ignored.
     pub fn compute_replication_lag_with(&self, source: LagSource) {
-        *self.replication_lag_source.write() = Some(source);
+        let _ = self.replication_lag_source.set(source);
     }
 
     /// One sync tick of the replication loop: how many rounds failed, how
@@ -1130,7 +1132,7 @@ impl Metrics {
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: readings.cluster_members,
             task_progress_age_secs: self.task_progress_ages_at(now),
-            replication_lag_ms: match &*self.replication_lag_source.read() {
+            replication_lag_ms: match self.replication_lag_source.get() {
                 Some(source) => source(),
                 None => self.get(&self.replication_lag_ms),
             },
@@ -1444,7 +1446,7 @@ impl Metrics {
              # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive, counted when this page is read. 0 with clustering off.\n\
              # TYPE kimmy_cluster_members gauge\n\
              kimmy_cluster_members {cluster}\n\
-             # HELP kimmy_replication_lag_seconds Seconds this node trails its peers, to the millisecond: the most over every peer of the age of the newest entry this node has witnessed from an origin that peer holds newer entries of. Computed when read, against this node's witnessed vector now and the vector each peer advertised at the start of its last round, successful or not, so a peer whose rounds keep failing still counts, and the reading grows with the clock until the entries arrive by any route. 0 once every peer's advertised entries are here; a peer membership has forgotten no longer counts. 0 when clustering is off.\n\
+             # HELP kimmy_replication_lag_seconds Seconds this node trails its peers, to the millisecond: the most over every peer of the age of the newest entry this node has witnessed from an origin that peer holds newer entries of. Computed when read, against this node's witnessed vector now and the vector each peer advertised at the start of its last round, successful or not, so a peer whose rounds keep failing still counts, and the reading grows with the clock until the entries arrive by any route. 0 once every peer's advertised entries are here; a peer membership no longer lists as live does not count. 0 when clustering is off.\n\
              # TYPE kimmy_replication_lag_seconds gauge\n\
              kimmy_replication_lag_seconds {lag}\n\
              # HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising with kimmy_replication_lag_seconds rising too is a peer whose rounds fail while it holds entries this node lacks.\n\
@@ -2666,7 +2668,7 @@ kimmy_webhook_backlog_seconds 17
 # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive, counted when this page is read. 0 with clustering off.
 # TYPE kimmy_cluster_members gauge
 kimmy_cluster_members 18
-# HELP kimmy_replication_lag_seconds Seconds this node trails its peers, to the millisecond: the most over every peer of the age of the newest entry this node has witnessed from an origin that peer holds newer entries of. Computed when read, against this node's witnessed vector now and the vector each peer advertised at the start of its last round, successful or not, so a peer whose rounds keep failing still counts, and the reading grows with the clock until the entries arrive by any route. 0 once every peer's advertised entries are here; a peer membership has forgotten no longer counts. 0 when clustering is off.
+# HELP kimmy_replication_lag_seconds Seconds this node trails its peers, to the millisecond: the most over every peer of the age of the newest entry this node has witnessed from an origin that peer holds newer entries of. Computed when read, against this node's witnessed vector now and the vector each peer advertised at the start of its last round, successful or not, so a peer whose rounds keep failing still counts, and the reading grows with the clock until the entries arrive by any route. 0 once every peer's advertised entries are here; a peer membership no longer lists as live does not count. 0 when clustering is off.
 # TYPE kimmy_replication_lag_seconds gauge
 kimmy_replication_lag_seconds 19.25
 # HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising with kimmy_replication_lag_seconds rising too is a peer whose rounds fail while it holds entries this node lacks.

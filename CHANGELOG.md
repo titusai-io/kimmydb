@@ -68,8 +68,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   from each peer's last advertised vector, recorded even when the round then
   failed, against this node's position now. So it grows with the clock while
   entries are missing and clears as soon as they arrive, by any route. A peer
-  membership has forgotten stops counting. The `HELP` texts of the gauge and
-  of `kimmy_sync_failures_total` say so.
+  membership no longer lists as live, one marked down included, stops
+  counting. The `HELP` texts of the gauge and of `kimmy_sync_failures_total`
+  say so.
 
 ## 0.40.2 - 2026-09-27
 

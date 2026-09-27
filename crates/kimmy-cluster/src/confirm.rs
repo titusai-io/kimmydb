@@ -624,6 +624,8 @@ impl Confirmer {
         let engine = &self.engine;
         // The same walk a pull makes, bounded the same way (ADR-194).
         let budget = kimmy_storage::ExamineBudget::serve();
+        #[cfg(test)]
+        let budget = self.hooks.push_budget.lock().unwrap_or(budget);
         let mut window = match kimmy_storage::blocking(|| {
             engine.entries_for_peer_within(
                 from,
@@ -969,6 +971,10 @@ mod test_hooks {
         pub after_snapshot: Mutex<Option<Hook>>,
         pub after_mine: Mutex<Option<Hook>>,
         pub panic_on_enqueue: std::sync::atomic::AtomicBool,
+        /// The push walk's budget, in place of `ExamineBudget::serve`: set
+        /// here rather than by `set_test_serve_walk_budget`, which is the
+        /// whole process's and would reach every other test running in it.
+        pub push_budget: Mutex<Option<kimmy_storage::ExamineBudget>>,
     }
 
     impl Hooks {
@@ -1782,6 +1788,32 @@ mod tests {
         let two = queued.await.unwrap();
         assert_eq!(two.outcome(), ConfirmOutcome::Unreached, "{two:?}");
         assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no window stops short of a change");
+    }
+
+    /// A push whose walk to the member's window runs past its budget sends
+    /// nothing: the member lacks more than a push should carry, and
+    /// anti-entropy's partial windows take it there (ADR-194). Well under
+    /// the batch cap, so only the budget can leave it unsent.
+    #[tokio::test]
+    async fn a_push_whose_walk_runs_past_its_budget_sends_nothing() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        let node = b.engine.node_id();
+        let orders = a.engine.get_collection("shop", "orders").unwrap();
+        for i in 0..40i64 {
+            a.engine.insert(&orders, bson::doc! { "_id": i }).unwrap();
+        }
+        *a.confirmer.hooks.push_budget.lock() =
+            Some(kimmy_storage::ExamineBudget { time: std::time::Duration::MAX, rows: 5 });
+        let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
+        match &one {
+            Resolution::Pending { outcome: ConfirmOutcome::Unreached, reason } => {
+                assert!(reason.contains("ran past its budget"), "{reason}");
+            }
+            other => panic!("not left to anti-entropy for the budget: {other:?}"),
+        }
+        assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no Push frame was sent");
+        assert!(b.served.windows().is_empty(), "the member was sent no window");
     }
 
     /// A window cut by the batch cap between two changes queued before it:
