@@ -473,7 +473,7 @@ pub(crate) fn maintain_remote(
 /// being written can flip it.
 fn apply_entries(
     engine: &crate::Engine,
-    table: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
+    table: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
     coll: &crate::CollectionMeta,
     indexes: &[IndexMeta],
     old: Option<&Document>,
@@ -1767,7 +1767,11 @@ impl crate::Engine {
             }
             let stamp = replicated.unwrap_or_else(|| self.next_stamp());
             {
-                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                let mut entries = open_walk_table_in(
+                    &txn,
+                    tables::INDEX_ENTRIES,
+                    crate::walk::WalkStop::in_write(),
+                )?;
                 clear_index_entries(&mut entries, index_id_range(meta.id, index.id))?;
             }
             // Entries are removed above, in this same transaction, which is what
@@ -2544,7 +2548,7 @@ pub(crate) mod clear_hooks {
 /// definition superseding this node's inside the winner's build, where nobody
 /// chose to wait.
 pub(crate) fn clear_index_entries(
-    entries: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
+    entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
     range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
 ) -> Result<usize> {
     let mut removed = 0;
@@ -5127,7 +5131,12 @@ mod clearing {
             let db = clearing.db();
             let txn = db.begin_write().unwrap();
             let outcome = {
-                let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+                let mut entries = open_walk_table_in(
+                    &txn,
+                    tables::INDEX_ENTRIES,
+                    crate::walk::WalkStop::in_write(),
+                )
+                .unwrap();
                 clear_index_entries(
                     &mut entries,
                     index_id_range(coll.id, IndexMeta::derive_id("by_x")),

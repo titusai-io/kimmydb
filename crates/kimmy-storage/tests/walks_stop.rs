@@ -225,6 +225,11 @@ const IN_WRITE_SITES: &[&str] = &[
     "index::maintain_remote",
     // find_and_modify's candidates, read in the write it commits.
     "index::scan_range_in_write",
+    // An index drop's removal of its entries, in the drop's write.
+    "index::Engine::drop_index_inner",
+    // Migrations at open, each in its own write.
+    "migrate::rebuild_partial_indexes",
+    "migrate::move_index_entries",
 ];
 
 /// Loops that do not iterate a table, each of which must call `check_walk(`,
@@ -536,22 +541,12 @@ fn every_walk_of_the_store_stops_or_says_why_it_need_not() {
     for key in STOP_AWARE_WALKS {
         let Some((_, f)) = walking.get(*key) else { continue };
         let takes_walk_table = f.code.iter().any(|l| l.contains("WalkTable<"));
-        let names_table_types = f.code.iter().any(|l| l.contains("TableTypes"));
         for (i, code) in f.code.iter().enumerate() {
             let at = f.line + i;
             if code.contains(".open_table(") {
                 problems.push(format!(
                     "{key}:{at}: opens a table with open_table; a stop-aware walk opens every \
                      table with open_walk_table"
-                ));
-            }
-            // A generic bound is fine on a walk table's own type parameter,
-            // when it names `TableTypes`: without it the walk table's own
-            // `range` does not apply, and `Deref` reaches redb's, unchecked.
-            if code.contains("ReadableTable") && takes_walk_table && !names_table_types {
-                problems.push(format!(
-                    "{key}:{at}: bounds a walk table's type by ReadableTable without TableTypes, \
-                     so its range and iter are redb's own, which do not check the stop"
                 ));
             }
             let plain = (code.contains("ReadableTable") && !takes_walk_table)
@@ -565,6 +560,17 @@ fn every_walk_of_the_store_stops_or_says_why_it_need_not() {
             let marked = f.text[i].contains("// not a row:")
                 || i.checked_sub(1)
                     .is_some_and(|p| f.text[p].trim_start().starts_with("// not a row:"));
+            // A walk propagates the stop; one that names it has found a way
+            // to end without it, and an `Err` answered with `None` is a
+            // swallow however it is spelled.
+            let named =
+                code.contains("Stopping(") || (code.contains("Err(") && code.contains("=> None"));
+            if !marked && named {
+                problems.push(format!(
+                    "{key}:{at}: a stop-aware walk handles the stop or an Err itself; propagate \
+                     it with `?`, or say `// not a row: <what it is>` on the line or the one above"
+                ));
+            }
             if !marked && let Some(s) = SWALLOWS.iter().find(|s| code.contains(*s)) {
                 problems.push(format!(
                     "{key}:{at}: `{s}` in a stop-aware walk can drop the stop's Err; propagate \

@@ -11345,17 +11345,25 @@ ends with `StorageError::Stopping`:
 The check is a few atomic loads, on every row: on a cold disk a row can be a
 seek, so a check every so many rows could leave a stop waiting seconds. It
 lives in one place, `walk::open_walk_table`, whose tables' `range` and `iter`
-return rows that check. **A guard holds the storage crate to it,
-closed-world** (`kimmy-storage/tests/walks_stop.rs`):
+return rows that check. A walk table does not `Deref` to the redb table it
+wraps: beside its checked `range` and `iter` it offers only reads of one key
+or one end (`get`, `first`, `last`) and, in a write, `insert` and `remove`,
+so no call on it can reach redb's own unchecked walks. **A guard holds the
+storage crate to it, closed-world** (`kimmy-storage/tests/walks_stop.rs`):
 - every function that iterates a table is a stop-aware walk or a bounded read
   with its reason: a registry, one row, a migration at open, a write;
 - a stop-aware walk opens every table through `open_walk_table`, takes none
-  as a plain redb table, and swallows no row's error (`.ok()`, `.flatten()`,
-  `let Ok(` are refused there unless marked `// not a row:`), since the
-  error is how the stop arrives, and a backup that dropped it would write
-  its `END` after half the store;
-- each walk that does not stop (`WalkStop::in_write`) is listed, and is inside
-  a write transaction;
+  as a plain redb table, and swallows no row's error, since the error is how
+  the stop arrives, and a backup that dropped it would write its `END` after
+  half the store. Refused there unless marked `// not a row:` are the untyped
+  swallows (`.ok()`, `.flatten()`, `let Ok(` and the like) and the typed
+  ones: any line naming `Stopping(`, and any `Err(..) => None`, since a walk
+  that matches the stop has found a way to end without it, and one that ends
+  its loop on it answers a short page or a partial list as a whole one;
+- each walk that does not stop (`WalkStop::in_write`) is listed in
+  `IN_WRITE_SITES` and is inside a write transaction: a write's index
+  maintenance and unique checks, `find_and_modify`'s candidates, an index
+  drop's removal of its entries, and the migrations at open;
 - the walks `kimmy-api`'s guard counts are stop-aware, or writes;
 - the loops that read no table, the HNSW insert loop and the call to an
   embedding provider, call `check_walk`.
@@ -11370,7 +11378,9 @@ node_stopping`, whose message now says the node "did not complete the
 request", since a read can be ended too.
 
 Tested by `walk`'s unit tests (each scope's stop, the rows passed over, a
-write's walk, a stopped backup never restorable), the resume's and the
+write's walk, a stopped backup never restorable, and every public walk
+stopped before its first row and again part of the way through, so one that
+answered what it had read so far fails), the resume's and the
 worker's, and on real processes: a backup and a graph build in flight at
 the stop end at the drain's deadline and the store closes
 (`KIMMY_TEST_WALK_ROW_MS` slows every row); a member stopped while its peers

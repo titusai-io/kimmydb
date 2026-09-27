@@ -28,7 +28,7 @@
 //! bounded read with its reason, and a listed walk opens its tables here.
 
 use std::borrow::Borrow;
-use std::ops::{Deref, DerefMut, RangeBounds};
+use std::ops::RangeBounds;
 
 use redb::{AccessGuard, Key, ReadableTable, TableDefinition, Value};
 
@@ -96,20 +96,29 @@ impl Engine {
     pub fn stop_walks_after_rows(&self, rows: u64) {
         self.stop_after_rows.store(rows, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// [`Self::stop_walks_after_rows`] for the drain's deadline: at the
+    /// `rows`-th row, [`Engine::set_stopping`], which ends a request's walks.
+    pub fn set_stopping_after_rows(&self, rows: u64) {
+        self.stopping_after_rows.store(rows, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl WalkStop<'_> {
     /// Count a row towards [`Engine::stop_walks_after_rows`].
     #[cfg(any(test, feature = "test-hooks"))]
     fn count_row(&self) {
-        use std::sync::atomic::Ordering;
-        if let Some((engine, _)) = self.stop
-            && engine
-                .stop_after_rows
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                == Ok(1)
-        {
-            engine.stop_walks();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let reaches = |left: &AtomicU64| {
+            left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1)
+        };
+        if let Some((engine, _)) = self.stop {
+            if reaches(&engine.stop_after_rows) {
+                engine.stop_walks();
+            }
+            if reaches(&engine.stopping_after_rows) {
+                engine.set_stopping();
+            }
         }
     }
 
@@ -126,20 +135,6 @@ impl WalkStop<'_> {
 pub(crate) struct WalkTable<'e, T> {
     table: T,
     walk: WalkStop<'e>,
-}
-
-impl<T> Deref for WalkTable<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.table
-    }
-}
-
-impl<T> DerefMut for WalkTable<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.table
-    }
 }
 
 /// The key and value types of a redb table, so [`WalkTable::range`] takes
@@ -159,12 +154,6 @@ impl<K: Key + 'static, V: Value + 'static> TableTypes for redb::Table<'_, K, V> 
     type V = V;
 }
 
-/// **A caller generic over the table must bound it by [`TableTypes`].**
-/// Without it these methods do not apply, and method resolution goes on
-/// through `Deref` to redb's own `range` and `iter`, which do not check the
-/// stop, and compiles. The guard refuses a stop-aware walk whose table
-/// bound leaves it out, and the table-driven test in this module catches
-/// one that reaches redb's anyway.
 impl<'e, T> WalkTable<'e, T> {
     /// The table's rows in `range`, checking the stop before each.
     pub(crate) fn range<'a, KR>(
@@ -186,6 +175,50 @@ impl<'e, T> WalkTable<'e, T> {
     {
         self.walk.check()?;
         Ok(Rows { rows: self.table.iter()?, walk: self.walk, stopped: false })
+    }
+}
+
+/// A row of a walk table's `T`, as redb gives one end of it.
+type EndRow<'a, T> = (AccessGuard<'a, <T as TableTypes>::K>, AccessGuard<'a, <T as TableTypes>::V>);
+
+/// The bounded reads a walk table allows beside its walks: one key, or one
+/// end. There is no `Deref` to the table: a walk table has no way to reach
+/// redb's own `range` or `iter`, which do not check the stop.
+impl<T> WalkTable<'_, T>
+where
+    T: TableTypes + ReadableTable<T::K, T::V>,
+{
+    pub(crate) fn get<'a>(
+        &self,
+        key: impl Borrow<<T::K as Value>::SelfType<'a>>,
+    ) -> Result<Option<AccessGuard<'_, T::V>>> {
+        Ok(self.table.get(key)?)
+    }
+
+    pub(crate) fn first(&self) -> Result<Option<EndRow<'_, T>>> {
+        Ok(self.table.first()?)
+    }
+
+    pub(crate) fn last(&self) -> Result<Option<EndRow<'_, T>>> {
+        Ok(self.table.last()?)
+    }
+}
+
+/// A write transaction's walk table also writes, a key at a time.
+impl<'t, K: Key + 'static, V: Value + 'static> WalkTable<'_, redb::Table<'t, K, V>> {
+    pub(crate) fn insert<'k, 'v>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Result<Option<AccessGuard<'_, V>>> {
+        Ok(self.table.insert(key, value)?)
+    }
+
+    pub(crate) fn remove<'k>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+    ) -> Result<Option<AccessGuard<'_, V>>> {
+        Ok(self.table.remove(key)?)
     }
 }
 
@@ -424,9 +457,22 @@ mod tests {
     #[test]
     fn every_stop_aware_walk_answers_stopping_once_its_stop_has_come() {
         type Walk = fn(&Engine, &crate::CollectionMeta) -> Result<()>;
+        // A peer's marks, as a snapshot leaves them, so the marks' walk has
+        // rows to be stopped among.
+        const HELD_ORIGIN: kimmy_core::NodeId = kimmy_core::NodeId::from_bytes([7; 16]);
         let unique = |engine: &Engine| {
             let field = crate::IndexField { path: "_id".into(), descending: false };
-            engine.create_index("shop", "orders", vec![field], true, Some("by_n".into())).unwrap()
+            engine.create_index("shop", "orders", vec![field], true, Some("by_n".into())).unwrap();
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut held = txn.open_table(crate::tables::OPLOG_HELD).unwrap();
+                for wall_ms in 1..=10 {
+                    let stamp = kimmy_core::Stamp::new(Hlc::new(wall_ms, 0), HELD_ORIGIN);
+                    held.insert(crate::codec::oplog_key(&stamp).as_slice(), ()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
         };
         let background: &[(&str, Walk)] = &[
             ("serve_entries_to_peer", |e, _| {
@@ -436,7 +482,8 @@ mod tests {
                 e.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).map(drop)
             }),
             ("held_marks_covered_by", |e, _| {
-                e.held_marks_covered_by(&e.witnessed_vector()?).map(drop)
+                let witnessed = [(HELD_ORIGIN, Hlc::new(u64::MAX, 0))].into_iter().collect();
+                e.held_marks_covered_by(&witnessed).map(drop)
             }),
             ("snapshot_page", |e, _| e.snapshot_page(None, None).map(drop)),
             ("collect_garbage", |e, _| {
@@ -479,18 +526,40 @@ mod tests {
         ];
         for (scope, walks) in [(WalkScope::Background, background), (WalkScope::Request, request)] {
             for (name, walk) in walks {
-                let (engine, _coll, _dir) = engine_with(10);
-                unique(&engine);
-                let coll = engine.get_collection("shop", "orders").unwrap();
-                match scope {
-                    WalkScope::Background => engine.stop_walks(),
-                    WalkScope::Request => engine.set_stopping(),
+                // Before the walk begins, and then part of the way through
+                // it: a walk that ends its loop on the stop and answers what
+                // it had is a short answer taken for a whole one, and only a
+                // stop in the middle shows it.
+                let mut midway = 0;
+                for rows in [0, 1, 2, 3, 5, 8] {
+                    let (engine, _coll, _dir) = engine_with(10);
+                    unique(&engine);
+                    let coll = engine.get_collection("shop", "orders").unwrap();
+                    let stopped = || match scope {
+                        WalkScope::Background => engine.walks_stopping(),
+                        WalkScope::Request => engine.is_stopping(),
+                    };
+                    match (scope, rows) {
+                        (WalkScope::Background, 0) => engine.stop_walks(),
+                        (WalkScope::Request, 0) => engine.set_stopping(),
+                        (WalkScope::Background, n) => engine.stop_walks_after_rows(n),
+                        (WalkScope::Request, n) => engine.set_stopping_after_rows(n),
+                    }
+                    let answer = walk(&engine, &coll);
+                    if !stopped() {
+                        // The walk read fewer rows than that, and finished.
+                        assert!(answer.is_ok(), "{name} ({scope:?}) at row {rows}: {answer:?}");
+                        continue;
+                    }
+                    midway += usize::from(rows > 0);
+                    assert!(
+                        matches!(answer, Err(StorageError::Stopping(_))),
+                        "{name} ({scope:?}) stopped at row {rows} and answered {answer:?}"
+                    );
                 }
-                let answer = walk(&engine, &coll);
-                assert!(
-                    matches!(answer, Err(StorageError::Stopping(_))),
-                    "{name} ({scope:?}) answered {answer:?}"
-                );
+                // Every walk here reads rows: each is stopped in the middle at
+                // least once.
+                assert!(midway > 0, "{name} ({scope:?}) was never stopped mid-walk");
             }
         }
     }

@@ -29,6 +29,7 @@ use crate::codec;
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::tables;
+use crate::walk::open_walk_table_in;
 
 /// The database layout this build writes and understands.
 ///
@@ -426,7 +427,8 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
         );
         let txn = db.begin_write()?;
         let (built, multikey, violations) = {
-            let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+            let mut entries =
+                open_walk_table_in(&txn, tables::INDEX_ENTRIES, crate::walk::WalkStop::in_write())?;
             crate::index::clear_index_entries(
                 &mut entries,
                 crate::index::index_id_range(meta.id, index.id),
@@ -912,7 +914,8 @@ fn move_index_entries(db: &Database, old: u64, new: u64) -> Result<()> {
 
     let txn = db.begin_write()?;
     {
-        let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+        let mut entries =
+            open_walk_table_in(&txn, tables::INDEX_ENTRIES, crate::walk::WalkStop::in_write())?;
         for (index_id, value, doc_key) in &rows {
             entries.insert((new, *index_id, value.as_slice(), doc_key.as_slice()), ())?;
         }
@@ -1502,7 +1505,9 @@ mod membership_migration {
                 })
                 .collect();
             let docs = txn.open_table(tables::DOCS).unwrap();
-            let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+            let mut entries =
+                open_walk_table_in(&txn, tables::INDEX_ENTRIES, crate::walk::WalkStop::in_write())
+                    .unwrap();
             for (d, c, mut meta) in rows {
                 for index in meta.indexes.iter_mut() {
                     if unique.contains(&index.name.as_str()) {

@@ -163,6 +163,10 @@ pub struct Engine {
     /// [`Engine::stop_walks_after_rows`].
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) stop_after_rows: std::sync::atomic::AtomicU64,
+    /// The same, for the drain's deadline: see
+    /// [`Engine::set_stopping_after_rows`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) stopping_after_rows: std::sync::atomic::AtomicU64,
     /// Run once, inside the next change stream's resolve of where it starts;
     /// see [`Engine::during_next_watch_resolve`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1304,6 +1308,8 @@ impl Engine {
             continuing_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             stop_after_rows: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            stopping_after_rows: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             watch_resolve_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
