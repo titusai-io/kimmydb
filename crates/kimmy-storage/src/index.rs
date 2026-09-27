@@ -17,7 +17,9 @@ use crate::engine::WriterHolder;
 use crate::error::{Result, StorageError};
 use crate::meta::{Enforcement, IndexField, IndexMeta};
 use crate::tables;
-use crate::walk::{WalkScope, WalkStop, WalkTable, open_walk_table, open_walk_table_in};
+use crate::walk::{
+    TableTypes, WalkScope, WalkStop, WalkTable, open_walk_table, open_walk_table_in,
+};
 
 /// Guard against an index producing a combinatorial number of entries for one
 /// document. A compound index over two array fields would write the cartesian
@@ -605,7 +607,8 @@ fn holders_of<T>(
     key: &[u8],
 ) -> Result<Vec<Vec<u8>>>
 where
-    T: ReadableTable<tables::IndexKey<'static>, ()>,
+    T: ReadableTable<tables::IndexKey<'static>, ()>
+        + TableTypes<K = tables::IndexKey<'static>, V = ()>,
 {
     use std::ops::Bound;
     let start = Bound::Included((coll.0, index_id, key, [].as_slice()));
@@ -705,7 +708,8 @@ fn scan_table<T>(
     unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>>
 where
-    T: ReadableTable<tables::IndexKey<'static>, ()>,
+    T: ReadableTable<tables::IndexKey<'static>, ()>
+        + TableTypes<K = tables::IndexKey<'static>, V = ()>,
 {
     use std::ops::Bound;
 
@@ -749,7 +753,8 @@ fn has_entries_at<T>(
     key: &[u8],
 ) -> Result<bool>
 where
-    T: ReadableTable<tables::IndexKey<'static>, ()>,
+    T: ReadableTable<tables::IndexKey<'static>, ()>
+        + TableTypes<K = tables::IndexKey<'static>, V = ()>,
 {
     use std::ops::Bound;
     let start = Bound::Included((coll.0, index_id, key, [].as_slice()));
@@ -1091,6 +1096,7 @@ impl crate::Engine {
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::IndexCreation);
             // `requested_name` rather than a shadow of `name`: a lost race
             // reassigns it before looping, and a shadow would swallow that.
+            // not a row: the name the client asked for, or the default.
             let name = requested_name.clone().unwrap_or_else(|| IndexMeta::default_name(&fields));
 
             // A local create takes the stamp of the entry it is about to mint, so
@@ -2282,6 +2288,7 @@ where
         use std::ops::Bound;
 
         let mut after: Option<Vec<u8>> = after.map(<[u8]>::to_vec);
+        // not a row: how many the caller wants.
         let mut batch = want.unwrap_or(usize::MAX).max(1);
         loop {
             self.outcome.passes += 1;

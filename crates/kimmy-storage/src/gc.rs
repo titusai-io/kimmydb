@@ -323,6 +323,7 @@ impl Engine {
                             });
                         }
                         Ok(_) => {}
+                        // not a row: the row's record, kept when it will not decode.
                         Err(_) => warn!("undecodable document record retained"),
                     }
                     if expired.len() >= TOMBSTONE_COLLECT_CHUNK || visited + seen >= budget {

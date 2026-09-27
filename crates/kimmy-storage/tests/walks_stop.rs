@@ -70,6 +70,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "divergence::Engine::collection_tombstones",
         "the dropped-collection registry: one row per drop",
     ),
+    (
+        "faults::Engine::corrupt_oplog_for_test",
+        "test support, built only with test-hooks: damages the store on purpose",
+    ),
     ("divergence::next_probe", "an in-memory set's range, not a table"),
     (
         "docs::WriteScope::for_each_doc",
@@ -425,19 +429,42 @@ fn functions(body: &str) -> Vec<Function> {
 /// Where `code`, one function's code joined, iterates a table: a `range`, an
 /// `iter()` whose result is a `Result`, or a `retain` that returns one.
 fn iterations(f: &Function) -> Vec<usize> {
+    // The names this function binds a table to, from any way of opening one.
+    let tables: Vec<String> = f
+        .code
+        .iter()
+        .filter(|l| l.contains("open_table(") || l.contains("open_walk_table"))
+        .filter_map(|l| {
+            let rest = l.trim_start().strip_prefix("let ")?;
+            let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+            let name: String =
+                rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
     let mut found = Vec::new();
     for (i, line) in f.code.iter().enumerate() {
         let next = f.code.get(i + 1).map_or("", |l| l.trim_start());
         let ranges = line.contains(".range(") || line.contains(".range::<");
-        let iter = line.find(".iter()").is_some_and(|at| {
+        // Called as a path: `ReadableTable::iter(&t)`, `ReadableTable::range(&t, ..)`.
+        let path = line.contains("::iter(") || line.contains("::range(");
+        // A table's `iter` returns a `Result`, which a slice's does not, so
+        // what follows it says which it was; and any `iter` on a name bound
+        // to a table is one.
+        let iter = line.match_indices(".iter()").any(|(at, _)| {
             let after = line[at + ".iter()".len()..].trim_start();
-            after.starts_with('?')
-                || after.starts_with(".map_err")
-                || (after.is_empty() && (next.starts_with('?') || next.starts_with(".map_err")))
+            let on_table = tables.iter().any(|t| line[..at].trim_end().ends_with(t.as_str()));
+            let result = |s: &str| {
+                ['?'].iter().any(|c| s.starts_with(*c))
+                    || [".map_err", ".expect(", ".unwrap(", ".unwrap_or", ".ok()"]
+                        .iter()
+                        .any(|m| s.starts_with(m))
+            };
+            on_table || result(after) || (after.is_empty() && result(next))
         });
         let retains = (line.contains(".retain(") || line.contains(".retain_in("))
             && line.trim_end().ends_with(")?;");
-        if ranges || iter || retains {
+        if ranges || path || iter || retains {
             found.push(f.line + i);
         }
     }
@@ -445,8 +472,20 @@ fn iterations(f: &Function) -> Vec<usize> {
 }
 
 /// The swallows a stop-aware walk may not make, unless marked.
-const SWALLOWS: [&str; 6] =
-    [".ok()", ".flatten()", "Result::ok", "let Ok(", "while let Some(Ok(", "filter_map(Result"];
+const SWALLOWS: [&str; 11] = [
+    ".ok()",
+    ".flatten()",
+    "Result::ok",
+    "let Ok(",
+    "while let Some(Ok(",
+    "filter_map(Result",
+    "Err(_) =>",
+    ".is_ok()",
+    "take_while",
+    "unwrap_or",
+    // Counting rows counts the stop's error as one more row.
+    ".count()",
+];
 
 fn storage_functions() -> Vec<(String, Function)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -497,6 +536,7 @@ fn every_walk_of_the_store_stops_or_says_why_it_need_not() {
     for key in STOP_AWARE_WALKS {
         let Some((_, f)) = walking.get(*key) else { continue };
         let takes_walk_table = f.code.iter().any(|l| l.contains("WalkTable<"));
+        let names_table_types = f.code.iter().any(|l| l.contains("TableTypes"));
         for (i, code) in f.code.iter().enumerate() {
             let at = f.line + i;
             if code.contains(".open_table(") {
@@ -505,7 +545,15 @@ fn every_walk_of_the_store_stops_or_says_why_it_need_not() {
                      table with open_walk_table"
                 ));
             }
-            // A generic bound is fine on a walk table's own type parameter.
+            // A generic bound is fine on a walk table's own type parameter,
+            // when it names `TableTypes`: without it the walk table's own
+            // `range` does not apply, and `Deref` reaches redb's, unchecked.
+            if code.contains("ReadableTable") && takes_walk_table && !names_table_types {
+                problems.push(format!(
+                    "{key}:{at}: bounds a walk table's type by ReadableTable without TableTypes, \
+                     so its range and iter are redb's own, which do not check the stop"
+                ));
+            }
             let plain = (code.contains("ReadableTable") && !takes_walk_table)
                 || (["ReadOnlyTable<", "redb::Table<"].iter().any(|t| code.contains(t))
                     && !code.contains("WalkTable<"));
@@ -621,6 +669,15 @@ fn the_scanner_finds_a_walk_and_skips_test_code() {
     assert_eq!(names, ["Walk::new", "Hold::drop"]);
     assert_eq!(iterations(&fs[0]), [2]);
     assert!(iterations(&fs[1]).is_empty(), "a Vec's iter is not a table's");
+    // A table's iter however its Result is handled, and redb's methods
+    // called by path.
+    let forms = "fn a() {\n    let rows = t.iter().expect(\"rows\");\n}\n\
+                 fn b() {\n    for row in ReadableTable::iter(&t)? {}\n}\n\
+                 fn c() {\n    let oplog = txn.open_table(OPLOG)?;\n    oplog.iter()\n}\n";
+    let fs = functions(forms);
+    for f in &fs {
+        assert!(!iterations(f).is_empty(), "{} iterates a table", f.name);
+    }
 }
 
 #[test]

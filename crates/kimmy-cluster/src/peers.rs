@@ -885,6 +885,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         // not applied is pulled again after the restart.
                         Err(crate::protocol::ProtocolError::Stopping(reason)) => {
                             debug!(%peer, %reason, "sync round ended: this node is shutting down");
+                            // Not counted as a contact's end either: that
+                            // count says how a running node's contacts end,
+                            // and the last round of a process's life is none
+                            // of its four ends.
                             contact.finish();
                         }
                         // A peer being unreachable is the normal state of a

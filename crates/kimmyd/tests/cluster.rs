@@ -2373,6 +2373,11 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
 /// stopped while they pull: its serve walks end at the signal, and it exits
 /// 0 promptly with the store closed (`engine closed`, the `shutdown` marker),
 /// and its next start repairs nothing.
+///
+/// Its drain is idle, so `close_writes` would end a request's walk at once
+/// too: this test covers the finding, and with no row checks at all the stop
+/// takes 10 s. `a_peers_pull_ends_at_the_signal_while_a_clients_request_drains`
+/// is its pair, and covers a serve walk mislabelled as a request's.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_closes_its_store() {
@@ -2435,7 +2440,7 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
     writer.abort();
     let log = b.log();
     assert!(status.success(), "{status:?}\n{log}");
-    assert!(took < Duration::from_secs(8), "the stop waited for the serve walks: {took:?}\n{log}");
+    assert!(took < Duration::from_secs(3), "the stop waited for the serve walks: {took:?}\n{log}");
     assert!(log.contains("stopped serving a peer's pull"), "no serve walk was in flight:\n{log}");
     // B's own pulls stop at the signal too, and that is no peer's failure.
     let stopping = &log[log.find("shutdown signal received").unwrap_or(0)..];
@@ -2541,6 +2546,10 @@ fn logged_at(line: &str) -> Option<f64> {
 /// The scopes apart: while a client's request keeps the drain busy, a pull a
 /// peer is making of this node ends at the signal, not at the drain's
 /// deadline. Its serve walk serves no client.
+///
+/// The pair of the headline test above: that one's idle drain ends a
+/// request's walk as promptly as a background one, so only this one, with the
+/// drain held, tells a serve walk mislabelled as a request's apart.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {

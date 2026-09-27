@@ -159,6 +159,10 @@ pub struct Engine {
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
     continuing_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Rows left before the walks stop; 0 for never. See
+    /// [`Engine::stop_walks_after_rows`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) stop_after_rows: std::sync::atomic::AtomicU64,
     /// Run once, inside the next change stream's resolve of where it starts;
     /// see [`Engine::during_next_watch_resolve`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1299,6 +1303,8 @@ impl Engine {
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
+            stop_after_rows: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
             watch_resolve_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             replay_read_hook: parking_lot::Mutex::new(None),
@@ -1545,8 +1551,8 @@ impl Engine {
     /// The node's stop signal has arrived: a walk of the store that serves
     /// no request should end rather than hold the engine open past the
     /// stop. Called beside every announcement of the stop. Irreversible for
-    /// this engine's life. Nothing reads it yet: the walks learn to stop in
-    /// a change of their own.
+    /// this engine's life. Every [`crate::WalkScope::Background`] walk reads
+    /// it, before each row (`walk::open_walk_table`).
     pub fn stop_walks(&self) {
         self.walks_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     }

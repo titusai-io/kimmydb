@@ -674,9 +674,13 @@ impl ApiError {
         // is the caller's (`WARN`), and everything else is this node's
         // (`ERROR`), a storage failure included.
         let (cause_code, cause_message, level) = match cause {
-            StorageError::Stopping(reason @ kimmy_storage::StopReason::DrainDeadline) => {
-                ("stopping", reason.to_string(), LogLevel::Warn)
-            }
+            // The signal's own reason reaches a request only through a walk
+            // that serves no client, which none does today; placed with the
+            // drain's, since it is the same shutdown doing its job.
+            StorageError::Stopping(
+                reason @ (kimmy_storage::StopReason::DrainDeadline
+                | kimmy_storage::StopReason::Shutdown),
+            ) => ("stopping", reason.to_string(), LogLevel::Warn),
             StorageError::Stopping(reason @ kimmy_storage::StopReason::StorageFailed) => {
                 ("storage_failed", reason.to_string(), LogLevel::Error)
             }

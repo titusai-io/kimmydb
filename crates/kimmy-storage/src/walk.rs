@@ -87,7 +87,32 @@ impl WalkStop<'static> {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+impl Engine {
+    /// Stop the walks, as the signal does, at the `rows`-th row any
+    /// stop-aware walk of this engine checks from now on. For a test that
+    /// needs the stop to arrive in the middle of a sequence of walks, where
+    /// no other hook reaches.
+    pub fn stop_walks_after_rows(&self, rows: u64) {
+        self.stop_after_rows.store(rows, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl WalkStop<'_> {
+    /// Count a row towards [`Engine::stop_walks_after_rows`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn count_row(&self) {
+        use std::sync::atomic::Ordering;
+        if let Some((engine, _)) = self.stop
+            && engine
+                .stop_after_rows
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                == Ok(1)
+        {
+            engine.stop_walks();
+        }
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         match self.stop {
             Some((engine, scope)) => engine.check_walk(scope),
@@ -134,13 +159,20 @@ impl<K: Key + 'static, V: Value + 'static> TableTypes for redb::Table<'_, K, V> 
     type V = V;
 }
 
-impl<'e, T: TableTypes + ReadableTable<T::K, T::V>> WalkTable<'e, T> {
+/// **A caller generic over the table must bound it by [`TableTypes`].**
+/// Without it these methods do not apply, and method resolution goes on
+/// through `Deref` to redb's own `range` and `iter`, which do not check the
+/// stop, and compiles. The guard refuses a stop-aware walk whose table
+/// bound leaves it out, and the table-driven test in this module catches
+/// one that reaches redb's anyway.
+impl<'e, T> WalkTable<'e, T> {
     /// The table's rows in `range`, checking the stop before each.
     pub(crate) fn range<'a, KR>(
         &self,
         range: impl RangeBounds<KR> + 'a,
     ) -> Result<Rows<'e, redb::Range<'_, T::K, T::V>>>
     where
+        T: TableTypes + ReadableTable<T::K, T::V>,
         KR: Borrow<<T::K as Value>::SelfType<'a>> + 'a,
     {
         self.walk.check()?;
@@ -148,7 +180,10 @@ impl<'e, T: TableTypes + ReadableTable<T::K, T::V>> WalkTable<'e, T> {
     }
 
     /// Every row of the table, checking the stop before each.
-    pub(crate) fn iter(&self) -> Result<Rows<'e, redb::Range<'_, T::K, T::V>>> {
+    pub(crate) fn iter(&self) -> Result<Rows<'e, redb::Range<'_, T::K, T::V>>>
+    where
+        T: TableTypes + ReadableTable<T::K, T::V>,
+    {
         self.walk.check()?;
         Ok(Rows { rows: self.table.iter()?, walk: self.walk, stopped: false })
     }
@@ -185,6 +220,8 @@ impl<I> Rows<'_, I> {
         if self.stopped {
             return None;
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.walk.count_row();
         let stop = self.walk.check().err();
         self.stopped = stop.is_some();
         stop
@@ -378,6 +415,84 @@ mod tests {
         engine.stop_walks();
         assert!(matches!(rows.next_back(), Some(Err(StorageError::Stopping(_)))));
         assert!(rows.next().is_none(), "one error, then the end");
+    }
+
+    /// Every public walk that stops, called once its scope's stop has come:
+    /// each answers `Stopping`, rather than a partial answer. A walk that
+    /// is stop-aware in its tables but ended some other way on the stop, or
+    /// swallowed the error, fails here whatever the source looks like.
+    #[test]
+    fn every_stop_aware_walk_answers_stopping_once_its_stop_has_come() {
+        type Walk = fn(&Engine, &crate::CollectionMeta) -> Result<()>;
+        let unique = |engine: &Engine| {
+            let field = crate::IndexField { path: "_id".into(), descending: false };
+            engine.create_index("shop", "orders", vec![field], true, Some("by_n".into())).unwrap()
+        };
+        let background: &[(&str, Walk)] = &[
+            ("serve_entries_to_peer", |e, _| {
+                e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[]).map(drop)
+            }),
+            ("entries_for_peer", |e, _| {
+                e.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).map(drop)
+            }),
+            ("held_marks_covered_by", |e, _| {
+                e.held_marks_covered_by(&e.witnessed_vector()?).map(drop)
+            }),
+            ("snapshot_page", |e, _| e.snapshot_page(None, None).map(drop)),
+            ("collect_garbage", |e, _| {
+                e.collect_garbage(crate::RetentionPolicy::new(0, 0)).map(drop)
+            }),
+            ("index_keyed_entries_after", |e, c| {
+                let index = c.index("by_n").unwrap();
+                e.index_keyed_entries_after(c, index.id, &[], &[0xFF; 8], None, 100).map(drop)
+            }),
+            ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Background, |_, _| Ok(true))),
+        ];
+        let request: &[(&str, Walk)] = &[
+            ("backup_to", |e, _| e.backup_to(&mut Vec::new(), WalkScope::Request).map(drop)),
+            ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Request, |_, _| Ok(true))),
+            ("for_each_record_after", |e, c| {
+                e.for_each_record_after(c, None, WalkScope::Request, |_, _, _| Ok(true))
+            }),
+            ("for_each_doc_or_undecodable", |e, c| {
+                e.for_each_doc_or_undecodable(c, WalkScope::Request, |_, _| Ok(true))
+            }),
+            ("count", |e, c| e.count(c, WalkScope::Request).map(drop)),
+            ("live_unique_violations", |e, c| {
+                e.live_unique_violations(c, None, WalkScope::Request).map(drop)
+            }),
+            ("read_oplog_from", |e, _| {
+                e.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).map(drop)
+            }),
+            ("index_candidates", |e, c| {
+                let index = c.index("by_n").unwrap();
+                e.index_candidates(c, index.id, &[], &[0xFF; 8]).map(drop)
+            }),
+            ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("by_n").unwrap().id).map(drop)),
+            ("undecidable_count", |e, c| {
+                e.undecidable_count(c, c.index("by_n").unwrap().id).map(drop)
+            }),
+            ("a client's index build", |e, _| {
+                let field = crate::IndexField { path: "m".into(), descending: false };
+                e.create_index("shop", "orders", vec![field], false, None).map(drop)
+            }),
+        ];
+        for (scope, walks) in [(WalkScope::Background, background), (WalkScope::Request, request)] {
+            for (name, walk) in walks {
+                let (engine, _coll, _dir) = engine_with(10);
+                unique(&engine);
+                let coll = engine.get_collection("shop", "orders").unwrap();
+                match scope {
+                    WalkScope::Background => engine.stop_walks(),
+                    WalkScope::Request => engine.set_stopping(),
+                }
+                let answer = walk(&engine, &coll);
+                assert!(
+                    matches!(answer, Err(StorageError::Stopping(_))),
+                    "{name} ({scope:?}) answered {answer:?}"
+                );
+            }
+        }
     }
 
     /// A backup that stops writes no `END`, so what it wrote is refused as

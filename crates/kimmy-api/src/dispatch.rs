@@ -198,39 +198,52 @@ impl Backoff {
 ///
 /// The union rather than this node's own record: after a failover the new owner
 /// must not resend what the previous owner already delivered.
-pub fn union_progress(state: &SharedState, subscription: &str) -> VersionVector {
+///
+/// An error when the records could not all be read, the node's stop
+/// included: a union of the ones that were would be lower than the truth, and
+/// a subscription planned from it could be invalidated as fallen behind.
+pub fn union_progress(
+    state: &SharedState,
+    subscription: &str,
+) -> kimmy_storage::Result<VersionVector> {
     let mut union = VersionVector::new();
-    let Ok(meta) = state.engine.get_collection(WEBHOOKS_DB, PROGRESS_COLLECTION) else {
-        return union;
+    let meta = match state.engine.get_collection(WEBHOOKS_DB, PROGRESS_COLLECTION) {
+        Ok(meta) => meta,
+        // Created on first use: no progress recorded anywhere yet.
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) => {
+            return Ok(union);
+        }
+        Err(e) => return Err(e),
     };
     let prefix = format!("{subscription}:");
-    let _ =
-        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
-            if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
-                && let Ok(vector) = document.get_document("delivered")
-            {
-                for (node, hlc) in vector {
-                    // The HLC is stored as its own byte encoding rather than a
-                    // string: it has no `FromStr`, and its wall clock is a `u64`
-                    // that BSON cannot hold as an integer above `i64::MAX` — the
-                    // bug that once stopped half of all collections replicating.
-                    let bson::Bson::Binary(binary) = hlc else {
-                        continue;
-                    };
-                    let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
-                        continue;
-                    };
-                    let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
-                        continue;
-                    };
-                    let mut one = VersionVector::new();
-                    one.insert(node, Hlc::from_bytes(bytes));
-                    union.merge(&one);
-                }
+    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
+        if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
+            && let Ok(vector) = document.get_document("delivered")
+        {
+            for (node, hlc) in vector {
+                // The HLC is stored as its own byte encoding rather than a
+                // string: it has no `FromStr`, and its wall clock is a `u64`
+                // that BSON cannot hold as an integer above `i64::MAX` — the
+                // bug that once stopped half of all collections replicating.
+                let bson::Bson::Binary(binary) = hlc else {
+                    continue;
+                };
+                let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
+                    continue;
+                };
+                let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
+                    continue;
+                };
+                let mut one = VersionVector::new();
+                one.insert(node, Hlc::from_bytes(bytes));
+                union.merge(&one);
             }
-            Ok(true)
-        });
-    union
+        }
+        Ok(true)
+    })?;
+    Ok(union)
 }
 
 /// Drop every node's progress record for a subscription that is gone.
@@ -247,14 +260,20 @@ pub fn forget_progress(state: &SharedState, subscription: &str) {
     };
     let prefix = format!("{subscription}:");
     let mut stale = Vec::new();
-    let _ = state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
-        if let Ok(id) = document.get_str("_id")
-            && id.starts_with(&prefix)
-        {
-            stale.push(id.to_string());
-        }
-        Ok(true)
-    });
+    let listed =
+        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
+            if let Ok(id) = document.get_str("_id")
+                && id.starts_with(&prefix)
+            {
+                stale.push(id.to_string());
+            }
+            Ok(true)
+        });
+    // What was listed is removed either way; the rest stays for no reader,
+    // as a failed removal below does.
+    if let Err(e) = listed {
+        warn!(subscription, error = %e, "could not list all of a removed webhook's progress");
+    }
     for id in stale {
         if let Err(e) = state.engine.delete(&meta, &kimmy_core::DocId::String(id.clone())) {
             warn!(subscription, record = %id, error = %e, "could not remove webhook progress");
@@ -703,7 +722,22 @@ pub async fn dispatch_once(
             continue;
         }
 
-        let mut progress = union_progress(state, &job.id);
+        let mut progress = match union_progress(state, &job.id) {
+            Ok(progress) => progress,
+            // The node is stopping: the pass ends quietly, planning nothing
+            // from a union it did not finish reading.
+            Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                debug!(%reason, "webhook dispatch ended: this node is shutting down");
+                return outcome;
+            }
+            // Not measured, and not planned: a lower union than the truth
+            // could invalidate a subscription that is not behind.
+            Err(e) => {
+                warn!(subscription = %job.id, error = %e, "could not read a subscription's progress");
+                read_failed = true;
+                continue;
+            }
+        };
         // `behind` answers "from where must I read", which is the same question
         // anti-entropy asks of a peer. `None` means the subscription's progress
         // already covers everything this node holds — it is caught up, and

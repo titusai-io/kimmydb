@@ -301,10 +301,6 @@ pub async fn serve_with(
     }
 }
 
-/// Whether an apply that failed failed on this node's own storage, rather
-/// than on what the peer sent: a push whose entry does not decode is the
-/// peer's frame, and a full disk is this node's. Exhaustive, so a new
-/// storage error has to be placed.
 /// A storage error as the protocol names it: this node's own stop is
 /// [`ProtocolError::Stopping`], which is neither the peer's failure nor the
 /// round's, and anything else is what `otherwise` makes of its text.
@@ -320,6 +316,10 @@ pub(crate) fn from_storage(
     }
 }
 
+/// Whether an apply that failed failed on this node's own storage, rather
+/// than on what the peer sent: a push whose entry does not decode is the
+/// peer's frame, and a full disk is this node's. Exhaustive, so a new
+/// storage error has to be placed.
 fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
     use kimmy_storage::StorageError as E;
     match e {

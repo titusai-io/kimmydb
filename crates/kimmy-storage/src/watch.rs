@@ -890,7 +890,7 @@ impl<'t> Seek<'t> {
                         // drops to the start of the range, and the race keeps
                         // the resume at the walk's price. Such keys are kept
                         // on purpose (`release_held_under`).
-                        Err(_) => self.lower(Hlc::ZERO),
+                        Err(_) => self.lower(Hlc::ZERO), // not a row: a mark's key.
                     }
                     return Ok(None);
                 }
