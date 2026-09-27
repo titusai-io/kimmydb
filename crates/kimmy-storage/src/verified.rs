@@ -514,10 +514,33 @@ mod tests {
             skipped.contains("skipped the oplog walk: the version vector is verified"),
             "{skipped}"
         );
-        for field in ["rows=", "logical_bytes=", "walk_ms="] {
+        for field in ["rows=", "logical_bytes=", "walk_ms=", "oplog_entries="] {
             assert!(skipped.contains(field), "{field}: {skipped}");
         }
         assert!(!skipped.contains("checked the version vector"), "{skipped}");
+    }
+
+    /// A skip says what the last walk read and what the oplog holds now,
+    /// which differ once the store has been written since: a store verified
+    /// empty and then loaded skipped with `rows=0` and nothing to say how
+    /// much it held (round 0430).
+    #[test]
+    fn a_skip_says_what_the_oplog_holds_now_beside_what_the_walk_read() {
+        let (_dir, path, _) = store(0);
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            for i in 0..5 {
+                engine.insert(&coll, doc! { "_id": 100 + i }).unwrap();
+            }
+        }
+        let now = Engine::open(&path).unwrap().oplog_entries().unwrap();
+        let skipped = logs_of(|| drop(Engine::open(&path).unwrap()));
+        let recorded = record_of(&path).unwrap();
+        let rows = decode(&recorded, crate::migrate::SCHEMA_VERSION).unwrap().rows;
+        assert!(rows < now, "premise: written since the walk: {rows} then, {now} now");
+        assert!(skipped.contains(&format!("rows={rows}")), "{skipped}");
+        assert!(skipped.contains(&format!("oplog_entries={now}")), "{skipped}");
     }
 
     /// A record that cannot be read is no record, not a failed open: here a
