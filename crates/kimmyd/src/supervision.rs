@@ -128,7 +128,16 @@ pub fn install(data_dir: PathBuf) -> bool {
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        error!(panic = %info, "a thread panicked");
+        let thread = std::thread::current();
+        error!(
+            panic = %info,
+            // Which thread, since a runtime's worker and blocking threads
+            // share one name, and where, apart from the message.
+            thread = thread.name().unwrap_or("unnamed"),
+            thread_id = ?thread.id(),
+            location = info.location().map(|l| l.to_string()),
+            "a thread panicked"
+        );
         default(info);
     }));
 }

@@ -455,6 +455,21 @@ impl Confirmer {
         self.drivers.lock().abort_all();
     }
 
+    /// [`Self::abort_all`], and then wait until every driver has ended: an
+    /// aborted driver inside a storage step runs on to its next yield, and
+    /// the node shuts its runtime down only after that. Repeated until no
+    /// driver is left, since a request may start one meanwhile.
+    pub async fn stop_all(&self) {
+        loop {
+            let mut drivers = std::mem::take(&mut *self.drivers.lock());
+            if drivers.is_empty() {
+                return;
+            }
+            drivers.abort_all();
+            while drivers.join_next().await.is_some() {}
+        }
+    }
+
     /// Members with a queue entry: something waiting, a push in flight, or a
     /// back-off that still counts. Empty on an idle node once back-offs have
     /// run out and a confirmation has run since.

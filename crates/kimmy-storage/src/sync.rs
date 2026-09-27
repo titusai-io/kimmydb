@@ -628,6 +628,7 @@ impl Engine {
         exhausted: bool,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
+        self.test_apply_delay();
         let (applied, waited) = crate::engine::metered_writer_wait(|| {
             self.apply_batch_absorbing_into(
                 entries,
