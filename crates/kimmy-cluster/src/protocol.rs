@@ -402,10 +402,22 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
     // Closed only at a frame boundary, before the first byte of a prefix. A
     // connection that ends inside the prefix ended mid-frame, which is an
     // I/O failure like one that ends inside the body.
+    //
+    // At the boundary, TLS's end without `close_notify` is a close too:
+    // rustls reports it as `UnexpectedEof` rather than as the end, but every
+    // exchange before it was whole, since frames carry their own length, so
+    // nothing was cut short. It is how a peer before 0.41 ended every round,
+    // and how any peer's connection ends when its process goes.
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < len.len() {
-        match reader.read(&mut len[got..]).await? {
+        let read = match reader.read(&mut len[got..]).await {
+            Err(e) if got == 0 && e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(ProtocolError::Closed);
+            }
+            read => read?,
+        };
+        match read {
             0 if got == 0 => return Err(ProtocolError::Closed),
             0 => {
                 return Err(ProtocolError::Io(io::Error::new(

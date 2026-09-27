@@ -126,16 +126,16 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
-    /// The control's no-op ([`crate`]'s `bench-no-live-counts`).
-    #[cfg(feature = "bench-no-live-counts")]
+    /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
+    #[cfg(kimmy_bench_no_live_counts)]
     fn moved(&mut self, _collection: u64, _was_live: bool, _is_live: bool) {}
 
-    /// The control's no-op ([`crate`]'s `bench-no-live-counts`).
-    #[cfg(feature = "bench-no-live-counts")]
+    /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
+    #[cfg(kimmy_bench_no_live_counts)]
     pub(crate) fn appended(&mut self, _mark: Vec<u8>) {}
 
     /// Move `collection`'s count by what one write did to liveness there.
-    #[cfg(not(feature = "bench-no-live-counts"))]
+    #[cfg(not(kimmy_bench_no_live_counts))]
     fn moved(&mut self, collection: u64, was_live: bool, is_live: bool) {
         let delta = match (was_live, is_live) {
             (false, true) => 1,
@@ -148,7 +148,7 @@ impl Pending {
     }
 
     /// Record where an append left the store, for [`flush`] to write once.
-    #[cfg(not(feature = "bench-no-live-counts"))]
+    #[cfg(not(kimmy_bench_no_live_counts))]
     pub(crate) fn appended(&mut self, mark: Vec<u8>) {
         self.mark = Some(mark);
     }
@@ -203,8 +203,8 @@ pub(crate) fn remove_record(
 /// before an engine exists (`Engine::open`, the migration, a restore) write
 /// through `rebuild_if_stale` or not at all.
 pub(crate) fn flush(txn: &WriteTransaction, pending: &Pending) -> Result<()> {
-    // The control writes nothing at all (`bench-no-live-counts`).
-    if cfg!(feature = "bench-no-live-counts") {
+    // The control writes nothing at all (`--cfg kimmy_bench_no_live_counts`).
+    if cfg!(kimmy_bench_no_live_counts) {
         let _ = (txn, pending);
         return Ok(());
     }

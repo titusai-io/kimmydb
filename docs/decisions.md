@@ -17149,7 +17149,7 @@ two.
 **What it is worth.** `benches/write_path.rs`, one Mac, `durable`. Three
 configurations of the same binary: 0.30.0 as shipped, this change, and a control
 with the live-count and mark calls compiled out (the `bench-no-live-counts`
-feature). Each trial builds its own store, grown to 64 MiB past an 8 MiB page
+feature, since 0.41.0 `--cfg kimmy_bench_no_live_counts`). Each trial builds its own store, grown to 64 MiB past an 8 MiB page
 cache so the tree is deeper than the cache is wide. Five trials per cell, given
 as the series in order, because a mean hides drift and drift is what wrecked the
 first attempt at this measurement.

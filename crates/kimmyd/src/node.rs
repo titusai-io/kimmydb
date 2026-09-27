@@ -3006,31 +3006,37 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
-        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // When the stop came. The callback runs on the drain deadline's own
+        // task, and axum-server ends `serve` on a timer of its own of the same
+        // length, so neither is ordered before the other: the test waits for
+        // the callback rather than reading a flag once `serve` has returned.
+        // The daemon does not rely on the order either, since its close to
+        // writes after `serve` sets the same stop (`Engine::close_writes`).
+        let (stopped, mut stop_at) = tokio::sync::oneshot::channel::<tokio::time::Instant>();
         let drain = Duration::from_millis(400);
-        let served = tokio::spawn({
-            let stopped = Arc::clone(&stopped);
-            serve(
-                listener,
-                app,
-                None,
-                async move {
-                    let _ = signalled.await;
-                },
-                drain,
-                move || stopped.store(true, std::sync::atomic::Ordering::SeqCst),
-            )
-        });
+        let served = tokio::spawn(serve(
+            listener,
+            app,
+            None,
+            async move {
+                let _ = signalled.await;
+            },
+            drain,
+            move || {
+                let _ = stopped.send(tokio::time::Instant::now());
+            },
+        ));
 
         // A request in flight that will never finish.
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"GET /forever HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        let signalled_at = tokio::time::Instant::now();
         signal.send(()).unwrap();
         tokio::time::sleep(drain / 2).await;
         assert!(
-            !stopped.load(std::sync::atomic::Ordering::SeqCst),
+            stop_at.try_recv().is_err(),
             "the stop came at the signal, before the drain had run"
         );
         let connections = tokio::time::timeout(drain * 4, served)
@@ -3038,7 +3044,9 @@ mod tests {
             .expect("the drain did not end at its deadline")
             .unwrap()
             .unwrap();
-        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "no stop at the deadline");
+        let stopped_at =
+            tokio::time::timeout(drain, stop_at).await.expect("no stop at the deadline").unwrap();
+        assert!(stopped_at >= signalled_at + drain, "the stop came before the drain's deadline");
         // The request still in flight is closed with its connection at the
         // deadline, and the connections' end, which the stop waits for
         // before the runtime goes, follows at once.

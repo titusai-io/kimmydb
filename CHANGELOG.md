@@ -43,6 +43,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   reported the same resource. When telemetry is configured, the start logs
   `telemetry instance`, with `service_instance_id` and `node`, the node id,
   so one can be found from the other.
+- **No more `peer connection failed` on every replication round.** Each
+  member logged it at `WARN`, with `reason: "io"` and "peer closed connection
+  without sending TLS close_notify", for every sync round a peer pulled from
+  it and every schema-change push a peer made to it: about 24 a minute per
+  member on an idle three-member cluster, each counted in
+  `kimmy_sync_serve_failures_total{reason="io"}`. Nothing had failed: the
+  dialling member ended each exchange by dropping its connection without
+  TLS's `close_notify`, which the serving member read as an error. A member
+  now closes an exchange's connection in order (bounded, half a second), and
+  reads a connection that ends between two messages without `close_notify`
+  as a close, since members before this one end theirs that way. A
+  connection that ends inside a message, or is reset, is still a failure,
+  logged and counted as before. What else changes in the count and the log:
+  - `reason="io"` no longer counts a peer whose process went away between
+    requests, or a pulling peer that gave up at its round's timeout: both
+    end between messages.
+  - **A peer that hangs up in the middle of the handshake now counts as
+    `reason="unauthenticated"`**, with the handshake's `WARN` text, where it
+    counted as `io`: a wrong `cluster_secret`, a handshake past its timeout,
+    or a member stopping mid-handshake in a rolling restart. An alert on
+    `unauthenticated` may now fire during a roll.
+  - A peer that completes TLS and hangs up before saying anything is logged
+    at `DEBUG` as `peer disconnected`, not counted.
 - **A quiet member's writes reach its peers after a large load elsewhere.**
   A pull asks a peer for what it lacks from one position, and the peer walks
   its oplog from there, passing over what the puller holds. That walk had no

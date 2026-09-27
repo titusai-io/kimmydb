@@ -781,7 +781,26 @@ pub async fn sync_once_with(
     stalls: &mut PeerStalls,
 ) -> Result<SyncOutcome, ProtocolError> {
     let (mut stream, their_node) = dial(engine, peer, secret).await?;
-    sync_over(engine, &mut stream, peer, their_node, probe, stalls).await
+    let outcome = sync_over(engine, &mut stream, peer, their_node, probe, stalls).await;
+    close(&mut stream).await;
+    outcome
+}
+
+/// How long a dialler gives its TLS close: one record out and the socket's
+/// write half shut, which a live peer takes at once.
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// End a dialled exchange in order: TLS `close_notify`, then the write half.
+///
+/// A connection dropped without it reaches the peer as an end with no
+/// `close_notify`, which rustls reports as an error and not as the end, and
+/// which the serving side logged at `WARN` as a failed peer connection, on
+/// every round from every peer (0.40.0, 0.40.1). Bounded, since a peer that
+/// has stopped reading must not hold a round, or a stop, up; and best effort,
+/// since the exchange has already ended and nothing depends on it.
+pub(crate) async fn close<S: AsyncWrite + Unpin>(stream: &mut S) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, stream.shutdown()).await;
 }
 
 /// Dial `peer`, complete TLS and the handshake, and hand back the stream and
@@ -2781,6 +2800,136 @@ pub(crate) mod test_hooks {
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
             const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    }
+}
+
+/// Test support: peer connections served as [`serve_with`] serves them, and
+/// how each ended, for this module's tests and `confirm`'s.
+#[cfg(test)]
+pub(crate) mod test_serving {
+    use super::*;
+
+    /// A stream that says how its reads ended: `Ok(0)`, the end TLS reports
+    /// after `close_notify`, or an error.
+    pub(crate) struct Recording<S> {
+        pub(crate) inner: S,
+        pub(crate) ended: Arc<parking_lot::Mutex<Option<String>>>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Recording<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            match &polled {
+                std::task::Poll::Ready(Ok(())) if buf.filled().len() == before => {
+                    *self.ended.lock() = Some("close_notify".into());
+                }
+                std::task::Poll::Ready(Err(e)) => *self.ended.lock() = Some(format!("{e}")),
+                _ => {}
+            }
+            polled
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Recording<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Serve one connection accepted on `listener` as `serve_with` does, and
+    /// answer how its reads ended.
+    pub(crate) async fn serve_one_recording(
+        engine: Arc<Engine>,
+        listener: tokio::net::TcpListener,
+        secret: &str,
+    ) -> Option<String> {
+        let (tcp, peer) = listener.accept().await.unwrap();
+        let tls = crate::tls::ClusterTls::new().unwrap();
+        let stream = tls.acceptor().accept(tcp).await.unwrap();
+        let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+        let ended = Arc::new(parking_lot::Mutex::new(None));
+        let recording = Recording { inner: stream, ended: Arc::clone(&ended) };
+        serve_connection(&engine, recording, secret, &binding, None, None, peer).await;
+        ended.lock().take()
+    }
+
+    /// A node's serve counted: every failure, from the hook that is called
+    /// at exactly the lines that log `peer connection failed` at WARN, and
+    /// every connection's end, so a test waits for the ends it caused rather
+    /// than for a time a slow runner can outlast.
+    pub(crate) struct Counted {
+        pub(crate) failures: Arc<parking_lot::Mutex<Vec<ServeFailure>>>,
+        ended: tokio::sync::watch::Receiver<usize>,
+    }
+
+    impl Counted {
+        /// Wait until `n` connections have ended, all told.
+        pub(crate) async fn ended(&mut self, n: usize) {
+            let waited =
+                tokio::time::timeout(Duration::from_secs(10), self.ended.wait_for(|e| *e >= n));
+            assert!(waited.await.is_ok(), "{n} connections never ended");
+        }
+    }
+
+    /// Serve `listener` as [`serve_with`] does, each connection counted.
+    pub(crate) fn serve_counted(
+        engine: Arc<Engine>,
+        listener: tokio::net::TcpListener,
+        secret: &str,
+    ) -> Counted {
+        let failures = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let failures = Arc::clone(&failures);
+            Arc::new(move |reason| failures.lock().push(reason))
+        };
+        let (count, ended) = tokio::sync::watch::channel(0usize);
+        let count = Arc::new(count);
+        let secret = secret.to_string();
+        let tls = Arc::new(crate::tls::ClusterTls::new().unwrap());
+        tokio::spawn(async move {
+            while let Ok((tcp, peer)) = listener.accept().await {
+                let (engine, secret, hook) = (Arc::clone(&engine), secret.clone(), hook.clone());
+                let (count, acceptor) = (Arc::clone(&count), tls.acceptor());
+                tokio::spawn(async move {
+                    if let Ok(stream) = acceptor.accept(tcp).await {
+                        let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+                        serve_connection(
+                            &engine,
+                            stream,
+                            &secret,
+                            &binding,
+                            None,
+                            Some(&hook),
+                            peer,
+                        )
+                        .await;
+                    }
+                    count.send_modify(|n| *n += 1);
+                });
+            }
+        });
+        Counted { failures, ended }
     }
 }
 
@@ -5351,6 +5500,102 @@ mod tests {
             declined += stalls.take_applied().ddl_declined;
         }
         assert_eq!(declined, 1, "the decline, counted by the batch that declined it");
+    }
+
+    // -----------------------------------------------------------------------
+    // How a peer connection ends
+    // -----------------------------------------------------------------------
+
+    const CLOSING_SECRET: &str = "a-closing-secret";
+
+    /// A node serving over real TLS, with its serve counted
+    /// ([`test_serving::serve_counted`]).
+    async fn serving_counted() -> (Arc<Engine>, tempfile::TempDir, SocketAddr, test_serving::Counted)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counted = test_serving::serve_counted(Arc::clone(&engine), listener, CLOSING_SECRET);
+        (engine, dir, addr, counted)
+    }
+
+    /// An idle two-node cluster's rounds end as rounds, not as failures. Each
+    /// round used to end with the dialler dropping its TLS stream, which the
+    /// serving side read as an end with no `close_notify` and logged at WARN
+    /// as `peer connection failed` with reason `io`, every round from every
+    /// peer (0.40.0 and 0.40.1, about every five seconds on an idle cluster).
+    #[tokio::test]
+    async fn a_round_between_two_nodes_ends_without_a_failure() {
+        let (a, _a_dir, addr, mut served) = serving_counted().await;
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let mut stalls = PeerStalls::new();
+        for _ in 0..3 {
+            sync_once_with(&b, addr, CLOSING_SECRET, None, &mut stalls).await.unwrap();
+        }
+        served.ended(3).await;
+        assert!(b.get_collection("shop", "orders").is_ok(), "premise: the rounds replicated");
+        assert_eq!(*served.failures.lock(), [], "a round's end logged as `peer connection failed`");
+    }
+
+    /// The dialler's half: a round ends with `close_notify`, so the serving
+    /// side reads the end TLS defines, not an error, whatever build it runs.
+    #[tokio::test]
+    async fn a_round_ends_with_close_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(test_serving::serve_one_recording(a, listener, CLOSING_SECRET));
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        sync_once_with(&b, addr, CLOSING_SECRET, None, &mut PeerStalls::new()).await.unwrap();
+        let ended = served.await.unwrap();
+        assert_eq!(ended.as_deref(), Some("close_notify"), "the round ended without it");
+    }
+
+    /// The serving side's half: a dialler that drops its connection after a
+    /// whole exchange, with no `close_notify`, as every build before 0.41 did
+    /// and as any process does when it goes, has closed it, not failed.
+    #[tokio::test]
+    async fn a_dropped_connection_at_a_frame_boundary_is_a_close() {
+        let (a, _a_dir, addr, mut served) = serving_counted().await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+        write_frame(&mut stream, &Message::AskVersions { witnessed: true }).await.unwrap();
+        assert!(read_frame(&mut stream).await.is_ok(), "premise: a whole exchange");
+        drop(stream);
+        served.ended(1).await;
+        assert_eq!(*served.failures.lock(), [], "a close counted as a serve failure");
+        drop(a);
+    }
+
+    /// And a connection that ends inside a frame still failed, with or
+    /// without `close_notify`: the peer went away mid-request.
+    #[tokio::test]
+    async fn a_connection_that_ends_mid_frame_is_still_a_failure() {
+        use tokio::io::AsyncWriteExt;
+        let (_a, _a_dir, addr, mut served) = serving_counted().await;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        for orderly in [false, true] {
+            let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
+            // Two of a length prefix's four bytes, then the end.
+            stream.write_all(&[0, 0]).await.unwrap();
+            stream.flush().await.unwrap();
+            if orderly {
+                close(&mut stream).await;
+            }
+            drop(stream);
+        }
+        served.ended(2).await;
+        let failures = served.failures.lock().clone();
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures.iter().all(|f| matches!(f, ServeFailure::Io)), "{failures:?}");
     }
 }
 
