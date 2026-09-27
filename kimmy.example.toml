@@ -660,9 +660,12 @@ format = "pretty"
 #
 # service_name = "kimmydb"
 
-# How long one export may take before it is abandoned. Exports are off the
-# request path, so this bounds an exporter thread rather than a client: an
-# unreachable collector costs a timeout every batch and nothing else.
+# The time an export has for its attempts. Exports are off the request path,
+# so this bounds an exporter thread rather than a client. A failed export is
+# retried with backoff (it could not connect, or was answered 429, 502, 503 or
+# 504), but a retry starts only while time is left here, and an attempt may
+# itself take all of it: a slow collector can hold an exporter thread for up to
+# about twice this per batch, and costs nothing else.
 #
 # export_timeout_secs = 10
 

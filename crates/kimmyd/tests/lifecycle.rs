@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod node_logs;
@@ -1199,6 +1201,105 @@ async fn a_collector_that_never_answers_does_not_hold_the_stop() {
     }
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
     drop(silent);
+}
+
+/// A collector that answers every export 503 with `Retry-After: {retry_after}`,
+/// and how many exports it has answered.
+fn throttling_collector(retry_after: u64) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = listener.local_addr().unwrap();
+    let throttled = Arc::new(AtomicUsize::new(0));
+    let answered = Arc::clone(&throttled);
+    // UNSUPERVISED: the test's collector, which lives as long as the test.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let answered = Arc::clone(&answered);
+            // UNSUPERVISED: one connection of the test's collector.
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    // One request: its headers, then as much body as they say.
+                    let mut length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    if reader.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    answered.fetch_add(1, Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nRetry-After: {retry_after}\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    );
+                    if reader.get_mut().write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (at, throttled)
+}
+
+/// A collector the exporter retries holds nothing up either, and what bounds
+/// each case. Since opentelemetry-otlp 0.33 an export that cannot connect, or
+/// is answered 429, 502, 503 or 504, is tried again with backoff; upstream
+/// checks the time left only before each wait, so its own timeout does not
+/// bound it.
+///
+/// - **Throttled with `Retry-After: 3`**, under the ten-second export
+///   timeout: the exporter waits the three seconds and asks again, so only
+///   the stop's two seconds for the exporters end it, and the node says it
+///   exited without them.
+/// - **Throttled with `Retry-After: 30`**, past the export timeout: the
+///   exporter gives up at once rather than wait, and the stop's deadline is
+///   never reached.
+/// - **Refused**: three retries over about a second of backoff end on their
+///   own, near the two seconds; bounded by the deadline either way.
+#[tokio::test]
+async fn a_collector_the_exporter_retries_does_not_hold_the_stop() {
+    let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let (waited_for, waiting) = throttling_collector(3);
+    let (given_up_on, giving_up) = throttling_collector(30);
+    let client = reqwest::Client::new();
+    const LATE: &str = "the collector did not take the last spans and metrics in time";
+    for (name, at, late) in [
+        ("throttling-otlp", waited_for, Some(true)),
+        ("throttled-past-the-timeout-otlp", given_up_on, Some(false)),
+        ("refusing-otlp", refused, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = format!("http://{at}");
+        let mut run = Run::spawn_with(dir.path(), name, &[("KIMMY_OTLP_ENDPOINT", &endpoint)]);
+        run.wait_ready(&client).await;
+        let (status, took) = stop(&mut run);
+        let log = run.log();
+        assert!(status.success(), "{name}: {status:?}: {log}");
+        assert!(took < Duration::from_secs(6), "{name}: the exporters held the stop: {took:?}");
+        assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""), "{name}");
+        if let Some(late) = late {
+            assert_eq!(log.contains(LATE), late, "{name}: {log}");
+        }
+    }
+    assert!(
+        waiting.load(Ordering::SeqCst) > 0,
+        "the throttling collector was never sent an export"
+    );
+    assert!(giving_up.load(Ordering::SeqCst) > 0, "nor the other one");
 }
 
 /// An expiry pass in progress at the stop ends at its next delete: the
