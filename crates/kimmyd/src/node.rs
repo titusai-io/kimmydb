@@ -1752,6 +1752,14 @@ impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
     async fn accept_stream(&self) -> std::io::Result<(tokio::net::TcpStream, Peer)> {
         match self.listener.accept().await {
             Ok((stream, addr)) => Ok((stream, Peer(addr))),
+            // One client's connection that failed before it was accepted is
+            // that client's, not the listener's: at debug, as `axum::serve`
+            // skipped it, so a port scan or a health check's churn raises no
+            // alarm.
+            Err(error) if !accept_error_is_the_listeners(error.kind()) => {
+                debug!(%error, "a connection failed before it was accepted");
+                Err(error)
+            }
             Err(error) => {
                 let now = std::time::Instant::now();
                 let mut logged =
@@ -1772,6 +1780,14 @@ impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
     fn get_local_addr(&self) -> std::io::Result<Peer> {
         self.listener.local_addr().map(Peer)
     }
+}
+
+/// Whether an accept that failed with `kind` is the listener's failure, one
+/// that refuses every client until it clears (out of descriptors, of buffers,
+/// of memory), rather than one client's connection that went away first.
+fn accept_error_is_the_listeners(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    !matches!(kind, ConnectionAborted | ConnectionReset | ConnectionRefused)
 }
 
 /// The end of every HTTP connection's task, which [`serve`] hands back: the
@@ -2918,6 +2934,23 @@ mod tests {
     /// comes at its end, not at the signal (ADR-192): a request that never
     /// finishes no longer holds the process up, and one that can finish
     /// inside the drain is not stopped.
+    /// A client's connection that failed before it was accepted is not the
+    /// listener's failure, and is not an alarm; running out of descriptors,
+    /// buffers or memory is.
+    #[test]
+    fn only_the_listeners_own_accept_errors_are_reported() {
+        use std::io::ErrorKind;
+        for kind in
+            [ErrorKind::ConnectionAborted, ErrorKind::ConnectionReset, ErrorKind::ConnectionRefused]
+        {
+            assert!(!accept_error_is_the_listeners(kind), "{kind:?}");
+        }
+        let out_of_descriptors = std::io::Error::from_raw_os_error(24).kind();
+        for kind in [out_of_descriptors, ErrorKind::OutOfMemory, ErrorKind::Other] {
+            assert!(accept_error_is_the_listeners(kind), "{kind:?}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_plain_drain_is_bounded_and_the_stop_comes_at_its_end() {
         static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
