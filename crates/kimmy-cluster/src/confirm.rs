@@ -500,9 +500,14 @@ impl Confirmer {
                 }
             }
             let progress = Progress::default();
+            // The connection outlives the push's timeout, so its close is
+            // outside it: an answered push is never recorded as unanswered
+            // for the time its close took, and a push that timed out is
+            // closed all the same.
+            let mut dialled = None;
             let result = match tokio::time::timeout(
                 self.config.request_timeout,
-                self.push_window(addr, &progress),
+                self.push_window(addr, &progress, &mut dialled),
             )
             .await
             {
@@ -514,24 +519,32 @@ impl Confirmer {
                     reason: format!("no answer within {:?}", self.config.request_timeout),
                 }),
             };
+            // However the push ended, say so to the peer, which otherwise
+            // reads the dropped connection as a failure (a TLS end with no
+            // close_notify). Bounded by its own `CLOSE_TIMEOUT`.
+            if let Some(mut stream) = dialled.take() {
+                close(&mut stream).await;
+            }
             if let Some(pause) = self.settle(addr, result) {
                 tokio::time::sleep(pause).await;
             }
         }
     }
 
-    /// One push to `addr`, for the waiters queued there.
-    async fn push_window(&self, addr: SocketAddr, progress: &Progress) -> PushResult {
-        let (mut stream, their_node) = match dial(&self.engine, addr, &self.secret).await {
+    /// One push to `addr`, for the waiters queued there, over a connection
+    /// it leaves in `dialled` for the caller to close.
+    async fn push_window(
+        &self,
+        addr: SocketAddr,
+        progress: &Progress,
+        dialled: &mut Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    ) -> PushResult {
+        let (stream, their_node) = match dial(&self.engine, addr, &self.secret).await {
             Ok(dialled) => dialled,
             Err(e) => return PushResult::Failed(Failure::before_send(None, false, e)),
         };
-        let result = self.push_over(&mut stream, addr, their_node, progress).await;
-        // The push is over, however it ended: say so to the peer, which
-        // otherwise reads the dropped connection as a failure (a TLS end
-        // with no close_notify).
-        close(&mut stream).await;
-        result
+        let stream = dialled.insert(stream);
+        self.push_over(stream, addr, their_node, progress).await
     }
 
     /// [`Self::push_window`] over the connection it dialled to `addr`.
@@ -1082,11 +1095,16 @@ mod tests {
     }
 
     fn pusher_for(member: &Member, config: ConfirmConfig) -> Pusher {
+        pusher_to(&member.engine, member.addr, config)
+    }
+
+    /// [`pusher_for`] a member served however the test serves it.
+    fn pusher_to(member: &Engine, addr: SocketAddr, config: ConfirmConfig) -> Pusher {
         let (engine, dir) = engine();
         engine.create_collection("shop", "orders").unwrap();
-        sync_into(&member.engine, &engine);
+        sync_into(member, &engine);
         let members = Members::default();
-        members.insert_for_test(member.addr, member.engine.node_id());
+        members.insert_for_test(addr, member.node_id());
         let outcomes = Arc::new(Mutex::new(Vec::new()));
         let pushes = Arc::new(AtomicUsize::new(0));
         let confirmer = Confirmer::with_hooks(
@@ -1160,6 +1178,27 @@ mod tests {
             member.served.windows().len() >= n
         })
         .await;
+    }
+
+    /// A push ends its connection with `close_notify`, as a round does, so
+    /// the member reads its end as a close: each push's end was logged as
+    /// `peer connection failed`, reason `io`, until 0.41.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_ends_its_connection_with_close_notify() {
+        let (member, _dir) = engine();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let a = pusher_to(&member, addr, quick());
+        let served = tokio::spawn(crate::transport::test_serving::serve_one_recording(
+            Arc::clone(&member),
+            listener,
+            SECRET,
+        ));
+        let entry = create(&a.engine, "f");
+        let resolution = a.confirmer.confirm(addr, member.node_id(), entry, DEADLINE).await;
+        assert_eq!(resolution, Resolution::Confirmed);
+        let ended = tokio::time::timeout(DEADLINE, served).await.unwrap().unwrap();
+        assert_eq!(ended.as_deref(), Some("close_notify"), "the push ended without it");
     }
 
     // --- T1 ---
