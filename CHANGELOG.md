@@ -33,6 +33,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   - **`OTEL_EXPORTER_OTLP_COMPRESSION` naming a compression this build does
     not have** (`gzip`, say) is warned about and ignored, where it stopped the
     node from starting.
+- **`local-embeddings` builds use fastembed 7.1** (from 6.1). The four local
+  models, their files and cache paths, their dimensions and their pooling are
+  unchanged, and so are the vectors: a batch embedded with each model before
+  and after is bit-identical. The build this matters to is one made with the
+  `local-embeddings` feature; the default build and the container image do
+  not include it.
 
 ### Fixed
 
