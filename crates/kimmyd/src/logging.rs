@@ -1381,7 +1381,9 @@ pub fn init(cfg: &LogConfig, telemetry: Option<&TelemetryConfig>) -> Result<Tele
         return Ok(TelemetryGuard::inert());
     };
 
-    let resource = resource(telemetry);
+    let instance = new_instance_id();
+    let _ = SERVICE_INSTANCE_ID.set(instance.clone());
+    let resource = resource(telemetry, &instance);
     let tracer_provider = tracer_provider(telemetry, resource.clone())?;
     let meter_provider = meter_provider(telemetry, resource)?;
 
@@ -1439,14 +1441,36 @@ fn exported(metadata: &tracing::Metadata<'_>) -> bool {
 /// exactly this reason: during a rolling upgrade or an incident the question is
 /// "which build is this exactly", and a version number alone does not answer it
 /// between releases. A trace is read at precisely that moment.
-fn resource(cfg: &TelemetryConfig) -> Resource {
+///
+/// `service.instance.id` tells the nodes of one deployment apart, which share
+/// `service.name`. It is a random UUID for this process, as the semantic
+/// conventions recommend, and **changes at every restart**: not the node id,
+/// which lives in the store and is not known until the store is open, long
+/// after the exporters are built. The node logs the two together once it is
+/// (`telemetry instance`), which is how one is found from the other.
+fn resource(cfg: &TelemetryConfig, instance: &str) -> Resource {
     Resource::builder()
         .with_service_name(cfg.service_name.clone())
         .with_attributes([
+            KeyValue::new(semconv::SERVICE_INSTANCE_ID, instance.to_string()),
             KeyValue::new(semconv::SERVICE_VERSION, kimmy_core::build::VERSION),
             KeyValue::new("service.commit", kimmy_core::build::COMMIT),
         ])
         .build()
+}
+
+/// This process's `service.instance.id`, set when the exporters are built;
+/// `None` when telemetry is not configured.
+static SERVICE_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A fresh `service.instance.id`: a random (v4) UUID.
+fn new_instance_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// This process's `service.instance.id`, if it exports telemetry.
+pub fn service_instance_id() -> Option<&'static str> {
+    SERVICE_INSTANCE_ID.get().map(String::as_str)
 }
 
 /// `http/protobuf` or `http/json`, already validated.
@@ -2119,13 +2143,30 @@ mod tests {
         assert!(guard.meter.is_none(), "no metric exporter");
     }
 
+    /// Nodes sharing a `service.name` are told apart by `service.instance.id`:
+    /// a UUID, and a new one for each process.
+    #[test]
+    fn the_resource_carries_a_service_instance_id_of_its_own() {
+        let cfg = TelemetryConfig::default();
+        let key = opentelemetry::Key::from_static_str(semconv::SERVICE_INSTANCE_ID);
+        assert_eq!(key.as_str(), "service.instance.id");
+        let of = |instance: String| {
+            let value = resource(&cfg, &instance).get(&key).expect("service.instance.id");
+            let value = value.as_str().into_owned();
+            assert!(uuid::Uuid::parse_str(&value).is_ok(), "not a UUID: {value}");
+            value
+        };
+        let (one, two) = (of(new_instance_id()), of(new_instance_id()));
+        assert_ne!(one, two, "two processes, one instance id");
+    }
+
     #[test]
     fn the_resource_carries_the_version_and_the_commit_this_binary_was_built_from() {
         // Paired for the same reason the startup log pairs them: during a
         // rolling upgrade the question is which build this exactly is, and a
         // version number alone does not answer it between releases.
         let cfg = TelemetryConfig { service_name: "kimmydb-test".into(), ..Default::default() };
-        let resource = resource(&cfg);
+        let resource = resource(&cfg, &new_instance_id());
 
         assert_eq!(
             resource.get(&opentelemetry::Key::from_static_str(semconv::SERVICE_NAME)),
