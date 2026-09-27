@@ -5793,7 +5793,7 @@ mod tests {
         assert!(
             matches!(
                 kimmy_core::PartialFilter::parse(&filter),
-                Err(kimmy_core::Error::UnsupportedOperator(_))
+                Err(kimmy_core::Error::UnsupportedOperator { .. })
             ),
             "premise: this build refuses that filter for its operator: {:?}",
             kimmy_core::PartialFilter::parse(&filter)

@@ -213,10 +213,14 @@ impl PartialFilter {
         let mut predicates = Vec::with_capacity(doc.len());
         for (path, value) in doc {
             if path.starts_with('$') {
-                return Err(Error::UnsupportedOperator(format!(
-                    "{path} cannot appear in a partialFilterExpression: only a conjunction of \
-                     per-field predicates is allowed, so containment stays decidable"
-                )));
+                return Err(Error::UnsupportedOperator {
+                    operator: path.clone(),
+                    reason: Some(
+                        "it cannot appear in a partialFilterExpression: only a conjunction of \
+                         per-field predicates is allowed, so containment stays decidable"
+                            .into(),
+                    ),
+                });
             }
             predicates.push((path.clone(), parse_op(path, value)?));
         }
@@ -347,10 +351,14 @@ fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
         "$exists" => match operand {
             Bson::Boolean(true) => PartialOp::Exists,
             Bson::Boolean(false) => {
-                return Err(Error::UnsupportedOperator(format!(
-                    "$exists: false cannot appear in a partialFilterExpression for {path:?}: no \
-                     query could ever be proven to imply it, so the index would never be used"
-                )));
+                return Err(Error::UnsupportedOperator {
+                    operator: "$exists".into(),
+                    reason: Some(format!(
+                        "$exists: false cannot appear in a partialFilterExpression for {path:?}: \
+                         no query could ever be proven to imply it, so the index would never be \
+                         used"
+                    )),
+                });
             }
             other => {
                 return Err(Error::InvalidQuery(format!(
@@ -364,12 +372,15 @@ fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
         "$lt" => PartialOp::Lt(operand.clone()),
         "$lte" => PartialOp::Lte(operand.clone()),
         other => {
-            return Err(Error::UnsupportedOperator(format!(
-                "{other} cannot appear in a partialFilterExpression for {path:?}. Allowed: \
-                 $exists: true, $eq, $gt, $gte, $lt, $lte, and a bare value for equality — the \
-                 language is deliberately small so a query's containment is decidable rather \
-                 than guessed"
-            )));
+            return Err(Error::UnsupportedOperator {
+                operator: other.to_string(),
+                reason: Some(format!(
+                    "it cannot appear in a partialFilterExpression for {path:?}. Allowed: \
+                     $exists: true, $eq, $gt, $gte, $lt, $lte, and a bare value for equality — \
+                     the language is deliberately small so a query's containment is decidable \
+                     rather than guessed"
+                )),
+            });
         }
     })
 }

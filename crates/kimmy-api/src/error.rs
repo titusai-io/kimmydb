@@ -904,7 +904,7 @@ impl From<CoreError> for ApiError {
             | CoreError::InvalidQuery(_)
             | CoreError::InvalidUpdate(_)
             | CoreError::InvalidDocumentId { .. }
-            | CoreError::UnsupportedOperator(_)
+            | CoreError::UnsupportedOperator { .. }
             | CoreError::MalformedResumeToken
             | CoreError::MalformedCursor
             | CoreError::MalformedStamp => ApiError::bad_request(e.to_string()),

@@ -56,8 +56,17 @@ pub enum Error {
     #[error("invalid update: {0}")]
     InvalidUpdate(String),
 
-    #[error("unsupported operator {0:?}")]
-    UnsupportedOperator(String),
+    /// An operator this build does not have. `operator` is the token as the
+    /// request spelled it, and nothing else: query-language.md's template,
+    /// `unsupported operator "$typo"`, is filled with an operator, and a
+    /// client matches or logs that slot. Why it is refused, when there is
+    /// more to say, goes in `reason`, after it. A refusal that is not about
+    /// an operator is an [`Error::InvalidQuery`].
+    #[error(
+        "unsupported operator {operator:?}{}",
+        .reason.as_deref().map(|reason| format!(": {reason}")).unwrap_or_default()
+    )]
+    UnsupportedOperator { operator: String, reason: Option<String> },
 
     #[error("change stream resume token is no longer available; the oplog has advanced past it")]
     ResumeTokenExpired,
@@ -106,7 +115,7 @@ impl Error {
             // What was asked is not something this build can honour, and
             // retrying cannot change that.
             Error::InvalidQuery(_)
-            | Error::UnsupportedOperator(_)
+            | Error::UnsupportedOperator { .. }
             | Error::Unsupported(_)
             | Error::IndexExists { .. } => true,
 

@@ -490,7 +490,9 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
             _ => return Err(Error::InvalidUpdate("$rename requires a field name".into())),
         },
         "currentDate" => OpKind::CurrentDate,
-        other => return Err(Error::UnsupportedOperator(format!("${other}"))),
+        other => {
+            return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
+        }
     })
 }
 

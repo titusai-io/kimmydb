@@ -2283,7 +2283,7 @@ mod tests {
         assert!(
             matches!(
                 kimmy_core::PartialFilter::parse(&filter),
-                Err(kimmy_core::Error::UnsupportedOperator(_))
+                Err(kimmy_core::Error::UnsupportedOperator { .. })
             ),
             "premise: refused for its operator, not as an invalid query"
         );
