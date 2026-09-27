@@ -1317,17 +1317,22 @@ mod tests {
         };
         type Walk = fn(&Fixture) -> Result<()>;
         let walks: &[(&str, Walk)] = &[
+            // covers: watch::Seek::new, watch::Seek::step, watch::Walk::new, watch::Walk::step
             ("first_arrival_beyond", |(e, _, middle)| {
                 let delivered: VersionVector = [(middle.node, middle.hlc)].into_iter().collect();
                 e.first_arrival_beyond(&delivered, &mut Walked::default()).map(drop)
             }),
+            // covers: watch::Engine::first_arrival_at_or_after
             ("first_arrival_at_or_after", |(e, _, middle)| {
                 e.first_arrival_at_or_after(middle.hlc, &mut Walked::default()).map(drop)
             }),
+            // covers: watch::Engine::first_arrival_stamped_after
             ("first_arrival_stamped_after", |(e, _, middle)| {
                 e.first_arrival_stamped_after(0, *middle, &mut Walked::default()).map(drop)
             }),
+            // covers: watch::Engine::read_arrival_batch
             ("read_arrival_batch to the tail", |(e, _, _)| e.read_arrival_batch(0, 100).map(drop)),
+            // covers: watch::Engine::read_arrival_batch
             ("read_arrival_batch short of it", |(e, _, _)| e.read_arrival_batch(0, 5).map(drop)),
         ];
         for (name, walk) in walks {

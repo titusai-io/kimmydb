@@ -11362,18 +11362,32 @@ commits nothing. **A guard holds the storage crate to it, closed-world**
   arrives, and a backup that dropped it would write its `END` after half the
   store. **Every row goes through `?`:** a row a walk binds, from a `for`
   over a table or a `Some(row) = rows.next()`, is used only as `row?`, and
-  any other `.next()` is `.next().transpose()?`. So `match row { Ok(r) => r,
-  _ => break }`, `Some(Err(_)) | None => break` and a look past the limit
-  with `.next().is_none()` are refused however they are spelled, as are the
-  untyped swallows (`.ok()`, `.flatten()`, `let Ok(` and the like), any line
-  naming `Stopping(`, and any arm for an `Err`: a walk that matches the stop
-  has found a way to end without it, and one that ends its loop on it answers
-  a short page, a partial list or a batch that claims the tail as a whole
-  one. A line that is not a row says so with `// not a row:` and what it is;
+  any other `.next()` is `.next().transpose()?`. So the common forms are
+  refused: `match row { Ok(r) => r, _ => break }`, `Some(Err(_)) | None =>
+  break`, `Some(Ok(..))` patterns, a look past the limit with
+  `.next().is_none()`, adapters on a table's rows that read an `Err` as the
+  end or as a row that does not match (`.nth(`, `.peek`, `.last()`, `.any(`,
+  `.filter(`, `.flat_map(` and the like), the untyped swallows (`.ok()`,
+  `.flatten()`, `let Ok(`, `Result::is_ok`), any line naming `Stopping(`, and
+  any arm for an `Err`. A walk that matches the stop has found a way to end
+  without it, and one that ends its loop on it answers a short page, a
+  partial list or a batch that claims the tail as a whole one. A line that
+  is not a row says so with `// not a row:` and what it is. These rules match
+  source, so they cannot refuse every spelling, which is why the next rule
+  exists;
+- **every stop-aware walk has an every-row test**: a case of `walk`'s or
+  the resume's every-row test that reaches it, stopped at each row it checks,
+  names it on a `// covers:` line, and a listed walk that none names fails.
+  The two halves check different things. The every-row test proves the
+  answer, `Stopping` at every row, however the walk is written. It cannot
+  see a swallow followed by another walk that checks the stop, since the
+  call still answers `Stopping` from the second, and the source rules catch
+  that one;
 - a walk table hands out no table: no `Deref`, `AsRef`, `Borrow` or other
-  conversion to it, no public field, no method returning its type, and
-  `walk.rs` reaches the table only by a point read, an end, a write or a walk
-  inside the checked `Rows`;
+  conversion to it, no public field, no method returning its type or any
+  redb table, no `WalkTable { .. }` built or taken apart outside its
+  constructors, and `walk.rs` reaches the table only by a point read, an end,
+  a write or a walk inside the checked `Rows`;
 - each walk that does not stop (`WalkStop::in_write`) is listed in
   `IN_WRITE_SITES` and is inside a write transaction: a write's index
   maintenance and unique checks, `find_and_modify`'s candidates, an index

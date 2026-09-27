@@ -21,6 +21,10 @@
 //!   the line, or the one above it, says `// not a row:` and why;
 //! - a walk table hands out no table, so none of this can be gone around
 //!   through it (`walk.rs`, which the rules above skip);
+//! - every stop-aware walk is named on a `// covers:` line of an every-row
+//!   test, which stops it at each row it checks and holds it to answering
+//!   `Stopping`, however it is written: the rules above match source, and
+//!   cannot refuse every spelling;
 //! - the storage walks the API's guard counts as walks
 //!   (`kimmy-api/tests/walks_leave_the_worker.rs`) are stop-aware, or are
 //!   writes, which `close_writes` bounds (ADR-192);
@@ -489,12 +493,15 @@ fn iterations(f: &Function) -> Vec<usize> {
 }
 
 /// The swallows a stop-aware walk may not make, unless marked.
-const SWALLOWS: [&str; 10] = [
+const SWALLOWS: [&str; 11] = [
     ".ok()",
     ".flatten()",
     "Result::ok",
     "let Ok(",
-    "while let Some(Ok(",
+    // `let Some(Ok(r)) = rows.next() else`, `if let Some(Ok(..))`: the
+    // stop's `Some(Err(..))` falls to the other arm.
+    "Some(Ok(",
+    "Result::is_ok",
     "filter_map(Result",
     ".is_ok()",
     "take_while",
@@ -625,6 +632,39 @@ fn whole_word_at(code: &str, at: usize, name: &str) -> bool {
     !code[..at].ends_with(word) && !code[at + name.len()..].starts_with(word)
 }
 
+/// The names `f` binds a table's rows to before it walks them:
+/// `let mut rows = t.range(..)?`.
+fn iterator_names(f: &Function, iterating: &[usize]) -> Vec<String> {
+    let ident = |s: &str| -> String {
+        s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+    };
+    (0..f.code.len())
+        .filter(|&i| iterating.contains(&f.numbers[i]))
+        .filter_map(|i| {
+            let rest = f.code[i].trim_start().strip_prefix("let ")?;
+            let name = ident(rest.strip_prefix("mut ").unwrap_or(rest));
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Iterator adapters that read a row's `Err` as something else: the end
+/// (`.nth(0).is_none()`, `.peek().is_none()`, `.last()`), a row that does not
+/// match (`.any(..)`, `.find(..)`, `.filter(..)`), or nothing (`.flat_map`).
+const ROW_ADAPTERS: [&str; 11] = [
+    ".nth(",
+    ".peek",
+    ".last()",
+    ".any(",
+    ".all(",
+    ".find(",
+    ".position(",
+    ".filter(",
+    ".flat_map(",
+    ".skip_while(",
+    ".map_while(",
+];
+
 /// The rows a stop-aware walk binds, as `(index into its code, name)`: the
 /// pattern of a `for` over a table's `range` or `iter` (`iterating`, from
 /// [`iterations`]), or over a name bound to one, and a `Some(row) =` taken
@@ -634,15 +674,7 @@ fn row_bindings(f: &Function, iterating: &[usize]) -> Vec<(usize, String)> {
         s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
     };
     let flagged = |i: usize| iterating.contains(&f.numbers[i]);
-    // Names bound to a table's rows before they are walked.
-    let iterators: Vec<String> = (0..f.code.len())
-        .filter(|&i| flagged(i))
-        .filter_map(|i| {
-            let rest = f.code[i].trim_start().strip_prefix("let ")?;
-            let name = ident(rest.strip_prefix("mut ").unwrap_or(rest));
-            (!name.is_empty()).then_some(name)
-        })
-        .collect();
+    let iterators = iterator_names(f, iterating);
     let mut out = Vec::new();
     for (i, code) in f.code.iter().enumerate() {
         let trimmed = code.trim_start();
@@ -680,6 +712,7 @@ fn row_bindings(f: &Function, iterating: &[usize]) -> Vec<(usize, String)> {
 /// table iterations are on `iterating`.
 fn walk_problems(key: &str, f: &Function, iterating: &[usize]) -> Vec<String> {
     let mut problems = Vec::new();
+    let iterators = iterator_names(f, iterating);
     let takes_walk_table = f.code.iter().any(|l| l.contains("WalkTable<"));
     let marked = |i: usize| {
         f.text[i].contains("// not a row:")
@@ -718,6 +751,18 @@ fn walk_problems(key: &str, f: &Function, iterating: &[usize]) -> Vec<String> {
             problems.push(format!(
                 "{key}:{at}: `{s}` in a stop-aware walk can drop the stop's Err; propagate it, \
                  or say `// not a row: <what it is>` on the line or the one above"
+            ));
+        }
+        // An adapter on a table's rows, straight off the `range` or on a
+        // name bound to them.
+        let on_rows = iterating.contains(&at)
+            || iterators.iter().any(|t| {
+                code.match_indices(&format!("{t}.")).any(|(pos, _)| whole_word_at(code, pos, t))
+            });
+        if on_rows && let Some(a) = ROW_ADAPTERS.iter().find(|a| code.contains(*a)) {
+            problems.push(format!(
+                "{key}:{at}: `{a}` on a table's rows reads the stop's Err as the end or as a row \
+                 that does not match; walk the rows and take each with `?`"
             ));
         }
         // A row taken by hand is `Option<Result<..>>`: its `Err` goes
@@ -918,6 +963,20 @@ fn the_guard_refuses_every_way_of_reading_the_stop_as_the_end() {
          for row in t.iter()? {\n        let _ = row?;\n    }\n    Ok(())\n}\n",
         "fn i(t: &T) -> Result<()> {\n    for row in t.range(..)? {\n        \
          consume(row);\n    }\n    Ok(())\n}\n",
+        "fn j(t: &T) -> Result<()> {\n    let mut rows = t.iter()?;\n    \
+         let Some(Ok((k, v))) = rows.next() else { return Ok(()) };\n    Ok(())\n}\n",
+        "fn k(t: &T) -> Result<()> {\n    let mut rows = t.iter()?;\n    \
+         if let Some(Ok((k, v))) = rows.next() {}\n    Ok(())\n}\n",
+        "fn l(t: &T) -> Result<usize> {\n    \
+         Ok(t.range(..)?.filter(Result::is_ok).count())\n}\n",
+        "fn m(t: &T) -> Result<bool> {\n    Ok(t.range(..)?.nth(0).is_none())\n}\n",
+        "fn n(t: &T) -> Result<bool> {\n    let mut rows = t.range(..)?.peekable();\n    \
+         Ok(rows.peek().is_none())\n}\n",
+        "fn o(t: &T) -> Result<bool> {\n    \
+         Ok(t.range(..)?.any(|r| r.is_ok_and(|(k, _)| k.value() == 1)))\n}\n",
+        "fn p(t: &T) -> Result<bool> {\n    Ok(t.range(..)?.last().is_none())\n}\n",
+        "fn q(t: &T) -> Result<()> {\n    for (k, v) in t.range(..)?.flat_map(|r| r) {}\n    \
+         Ok(())\n}\n",
     ];
     for mutant in refused {
         let f = functions(mutant).remove(0);
@@ -958,6 +1017,9 @@ fn a_walk_table_hands_out_no_table() {
          pub(crate) fn raw(&self) -> Result<redb::Range<'_, K, V>> {\n        \
          Ok(self.table.range::<K>(..)?)\n    }\n}\n",
         "pub(crate) struct WalkTable<'e, T> {\n    pub(crate) table: T,\n    walk: WalkStop<'e>,\n}\n",
+        "impl<'e, K: Key + 'static, V: Value + 'static> WalkTable<'e, redb::ReadOnlyTable<K, V>> {\n    \
+         pub(crate) fn raw(&self) -> &redb::ReadOnlyTable<K, V> {\n        \
+         let WalkTable { table, .. } = self;\n        table\n    }\n}\n",
     ];
     for mutant in mutants {
         if walk_table_problems(mutant).is_empty() {
@@ -1017,8 +1079,29 @@ fn walk_table_problems(body: &str) -> Vec<String> {
             }
         }
     }
-    // No method of a walk table returns its table's type.
-    for f in functions(body).iter().filter(|f| f.name.starts_with("WalkTable::")) {
+    // A walk table is made or taken apart only where it is defined and in
+    // the constructors: `let WalkTable { table, .. } = self` hands out the
+    // table as surely as a field would.
+    let fns = functions(body);
+    let mut in_string = false;
+    for (n, line) in body.lines().enumerate() {
+        let code = code_of(line, &mut in_string);
+        let trimmed = code.trim();
+        let defines = trimmed.starts_with("pub(crate) struct WalkTable")
+            || trimmed.starts_with("struct WalkTable");
+        let constructs = fns
+            .iter()
+            .any(|f| f.name.starts_with("open_walk_table") && f.numbers.contains(&(n + 1)));
+        if code.contains("WalkTable {") && !defines && !constructs {
+            problems.push(format!(
+                "walk.rs:{}: builds or takes apart a walk table outside its constructors: \
+                 {trimmed}",
+                n + 1
+            ));
+        }
+    }
+    // No method of a walk table returns its table's type, or any redb table.
+    for f in fns.iter().filter(|f| f.name.starts_with("WalkTable::")) {
         let signature: String = f.code.iter().take_while(|l| !l.contains('{')).cloned().collect();
         let signature = format!("{signature}{}", f.code.iter().find(|l| l.contains('{')).unwrap());
         let returns = signature.split_once("->").map_or("", |(_, r)| r);
@@ -1035,7 +1118,10 @@ fn walk_table_problems(body: &str) -> Vec<String> {
                 && !returns[pos + 1..].starts_with(word)
                 && !returns[pos + 1..].starts_with("::")
         });
-        if names_t {
+        let names_a_table = ["ReadOnlyTable", "Table<", "ReadableTable", "UntypedTable"]
+            .iter()
+            .any(|t| returns.contains(t));
+        if names_t || names_a_table {
             problems.push(format!(
                 "walk.rs:{}: {} returns the table's own type:{returns}",
                 f.numbers[0], f.name
@@ -1043,6 +1129,96 @@ fn walk_table_problems(body: &str) -> Vec<String> {
         }
     }
     problems
+}
+
+/// The every-row tests: where each is, and its name. Between them they stop
+/// every public walk at each row it checks (`walk::every_row`).
+const EVERY_ROW_TESTS: &[(&str, &str)] = &[
+    ("src/walk.rs", "every_stop_aware_walk_answers_stopping_at_every_row_it_reads"),
+    ("src/watch.rs", "a_resumes_walks_end_at_the_signal_on_every_row"),
+];
+
+/// **Every stop-aware walk is stopped at every row by a test that calls it.**
+/// The rules above refuse the common ways of reading the stop as the end,
+/// but not every way: an adapter or a helper the rows are handed to can
+/// still do it. The every-row test does not care how, since it checks the
+/// answer. So each [`STOP_AWARE_WALKS`] entry must be named on a
+/// `// covers:` line above a case of an every-row test that reaches it.
+#[test]
+fn every_stop_aware_walk_has_an_every_row_test() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let bodies: Vec<(String, String)> = EVERY_ROW_TESTS
+        .iter()
+        .map(|(file, test)| {
+            let body = std::fs::read_to_string(root.join(file)).unwrap();
+            let body = test_body(&body, test).unwrap_or_else(|| panic!("{file}: no {test}"));
+            (format!("{file}::{test}"), body)
+        })
+        .collect();
+    let problems = coverage_problems(STOP_AWARE_WALKS, &bodies);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// The lines of test function `name` in `body`, to its closing brace.
+fn test_body(body: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.iter().position(|l| l.trim_start().starts_with(&format!("fn {name}(")))?;
+    let indent = &lines[start][..lines[start].len() - lines[start].trim_start().len()];
+    let end = (start..lines.len()).find(|&i| lines[i] == format!("{indent}}}"))?;
+    Some(lines[start..=end].join("\n"))
+}
+
+/// What leaves a walk in `walks` without an every-row test in `bodies`, each
+/// `(where, body)`: a walk no `// covers:` line names, a name that is no
+/// listed walk, and a `// covers:` line that is not on a case.
+fn coverage_problems(walks: &[&str], bodies: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut covered: Vec<String> = Vec::new();
+    for (at, body) in bodies {
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(keys) = line.strip_prefix("// covers:") else { continue };
+            let case = lines[i + 1..].iter().find(|l| !l.starts_with("//"));
+            if !case.is_some_and(|l| l.starts_with("(\"")) {
+                problems.push(format!("{at}: `{line}` is not above a case"));
+            }
+            for key in keys.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+                if !walks.contains(&key) {
+                    problems.push(format!("{at}: covers {key}, which is no stop-aware walk"));
+                }
+                covered.push(key.to_string());
+            }
+        }
+    }
+    for walk in walks {
+        if !covered.iter().any(|c| c == walk) {
+            problems.push(format!(
+                "{walk} is stop-aware and no every-row test covers it: add a case that reaches \
+                 it, with `// covers: {walk}` above it"
+            ));
+        }
+    }
+    problems
+}
+
+/// The coverage check's own mutants.
+#[test]
+fn the_coverage_check_finds_a_walk_with_no_every_row_test() {
+    let walks = ["a::f", "a::g"];
+    let body = |text: &str| vec![("t".to_string(), text.to_string())];
+    let full = "fn t() {\n    let cases = [\n        // covers: a::f, a::g\n        (\"both\", 1),\n    ];\n}";
+    assert!(coverage_problems(&walks, &body(full)).is_empty());
+    let mutants = [
+        // a::g named by nothing.
+        "fn t() {\n    // covers: a::f\n    (\"f\", 1),\n}",
+        // A name that is no listed walk.
+        "fn t() {\n    // covers: a::f, a::g, a::h\n    (\"all\", 1),\n}",
+        // A covers line on no case.
+        "fn t() {\n    // covers: a::f, a::g\n    let x = 1;\n}",
+    ];
+    for mutant in mutants {
+        assert!(!coverage_problems(&walks, &body(mutant)).is_empty(), "let through:\n{mutant}");
+    }
 }
 
 #[test]

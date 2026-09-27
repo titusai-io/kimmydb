@@ -606,67 +606,89 @@ mod tests {
                 .map(drop)
         }
         let background: &[(&str, Walk)] = &[
+            // covers: watch::Engine::read_oplog_from_skipping
             ("serve_entries_to_peer", |e, _| {
                 e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[]).map(drop)
             }),
+            // covers: watch::Engine::read_oplog_from_skipping
             ("entries_for_peer", |e, _| {
                 e.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).map(drop)
             }),
+            // covers: sync::Engine::held_marks_covered_by
             ("held_marks_covered_by", |e, _| {
                 let witnessed = [(HELD_ORIGIN, Hlc::new(u64::MAX, 0))].into_iter().collect();
                 e.held_marks_covered_by(&witnessed).map(drop)
             }),
+            // covers: snapshot::Engine::snapshot_documents
             ("snapshot_page", |e, _| e.snapshot_page(None, None).map(drop)),
+            // covers: gc::Engine::collect_oplog, gc::Engine::collect_tombstones_within
             ("collect_garbage", |e, _| {
                 e.collect_garbage(crate::RetentionPolicy::new(0, 0)).map(drop)
             }),
+            // covers: index::Engine::index_keyed_entries_after
             ("index_keyed_entries_after", |e, c| {
                 let index = c.index("by_n").unwrap();
                 e.index_keyed_entries_after(c, index.id, &[], &[0xFF; 8], None, 100).map(drop)
             }),
+            // covers: docs::Engine::for_each_record_after
             ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Background, |_, _| Ok(true))),
         ];
         let request: &[(&str, Walk)] = &[
+            // covers: backup::Engine::backup_to
             ("backup_to", |e, _| e.backup_to(&mut Vec::new(), WalkScope::Request).map(drop)),
+            // covers: docs::Engine::for_each_record_after
             ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Request, |_, _| Ok(true))),
+            // covers: docs::Engine::for_each_record_after
             ("for_each_record_after", |e, c| {
                 e.for_each_record_after(c, None, WalkScope::Request, |_, _, _| Ok(true))
             }),
+            // covers: docs::Engine::for_each_doc_or_undecodable
             ("for_each_doc_or_undecodable", |e, c| {
                 e.for_each_doc_or_undecodable(c, WalkScope::Request, |_, _| Ok(true))
             }),
+            // covers: docs::Engine::for_each_record_after
             ("count", |e, c| e.count(c, WalkScope::Request).map(drop)),
+            // covers: docs::Engine::live_unique_violations
             ("live_unique_violations", |e, c| {
                 e.live_unique_violations(c, None, WalkScope::Request).map(drop)
             }),
+            // covers: watch::Engine::read_oplog_from_skipping
             ("read_oplog_from", |e, _| {
                 e.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).map(drop)
             }),
+            // covers: index::scan_table
             ("index_candidates", |e, c| {
                 let index = c.index("by_n").unwrap();
                 e.index_candidates(c, index.id, &[], &[0xFF; 8]).map(drop)
             }),
+            // covers: index::holders_of
             ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("ab").unwrap().id).map(drop)),
+            // covers: index::holders_of
             ("undecidable_count", |e, c| {
                 e.undecidable_count(c, c.index("partial").unwrap().id).map(drop)
             }),
             // The candidate walks: in index order, one exact run, exact runs
             // merged, and an inexact range put in key order.
+            // covers: index::has_entries_at, index::Walk::in_index_order
             ("in_index_order", |e, c| {
                 candidates(e, c, doc! { "_id": { "$gte": 2 } }, crate::CandidateOrder::Any)
             }),
+            // covers: index::has_entries_at, index::Walk::one_run
             ("one_run", |e, c| {
                 let by_id = crate::CandidateOrder::ById { after: None, want: None };
                 candidates(e, c, doc! { "_id": 3 }, by_id)
             }),
+            // covers: index::has_entries_at, index::Walk::merged_runs
             ("merged_runs", |e, c| {
                 let by_id = crate::CandidateOrder::ById { after: None, want: None };
                 candidates(e, c, doc! { "_id": { "$in": [2, 5, 8] } }, by_id)
             }),
+            // covers: index::has_entries_at, index::Walk::in_key_order
             ("in_key_order", |e, c| {
                 let by_id = crate::CandidateOrder::ById { after: None, want: None };
                 candidates(e, c, doc! { "_id": { "$gte": 2, "$lte": 9 } }, by_id)
             }),
+            // covers: index::Engine::create_index_inner
             ("a client's index build", |e, _| {
                 let field = crate::IndexField { path: "m".into(), descending: false };
                 e.create_index("shop", "orders", vec![field], false, None).map(drop)
