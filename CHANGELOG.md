@@ -17,11 +17,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **OTLP exports are retried.** OpenTelemetry moves to 0.33 (and
   `tracing-opentelemetry` to 0.34), whose exporter tries an export again when
   it cannot connect or the collector answers 429, 502, 503 or 504: up to three
-  more times, with backoff, within `telemetry.export_timeout_secs`. A
-  collector that is briefly down now loses fewer spans and metrics. Nothing
-  else an operator sees changes: the span and attribute names, the `kimmy_*`
-  metrics on `/metrics` and on the OTLP bridge, and the two seconds the
-  exporters get when the node stops are as they were.
+  more times, with backoff, honouring a `Retry-After` on a 429 or 503. A
+  collector that is briefly down now loses fewer spans and metrics. A retry
+  starts only while time is left in `telemetry.export_timeout_secs`, but an
+  attempt may take all of it, so one export against a slow collector can take
+  up to about twice that, on an exporter thread. The span and attribute
+  names, and the `kimmy_*` metrics on `/metrics` and on the OTLP bridge, are
+  unchanged. What else an operator may notice:
+  - **A stop against a collector that refuses connections** now spends about
+    1.8 s of the exporters' two seconds retrying, where it failed at once,
+    and can log that it exited without the last spans and metrics. The stop
+    is still bounded by those two seconds.
+  - **Each failed export logs its retries** at `WARN` on the `opentelemetry`
+    target (`Export.Failed.*`), and a throttled one at `INFO`.
+  - **`OTEL_EXPORTER_OTLP_COMPRESSION` naming a compression this build does
+    not have** (`gzip`, say) is warned about and ignored, where it stopped the
+    node from starting.
 
 ## 0.40.1 - 2026-09-27
 
