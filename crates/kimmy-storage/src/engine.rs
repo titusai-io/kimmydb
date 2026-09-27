@@ -167,6 +167,10 @@ pub struct Engine {
     /// [`Engine::set_stopping_after_rows`].
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) stopping_after_rows: std::sync::atomic::AtomicU64,
+    /// `KIMMY_TEST_STOP=slow_apply:<ms>`: how long each peer batch's apply
+    /// waits, inside its storage step, before it starts; 0 for none. See
+    /// [`Engine::slow_peer_applies`].
+    test_apply_delay_ms: std::sync::atomic::AtomicU64,
     /// Run once, inside the next change stream's resolve of where it starts;
     /// see [`Engine::during_next_watch_resolve`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1310,6 +1314,7 @@ impl Engine {
             stop_after_rows: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             stopping_after_rows: std::sync::atomic::AtomicU64::new(0),
+            test_apply_delay_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             watch_resolve_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1584,6 +1589,30 @@ impl Engine {
     pub fn panic_inside_a_write(&self) -> Result<()> {
         let _txn = self.begin_write(WriterHolder::Write)?;
         panic!("a panic inside a write transaction, on purpose (KIMMY_TEST_STOP=panic_in_write)");
+    }
+
+    /// `KIMMY_TEST_STOP=slow_apply:<ms>`: each peer batch's apply waits
+    /// `delay` inside its storage step, before it takes the writer, and says
+    /// so. So that a test of a real node can stop it while a replication
+    /// round is inside a step, which is where a 0.40.1 stop panicked. In the
+    /// shipped binary, like the other test switches.
+    #[doc(hidden)]
+    pub fn slow_peer_applies(&self, delay: std::time::Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.test_apply_delay_ms.store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The wait [`Self::slow_peer_applies`] set, taken in a peer batch's
+    /// apply.
+    pub(crate) fn test_apply_delay(&self) {
+        let ms = self.test_apply_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            tracing::info!(
+                ms,
+                "a slowed apply of a peer's batch, on purpose (KIMMY_TEST_STOP=slow_apply)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
     }
 
     /// Whether [`Self::stop_walks`] has been called.

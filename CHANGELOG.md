@@ -10,6 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A stop no longer panics when a replication round is mid-apply.** A
+  member stopped while one of its tasks was inside a storage step, most often
+  a replication round applying a peer's batch, logged `a thread panicked`
+  with "A Tokio 1.x context was found, but it is being shutdown", and
+  sometimes `sync round failed` with the same text. The stop was otherwise
+  correct (exit 0, the store closed), and nothing was lost: the step had
+  finished, and the panic ended only a task the stop had already ended. The
+  cause: the stop shut the runtime down without waiting for its tasks to
+  end, and a task inside a storage step runs on after it until its next
+  yield. The stop now waits for them: the background tasks, the
+  schema-change pushers and the HTTP connections, within the window it
+  already gave writes to finish (10 s after the drain). A task still running
+  then is aborted as before, so the stop's bound is unchanged.
+- **The panic line says on which thread, and where.** `a thread panicked`
+  now carries `thread`, `thread_id` and `location`.
+
 ## 0.40.1 - 2026-09-27
 
 **Roll the members one at a time. This release is not a rollback boundary:

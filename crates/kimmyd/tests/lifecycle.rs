@@ -1096,6 +1096,14 @@ async fn a_panic_inside_a_write_is_never_recorded_as_a_clean_shutdown() {
     assert_eq!(status.code(), Some(75), "{status:?}");
     let log = run.log();
     assert!(!log.contains("shutdown complete"), "{log}");
+    // The panic's line says on which thread, and where.
+    // The message carries its own line break, so the record runs to the next
+    // line that starts with a timestamp.
+    let from = log.find("a thread panicked").expect("the panic's line");
+    let panicked = log[from..].split("\n20").next().unwrap();
+    for field in ["thread", "thread_id", "location", "engine.rs"] {
+        assert!(panicked.contains(field), "{field}: {panicked}");
+    }
     let marker = marker(dir.path()).expect("a marker");
     assert!(marker.contains("exit = \"storage_not_closed\""), "{marker}");
     assert!(marker.contains("needing recovery"), "{marker}");
