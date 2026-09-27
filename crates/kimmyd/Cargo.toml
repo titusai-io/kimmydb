@@ -21,6 +21,8 @@ storage-cache-metrics = ["kimmy-api/storage-cache-metrics"]
 
 [dependencies]
 kimmy-core.workspace = true
+# `service.instance.id`, one per process (`logging::resource`).
+uuid.workspace = true
 kimmy-task.workspace = true
 kimmy-storage.workspace = true
 kimmy-api.workspace = true
