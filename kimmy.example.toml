@@ -652,9 +652,11 @@ format = "pretty"
 # include_names = false
 
 # What `service.name` this node reports itself as. One name for the whole
-# deployment rather than one per node -- nodes are told apart by their
-# resource attributes, and a per-node service name makes a three-node cluster
-# look like three unrelated systems.
+# deployment rather than one per node: a per-node service name makes a
+# three-node cluster look like three unrelated systems. Nodes are told apart by
+# `service.instance.id`, a random UUID for each process, which changes at every
+# restart. It is not the node id; the start logs the two together, as
+# `telemetry instance`.
 #
 # service_name = "kimmydb"
 

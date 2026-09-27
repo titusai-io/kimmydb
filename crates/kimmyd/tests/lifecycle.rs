@@ -1192,6 +1192,11 @@ async fn a_collector_that_never_answers_does_not_hold_the_stop() {
     assert!(took < Duration::from_secs(6), "the exporters held the stop: {took:?}");
     let log = run.log();
     assert!(log.contains("the collector did not take the last spans and metrics in time"), "{log}");
+    // Where this process's service.instance.id meets the node id.
+    let instance = log.lines().find(|l| l.contains("telemetry instance")).expect("the line");
+    for field in ["service_instance_id", "node"] {
+        assert!(instance.contains(field), "{field}: {instance}");
+    }
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
     drop(silent);
 }

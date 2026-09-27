@@ -408,6 +408,11 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         commit = kimmy_core::build::COMMIT,
         "starting kimmyd"
     );
+    // The resource's `service.instance.id` is this process's, made before the
+    // store was open: this is where it meets the node id.
+    if let Some(instance) = crate::logging::service_instance_id() {
+        info!(service_instance_id = instance, node = %engine.node_id(), "telemetry instance");
+    }
     info!("{}", config.summary());
 
     // After the banner, so the line an operator is sent to look for sits

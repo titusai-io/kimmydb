@@ -10,6 +10,18 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **Each node's telemetry says which process it came from.** Spans and
+  metrics now carry `service.instance.id`, a random UUID for each process,
+  which changes at every restart. The documentation already said nodes were
+  told apart by it, but no node set it, so every member of a deployment
+  reported the same resource. When telemetry is configured, the start logs
+  `telemetry instance`, with `service_instance_id` and `node`, the node id,
+  so one can be found from the other.
+
 ## 0.40.2 - 2026-09-27
 
 **Roll the members one at a time. This release is not a rollback boundary:
