@@ -2870,7 +2870,17 @@ pub(crate) mod test_serving {
         let binding = crate::tls::binding(stream.get_ref().1).unwrap();
         let ended = Arc::new(parking_lot::Mutex::new(None));
         let recording = Recording { inner: stream, ended: Arc::clone(&ended) };
-        serve_connection(&engine, recording, secret, &binding, None, None, peer).await;
+        serve_connection(
+            &engine,
+            recording,
+            secret,
+            &binding,
+            None,
+            None,
+            peer,
+            ServeBudgets::serving(),
+        )
+        .await;
         ended.lock().take()
     }
 
@@ -2922,6 +2932,7 @@ pub(crate) mod test_serving {
                             None,
                             Some(&hook),
                             peer,
+                            ServeBudgets::serving(),
                         )
                         .await;
                     }
