@@ -578,7 +578,7 @@ cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
 one used to wait for every request in flight, with no limit**. Then, with its
 background work stopped, the node **closes its storage to writes**: a write
 that begins from then on is refused, answered `503 node_stopping` with `retry:
-elsewhere` ("this node did not begin the write because it is shutting down"),
+elsewhere` ("this node did not complete the request because it is shutting down"),
 logged at `WARN`, with nothing written, and a write already in
 progress is waited for, up to 10 s more. Commits waiting on the coalescing
 barrier at that point are flushed then, before the marker. Then the node waits
@@ -592,8 +592,8 @@ complete`. Exported spans and metrics get 2 s more, after the marker.
 prevent the close, and each is logged at `ERROR` as `exiting without closing
 the storage engine; the next start repairs the database`, with the reason in
 `error`:
-- a thread still holds the store 22 s after the signal, such as a walk of the
-  oplog serving a peer's pull (`still held by a thread …`);
+- a thread still holds the store 22 s after the signal (`still held by a
+  thread …`), which no walk of the store does from 0.40.1: see below;
 - a write still in progress 10 s after the drain, or, under
   `storage.durability = coalesced`, a last flush that failed (`a write was
   still in progress …`);
@@ -607,6 +607,16 @@ the cause, and repairs the store before it serves. Before 0.40.1 the first of
 these wrote `shutdown` and logged `shutdown complete` at once, and the process
 went on running until the walk ended or the supervisor killed it; the next
 start then repaired a store its marker called clean.
+
+**Walks of the store end at the stop.** A walk serves either no client, such
+as a pull a peer makes of this node, retention, a change stream finding
+where to resume, or TTL expiry, and ends at the signal; or a client's
+request, such as a backup, a query or a schema change, and runs on through
+the drain like any request, ending at its deadline. A request a stop ends is
+answered `503 node_stopping` with `retry: elsewhere`. A peer whose pull a
+stopping node ends backs off from it as from any member that went away. So a
+member stopped while its peers pull from it exits at once, where before
+0.40.1 it served until the walk ended or the supervisor killed it.
 
 **Give a stop 30 s or more, measured from the signal.** The phases above come
 to about 25.2 s at most: 22 s to the runtime's shutdown, 0.2 s more waiting

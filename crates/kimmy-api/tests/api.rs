@@ -3495,7 +3495,8 @@ async fn a_write_refused_after_the_close_answers_503_elsewhere_and_writes_nothin
     assert_eq!(res.body["error"], "node_stopping", "{:?}", res.body);
     assert_eq!(res.body["retry"], "elsewhere", "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("shutting down"));
-    assert_eq!(server.state.engine.count(&orders).unwrap(), 0);
+    // The kept count: a walk is refused too once the engine is stopping.
+    assert_eq!(server.state.engine.count_by_id(orders.id).unwrap(), Some(0));
 }
 
 #[tokio::test]
@@ -3589,7 +3590,11 @@ async fn registering_an_unchanged_record_appends_nothing() {
 /// How many entries the oplog holds, for tests whose subject is whether a
 /// write happened at all.
 fn oplog_len(state: &kimmy_api::SharedState) -> usize {
-    state.engine.read_oplog_from(kimmy_core::Hlc::ZERO, 10_000).expect("reading the oplog").len()
+    state
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+        .expect("reading the oplog")
+        .len()
 }
 
 /// One contact's drain of `from` into `to`, in the shape the sync transport
@@ -3602,7 +3607,16 @@ fn drain_between(from: &Server, to: &Server) -> Vec<kimmy_storage::SyncOutcome> 
         let held = to.state.engine.witnessed_vector().unwrap();
         let theirs = from.state.engine.version_vector().unwrap();
         let Some(start) = held.behind(&theirs) else { return pulls };
-        let window = from.state.engine.entries_for_peer_holding(start, 1024, Some(&held)).unwrap();
+        let window = from
+            .state
+            .engine
+            .entries_for_peer_holding(
+                start,
+                1024,
+                Some(&held),
+                kimmy_storage::WalkScope::Background,
+            )
+            .unwrap();
         let outcome = to
             .state
             .engine
@@ -5110,7 +5124,7 @@ async fn a_collection_whose_vectors_were_all_deleted_still_has_no_vectors() {
     let shadow = engine.vector_collection("shop", "docs").unwrap().unwrap();
     let mut rows = Vec::new();
     engine
-        .for_each_doc(&shadow, |id, _| {
+        .for_each_doc(&shadow, kimmy_storage::WalkScope::Request, |id, _| {
             rows.push(id);
             Ok(true)
         })
@@ -8070,7 +8084,7 @@ async fn a_backup_declares_its_length_and_restores() {
     kimmy_storage::backup::restore(&path, &mut body.as_slice()).unwrap();
     let engine = Engine::open(&path).unwrap();
     let orders = engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(engine.count(&orders).unwrap(), 1);
+    assert_eq!(engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(), 1);
 }
 
 /// A backup walks the whole store, which takes minutes on a real one, so the
@@ -10687,11 +10701,21 @@ async fn a_drop_of_an_index_this_member_does_not_hold_is_recorded_and_replicates
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
 
-    let before = server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    let before = server
+        .state
+        .engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
     let dropped = server.delete("/v1/db/shop/coll/orders/indexes/never_here", Some(&token)).await;
     assert_eq!(dropped.status, 200, "{:?}", dropped.body);
     assert_eq!(dropped.body["dropped"], false, "this member held nothing to remove");
-    let after = server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    let after = server
+        .state
+        .engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
     assert_eq!(after.len(), before.len() + 1, "one entry minted for the drop");
     let entry = after.last().unwrap();
     assert_eq!(entry.kind, kimmy_core::OpKind::DropIndex);
@@ -10709,8 +10733,12 @@ async fn a_drop_of_an_index_this_member_does_not_hold_is_recorded_and_replicates
     // A name a create would refuse is refused here too, and mints nothing.
     let refused = server.delete("/v1/db/shop/coll/orders/indexes/__system", Some(&token)).await;
     assert_eq!(refused.status, 400, "{:?}", refused.body);
-    let unchanged =
-        server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    let unchanged = server
+        .state
+        .engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 100, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
     assert_eq!(unchanged.len(), after.len(), "nothing minted for a name that cannot exist");
 
     // And a collection that does not exist is still 404.
@@ -10914,7 +10942,11 @@ fn replicate(from: &Server, to: &Server) {
     let mine = to.state.engine.version_vector().unwrap();
     let theirs = from.state.engine.version_vector().unwrap();
     if let Some(start) = mine.behind(&theirs) {
-        let window = from.state.engine.entries_for_peer(start, 1024).unwrap();
+        let window = from
+            .state
+            .engine
+            .entries_for_peer(start, 1024, kimmy_storage::WalkScope::Background)
+            .unwrap();
         let applied = to.state.engine.apply_batch(&window.entries).unwrap();
         // A recreation waiting for this member's drop purger (ADR-189): the
         // purger runs between rounds, and the next round takes the rest.
@@ -11175,7 +11207,11 @@ async fn a_re_delivered_reconfiguration_leaves_the_rebuilt_graph_alone() {
     let mine = applier.state.engine.version_vector().unwrap();
     let theirs = issuer.state.engine.version_vector().unwrap();
     let start = mine.behind(&theirs).expect("the guard's drop is news");
-    let window = issuer.state.engine.entries_for_peer(start, 1024).unwrap();
+    let window = issuer
+        .state
+        .engine
+        .entries_for_peer(start, 1024, kimmy_storage::WalkScope::Background)
+        .unwrap();
     let redelivered = window.entries.iter().filter(|e| {
         e.kind == kimmy_core::OpKind::ConfigureVectors
             && e.body.as_deref().is_some_and(|b| {
@@ -12141,7 +12177,12 @@ async fn a_webhook_and_its_starting_point_are_one_commit_and_a_failed_commit_sto
     let res = register().await;
     assert_eq!(res.status, 500, "{:?}", res.body);
     let registry = server.state.engine.get_collection("__kimmy", "__webhooks").unwrap();
-    assert_eq!(server.state.engine.count(&registry).unwrap(), 2, "only the two that landed");
+    // The kept count: the storage has failed, so a walk is refused.
+    assert_eq!(
+        server.state.engine.count_by_id(registry.id).unwrap(),
+        Some(2),
+        "only the two that landed"
+    );
 }
 
 #[tokio::test]

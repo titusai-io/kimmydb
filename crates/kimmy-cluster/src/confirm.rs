@@ -608,10 +608,17 @@ impl Confirmer {
         }
         let engine = &self.engine;
         let mut window = match kimmy_storage::blocking(|| {
-            engine.entries_for_peer_holding(from, MAX_BATCH, Some(&held))
+            engine.entries_for_peer_holding(
+                from,
+                MAX_BATCH,
+                Some(&held),
+                // A DDL's confirmation is part of its request, which the
+                // drain lets finish (ADR-192).
+                kimmy_storage::WalkScope::Request,
+            )
         }) {
             Ok(window) => window,
-            Err(e) => return failed(ProtocolError::Malformed(e.to_string())),
+            Err(e) => return failed(crate::transport::from_storage(e, ProtocolError::Malformed)),
         };
         if let Fits::Only(fits) = how_many_fit(&window.entries) {
             if fits == 0 {
@@ -621,10 +628,17 @@ impl Confirmer {
                 )));
             }
             window = match kimmy_storage::blocking(|| {
-                engine.entries_for_peer_holding(from, fits, Some(&held))
+                engine.entries_for_peer_holding(
+                    from,
+                    fits,
+                    Some(&held),
+                    kimmy_storage::WalkScope::Request,
+                )
             }) {
                 Ok(window) => window,
-                Err(e) => return failed(ProtocolError::Malformed(e.to_string())),
+                Err(e) => {
+                    return failed(crate::transport::from_storage(e, ProtocolError::Malformed));
+                }
             };
         }
         let sent: Vec<Stamp> = window.entries.iter().map(|entry| entry.stamp).collect();
@@ -1077,7 +1091,9 @@ mod tests {
 
     /// Everything `from` holds, applied on `into` as a pulled window.
     fn sync_into(into: &Engine, from: &Engine) {
-        let window = from.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let window = from
+            .entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background)
+            .unwrap();
         into.apply_peer_batch(
             &from.version_vector().unwrap(),
             &window.entries,
@@ -1098,7 +1114,12 @@ mod tests {
                 Some(name.into()),
             )
             .unwrap();
-        engine.entries_for_peer(Hlc::ZERO, MAX_BATCH * 4).unwrap().entries.pop().unwrap()
+        engine
+            .entries_for_peer(Hlc::ZERO, MAX_BATCH * 4, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap()
     }
 
     const DEADLINE: Duration = Duration::from_secs(10);
@@ -1922,7 +1943,13 @@ mod tests {
                 Some("by_email".into()),
             )
             .unwrap();
-        let clash = a.engine.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap().entries.pop().unwrap();
+        let clash = a
+            .engine
+            .entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap();
         let fine = create(&a.engine, "by_name");
         let clash = a.confirmer.enqueue(b.addr, node, clash).unwrap();
         let fine = a.confirmer.enqueue(b.addr, node, fine).unwrap();

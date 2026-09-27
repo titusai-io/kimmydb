@@ -84,7 +84,7 @@ pub enum ErrorCode {
     /// first commit: part of it landed, and the answer says how much
     /// (ADR-192).
     PartiallyApplied,
-    /// This node is shutting down and did not begin the write: nothing was
+    /// This node is shutting down and did not complete the request: nothing was
     /// written, and another member serves (ADR-192). An expected refusal,
     /// not a fault.
     NodeStopping,
@@ -729,8 +729,9 @@ impl ApiError {
         e
     }
 
-    /// A write this node did not begin, because it is stopping (ADR-192).
-    /// Nothing was written. `503 node_stopping`, and `elsewhere`: the node is
+    /// A request this node did not complete, because it is stopping: a write
+    /// it did not begin (ADR-192), or a walk that ended at the drain's
+    /// deadline. Nothing was written. `503 node_stopping`, and `elsewhere`: the node is
     /// going away, and another member serves. Its own code, not `internal`,
     /// so that a planned refusal does not read as a fault to anything keyed
     /// on the code. `WARN`; the storage failure behind the other reason is
@@ -740,7 +741,7 @@ impl ApiError {
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::NodeStopping,
             format!(
-                "this node did not begin the write because it is shutting down ({reason}); \
+                "this node did not complete the request because it is shutting down ({reason}); \
                  nothing was written. Send it to another member"
             ),
         )

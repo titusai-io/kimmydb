@@ -1297,7 +1297,9 @@ impl EmbeddingWorker {
         // Off the async worker (ADR-153): the walk is the whole collection.
         let mut ids = Vec::new();
         kimmy_storage::blocking(|| {
-            self.engine.for_each_doc(collection, |id, _| {
+            // The backfill serves no client: it ends at the signal, and its
+            // next start lists the collection again.
+            self.engine.for_each_doc(collection, kimmy_storage::WalkScope::Background, |id, _| {
                 ids.push(id);
                 Ok(true)
             })
@@ -1461,6 +1463,11 @@ impl EmbeddingWorker {
         // Counted at the only line a provider outage can produce — including
         // the retries, so a sustained outage reads as a climbing counter
         // rather than one flat increment.
+        // None started once the node is stopping: a batch in progress is
+        // bounded by `vector.batch.max_chunks` and finishes, but a new one would
+        // hold the engine past the stop. What it would have embedded is
+        // delivered again after the restart.
+        self.engine.check_walk(kimmy_storage::WalkScope::Background)?;
         provider.embed(inputs).await.inspect_err(|e| self.counters.failed(e))
     }
 
@@ -2040,7 +2047,35 @@ mod tests {
 
     /// The oplog entry a write produced.
     fn last_entry(engine: &Engine) -> kimmy_core::OplogEntry {
-        engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap().pop().expect("an entry")
+        engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .pop()
+            .expect("an entry")
+    }
+
+    /// Once the node's stop has begun, no embedding starts: a local model's
+    /// batch holds the worker, and the engine with it, for as long as it
+    /// runs. The document is embedded after the restart instead.
+    #[tokio::test]
+    async fn no_embedding_starts_once_the_node_is_stopping() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let provider = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&provider) as Arc<dyn EmbeddingProvider>);
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+        engine.stop_walks();
+        let stopped = worker.process(&entry).await;
+        assert!(
+            matches!(
+                stopped,
+                Err(VectorError::Storage(kimmy_storage::StorageError::Stopping(
+                    kimmy_storage::StopReason::Shutdown
+                )))
+            ),
+            "{stopped:?}"
+        );
+        assert_eq!(provider.calls(), 0, "no provider call once stopping");
     }
 
     #[tokio::test]
@@ -2425,7 +2460,10 @@ mod tests {
         // was written while it was "down", and retention collected everything
         // but the newest entry — which the GC never removes, so the position
         // must point below it to be collected at all.
-        let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
+        let first = engine
+            .read_oplog_from(Hlc::ZERO, 1, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .remove(0);
         let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
         engine.put_consumer_position(CONSUMER, stale.clone()).unwrap();
         let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
@@ -3312,7 +3350,7 @@ mod tests {
             engine.insert(&coll, doc! { "_id": i as i64, "title": format!("doc {i}") }).unwrap();
         }
         let entries: Vec<kimmy_core::OplogEntry> = engine
-            .read_oplog_from(Hlc::ZERO, 10_000)
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
             .unwrap()
             .into_iter()
             .filter(|e| e.collection == coll.id && e.doc_id.is_some())
@@ -3514,7 +3552,9 @@ mod tests {
                 .unwrap();
         }
         // Process the replaces so vectors are current for the old config.
-        let entries = engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap();
+        let entries = engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap();
         for entry in &entries {
             worker.process(entry).await.unwrap();
         }

@@ -153,6 +153,59 @@ allowed_hosts = ["127.0.0.1"]
         Node { name, child: std::sync::Mutex::new(child), pid, cluster, http, dir }
     }
 
+    /// Stop this node with SIGTERM, wait for it, and start it again on the
+    /// same data directory and ports, with `env` added. The run before keeps
+    /// its logs as `stdout.before.log` and `stderr.before.log`.
+    fn restart_with(&mut self, env: &[(&str, &str)]) -> std::process::ExitStatus {
+        let exited = self.child.get_mut().unwrap().try_wait().unwrap();
+        let status = match exited {
+            Some(status) => status,
+            None => {
+                self.signal("TERM");
+                self.wait_exit(Duration::from_secs(60))
+            }
+        };
+        for log in ["stdout", "stderr"] {
+            let _ = std::fs::rename(
+                self.dir.path().join(format!("{log}.log")),
+                self.dir.path().join(format!("{log}.before.log")),
+            );
+        }
+        let stdout = std::fs::File::create(self.dir.path().join("stdout.log")).unwrap();
+        let stderr = std::fs::File::create(self.dir.path().join("stderr.log")).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kimmyd"));
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command
+            .arg("--config")
+            .arg(self.dir.path().join("kimmy.toml"))
+            .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawning kimmyd");
+        self.pid = child.id();
+        *self.child.get_mut().unwrap() = child;
+        status
+    }
+
+    /// Wait up to `within` for the process to end, and report its status.
+    fn wait_exit(&self, within: Duration) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Some(status) = self.child.lock().unwrap().try_wait().unwrap() {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{} did not exit", self.name);
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("stdout.log")).unwrap_or_default()
+    }
+
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.http)
     }
@@ -2308,4 +2361,271 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
     }
     drop(feeds);
     drop(silent);
+}
+
+/// **The finding this change is for** (0.40.0, and since at least 0.39.0): a
+/// member stopped while its peers are pulling from it kept serving the walk
+/// in flight until it ended, so a supervisor killed it at its stop timeout
+/// and its next start repaired the whole store.
+///
+/// Node B's every walk is slowed so that the pulls A and C make of it each
+/// hold a serve walk for seconds, as a cold walk of a large oplog does. B is
+/// stopped while they pull: its serve walks end at the signal, and it exits
+/// 0 promptly with the store closed (`engine closed`, the `shutdown` marker),
+/// and its next start repairs nothing.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_closes_its_store() {
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let post = |node: &Node, path: &str, body: serde_json::Value| {
+        client.post(node.url(path)).bearer_auth(&token).json(&body).send()
+    };
+    assert!(
+        post(&a, "/v1/db/shop/collections", serde_json::json!({ "name": "orders" }))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let docs: Vec<_> = (0..400).map(|i| serde_json::json!({ "_id": i })).collect();
+    assert!(
+        post(&a, "/v1/db/shop/coll/orders/bulk", serde_json::json!(docs))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    pulls_settle(&client, &[&a, &b, &c]).await;
+
+    // Every row of every walk on B takes 25 ms from here: a pull of its
+    // oplog walks hundreds, so its peers' pulls keep serve walks in flight.
+    let before = b.restart_with(&[
+        ("KIMMY_TEST_WALK_ROW_MS", "25"),
+        ("RUST_LOG", "info,kimmy_cluster::transport=debug"),
+    ]);
+    assert!(before.success(), "{before:?}");
+    b.wait_ready(&client).await;
+    // Writes stream into B, so each of its peers' pulls, every second, has
+    // new entries to be served: a serve walk of a second or more on B.
+    let writer = {
+        let url = b.url("/v1/db/shop/coll/orders/bulk");
+        let token = b.login(&client).await;
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for batch in 0u64.. {
+                let docs: Vec<_> = (0..20)
+                    .map(|i| serde_json::json!({ "_id": format!("s{batch}-{i}") }))
+                    .collect();
+                if client.post(&url).bearer_auth(&token).json(&docs).send().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let started = std::time::Instant::now();
+    b.signal("TERM");
+    let status = b.wait_exit(Duration::from_secs(60));
+    let took = started.elapsed();
+    writer.abort();
+    let log = b.log();
+    assert!(status.success(), "{status:?}\n{log}");
+    assert!(took < Duration::from_secs(8), "the stop waited for the serve walks: {took:?}\n{log}");
+    assert!(log.contains("stopped serving a peer's pull"), "no serve walk was in flight:\n{log}");
+    // B's own pulls stop at the signal too, and that is no peer's failure.
+    let stopping = &log[log.find("shutdown signal received").unwrap_or(0)..];
+    assert!(!stopping.contains("sync round failed"), "{stopping}");
+    assert!(log.contains("engine closed"), "{log}");
+    let marker =
+        std::fs::read_to_string(b.dir.path().join("data").join("kimmy.last-exit")).unwrap();
+    assert!(marker.contains("exit = \"shutdown\""), "{marker}");
+
+    b.restart_with(&[]);
+    b.wait_ready(&client).await;
+    let log = b.log();
+    assert!(log.contains("previous run ended cleanly"), "{log}");
+    assert!(!log.contains("repairing the database"), "{log}");
+}
+
+/// A schema change in flight at the signal is a client's request, which the
+/// drain lets finish: its index build and its confirmation's push walk go
+/// on through the drain (ADR-192), and the members confirm it before the
+/// node stops. Only a walk that serves no client ends at the signal.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_schema_change_in_flight_at_the_signal_completes_in_the_drain() {
+    let client = reqwest::Client::new();
+    let (mut a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let post = |node: &Node, path: &str, body: serde_json::Value| {
+        client.post(node.url(path)).bearer_auth(&token).json(&body).send()
+    };
+    assert!(
+        post(&a, "/v1/db/shop/collections", serde_json::json!({ "name": "sessions" }))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let docs: Vec<_> = (0..200).map(|i| serde_json::json!({ "_id": i, "seen": i })).collect();
+    assert!(
+        post(&a, "/v1/db/shop/coll/sessions/bulk", serde_json::json!(docs))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    pulls_settle(&client, &[&a, &b, &c]).await;
+
+    // A's build reads 200 documents at 20 ms each: seconds, so the signal
+    // arrives while it runs.
+    assert!(a.restart_with(&[("KIMMY_TEST_WALK_ROW_MS", "20")]).success());
+    a.wait_ready(&client).await;
+    let token = a.login(&client).await;
+    let create = {
+        let url = a.url("/v1/db/shop/coll/sessions/indexes");
+        tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "name": "by_seen", "fields": [{ "path": "seen" }] }))
+                .send()
+                .await
+                .unwrap();
+            (res.status(), res.json::<serde_json::Value>().await.unwrap())
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    a.signal("TERM");
+    let (status, created) = create.await.unwrap();
+    assert!(status.is_success(), "{status}: {created}");
+    assert_eq!(created["confirmation"]["confirmed"].as_array().map(Vec::len), Some(2), "{created}");
+    let exited = a.wait_exit(Duration::from_secs(60));
+    assert!(exited.success(), "{exited:?}\n{}", a.log());
+    assert!(a.log().contains("engine closed"), "{}", a.log());
+}
+
+/// Seconds since midnight of a pretty log line's timestamp, such as
+/// `2026-09-27T00:04:54.993839Z`, after its colour escapes.
+fn logged_at(line: &str) -> Option<f64> {
+    let plain: String = {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let time = plain.trim_start().split('T').nth(1)?.split('Z').next()?;
+    let mut parts = time.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// The scopes apart: while a client's request keeps the drain busy, a pull a
+/// peer is making of this node ends at the signal, not at the drain's
+/// deadline. Its serve walk serves no client.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    assert!(
+        client
+            .post(a.url("/v1/db/shop/collections"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "name": "orders" }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let docs: Vec<_> = (0..200).map(|i| serde_json::json!({ "_id": i })).collect();
+    assert!(
+        client
+            .post(a.url("/v1/db/shop/coll/orders/bulk"))
+            .bearer_auth(&token)
+            .json(&docs)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    pulls_settle(&client, &[&a, &b, &c]).await;
+
+    // 200 ms a row on B: a pull of a few new entries is a serve walk of
+    // seconds, and a backup of the store outlasts the drain.
+    assert!(
+        b.restart_with(&[
+            ("KIMMY_TEST_WALK_ROW_MS", "200"),
+            ("RUST_LOG", "info,kimmy_cluster::transport=debug"),
+        ])
+        .success()
+    );
+    b.wait_ready(&client).await;
+    let token = b.login(&client).await;
+    let writer = {
+        let url = b.url("/v1/db/shop/coll/orders/bulk");
+        let token = token.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for batch in 0u64.. {
+                let docs: Vec<_> = (0..20)
+                    .map(|i| serde_json::json!({ "_id": format!("s{batch}-{i}") }))
+                    .collect();
+                if client.post(&url).bearer_auth(&token).json(&docs).send().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let backup = {
+        let url = b.url("/v1/admin/backup");
+        tokio::spawn(async move { reqwest::Client::new().get(url).bearer_auth(token).send().await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    b.signal("TERM");
+    let status = b.wait_exit(Duration::from_secs(60));
+    writer.abort();
+    backup.abort();
+    let log = b.log();
+    assert!(status.success(), "{status:?}\n{log}");
+    let signal = log
+        .lines()
+        .find(|l| l.contains("shutdown signal received"))
+        .and_then(logged_at)
+        .expect("the signal logged");
+    let stopped = log
+        .lines()
+        .filter(|l| l.contains("stopped serving a peer's pull"))
+        .filter_map(logged_at)
+        .find(|at| *at >= signal)
+        .unwrap_or_else(|| panic!("no pull was being served at the signal:\n{log}"));
+    assert!(
+        stopped - signal < 3.0,
+        "the serve walk ran on {:.1} s into the drain, as a request's would\n{log}",
+        stopped - signal
+    );
 }

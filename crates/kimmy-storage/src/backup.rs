@@ -52,12 +52,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use kimmy_core::NodeId;
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase};
 use tracing::info;
 
 use crate::engine::Engine;
 use crate::error::{Result, StorageError};
 use crate::tables;
+use crate::walk::{WalkScope, open_walk_table_if_exists};
 
 const MAGIC: &[u8; 8] = b"KIMMYBK1";
 const FORMAT: u8 = 1;
@@ -120,8 +121,10 @@ impl Engine {
     /// Stream a consistent backup.
     ///
     /// Runs in a read transaction, so writers keep working and every table is
-    /// read as of the same instant.
-    pub fn backup_to(&self, out: &mut impl Write) -> Result<BackupInfo> {
+    /// read as of the same instant. Ends at the stop `scope` names with
+    /// [`StorageError::Stopping`], before its `END` marker, so what it wrote
+    /// reads as a truncated backup and is never restored as a whole one.
+    pub fn backup_to(&self, out: &mut impl Write, scope: WalkScope) -> Result<BackupInfo> {
         let io = |e: std::io::Error| StorageError::Database(format!("writing a backup: {e}"));
         let created_ms = crate::engine::physical_now_ms();
         let node = self.node_id();
@@ -136,23 +139,20 @@ impl Engine {
         // One read transaction for the whole walk. This is the line that makes
         // the backup consistent rather than a series of unrelated reads.
         let txn = self.db().begin_read()?;
+        let walk = self.walk(scope);
 
         macro_rules! simple {
             ($tag:expr, $table:expr, $keybytes:expr) => {{
-                match txn.open_table($table) {
-                    Ok(t) => {
-                        for entry in t.iter()? {
-                            let (k, v) = entry?;
-                            #[allow(clippy::redundant_closure_call)]
-                            let key = ($keybytes)(k.value());
-                            bytes += write_record(out, $tag, &key, v.value())?;
-                            records += 1;
-                        }
+                // A table absent from a database that never used it is not an
+                // error; a fresh node has never written some of these.
+                if let Some(t) = open_walk_table_if_exists(&txn, $table, walk)? {
+                    for entry in t.iter()? {
+                        let (k, v) = entry?;
+                        #[allow(clippy::redundant_closure_call)]
+                        let key = ($keybytes)(k.value());
+                        bytes += write_record(out, $tag, &key, v.value())?;
+                        records += 1;
                     }
-                    // A table absent from a database that never used it is not
-                    // an error; a fresh node has never written some of these.
-                    Err(redb::TableError::TableDoesNotExist(_)) => {}
-                    Err(e) => return Err(e.into()),
                 }
             }};
         }
@@ -189,39 +189,27 @@ impl Engine {
         });
 
         // Value types that are not `&[u8]` need their own arm.
-        match txn.open_table(tables::OPLOG_ARRIVAL_SEQ) {
-            Ok(t) => {
-                for entry in t.iter()? {
-                    let (k, v) = entry?;
-                    bytes += write_record(
-                        out,
-                        T_OPLOG_ARRIVAL_SEQ,
-                        k.value(),
-                        &v.value().to_be_bytes(),
-                    )?;
-                    records += 1;
-                }
+        if let Some(t) = open_walk_table_if_exists(&txn, tables::OPLOG_ARRIVAL_SEQ, walk)? {
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                bytes +=
+                    write_record(out, T_OPLOG_ARRIVAL_SEQ, k.value(), &v.value().to_be_bytes())?;
+                records += 1;
             }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(e.into()),
         }
 
-        match txn.open_table(tables::INDEX_ENTRIES) {
-            Ok(t) => {
-                for entry in t.iter()? {
-                    let (k, _) = entry?;
-                    let (coll, index, key, id) = k.value();
-                    let mut composed = Vec::new();
-                    composed.extend_from_slice(&coll.to_be_bytes());
-                    composed.extend_from_slice(&index.to_be_bytes());
-                    push_part(&mut composed, key);
-                    push_part(&mut composed, id);
-                    bytes += write_record(out, T_INDEX_ENTRIES, &composed, &[])?;
-                    records += 1;
-                }
+        if let Some(t) = open_walk_table_if_exists(&txn, tables::INDEX_ENTRIES, walk)? {
+            for entry in t.iter()? {
+                let (k, _) = entry?;
+                let (coll, index, key, id) = k.value();
+                let mut composed = Vec::new();
+                composed.extend_from_slice(&coll.to_be_bytes());
+                composed.extend_from_slice(&index.to_be_bytes());
+                push_part(&mut composed, key);
+                push_part(&mut composed, id);
+                bytes += write_record(out, T_INDEX_ENTRIES, &composed, &[])?;
+                records += 1;
             }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(e.into()),
         }
 
         out.write_all(&[END]).map_err(io)?;
@@ -512,7 +500,7 @@ mod tests {
     fn meta_leads_the_backup_stream() {
         let (engine, _dir) = populated();
         let mut out = Vec::new();
-        engine.backup_to(&mut out).unwrap();
+        engine.backup_to(&mut out, crate::WalkScope::Request).unwrap();
         let mut rest = &out[8 + 1 + 16 + 8..];
         let mut tags = Vec::new();
         loop {
@@ -556,12 +544,12 @@ mod tests {
     fn a_backup_round_trips_documents_indexes_and_identity() {
         let (engine, _dir) = populated();
         let coll = engine.get_collection("shop", "orders").unwrap();
-        let before_count = engine.count(&coll).unwrap();
+        let before_count = engine.count(&coll, crate::WalkScope::Request).unwrap();
         let before_node = engine.node_id();
         let before_versions = engine.version_vector().unwrap();
 
         let mut buf = Vec::new();
-        let info = engine.backup_to(&mut buf).unwrap();
+        let info = engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
         assert!(info.records > 0);
         assert_eq!(info.node, Some(before_node));
 
@@ -573,7 +561,11 @@ mod tests {
         let restored = Engine::open(&path).unwrap();
         let rcoll = restored.get_collection("shop", "orders").expect("the collection must restore");
 
-        assert_eq!(restored.count(&rcoll).unwrap(), before_count, "document count");
+        assert_eq!(
+            restored.count(&rcoll, crate::WalkScope::Request).unwrap(),
+            before_count,
+            "document count"
+        );
         assert_eq!(
             restored.node_id(),
             before_node,
@@ -601,7 +593,7 @@ mod tests {
         // would look perfectly healthy.
         let (engine, _dir) = populated();
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
 
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("restored.redb");
@@ -629,7 +621,7 @@ mod tests {
         let index_id = kimmy_core::IndexMeta::derive_id("qty_1");
         let dropped_at = engine.index_dropped_at(coll.id, index_id).unwrap().expect("recorded");
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
 
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("restored.redb");
@@ -668,7 +660,7 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
         writer.join().unwrap();
 
         let dest = tempfile::tempdir().unwrap();
@@ -686,7 +678,7 @@ mod tests {
                 "document {i} was committed before the backup began"
             );
         }
-        let count = restored.count(&rcoll).unwrap();
+        let count = restored.count(&rcoll, crate::WalkScope::Request).unwrap();
         assert!((50..=250).contains(&count), "implausible count {count}");
     }
 
@@ -696,7 +688,7 @@ mod tests {
         // loss, and the operator who wants one can remove the file themselves.
         let (engine, _dir) = populated();
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
 
         let dest = tempfile::tempdir().unwrap();
         let path = dest.path().join("restored.redb");
@@ -721,7 +713,7 @@ mod tests {
         // missing whatever came after the truncation.
         let (engine, _dir) = populated();
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
         buf.truncate(buf.len() / 2);
 
         let dest = tempfile::tempdir().unwrap();
@@ -738,7 +730,7 @@ mod tests {
         // whatever it held.
         let (engine, _dir) = populated();
         let mut buf = Vec::new();
-        engine.backup_to(&mut buf).unwrap();
+        engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
         buf[8] = FORMAT + 1;
 
         let dest = tempfile::tempdir().unwrap();

@@ -17,6 +17,7 @@ use crate::engine::WriterHolder;
 use crate::error::{Result, StorageError};
 use crate::meta::{Enforcement, IndexField, IndexMeta};
 use crate::tables;
+use crate::walk::{WalkScope, WalkStop, WalkTable, open_walk_table, open_walk_table_in};
 
 /// Guard against an index producing a combinatorial number of entries for one
 /// document. A compound index over two array fields would write the cartesian
@@ -336,7 +337,7 @@ pub(crate) fn maintain(
     }
     // One handle for the whole operation: redb refuses to open the same table
     // twice in a transaction, and a `Table` is readable as well as writable.
-    let mut table = txn.open_table(tables::INDEX_ENTRIES)?;
+    let mut table = open_walk_table_in(txn, tables::INDEX_ENTRIES, WalkStop::in_write())?;
 
     // Check every constraint first. Failing halfway through the mutations
     // would leave the index describing a write that was then rejected.
@@ -428,7 +429,7 @@ pub(crate) fn maintain_remote(
     if indexes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let mut table = txn.open_table(tables::INDEX_ENTRIES)?;
+    let mut table = open_walk_table_in(txn, tables::INDEX_ENTRIES, WalkStop::in_write())?;
 
     let mut violations = Vec::new();
     if let Some(new) = new {
@@ -595,8 +596,14 @@ pub(crate) fn mark_multikey(
     Ok(())
 }
 
-/// Every document id currently filed under one exact index key.
-fn holders_of<T>(table: &T, coll: CollectionId, index_id: u32, key: &[u8]) -> Result<Vec<Vec<u8>>>
+/// Every document id currently filed under one exact index key: a unique
+/// key's holder, or a whole sentinel run.
+fn holders_of<T>(
+    table: &WalkTable<'_, T>,
+    coll: CollectionId,
+    index_id: u32,
+    key: &[u8],
+) -> Result<Vec<Vec<u8>>>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>,
 {
@@ -635,17 +642,27 @@ pub(crate) enum Unkeyed {
 /// whether the documents the index could not key come back too — see
 /// [`Unkeyed`] for which reader wants which.
 pub(crate) fn scan_range(
-    db: &redb::Database,
+    engine: &crate::Engine,
+    walk: WalkScope,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
     unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    scan_range_in(&db.begin_read()?, coll, index_id, lower, upper, unkeyed)
+    scan_range_in(
+        &engine.db().begin_read()?,
+        engine.walk(walk),
+        coll,
+        index_id,
+        lower,
+        upper,
+        unkeyed,
+    )
 }
 
-/// [`scan_range`] inside a **write** transaction.
+/// [`scan_range`] inside a **write** transaction, which does not stop at the
+/// node's stop ([`Walk::in_write`]).
 ///
 /// Separate from the read-transaction twin because redb's two transaction
 /// types are distinct: `find_and_modify` matches inside the write it is about
@@ -658,7 +675,7 @@ pub(crate) fn scan_range_in_write(
     upper: Option<&[u8]>,
     unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    let table = txn.open_table(tables::INDEX_ENTRIES)?;
+    let table = open_walk_table_in(txn, tables::INDEX_ENTRIES, WalkStop::in_write())?;
     scan_table(&table, coll, index_id, lower, upper, unkeyed)
 }
 
@@ -667,19 +684,20 @@ pub(crate) fn scan_range_in_write(
 /// [`crate::Engine::index_candidates_unless_multikey`].
 fn scan_range_in(
     txn: &redb::ReadTransaction,
+    walk: WalkStop<'_>,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
     unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    let table = txn.open_table(tables::INDEX_ENTRIES)?;
+    let table = open_walk_table(txn, tables::INDEX_ENTRIES, walk)?;
     scan_table(&table, coll, index_id, lower, upper, unkeyed)
 }
 
 /// The body of [`scan_range`], over any readable view of the entries.
 fn scan_table<T>(
-    table: &T,
+    table: &WalkTable<'_, T>,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
@@ -724,7 +742,12 @@ where
 /// One seek: the unkeyed run sits at the front of the index's entries, so
 /// the first entry at or after `(collection, index, UNKEYED)` either is one
 /// or proves there are none.
-fn has_entries_at<T>(table: &T, coll: CollectionId, index_id: u32, key: &[u8]) -> Result<bool>
+fn has_entries_at<T>(
+    table: &WalkTable<'_, T>,
+    coll: CollectionId,
+    index_id: u32,
+    key: &[u8],
+) -> Result<bool>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>,
 {
@@ -1320,6 +1343,14 @@ impl crate::Engine {
             }
 
             let txn = self.begin_write(WriterHolder::IndexBuild)?;
+            // The build reads every document of the collection, so it ends at
+            // the stop: a client's build at the drain's deadline, answered
+            // `node_stopping` with nothing written; a peer's at the signal, and
+            // the batch that carried it is delivered again.
+            let fill = self.walk(match origin {
+                CreateOrigin::Local => WalkScope::Request,
+                _ => WalkScope::Background,
+            });
             // Everything above decided from a definition read before the writer;
             // one that has changed since is decided again (`definition_is`).
             if !crate::Engine::definition_is(&txn, &read)? {
@@ -1352,7 +1383,7 @@ impl crate::Engine {
             // leaving the name empty on this member alone.
             if let Some(loser) = &superseded {
                 {
-                    let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                    let mut entries = open_walk_table_in(&txn, tables::INDEX_ENTRIES, fill)?;
                     clear_index_entries(&mut entries, index_id_range(meta.id, loser.id))?;
                 }
                 // Under the *winner's* stamp. The upper bound is the load-bearing
@@ -1380,8 +1411,8 @@ impl crate::Engine {
             // the keys the existing documents already share, and how many documents
             // were filed unkeyed.
             let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize, usize)> {
-                let docs = txn.open_table(tables::DOCS)?;
-                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                let docs = open_walk_table_in(&txn, tables::DOCS, fill)?;
+                let mut entries = open_walk_table_in(&txn, tables::INDEX_ENTRIES, fill)?;
                 // What a unique index has filed so far. Locally only the keys
                 // matter, since the first repeat is a refusal; a replicated build
                 // also keeps who holds each key, in scan order, because that is
@@ -1780,7 +1811,16 @@ impl crate::Engine {
         lower: &[u8],
         upper: &[u8],
     ) -> Result<Vec<Vec<u8>>> {
-        scan_range(self.db(), coll.id, index_id, lower, Some(upper), Unkeyed::Include)
+        // A query's candidates.
+        scan_range(
+            self,
+            WalkScope::Request,
+            coll.id,
+            index_id,
+            lower,
+            Some(upper),
+            Unkeyed::Include,
+        )
     }
 
     /// Keyed entries in `lower..=upper`, in index order, strictly after
@@ -1803,7 +1843,8 @@ impl crate::Engine {
         use std::ops::Bound;
 
         let txn = self.db().begin_read()?;
-        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        // For TTL expiry, which serves no client.
+        let table = open_walk_table(&txn, tables::INDEX_ENTRIES, self.walk(WalkScope::Background))?;
         let start = match after {
             Some((key, doc_key)) => {
                 Bound::Excluded((coll.id.0, index_id, key.as_slice(), doc_key.as_slice()))
@@ -1840,9 +1881,11 @@ impl crate::Engine {
     /// 0 — and every place this figure is documented says "could not key".
     /// [`Self::undecidable_count`] is the other reason, and an owner needs both:
     /// on a money field the second may be most of the collection.
+    ///
+    /// A walk of the run, for a client reading the index listing.
     pub fn unkeyed_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
         let txn = self.db().begin_read()?;
-        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        let table = open_walk_table(&txn, tables::INDEX_ENTRIES, self.walk(WalkScope::Request))?;
         Ok(holders_of(&table, coll.id, index_id, UNKEYED)?.len() as u64)
     }
 
@@ -1852,9 +1895,11 @@ impl crate::Engine {
     /// Standing, unlike `kimmy_index_undecidable_total`, which is a rate since
     /// start: an owner asking "how much of this index is being rechecked on every
     /// scan?" needs the number now, not how it got there.
+    ///
+    /// A walk of the run, for a client reading the index listing.
     pub fn undecidable_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
         let txn = self.db().begin_read()?;
-        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        let table = open_walk_table(&txn, tables::INDEX_ENTRIES, self.walk(WalkScope::Request))?;
         Ok(holders_of(&table, coll.id, index_id, UNDECIDABLE)?.len() as u64)
     }
 
@@ -1892,7 +1937,16 @@ impl crate::Engine {
                 _ => return Ok(None),
             }
         }
-        scan_range_in(&txn, coll.id, index_id, lower, Some(upper), Unkeyed::Include).map(Some)
+        scan_range_in(
+            &txn,
+            self.walk(WalkScope::Request),
+            coll.id,
+            index_id,
+            lower,
+            Some(upper),
+            Unkeyed::Include,
+        )
+        .map(Some)
     }
 
     /// Fetch a document by its already-encoded key.
@@ -1999,11 +2053,15 @@ pub struct IndexScanOutcome {
 /// Documents are fetched from the **same snapshot** as the index entries —
 /// one read transaction per query — where the older candidate list opened a
 /// new transaction per document.
+/// The index entries and documents tables as a query reads them.
+type EntriesTable = redb::ReadOnlyTable<tables::IndexKey<'static>, ()>;
+type DocsTable = redb::ReadOnlyTable<(u64, &'static [u8]), &'static [u8]>;
+
 struct Walk<'t, F> {
     coll: CollectionId,
     index: &'t IndexMeta,
-    entries: &'t redb::ReadOnlyTable<tables::IndexKey<'static>, ()>,
-    docs: &'t redb::ReadOnlyTable<(u64, &'static [u8]), &'static [u8]>,
+    entries: &'t WalkTable<'t, EntriesTable>,
+    docs: &'t WalkTable<'t, DocsTable>,
     /// The ranges to read, in key order: the index's sentinel runs first —
     /// [`UNKEYED`], then [`UNDECIDABLE`] — each when it holds anything, and
     /// then the planner's, which start above both ([`ABOVE_SENTINELS`]). A run
@@ -2304,6 +2362,7 @@ impl crate::Engine {
         coll: &crate::CollectionMeta,
         scan: &IndexScan<'_>,
         order: CandidateOrder<'_>,
+        scope: WalkScope,
         visit: F,
     ) -> Result<Option<IndexScanOutcome>>
     where
@@ -2322,8 +2381,8 @@ impl crate::Engine {
                 _ => return Ok(None),
             }
         };
-        let entries = txn.open_table(tables::INDEX_ENTRIES)?;
-        let docs = txn.open_table(tables::DOCS)?;
+        let entries = open_walk_table(&txn, tables::INDEX_ENTRIES, self.walk(scope))?;
+        let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
         // A plan with no ranges — a `$in` over nothing — matches nothing,
         // unkeyed documents included: they are candidates for a question,
         // not for the absence of one.
@@ -3021,7 +3080,16 @@ mod tests {
 
     /// Every document id currently filed under an index, via a full scan of it.
     fn entries_for(engine: &Engine, coll: &CollectionMeta, index_id: u32) -> Vec<Vec<u8>> {
-        scan_range(engine.db(), coll.id, index_id, &[], None, Unkeyed::Exclude).unwrap()
+        scan_range(
+            engine,
+            crate::WalkScope::Request,
+            coll.id,
+            index_id,
+            &[],
+            None,
+            Unkeyed::Exclude,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3073,7 +3141,7 @@ mod tests {
         // The rejected write must leave nothing behind — neither document nor
         // index entry.
         assert!(engine.get(&coll, &DocId::Int64(2)).unwrap().is_none());
-        assert_eq!(engine.count(&coll).unwrap(), 1);
+        assert_eq!(engine.count(&coll, crate::WalkScope::Request).unwrap(), 1);
     }
 
     #[test]
@@ -3494,7 +3562,10 @@ mod tests {
 
         let coll = a.get_collection("app", "docs").unwrap();
         a.insert(&coll, doc! { "_id": 1, "a": [1, 2] }).unwrap();
-        let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+        let entries = a
+            .entries_for_peer(kimmy_core::Hlc::ZERO, 100, crate::WalkScope::Background)
+            .unwrap()
+            .entries;
         b.apply_batch(&entries).unwrap();
 
         assert!(multikey_of(&b, "a_1"), "the applying node must observe what it applied");
@@ -3672,7 +3743,7 @@ mod tests {
         };
         let mut ids = Vec::new();
         let outcome = engine
-            .visit_index_candidates(coll, &scan, order, |_, _, doc| {
+            .visit_index_candidates(coll, &scan, order, crate::WalkScope::Request, |_, _, doc| {
                 let id = doc.get_i64("_id").unwrap();
                 if accept(id) {
                     ids.push(id);
@@ -3905,10 +3976,16 @@ mod tests {
         };
         let mut visited = 0;
         let refused = engine
-            .visit_index_candidates(&stale, &scan, CandidateOrder::Any, |_, _, _| {
-                visited += 1;
-                Ok(true)
-            })
+            .visit_index_candidates(
+                &stale,
+                &scan,
+                CandidateOrder::Any,
+                crate::WalkScope::Request,
+                |_, _, _| {
+                    visited += 1;
+                    Ok(true)
+                },
+            )
             .unwrap();
         assert_eq!(refused, None, "a flipped flag must force a re-plan");
         assert_eq!(visited, 0, "and nothing may have been handed out first");
@@ -3923,7 +4000,7 @@ mod tests {
         let filter = kimmy_query::filter::parse(query).unwrap();
         let mut ids = Vec::new();
         engine
-            .for_each_doc(coll, |id, doc| {
+            .for_each_doc(coll, crate::WalkScope::Request, |id, doc| {
                 if kimmy_query::filter::matches(&filter, &doc)
                     && let DocId::Int64(n) = id
                 {
@@ -4783,7 +4860,10 @@ mod tests {
             let ca = a.get_collection("app", "docs").unwrap();
             a.insert(&ca, doc! { "_id": 1i64, "a": [1], "b": [2] }).unwrap();
             a.insert(&ca, doc! { "_id": 2i64, "a": 1, "b": 2 }).unwrap();
-            let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+            let entries = a
+                .entries_for_peer(kimmy_core::Hlc::ZERO, 100, crate::WalkScope::Background)
+                .unwrap()
+                .entries;
             let outcome = b.apply_batch(&entries).unwrap();
             assert_eq!(outcome.applied, 2, "{outcome:?}");
 
@@ -4989,7 +5069,9 @@ mod clearing {
     fn entries_of(engine: &crate::Engine, index: &str) -> usize {
         let coll = engine.get_collection("shop", "t").unwrap();
         let id = IndexMeta::derive_id(index);
-        scan_range(engine.db(), coll.id, id, &[], None, Unkeyed::Include).unwrap().len()
+        scan_range(engine, crate::WalkScope::Request, coll.id, id, &[], None, Unkeyed::Include)
+            .unwrap()
+            .len()
     }
 
     fn assert_no_growth(before: u64, after: u64, what: &str) {

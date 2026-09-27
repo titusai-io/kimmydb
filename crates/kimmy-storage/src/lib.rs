@@ -38,7 +38,9 @@ pub mod sync;
 pub mod tables;
 pub mod vectors;
 pub mod verified;
+pub mod walk;
 pub use verified::VerifiedWalk;
+pub use walk::WalkScope;
 pub mod watch;
 
 pub use divergence::{

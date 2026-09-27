@@ -383,7 +383,7 @@ impl HnswIndex {
         // reachability probe below had finished with it. That was most of the
         // headroom a rebuild needed, paid every `MAX_STALENESS` under writes.
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
-        engine.for_each_vector(shadow, |record| {
+        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
             if record.vector.len() == dim {
@@ -453,6 +453,8 @@ impl HnswIndex {
         // build's peak is one copy plus the graph's bookkeeping, not two.
         let mut keys = Vec::with_capacity(n);
         for (key, vector) in records {
+            // A build is for a search, which the drain's deadline ends.
+            engine.check_walk(kimmy_storage::WalkScope::Request)?;
             let id = keys.len();
             match &graph {
                 Graph::Cosine(g) => g.insert((vector.as_slice(), id)),
@@ -880,7 +882,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let mut records = Vec::new();
         engine
-            .for_each_vector(&shadow, |r| {
+            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |r| {
                 records.push(r);
                 Ok(true)
             })
@@ -1011,7 +1013,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let mut records = Vec::new();
         engine
-            .for_each_vector(&shadow, |r| {
+            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |r| {
                 records.push(r);
                 Ok(true)
             })

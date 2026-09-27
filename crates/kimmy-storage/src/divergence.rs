@@ -557,7 +557,7 @@ mod tests {
             )
             .unwrap();
 
-        let decoded = engine.count(&coll).unwrap();
+        let decoded = engine.count(&coll, crate::WalkScope::Request).unwrap();
         assert_eq!(decoded, 3);
         assert_eq!(engine.count_by_id(coll.id).unwrap(), Some(decoded));
         assert_eq!(engine.count_probe_reading(coll.id).unwrap().1, Some(decoded));

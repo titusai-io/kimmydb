@@ -254,7 +254,7 @@ pub fn list(state: &SharedState, auth: &Auth, db: &str, coll: &str) -> Result<Va
 
     let meta = registry(state)?;
     let mut out = Vec::new();
-    state.engine.for_each_doc(&meta, |_id, document| {
+    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
         let matches = document.get_str("database").is_ok_and(|d| d == db)
             && document.get_str("collection").is_ok_and(|c| c == coll);
         if matches {

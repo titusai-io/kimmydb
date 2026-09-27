@@ -84,12 +84,12 @@ pub fn describe_collection(
     // The sample stops at `limit`, but the total is every document decoded,
     // so the two run as one walk off the worker (ADR-153).
     let total = kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&meta, |_, doc| {
+        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_, doc| {
             observe_document(&doc, &mut fields);
             sampled += 1;
             Ok(sampled < limit)
         })?;
-        state.engine.count(&meta)
+        state.engine.count(&meta, kimmy_storage::WalkScope::Request)
     })?;
 
     let described: Vec<Value> = fields
@@ -269,7 +269,7 @@ pub fn sample_documents(
 ) -> Result<Vec<Value>, ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let mut out = Vec::new();
-    state.engine.for_each_doc(&meta, |_, doc| {
+    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_, doc| {
         out.push(document_to_json(&doc));
         Ok(out.len() < limit)
     })?;

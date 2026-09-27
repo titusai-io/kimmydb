@@ -1030,7 +1030,11 @@ mod tests {
         let orders = engine.get_collection("shop", "orders").unwrap();
 
         assert_eq!(orders.id, CollectionId::derive("shop", "orders"), "id must be renumbered");
-        assert_eq!(engine.count(&orders).unwrap(), 5, "documents must move with the id");
+        assert_eq!(
+            engine.count(&orders, crate::WalkScope::Request).unwrap(),
+            5,
+            "documents must move with the id"
+        );
         assert!(engine.get(&orders, &DocId::Int64(3)).unwrap().is_some());
     }
 
@@ -1061,10 +1065,15 @@ mod tests {
 
         for name in ["orders", "lines"] {
             let coll = engine.get_collection("shop", name).unwrap();
-            assert_eq!(engine.count(&coll).unwrap(), 5_000, "{name}: every document moved");
+            assert_eq!(
+                engine.count(&coll, crate::WalkScope::Request).unwrap(),
+                5_000,
+                "{name}: every document moved"
+            );
             let index = &coll.indexes[0];
             let entries = crate::index::scan_range(
-                engine.db(),
+                &engine,
+                crate::WalkScope::Request,
                 coll.id,
                 index.id,
                 &[],
@@ -1150,7 +1159,7 @@ mod tests {
             let engine = Engine::open(&path).unwrap();
             let orders = engine.get_collection("shop", "orders").unwrap();
             assert_eq!(orders.id, CollectionId::derive("shop", "orders"));
-            assert_eq!(engine.count(&orders).unwrap(), 1);
+            assert_eq!(engine.count(&orders, crate::WalkScope::Request).unwrap(), 1);
         }
     }
 

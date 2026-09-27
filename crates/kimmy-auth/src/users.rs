@@ -244,7 +244,9 @@ impl UserStore {
     }
 
     pub fn count(&self, engine: &Engine) -> Result<u64> {
-        engine.count(&self.collection).map_err(AuthError::Storage)
+        engine
+            .count(&self.collection, kimmy_storage::WalkScope::Request)
+            .map_err(AuthError::Storage)
     }
 
     pub fn create(
@@ -284,7 +286,7 @@ impl UserStore {
     pub fn list(&self, engine: &Engine) -> Result<Vec<String>> {
         let mut names = Vec::new();
         engine
-            .for_each_doc(&self.collection, |id, _| {
+            .for_each_doc(&self.collection, kimmy_storage::WalkScope::Request, |id, _| {
                 names.push(id.to_string());
                 Ok(true)
             })

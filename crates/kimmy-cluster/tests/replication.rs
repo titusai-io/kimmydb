@@ -174,7 +174,11 @@ async fn a_replicated_document_costs_about_its_own_size_on_the_wire() {
     let payload = "x".repeat(1024 * 1024);
     a.engine.insert(&ca, doc! { "_id": "d0", "blob": payload.clone() }).unwrap();
 
-    let entries = a.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap().entries;
+    let entries = a
+        .engine
+        .entries_for_peer(kimmy_core::Hlc::ZERO, 10, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
     let insert =
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::Insert).expect("the insert entry");
 
@@ -302,7 +306,7 @@ async fn a_node_joining_an_existing_cluster_catches_up() {
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), 200);
+    assert_eq!(b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(), 200);
 }
 
 #[tokio::test]
@@ -392,7 +396,7 @@ async fn one_bad_connection_does_not_stop_the_listener() {
     let b = node().await;
     sync_once(&b.engine, a.addr, SECRET, None).await.expect("the listener must still be serving");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), 1);
+    assert_eq!(b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(), 1);
 }
 
 #[tokio::test]
@@ -451,7 +455,11 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must arrive");
-    assert_eq!(b.engine.count(&cb).unwrap(), 50, "every document must arrive");
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        50,
+        "every document must arrive"
+    );
     assert!(
         cb.indexes.iter().any(|i| i.name == "item_1" && i.unique),
         "the index must arrive with its uniqueness"
@@ -493,7 +501,7 @@ async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
     let first = sync_once(&b.engine, a.addr, SECRET, None).await.expect("the snapshot must encode");
     assert_eq!(first.applied, 50);
     let cb = b.engine.get_collection("shop", &name).expect("the collection must arrive");
-    assert_eq!(b.engine.count(&cb).unwrap(), 50);
+    assert_eq!(b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(), 50);
 
     let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
@@ -941,8 +949,8 @@ async fn a_document_an_index_here_cannot_key_does_not_wedge_replication() {
     // met in on each of them.
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(index_state(&b.engine, "tags_1_cats_1"), Some(1));
-    assert_eq!(a.engine.count(&ca).unwrap(), 3);
-    assert_eq!(b.engine.count(&cb).unwrap(), 3);
+    assert_eq!(a.engine.count(&ca, kimmy_storage::WalkScope::Request).unwrap(), 3);
+    assert_eq!(b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(), 3);
 }
 
 #[tokio::test]
@@ -1373,7 +1381,11 @@ async fn one_write_on_a_quiet_member_is_one_pull_for_a_caught_up_peer() {
 
     let held = c.engine.witnessed_vector().unwrap();
     let from = held.behind(&b.engine.version_vector().unwrap()).expect("C trails B by one write");
-    let above = b.engine.read_oplog_from(from, usize::MAX).unwrap().len();
+    let above = b
+        .engine
+        .read_oplog_from(from, usize::MAX, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .len();
     assert!(above > BUSY, "the fixture must put A's writes above C's position on B: {above}");
     assert!(held.get(a.engine.node_id()) > from, "and C must already hold them");
 
@@ -1425,7 +1437,7 @@ async fn a_peer_partway_through_an_origin_is_served_everything_it_lacks_of_it() 
 
     drain(&c, &b).await;
     assert_eq!(
-        c.engine.count(&cc).unwrap(),
+        c.engine.count(&cc, kimmy_storage::WalkScope::Request).unwrap(),
         BUSY as u64 + 1,
         "every write of A's C lacked arrives from B"
     );
@@ -1479,7 +1491,10 @@ async fn a_member_holding_a_repaired_entry_below_its_position()
     let a_id = a.engine.node_id();
     let s = a.engine.version_vector().unwrap().get(a_id);
 
-    let history = a.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let history = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Background)
+        .unwrap();
     let holed: Vec<kimmy_core::OplogEntry> = history
         .entries
         .iter()
@@ -1544,7 +1559,10 @@ async fn holed_members(writes: usize, a_holes: &[usize], r_holes: &[usize]) -> (
     o.engine
         .insert_many(&co, (0..writes).map(|i| doc! { "_id": format!("d{i}") }).collect())
         .unwrap();
-    let history = o.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let history = o
+        .engine
+        .entries_for_peer(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Background)
+        .unwrap();
     let theirs = o.engine.version_vector().unwrap();
     for (member, holes) in [(&a, a_holes), (&r, r_holes)] {
         let missing: BTreeSet<DocId> =
@@ -1664,7 +1682,10 @@ async fn a_mark_added_below_a_spans_resume_point_reopens_the_span_from_its_new_b
     o.engine
         .insert_many(&cd, (0..3_000).map(|i| doc! { "_id": format!("d{i}") }).collect())
         .unwrap();
-    let history = o.engine.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+    let history = o
+        .engine
+        .entries_for_peer(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Background)
+        .unwrap();
     let theirs = o.engine.version_vector().unwrap();
     let stamp_of = |id: &str| {
         history
@@ -1907,7 +1928,7 @@ async fn a_peer_moving_on_the_origin_does_not_re_walk_an_answered_span() {
 
     let d10 = o
         .engine
-        .entries_for_peer(Hlc::ZERO, usize::MAX)
+        .entries_for_peer(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Background)
         .unwrap()
         .entries
         .into_iter()
@@ -2020,13 +2041,17 @@ async fn a_requester_naming_spans_asks_a_sender_that_ignores_them_for_no_more_th
     // Behind on nothing, a requester before ADR-172 sends no request. This one
     // asks from A's newest stamp, never from the span's bottom.
     let from = entries_threshold(&held, &theirs, &spans).expect("a member holding spans asks");
-    let before_171 = a.engine.entries_for_peer(from, 1024).unwrap();
+    let before_171 =
+        a.engine.entries_for_peer(from, 1024, kimmy_storage::WalkScope::Background).unwrap();
     assert!(
         before_171.exhausted && before_171.entries.len() <= 1,
         "served from A's newest stamp, not the span's bottom: {:?}",
         before_171.entries
     );
-    let adr_171 = a.engine.entries_for_peer_holding(from, 1024, Some(&held)).unwrap();
+    let adr_171 = a
+        .engine
+        .entries_for_peer_holding(from, 1024, Some(&held), kimmy_storage::WalkScope::Background)
+        .unwrap();
     assert!(adr_171.exhausted && adr_171.entries.is_empty(), "{:?}", adr_171.entries);
 
     // Behind, the request is the one a requester before ADR-172 sends.
@@ -2428,7 +2453,11 @@ async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() 
     }
     sync(&a, &b).await;
     let busy_here = b.engine.get_collection("shop", "busy").expect("B holds the busy collection");
-    assert_eq!(b.engine.count(&busy_here).unwrap(), BUSY_DOCS as u64, "and all of its documents");
+    assert_eq!(
+        b.engine.count(&busy_here, kimmy_storage::WalkScope::Request).unwrap(),
+        BUSY_DOCS as u64,
+        "and all of its documents"
+    );
 
     // Only now the collection that gets stranded, and the induced hole: B's
     // witness claims to cover the creation it never applied.
@@ -3933,7 +3962,11 @@ async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
 /// pushes a moment after minting it.
 fn newest(engine: &Engine, kind: kimmy_core::OpKind) -> kimmy_core::OplogEntry {
     engine
-        .entries_for_peer(Hlc::ZERO, kimmy_cluster::protocol::MAX_BATCH * 2)
+        .entries_for_peer(
+            Hlc::ZERO,
+            kimmy_cluster::protocol::MAX_BATCH * 2,
+            kimmy_storage::WalkScope::Background,
+        )
         .unwrap()
         .entries
         .into_iter()
@@ -4024,7 +4057,10 @@ async fn a_member_more_than_a_batch_behind_is_reported_unreached_and_sent_nothin
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     let cb = b.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), kimmy_cluster::protocol::MAX_BATCH as u64 + 1);
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        kimmy_cluster::protocol::MAX_BATCH as u64 + 1
+    );
     assert!(cb.index("by_email").is_some(), "anti-entropy carried it");
 }
 
@@ -4066,7 +4102,11 @@ async fn a_member_below_the_retention_horizon_is_reported_unreached() {
 
     sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     let cb = b.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), 50, "the snapshot brought it up");
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        50,
+        "the snapshot brought it up"
+    );
     assert!(cb.index("by_email").is_some(), "index included");
 }
 
@@ -4257,7 +4297,11 @@ async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
     let theirs = a.engine.version_vector().unwrap();
     b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
     let gamma_on_b = b.engine.get_collection("shop", "gamma").unwrap();
-    assert_eq!(b.engine.count(&gamma_on_b).unwrap(), 1, "the hole: witnessed, never applied");
+    assert_eq!(
+        b.engine.count(&gamma_on_b, kimmy_storage::WalkScope::Request).unwrap(),
+        1,
+        "the hole: witnessed, never applied"
+    );
     assert!(
         b.engine.witnessed_vector().unwrap().covers(&theirs),
         "and nothing about the position says so"
@@ -4284,7 +4328,7 @@ async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
                 panic!(
                     "the divergence was not confirmed and repaired in time: confirmed={confirmed_once} \
                      repair_rounds={repair_rounds} gamma on b={}",
-                    b.engine.count(&gamma_on_b).unwrap()
+                    b.engine.count(&gamma_on_b, kimmy_storage::WalkScope::Request).unwrap()
                 )
             })
             .expect("the loop must keep reporting");
@@ -4295,7 +4339,7 @@ async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
     looping.abort();
 
     assert_eq!(
-        b.engine.count(&gamma_on_b).unwrap(),
+        b.engine.count(&gamma_on_b, kimmy_storage::WalkScope::Request).unwrap(),
         21,
         "the replay re-served the documents the position had claimed"
     );
@@ -4359,7 +4403,7 @@ async fn a_member_lacking_a_collection_stops_plans_a_snapshot_and_catches_up() {
         repair_rounds += report.repair_rounds;
         failed += report.failed;
         if let Ok(on_b) = b.engine.get_collection("shop", "late")
-            && b.engine.count(&on_b).unwrap() == 5
+            && b.engine.count(&on_b, kimmy_storage::WalkScope::Request).unwrap() == 5
             && b.engine.witnessed_vector().unwrap().covers(&a.engine.version_vector().unwrap())
         {
             break;
@@ -4420,7 +4464,11 @@ async fn a_collection_dropped_here_is_not_pulled_back_from_a_peer_that_has_not_a
         sync(&a, &b).await;
         rounds += 1;
         match b.engine.get_collection("shop", "bench") {
-            Ok(cb) if b.engine.count(&cb).unwrap() == DOCUMENTS => break cb,
+            Ok(cb)
+                if b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap() == DOCUMENTS =>
+            {
+                break cb;
+            }
             _ => assert!(rounds < 10, "B never caught up with A's {DOCUMENTS} documents"),
         }
     };
@@ -4474,11 +4522,11 @@ async fn a_collection_dropped_here_is_not_pulled_back_from_a_peer_that_has_not_a
         panic!(
             "the drop was undone: {} documents are back on A, pulled from a peer that had \
              not applied the drop",
-            a.engine.count(&back).unwrap()
+            a.engine.count(&back, kimmy_storage::WalkScope::Request).unwrap()
         );
     }
     assert_eq!(
-        b.engine.count(&cb).unwrap(),
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
         DOCUMENTS,
         "B held every document throughout, so there was something to pull back all along"
     );
@@ -4528,7 +4576,7 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
     a.engine.insert_many(&ca, first).unwrap();
     sync(&a, &b).await;
     let cb = b.engine.get_collection("shop", "bench").unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), 600);
+    assert_eq!(b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(), 600);
 
     // A writes on, and B's position moves past those writes without them:
     // half a copy, and nothing in the position saying so.
@@ -4536,7 +4584,11 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
     a.engine.insert_many(&ca, second).unwrap();
     let past = a.engine.version_vector().unwrap();
     b.engine.apply_peer_batch(&past, &[], Hlc::ZERO, true).unwrap();
-    assert_eq!(b.engine.count(&cb).unwrap(), 600, "the partial copy the repair is planned for");
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        600,
+        "the partial copy the repair is planned for"
+    );
 
     // A drops it while B is repairing from A.
     assert!(a.engine.drop_collection("shop", "bench").unwrap());
@@ -4552,7 +4604,7 @@ async fn a_snapshot_repair_whose_sender_has_dropped_the_collection_drops_it_here
     if let Ok(kept) = b.engine.get_collection("shop", "bench") {
         panic!(
             "B kept {} documents of a collection A has dropped, and goes on advertising it",
-            b.engine.count(&kept).unwrap()
+            b.engine.count(&kept, kimmy_storage::WalkScope::Request).unwrap()
         );
     }
     assert_eq!(
@@ -4678,7 +4730,7 @@ async fn a_repair_whose_sender_drops_the_collection_between_pages_discards_the_p
         panic!(
             "B kept {} documents of the incarnation A dropped between pages, and goes on \
              advertising it",
-            b.engine.count(&kept).unwrap()
+            b.engine.count(&kept, kimmy_storage::WalkScope::Request).unwrap()
         );
     }
     assert_eq!(b.engine.count_by_id(ca.id).unwrap(), None, "the partial copy went with the drop");
@@ -4721,7 +4773,15 @@ async fn a_collection_recreated_on_the_peer_after_the_drop_is_still_pulled() {
     let old: Vec<_> = (0..10).map(|n| doc! { "_id": format!("old-{n}") }).collect();
     a.engine.insert_many(&ca, old).unwrap();
     sync(&a, &b).await;
-    assert_eq!(b.engine.count(&b.engine.get_collection("shop", "bench").unwrap()).unwrap(), 10);
+    assert_eq!(
+        b.engine
+            .count(
+                &b.engine.get_collection("shop", "bench").unwrap(),
+                kimmy_storage::WalkScope::Request
+            )
+            .unwrap(),
+        10
+    );
 
     // The drop, applied on both members.
     assert!(a.engine.drop_collection("shop", "bench").unwrap());
@@ -4778,7 +4838,7 @@ async fn a_collection_recreated_on_the_peer_after_the_drop_is_still_pulled() {
         reported |= report.divergent_collections > 0;
         repair_rounds += report.repair_rounds;
         if let Ok(on_a) = a.engine.get_collection("shop", "bench")
-            && a.engine.count(&on_a).unwrap() == 10
+            && a.engine.count(&on_a, kimmy_storage::WalkScope::Request).unwrap() == 10
         {
             break on_a;
         }
@@ -4813,7 +4873,11 @@ async fn a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_docum
     let c = node().await;
     sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
     let cc = c.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(c.engine.count(&cc).unwrap(), 2, "C must hold the document first");
+    assert_eq!(
+        c.engine.count(&cc, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "C must hold the document first"
+    );
 
     assert!(a.engine.delete(&ca, &DocId::Int64(2)).unwrap());
     // Retention keeps an origin's newest entry, so a later write stands in
@@ -5328,7 +5392,11 @@ async fn a_window_applied_before_its_round_fails_is_still_a_pull() {
     .await;
 
     let cb = b.engine.get_collection("shop", "orders").expect("the window was applied");
-    assert_eq!(b.engine.count(&cb).unwrap(), 50, "and committed before the round failed");
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        50,
+        "and committed before the round failed"
+    );
     assert!(seen.serve.count >= 1, "the applied window is a pull: {seen:?}");
     assert!(seen.entries >= 51, "carrying what it applied: {seen:?}");
 }
@@ -5390,7 +5458,12 @@ async fn an_index_restored_by_snapshot_relays_to_a_member_that_holds_the_collect
     sync_once(&m.engine, p.addr, SECRET, None).await.unwrap();
 
     let held = m.engine.get_collection("shop", "orders").unwrap();
-    assert_eq!(m.engine.count(&held).unwrap(), 2, "m took the window: {:?}", held.indexes);
+    assert_eq!(
+        m.engine.count(&held, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "m took the window: {:?}",
+        held.indexes
+    );
     assert!(held.index("by_x").is_some(), "and the index in it: {:?}", held.indexes);
     assert_eq!(p.engine.ddl_relogged(), 1, "counted where p re-logged it");
 }
@@ -5529,7 +5602,11 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     // the member's answer must place the stop against, by stamp.
     a.engine.create_collection("shop", "before").unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
-    let mut entries = a.engine.entries_for_peer(Hlc::ZERO, 1_024).unwrap().entries;
+    let mut entries = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 1_024, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
     let entry = entries.pop().expect("the recreation's entry");
     let before = entries.pop().expect("the change before it");
     assert_eq!(entry.kind, kimmy_core::OpKind::CreateCollection);

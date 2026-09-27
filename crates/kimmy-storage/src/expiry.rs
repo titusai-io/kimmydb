@@ -779,7 +779,8 @@ mod tests {
                 .unwrap();
         }
         let held = crate::index::scan_range(
-            engine.db(),
+            &engine,
+            crate::WalkScope::Request,
             coll.id,
             index.id,
             &[],

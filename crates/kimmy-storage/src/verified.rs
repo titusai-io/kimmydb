@@ -409,9 +409,13 @@ mod tests {
         let until = {
             let engine = Engine::open(&path).unwrap();
             let coll = engine.get_collection("app", "docs").unwrap();
-            let until = engine.read_oplog_from(Hlc::ZERO, usize::MAX).unwrap()[5].stamp.hlc;
+            let until = engine
+                .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+                .unwrap()[5]
+                .stamp
+                .hlc;
             engine.insert(&coll, doc! { "_id": "late" }).unwrap();
-            engine.backup_to(&mut backup).unwrap();
+            engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
             until
         };
         let restored_dir = tempfile::tempdir().unwrap();
@@ -705,7 +709,7 @@ mod tests {
                     let local = self.engine().node_id();
                     let stamps: Vec<Hlc> = self
                         .engine()
-                        .read_oplog_from(Hlc::ZERO, usize::MAX)
+                        .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                         .unwrap()
                         .into_iter()
                         .filter(|e| e.stamp.node == local)
@@ -718,7 +722,7 @@ mod tests {
                 }
                 Op::Restore => {
                     let mut backup = Vec::new();
-                    self.engine().backup_to(&mut backup).unwrap();
+                    self.engine().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
                     self.close();
                     let dir = tempfile::tempdir().unwrap();
                     self.path = dir.path().join("kimmy.redb");
@@ -1149,7 +1153,7 @@ mod tests {
         assert!(!source.contains("VECTOR_VERIFIED"), "backup.rs names the record's table");
         let (_dir, path, _) = store(2);
         let mut backup = Vec::new();
-        Engine::open(&path).unwrap().backup_to(&mut backup).unwrap();
+        Engine::open(&path).unwrap().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
         let restored_dir = tempfile::tempdir().unwrap();
         let restored = restored_dir.path().join("kimmy.redb");
         crate::backup::restore(&restored, &mut backup.as_slice()).unwrap();

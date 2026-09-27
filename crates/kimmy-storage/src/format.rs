@@ -1052,7 +1052,7 @@ mod tests {
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
         let mut backup = Vec::new();
-        engine.backup_to(&mut backup).unwrap();
+        engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
         drop(engine);
         let dir = tempfile::tempdir().unwrap();
         let restored = dir.path().join("kimmy.redb");
@@ -1253,7 +1253,7 @@ mod tests {
         let (_dir, path) = a_store();
         let engine = Engine::open(&path).unwrap();
         let mut backup = Vec::new();
-        engine.backup_to(&mut backup).unwrap();
+        engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
         drop(engine);
 
         let older_redb = BuildVersions {

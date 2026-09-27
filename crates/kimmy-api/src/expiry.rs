@@ -115,6 +115,12 @@ pub fn pass(engine: &Engine, me: NodeId, members: &BTreeSet<NodeId>, now_ms: u64
                         total.skipped_filter += outcome.skipped_filter;
                         total.truncated |= outcome.truncated;
                     }
+                    // The node is stopping: the pass ends here, quietly, and
+                    // the next start's pass finds what this one did not.
+                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                        debug!(%reason, "expiry pass ended: this node is shutting down");
+                        return total;
+                    }
                     // Not fatal. The documents are still there and the next
                     // tick will find them, which is the same reasoning the
                     // retention collector uses.

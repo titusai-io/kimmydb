@@ -61,7 +61,7 @@ pub fn vector_search(
 ) -> Result<Vec<Hit>> {
     let mut top = TopK::new(options);
 
-    engine.for_each_vector(shadow, |record: VectorRecord| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record: VectorRecord| {
         // A dimension mismatch means this vector was written under a different
         // model. Scoring it would produce a meaningless number rather than an
         // error, so it is skipped.
@@ -353,7 +353,7 @@ pub fn keyword_search(
     let required = min_overlap.clamp(1, distinct.len());
 
     let mut top = TopK::new(options);
-    engine.for_each_vector(shadow, |record: VectorRecord| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record: VectorRecord| {
         let haystack = tokenize(&record.text);
         if haystack.is_empty() {
             return Ok(true);

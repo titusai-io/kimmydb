@@ -907,9 +907,13 @@ where
             Order::Any => kimmy_storage::CandidateOrder::Any,
         };
         let outcome = kimmy_storage::blocking(|| {
-            state.engine.visit_index_candidates(meta, &scan, delivery, |_, stamp, doc| {
-                Ok(recheck.take(stamp, doc))
-            })
+            state.engine.visit_index_candidates(
+                meta,
+                &scan,
+                delivery,
+                kimmy_storage::WalkScope::Request,
+                |_, stamp, doc| Ok(recheck.take(stamp, doc)),
+            )
         })?;
         match outcome {
             Some(outcome) => {
@@ -922,9 +926,12 @@ where
     }
     if plan.is_none() {
         kimmy_storage::blocking(|| {
-            state
-                .engine
-                .for_each_record_after(meta, after, |_, stamp, doc| Ok(recheck.take(stamp, doc)))
+            state.engine.for_each_record_after(
+                meta,
+                after,
+                kimmy_storage::WalkScope::Request,
+                |_, stamp, doc| Ok(recheck.take(stamp, doc)),
+            )
         })?;
     }
 
@@ -1715,7 +1722,9 @@ pub fn violations(
     // A pass over the retained oplog, as long as retention makes it, and so a
     // walk like any other (ADR-153). Skipped by the engine when no unique index
     // could answer, which includes an `index` this collection does not have.
-    let live = kimmy_storage::blocking(|| state.engine.live_unique_violations(&meta, index))?;
+    let live = kimmy_storage::blocking(|| {
+        state.engine.live_unique_violations(&meta, index, kimmy_storage::WalkScope::Request)
+    })?;
 
     let Some(name) = index else {
         let mut per_index: std::collections::BTreeMap<&str, u64> = Default::default();
@@ -2035,7 +2044,7 @@ fn lookup(
     let mut held = 0usize;
     // The whole foreign collection, so a walk (ADR-153).
     kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&foreign, |_id, doc| {
+        state.engine.for_each_doc(&foreign, kimmy_storage::WalkScope::Request, |_id, doc| {
             // `foreignField` and `localField` are field paths, not expressions:
             // they name the key on each side, read the same way here and in
             // `aggregate::lookup_keys`, and neither fans out across an array.
@@ -2107,7 +2116,7 @@ fn lookup_pipeline(
     let mut foreign: Vec<bson::Document> = Vec::new();
     // The whole foreign collection, so a walk (ADR-153).
     kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&foreign_meta, |_id, doc| {
+        state.engine.for_each_doc(&foreign_meta, kimmy_storage::WalkScope::Request, |_id, doc| {
             foreign.push(doc);
             Ok(true)
         })

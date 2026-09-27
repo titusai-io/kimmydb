@@ -101,7 +101,7 @@ pub async fn topology(
     let mut nodes = Vec::new();
     let mut me_seen = false;
 
-    state.engine.for_each_doc(&meta, |id, document| {
+    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |id, document| {
         let node = id.to_string();
         let is_me = node == me.to_string();
         me_seen |= is_me;

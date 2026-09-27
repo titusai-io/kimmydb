@@ -305,6 +305,21 @@ pub async fn serve_with(
 /// than on what the peer sent: a push whose entry does not decode is the
 /// peer's frame, and a full disk is this node's. Exhaustive, so a new
 /// storage error has to be placed.
+/// A storage error as the protocol names it: this node's own stop is
+/// [`ProtocolError::Stopping`], which is neither the peer's failure nor the
+/// round's, and anything else is what `otherwise` makes of its text.
+pub(crate) fn from_storage(
+    e: kimmy_storage::StorageError,
+    otherwise: impl FnOnce(String) -> ProtocolError,
+) -> ProtocolError {
+    match e {
+        kimmy_storage::StorageError::Stopping(reason) => {
+            ProtocolError::Stopping(reason.to_string())
+        }
+        e => otherwise(e.to_string()),
+    }
+}
+
 fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
     use kimmy_storage::StorageError as E;
     match e {
@@ -448,10 +463,19 @@ where
                 // Off the worker: passing over what the peer holds can walk the
                 // retained oplog to reach the first entry it lacks, in one read
                 // transaction (ADR-153).
-                let window = kimmy_storage::blocking(|| {
+                let window = match kimmy_storage::blocking(|| {
                     engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked)
-                })
-                .map_err(|e| ProtocolError::Local(e.to_string()))?;
+                }) {
+                    Ok(window) => window,
+                    // The walk ended at this node's stop, so it can close its
+                    // store. The connection ends here, and the peer backs off
+                    // as from any peer that went away: not a serve failure.
+                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                        debug!(%reason, "stopped serving a peer's pull: this node is shutting down");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(ProtocolError::Local(e.to_string())),
+                };
 
                 // Large entries can put a full batch over the frame limit. Failing the
                 // write would drop the connection, and the same oversized batch is the
@@ -480,9 +504,15 @@ where
             Message::AskSnapshot { after, collection } => {
                 // The whole database, or the one collection a repair named
                 // (ADR-152); resumed from wherever the requester says.
-                let page = engine
-                    .snapshot_page(after, collection)
-                    .map_err(|e| ProtocolError::Local(e.to_string()))?;
+                let page = match engine.snapshot_page(after, collection) {
+                    Ok(page) => page,
+                    // As a window's walk: the connection ends, quietly.
+                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                        debug!(%reason, "stopped serving a peer's snapshot: this node is shutting down");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(ProtocolError::Local(e.to_string())),
+                };
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
             Message::AskDivergence { probe } => {
@@ -870,7 +900,7 @@ where
     // from the same place on every pull.
     let marked = if repair.is_none() {
         let spans = kimmy_storage::blocking(|| engine.held_marks_covered_by(&mine))
-            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            .map_err(|e| from_storage(e, ProtocolError::Malformed))?;
         let reachable = spans
             .into_iter()
             .filter_map(|(span, marks)| {
@@ -1095,7 +1125,7 @@ where
             counted.unknown_collection += outcome.unknown_collection;
             counted.purge_pending += outcome.purge_pending;
             counted.deferred += outcome.deferred;
-            applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+            applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
             #[cfg(test)]
             if test_hooks::fails_after_apply(peer) {
                 return Err(ProtocolError::Malformed("a failure injected after the apply".into()));
@@ -2449,7 +2479,7 @@ where
             stalls.snapshot_advanced(node);
             pages += 1;
         }
-        let applied = applied.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        let applied = applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
         // A page that would create a collection whose earlier life this node
         // is still purging applied nothing and moved nothing (ADR-189). The
         // snapshot ends here for this round, planned as it was, and asks for
@@ -3245,7 +3275,7 @@ mod tests {
             Some(std::collections::BTreeSet::new()),
             "so the check ran on a round that deferred: {outcome:?}"
         );
-        assert_eq!(engine.count(&orders).unwrap(), 1);
+        assert_eq!(engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(), 1);
         let mine = engine.witnessed_vector().unwrap();
         assert_eq!(mine.get(origin), advertised, "witnessed exactly what was advertised");
         assert_eq!(mine.behind(&theirs), None);
@@ -3434,7 +3464,11 @@ mod tests {
         assert_eq!(outcome.applied, 1, "{outcome:?}");
         assert!(outcome.repairing && outcome.exhausted, "{outcome:?}");
         assert!(!stalls.repairing(node(9)), "done");
-        assert_eq!(engine.count(&orders).unwrap(), 3, "the hole is closed");
+        assert_eq!(
+            engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+            3,
+            "the hole is closed"
+        );
         assert!(
             !stalls.plan_repair(node(9), orders.id, Repair::Snapshot),
             "not repaired again until the finding clears or the cooldown passes"
@@ -3604,7 +3638,7 @@ mod tests {
         assert!(stalls.snapshot_resumes(their_node, None), "the cursor is kept");
         assert_eq!(stalls.snapshots[&their_node].after(), Some(&cursor(2_000)));
         let meta = engine.collection_by_id(orders).unwrap().expect("the definition arrived");
-        assert_eq!(engine.count(&meta).unwrap(), 2);
+        assert_eq!(engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(), 2);
         assert_eq!(
             engine.witnessed_vector().unwrap().get(origin),
             Hlc::ZERO,
@@ -3642,7 +3676,11 @@ mod tests {
         assert!(outcome.exhausted, "a completed snapshot is the tail: {outcome:?}");
         assert!(outcome.divergent.is_some(), "so the check ran: {outcome:?}");
         assert!(!stalls.snapshot_resumes(their_node, None), "nothing left to resume");
-        assert_eq!(engine.count(&meta).unwrap(), 4, "every page, each exactly once");
+        assert_eq!(
+            engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(),
+            4,
+            "every page, each exactly once"
+        );
         let mine = engine.witnessed_vector().unwrap();
         assert!(mine.covers(&first_vector), "the first page's vector is adopted: {mine:?}");
         assert!(
@@ -3877,7 +3915,11 @@ mod tests {
         assert!(!stalls.repairing(their_node), "done");
         assert!(!stalls.snapshot_resumes(their_node, Some(orders)));
         let meta = engine.collection_by_id(orders).unwrap().expect("the collection arrived");
-        assert_eq!(engine.count(&meta).unwrap(), rounds + 1, "every page exactly once");
+        assert_eq!(
+            engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(),
+            rounds + 1,
+            "every page exactly once"
+        );
         assert_eq!(
             engine.witnessed_vector().unwrap(),
             theirs,
@@ -4236,7 +4278,8 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
         a.create_collection("shop", "orders").unwrap();
-        let mut window = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let mut window =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         // A creation whose body does not decode: an error from the apply
         // itself, after the batch passed every check the arm makes first.
         window.entries[0].body = Some(vec![0xde, 0xad]);
@@ -4459,7 +4502,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
         a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
-        let window = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let window =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         let versions = a.version_vector().unwrap();
 
         const SECRET: &str = "a-push-twice-secret";
@@ -4521,12 +4565,14 @@ mod tests {
         let field = |p: &str| kimmy_core::IndexField { path: p.into(), descending: false };
         a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
         let theirs = a.version_vector().unwrap();
-        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let first =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
             .unwrap();
         a.drop_index("shop", "orders", "by_a").unwrap();
         a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let whole =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         let drop =
             whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
         let recreate = whole.entries.last().unwrap().clone();
@@ -4735,7 +4781,7 @@ mod tests {
         let outcome = round.expect("the peer answered at once; the apply's time is this node's");
         assert_eq!(outcome.applied, 1, "{outcome:?}");
         assert_eq!(stalls.take_applied().ddl_refused, 1, "the refused definition is counted");
-        assert_eq!(engine.count(&orders).unwrap(), 1);
+        assert_eq!(engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(), 1);
     }
 
     /// ADR-177: what an apply refused is counted when it commits, not only
@@ -4757,7 +4803,11 @@ mod tests {
         peer.abort();
 
         assert!(matches!(round, Err(ProtocolError::TimedOut(_))), "{round:?}");
-        assert_eq!(engine.count(&orders).unwrap(), 1, "the apply committed");
+        assert_eq!(
+            engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+            1,
+            "the apply committed"
+        );
         assert_eq!(stalls.take_applied().ddl_refused, 1, "and its refusal is counted");
     }
 
@@ -4940,13 +4990,15 @@ mod tests {
         // B holds the collection only: the first index never reached it, so
         // B has no tombstone of the name when the recreation supersedes it.
         let theirs = a.version_vector().unwrap();
-        let first = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let first =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         b.apply_peer_batch(&theirs, &first.entries[..1], first.entries[0].stamp.hlc, false)
             .unwrap();
         a.drop_index("shop", "orders", "by_a").unwrap();
         a.create_index("shop", "orders", vec![field("b")], false, Some("by_a".into())).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, MAX_BATCH).unwrap();
+        let whole =
+            a.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
         let drop =
             whole.entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropIndex).unwrap().clone();
         let recreate = whole.entries.last().unwrap().clone();

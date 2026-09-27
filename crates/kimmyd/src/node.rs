@@ -314,8 +314,10 @@ impl Stop {
     /// deadline is taken from the first call, so a second changes nothing.
     fn begin(&self) {
         let _ = self.by.set(std::time::Instant::now() + STOP_BUDGET);
-        self.engine.stop_walks();
+        // Announced to the tasks first, so a task that sees its walk stop
+        // finds the stop already begun, and ends rather than retries.
         self.shutdown.begin();
+        self.engine.stop_walks();
     }
 }
 
@@ -442,6 +444,16 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         parsed
     });
     let test_stop = test_stop.flatten();
+    let walk_row_delay = std::env::var("KIMMY_TEST_WALK_ROW_MS").ok().map(|value| {
+        let parsed = value.parse::<u64>().ok().map(Duration::from_millis);
+        warn!(
+            KIMMY_TEST_WALK_ROW_MS = %value,
+            recognised = parsed.is_some(),
+            "a test switch is set that slows every walk of the store on purpose; unset \
+             KIMMY_TEST_WALK_ROW_MS outside a test"
+        );
+        parsed
+    });
     if let Some(what) = kimmy_task::test_kill_requested() {
         // The line says what is set, and the value says what it will do -- which
         // may be nothing. The prefix used to promise "will stop a background
@@ -922,6 +934,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // act: armed later than startup so it can never turn a start into a crash
     // loop, and can never be mistaken for a startup failure.
     kimmy_task::arm_test_kills();
+    if let Some(Some(delay)) = walk_row_delay {
+        kimmy_storage::walk::set_test_walk_row_delay(delay);
+    }
     match test_stop {
         // A test's stand-in for a walk serving a peer, which holds the engine
         // on a blocking thread for as long as it runs. The run goes on only
@@ -2109,6 +2124,11 @@ fn spawn_collector(
                 // A failed pass is not fatal — the garbage is still there and
                 // the next tick will find it — so it is logged and retried
                 // rather than taking the node down.
+                // Ended at the stop, which is not a failure: the next start's
+                // pass finds the same garbage.
+                Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                    debug!(%reason, "retention pass ended: this node is shutting down");
+                }
                 Err(e) => warn!(error = %e, "retention pass failed"),
                 Ok(outcome) if outcome.is_empty() => {}
                 Ok(outcome) => info!(
@@ -2226,8 +2246,12 @@ mod tests {
                 Some("by_email".into()),
             )
             .unwrap();
-        let entry =
-            engine.entries_for_peer(kimmy_core::Hlc::ZERO, 1_000).unwrap().entries.pop().unwrap();
+        let entry = engine
+            .entries_for_peer(kimmy_core::Hlc::ZERO, 1_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .entries
+            .pop()
+            .unwrap();
         let members = kimmy_cluster::Members::default();
         members.insert_for_test(addr, kimmy_core::NodeId::generate());
         let confirmer = kimmy_cluster::Confirmer::new(
