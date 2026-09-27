@@ -121,14 +121,23 @@ pub(crate) fn write(txn: &WriteTransaction, schema: u8, walk: &VerifiedWalk) -> 
     Ok(())
 }
 
-/// Whether an open should walk even with a record: `KIMMY_VERIFY_OPLOG_AT_OPEN`
-/// set to `1`. The walk then rewrites the record. Read once per open.
+/// The variable that makes an open walk even with a record, as
+/// `docs/operations.md` names it.
+const FORCE_VARIABLE: &str = "KIMMY_VERIFY_OPLOG_AT_OPEN";
+
+/// Whether an open should walk even with a record: [`FORCE_VARIABLE`] set to
+/// `1`. The walk then rewrites the record. Read once per open.
 pub(crate) fn forced() -> bool {
     #[cfg(test)]
     if test_support::forced_on_this_thread() {
         return true;
     }
-    std::env::var_os("KIMMY_VERIFY_OPLOG_AT_OPEN").is_some_and(|v| v == "1")
+    forced_by(std::env::var_os(FORCE_VARIABLE).as_deref())
+}
+
+/// Whether [`FORCE_VARIABLE`]'s value, if set, forces the walk: exactly `1`.
+fn forced_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 #[cfg(test)]
@@ -145,19 +154,22 @@ pub(crate) mod test_support {
     /// only, not through the environment: `cargo test` runs the tests as
     /// threads of one process, and a variable set by one made another's open
     /// walk where it was meant to skip.
+    ///
+    /// **Only an open on the calling thread is forced.** One that `f` spawns
+    /// onto another thread skips as usual. Nested, the inner call leaves the
+    /// outer one's forcing as it found it.
     pub(crate) fn forcing<T>(f: impl FnOnce() -> T) -> T {
-        struct Unforce;
-        impl Drop for Unforce {
+        struct Restore(bool);
+        impl Drop for Restore {
             fn drop(&mut self) {
-                FORCED.with(|f| f.set(false));
+                FORCED.with(|f| f.set(self.0));
             }
         }
-        FORCED.with(|f| f.set(true));
-        let _unforce = Unforce;
+        let _restore = Restore(FORCED.with(|f| f.replace(true)));
         f()
     }
 
-    pub(super) fn forced_on_this_thread() -> bool {
+    pub(crate) fn forced_on_this_thread() -> bool {
         FORCED.with(Cell::get)
     }
 
@@ -453,6 +465,35 @@ mod tests {
         let skipped = Engine::open(&restored).unwrap().version_vector().unwrap();
         let walked = forcing(|| Engine::open(&restored).unwrap()).version_vector().unwrap();
         assert_eq!(skipped, walked);
+    }
+
+    // --- the variable ---
+
+    /// The variable's name is the one the operations guide gives, and only
+    /// `1` forces the walk.
+    #[test]
+    fn the_variable_forces_the_walk_only_when_it_is_one() {
+        use std::ffi::OsStr;
+        assert_eq!(FORCE_VARIABLE, "KIMMY_VERIFY_OPLOG_AT_OPEN");
+        assert!(forced_by(Some(OsStr::new("1"))));
+        for value in ["0", "", "true", "yes", " 1", "1 ", "01"] {
+            assert!(!forced_by(Some(OsStr::new(value))), "{value:?} forces the walk");
+        }
+        assert!(!forced_by(None));
+    }
+
+    /// Nested, the inner forcing leaves the outer's as it was, and the
+    /// forcing reaches no other thread.
+    #[test]
+    fn forcing_nests_and_stays_on_its_thread() {
+        assert!(!test_support::forced_on_this_thread());
+        forcing(|| {
+            forcing(|| assert!(forced()));
+            assert!(forced(), "the inner forcing ended the outer's");
+            let elsewhere = std::thread::spawn(test_support::forced_on_this_thread).join().unwrap();
+            assert!(!elsewhere, "a spawned thread is forced");
+        });
+        assert!(!test_support::forced_on_this_thread());
     }
 
     // --- (f) the two lines ---
