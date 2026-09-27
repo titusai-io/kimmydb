@@ -29,6 +29,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   then is aborted as before, so the stop's bound is unchanged.
 - **The panic line says on which thread, and where.** `a thread panicked`
   now carries `thread`, `thread_id` and `location`.
+- **The start that skips the oplog walk says what the oplog holds.**
+  `skipped the oplog walk: the version vector is verified` keeps `rows`,
+  `logical_bytes` and `walk_ms`, which are what the last walk read (for a
+  store verified empty and loaded since, `rows=0`), and adds
+  `oplog_entries`, what the oplog holds now.
 
 ## 0.40.1 - 2026-09-27
 

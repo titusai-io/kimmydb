@@ -2166,10 +2166,20 @@ impl Engine {
         if !crate::verified::forced()
             && let Some(walk) = crate::verified::read_db(db, schema)?
         {
+            // `rows`, `logical_bytes` and `walk_ms` are what the last walk
+            // read and took, which may be long ago: a store loaded since it
+            // still says what it held then, 0 for one verified empty.
+            // `oplog_entries` is what it holds now, from the table's own
+            // count.
+            let oplog_entries = {
+                use redb::{ReadableDatabase, ReadableTableMetadata};
+                db.begin_read()?.open_table(tables::OPLOG)?.len()?
+            };
             info!(
                 rows = walk.rows,
                 logical_bytes = walk.logical_bytes,
                 walk_ms = walk.elapsed_ms,
+                oplog_entries,
                 "skipped the oplog walk: the version vector is verified"
             );
             return Ok(());
