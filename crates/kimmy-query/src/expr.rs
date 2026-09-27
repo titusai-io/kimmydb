@@ -597,9 +597,14 @@ impl Expr {
             // uppercase name that is not bound is a feature this does not
             // have rather than a typo, and the message says which.
             if name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                return Err(Error::UnsupportedOperator(format!(
-                    "system variable $${name} is not supported; $$ROOT and $$CURRENT are"
-                )));
+                return Err(Error::UnsupportedOperator {
+                    operator: format!("$${name}"),
+                    reason: Some(
+                        "a system variable this build does not have; $$ROOT and $$CURRENT are \
+                         the ones it does"
+                            .into(),
+                    ),
+                });
             }
             return Err(Error::InvalidQuery(format!(
                 "unknown variable $${name}; the variables in scope are $$ROOT, $$CURRENT and any \
@@ -650,9 +655,10 @@ impl Expr {
             }
             name => {
                 let Some(op) = Op::from_name(name) else {
-                    return Err(Error::UnsupportedOperator(format!(
-                        "unknown expression operator {name:?}"
-                    )));
+                    return Err(Error::UnsupportedOperator {
+                        operator: name.to_string(),
+                        reason: Some("not an expression operator".into()),
+                    });
                 };
                 if op == Op::Literal {
                     refuse_decimal_literal(raw)?;
@@ -1928,7 +1934,7 @@ fn format_date(millis: i64, format: &str) -> Result<String> {
             Some('L') => out.push_str(&format!("{:03}", c.milli)),
             Some('%') => out.push('%'),
             Some(other) => {
-                return Err(Error::UnsupportedOperator(format!(
+                return Err(Error::InvalidQuery(format!(
                     "$dateToString does not support the specifier %{other}"
                 )));
             }
@@ -2359,7 +2365,7 @@ mod tests {
         // `$$NOW` is a feature this does not have, not a typo, and the error
         // class says which.
         let err = Expr::parse(&Bson::String("$$NOW".into())).unwrap_err();
-        assert!(matches!(err, Error::UnsupportedOperator(_)), "{err:?}");
+        assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
         assert!(Expr::parse(&Bson::String("$$".into())).is_err());
         assert!(Expr::parse(&Bson::String("$$ROOT.".into())).is_err());
     }
