@@ -11348,18 +11348,32 @@ lives in one place, `walk::open_walk_table`, whose tables' `range` and `iter`
 return rows that check. A walk table does not `Deref` to the redb table it
 wraps: beside its checked `range` and `iter` it offers only reads of one key
 or one end (`get`, `first`, `last`) and, in a write, `insert` and `remove`,
-so no call on it can reach redb's own unchecked walks. **A guard holds the
-storage crate to it, closed-world** (`kimmy-storage/tests/walks_stop.rs`):
+so no call on it can reach redb's own unchecked walks. That reaches one walk
+the stop did not before: a peer's definition superseding this node's clears
+the loser's entries inside the winner's build, through the build's own walk
+table, so that clear now ends with a replicated build at the signal, and
+commits nothing. **A guard holds the storage crate to it, closed-world**
+(`kimmy-storage/tests/walks_stop.rs`):
 - every function that iterates a table is a stop-aware walk or a bounded read
   with its reason: a registry, one row, a migration at open, a write;
-- a stop-aware walk opens every table through `open_walk_table`, takes none
-  as a plain redb table, and swallows no row's error, since the error is how
-  the stop arrives, and a backup that dropped it would write its `END` after
-  half the store. Refused there unless marked `// not a row:` are the untyped
-  swallows (`.ok()`, `.flatten()`, `let Ok(` and the like) and the typed
-  ones: any line naming `Stopping(`, and any `Err(..) => None`, since a walk
-  that matches the stop has found a way to end without it, and one that ends
-  its loop on it answers a short page or a partial list as a whole one;
+- a stop-aware walk opens every table through `open_walk_table` (by method
+  or by path, `ReadTransaction::open_table(..)`), takes none as a plain redb
+  table, and swallows no row's error, since the error is how the stop
+  arrives, and a backup that dropped it would write its `END` after half the
+  store. **Every row goes through `?`:** a row a walk binds, from a `for`
+  over a table or a `Some(row) = rows.next()`, is used only as `row?`, and
+  any other `.next()` is `.next().transpose()?`. So `match row { Ok(r) => r,
+  _ => break }`, `Some(Err(_)) | None => break` and a look past the limit
+  with `.next().is_none()` are refused however they are spelled, as are the
+  untyped swallows (`.ok()`, `.flatten()`, `let Ok(` and the like), any line
+  naming `Stopping(`, and any arm for an `Err`: a walk that matches the stop
+  has found a way to end without it, and one that ends its loop on it answers
+  a short page, a partial list or a batch that claims the tail as a whole
+  one. A line that is not a row says so with `// not a row:` and what it is;
+- a walk table hands out no table: no `Deref`, `AsRef`, `Borrow` or other
+  conversion to it, no public field, no method returning its type, and
+  `walk.rs` reaches the table only by a point read, an end, a write or a walk
+  inside the checked `Rows`;
 - each walk that does not stop (`WalkStop::in_write`) is listed in
   `IN_WRITE_SITES` and is inside a write transaction: a write's index
   maintenance and unique checks, `find_and_modify`'s candidates, an index
@@ -11379,9 +11393,14 @@ request", since a read can be ended too.
 
 Tested by `walk`'s unit tests (each scope's stop, the rows passed over, a
 write's walk, a stopped backup never restorable, and every public walk
-stopped before its first row and again part of the way through, so one that
-answered what it had read so far fails), the resume's and the
-worker's, and on real processes: a backup and a graph build in flight at
+stopped at each row it checks, first to last, so one that answered what it
+had read so far fails: inside each walk of a call made of several, such as
+retention's oplog and then its tombstones, and a candidate scan's sentinel
+seeks and then its runs in each of its four orders), the resume's (each of
+its walks at every row, its seek's marks and range and its walk, and a
+replay batch's look past its limit), a superseding build stopped at every
+row committing nothing, the guard's own mutants, and the worker's, and on
+real processes: a backup and a graph build in flight at
 the stop end at the drain's deadline and the store closes
 (`KIMMY_TEST_WALK_ROW_MS` slows every row); a member stopped while its peers
 pull from it exits 0 promptly with the store closed, and its next start
