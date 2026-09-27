@@ -704,6 +704,29 @@ impl Engine {
         skip: impl Fn(&Stamp) -> bool,
         keep: impl Fn(&OplogEntry) -> bool,
     ) -> Result<OplogWindow> {
+        self.read_oplog_budgeted(from, limit, scope, skip, keep, None)
+    }
+
+    /// [`Self::read_oplog_from_skipping`], ending the scan at `budget` once it
+    /// has passed the budget's floor: the window then ends at the last row it
+    /// examined, which it names in [`OplogWindow::passed_through`], however
+    /// few entries it kept (ADR-194).
+    ///
+    /// **Every row examined counts**, kept, withheld or passed over: a walk
+    /// costs what it reads, and passing over what a peer holds is where one
+    /// spent 2 GB of reads on nothing (round 0430). The budget is checked
+    /// after a row is examined, never before, and only once the row's stamp
+    /// is past `floor`, so a budgeted walk always gets past where it began
+    /// and the next one starts further on.
+    pub fn read_oplog_budgeted(
+        &self,
+        from: Hlc,
+        limit: usize,
+        scope: WalkScope,
+        skip: impl Fn(&Stamp) -> bool,
+        keep: impl Fn(&OplogEntry) -> bool,
+        budget: Option<(ExamineBudget, Hlc)>,
+    ) -> Result<OplogWindow> {
         let txn = self.db().begin_read()?;
         let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(scope))?;
         let lower = codec::oplog_key_lower_bound(from);
@@ -711,24 +734,36 @@ impl Engine {
         // Exhausted until something stops the scan short: an empty range is the
         // end of the oplog as much as a range that runs out is.
         let mut window = OplogWindow { exhausted: true, ..OplogWindow::default() };
+        let mut examined = 0u64;
+        let mut first_row: Option<std::time::Instant> = None;
         for entry in oplog.range(lower.as_slice()..)? {
             let (key, value) = entry?;
             let stamp = codec::decode_oplog_key(key.value())?;
+            let started = *first_row.get_or_insert_with(std::time::Instant::now);
+            examined += 1;
             if skip(&stamp) {
                 window.scanned_to = stamp.hlc;
-                continue;
-            }
-            let entry = codec::decode_oplog_entry(value.value())?;
-            // Every entry the scan *examines* moves the window's end, kept or
-            // not: the peer has read past it either way, and a stamp it will
-            // never ship must not be able to hold the window open.
-            window.scanned_to = entry.stamp.hlc;
-            if keep(&entry) {
-                window.entries.push(entry);
-                if window.entries.len() >= limit {
-                    window.exhausted = false;
-                    break;
+            } else {
+                let entry = codec::decode_oplog_entry(value.value())?;
+                // Every entry the scan *examines* moves the window's end, kept or
+                // not: the peer has read past it either way, and a stamp it will
+                // never ship must not be able to hold the window open.
+                window.scanned_to = entry.stamp.hlc;
+                if keep(&entry) {
+                    window.entries.push(entry);
+                    if window.entries.len() >= limit {
+                        window.exhausted = false;
+                        break;
+                    }
                 }
+            }
+            if let Some((budget, floor)) = budget
+                && stamp.hlc > floor
+                && budget.spent(examined, started.elapsed())
+            {
+                window.exhausted = false;
+                window.passed_through = Some(stamp);
+                break;
             }
         }
         Ok(window)
@@ -751,6 +786,73 @@ pub struct OplogWindow {
     /// Whether the scan reached the end of the oplog rather than stopping
     /// because the window was full.
     pub exhausted: bool,
+    /// The full stamp of the last row the scan examined, when its
+    /// [`ExamineBudget`] ended it: every row from where it began through this
+    /// one was kept, withheld, or passed over (ADR-194). `None` for a window
+    /// that filled or reached the end.
+    pub passed_through: Option<Stamp>,
+}
+
+/// How much of the oplog one served window may examine before it ends
+/// (ADR-194): whichever of the two runs out first. Every row examined
+/// counts, kept or passed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExamineBudget {
+    /// From the walk's first row.
+    pub time: std::time::Duration,
+    pub rows: u64,
+}
+
+impl ExamineBudget {
+    /// The time a window served to a peer that asked for a partial one may
+    /// take: well inside a sync round's thirty seconds, and about two pulls
+    /// per five-second tick (ADR-157).
+    pub const SERVE_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+    /// And the rows, 64 batches' worth: what bounds a warm walk, which reads
+    /// fast enough that the time would let it churn the page cache.
+    pub const SERVE_ROWS: u64 = 65_536;
+
+    /// The budget a window served to a peer gets: [`Self::SERVE_TIME`] and
+    /// [`Self::SERVE_ROWS`], or what `KIMMY_TEST_SERVE_WALK_MS` and
+    /// `KIMMY_TEST_SERVE_WALK_ROWS` set ([`set_test_serve_walk_budget`]).
+    pub fn serve() -> Self {
+        use std::sync::atomic::Ordering;
+        let rows = match TEST_SERVE_WALK_ROWS.load(Ordering::Relaxed) {
+            0 => Self::SERVE_ROWS,
+            rows => rows,
+        };
+        let time = match TEST_SERVE_WALK_MS.load(Ordering::Relaxed) {
+            u64::MAX => Self::SERVE_TIME,
+            ms => std::time::Duration::from_millis(ms),
+        };
+        Self { time, rows }
+    }
+
+    /// A budget of `time` alone, for a walk that no row count should end.
+    pub fn time(time: std::time::Duration) -> Self {
+        Self { time, rows: u64::MAX }
+    }
+
+    fn spent(&self, examined: u64, elapsed: std::time::Duration) -> bool {
+        examined >= self.rows || elapsed >= self.time
+    }
+}
+
+/// `KIMMY_TEST_SERVE_WALK_ROWS`: [`ExamineBudget::serve`]'s rows, 0 for the
+/// default.
+static TEST_SERVE_WALK_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `KIMMY_TEST_SERVE_WALK_MS`: its time, `u64::MAX` for the default.
+static TEST_SERVE_WALK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Set what [`ExamineBudget::serve`] gives, for the whole process: `rows`
+/// and `ms`, each `None` for its default. In the shipped binary, like
+/// `KIMMY_TEST_WALK_ROW_MS`, so that a test of a real node can make a served
+/// walk end within a known number of rows; the daemon logs it when set.
+pub fn set_test_serve_walk_budget(rows: Option<u64>, ms: Option<u64>) {
+    use std::sync::atomic::Ordering;
+    TEST_SERVE_WALK_ROWS.store(rows.unwrap_or(0), Ordering::Relaxed);
+    TEST_SERVE_WALK_MS.store(ms.unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
 /// Where a stream starts, as [`Engine::watch`]'s resolve found it.

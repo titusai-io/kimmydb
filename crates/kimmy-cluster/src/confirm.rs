@@ -622,14 +622,17 @@ impl Confirmer {
             Err(e) => return failed(ProtocolError::Malformed(e.to_string())),
         }
         let engine = &self.engine;
+        // The same walk a pull makes, bounded the same way (ADR-194).
+        let budget = kimmy_storage::ExamineBudget::serve();
         let mut window = match kimmy_storage::blocking(|| {
-            engine.entries_for_peer_holding(
+            engine.entries_for_peer_within(
                 from,
                 MAX_BATCH,
                 Some(&held),
                 // A DDL's confirmation is part of its request, which the
                 // drain lets finish (ADR-192).
                 kimmy_storage::WalkScope::Request,
+                budget,
             )
         }) {
             Ok(window) => window,
@@ -643,17 +646,31 @@ impl Confirmer {
                 )));
             }
             window = match kimmy_storage::blocking(|| {
-                engine.entries_for_peer_holding(
+                engine.entries_for_peer_within(
                     from,
                     fits,
                     Some(&held),
                     kimmy_storage::WalkScope::Request,
+                    budget,
                 )
             }) {
                 Ok(window) => window,
                 Err(e) => {
                     return failed(crate::transport::from_storage(e, ProtocolError::Malformed));
                 }
+            };
+        }
+        // The walk to the change ran past its budget: the member lacks more
+        // than a push should carry, and anti-entropy's partial windows will
+        // take it there. Nothing is sent; the waiters resolve pending.
+        if window.passed_through.is_some() {
+            return PushResult::NothingSent {
+                their_node,
+                unreached: Some(
+                    "the walk to the member's window ran past its budget; anti-entropy will \
+                     carry the change"
+                        .into(),
+                ),
             };
         }
         let sent: Vec<Stamp> = window.entries.iter().map(|entry| entry.stamp).collect();

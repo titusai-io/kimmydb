@@ -125,6 +125,13 @@ pub enum Message {
         /// sends none, which reads as no spans.
         #[serde(default)]
         marked: Vec<kimmy_storage::MarkedRange>,
+        /// The requester can take a partial window (ADR-194): the sender may
+        /// end its walk at a budget, however few entries it has kept, and say
+        /// where in `Entries::passed_through`. A sender that predates the
+        /// field ignores it and serves the whole window, as before; a
+        /// requester that predates it sends none, which reads as `false`.
+        #[serde(default)]
+        partial: bool,
     },
     /// The answer, in stamp order, and where the window it came from ended.
     ///
@@ -143,7 +150,21 @@ pub enum Message {
     /// the window without ever being sent it, and nothing re-serves them
     /// (ADR-126, ADR-127). Stating the fact costs one stamp and one bool per
     /// batch and cannot be reopened by whatever the next filter is.
-    Entries { entries: Vec<OplogEntry>, scanned_to: Hlc, exhausted: bool },
+    ///
+    /// `passed_through` is the full stamp of the last row the sender
+    /// examined, when its budget ended the window rather than the batch or
+    /// the oplog (ADR-194): only in answer to an `AskEntries` that set
+    /// `partial`, with `scanned_to` its timestamp and `exhausted` false, and
+    /// the window then covers everything through it, however few entries it
+    /// carries. A requester that predates the field ignores it; a sender that
+    /// predates it sends none.
+    Entries {
+        entries: Vec<OplogEntry>,
+        scanned_to: Hlc,
+        exhausted: bool,
+        #[serde(default)]
+        passed_through: Option<kimmy_core::Stamp>,
+    },
     /// "That many entries will not fit in a frame; ask for this many."
     ///
     /// [`MAX_BATCH`] bounds a response by entry count and [`MAX_FRAME`] bounds it
@@ -619,12 +640,19 @@ mod tests {
         let messages = [
             Message::AskVersions { witnessed: false },
             Message::AskVersions { witnessed: true },
-            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None, marked: Vec::new() },
+            Message::AskEntries {
+                from: Hlc::new(7, 1),
+                limit: 10,
+                held: None,
+                marked: Vec::new(),
+                partial: false,
+            },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
                 limit: 10,
                 held: Some(populated_vector()),
                 marked: Vec::new(),
+                partial: false,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -635,11 +663,22 @@ mod tests {
                     from: Hlc::new(3, 0),
                     through: Hlc::new(5, 2),
                 }],
+                partial: false,
             },
             Message::Versions(populated_vector()),
             Message::Vectors { servable: populated_vector(), witnessed: populated_vector() },
-            Message::Entries { entries: Vec::new(), scanned_to: Hlc::new(11, 2), exhausted: false },
-            Message::Entries { entries: Vec::new(), scanned_to: Hlc::ZERO, exhausted: true },
+            Message::Entries {
+                entries: Vec::new(),
+                scanned_to: Hlc::new(11, 2),
+                exhausted: false,
+                passed_through: None,
+            },
+            Message::Entries {
+                entries: Vec::new(),
+                scanned_to: Hlc::ZERO,
+                exhausted: true,
+                passed_through: None,
+            },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
             Message::AskDivergence { probe: Some(CollectionId(42)) },
@@ -713,7 +752,13 @@ mod tests {
         write_frame(&mut buffer, &Message::AskVersions { witnessed: false }).await.unwrap();
         write_frame(
             &mut buffer,
-            &Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None, marked: Vec::new() },
+            &Message::AskEntries {
+                from: Hlc::ZERO,
+                limit: 5,
+                held: None,
+                marked: Vec::new(),
+                partial: false,
+            },
         )
         .await
         .unwrap();
@@ -725,7 +770,13 @@ mod tests {
         );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None, marked: Vec::new() }
+            Message::AskEntries {
+                from: Hlc::ZERO,
+                limit: 5,
+                held: None,
+                marked: Vec::new(),
+                partial: false
+            }
         );
     }
 
@@ -745,7 +796,7 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new() },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
             "a request without the field must read as one that did not send it"
         );
 
@@ -759,8 +810,106 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new() },
+            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
             "a field this build does not know must not fail the frame"
+        );
+    }
+
+    /// The same boundary for `AskEntries::partial` and `Entries::
+    /// passed_through` (ADR-194), in both directions. A sender before
+    /// `partial` reads a request that sets it as the request it knew, and
+    /// serves a whole window; a requester before `passed_through` reads a
+    /// partial window's frame as the window it knew. A frame from a build
+    /// before either reads as `false` and `None`.
+    #[tokio::test]
+    async fn the_partial_window_fields_cross_a_version_boundary_in_both_directions() {
+        /// `AskEntries` as a sender before ADR-194 declares it.
+        #[derive(Debug, Deserialize)]
+        struct AskEntriesBeforePartial {
+            from: Hlc,
+            limit: usize,
+            #[serde(default)]
+            held: Option<VersionVector>,
+            #[serde(default)]
+            marked: Vec<kimmy_storage::MarkedRange>,
+        }
+        /// `Entries` as a requester before ADR-194 declares it.
+        #[derive(Debug, Deserialize)]
+        struct EntriesBeforePassedThrough {
+            entries: Vec<OplogEntry>,
+            scanned_to: Hlc,
+            exhausted: bool,
+        }
+        async fn body_of(message: &Message, variant: &str) -> bson::Document {
+            let mut written = Vec::new();
+            write_frame(&mut written, message).await.unwrap();
+            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+            body.get_document(variant).unwrap().clone()
+        }
+        async fn read_back(variant: &str, fields: bson::Document) -> Message {
+            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
+            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&bytes);
+            read_frame(&mut frame.as_slice()).await.unwrap()
+        }
+
+        let held = populated_vector();
+        let ask = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: Some(held.clone()),
+            marked: Vec::new(),
+            partial: true,
+        };
+        let sent = body_of(&ask, "AskEntries").await;
+        assert_eq!(
+            sent.get_bool("partial").ok(),
+            Some(true),
+            "the frame carries the field: {sent}"
+        );
+        let older: AskEntriesBeforePartial = bson::deserialize_from_document(sent.clone())
+            .expect("a sender that predates the field reads the request");
+        assert_eq!((older.from, older.limit), (Hlc::new(7, 1), 10));
+        assert_eq!(older.held, Some(held.clone()));
+        assert!(older.marked.is_empty());
+        let mut before = sent;
+        before.remove("partial");
+        assert_eq!(
+            read_back("AskEntries", before).await,
+            Message::AskEntries {
+                from: Hlc::new(7, 1),
+                limit: 10,
+                held: Some(held),
+                marked: Vec::new(),
+                partial: false,
+            },
+            "a request from before the field asks for a whole window"
+        );
+
+        let p = kimmy_core::Stamp::new(Hlc::new(11, 2), NodeId::generate());
+        let entries = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: p.hlc,
+            exhausted: false,
+            passed_through: Some(p),
+        };
+        let sent = body_of(&entries, "Entries").await;
+        assert!(sent.contains_key("passed_through"), "the frame carries the field: {sent}");
+        let older: EntriesBeforePassedThrough = bson::deserialize_from_document(sent.clone())
+            .expect("a requester that predates the field reads the window");
+        assert!(older.entries.is_empty());
+        assert_eq!((older.scanned_to, older.exhausted), (p.hlc, false));
+        let mut before = sent;
+        before.remove("passed_through");
+        assert_eq!(
+            read_back("Entries", before).await,
+            Message::Entries {
+                entries: Vec::new(),
+                scanned_to: p.hlc,
+                exhausted: false,
+                passed_through: None,
+            },
+            "a window from before the field names no end of its own"
         );
     }
 
@@ -789,6 +938,7 @@ mod tests {
                 from: Hlc::new(3, 0),
                 through: Hlc::new(5, 2),
             }],
+            partial: false,
         };
         let mut written = Vec::new();
         write_frame(&mut written, &request).await.unwrap();
@@ -819,7 +969,8 @@ mod tests {
                 from: Hlc::new(7, 1),
                 limit: 10,
                 held: Some(held),
-                marked: Vec::new()
+                marked: Vec::new(),
+                partial: false,
             },
             "a request without the field must read as one naming no spans"
         );

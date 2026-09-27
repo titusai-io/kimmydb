@@ -473,6 +473,50 @@ pub struct ReplicationConfig {
     /// metrics — and unlike `on_lag` it *is* called when no peer was
     /// reached, because "every round failed" is precisely the report.
     pub on_round: Option<RoundHook>,
+    /// Where each peer's last advertised vector is kept, for the replication
+    /// lag gauge to be computed from when it is read (ADR-175's addendum).
+    pub lag_vectors: Option<std::sync::Arc<LagVectors>>,
+}
+
+/// Each peer's last advertised vector, kept for the replication lag gauge,
+/// which is computed from them when it is read rather than pushed after a
+/// round that succeeded (ADR-175's addendum, ADR-194).
+///
+/// Recorded whenever a round has read a peer's vectors, whether the round
+/// then succeeded or failed, so a peer whose every round fails after that
+/// read still counts: in round 0430 the gauge read 0 on a member missing
+/// another's writes, because only successful rounds reported. A round that
+/// fails before it reads them leaves the last one standing. An entry goes
+/// when membership forgets the peer. The gauge never freezes, since it is
+/// computed against the clock and this node's current witnessed vector, and
+/// it clears as soon as the entries arrive by any route, a third member's
+/// included.
+#[derive(Debug, Default)]
+pub struct LagVectors(
+    parking_lot::Mutex<std::collections::HashMap<SocketAddr, kimmy_core::VersionVector>>,
+);
+
+impl LagVectors {
+    /// Keep `theirs` as `peer`'s last advertised vector.
+    pub fn record(&self, peer: SocketAddr, theirs: kimmy_core::VersionVector) {
+        self.0.lock().insert(peer, theirs);
+    }
+
+    /// Forget every peer that is not in `live`.
+    pub fn retain(&self, live: &std::collections::BTreeSet<SocketAddr>) {
+        self.0.lock().retain(|peer, _| live.contains(peer));
+    }
+
+    /// How far behind this node is, in milliseconds, at `now_ms`, given
+    /// what it has `witnessed`: the most over every peer kept, 0 for none.
+    pub fn lag_ms(&self, witnessed: &kimmy_core::VersionVector, now_ms: u64) -> u64 {
+        self.0
+            .lock()
+            .values()
+            .map(|theirs| kimmy_storage::lag_behind_ms(witnessed, theirs, now_ms))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// The most pulls one contact makes in a tick, however much of the tick's
@@ -513,6 +557,7 @@ impl ReplicationConfig {
             tombstone_retention: Duration::from_secs(24 * 60 * 60),
             on_peer_staleness: None,
             on_round: None,
+            lag_vectors: None,
         }
     }
 }
@@ -601,6 +646,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     }
                     _ => discovered.clone(),
                 };
+                // A peer membership has forgotten counts no more towards the
+                // lag gauge.
+                if let Some(lag) = &config.lag_vectors {
+                    lag.retain(&peers);
+                }
 
                 // The round's worst lag across the peers actually reached.
                 // `None` when nothing answered, and then nothing is reported:
@@ -693,6 +743,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // applied before a failure later in the round is work
                     // done, and the pull series must not lose it in exactly
                     // the conditions they exist to diagnose (ADR-175).
+                    // Every vector a round read, whatever became of the
+                    // round after (ADR-175's addendum).
+                    for (peer, theirs) in stalls.take_vectors_read() {
+                        if let Some(lag) = &config.lag_vectors {
+                            lag.record(peer, theirs);
+                        }
+                    }
                     if let Some(pull) = stalls.take_pull() {
                         report.pulls.pulled(&pull);
                     }
@@ -745,16 +802,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 // ends here as though the budget had run out,
                                 // and the next tick resumes from wherever
                                 // this one stood. A real drain deeper than the
-                                // ceiling reaches it too, and says so at info
-                                // with what it applied; only a contact that
-                                // applied nothing in all of its pulls is the
-                                // shape of a peer serving windows that cannot
-                                // advance, and that is the one worth a warning.
-                                if contact.applied > 0 {
+                                // ceiling reaches it too, and says so at info;
+                                // only a contact none of whose pulls moved this
+                                // node's position is the shape of a peer
+                                // serving windows that cannot advance, and that
+                                // is the one worth a warning. Moved, not
+                                // applied: a partial window drains what this
+                                // node holds without applying anything, and
+                                // advances all the same (ADR-194).
+                                if contact.advanced > 0 {
                                     info!(
                                         peer = %peer,
                                         pulls = contact.pulls,
                                         applied = contact.applied,
+                                        advanced = contact.advanced,
                                         "pull ceiling reached for this peer this tick; the next \
                                          tick resumes"
                                     );
@@ -762,9 +823,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     warn!(
                                         peer = %peer,
                                         pulls = contact.pulls,
-                                        applied = 0,
-                                        "pull ceiling reached for this peer this tick with nothing \
-                                         applied in any pull; the next tick resumes"
+                                        applied = contact.applied,
+                                        advanced = 0,
+                                        "pull ceiling reached for this peer this tick with no pull \
+                                         moving this node's position; the next tick resumes"
                                     );
                                 }
                             }
@@ -1012,6 +1074,11 @@ struct Contact {
     pulls: usize,
     applied: usize,
     ddl: usize,
+    /// Pulls whose window the sender's budget ended (ADR-194).
+    partial: usize,
+    /// Pulls that moved this node's position, applied or not: what the
+    /// ceiling's warning counts (ADR-157, ADR-194).
+    advanced: usize,
     /// Everything the pulls accounted for, [`kimmy_storage::SyncOutcome::total`]
     /// summed: what decides whether this contact merged anything worth a
     /// line, on the same terms as before a contact could make more than one
@@ -1024,7 +1091,17 @@ struct Contact {
 
 impl Contact {
     fn new(peer: SocketAddr) -> Self {
-        Self { peer, span: None, pulls: 0, applied: 0, ddl: 0, total: 0, slowest: Duration::ZERO }
+        Self {
+            peer,
+            span: None,
+            pulls: 0,
+            applied: 0,
+            ddl: 0,
+            partial: 0,
+            advanced: 0,
+            total: 0,
+            slowest: Duration::ZERO,
+        }
     }
 
     /// The span this contact's pulls run under, created on the first of
@@ -1058,6 +1135,8 @@ impl Contact {
         self.pulls += 1;
         self.applied += outcome.applied;
         self.ddl += outcome.ddl;
+        self.partial += usize::from(outcome.partial);
+        self.advanced += usize::from(outcome.advanced);
         self.total += outcome.total();
         self.slowest = self.slowest.max(took);
     }
@@ -1090,12 +1169,15 @@ impl Contact {
     fn finish(self) {
         self.record("applied", self.applied as i64);
         self.record("ddl", self.ddl as i64);
-        if self.total > 0 {
+        // A partial window can carry nothing and still move the position
+        // (ADR-194): a contact that drained one says so too.
+        if self.total > 0 || self.partial > 0 {
             info!(
                 peer = %self.peer,
                 pulls = self.pulls,
                 applied = self.applied,
                 ddl = self.ddl,
+                partial = self.partial,
                 "merged from peer"
             );
         }
@@ -1217,6 +1299,35 @@ async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr
 
 #[cfg(test)]
 mod tests {
+    /// The lag gauge's source (ADR-175's addendum): what a peer advertised,
+    /// against what this node has witnessed now. It grows with the clock
+    /// while the entries are missing, whatever became of the rounds that read
+    /// the vector, clears once they arrive by any route, and forgets a peer
+    /// membership forgets.
+    #[test]
+    fn the_lag_is_computed_from_each_peers_last_vector_when_read() {
+        use kimmy_core::{Hlc, NodeId, VersionVector};
+        let origin = NodeId::from_bytes([7; 16]);
+        let peer: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let lag = LagVectors::default();
+        let mut theirs = VersionVector::new();
+        theirs.insert(origin, Hlc::new(10_000, 0));
+        let mut mine = VersionVector::new();
+        mine.insert(origin, Hlc::new(4_000, 0));
+        assert_eq!(lag.lag_ms(&mine, 20_000), 0, "nothing kept, no lag");
+
+        lag.record(peer, theirs.clone());
+        let now = lag.lag_ms(&mine, 20_000);
+        assert!(now > 0, "behind a peer that holds newer: {now}");
+        assert!(lag.lag_ms(&mine, 25_000) > now, "it grows with the clock between rounds");
+
+        let caught_up = theirs.clone();
+        assert_eq!(lag.lag_ms(&caught_up, 25_000), 0, "cleared once the entries are here");
+
+        lag.retain(&std::collections::BTreeSet::new());
+        assert_eq!(lag.lag_ms(&mine, 25_000), 0, "a forgotten peer no longer counts");
+    }
+
     use super::*;
 
     #[test]

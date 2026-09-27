@@ -35,8 +35,8 @@ pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
 pub use peers::{
     ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,
-    Histogram, MAX_PULLS_PER_CONTACT, PULL_BUCKETS_US, PullReport, ReplicationConfig, RoundHook,
-    RoundReport, replicate,
+    Histogram, LagVectors, MAX_PULLS_PER_CONTACT, PULL_BUCKETS_US, PullReport, ReplicationConfig,
+    RoundHook, RoundReport, replicate,
 };
 pub use transport::{
     FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,

@@ -1827,6 +1827,7 @@ mod tests {
             entries: window.entries[n - 2..].to_vec(),
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
+            passed_through: None,
         };
         assert_eq!(
             after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -1901,6 +1902,7 @@ mod tests {
                 .collect(),
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
+            passed_through: None,
         };
         assert_eq!(
             after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),

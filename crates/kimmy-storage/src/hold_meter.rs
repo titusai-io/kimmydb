@@ -1898,7 +1898,8 @@ mod tests {
             .unwrap()
             .entries;
         let before = engine.serve_cost();
-        let window = engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[]).unwrap();
+        let window =
+            engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[], None).unwrap();
         let after = engine.serve_cost();
         assert!(window.entries.iter().all(|e| e.kind != kimmy_core::OpKind::UniqueViolation));
         assert_eq!(after.passed - before.passed, 1, "the one violation entry");
@@ -1942,8 +1943,9 @@ mod tests {
         let passed = all.iter().filter(|e| e.stamp.hlc <= stamps[3].hlc).count() as u64;
 
         let before = engine.serve_cost();
-        let window =
-            engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, Some(&held), &[]).unwrap();
+        let window = engine
+            .serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, Some(&held), &[], None)
+            .unwrap();
         let after = engine.serve_cost();
         assert_eq!(after.windows - before.windows, 1);
         assert_eq!(after.entries - before.entries, window.entries.len() as u64);
@@ -1982,7 +1984,8 @@ mod tests {
             }
         }
         let engine = Engine::open_with_cache(&path, Some(1 << 20)).unwrap();
-        let window = engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[]).unwrap();
+        let window =
+            engine.serve_entries_to_peer(kimmy_core::Hlc::ZERO, 1_024, None, &[], None).unwrap();
         assert_eq!(window.entries.len(), 1_024);
         let cost = engine.serve_cost();
         assert!(cost.read_bytes > 0 && cost.read_ns > 0, "{cost:?}");

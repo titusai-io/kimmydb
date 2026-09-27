@@ -606,11 +606,11 @@ mod tests {
                 .map(drop)
         }
         let background: &[(&str, Walk)] = &[
-            // covers: watch::Engine::read_oplog_from_skipping
+            // covers: watch::Engine::read_oplog_budgeted
             ("serve_entries_to_peer", |e, _| {
-                e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[]).map(drop)
+                e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[], None).map(drop)
             }),
-            // covers: watch::Engine::read_oplog_from_skipping
+            // covers: watch::Engine::read_oplog_budgeted
             ("entries_for_peer", |e, _| {
                 e.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).map(drop)
             }),
@@ -652,7 +652,7 @@ mod tests {
             ("live_unique_violations", |e, c| {
                 e.live_unique_violations(c, None, WalkScope::Request).map(drop)
             }),
-            // covers: watch::Engine::read_oplog_from_skipping
+            // covers: watch::Engine::read_oplog_budgeted
             ("read_oplog_from", |e, _| {
                 e.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).map(drop)
             }),
