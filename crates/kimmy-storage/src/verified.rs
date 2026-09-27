@@ -124,6 +124,10 @@ pub(crate) fn write(txn: &WriteTransaction, schema: u8, walk: &VerifiedWalk) -> 
 /// Whether an open should walk even with a record: `KIMMY_VERIFY_OPLOG_AT_OPEN`
 /// set to `1`. The walk then rewrites the record. Read once per open.
 pub(crate) fn forced() -> bool {
+    #[cfg(test)]
+    if test_support::forced_on_this_thread() {
+        return true;
+    }
     std::env::var_os("KIMMY_VERIFY_OPLOG_AT_OPEN").is_some_and(|v| v == "1")
 }
 
@@ -133,6 +137,28 @@ pub(crate) mod test_support {
 
     thread_local! {
         static FAIL_BEFORE_THE_RAISE_COMMITS: Cell<bool> = const { Cell::new(false) };
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with the opens on this thread walking, as
+    /// `KIMMY_VERIFY_OPLOG_AT_OPEN=1` makes every open do. On this thread
+    /// only, not through the environment: `cargo test` runs the tests as
+    /// threads of one process, and a variable set by one made another's open
+    /// walk where it was meant to skip.
+    pub(crate) fn forcing<T>(f: impl FnOnce() -> T) -> T {
+        struct Unforce;
+        impl Drop for Unforce {
+            fn drop(&mut self) {
+                FORCED.with(|f| f.set(false));
+            }
+        }
+        FORCED.with(|f| f.set(true));
+        let _unforce = Unforce;
+        f()
+    }
+
+    pub(super) fn forced_on_this_thread() -> bool {
+        FORCED.with(Cell::get)
     }
 
     /// Fail the next open's walk on this thread just before the transaction
@@ -167,6 +193,7 @@ mod tests {
     use proptest::prelude::*;
     use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
+    use super::test_support::forcing;
     use super::*;
     use crate::codec;
     use crate::engine::{Engine, Position, WriterHolder};
@@ -193,18 +220,6 @@ mod tests {
             tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
         tracing::subscriber::with_default(subscriber, body);
         String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
-    }
-
-    /// Run `f` with the walk forced, as `KIMMY_VERIFY_OPLOG_AT_OPEN=1` does.
-    /// Each test runs in its own process under nextest, so the variable
-    /// reaches no other test.
-    fn forcing<T>(f: impl FnOnce() -> T) -> T {
-        // SAFETY: no other thread of this test reads the environment.
-        unsafe { std::env::set_var("KIMMY_VERIFY_OPLOG_AT_OPEN", "1") };
-        let out = f();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("KIMMY_VERIFY_OPLOG_AT_OPEN") };
-        out
     }
 
     /// Change the raw store under a closed engine.
