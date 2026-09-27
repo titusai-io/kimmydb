@@ -1250,15 +1250,15 @@ impl Engine {
             }
         }
 
-        // A Cargo.toml comment is the only thing standing between the benchmark
-        // control and a person, which is not enough. Such a build keeps no live
+        // Nothing but a cfg set by hand stands between the benchmark control
+        // and a person, which is not enough. Such a build keeps no live
         // counts: nothing here is corrupted on disk — the mark is never written,
         // so a later ordinary start rebuilds — but *this* process serves an
         // empty count table, and the divergence check reads that as a
         // divergence on every contact.
-        #[cfg(feature = "bench-no-live-counts")]
+        #[cfg(kimmy_bench_no_live_counts)]
         tracing::error!(
-            "this build was compiled with `bench-no-live-counts`: it does not keep the live \
+            "this build was compiled with `--cfg kimmy_bench_no_live_counts`: it does not keep the live \
              document counts, and the cross-member divergence check will report differences \
              that do not exist. It is a benchmark control and must never serve traffic."
         );
@@ -4516,7 +4516,7 @@ pub(crate) fn append_oplog_at(
     // rewrote the same single key once for every entry in a batch, while
     // computing it at the commit instead would have to open these two tables
     // again on every transaction, single-document writes included.
-    #[cfg(not(feature = "bench-no-live-counts"))]
+    #[cfg(not(kimmy_bench_no_live_counts))]
     {
         let mark = crate::live_count::mark_of(&arrival, &oplog)?;
         txn.live_counts().lock().appended(mark);

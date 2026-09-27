@@ -1330,10 +1330,14 @@ async fn every_documented_operation_answers_as_the_specification_says() {
              served {served:?}"
         );
     }
-    assert!(
-        !served.contains(&"local-embeddings"),
-        "the default build has no in-process embedding, so it must not advertise it — \
-         this is the capability that proves the list is answered rather than asserted"
+    // The default build has no in-process embedding, so it must not advertise
+    // it: this is the capability that proves the list is answered rather than
+    // asserted. A build with `local-embeddings`, which `--all-features` makes,
+    // must advertise it.
+    assert_eq!(
+        served.contains(&"local-embeddings"),
+        kimmy_vector::local_embeddings_available(),
+        "local-embeddings is advertised exactly when this build has it; served {served:?}"
     );
 
     // -- auth --------------------------------------------------------------

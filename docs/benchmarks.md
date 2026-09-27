@@ -25,6 +25,15 @@ cell, because throughput under contention is not a shape Criterion measures.
 `KIMMY_BENCH_MS` and `KIMMY_BENCH_CONCURRENCY` change the duration and the
 client counts.
 
+**The live-count control** (ADR-174's addendum) is a `cfg`, not a feature, so
+`--all-features` never builds it. Give it a target directory of its own, since
+a build with it keeps no live counts:
+
+```bash
+RUSTFLAGS="--cfg kimmy_bench_no_live_counts" CARGO_TARGET_DIR=target/bench-control \
+    cargo bench -p kimmy-storage --bench write_path
+```
+
 **Recorded, not gated.** Numbers land here by hand rather than failing CI.
 Criterion on a shared runner is noisy enough that a threshold gate produces
 false failures, and a check people learn to ignore is worse than no check —
