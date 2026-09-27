@@ -2171,17 +2171,30 @@ impl Engine {
             // still says what it held then, 0 for one verified empty.
             // `oplog_entries` is what it holds now, from the table's own
             // count.
-            let oplog_entries = {
+            // Only for the line: a count that cannot be read is said, and
+            // the line goes without it, rather than failing the open.
+            let oplog_entries = (|| -> Result<u64> {
                 use redb::{ReadableDatabase, ReadableTableMetadata};
-                db.begin_read()?.open_table(tables::OPLOG)?.len()?
-            };
-            info!(
-                rows = walk.rows,
-                logical_bytes = walk.logical_bytes,
-                walk_ms = walk.elapsed_ms,
-                oplog_entries,
-                "skipped the oplog walk: the version vector is verified"
-            );
+                Ok(db.begin_read()?.open_table(tables::OPLOG)?.len()?)
+            })();
+            match oplog_entries {
+                Ok(oplog_entries) => info!(
+                    rows = walk.rows,
+                    logical_bytes = walk.logical_bytes,
+                    walk_ms = walk.elapsed_ms,
+                    oplog_entries,
+                    "skipped the oplog walk: the version vector is verified"
+                ),
+                Err(error) => {
+                    warn!(%error, "could not count the oplog's entries for the start's line");
+                    info!(
+                        rows = walk.rows,
+                        logical_bytes = walk.logical_bytes,
+                        walk_ms = walk.elapsed_ms,
+                        "skipped the oplog walk: the version vector is verified"
+                    );
+                }
+            }
             return Ok(());
         }
         let (raised, walk) = Self::rebuild_version_vector_if_stale(db)?;

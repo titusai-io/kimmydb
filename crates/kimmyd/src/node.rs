@@ -72,6 +72,8 @@ fn remind_to_remove_previous_secret(ttl_secs: u64) {
     );
     // UNSUPERVISED: a reminder that warns once and stops. Its ending is the point, and a
     // panic in it must not stop a node that is otherwise serving.
+    // The stop does not wait for it: it runs no storage step, so it is never
+    // mid-poll when the runtime shuts down (see `start_and_serve`).
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
         warn!(
@@ -126,12 +128,11 @@ pub async fn run(config: Config) -> RunEnd {
         Ok(served) => {
             end.stop_by = served.stop_by.get().copied();
             end.test_stop = served.test_stop;
-            // Closed to writes whether serving ended at the signal or on an
-            // error: either way the engine is closed next, and a commit must
-            // not land after the marker.
-            // Kept apart from the outcome, so a serving error cannot hide it.
-            let left = served.writes_by.saturating_duration_since(tokio::time::Instant::now());
-            let closed = close_for_exit(&served.engine, left);
+            // Closed to writes as serving ended, at the signal or on an
+            // error (`start_and_serve`): either way the engine is closed next,
+            // and a commit must not land after the marker. Kept apart from the
+            // outcome, so a serving error cannot hide it.
+            let closed = served.closed;
             end.writes_open = closed.is_err();
             end.outcome = served.outcome.and(closed);
             end.engine = Some(served.engine);
@@ -296,9 +297,9 @@ struct Served {
     engine: Arc<Engine>,
     /// `Ok` for a stop at the signal; the error serving ended on otherwise.
     outcome: Result<()>,
-    /// Where the window after serving ends: [`WRITES_CLOSE_CAP`] after it,
-    /// shared by the wait for the tasks to end and the close to writes.
-    writes_by: tokio::time::Instant,
+    /// The close to writes, made the moment serving ended: `Err` when a
+    /// write was still in progress at [`WRITES_CLOSE_CAP`].
+    closed: Result<()>,
     /// Set when the stop began: see [`Stop::begin`].
     stop_by: Arc<std::sync::OnceLock<std::time::Instant>>,
     test_stop: Option<TestStop>,
@@ -449,7 +450,8 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         warn!(
             KIMMY_TEST_STOP = %value,
             recognised = parsed.is_some(),
-            "a test switch is set that acts on this node's stop on purpose; unset \
+            "a test switch is set that acts on this node's stop, or with slow_apply slows \
+             every apply of a peer's batch for the whole run, on purpose; unset \
              KIMMY_TEST_STOP outside a test"
         );
         parsed
@@ -1007,6 +1009,14 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         Ok(connections) => (Ok(()), Some(connections)),
         Err(e) => (Err(e), None),
     };
+    // Closed to writes the moment serving ends, whether at the signal or on
+    // an error, before anything below waits: from here no transaction can
+    // begin (ADR-192), so a loop that commits again and again, an expiry
+    // pass's deletes or a round's applies, ends at its next commit rather
+    // than running on through the wait. A write in progress is waited for,
+    // up to the cap. Kept apart from the outcome, so a serving error cannot
+    // hide it.
+    let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
     // Before the aborts below: from here on a supervised task ending is a
     // stop, not a death. `serve` has already announced it on the signal path;
     // this covers the path where serving itself failed, where no signal ever
@@ -1079,7 +1089,7 @@ async fn start_and_serve(config: Config) -> Result<Served> {
 
     // `run` closes the engine to writes, and `conclude` closes it and then
     // writes the exit marker, in that order.
-    Ok(Served { engine, outcome: served, writes_by, stop_by: Arc::clone(&stop.by), test_stop })
+    Ok(Served { engine, outcome: served, closed, stop_by: Arc::clone(&stop.by), test_stop })
 }
 
 /// Close the engine to writes, waiting up to `cap` for one in progress; an
@@ -1624,9 +1634,10 @@ async fn serve(
 ) -> Result<Connections> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    // The drain begins at `signal` and ends `drain` after it, on both paths. Plain HTTP used to wait for every in-flight request
-    // however long it took, so a request that never finished held the
-    // process up until the supervisor killed it (ADR-192).
+    // The drain begins at `signal` and ends `drain` after it. Plain HTTP used
+    // to wait for every in-flight request however long it took, so a request
+    // that never finished held the process up until the supervisor killed it
+    // (ADR-192).
     let (drain_begun, drain_started) = tokio::sync::oneshot::channel::<()>();
     let signal = async move {
         signal.await;
@@ -1640,33 +1651,14 @@ async fn serve(
         tokio::time::sleep(drain).await;
     };
 
-    let Some(tls) = tls else {
-        let mut serving =
-            axum::serve(listener, service).with_graceful_shutdown(signal).into_future();
-        tokio::select! {
-            served = &mut serving => {
-                served?;
-                return Ok(Box::pin(std::future::ready(())));
-            }
-            () = deadline => {
-                on_drain_deadline();
-                warn!(
-                    drain_secs = drain.as_secs(),
-                    "requests still in flight at the drain deadline were cut off"
-                );
-            }
-        }
-        // The graceful serve ends once every connection's task has, which is
-        // what the caller waits for: a request told to stop at the deadline
-        // may still be inside a storage step.
-        return Ok(Box::pin(async move {
-            let _ = serving.await;
-        }));
-    };
-
-    // `axum::serve` has no TLS, so the TLS path runs on axum-server. It takes a
-    // std listener, which lets the bind stay where it was — a port already in
-    // use is still a startup error rather than a warning in a log nobody reads.
+    // Both paths run on axum-server, which ends the drain at its deadline:
+    // a connection still open then, a request in flight, a client that sent
+    // half its headers, one that has stopped reading, an idle HTTP/2 one, is
+    // closed at its task's next poll. `axum::serve` served plain HTTP until
+    // 0.40.2 and could not: at the deadline its connections' tasks ran on,
+    // and waiting for them to end held a stop up to 20 s. It takes a std
+    // listener, which lets the bind stay where it was — a port already in use
+    // is still a startup error rather than a warning in a log nobody reads.
     let std_listener = listener.into_std().context("converting the listener")?;
     // Must stay non-blocking. `into_std` preserves the flag tokio set, and
     // axum-server re-registers the socket with the runtime — handing it a
@@ -1684,18 +1676,38 @@ async fn serve(
         }
     });
     // UNSUPERVISED: the drain deadline, which acts once and only during shutdown.
-    tokio::spawn(async move {
-        deadline.await;
-        on_drain_deadline();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            deadline.await;
+            on_drain_deadline();
+            if handle.connection_count() > 0 {
+                warn!(
+                    drain_secs = drain.as_secs(),
+                    "requests still in flight at the drain deadline were cut off"
+                );
+            }
+        }
     });
 
-    axum_server::from_tcp_rustls(std_listener, tls)
-        .context("preparing the TLS listener")?
-        .handle(handle.clone())
-        .serve(service)
-        .await?;
-    // axum-server returns at its deadline with connections' tasks still
-    // running: each ends at its next poll, and its count with it.
+    match tls {
+        Some(tls) => {
+            axum_server::from_tcp_rustls(std_listener, tls)
+                .context("preparing the TLS listener")?
+                .handle(handle.clone())
+                .serve(service)
+                .await?
+        }
+        None => {
+            axum_server::from_tcp(std_listener)
+                .context("preparing the listener")?
+                .handle(handle.clone())
+                .serve(service)
+                .await?
+        }
+    }
+    // axum-server returns at its deadline with connections' tasks told to
+    // end: each ends at its next poll, and its count with it.
     Ok(Box::pin(async move {
         while handle.connection_count() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1703,9 +1715,9 @@ async fn serve(
     }))
 }
 
-/// The end of every HTTP connection's task, which [`serve`] hands back: its
-/// drain ends at a deadline, and a request still in flight then is told to
-/// stop, not waited for.
+/// The end of every HTTP connection's task, which [`serve`] hands back: the
+/// drain closes what is left at its deadline, and this is when those tasks
+/// have gone.
 type Connections = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 fn is_loopback(addr: &std::net::SocketAddr) -> bool {
@@ -2061,6 +2073,9 @@ fn ddl_confirmer(
                 // push it waits on belongs to the confirmer's driver for that
                 // member, which the node's shutdown aborts.
                 // UNSUPERVISED: a panic here must not stop the node; the loop below logs it and anti-entropy carries the entry.
+                // The stop does not wait for it: it only awaits its answer and
+                // runs no storage step, so it is never mid-poll when the
+                // runtime shuts down (see `start_and_serve`).
                 asked.spawn(async move { (addr, node, waiting.await) });
             }
             let mut found = kimmy_api::DdlConfirmation::default();
@@ -2846,7 +2861,15 @@ mod tests {
     /// inside the drain is not stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_plain_drain_is_bounded_and_the_stop_comes_at_its_end() {
+        static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        struct Dropped;
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         async fn forever() -> &'static str {
+            let _dropped = Dropped;
             std::future::pending::<()>().await;
             "never"
         }
@@ -2887,12 +2910,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "no stop at the deadline");
-        // And the connections' end, which the stop waits for before the
-        // runtime goes, is not claimed while that request is still running.
-        assert!(
-            tokio::time::timeout(drain, connections).await.is_err(),
-            "the connections were said to have ended with a request still in flight"
-        );
+        // The request still in flight is closed with its connection at the
+        // deadline, and the connections' end, which the stop waits for
+        // before the runtime goes, follows at once.
+        tokio::time::timeout(drain, connections)
+            .await
+            .expect("the connections outlived the drain's deadline");
+        assert!(DROPPED.load(std::sync::atomic::Ordering::SeqCst), "the request ran on");
+    }
+
+    /// A connection that never finishes its request, half its headers sent,
+    /// ends at the drain's deadline with the rest: it held a 0.40.2 stop to
+    /// 20 s once the stop waited for connections to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_with_half_its_headers_ends_at_the_drains_deadline() {
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let drain = Duration::from_millis(400);
+        let served = tokio::spawn(serve(
+            listener,
+            app,
+            None,
+            async move {
+                let _ = signalled.await;
+            },
+            drain,
+            || {},
+        ));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        signal.send(()).unwrap();
+        let connections = tokio::time::timeout(drain * 4, served).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(drain * 2, connections)
+            .await
+            .expect("the half-sent request's connection outlived the drain");
+        assert!(started.elapsed() < drain * 3, "{:?}", started.elapsed());
+        drop(stream);
     }
 
     /// Serve a router that reports the caller's address, and return where it is.

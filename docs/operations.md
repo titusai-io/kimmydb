@@ -572,19 +572,24 @@ on an error` ([ADR-147](decisions.md)).
 
 **The drain is 10 seconds, on both listeners, and the clean-exit marker waits
 for the last write and for the store's close.** From the signal, requests in flight get 10 s to finish,
-and new connections are refused. At 10 s the node stops waiting for them, and
-the plain listener logs `requests still in flight at the drain deadline were
-cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
-one used to wait for every request in flight, with no limit**. Then, with its
-background work stopped, the node **closes its storage to writes**: a write
-that begins from then on is refused, answered `503 node_stopping` with `retry:
-elsewhere` ("this node did not complete the request because it is shutting down"),
-logged at `WARN`, with nothing written, and a write already in
-progress is waited for, up to 10 s more. Commits waiting on the coalescing
-barrier at that point are flushed then, before the marker. Then the node waits
-for its remaining work to end, up to **22 s from the signal** in all (at least
-3 s however long the drain and the close to writes took), and **closes the
-store**: it logs `engine closed` with `elapsed_ms`, checks that redb recorded
+and new connections are refused. At 10 s the node stops waiting for them:
+each connection still open is closed, a request in flight with it, and the
+node logs `requests still in flight at the drain deadline were cut off` at
+`WARN`. **Plain HTTP used to wait for every request in flight, with no limit**;
+since 0.40.2 plain HTTP and TLS end the drain the same way. The moment the
+drain ends the node **closes its storage to writes**: a write that begins from
+then on is refused, answered `503 node_stopping` with `retry: elsewhere` ("this
+node did not complete the request because it is shutting down"), logged at
+`WARN`, with nothing written, and a background loop that commits again and
+again, an expiry pass or a replication round, ends at its next commit. A write
+already in progress is waited for, up to 10 s more. Commits waiting on the
+coalescing barrier at that point are flushed then, before the marker. In what
+is left of those 10 s the node waits for its tasks to end, the HTTP
+connections' and the background tasks', so that none is still running when
+the runtime shuts down; one still running at the end is aborted, with a
+`WARN`. Then it waits for its remaining work to end, up to **22 s from the
+signal** in all (at least 3 s however long the drain and the close to writes
+took), and **closes the store**: it logs `engine closed` with `elapsed_ms`, checks that redb recorded
 the close, and only then writes the clean-exit marker and logs `shutdown
 complete`. Exported spans and metrics get 2 s more, after the marker.
 

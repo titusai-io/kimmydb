@@ -23,10 +23,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   finished, and the panic ended only a task the stop had already ended. The
   cause: the stop shut the runtime down without waiting for its tasks to
   end, and a task inside a storage step runs on after it until its next
-  yield. The stop now waits for them: the background tasks, the
-  schema-change pushers and the HTTP connections, within the window it
-  already gave writes to finish (10 s after the drain). A task still running
-  then is aborted as before, so the stop's bound is unchanged.
+  yield. Now, once the drain ends, the node closes its storage to writes, as
+  before, so a loop that commits again and again ends at its next commit;
+  then, within what is left of the 10 s it gives a write in progress, it
+  waits for its tasks to end: the HTTP connections, the schema-change
+  pushers and the background tasks. A background task or pusher still
+  running at the end is aborted, as before; an HTTP connection still open
+  then is left to the runtime's shutdown, as before. The stop's bound is
+  unchanged.
+- **Plain HTTP ends its drain as TLS does.** A connection still open at the
+  drain's 10 s deadline, a request in flight, a client that sent half its
+  headers or stopped reading, an idle HTTP/2 connection, is now closed there.
+  Before, plain HTTP's connections ran on until the runtime shut down.
 - **The panic line says on which thread, and where.** `a thread panicked`
   now carries `thread`, `thread_id` and `location`.
 - **The start that skips the oplog walk says what the oplog holds.**

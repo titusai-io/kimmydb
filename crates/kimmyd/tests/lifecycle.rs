@@ -58,14 +58,19 @@ impl Run {
     }
 
     fn spawn_on_with(dir: &Path, name: &str, http: u16, extra_env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, http, extra_env, false)
+        Run::spawn_full(dir, name, http, extra_env, "", false)
     }
 
     /// [`Run::spawn_with`], with the node's stderr a pipe whose reader is
     /// already closed, so every write the node makes to it fails with EPIPE:
     /// the stderr a process has when whatever was reading it has gone.
     fn spawn_with_stderr_closed(dir: &Path, name: &str, env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, 0, env, true)
+        Run::spawn_full(dir, name, 0, env, "", true)
+    }
+
+    /// [`Run::spawn`], with `storage` added to the config's `[storage]`.
+    fn spawn_with_storage(dir: &Path, name: &str, storage: &str) -> Run {
+        Run::spawn_full(dir, name, 0, &[], storage, false)
     }
 
     fn spawn_full(
@@ -73,6 +78,7 @@ impl Run {
         name: &str,
         http: u16,
         extra_env: &[(&str, &str)],
+        storage: &str,
         stderr_closed: bool,
     ) -> Run {
         let config = format!(
@@ -82,6 +88,7 @@ bind = "127.0.0.1:{http}"
 
 [storage]
 data_dir = "{data}"
+{storage}
 
 [auth]
 jwt_secret = "{JWT_SECRET}"
@@ -1169,6 +1176,85 @@ async fn a_collector_that_never_answers_does_not_hold_the_stop() {
     assert!(log.contains("the collector did not take the last spans and metrics in time"), "{log}");
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
     drop(silent);
+}
+
+/// An expiry pass in progress at the stop ends at its next delete: the
+/// engine is closed to writes the moment serving ends, before the stop
+/// waits for its tasks. A 0.40.2 candidate that waited first let the pass run
+/// on through the wait, one commit per document, for 6 to 10 s, and past the
+/// window with twelve collections due, when the stop exited 75 and the next
+/// start repaired.
+#[tokio::test]
+async fn an_expiry_pass_in_progress_at_the_stop_ends_at_once() {
+    const COLLECTIONS: usize = 12;
+    const DUE: usize = 1_000;
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with_storage(dir.path(), "expiring", "ttl_interval_secs = 1");
+    run.wait_ready(&client).await;
+    let url = |path: &str| format!("http://127.0.0.1:{}{path}", run.http.get().unwrap());
+    let login = client
+        .post(url("/v1/auth/login"))
+        .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = login.json().await.unwrap();
+    let token = body["token"].as_str().expect("a token").to_string();
+    let post = |path: String, body: serde_json::Value| {
+        client.post(url(&path)).bearer_auth(&token).json(&body).send()
+    };
+    // Every document is due, and no index exists until all are written, so
+    // the passes begin with every collection's whole backlog waiting.
+    for c in 0..COLLECTIONS {
+        let made =
+            post("/v1/db/shop/collections".into(), serde_json::json!({ "name": format!("t{c}") }));
+        assert!(made.await.unwrap().status().is_success());
+        let docs: Vec<_> = (0..DUE)
+            .map(|i| serde_json::json!({ "_id": i, "at": { "$date": 1_000_000_000_000i64 } }))
+            .collect();
+        let bulk = post(format!("/v1/db/shop/coll/t{c}/bulk"), serde_json::json!(docs));
+        assert!(bulk.await.unwrap().status().is_success());
+    }
+    for c in 0..COLLECTIONS {
+        let index = post(
+            format!("/v1/db/shop/coll/t{c}/indexes"),
+            serde_json::json!({ "name": "ttl", "fields": [{ "path": "at" }], "expireAfterSeconds": 0 }),
+        );
+        let index = index.await.unwrap();
+        assert!(index.status().is_success(), "{}", index.text().await.unwrap());
+    }
+    let deadline = Instant::now() + PATIENCE;
+    while !run.log().contains("expired documents") {
+        assert!(Instant::now() < deadline, "no expiry pass ran: {}", run.log());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (status, took) = stop(&mut run);
+    let log = run.log();
+    assert!(status.success(), "{status:?}: {log}");
+    assert!(took < Duration::from_secs(3), "the pass held the stop: {took:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
+/// A client that sent half its request's headers holds the stop no longer
+/// than the drain: its connection is closed at the drain's deadline. A 0.40.2
+/// candidate that waited for plain HTTP's connections to end held it to 20 s.
+#[tokio::test]
+async fn a_half_sent_request_holds_the_stop_no_longer_than_the_drain() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn(dir.path(), "half-sent");
+    run.wait_ready(&client).await;
+    let mut half = std::net::TcpStream::connect(("127.0.0.1", *run.http.get().unwrap())).unwrap();
+    half.write_all(b"GET /healthz HTTP/1.1\r\nHost").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, took) = stop(&mut run);
+    assert!(status.success(), "{status:?}: {}", run.log());
+    // The drain is ten seconds.
+    assert!(took < Duration::from_secs(13), "the half-sent request held the stop: {took:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+    drop(half);
 }
 
 /// Pinned as it is, and out of the stop's scope: a SIGTERM before the node
