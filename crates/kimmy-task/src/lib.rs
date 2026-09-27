@@ -667,7 +667,17 @@ where
     tokio::select! {
         _ = shutdown.reached() => {
             info!(task = name, "stopping a background task for shutdown");
-            // `running` drops here and stops the work.
+            // Stopped, and then waited for: the supervisor ends only once the
+            // work has. An abort lands at the work's next yield, and a work
+            // inside a storage step (`block_in_place`) runs on to it after the
+            // step returns, polling whatever timer it is under. Had the
+            // runtime begun to shut down meanwhile, that poll panics ("A Tokio
+            // 1.x context was found, but it is being shutdown"), which a
+            // 0.40.1 stop logged. The node waits for its supervisors, within
+            // the stop's time, before it shuts the runtime down; a supervisor
+            // it gives up on is aborted, and `running` then drops as before.
+            running.handle.abort();
+            let _ = (&mut running.handle).await;
         }
         ended = &mut running.handle => classify(name, &shutdown, ended, judge),
     }

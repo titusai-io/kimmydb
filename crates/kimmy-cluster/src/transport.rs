@@ -266,6 +266,9 @@ pub async fn serve_with(
         // the first thing an attacker can make slow.
         // UNSUPERVISED: one task per inbound connection, and a panic in one connection must
         // not stop the node -- which is the rule the comment above already states.
+        // The stop does not wait for it: its only timer is the handshake's,
+        // before any storage step, so a step's continuation never polls one
+        // after the runtime has shut down (0.40.2).
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,

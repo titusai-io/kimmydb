@@ -56,6 +56,9 @@ pub async fn watch_collection(
     // unexplained socket close.
     let stream = state.engine.watch(WatchScope::Collection(meta.id), options)?;
 
+    // The pump's task is not waited for at the stop: after its storage step,
+    // `ChangeStream::next`'s read, it receives and sends and never polls a
+    // timer, so none can outlive the runtime's shutdown (0.40.2).
     Ok(upgrade.on_upgrade(move |socket| pump(socket, state, stream, q.full_document)))
 }
 
