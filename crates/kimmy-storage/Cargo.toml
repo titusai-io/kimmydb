@@ -18,16 +18,6 @@ description = "redb-backed storage engine, indexes, and oplog for KimmyDB"
 # The feature needs a target with 64-bit atomics; redb refuses to compile it
 # otherwise.
 cache-metrics = ["redb/cache_metrics"]
-# A control for the benchmarks behind ADR-174's addendum, and nothing else.
-#
-# Compiles the live-count and mark work out of the write path entirely, so a
-# benchmark can price that work against the same binary, the same store and the
-# same apply path with only those calls removed. A build with this enabled does
-# NOT keep the counts and must never ship: the divergence check would read a
-# stale number, and the mark would stop telling the next start that a build
-# which does not keep the counts has written.
-bench-no-live-counts = []
-
 # The count rule's failure injection (ADR-177), for another crate's tests: the
 # transport's push tests enable it as a dev-dependency. Never enabled by a
 # build that ships.
@@ -76,3 +66,20 @@ harness = false
 [[bench]]
 name = "concurrent_writes"
 harness = false
+
+[lints.rust]
+# `kimmy_bench_no_live_counts`: a control for the benchmarks behind ADR-174's
+# addendum, and nothing else. Set by hand, never by a feature:
+#
+#     RUSTFLAGS="--cfg kimmy_bench_no_live_counts" \
+#         cargo bench -p kimmy-storage --bench write_path
+#
+# It compiles the live-count and mark work out of the write path entirely, so a
+# benchmark can price that work against the same binary, the same store and the
+# same apply path with only those calls removed. A build with it does NOT keep
+# the counts and must never ship: the divergence check would read a stale
+# number, and the mark would stop telling the next start that a build which
+# does not keep the counts has written. It was the `bench-no-live-counts`
+# feature until `--all-features` compiled it into every test run, where 33
+# tests that read the kept count failed.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kimmy_bench_no_live_counts)"] }
