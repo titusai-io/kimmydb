@@ -572,19 +572,24 @@ on an error` ([ADR-147](decisions.md)).
 
 **The drain is 10 seconds, on both listeners, and the clean-exit marker waits
 for the last write and for the store's close.** From the signal, requests in flight get 10 s to finish,
-and new connections are refused. At 10 s the node stops waiting for them, and
-the plain listener logs `requests still in flight at the drain deadline were
-cut off` at `WARN`; the TLS listener has always had this bound, and **the plain
-one used to wait for every request in flight, with no limit**. Then, with its
-background work stopped, the node **closes its storage to writes**: a write
-that begins from then on is refused, answered `503 node_stopping` with `retry:
-elsewhere` ("this node did not complete the request because it is shutting down"),
-logged at `WARN`, with nothing written, and a write already in
-progress is waited for, up to 10 s more. Commits waiting on the coalescing
-barrier at that point are flushed then, before the marker. Then the node waits
-for its remaining work to end, up to **22 s from the signal** in all (at least
-3 s however long the drain and the close to writes took), and **closes the
-store**: it logs `engine closed` with `elapsed_ms`, checks that redb recorded
+and new connections are refused. At 10 s the node stops waiting for them:
+each connection still open is closed, a request in flight with it, and the
+node logs `requests still in flight at the drain deadline were cut off` at
+`WARN`. **Plain HTTP used to wait for every request in flight, with no limit**;
+since 0.40.2 plain HTTP and TLS end the drain the same way. The moment the
+drain ends the node **closes its storage to writes**: a write that begins from
+then on is refused, answered `503 node_stopping` with `retry: elsewhere` ("this
+node did not complete the request because it is shutting down"), logged at
+`WARN`, with nothing written, and a background loop that commits again and
+again, an expiry pass or a replication round, ends at its next commit. A write
+already in progress is waited for, up to 10 s more. Commits waiting on the
+coalescing barrier at that point are flushed then, before the marker. In what
+is left of those 10 s the node waits for its tasks to end, the HTTP
+connections' and the background tasks', so that none is still running when
+the runtime shuts down; one still running at the end is aborted, with a
+`WARN`. Then it waits for its remaining work to end, up to **22 s from the
+signal** in all (at least 3 s however long the drain and the close to writes
+took), and **closes the store**: it logs `engine closed` with `elapsed_ms`, checks that redb recorded
 the close, and only then writes the clean-exit marker and logs `shutdown
 complete`. Exported spans and metrics get 2 s more, after the marker.
 
@@ -1802,7 +1807,7 @@ partially read.
 | Query cost | Index-backed where a secondary index applies, otherwise a collection scan. `POST …/find` with `"explain": true` reports which |
 | `skip` | O(n) even with an index; deep paging is expensive |
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
-| Start time | An open checks that the version vector covers the oplog by walking every retained oplog entry, keys and values. It records that it did, and later starts read the record and skip the walk; a rewind records it too. **A start walks when there is no record it can use:** the first start of this release, and of any later release that raises the schema or `I_EPOCH`; the first start after a restore, since no backup carries the record; and **every** start of a release before this one, which does not read the record, so a rollback to 0.39 or earlier walks at every start as those releases always did. Each start logs which: `checked the version vector against the oplog`, with `elapsed_ms`, `rows` and `logical_bytes`, or `skipped the oplog walk: the version vector is verified`. **The walk's time is the oplog's bytes over the disk's random-read rate.** With the store in the page cache it is about 46 s per 10 million entries. Cold, after a reboot or once other work has pushed the store out of the cache, it measured **about 30 s per GB of oplog read on the lab host (mars, round 0420: 1.08 GB in 32.3–32.7 s)**; that is that host's disks, so measure yours from the first start's line. `kimmy_oplog_entries` is what the next walk would read; `kimmy_oplog_verified_entries`, `_logical_bytes` and `_walk_seconds` are what the last walk read and took. **`KIMMY_VERIFY_OPLOG_AT_OPEN=1`** makes a start walk anyway and rewrite the record. A skipping start no longer decodes every oplog key, so damage to one is found by the first read that reaches it rather than at the open ([ADR-173](decisions.md)'s addendum of 2026-09-26) |
+| Start time | An open checks that the version vector covers the oplog by walking every retained oplog entry, keys and values. It records that it did, and later starts read the record and skip the walk; a rewind records it too. **A start walks when there is no record it can use:** the first start of this release, and of any later release that raises the schema or `I_EPOCH`; the first start after a restore, since no backup carries the record; and **every** start of a release before this one, which does not read the record, so a rollback to 0.39 or earlier walks at every start as those releases always did. Each start logs which: `checked the version vector against the oplog`, with `elapsed_ms`, `rows` and `logical_bytes`, or `skipped the oplog walk: the version vector is verified`, whose `rows`, `logical_bytes` and `walk_ms` are what the last walk read and took, which may be long ago (a store verified empty and loaded since says `rows=0`), and whose `oplog_entries` is what the oplog holds now. **The walk's time is the oplog's bytes over the disk's random-read rate.** With the store in the page cache it is about 46 s per 10 million entries. Cold, after a reboot or once other work has pushed the store out of the cache, it measured **about 30 s per GB of oplog read on the lab host (mars, round 0420: 1.08 GB in 32.3–32.7 s)**; that is that host's disks, so measure yours from the first start's line. `kimmy_oplog_entries` is what the next walk would read; `kimmy_oplog_verified_entries`, `_logical_bytes` and `_walk_seconds` are what the last walk read and took. **`KIMMY_VERIFY_OPLOG_AT_OPEN=1`** makes a start walk anyway and rewrite the record. A skipping start no longer decodes every oplog key, so damage to one is found by the first read that reaches it rather than at the open ([ADR-173](decisions.md)'s addendum of 2026-09-26) |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | Retention pass | Reads the expired oplog prefix by key range and up to 100,000 documents of the tombstone scan per pass, under read transactions; holds the single writer only to remove what it found, 1,000 records per commit. On a member whose container leaves no page cache for the database file, a scan of that size reads from disk — size a container limit for the file's working set as well as for `kimmy_process_resident_bytes`, or the pass, and every read that misses, runs at the disk's speed ([ADR-151](decisions.md)) |
 | Backup | Reads the whole store under one read transaction and writes it to an unlinked file in the data directory, so it needs free space there equal to one backup for as long as the walk and the transfer take; the heap holds one read chunk. Its time follows the store and the page cache — the same dependence as the retention pass above — and three identical 4.29 GB stores took 92 s to 1,903 s. No request deadline applies. See [Taking a backup](#taking-a-backup) and `kimmy_backup_duration_seconds` ([ADR-170](decisions.md)) |
@@ -1945,7 +1950,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.40.1; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.40.2; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -1965,7 +1970,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.40.1 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.40.2 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and

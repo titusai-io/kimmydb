@@ -2457,6 +2457,134 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
     assert!(!log.contains("repairing the database"), "{log}");
 }
 
+/// **0.40.1's panic at the stop**: a member stopped while one of its
+/// replication rounds was inside a storage step logged `a thread panicked`,
+/// "A Tokio 1.x context was found, but it is being shutdown". The round's
+/// task, aborted at the signal, ran on after the step until its next yield,
+/// and polled its deadline there after the runtime had begun to shut down.
+///
+/// B's applies of its peers' batches are slowed (`slow_apply`), and B is
+/// stopped just after one begins, while A's writes stream in. Each time, B
+/// exits 0 with its store closed and logs no panic and no error on the way
+/// out: the stop waits for its tasks to end before it shuts the runtime down.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_member_stopped_inside_an_apply_exits_without_a_panic() {
+    const TIMES: usize = 5;
+    const SLOWED: &str = "a slowed apply of a peer's batch, on purpose";
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    // Writes stream into A, so B always has a batch to pull and apply.
+    let writer = {
+        let url = a.url("/v1/db/shop/coll/orders/bulk");
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for batch in 0u64.. {
+                let docs: Vec<_> = (0..20)
+                    .map(|i| serde_json::json!({ "_id": format!("w{batch}-{i}") }))
+                    .collect();
+                if client.post(&url).bearer_auth(&token).json(&docs).send().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    for time in 1..=TIMES {
+        let before = b.restart_with(&[("KIMMY_TEST_STOP", "slow_apply:1500")]);
+        assert!(before.success(), "stop {}: {before:?}\n{}", time - 1, b.log());
+        b.wait_ready(&client).await;
+        // Stopped just after an apply begins: its step has 1.5 s to run.
+        let seen = b.log().matches(SLOWED).count();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while b.log().matches(SLOWED).count() == seen {
+            assert!(std::time::Instant::now() < deadline, "no apply began:\n{}", b.log());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        b.signal("TERM");
+        let status = b.wait_exit(Duration::from_secs(60));
+        let log = b.log();
+        let stopping = &log[log.rfind("shutdown signal received").expect("the stop's line")..];
+        assert!(status.success(), "stop {time}: {status:?}\n{stopping}");
+        assert!(!stopping.contains("panicked"), "stop {time}:\n{stopping}");
+        // The level, whether the log is coloured or not.
+        assert!(!stopping.contains("ERROR"), "stop {time}:\n{stopping}");
+        assert!(!stopping.contains("being shutdown"), "stop {time}:\n{stopping}");
+        assert!(stopping.contains("engine closed"), "stop {time}:\n{stopping}");
+        let marker =
+            std::fs::read_to_string(b.dir.path().join("data").join("kimmy.last-exit")).unwrap();
+        assert!(marker.contains("exit = \"shutdown\""), "stop {time}: {marker}");
+    }
+    writer.abort();
+    drop((a, c));
+}
+
+/// And a task that does not end within the stop's window is aborted there,
+/// as before this waited for it, and the exit says what happened: B's apply
+/// is slowed past the whole stop, so its thread still holds the engine when
+/// the runtime has shut down, and the store is not closed. The stop still
+/// ends within its budget, and the next start repairs.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_task_stuck_past_the_stops_window_is_aborted_and_the_exit_is_honest() {
+    const SLOWED: &str = "a slowed apply of a peer's batch, on purpose";
+    let client = reqwest::Client::new();
+    let (a, mut b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    let before = b.restart_with(&[("KIMMY_TEST_STOP", "slow_apply:60000")]);
+    assert!(before.success(), "{before:?}");
+    b.wait_ready(&client).await;
+    let docs: Vec<_> = (0..20).map(|i| serde_json::json!({ "_id": i })).collect();
+    let bulk = client
+        .post(a.url("/v1/db/shop/coll/orders/bulk"))
+        .bearer_auth(&token)
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert!(bulk.status().is_success());
+    eventually("B to begin an apply", || {
+        let begun = b.log().contains(SLOWED);
+        async move { begun }
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    b.signal("TERM");
+    let status = b.wait_exit(Duration::from_secs(60));
+    let took = started.elapsed();
+    let log = b.log();
+    assert!(took < Duration::from_secs(30), "the stop outran its budget: {took:?}\n{log}");
+    assert!(
+        log.contains("a background task was still stopping at the end of the stop's window"),
+        "{log}"
+    );
+    assert_eq!(status.code(), Some(75), "{status:?}\n{log}");
+    let marker =
+        std::fs::read_to_string(b.dir.path().join("data").join("kimmy.last-exit")).unwrap();
+    assert!(marker.contains("exit = \"storage_not_closed\""), "{marker}");
+    drop((a, c));
+}
+
 /// A schema change in flight at the signal is a client's request, which the
 /// drain lets finish: its index build and its confirmation's push walk go
 /// on through the drain (ADR-192), and the members confirm it before the

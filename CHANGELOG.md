@@ -34,6 +34,55 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
     not have** (`gzip`, say) is warned about and ignored, where it stopped the
     node from starting.
 
+## 0.40.2 - 2026-09-27
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the schema is still 4 and redb still 4.3, so 0.40.1, 0.40.0 and 0.39.0 open a
+store 0.40.2 has run on. A stop no longer logs a panic when a replication
+round is mid-apply: the node now waits for its tasks to end before it shuts
+its runtime down, within the stop's unchanged bound. Plain HTTP now ends its
+drain at the 10 s deadline as TLS does, a listener that cannot accept a
+connection logs it on both, and the start that skips the oplog walk adds
+`oplog_entries`, what the oplog holds now.**
+
+### Fixed
+
+- **A stop no longer panics when a replication round is mid-apply.** A
+  member stopped while one of its tasks was inside a storage step, most often
+  a replication round applying a peer's batch, logged `a thread panicked`
+  with "A Tokio 1.x context was found, but it is being shutdown", and
+  sometimes `sync round failed` with the same text. The stop was otherwise
+  correct (exit 0, the store closed), and nothing was lost: the step had
+  finished, and the panic ended only a task the stop had already ended. The
+  cause: the stop shut the runtime down without waiting for its tasks to
+  end, and a task inside a storage step runs on after it until its next
+  yield. Now, once the drain ends, the node closes its storage to writes, as
+  before, so a loop that commits again and again ends at its next commit;
+  then, within what is left of the 10 s it gives a write in progress, it
+  waits for its tasks to end: the HTTP connections, the schema-change
+  pushers and the background tasks. A background task or pusher still
+  running at the end is aborted, as before; an HTTP connection still open
+  then is left to the runtime's shutdown, as before. The stop's bound is
+  unchanged.
+- **Plain HTTP ends its drain as TLS does.** A connection still open at the
+  drain's 10 s deadline, a request in flight, a client that sent half its
+  headers or stopped reading, an idle HTTP/2 connection, is now closed there.
+  Before, plain HTTP's connections ran on until the runtime shut down.
+- **A node that cannot accept a connection says so, on TLS too.** When the
+  HTTP listener's accept fails, most often because the process is out of
+  file descriptors, it logs `could not accept an HTTP connection` at `ERROR`,
+  with the error in `error`, at most once a second, and keeps trying. Plain
+  HTTP logged this before (as `axum::serve`'s `accept error`); the TLS
+  listener never did, and a node out of descriptors refused every new client
+  with nothing in its log.
+- **The panic line says on which thread, and where.** `a thread panicked`
+  now carries `thread`, `thread_id` and `location`.
+- **The start that skips the oplog walk says what the oplog holds.**
+  `skipped the oplog walk: the version vector is verified` keeps `rows`,
+  `logical_bytes` and `walk_ms`, which are what the last walk read (for a
+  store verified empty and loaded since, `rows=0`), and adds
+  `oplog_entries`, what the oplog holds now.
+
 ## 0.40.1 - 2026-09-27
 
 **Roll the members one at a time. This release is not a rollback boundary:
