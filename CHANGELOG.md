@@ -10,6 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **No more `peer connection failed` on every replication round.** Each
+  member logged it at `WARN`, with `reason: "io"` and "peer closed connection
+  without sending TLS close_notify", for every round every peer pulled from
+  it: about 24 a minute per member on an idle three-member cluster, and
+  counted in `kimmy_sync_serve_failures_total{reason="io"}`. Nothing had
+  failed: the pulling member ended each round by dropping its connection
+  without TLS's `close_notify`, which the serving member read as an error.
+  A member now closes a round's connection in order (bounded, half a
+  second), and reads a connection that ends between two messages without
+  `close_notify`, as a member before this one ends it, as a close. A
+  connection that ends inside a message, or is reset, is still a failure,
+  logged and counted as before.
+
 ## 0.40.1 - 2026-09-27
 
 **Roll the members one at a time. This release is not a rollback boundary:

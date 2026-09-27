@@ -31,7 +31,7 @@ use tracing::error;
 
 use crate::membership::Members;
 use crate::protocol::{MAX_BATCH, Message, ProtocolError, read_frame, write_frame};
-use crate::transport::{Fits, REQUEST_TIMEOUT, dial, how_many_fit};
+use crate::transport::{Fits, REQUEST_TIMEOUT, close, dial, how_many_fit};
 
 /// The longest a member's back-off runs after pushes it did not answer
 /// (ADR-191).
@@ -526,6 +526,25 @@ impl Confirmer {
             Ok(dialled) => dialled,
             Err(e) => return PushResult::Failed(Failure::before_send(None, false, e)),
         };
+        let result = self.push_over(&mut stream, addr, their_node, progress).await;
+        // The push is over, however it ended: say so to the peer, which
+        // otherwise reads the dropped connection as a failure (a TLS end
+        // with no close_notify).
+        close(&mut stream).await;
+        result
+    }
+
+    /// [`Self::push_window`] over the connection it dialled to `addr`.
+    async fn push_over<S>(
+        &self,
+        mut stream: S,
+        addr: SocketAddr,
+        their_node: NodeId,
+        progress: &Progress,
+    ) -> PushResult
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         *progress.their_node.lock() = Some(their_node);
         let failed = |e: ProtocolError| {
             PushResult::Failed(Failure::before_send(
