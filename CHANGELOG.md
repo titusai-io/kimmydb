@@ -10,7 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.40.1 - 2026-09-27
+
+**Roll the members one at a time. This release is not a rollback boundary:
+the schema is still 4 and redb still 4.3, so 0.40.0 and 0.39.0 open a store
+0.40.1 has run on. It fixes a stop that did not end: a member stopped while
+its peers were pulling from it logged `shutdown complete`, went on serving
+until the walk ended, was killed at its stop timeout, and left a store the
+next start repaired beside a marker that said the stop was clean. Now every
+walk of the store ends at the stop, the node closes the store and reads back
+that redb recorded the close, and only then logs `shutdown complete`. A stop
+that cannot close the store writes the new marker `storage_not_closed` and
+exits 75. Give a stop 30 s or more from the signal. `node_stopping`'s message
+now says the node "did not complete the request"; its code and retry class
+are unchanged.**
 
 ### Fixed
 
