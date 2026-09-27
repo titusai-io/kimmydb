@@ -58,27 +58,34 @@ impl Run {
     }
 
     fn spawn_on_with(dir: &Path, name: &str, http: u16, extra_env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, http, extra_env, "", false)
+        Run::spawn_full(dir, name, http, extra_env, "", None, false)
     }
 
     /// [`Run::spawn_with`], with the node's stderr a pipe whose reader is
     /// already closed, so every write the node makes to it fails with EPIPE:
     /// the stderr a process has when whatever was reading it has gone.
     fn spawn_with_stderr_closed(dir: &Path, name: &str, env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, 0, env, "", true)
+        Run::spawn_full(dir, name, 0, env, "", None, true)
     }
 
     /// [`Run::spawn`], with `storage` added to the config's `[storage]`.
     fn spawn_with_storage(dir: &Path, name: &str, storage: &str) -> Run {
-        Run::spawn_full(dir, name, 0, &[], storage, false)
+        Run::spawn_full(dir, name, 0, &[], storage, None, false)
     }
 
+    /// [`Run::spawn`], with the process allowed `nofile` file descriptors.
+    fn spawn_with_fd_limit(dir: &Path, name: &str, nofile: u32) -> Run {
+        Run::spawn_full(dir, name, 0, &[], "", Some(nofile), false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_full(
         dir: &Path,
         name: &str,
         http: u16,
         extra_env: &[(&str, &str)],
         storage: &str,
+        nofile: Option<u32>,
         stderr_closed: bool,
     ) -> Run {
         let config = format!(
@@ -100,7 +107,18 @@ jwt_secret = "{JWT_SECRET}"
         let stdout = dir.join(format!("{name}.stdout.log"));
         let stderr = dir.join(format!("{name}.stderr.log"));
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kimmyd"));
+        // A descriptor limit through the shell, which `exec`s the node so it
+        // keeps the pid the harness signals.
+        let mut command = match nofile {
+            None => Command::new(env!("CARGO_BIN_EXE_kimmyd")),
+            Some(nofile) => {
+                let mut sh = Command::new("/bin/sh");
+                sh.arg("-c")
+                    .arg(format!("ulimit -n {nofile} && exec \"$0\" \"$@\""))
+                    .arg(env!("CARGO_BIN_EXE_kimmyd"));
+                sh
+            }
+        };
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -1255,6 +1273,36 @@ async fn a_half_sent_request_holds_the_stop_no_longer_than_the_drain() {
     assert!(took < Duration::from_secs(13), "the half-sent request held the stop: {took:?}");
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
     drop(half);
+}
+
+/// A node out of file descriptors says it cannot accept new clients: the
+/// HTTP listener logs the error, at most once a second, where 0.40.2's first
+/// candidate went silent on plain HTTP.
+#[tokio::test]
+async fn a_listener_out_of_descriptors_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with_fd_limit(dir.path(), "starved", 64);
+    run.wait_ready(&client).await;
+    let port = *run.http.get().unwrap();
+    // More connections than the node has descriptors, held open.
+    let mut held = Vec::new();
+    for _ in 0..150 {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => held.push(stream),
+            Err(_) => break,
+        }
+    }
+    let deadline = Instant::now() + PATIENCE;
+    while !run.log().contains("could not accept an HTTP connection") {
+        assert!(Instant::now() < deadline, "no accept error was logged: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    let line = run.log().lines().find(|l| l.contains("could not accept")).unwrap().to_string();
+    assert!(line.contains("ERROR") && line.contains("error"), "{line}");
+    drop(held);
+    let (status, _) = stop(&mut run);
+    assert!(status.success(), "{status:?}: {}", run.log());
 }
 
 /// Pinned as it is, and out of the stop's scope: a SIGTERM before the node

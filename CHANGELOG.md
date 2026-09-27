@@ -35,6 +35,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   drain's 10 s deadline, a request in flight, a client that sent half its
   headers or stopped reading, an idle HTTP/2 connection, is now closed there.
   Before, plain HTTP's connections ran on until the runtime shut down.
+- **A node that cannot accept a connection says so, on TLS too.** When the
+  HTTP listener's accept fails, most often because the process is out of
+  file descriptors, it logs `could not accept an HTTP connection` at `ERROR`,
+  with the error in `error`, at most once a second, and keeps trying. Plain
+  HTTP logged this before (as `axum::serve`'s `accept error`); the TLS
+  listener never did, and a node out of descriptors refused every new client
+  with nothing in its log.
 - **The panic line says on which thread, and where.** `a thread panicked`
   now carries `thread`, `thread_id` and `location`.
 - **The start that skips the oplog walk says what the oplog holds.**

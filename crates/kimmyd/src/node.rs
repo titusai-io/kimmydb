@@ -1009,6 +1009,12 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         Ok(connections) => (Ok(()), Some(connections)),
         Err(e) => (Err(e), None),
     };
+    // Before the close and every wait below: from here on a supervised task
+    // ending is a stop, not a death. `serve` has already announced it on the
+    // signal path; this covers the path where serving itself failed, where no
+    // signal ever arrived, so a task the close then refuses meets a stop that
+    // has begun rather than a failure to retry.
+    stop.begin();
     // Closed to writes the moment serving ends, whether at the signal or on
     // an error, before anything below waits: from here no transaction can
     // begin (ADR-192), so a loop that commits again and again, an expiry
@@ -1017,12 +1023,6 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // up to the cap. Kept apart from the outcome, so a serving error cannot
     // hide it.
     let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
-    // Before the aborts below: from here on a supervised task ending is a
-    // stop, not a death. `serve` has already announced it on the signal path;
-    // this covers the path where serving itself failed, where no signal ever
-    // arrived. The aborts run on both paths, and the engine is closed after
-    // either.
-    stop.begin();
     let served = served.context("serving");
 
     // **Every task that can be inside a storage step is waited for before
@@ -1690,21 +1690,16 @@ async fn serve(
         }
     });
 
+    let listener = Accepting::from_std(std_listener).context("preparing the listener")?;
+    let server = axum_server::Server::<Peer>::from_listener(listener).handle(handle.clone());
     match tls {
         Some(tls) => {
-            axum_server::from_tcp_rustls(std_listener, tls)
-                .context("preparing the TLS listener")?
-                .handle(handle.clone())
+            server
+                .acceptor(axum_server::tls_rustls::RustlsAcceptor::new(tls))
                 .serve(service)
                 .await?
         }
-        None => {
-            axum_server::from_tcp(std_listener)
-                .context("preparing the listener")?
-                .handle(handle.clone())
-                .serve(service)
-                .await?
-        }
+        None => server.serve(service).await?,
     }
     // axum-server returns at its deadline with connections' tasks told to
     // end: each ends at its next poll, and its count with it.
@@ -1713,6 +1708,70 @@ async fn serve(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }))
+}
+
+/// A client's address, as [`Accepting`] hands it to axum-server: the address
+/// type the server is generic over, so that the listener can be this node's.
+#[derive(Clone, Copy, Debug)]
+struct Peer(std::net::SocketAddr);
+
+impl axum_server::Address for Peer {
+    type Stream = tokio::net::TcpStream;
+    type Listener = Accepting;
+}
+
+impl axum::extract::connect_info::Connected<Peer> for std::net::SocketAddr {
+    fn connect_info(peer: Peer) -> Self {
+        peer.0
+    }
+}
+
+/// The HTTP listener, which says when it cannot accept. axum-server retries
+/// a failed accept every 50 ms and says nothing, so a node out of file
+/// descriptors refused every new client with no line anywhere; `axum::serve`,
+/// which served plain HTTP until 0.40.2, logged it. Logged here, for both
+/// paths, at most once a second.
+struct Accepting {
+    listener: tokio::net::TcpListener,
+    logged: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Accepting {
+    fn from_std(listener: std::net::TcpListener) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        Ok(Self { listener, logged: std::sync::Mutex::new(None) })
+    }
+}
+
+impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
+    async fn bind_to(addr: Peer) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(addr.0).await?;
+        Ok(Self { listener, logged: std::sync::Mutex::new(None) })
+    }
+
+    async fn accept_stream(&self) -> std::io::Result<(tokio::net::TcpStream, Peer)> {
+        match self.listener.accept().await {
+            Ok((stream, addr)) => Ok((stream, Peer(addr))),
+            Err(error) => {
+                let now = std::time::Instant::now();
+                let mut logged =
+                    self.logged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if logged.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+                    *logged = Some(now);
+                    error!(
+                        %error,
+                        "could not accept an HTTP connection; new clients are refused until \
+                         this clears, and the listener keeps trying"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn get_local_addr(&self) -> std::io::Result<Peer> {
+        self.listener.local_addr().map(Peer)
+    }
 }
 
 /// The end of every HTTP connection's task, which [`serve`] hands back: the
