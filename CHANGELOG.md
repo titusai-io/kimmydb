@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **OTLP exports are retried.** OpenTelemetry moves to 0.33 (and
+  `tracing-opentelemetry` to 0.34), whose exporter tries an export again when
+  it cannot connect or the collector answers 429, 502, 503 or 504: up to three
+  more times, with backoff, within `telemetry.export_timeout_secs`. A
+  collector that is briefly down now loses fewer spans and metrics. Nothing
+  else an operator sees changes: the span and attribute names, the `kimmy_*`
+  metrics on `/metrics` and on the OTLP bridge, and the two seconds the
+  exporters get when the node stops are as they were.
+
 ## 0.40.1 - 2026-09-27
 
 **Roll the members one at a time. This release is not a rollback boundary:

@@ -1499,7 +1499,11 @@ forward over TLS ([ADR-069](decisions.md)).
 processor on its own threads, exports are bounded by `export_timeout_secs`, and
 nothing on the request path waits for either. A node configured against a dead
 port serves at unchanged latency and keeps serving — verified, not asserted;
-the numbers are in [Benchmarks](benchmarks.md).
+the numbers are in [Benchmarks](benchmarks.md). An export that cannot connect,
+or that the collector answers 429, 502, 503 or 504, is tried again up to three
+times with backoff, all within `export_timeout_secs`, and a `Retry-After` that
+would run past it ends the export instead. On the way out the exporters get
+two seconds between them, whatever the collector does.
 
 #### What you get
 
