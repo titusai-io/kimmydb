@@ -121,10 +121,23 @@ pub(crate) fn write(txn: &WriteTransaction, schema: u8, walk: &VerifiedWalk) -> 
     Ok(())
 }
 
-/// Whether an open should walk even with a record: `KIMMY_VERIFY_OPLOG_AT_OPEN`
-/// set to `1`. The walk then rewrites the record. Read once per open.
+/// The variable that makes an open walk even with a record, as
+/// `docs/operations.md` names it.
+const FORCE_VARIABLE: &str = "KIMMY_VERIFY_OPLOG_AT_OPEN";
+
+/// Whether an open should walk even with a record: [`FORCE_VARIABLE`] set to
+/// `1`. The walk then rewrites the record. Read once per open.
 pub(crate) fn forced() -> bool {
-    std::env::var_os("KIMMY_VERIFY_OPLOG_AT_OPEN").is_some_and(|v| v == "1")
+    #[cfg(test)]
+    if test_support::forced_on_this_thread() {
+        return true;
+    }
+    forced_by(std::env::var_os(FORCE_VARIABLE).as_deref())
+}
+
+/// Whether [`FORCE_VARIABLE`]'s value, if set, forces the walk: exactly `1`.
+fn forced_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 #[cfg(test)]
@@ -133,6 +146,31 @@ pub(crate) mod test_support {
 
     thread_local! {
         static FAIL_BEFORE_THE_RAISE_COMMITS: Cell<bool> = const { Cell::new(false) };
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with the opens on this thread walking, as
+    /// `KIMMY_VERIFY_OPLOG_AT_OPEN=1` makes every open do. On this thread
+    /// only, not through the environment: `cargo test` runs the tests as
+    /// threads of one process, and a variable set by one made another's open
+    /// walk where it was meant to skip.
+    ///
+    /// **Only an open on the calling thread is forced.** One that `f` spawns
+    /// onto another thread skips as usual. Nested, the inner call leaves the
+    /// outer one's forcing as it found it.
+    pub(crate) fn forcing<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCED.with(|f| f.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCED.with(|f| f.replace(true)));
+        f()
+    }
+
+    pub(crate) fn forced_on_this_thread() -> bool {
+        FORCED.with(Cell::get)
     }
 
     /// Fail the next open's walk on this thread just before the transaction
@@ -167,6 +205,7 @@ mod tests {
     use proptest::prelude::*;
     use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
+    use super::test_support::forcing;
     use super::*;
     use crate::codec;
     use crate::engine::{Engine, Position, WriterHolder};
@@ -193,18 +232,6 @@ mod tests {
             tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
         tracing::subscriber::with_default(subscriber, body);
         String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
-    }
-
-    /// Run `f` with the walk forced, as `KIMMY_VERIFY_OPLOG_AT_OPEN=1` does.
-    /// Each test runs in its own process under nextest, so the variable
-    /// reaches no other test.
-    fn forcing<T>(f: impl FnOnce() -> T) -> T {
-        // SAFETY: no other thread of this test reads the environment.
-        unsafe { std::env::set_var("KIMMY_VERIFY_OPLOG_AT_OPEN", "1") };
-        let out = f();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("KIMMY_VERIFY_OPLOG_AT_OPEN") };
-        out
     }
 
     /// Change the raw store under a closed engine.
@@ -409,9 +436,13 @@ mod tests {
         let until = {
             let engine = Engine::open(&path).unwrap();
             let coll = engine.get_collection("app", "docs").unwrap();
-            let until = engine.read_oplog_from(Hlc::ZERO, usize::MAX).unwrap()[5].stamp.hlc;
+            let until = engine
+                .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+                .unwrap()[5]
+                .stamp
+                .hlc;
             engine.insert(&coll, doc! { "_id": "late" }).unwrap();
-            engine.backup_to(&mut backup).unwrap();
+            engine.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
             until
         };
         let restored_dir = tempfile::tempdir().unwrap();
@@ -434,6 +465,35 @@ mod tests {
         let skipped = Engine::open(&restored).unwrap().version_vector().unwrap();
         let walked = forcing(|| Engine::open(&restored).unwrap()).version_vector().unwrap();
         assert_eq!(skipped, walked);
+    }
+
+    // --- the variable ---
+
+    /// The variable's name is the one the operations guide gives, and only
+    /// `1` forces the walk.
+    #[test]
+    fn the_variable_forces_the_walk_only_when_it_is_one() {
+        use std::ffi::OsStr;
+        assert_eq!(FORCE_VARIABLE, "KIMMY_VERIFY_OPLOG_AT_OPEN");
+        assert!(forced_by(Some(OsStr::new("1"))));
+        for value in ["0", "", "true", "yes", " 1", "1 ", "01"] {
+            assert!(!forced_by(Some(OsStr::new(value))), "{value:?} forces the walk");
+        }
+        assert!(!forced_by(None));
+    }
+
+    /// Nested, the inner forcing leaves the outer's as it was, and the
+    /// forcing reaches no other thread.
+    #[test]
+    fn forcing_nests_and_stays_on_its_thread() {
+        assert!(!test_support::forced_on_this_thread());
+        forcing(|| {
+            forcing(|| assert!(forced()));
+            assert!(forced(), "the inner forcing ended the outer's");
+            let elsewhere = std::thread::spawn(test_support::forced_on_this_thread).join().unwrap();
+            assert!(!elsewhere, "a spawned thread is forced");
+        });
+        assert!(!test_support::forced_on_this_thread());
     }
 
     // --- (f) the two lines ---
@@ -705,7 +765,7 @@ mod tests {
                     let local = self.engine().node_id();
                     let stamps: Vec<Hlc> = self
                         .engine()
-                        .read_oplog_from(Hlc::ZERO, usize::MAX)
+                        .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                         .unwrap()
                         .into_iter()
                         .filter(|e| e.stamp.node == local)
@@ -718,7 +778,7 @@ mod tests {
                 }
                 Op::Restore => {
                     let mut backup = Vec::new();
-                    self.engine().backup_to(&mut backup).unwrap();
+                    self.engine().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
                     self.close();
                     let dir = tempfile::tempdir().unwrap();
                     self.path = dir.path().join("kimmy.redb");
@@ -1149,7 +1209,7 @@ mod tests {
         assert!(!source.contains("VECTOR_VERIFIED"), "backup.rs names the record's table");
         let (_dir, path, _) = store(2);
         let mut backup = Vec::new();
-        Engine::open(&path).unwrap().backup_to(&mut backup).unwrap();
+        Engine::open(&path).unwrap().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
         let restored_dir = tempfile::tempdir().unwrap();
         let restored = restored_dir.path().join("kimmy.redb");
         crate::backup::restore(&restored, &mut backup.as_slice()).unwrap();

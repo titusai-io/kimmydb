@@ -11312,9 +11312,7 @@ reads the marker as unreadable, removes it, and repairs the store as for any
 unclean stop.
 
 **What this does not do.** It bounds the stop and makes the marker honest; it
-does not make a walk stop. A stop that finds a peer's pull being served is
-still `storage_not_closed` if the walk outlasts the deadline. Walks that end
-at the stop are a change of their own. A signal before the node serves
+does not make a walk stop. That is the next addendum's. A signal before the node serves
 installs no handler yet, and ends the process with the signal and no marker,
 as before; `a_signal_during_start_up_ends_the_process_with_no_marker` pins it.
 
@@ -11325,6 +11323,104 @@ fails), and by `crates/kimmyd/tests/lifecycle.rs` on the shipped binary with
 and repaired, a panic inside a write, serving that fails, a second signal, a
 collector that never answers, TLS) and the cluster harness's
 `a_stop_with_every_duty_running_closes_every_members_store`.
+
+**Walks end at the stop (0.40.1).** With the stop bounded, a walk still
+running at its deadline made the exit 75, and a store to repair: the serve
+walk of the finding, and every other walk a stop can meet. Now a walk checks
+the stop **before every row it reads**, the rows it passes over included, and
+ends with `StorageError::Stopping`:
+- **`WalkScope::Background`**, work that serves no client, stops at the
+  signal (`StopReason::Shutdown`): a pull served to a peer, a snapshot page,
+  the marks a pull names, retention's scans, TTL expiry's read, a change
+  stream's resolve and replay, a replicated index build, the embedding
+  backfill's listing.
+- **`WalkScope::Request`**, a client's, stops where ADR-192's requests do:
+  at the drain's deadline, or when the storage has failed. So a backup, a
+  query's scans, a client's index build and a schema change's confirmation
+  push run on through the drain, and a DDL in flight at the signal is still
+  confirmed.
+- **A write transaction's walks never stop.** `close_writes` bounds them
+  (ADR-192), and stopping one would refuse a write the drain let finish.
+
+The check is a few atomic loads, on every row: on a cold disk a row can be a
+seek, so a check every so many rows could leave a stop waiting seconds. It
+lives in one place, `walk::open_walk_table`, whose tables' `range` and `iter`
+return rows that check. A walk table does not `Deref` to the redb table it
+wraps: beside its checked `range` and `iter` it offers only reads of one key
+or one end (`get`, `first`, `last`) and, in a write, `insert` and `remove`,
+so no call on it can reach redb's own unchecked walks. That reaches one walk
+the stop did not before: a peer's definition superseding this node's clears
+the loser's entries inside the winner's build, through the build's own walk
+table, so that clear now ends with a replicated build at the signal, and
+commits nothing. **A guard holds the storage crate to it, closed-world**
+(`kimmy-storage/tests/walks_stop.rs`):
+- every function that iterates a table is a stop-aware walk or a bounded read
+  with its reason: a registry, one row, a migration at open, a write;
+- a stop-aware walk opens every table through `open_walk_table` (by method
+  or by path, `ReadTransaction::open_table(..)`), takes none as a plain redb
+  table, and swallows no row's error, since the error is how the stop
+  arrives, and a backup that dropped it would write its `END` after half the
+  store. **Every row goes through `?`:** a row a walk binds, from a `for`
+  over a table or a `Some(row) = rows.next()`, is used only as `row?`, and
+  any other `.next()` is `.next().transpose()?`. So the common forms are
+  refused: `match row { Ok(r) => r, _ => break }`, `Some(Err(_)) | None =>
+  break`, `Some(Ok(..))` patterns, a look past the limit with
+  `.next().is_none()`, adapters on a table's rows that read an `Err` as the
+  end or as a row that does not match (`.nth(`, `.peek`, `.last()`, `.any(`,
+  `.filter(`, `.flat_map(` and the like), the untyped swallows (`.ok()`,
+  `.flatten()`, `let Ok(`, `Result::is_ok`), any line naming `Stopping(`, and
+  any arm for an `Err`. A walk that matches the stop has found a way to end
+  without it, and one that ends its loop on it answers a short page, a
+  partial list or a batch that claims the tail as a whole one. A line that
+  is not a row says so with `// not a row:` and what it is. These rules match
+  source, so they cannot refuse every spelling, which is why the next rule
+  exists;
+- **every stop-aware walk has an every-row test**: a case of `walk`'s or
+  the resume's every-row test that reaches it, stopped at each row it checks,
+  names it on a `// covers:` line, and a listed walk that none names fails.
+  The two halves check different things. The every-row test proves the
+  answer, `Stopping` at every row, however the walk is written. It cannot
+  see a swallow followed by another walk that checks the stop, since the
+  call still answers `Stopping` from the second, and the source rules catch
+  that one;
+- a walk table hands out no table: no `Deref`, `AsRef`, `Borrow` or other
+  conversion to it, no public field, no method returning its type or any
+  redb table, no `WalkTable { .. }` built or taken apart outside its
+  constructors, and `walk.rs` reaches the table only by a point read, an end,
+  a write or a walk inside the checked `Rows`;
+- each walk that does not stop (`WalkStop::in_write`) is listed in
+  `IN_WRITE_SITES` and is inside a write transaction: a write's index
+  maintenance and unique checks, `find_and_modify`'s candidates, an index
+  drop's removal of its entries, and the migrations at open;
+- the walks `kimmy-api`'s guard counts are stop-aware, or writes;
+- the loops that read no table, the HNSW insert loop and the call to an
+  embedding provider, call `check_walk`.
+
+The public walks take their scope as a parameter. A stop reaches a peer as
+`ProtocolError::Stopping`, never as a failure: the serve walk's stop ends the
+connection with a debug line, a pull that stops ends its round without a
+backoff or a failed round, and retention's and expiry's passes end at debug.
+A graph built at the stop is not saved, and no embedding starts once the stop
+has begun. A client whose request a stop ends is answered `503
+node_stopping`, whose message now says the node "did not complete the
+request", since a read can be ended too.
+
+Tested by `walk`'s unit tests (each scope's stop, the rows passed over, a
+write's walk, a stopped backup never restorable, and every public walk
+stopped at each row it checks, first to last, so one that answered what it
+had read so far fails: inside each walk of a call made of several, such as
+retention's oplog and then its tombstones, and a candidate scan's sentinel
+seeks and then its runs in each of its four orders), the resume's (each of
+its walks at every row, its seek's marks and range and its walk, and a
+replay batch's look past its limit), a superseding build stopped at every
+row committing nothing, the guard's own mutants, and the worker's, and on
+real processes: a backup and a graph build in flight at
+the stop end at the drain's deadline and the store closes
+(`KIMMY_TEST_WALK_ROW_MS` slows every row); a member stopped while its peers
+pull from it exits 0 promptly with the store closed, and its next start
+repairs nothing (`a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_closes_its_store`);
+a peer's pull ends at the signal while a client's backup keeps the drain
+busy; and a schema change in flight at the signal is confirmed in the drain.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
 

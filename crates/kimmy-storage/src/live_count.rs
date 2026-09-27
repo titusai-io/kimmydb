@@ -1084,7 +1084,7 @@ mod tests {
         a.delete(&items, &DocId::Int64(1)).unwrap();
 
         let entries: Vec<OplogEntry> = a
-            .entries_for_peer(Hlc::ZERO, 4_096)
+            .entries_for_peer(Hlc::ZERO, 4_096, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()

@@ -74,10 +74,16 @@ fn candidates(
     };
     let mut ids = Vec::new();
     engine
-        .visit_index_candidates(coll, &scan, order, |_, _, doc| {
-            ids.push(doc.get_i64("_id").unwrap());
-            Ok(true)
-        })
+        .visit_index_candidates(
+            coll,
+            &scan,
+            order,
+            kimmy_storage::WalkScope::Request,
+            |_, _, doc| {
+                ids.push(doc.get_i64("_id").unwrap());
+                Ok(true)
+            },
+        )
         .unwrap()
         .expect("the scan was not refused");
     Some(ids)

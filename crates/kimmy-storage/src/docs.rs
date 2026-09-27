@@ -23,6 +23,7 @@ use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
 use crate::tables;
+use crate::walk::{WalkScope, open_walk_table};
 
 /// Outcome of a write, so callers can report counts without a second read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -268,11 +269,13 @@ impl Engine {
     /// borrows its transaction; this keeps the transaction's lifetime contained
     /// and lets a caller stop early without materializing the whole collection.
     /// Return `false` from `f` to stop.
-    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, f: F) -> Result<()>
+    ///
+    /// `scope` says when the walk ends at the node's stop ([`WalkScope`]).
+    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, scope: WalkScope, f: F) -> Result<()>
     where
         F: FnMut(DocId, Document) -> Result<bool>,
     {
-        self.for_each_doc_after(coll, None, f)
+        self.for_each_doc_after(coll, None, scope, f)
     }
 
     /// [`Engine::for_each_doc`], resuming strictly after an encoded key.
@@ -285,12 +288,13 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         after: Option<&[u8]>,
+        scope: WalkScope,
         mut f: F,
     ) -> Result<()>
     where
         F: FnMut(DocId, Document) -> Result<bool>,
     {
-        self.for_each_record_after(coll, after, |id, _, doc| f(id, doc))
+        self.for_each_record_after(coll, after, scope, |id, _, doc| f(id, doc))
     }
 
     /// [`Engine::for_each_doc_after`], with each document's stamp.
@@ -301,13 +305,14 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         after: Option<&[u8]>,
+        scope: WalkScope,
         mut f: F,
     ) -> Result<()>
     where
         F: FnMut(DocId, Stamp, Document) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
-        let docs = txn.open_table(tables::DOCS)?;
+        let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
         for entry in docs.range(doc_range_after(coll.id, after))? {
             let (_, value) = entry?;
             let record = codec::decode_doc_record(value.value())?;
@@ -331,19 +336,27 @@ impl Engine {
     /// included, such as the scrape counting webhook subscriptions (ADR-187).
     /// A failure to read the table itself is still an error: that is storage
     /// being unreadable, not one record.
-    pub fn for_each_doc_or_undecodable<F>(&self, coll: &CollectionMeta, mut f: F) -> Result<()>
+    pub fn for_each_doc_or_undecodable<F>(
+        &self,
+        coll: &CollectionMeta,
+        scope: WalkScope,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&[u8], Option<Document>) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
-        let docs = txn.open_table(tables::DOCS)?;
+        let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
         for entry in docs.range(doc_range_after(coll.id, None))? {
             let (key, value) = entry?;
+            // not a row: a record this walk has read, reported as undecodable.
             let decoded = codec::decode_doc_record(value.value()).ok().and_then(|record| {
                 if record.deleted {
                     return Some(None);
                 }
+                // not a row: the record's body, reported as undecodable.
                 let doc: Document = bson::deserialize_from_slice(&record.body).ok()?;
+                // not a row: the body's `_id`, reported as undecodable.
                 extract_id(&doc).ok()?;
                 Some(Some(doc))
             });
@@ -388,9 +401,9 @@ impl Engine {
         }
     }
 
-    pub fn count(&self, coll: &CollectionMeta) -> Result<u64> {
+    pub fn count(&self, coll: &CollectionMeta, scope: WalkScope) -> Result<u64> {
         let mut n = 0;
-        self.for_each_doc(coll, |_, _| {
+        self.for_each_doc(coll, scope, |_, _| {
             n += 1;
             Ok(true)
         })?;
@@ -1302,6 +1315,7 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         index: Option<&str>,
+        scope: WalkScope,
     ) -> Result<Vec<kimmy_core::UniqueViolationDetail>> {
         // A record is reported only while the index it names exists and is
         // unique (`standing_members`), so with no such index — none on the
@@ -1325,7 +1339,7 @@ impl Engine {
             let mut last = None;
             {
                 let txn = self.db().begin_read()?;
-                let oplog = txn.open_table(tables::OPLOG)?;
+                let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(scope))?;
                 let lower = codec::oplog_key_lower_bound(from);
                 for row in oplog.range(lower.as_slice()..)? {
                     let (key, value) = row?;
@@ -1904,7 +1918,8 @@ mod tests {
             .insert_many(&coll, vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }])
             .unwrap();
 
-        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
+        let entries =
+            engine.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Background).unwrap().entries;
         let inserts: Vec<_> = entries.iter().filter(|e| e.kind == OpKind::Insert).collect();
         assert_eq!(inserts.len(), 3, "the batch is three documents and three log entries");
         for pair in inserts.windows(2) {
@@ -2003,7 +2018,7 @@ mod tests {
 
         assert!(engine.delete(&coll, &id).unwrap());
         assert!(engine.get(&coll, &id).unwrap().is_none());
-        assert_eq!(engine.count(&coll).unwrap(), 0);
+        assert_eq!(engine.count(&coll, crate::WalkScope::Request).unwrap(), 0);
         // Deleting again reports nothing was there.
         assert!(!engine.delete(&coll, &id).unwrap());
     }
@@ -2117,7 +2132,7 @@ mod tests {
 
         let mut seen = Vec::new();
         engine
-            .for_each_doc(&coll, |id, _| {
+            .for_each_doc(&coll, crate::WalkScope::Request, |id, _| {
                 seen.push(id);
                 Ok(true)
             })
@@ -2135,7 +2150,7 @@ mod tests {
 
         let mut seen = 0;
         engine
-            .for_each_doc(&coll, |_, _| {
+            .for_each_doc(&coll, crate::WalkScope::Request, |_, _| {
                 seen += 1;
                 Ok(seen < 3)
             })
@@ -2467,7 +2482,7 @@ mod tests {
             remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
         engine.apply_remote(&coll, &entry).unwrap();
 
-        let live = engine.live_unique_violations(&coll, None).unwrap();
+        let live = engine.live_unique_violations(&coll, None, crate::WalkScope::Request).unwrap();
         assert_eq!(live.len(), 1, "{live:?}");
         assert_eq!(live[0].ids.len(), 2);
 
@@ -2479,7 +2494,7 @@ mod tests {
             9_500,
         );
         engine.apply_remote(&coll, &later).unwrap();
-        let live = engine.live_unique_violations(&coll, None).unwrap();
+        let live = engine.live_unique_violations(&coll, None, crate::WalkScope::Request).unwrap();
         assert_eq!(live.len(), 1, "a rewrite that keeps the value keeps the collision");
         assert_eq!(live[0].ids.len(), 2);
 
@@ -2497,7 +2512,10 @@ mod tests {
         assert!(engine.get(&coll, &DocId::String("local".into())).unwrap().is_some());
         assert!(engine.get(&coll, &DocId::String("remote".into())).unwrap().is_some());
         assert!(
-            engine.live_unique_violations(&coll, None).unwrap().is_empty(),
+            engine
+                .live_unique_violations(&coll, None, crate::WalkScope::Request)
+                .unwrap()
+                .is_empty(),
             "a rewrite of the colliding value resolves the violation"
         );
         // The metric counts detections, not standing violations: the peer's
@@ -2738,7 +2756,7 @@ mod tests {
         let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
         put_raw_oplog_row(&engine, &stamp, &truncated_insert(stamp, elsewhere.id));
 
-        let live = engine.live_unique_violations(&coll, None).unwrap();
+        let live = engine.live_unique_violations(&coll, None, crate::WalkScope::Request).unwrap();
         assert!(live.is_empty(), "{live:?}");
     }
 
@@ -2757,13 +2775,33 @@ mod tests {
         let stamp = Stamp::new(Hlc::new(u64::MAX >> 20, 0), NodeId::generate());
         put_raw_oplog_row(&engine, &stamp, &[0xFF; 64]);
 
-        assert!(engine.live_unique_violations(&unique, None).is_err(), "the pass reads the row");
         assert!(
-            engine.live_unique_violations(&unique, Some("email_1")).is_err(),
+            engine.live_unique_violations(&unique, None, crate::WalkScope::Request).is_err(),
+            "the pass reads the row"
+        );
+        assert!(
+            engine
+                .live_unique_violations(&unique, Some("email_1"), crate::WalkScope::Request)
+                .is_err(),
             "and does for the unique index by name"
         );
-        assert!(engine.live_unique_violations(&unique, Some("no_such_index")).unwrap().is_empty());
-        assert!(engine.live_unique_violations(&plain, None).unwrap().is_empty());
-        assert!(engine.live_unique_violations(&plain, Some("email_1")).unwrap().is_empty());
+        assert!(
+            engine
+                .live_unique_violations(&unique, Some("no_such_index"), crate::WalkScope::Request)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .live_unique_violations(&plain, None, crate::WalkScope::Request)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .live_unique_violations(&plain, Some("email_1"), crate::WalkScope::Request)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

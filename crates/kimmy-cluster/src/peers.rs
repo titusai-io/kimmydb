@@ -878,6 +878,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             }
                             contact.finish();
                         }
+                        // This node's own stop ended the round: a walk or an
+                        // apply stopped at the signal so the store can close.
+                        // Not the peer's failure, so no backoff, no failed
+                        // round and nothing above debug; what the round had
+                        // not applied is pulled again after the restart.
+                        Err(crate::protocol::ProtocolError::Stopping(reason)) => {
+                            debug!(%peer, %reason, "sync round ended: this node is shutting down");
+                            // Not counted as a contact's end either: that
+                            // count says how a running node's contacts end,
+                            // and the last round of a process's life is none
+                            // of its four ends.
+                            contact.finish();
+                        }
                         // A peer being unreachable is the normal state of a
                         // cluster, not an error worth stopping for — but it is
                         // worth backing off, so a node that is not coming back

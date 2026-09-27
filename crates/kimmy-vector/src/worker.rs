@@ -363,6 +363,14 @@ impl Pending {
 struct Checkpoint {
     token: Option<kimmy_core::ResumeToken>,
     failed: bool,
+    /// The node's stop ended the work: nothing more is done, and nothing is
+    /// recorded as done. The documents are embedded after the restart.
+    stopped: Option<kimmy_storage::StopReason>,
+}
+
+/// The error the worker returns once the node's stop has ended its work.
+fn stopped(reason: kimmy_storage::StopReason) -> VectorError {
+    VectorError::Storage(kimmy_storage::StorageError::Stopping(reason))
 }
 
 /// Keeps a collection's vectors in step with its documents.
@@ -711,6 +719,13 @@ impl EmbeddingWorker {
             let event = match tokio::time::timeout(wait, stream.next(&self.engine)).await {
                 Ok(Some(event)) => event,
                 Ok(None) => {
+                    // A stream the stop ended: what it gathered is embedded
+                    // after the restart, and no position is written for it.
+                    if let Some(reason) =
+                        self.engine.walk_stop(kimmy_storage::WalkScope::Background)
+                    {
+                        return Err(stopped(reason));
+                    }
                     self.flush(&mut pending).await?;
                     return Ok(StreamEnd::Ended);
                 }
@@ -746,39 +761,7 @@ impl EmbeddingWorker {
                 self.flush(&mut pending).await?;
             }
 
-            // Retry rather than advance: losing an entry means a document stays
-            // unembedded with nothing to notice it.
-            let prepared = loop {
-                match self.prepare_entry(&entry).await {
-                    Ok(prepared) => break prepared,
-                    Err(e) if e.is_retryable() => {
-                        warn!(error = %e, "embedding failed; retrying");
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    }
-                    Err(e) => {
-                        // A permanent failure would retry forever. Record it
-                        // and move on, so one poisoned entry cannot stall
-                        // every other one. A policy refusal was reported when
-                        // the provider failed to build, once; the documents
-                        // behind it are noted at debug.
-                        if e.is_refused_by_policy() {
-                            debug!(
-                                collection = ?entry.collection,
-                                doc = ?entry.doc_id,
-                                "skipping an entry of a collection whose provider is refused"
-                            );
-                        } else {
-                            warn!(
-                                error = %e,
-                                collection = ?entry.collection,
-                                doc = ?entry.doc_id,
-                                "embedding permanently failed; skipping this entry"
-                            );
-                        }
-                        break Prepared::Done(Outcome::Skipped);
-                    }
-                }
-            };
+            let prepared = self.prepare_or_skip(&entry).await?;
 
             match prepared {
                 // Held, not written: the position is recorded by a flush,
@@ -860,9 +843,15 @@ impl EmbeddingWorker {
                 checkpoint.token = pending.token.take();
             }
             self.embed_batch(batch, &mut checkpoint).await;
+            if checkpoint.stopped.is_some() {
+                break;
+            }
         }
         if checkpoint.failed {
             pending.token = pending.token.take().or(checkpoint.token.take());
+            if let Some(reason) = checkpoint.stopped {
+                return Err(stopped(reason));
+            }
             return Ok(());
         }
         if let Some(token) = pending.token.take().or(checkpoint.token) {
@@ -970,6 +959,11 @@ impl EmbeddingWorker {
                         self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                // The node is stopping: kept, quietly, and the pass ends.
+                Err(e) if e.is_stopping() => {
+                    self.deferred.push_back(item);
+                    break;
+                }
                 // Put back to try again rather than lost: a provider that is
                 // briefly down must not cost the document.
                 Err(e) if e.is_retryable() => {
@@ -1070,6 +1064,50 @@ impl EmbeddingWorker {
         } else {
             Recheck::Current
         })
+    }
+
+    /// Prepare one entry, retrying what is worth retrying and skipping, by
+    /// name, an entry that fails for good. The node's stop is neither: it is
+    /// returned, so the entry is processed after the restart, from a
+    /// position that has not passed it.
+    async fn prepare_or_skip(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Prepared> {
+        // Retry rather than advance: losing an entry means a document stays
+        // unembedded with nothing to notice it.
+        loop {
+            match self.prepare_entry(entry).await {
+                Ok(prepared) => return Ok(prepared),
+                // Not a failure of the entry: the node is stopping, and the
+                // entry is processed after the restart, from a position
+                // that has not passed it.
+                Err(e) if e.is_stopping() => return Err(e),
+                Err(e) if e.is_retryable() => {
+                    warn!(error = %e, "embedding failed; retrying");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    // A permanent failure would retry forever. Record it
+                    // and move on, so one poisoned entry cannot stall
+                    // every other one. A policy refusal was reported when
+                    // the provider failed to build, once; the documents
+                    // behind it are noted at debug.
+                    if e.is_refused_by_policy() {
+                        debug!(
+                            collection = ?entry.collection,
+                            doc = ?entry.doc_id,
+                            "skipping an entry of a collection whose provider is refused"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            collection = ?entry.collection,
+                            doc = ?entry.doc_id,
+                            "embedding permanently failed; skipping this entry"
+                        );
+                    }
+                    return Ok(Prepared::Done(Outcome::Skipped));
+                }
+            }
+        }
     }
 
     /// Handle one oplog entry on its own, embedding at once.
@@ -1297,7 +1335,9 @@ impl EmbeddingWorker {
         // Off the async worker (ADR-153): the walk is the whole collection.
         let mut ids = Vec::new();
         kimmy_storage::blocking(|| {
-            self.engine.for_each_doc(collection, |id, _| {
+            // The backfill serves no client: it ends at the signal, and its
+            // next start lists the collection again.
+            self.engine.for_each_doc(collection, kimmy_storage::WalkScope::Background, |id, _| {
                 ids.push(id);
                 Ok(true)
             })
@@ -1315,6 +1355,7 @@ impl EmbeddingWorker {
             let job = match self.prepare_one(collection, shadow, config, &source, force) {
                 Ok(Some(job)) => job,
                 Ok(None) => continue,
+                Err(e) if e.is_stopping() => return Err(e),
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -1331,7 +1372,7 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready).await;
+                embedded += self.embed_scanned(ready).await?;
             }
             batch.push(job);
             if batch.full(&self.batching) {
@@ -1339,13 +1380,18 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready).await;
+                embedded += self.embed_scanned(ready).await?;
             }
         }
-        embedded += self.embed_scanned(batch).await;
+        embedded += self.embed_scanned(batch).await?;
 
         // The completed scan is what the fingerprint attests. Failing to
-        // write it costs a redundant re-scan next time, never a gap.
+        // write it costs a redundant re-scan next time, never a gap. A scan
+        // the stop ended is not complete, however it ended: the flag only
+        // rises, so a document it skipped is seen here.
+        if let Some(reason) = self.engine.walk_stop(kimmy_storage::WalkScope::Background) {
+            return Err(stopped(reason));
+        }
         self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
         info!(
             collection = %collection.name,
@@ -1461,6 +1507,11 @@ impl EmbeddingWorker {
         // Counted at the only line a provider outage can produce — including
         // the retries, so a sustained outage reads as a climbing counter
         // rather than one flat increment.
+        // None started once the node is stopping: a batch in progress is
+        // bounded by `vector.batch.max_chunks` and finishes, but a new one would
+        // hold the engine past the stop. What it would have embedded is
+        // delivered again after the restart.
+        self.engine.check_walk(kimmy_storage::WalkScope::Background)?;
         provider.embed(inputs).await.inspect_err(|e| self.counters.failed(e))
     }
 
@@ -1585,13 +1636,16 @@ impl EmbeddingWorker {
     /// between them, and it is working: without this its age climbed for the
     /// whole scan. A store that fails is not progress, or a shadow collection
     /// that cannot be written would read fresh for the whole scan.
-    async fn embed_scanned(&mut self, batch: Batch) -> usize {
+    async fn embed_scanned(&mut self, batch: Batch) -> Result<usize> {
         let mut checkpoint = Checkpoint::default();
         let embedded = self.embed_batch(batch, &mut checkpoint).await;
+        if let Some(reason) = checkpoint.stopped {
+            return Err(stopped(reason));
+        }
         if !checkpoint.failed {
             self.counters.progressed();
         }
-        embedded
+        Ok(embedded)
     }
 
     /// Embed one batch and return how many documents were written.
@@ -1627,6 +1681,13 @@ impl EmbeddingWorker {
         let vectors = loop {
             match self.call_provider(&collection, &config, &jobs).await {
                 Ok(vectors) => break vectors,
+                // The node is stopping: none of the batch is embedded, and
+                // nothing is recorded as done.
+                Err(e) if e.is_stopping() => {
+                    checkpoint.failed = true;
+                    checkpoint.stopped = e.stop_reason();
+                    return 0;
+                }
                 Err(e) if e.is_retryable() => {
                     warn!(error = %e, documents = jobs.len(), "embedding failed; retrying");
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -1656,8 +1717,12 @@ impl EmbeddingWorker {
                     for job in jobs {
                         written +=
                             self.embed_alone(&collection, &shadow, &config, job, &mut alone).await;
+                        if alone.stopped.is_some() {
+                            break;
+                        }
                     }
                     checkpoint.failed |= alone.failed;
+                    checkpoint.stopped = checkpoint.stopped.or(alone.stopped);
                     return written;
                 }
             }
@@ -1690,6 +1755,11 @@ impl EmbeddingWorker {
         let vectors = loop {
             match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
                 Ok(vectors) => break vectors,
+                Err(e) if e.is_stopping() => {
+                    checkpoint.failed = true;
+                    checkpoint.stopped = e.stop_reason();
+                    return 0;
+                }
                 Err(e) if e.is_retryable() => {
                     warn!(error = %e, "embedding failed; retrying");
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -1881,6 +1951,20 @@ impl VectorError {
         }
     }
 
+    /// Whether the node's stop ended the work: not a failure of what was
+    /// being done, and never a reason to skip it or record it as done.
+    pub fn is_stopping(&self) -> bool {
+        self.stop_reason().is_some()
+    }
+
+    /// Why the node's stop ended the work, when it did.
+    pub fn stop_reason(&self) -> Option<kimmy_storage::StopReason> {
+        match self {
+            VectorError::Storage(kimmy_storage::StorageError::Stopping(reason)) => Some(*reason),
+            _ => None,
+        }
+    }
+
     /// Whether this node's provider policy refused the configuration, or
     /// the configuration names a profile this node does not define. Both are
     /// permanent for the configuration and reported once, when the provider
@@ -2040,7 +2124,98 @@ mod tests {
 
     /// The oplog entry a write produced.
     fn last_entry(engine: &Engine) -> kimmy_core::OplogEntry {
-        engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap().pop().expect("an entry")
+        engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .pop()
+            .expect("an entry")
+    }
+
+    /// The oplog entry that configured the test collection's vectors.
+    fn configured_entry(engine: &Engine) -> kimmy_core::OplogEntry {
+        engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .into_iter()
+            .rfind(|e| e.kind == OpKind::ConfigureVectors)
+            .expect("the configuration's entry")
+    }
+
+    /// A flush the stop ends embeds nothing and writes no position: the
+    /// entries it held are processed after the restart. It wrote the position
+    /// with nothing embedded, so a routine restart skipped the documents.
+    #[tokio::test]
+    async fn a_flush_the_stop_ends_records_no_position() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let before = engine.consumer_position(CONSUMER).unwrap();
+        let (mut pending, token) = a_batch_of(&engine, &worker, &coll, &["alpha", "beta"]);
+        engine.stop_walks();
+        let stopped = worker.flush(&mut pending).await;
+        assert!(stopped.as_ref().is_err_and(VectorError::is_stopping), "{stopped:?}");
+        assert_eq!(fake.calls(), 0, "no provider call once stopping");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), before, "no position written");
+        assert_eq!(pending.token, Some(token), "the position is still held");
+    }
+
+    /// A backfill the stop ends, after its listing, writes no fingerprint: the
+    /// fingerprint attests a completed scan, and the next start scans again.
+    #[tokio::test]
+    async fn a_backfill_the_stop_ends_records_no_fingerprint() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        for i in 0..5 {
+            engine.insert(&coll, doc! { "_id": i, "title": format!("t{i}") }).unwrap();
+        }
+        let fake = FakeProvider::new(4);
+        {
+            let engine = Arc::clone(&engine);
+            *fake.on_call.lock().unwrap() = Some(Box::new(move || engine.stop_walks()));
+        }
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let before = engine.vector_fingerprint(coll.id).unwrap();
+        let stopped = worker.process(&configured_entry(&engine)).await;
+        assert!(stopped.as_ref().is_err_and(VectorError::is_stopping), "{stopped:?}");
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), before, "no fingerprint written");
+    }
+
+    /// An entry whose preparation the stop ends is returned, not skipped: a
+    /// skipped entry's position is written by the next flush, and its
+    /// documents would never be embedded.
+    #[tokio::test]
+    async fn an_entry_the_stop_interrupts_is_not_skipped() {
+        let (engine, _coll, mut worker, _dir) = setup().await;
+        let configured = configured_entry(&engine);
+        engine.stop_walks();
+        let prepared = worker.prepare_or_skip(&configured).await;
+        assert!(
+            matches!(&prepared, Err(e) if e.is_stopping()),
+            "the stop was read as the entry's own failure"
+        );
+    }
+
+    /// Once the node's stop has begun, no embedding starts: a local model's
+    /// batch holds the worker, and the engine with it, for as long as it
+    /// runs. The document is embedded after the restart instead.
+    #[tokio::test]
+    async fn no_embedding_starts_once_the_node_is_stopping() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let provider = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&provider) as Arc<dyn EmbeddingProvider>);
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+        engine.stop_walks();
+        let stopped = worker.process(&entry).await;
+        assert!(
+            matches!(
+                stopped,
+                Err(VectorError::Storage(kimmy_storage::StorageError::Stopping(
+                    kimmy_storage::StopReason::Shutdown
+                )))
+            ),
+            "{stopped:?}"
+        );
+        assert_eq!(provider.calls(), 0, "no provider call once stopping");
     }
 
     #[tokio::test]
@@ -2425,7 +2600,10 @@ mod tests {
         // was written while it was "down", and retention collected everything
         // but the newest entry — which the GC never removes, so the position
         // must point below it to be collected at all.
-        let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
+        let first = engine
+            .read_oplog_from(Hlc::ZERO, 1, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .remove(0);
         let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
         engine.put_consumer_position(CONSUMER, stale.clone()).unwrap();
         let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
@@ -3312,7 +3490,7 @@ mod tests {
             engine.insert(&coll, doc! { "_id": i as i64, "title": format!("doc {i}") }).unwrap();
         }
         let entries: Vec<kimmy_core::OplogEntry> = engine
-            .read_oplog_from(Hlc::ZERO, 10_000)
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
             .unwrap()
             .into_iter()
             .filter(|e| e.collection == coll.id && e.doc_id.is_some())
@@ -3514,7 +3692,9 @@ mod tests {
                 .unwrap();
         }
         // Process the replaces so vectors are current for the old config.
-        let entries = engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap();
+        let entries = engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap();
         for entry in &entries {
             worker.process(entry).await.unwrap();
         }

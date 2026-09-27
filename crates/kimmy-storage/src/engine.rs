@@ -159,6 +159,14 @@ pub struct Engine {
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
     continuing_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Rows left before the walks stop; 0 for never. See
+    /// [`Engine::stop_walks_after_rows`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) stop_after_rows: std::sync::atomic::AtomicU64,
+    /// The same, for the drain's deadline: see
+    /// [`Engine::set_stopping_after_rows`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) stopping_after_rows: std::sync::atomic::AtomicU64,
     /// Run once, inside the next change stream's resolve of where it starts;
     /// see [`Engine::during_next_watch_resolve`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1299,6 +1307,10 @@ impl Engine {
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
+            stop_after_rows: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            stopping_after_rows: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
             watch_resolve_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             replay_read_hook: parking_lot::Mutex::new(None),
@@ -1545,10 +1557,22 @@ impl Engine {
     /// The node's stop signal has arrived: a walk of the store that serves
     /// no request should end rather than hold the engine open past the
     /// stop. Called beside every announcement of the stop. Irreversible for
-    /// this engine's life. Nothing reads it yet: the walks learn to stop in
-    /// a change of their own.
+    /// this engine's life. Every [`crate::WalkScope::Background`] walk reads
+    /// it, before each row (`walk::open_walk_table`).
     pub fn stop_walks(&self) {
         self.walks_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lift both stops, and the stops armed to come after so many rows: for a
+    /// test that stops the same engine's walks again at another row. No
+    /// engine that serves is ever un-stopped.
+    #[cfg(test)]
+    pub(crate) fn lift_stops_for_test(&self) {
+        use std::sync::atomic::Ordering;
+        self.walks_stopping.store(false, Ordering::SeqCst);
+        self.stopping.store(false, Ordering::SeqCst);
+        self.stop_after_rows.store(0, Ordering::SeqCst);
+        self.stopping_after_rows.store(0, Ordering::SeqCst);
     }
 
     /// `KIMMY_TEST_STOP=panic_in_write`: open a write transaction and panic
@@ -2450,6 +2474,7 @@ impl Engine {
     /// removes a mark alongside the entry it names, so a mark left behind by
     /// any OTHER remover can never be collected afterwards. Zero, always --
     /// an orphan here is the one growth path nothing bounds.
+    #[cfg(test)]
     pub(crate) fn held_orphans(&self) -> Result<usize> {
         let txn = self.db.begin_read()?;
         let held = txn.open_table(tables::OPLOG_HELD)?;
@@ -2613,6 +2638,7 @@ impl Engine {
     /// (ADR-160). Not zero on a settled node in general -- see the note on
     /// `OPLOG_HELD` for the two cases that leave marks behind a completed
     /// transfer.
+    #[cfg(test)]
     pub(crate) fn held_len(&self) -> Result<usize> {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(tables::OPLOG_HELD)?.iter()?.count())
@@ -4787,7 +4813,8 @@ mod tests {
             matches!(refused, Err(StorageError::Stopping(crate::StopReason::DrainDeadline))),
             "{refused:?}"
         );
-        assert_eq!(engine.count(&meta).unwrap(), 0);
+        // The kept count: a walk is refused too once the engine is stopping.
+        assert_eq!(engine.count_by_id(meta.id).unwrap(), Some(0));
     }
 
     /// Hold the writer from another thread for `hold`; returns once held.
@@ -4927,7 +4954,8 @@ mod tests {
         assert!(!engine.database_exists("shop").unwrap());
         // Its own replicated entry, naming the shadow: a peer holding the same
         // orphan drops it through the ordinary sync arm.
-        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
+        let entries =
+            engine.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Background).unwrap().entries;
         assert!(
             entries.iter().any(|e| e.kind == OpKind::DropCollection && e.collection == orphan.id),
             "no DropCollection entry names the orphan shadow"
@@ -4942,7 +4970,7 @@ mod tests {
             super::Engine::open_with_cache(&dir.path().join("k.redb"), Some(8 << 20)).unwrap();
         let coll = engine.create_collection("app", "docs").unwrap();
         engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
-        assert_eq!(engine.count(&coll).unwrap(), 1);
+        assert_eq!(engine.count(&coll, crate::WalkScope::Request).unwrap(), 1);
     }
 
     use super::*;
@@ -5363,7 +5391,11 @@ mod tests {
         let recreated = engine.create_collection("app", "a").unwrap();
 
         assert_eq!(recreated.id, coll.id, "a derived id is stable across drop and recreate");
-        assert_eq!(engine.count(&recreated).unwrap(), 0, "the dropped data must not be inherited");
+        assert_eq!(
+            engine.count(&recreated, crate::WalkScope::Request).unwrap(),
+            0,
+            "the dropped data must not be inherited"
+        );
         assert!(engine.get(&recreated, &kimmy_core::DocId::Int64(1)).unwrap().is_none());
     }
 
@@ -5591,7 +5623,11 @@ mod tests {
         let coll = engine.create_collection("shop", "orders").unwrap();
         engine.insert(&coll, bson::doc! { "_id": 1, "v": 1 }).unwrap();
         assert_eq!(engine.purge_chunk(coll.id).unwrap(), 0);
-        assert_eq!(engine.count(&coll).unwrap(), 1, "the standing collection's own document");
+        assert_eq!(
+            engine.count(&coll, crate::WalkScope::Request).unwrap(),
+            1,
+            "the standing collection's own document"
+        );
     }
 
     /// Rows an older collector left without their tombstone (ADR-158's
@@ -5814,7 +5850,11 @@ mod tests {
         drop(engine);
         let reopened = Engine::open(&path).unwrap();
         let coll = reopened.get_collection("app", "c").unwrap();
-        assert_eq!(reopened.count(&coll).unwrap(), 160, "durable when the call returned");
+        assert_eq!(
+            reopened.count(&coll, crate::WalkScope::Request).unwrap(),
+            160,
+            "durable when the call returned"
+        );
     }
 
     #[test]
@@ -6161,8 +6201,8 @@ mod tests {
                 before.used_bytes > 0,
                 "a cache that has been written through holds pages: {before:?}"
             );
-            assert_eq!(engine.count(&coll).unwrap(), 2_000);
-            engine.for_each_doc(&coll, |_, _| Ok(true)).unwrap();
+            assert_eq!(engine.count(&coll, crate::WalkScope::Request).unwrap(), 2_000);
+            engine.for_each_doc(&coll, crate::WalkScope::Request, |_, _| Ok(true)).unwrap();
             let after = engine.cache_reading();
             assert!(
                 after.read_hits > before.read_hits,
@@ -6174,7 +6214,7 @@ mod tests {
         let engine = Engine::open_with_cache(&path, Some(64 * 1024)).unwrap();
         let coll = engine.get_collection("app", "c").unwrap();
         let before = engine.cache_reading();
-        engine.for_each_doc(&coll, |_, _| Ok(true)).unwrap();
+        engine.for_each_doc(&coll, crate::WalkScope::Request, |_, _| Ok(true)).unwrap();
         let after = engine.cache_reading();
         assert!(after.read_misses > before.read_misses, "a cold walk misses: {after:?}");
         assert!(after.evictions > before.evictions, "and evicts to stay in bounds: {after:?}");
@@ -6394,7 +6434,9 @@ mod tests {
         assert!(engine.arm_test_storage_failure("read"));
         let reader = {
             let (engine, coll) = (Arc::clone(&engine), coll.clone());
-            std::thread::spawn(move || engine.for_each_doc(&coll, |_, _| Ok(true)))
+            std::thread::spawn(move || {
+                engine.for_each_doc(&coll, crate::WalkScope::Request, |_, _| Ok(true))
+            })
         };
         reported
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -6469,7 +6511,11 @@ mod tests {
         );
         assert_eq!(engine.writer_wait_timeouts(), 1);
         assert_eq!(engine.writer_wait().count, waits_before + 1, "a refused wait is still a wait");
-        assert_eq!(engine.count(&meta).unwrap(), 0, "nothing was written");
+        assert_eq!(
+            engine.count(&meta, crate::WalkScope::Request).unwrap(),
+            0,
+            "nothing was written"
+        );
 
         // Released after a while: a caller with no budget outlasts it.
         let release = {
@@ -6480,7 +6526,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(150));
         drop(hold);
         release.await.unwrap().expect("a write with no budget waits out the hold");
-        assert_eq!(engine.count(&meta).unwrap(), 1);
+        assert_eq!(engine.count(&meta, crate::WalkScope::Request).unwrap(), 1);
         assert_eq!(engine.writer_wait_timeouts(), 1, "the unbounded wait did not time out");
         assert!(
             engine.writer_hold_max() >= std::time::Duration::from_millis(150),

@@ -30,6 +30,7 @@ use crate::engine::{Engine, WriteTxn, WriterHolder};
 use crate::error::Result;
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
+use crate::walk::{WalkScope, open_walk_table};
 use crate::watch::OplogWindow;
 
 /// What applying a batch of replicated entries did.
@@ -655,8 +656,13 @@ impl Engine {
     /// a shorter one really is the end of the oplog. Spending the cap first and
     /// filtering afterwards is what let a withheld violation disguise a
     /// truncated window as a tail (ADR-126).
-    pub fn entries_for_peer(&self, from: Hlc, limit: usize) -> Result<OplogWindow> {
-        self.entries_for_peer_holding(from, limit, None)
+    pub fn entries_for_peer(
+        &self,
+        from: Hlc,
+        limit: usize,
+        scope: WalkScope,
+    ) -> Result<OplogWindow> {
+        self.entries_for_peer_holding(from, limit, None, scope)
     }
 
     /// [`Self::entries_for_peer`] for a peer that said what it has processed:
@@ -701,8 +707,9 @@ impl Engine {
         from: Hlc,
         limit: usize,
         held: Option<&VersionVector>,
+        scope: WalkScope,
     ) -> Result<OplogWindow> {
-        self.entries_for_peer_marked(from, limit, held, &[])
+        self.entries_for_peer_marked(from, limit, held, &[], scope)
     }
 
     /// [`Self::entries_for_peer_holding`], also serving the spans a requester
@@ -730,8 +737,9 @@ impl Engine {
         limit: usize,
         held: Option<&VersionVector>,
         marked: &[MarkedRange],
+        scope: WalkScope,
     ) -> Result<OplogWindow> {
-        self.entries_for_peer_counting(from, limit, held, marked, &std::cell::Cell::new(0))
+        self.entries_for_peer_counting(from, limit, held, marked, scope, &std::cell::Cell::new(0))
     }
 
     /// [`Self::entries_for_peer_marked`], for a window this node is serving a
@@ -750,7 +758,15 @@ impl Engine {
         let passed = std::cell::Cell::new(0u64);
         let walk = crate::hold_meter::Scope::walk();
         let walked_from = std::time::Instant::now();
-        let window = self.entries_for_peer_counting(from, limit, held, marked, &passed);
+        // Serving a peer is no client's request: it ends at the signal.
+        let window = self.entries_for_peer_counting(
+            from,
+            limit,
+            held,
+            marked,
+            WalkScope::Background,
+            &passed,
+        );
         let walked = walked_from.elapsed();
         let (read, _) = walk.finish();
         if let Ok(window) = &window {
@@ -767,6 +783,7 @@ impl Engine {
         limit: usize,
         held: Option<&VersionVector>,
         marked: &[MarkedRange],
+        scope: WalkScope,
         passed: &std::cell::Cell<u64>,
     ) -> Result<OplogWindow> {
         let marked = if held.is_some() { marked } else { &[] };
@@ -774,6 +791,7 @@ impl Engine {
         self.read_oplog_from_skipping(
             start,
             limit,
+            scope,
             |stamp| {
                 let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
                     && !marked.iter().any(|span| span.contains(stamp));
@@ -821,10 +839,14 @@ impl Engine {
         };
         let upper = crate::codec::oplog_key(&Stamp::new(highest, NodeId::from_bytes([0xFF; 16])));
         let txn = self.db().begin_read()?;
-        let held = txn.open_table(crate::tables::OPLOG_HELD)?;
+        // Read for a pull this node makes, which no client asked for: it ends
+        // at the signal.
+        let held =
+            open_walk_table(&txn, crate::tables::OPLOG_HELD, self.walk(WalkScope::Background))?;
         let mut marks: HashMap<NodeId, Vec<Hlc>> = HashMap::new();
         for row in held.range(..=upper.as_slice())? {
             let (key, _) = row?;
+            // not a row: a mark's key, which a newer build may write (ADR-160).
             let Ok(stamp) = crate::codec::decode_oplog_key(key.value()) else {
                 continue;
             };
@@ -2605,7 +2627,10 @@ mod tests {
         let theirs = from.version_vector().unwrap();
         match mine.behind(&theirs) {
             Some(start) => {
-                let entries = from.entries_for_peer(start, BATCH).unwrap().entries;
+                let entries = from
+                    .entries_for_peer(start, BATCH, crate::WalkScope::Background)
+                    .unwrap()
+                    .entries;
                 into.apply_batch(&entries).unwrap()
             }
             None => SyncOutcome::default(),
@@ -2633,7 +2658,8 @@ mod tests {
         let theirs = from.version_vector().unwrap();
         match mine.behind(&theirs) {
             Some(start) => {
-                let window = from.entries_for_peer(start, limit).unwrap();
+                let window =
+                    from.entries_for_peer(start, limit, crate::WalkScope::Background).unwrap();
                 let outcome = into
                     .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
                     .unwrap();
@@ -2661,7 +2687,8 @@ mod tests {
         gap();
         match mine.behind(&theirs) {
             Some(start) => {
-                let window = from.entries_for_peer(start, limit).unwrap();
+                let window =
+                    from.entries_for_peer(start, limit, crate::WalkScope::Background).unwrap();
                 let outcome = into
                     .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
                     .unwrap();
@@ -2827,7 +2854,8 @@ mod tests {
         assert_eq!(a.unique_violations(), 1);
         let a_adv = a.version_vector().unwrap();
         assert!(a_adv.get(a.node_id()) > c.version_vector().unwrap().get(c.node_id()));
-        let shippable = a.entries_for_peer(floor, usize::MAX).unwrap().entries;
+        let shippable =
+            a.entries_for_peer(floor, usize::MAX, crate::WalkScope::Background).unwrap().entries;
         assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
 
         // B trails A, and the floor it would resume from is under all of it.
@@ -2858,7 +2886,7 @@ mod tests {
         // own, and the clashing remote one — a violation is reported, not
         // rejected (ADR-029), so it is a document on every node.
         let cb = b.get_collection("shop", "orders").unwrap();
-        assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2);
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap() as usize, DOCS + 2);
     }
 
     /// A peer holding a withheld `UniqueViolation` near the head of its oplog,
@@ -2946,11 +2974,15 @@ mod tests {
         );
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(
-            b.count(&cb).unwrap() as usize,
+            b.count(&cb, crate::WalkScope::Request).unwrap() as usize,
             DOCS + 2,
             "every document, the local one and the merged collision included"
         );
-        assert_eq!(a.count(&ca).unwrap(), b.count(&cb).unwrap(), "and the members agree");
+        assert_eq!(
+            a.count(&ca, crate::WalkScope::Request).unwrap(),
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            "and the members agree"
+        );
     }
 
     #[test]
@@ -2985,7 +3017,11 @@ mod tests {
             .get_collection("shop", "late")
             .expect("the collection created behind the window must exist on the peer");
         assert_eq!(on_b.id, late.id, "and address the same storage");
-        assert_eq!(b.count(&on_b).unwrap() as usize, LATE, "with the documents written into it");
+        assert_eq!(
+            b.count(&on_b, crate::WalkScope::Request).unwrap() as usize,
+            LATE,
+            "with the documents written into it"
+        );
         assert!(
             b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
             "and the round has converged rather than merely got lucky"
@@ -3043,7 +3079,10 @@ mod tests {
         assert_eq!(a.unique_violations(), 1);
 
         let pinning = a.version_vector().unwrap().get(a.node_id());
-        let shippable = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap().entries;
+        let shippable = a
+            .entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+            .unwrap()
+            .entries;
         assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
         assert!(
             shippable.iter().all(|e| e.stamp.hlc < pinning),
@@ -3072,7 +3111,11 @@ mod tests {
             "a further round transfers nothing"
         );
         let cb = b.get_collection("shop", "orders").unwrap();
-        assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2, "and nothing was lost getting there");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap() as usize,
+            DOCS + 2,
+            "and nothing was lost getting there"
+        );
 
         // The discriminating half. The round that finished the catch-up ran
         // off the end of A's oplog, and *that* is what proves coverage of
@@ -3122,7 +3165,8 @@ mod tests {
         }
 
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let whole =
+            a.entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
         assert!(whole.exhausted);
         let head = whole.scanned_to;
 
@@ -3132,7 +3176,11 @@ mod tests {
         b.apply_peer_batch(&theirs, trimmed, head, false).unwrap();
 
         let cb = b.get_collection("shop", "orders").expect("the creation was in the three");
-        assert_eq!(b.count(&cb).unwrap(), 2, "only two documents were actually sent");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            2,
+            "only two documents were actually sent"
+        );
         assert!(
             !b.witnessed_vector().unwrap().covers(&theirs),
             "so the peer's tail must still be outstanding, whatever the peer claimed"
@@ -3148,7 +3196,11 @@ mod tests {
         for _ in 0..budget {
             round(&b, &a, 8);
         }
-        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "every document arrives on a later round");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap() as usize,
+            DOCS,
+            "every document arrives on a later round"
+        );
     }
 
     #[test]
@@ -3208,7 +3260,8 @@ mod tests {
         }
 
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        let whole =
+            a.entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap();
         assert!(whole.exhausted);
 
         let outcome = b.apply_peer_batch(&theirs, &[], whole.scanned_to, false).unwrap();
@@ -3236,7 +3289,11 @@ mod tests {
             round(&b, &a, 8);
         }
         let cb = b.get_collection("shop", "orders").expect("a later round creates it");
-        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "and every document arrives");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap() as usize,
+            DOCS,
+            "and every document arrives"
+        );
     }
 
     mod props {
@@ -3326,7 +3383,7 @@ mod tests {
 
                 // And the point of the invariant: nothing was witnessed away.
                 let cb = b.get_collection("shop", "orders").unwrap();
-                prop_assert_eq!(b.count(&cb).unwrap(), a.count(&ca).unwrap());
+                prop_assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), a.count(&ca, crate::WalkScope::Request).unwrap());
             }
         }
     }
@@ -3417,7 +3474,8 @@ mod tests {
         a.insert(&coll_a, doc! { "_id": 1, "v": "from-a" }).unwrap();
         b.insert(&coll_b, doc! { "_id": 1, "v": "from-b" }).unwrap();
 
-        let losing = a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
+        let losing =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Background).unwrap().entries;
         let outcome = b.apply_batch(&losing).unwrap();
         assert_eq!(outcome.applied, 0, "A's write must lose");
         assert!(outcome.superseded > 0);
@@ -3470,7 +3528,7 @@ mod tests {
         let (b, _db) = engine();
         a.create_collection("db", "c").unwrap();
 
-        let ddl = a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
+        let ddl = a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Background).unwrap().entries;
         assert!(!ddl.is_empty(), "creating a collection logs an entry");
         let outcome = b.apply_batch(&ddl).unwrap();
         assert!(outcome.ddl > 0);
@@ -3672,7 +3730,7 @@ mod tests {
                 outcome.superseded, 1,
                 "hlc {hlc:?}: a pre-recreation entry must not enter the new incarnation"
             );
-            assert_eq!(a.count(&ca_new).unwrap(), 0);
+            assert_eq!(a.count(&ca_new, crate::WalkScope::Request).unwrap(), 0);
         }
 
         // And genuinely post-recreation writes still apply: the floor is not
@@ -3693,7 +3751,7 @@ mod tests {
             let outcome = a.apply_batch(&[entry]).unwrap();
             assert_eq!(outcome.applied, 1, "post-recreation writes must apply (offset {offset})");
         }
-        assert_eq!(a.count(&ca_new).unwrap(), 2);
+        assert_eq!(a.count(&ca_new, crate::WalkScope::Request).unwrap(), 2);
     }
 
     #[test]
@@ -3719,7 +3777,8 @@ mod tests {
         a.apply_remote(&ca, &entry).unwrap();
         assert_eq!(a.unique_violations(), 1, "the collision must have been recorded");
 
-        let outgoing = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let outgoing =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         assert!(
             outgoing.iter().all(|e| e.kind != OpKind::UniqueViolation),
             "a violation entry must not be replicated"
@@ -3765,7 +3824,7 @@ mod tests {
         // ends a run by design and is measured separately below.
         let theirs = a.version_vector().unwrap();
         let entries: Vec<_> = a
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()
@@ -3784,7 +3843,11 @@ mod tests {
              must be one commit"
         );
         assert_eq!(b.fsyncs() - fsyncs, 1, "and so one fsync");
-        assert_eq!(b.count(&cb).unwrap() as usize, N, "every document landed");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap() as usize,
+            N,
+            "every document landed"
+        );
         assert!(
             b.witnessed_vector().unwrap().covers(&theirs),
             "and the round's coverage was recorded in that same commit"
@@ -3811,7 +3874,8 @@ mod tests {
             Some("by_email".into()),
         )
         .unwrap();
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         assert_eq!(entries.iter().filter(|e| e.kind.is_ddl()).count(), 2, "{entries:?}");
 
         let first = b.apply_batch(&entries).unwrap();
@@ -3835,7 +3899,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
             .unwrap();
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let of = |kind| entries.iter().find(|e| e.kind == kind).cloned().unwrap();
         (of(OpKind::CreateCollection), of(OpKind::CreateIndex))
     }
@@ -4011,7 +4076,8 @@ mod tests {
         a.drop_index("shop", "orders", "by_email").unwrap();
         a.create_collection("shop", "gone").unwrap();
         a.drop_collection("shop", "gone").unwrap();
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         b.apply_batch(&entries).unwrap();
         let of = |kind| entries.iter().filter(|e| e.kind == kind).cloned().collect::<Vec<_>>();
         let replays: Vec<OplogEntry> = [of(OpKind::DropIndex), of(OpKind::DropCollection)]
@@ -4122,7 +4188,7 @@ mod tests {
         }
         // Stamp order: three documents, the creation of `items`, three more.
         let entries: Vec<_> = a
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()
@@ -4153,8 +4219,16 @@ mod tests {
 
         let orders_b = b.get_collection("shop", "orders").unwrap();
         let items_b = b.get_collection("shop", "items").expect("created mid-batch");
-        assert_eq!(b.count(&orders_b).unwrap(), 3, "the run before the schema change landed");
-        assert_eq!(b.count(&items_b).unwrap(), 3, "and the run after it");
+        assert_eq!(
+            b.count(&orders_b, crate::WalkScope::Request).unwrap(),
+            3,
+            "the run before the schema change landed"
+        );
+        assert_eq!(
+            b.count(&items_b, crate::WalkScope::Request).unwrap(),
+            3,
+            "and the run after it"
+        );
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
 
@@ -4174,7 +4248,7 @@ mod tests {
         b.insert(&cb, doc! { "_id": 2, "who": "b" }).unwrap();
 
         let entries: Vec<_> = a
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()
@@ -4226,9 +4300,13 @@ mod tests {
         assert_eq!(outcome.applied, 3, "the colliding write is merged, not refused: {outcome:?}");
         assert_eq!(b.commits() - before, 2, "the run, then the violation's own entry after it");
         assert_eq!(b.unique_violations(), 1);
-        assert_eq!(b.count(&cb).unwrap(), 4, "every document is present, the collision included");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            4,
+            "every document is present, the collision included"
+        );
         let recorded = b
-            .read_oplog_from(Hlc::ZERO, BATCH)
+            .read_oplog_from(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .into_iter()
             .filter(|e| e.kind == OpKind::UniqueViolation)
@@ -4372,8 +4450,8 @@ mod tests {
 
         // The peers converge on the documents, both ways.
         sync(&a, &b);
-        assert_eq!(a.count(&ca).unwrap(), 3);
-        assert_eq!(b.count(&cb).unwrap(), 3);
+        assert_eq!(a.count(&ca, crate::WalkScope::Request).unwrap(), 3);
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 3);
     }
 
     /// Whether `engine` holds `name` on `shop.orders`, and how many of its
@@ -4410,7 +4488,7 @@ mod tests {
         // (ADR-119). A holds the collection already.
         let theirs = b.version_vector().unwrap();
         let entries: Vec<_> = b
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()
@@ -4523,7 +4601,7 @@ mod tests {
         // above: the run is what is measured, and A holds the collection.
         let theirs = b.version_vector().unwrap();
         let entries: Vec<_> = b
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .into_iter()
@@ -4535,7 +4613,7 @@ mod tests {
         assert_eq!(outcome.applied, 20, "{outcome:?}");
         assert_eq!(a.commits() - commits, 1, "one run, one commit");
         let ca = a.get_collection("shop", "orders").unwrap();
-        assert_eq!(a.count(&ca).unwrap(), 20);
+        assert_eq!(a.count(&ca, crate::WalkScope::Request).unwrap(), 20);
         assert_eq!(index_state(&a, "tags_1_cats_1"), Some(7), "0, 3, 6, …, 18");
     }
 
@@ -4554,7 +4632,8 @@ mod tests {
         let ca = a.get_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let first = b.apply_batch(&history).unwrap();
         assert_eq!(first.ddl_refused, 0, "nothing to refuse the first time: {first:?}");
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -4584,7 +4663,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         two_array_index(&a);
         a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
 
         b.apply_batch(&only(&history, &[OpKind::CreateCollection, OpKind::DropIndex])).unwrap();
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -4637,12 +4717,16 @@ mod tests {
         let stamp = dropped.stamp.expect("the drop was recorded all the same");
         let index_id = kimmy_core::IndexMeta::derive_id("ghost");
         assert_eq!(a.index_dropped_at(ca.id, index_id).unwrap(), Some(stamp), "tombstone");
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let drop = history.iter().find(|e| e.kind == OpKind::DropIndex).expect("the entry");
         assert_eq!(drop.stamp, stamp, "under the stamp the tombstone records");
         assert!(!a.drop_index("shop", "orders", "ghost").unwrap(), "and `drop_index` says so");
         assert_eq!(
-            a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries.len(),
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+                .unwrap()
+                .entries
+                .len(),
             history.len() + 1,
             "a second drop of the same absent name is a second instruction"
         );
@@ -4837,7 +4921,8 @@ mod tests {
         a.drop_index("shop", "orders", "email_1").unwrap();
         a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
 
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let kinds: Vec<OpKind> = history.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
@@ -4905,7 +4990,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
         a.drop_index("shop", "orders", "email_1").unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         b.apply_batch(&history).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().index("email_1").is_none());
 
@@ -4929,7 +5015,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
         a.drop_index("shop", "orders", "email_1").unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
 
         // The creation first, on its own, so the drop meets a live index.
         b.apply_batch(&history[..2]).unwrap();
@@ -4944,7 +5031,8 @@ mod tests {
             "a drop newer than the index it names must still remove it"
         );
         let entries = crate::index::scan_range(
-            b.db(),
+            &b,
+            crate::WalkScope::Request,
             cb.id,
             index.id,
             &[],
@@ -4966,7 +5054,8 @@ mod tests {
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         b.apply_batch(&history).unwrap();
         restamp_index(&b, "shop", "orders", "email_1", None);
 
@@ -5033,7 +5122,10 @@ mod tests {
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
-        b.apply_batch(&a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries).unwrap();
+        b.apply_batch(
+            &a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries,
+        )
+        .unwrap();
         b.create_index_with(
             "shop",
             "orders",
@@ -5482,7 +5574,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
         let created = a.get_collection("shop", "orders").unwrap().index("email_1").unwrap().created;
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         b.apply_batch(&history).unwrap();
         restamp_index(&b, "shop", "orders", "email_1", None);
 
@@ -5527,7 +5620,8 @@ mod tests {
         let outcome = m.apply_batch(&[loser]).unwrap();
         assert_eq!(outcome.ddl_refused, 0, "history, not a refusal: {outcome:?}");
 
-        let served = m.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let served =
+            m.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         assert!(
             !served.iter().any(|e| e.kind == OpKind::CreateIndex && e.stamp == earlier),
             "this node must not serve onward a definition it decided was history: {served:?}"
@@ -5566,7 +5660,8 @@ mod tests {
         // Built in full: both holders are in the index, so an index-backed
         // query finds both.
         let entries = crate::index::scan_range(
-            b.db(),
+            &b,
+            crate::WalkScope::Request,
             cb.id,
             index.id,
             &[],
@@ -5578,14 +5673,14 @@ mod tests {
 
         // Recorded the way a merged write's collision is.
         assert_eq!(b.unique_violations(), 1, "counted once per shared key");
-        let live = b.live_unique_violations(&cb, None).unwrap();
+        let live = b.live_unique_violations(&cb, None, crate::WalkScope::Request).unwrap();
         assert_eq!(live.len(), 1, "the violations route reports it: {live:?}");
         assert_eq!(live[0].index, "email_1");
         let mut ids: Vec<String> = live[0].ids.iter().map(|id| id.to_string()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"], "naming every holder");
         let recorded = b
-            .read_oplog_from(Hlc::ZERO, BATCH)
+            .read_oplog_from(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .into_iter()
             .filter(|e| e.kind == OpKind::UniqueViolation)
@@ -5865,7 +5960,8 @@ mod tests {
         );
         let held = b.get_collection("shop", "orders").unwrap().index("probe").unwrap().id;
         let before = crate::index::scan_range(
-            b.db(),
+            &b,
+            crate::WalkScope::Request,
             cb.id,
             held,
             &[],
@@ -5882,7 +5978,9 @@ mod tests {
         winner.expire_after_secs = Some(60);
         a.insert(&ca, doc! { "_id": "after" }).unwrap();
         let mut batch = vec![create_index_entry(ca.id, "shop", "orders", winner, stamp)];
-        batch.extend(a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries);
+        batch.extend(
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries,
+        );
         batch.sort_by_key(|e| e.stamp);
 
         let outcome = b.apply_batch(&batch).unwrap();
@@ -5894,7 +5992,8 @@ mod tests {
             "the replacement aborted whole: B keeps its own definition, not neither"
         );
         let after = crate::index::scan_range(
-            b.db(),
+            &b,
+            crate::WalkScope::Request,
             cb.id,
             index.id,
             &[],
@@ -5972,14 +6071,19 @@ mod tests {
         )
         .unwrap();
         sync(&a, &b);
-        assert_eq!(b.count(&shadow_b).unwrap(), 1, "the chunk must have replicated");
+        assert_eq!(
+            b.count(&shadow_b, crate::WalkScope::Request).unwrap(),
+            1,
+            "the chunk must have replicated"
+        );
         let after_put = b.vector_generation(shadow_b.id);
         assert!(after_put > 0, "a replicated chunk write must bump the applier's generation");
 
         // Peers resend overlapping ranges by design. A re-delivery is
         // superseded — nothing is written — so nothing has changed for the
         // index to notice, and the counter must hold still.
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let outcome = b.apply_batch(&entries).unwrap();
         assert_eq!(outcome.applied, 0, "the whole window was already applied");
         assert_eq!(
@@ -5993,7 +6097,11 @@ mod tests {
         // exactly as a local `delete_vectors` does.
         assert_eq!(a.delete_vectors(&shadow_a, &source).unwrap(), 1);
         sync(&a, &b);
-        assert_eq!(b.count(&shadow_b).unwrap(), 0, "the tombstone must have replicated");
+        assert_eq!(
+            b.count(&shadow_b, crate::WalkScope::Request).unwrap(),
+            0,
+            "the tombstone must have replicated"
+        );
         assert!(
             b.vector_generation(shadow_b.id) > after_put,
             "a replicated chunk delete must bump the applier's generation"
@@ -6009,7 +6117,8 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
 
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         b.apply_batch(&entries).unwrap();
         b.apply_batch(&entries).unwrap();
 
@@ -6167,7 +6276,7 @@ mod tests {
         pull(&a, &b);
 
         assert_eq!(
-            a.count(&ca).unwrap(),
+            a.count(&ca, crate::WalkScope::Request).unwrap(),
             0,
             "documents written before the drop must not flow back into the recreated collection"
         );
@@ -6226,23 +6335,37 @@ mod tests {
         let cb = b.get_collection("shop", "orders").unwrap();
         b.insert(&cb, doc! { "_id": "kept-on-b" }).unwrap();
         pull(&a, &b);
-        assert_eq!(a.count(&recreated).unwrap(), 2);
-        assert_eq!(b.count(&cb).unwrap(), 2);
+        assert_eq!(a.count(&recreated, crate::WalkScope::Request).unwrap(), 2);
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 2);
 
         // Re-deliver A's whole history to B, and B's whole history to A,
         // twice: the old drop rides along both times.
         for _ in 0..2 {
-            let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
+            let everything = a
+                .entries_for_peer(Hlc::new(0, 0), BATCH, crate::WalkScope::Background)
+                .unwrap()
+                .entries;
             assert!(everything.iter().any(|e| e.kind == OpKind::DropCollection));
             b.apply_batch(&everything).unwrap();
-            let everything = b.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
+            let everything = b
+                .entries_for_peer(Hlc::new(0, 0), BATCH, crate::WalkScope::Background)
+                .unwrap()
+                .entries;
             a.apply_batch(&everything).unwrap();
         }
 
         let ca = a.get_collection("shop", "orders").expect("a still has the recreation");
         let cb = b.get_collection("shop", "orders").expect("b still has the recreation");
-        assert_eq!(a.count(&ca).unwrap(), 2, "a replayed drop must not empty the recreation");
-        assert_eq!(b.count(&cb).unwrap(), 2, "a replayed drop must not empty the recreation");
+        assert_eq!(
+            a.count(&ca, crate::WalkScope::Request).unwrap(),
+            2,
+            "a replayed drop must not empty the recreation"
+        );
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            2,
+            "a replayed drop must not empty the recreation"
+        );
     }
 
     #[test]
@@ -6256,7 +6379,10 @@ mod tests {
         let recreated = a.create_collection("shop", "orders").unwrap();
         a.insert(&recreated, doc! { "_id": "kept" }).unwrap();
 
-        let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
+        let everything = a
+            .entries_for_peer(Hlc::new(0, 0), BATCH, crate::WalkScope::Background)
+            .unwrap()
+            .entries;
         let old_drop =
             everything.iter().find(|e| e.kind == OpKind::DropCollection).cloned().unwrap();
         let after_the_drop: Vec<_> =
@@ -6265,11 +6391,11 @@ mod tests {
         // C learns the recreation and the document first…
         c.apply_batch(&after_the_drop).unwrap();
         let cc = c.get_collection("shop", "orders").unwrap();
-        assert_eq!(c.count(&cc).unwrap(), 1);
+        assert_eq!(c.count(&cc, crate::WalkScope::Request).unwrap(), 1);
         // …and the old drop only afterwards.
         c.apply_batch(std::slice::from_ref(&old_drop)).unwrap();
         let cc = c.get_collection("shop", "orders").expect("the stale drop must not apply");
-        assert_eq!(c.count(&cc).unwrap(), 1);
+        assert_eq!(c.count(&cc, crate::WalkScope::Request).unwrap(), 1);
     }
 
     #[test]
@@ -6333,7 +6459,11 @@ mod tests {
 
         sync(&a, &b);
 
-        assert_eq!(b.count(&cb).unwrap(), 50, "an empty peer must catch up from zero");
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            50,
+            "an empty peer must catch up from zero"
+        );
     }
 
     #[test]
@@ -6624,7 +6754,11 @@ mod tests {
         // B writes after it, so C's position on B sorts above A's run.
         b.insert(&on_b, doc! { "_id": "b1" }).unwrap();
         round(&c, &b, BATCH);
-        assert_eq!(c.count(&on_c).unwrap(), 1, "C has B's write and none of A's yet");
+        assert_eq!(
+            c.count(&on_c, crate::WalkScope::Request).unwrap(),
+            1,
+            "C has B's write and none of A's yet"
+        );
 
         // A's second run, above C's position on B; then B writes again so C
         // has something to pull from B.
@@ -6743,7 +6877,8 @@ mod tests {
         for i in 0..2 {
             a.insert(&later, doc! { "_id": i }).unwrap();
         }
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let first_doc = history.iter().find(|e| e.kind == OpKind::Insert).unwrap().stamp;
         let later_create = history
             .iter()
@@ -6796,7 +6931,8 @@ mod tests {
         let orders = a.create_collection("shop", "orders").unwrap();
         let field = crate::meta::IndexField { path: "n".into(), descending: false };
         a.create_index("shop", "orders", vec![field], false, None).unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let history =
+            a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
         let index = history.iter().find(|e| e.kind == OpKind::CreateIndex).unwrap().clone();
 
         let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
@@ -6832,7 +6968,7 @@ mod tests {
     /// Every stamp `engine` holds in its oplog.
     fn stamps_held(engine: &Engine) -> std::collections::BTreeSet<Stamp> {
         engine
-            .read_oplog_from(Hlc::ZERO, usize::MAX)
+            .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
             .unwrap()
             .into_iter()
             .map(|e| e.stamp)
@@ -7037,7 +7173,7 @@ mod tests {
             ids_on(&a, "app", "other"),
             "nothing behind the dropped collection's write was stranded"
         );
-        assert_eq!(b.count(&other_on_b).unwrap(), 1);
+        assert_eq!(b.count(&other_on_b, crate::WalkScope::Request).unwrap(), 1);
         assert!(
             b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
             "and the round converged rather than re-serving the same window for ever"
@@ -7100,7 +7236,7 @@ mod tests {
     fn window_for(into: &Engine, from: &Engine) -> (VersionVector, OplogWindow) {
         let theirs = from.version_vector().unwrap();
         let start = into.witnessed_vector().unwrap().behind(&theirs).expect("behind the peer");
-        (theirs, from.entries_for_peer(start, BATCH).unwrap())
+        (theirs, from.entries_for_peer(start, BATCH, crate::WalkScope::Background).unwrap())
     }
 
     /// Apply `window` into `engine` twice, the second apply running inside
@@ -7205,7 +7341,11 @@ mod tests {
         // The push that won appended the creation, so the pull holds it.
         assert_eq!((pulled.ddl, pulled.ddl_held), (0, 1), "{pulled:?}");
         assert_eq!(pulled.applied + pulled.superseded, 2, "{pulled:?}");
-        assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 2);
+        assert_eq!(
+            b.count(&b.get_collection("shop", "orders").unwrap(), crate::WalkScope::Request)
+                .unwrap(),
+            2
+        );
         assert_eq!(b.witnessed_vector().unwrap().behind(&theirs), None, "{pulled:?}");
         race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
     }
@@ -7223,7 +7363,11 @@ mod tests {
         a.insert(&orders, doc! { "_id": 1 }).unwrap();
         let (theirs, window) = window_for(&b, &a);
         b.apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted).unwrap();
-        assert_eq!(b.count(&b.get_collection("shop", "orders").unwrap()).unwrap(), 1);
+        assert_eq!(
+            b.count(&b.get_collection("shop", "orders").unwrap(), crate::WalkScope::Request)
+                .unwrap(),
+            1
+        );
 
         a.drop_collection("shop", "orders").unwrap();
         let dropped_at = a.collection_dropped_at(orders.id).unwrap().expect("a tombstone");
@@ -7503,7 +7647,11 @@ mod tests {
         let theirs = from.version_vector().unwrap();
         let held = into.witnessed_vector().unwrap();
         let start = held.behind(&theirs).expect("behind the peer");
-        (theirs, from.entries_for_peer_holding(start, BATCH, Some(&held)).unwrap())
+        (
+            theirs,
+            from.entries_for_peer_holding(start, BATCH, Some(&held), crate::WalkScope::Background)
+                .unwrap(),
+        )
     }
 
     /// `window` cut after its first `n` entries, as a pull truncated there.
@@ -7598,7 +7746,7 @@ mod tests {
         assert!(first.unwrap(), "the first drop drops it");
         assert!(!second.unwrap(), "the second answers that it dropped nothing");
         let drops: Vec<Stamp> = engine
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .iter()
@@ -7708,8 +7856,16 @@ mod tests {
         assert_eq!(outcome.purge_pending, 0, "{outcome:?}");
         let held = b.get_collection("shop", "orders").unwrap();
         assert_eq!(held.created, second.created);
-        assert_eq!(b.count(&held).unwrap(), 1, "the second life's one document");
-        assert_eq!(b.count(&b.get_collection("shop", "other").unwrap()).unwrap(), 1);
+        assert_eq!(
+            b.count(&held, crate::WalkScope::Request).unwrap(),
+            1,
+            "the second life's one document"
+        );
+        assert_eq!(
+            b.count(&b.get_collection("shop", "other").unwrap(), crate::WalkScope::Request)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -7737,7 +7893,9 @@ mod tests {
         let theirs = a.version_vector().unwrap();
         let held = b.witnessed_vector().unwrap();
         let start = held.behind(&theirs).unwrap();
-        let whole = a.entries_for_peer_holding(start, BATCH, Some(&held)).unwrap();
+        let whole = a
+            .entries_for_peer_holding(start, BATCH, Some(&held), crate::WalkScope::Background)
+            .unwrap();
         let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
         assert_eq!(
             kinds,
@@ -7780,7 +7938,7 @@ mod tests {
         dropped.expect("the drop applies");
         let held = b.get_collection("shop", "orders").expect("the recreation stands");
         assert_eq!(held.created, second.created, "and it is the new incarnation");
-        assert_eq!(b.count(&held).unwrap(), 1, "with its document");
+        assert_eq!(b.count(&held, crate::WalkScope::Request).unwrap(), 1, "with its document");
         race_hooks::assert_absorbed(race_hooks::Race::Burial);
     }
 
@@ -7813,7 +7971,7 @@ mod tests {
         a.drop_collection("shop", "orders").unwrap();
         a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &theirs, &whole).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_none());
         let configure =
@@ -7838,7 +7996,7 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &theirs, &whole).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
         let removal = whole
@@ -7877,7 +8035,7 @@ mod tests {
         a.drop_collection("shop", "orders").unwrap();
         let second = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let at = |kind: OpKind| whole.entries.iter().position(|e| e.kind == kind).unwrap();
         let (create, configure, drop) = (
             at(OpKind::CreateCollection),
@@ -7935,14 +8093,14 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         c.create_collection("shop", "orders").unwrap();
-        let from_c = c.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let from_c = c.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &c.version_vector().unwrap(), &from_c).unwrap();
         assert!(
             b.get_collection("shop", "orders").unwrap().created
                 > a.get_collection("shop", "orders").unwrap().created
         );
 
-        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &a.version_vector().unwrap(), &from_a).unwrap();
         assert!(
             b.get_collection("shop", "orders").unwrap().vector.is_some(),
@@ -7963,7 +8121,7 @@ mod tests {
         a.drop_collection("shop", "orders").unwrap();
         a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &theirs, &whole).unwrap();
         let create = whole.entries.iter().position(|e| e.kind == OpKind::CreateIndex).unwrap();
 
@@ -7982,7 +8140,7 @@ mod tests {
         a.drop_collection("shop", "orders").unwrap();
         let second = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         assert_eq!(
             kinds(&whole),
             [
@@ -8025,7 +8183,7 @@ mod tests {
         a.create_index("shop", "orders", vec![field("a")], false, Some("by_a".into())).unwrap();
         a.drop_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let mine: Vec<usize> = (0..whole.entries.len())
             .filter(|&i| whole.entries[i].collection == orders.id)
             .collect();
@@ -8074,7 +8232,7 @@ mod tests {
         let second = a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let of = |id: CollectionId, kind: OpKind| -> Vec<usize> {
             (0..whole.entries.len())
                 .filter(|&i| whole.entries[i].collection == id && whole.entries[i].kind == kind)
@@ -8199,7 +8357,7 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"));
         let is_shadow_create =
             |e: &OplogEntry| e.kind == OpKind::CreateCollection && e.collection == shadow;
@@ -8231,7 +8389,7 @@ mod tests {
     /// The stamps of every creation of the shadow in `engine`'s oplog.
     fn shadow_creations(engine: &Engine) -> Vec<Stamp> {
         engine
-            .entries_for_peer(Hlc::ZERO, BATCH)
+            .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
             .unwrap()
             .entries
             .iter()
@@ -8249,9 +8407,9 @@ mod tests {
         let (c, _c_dir) = engine();
         a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
-        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let from_a = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &a.version_vector().unwrap(), &from_a).unwrap();
-        let from_b = b.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let from_b = b.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&c, &b.version_vector().unwrap(), &from_b).unwrap();
 
         let mut creations: Vec<Stamp> =
@@ -8284,7 +8442,7 @@ mod tests {
         x.configure_vectors("shop", "orders", vector_config()).unwrap();
         x.disable_vectors("shop", "orders", true).unwrap();
         let theirs = x.version_vector().unwrap();
-        let whole = x.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = x.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let shadow_create =
             |e: &OplogEntry| e.kind == OpKind::CreateCollection && e.collection == shadow_id();
         let configure =
@@ -8329,7 +8487,7 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &theirs, &whole).unwrap();
         assert!(shadow_held(&b));
         let configure =
@@ -8353,7 +8511,12 @@ mod tests {
     fn a_document_behind(a: &Engine, b: &Engine) -> CollectionMeta {
         let orders = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        apply(b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        apply(
+            b,
+            &theirs,
+            &a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap(),
+        )
+        .unwrap();
         a.insert(&orders, doc! { "_id": 1 }).unwrap();
         orders
     }
@@ -8372,7 +8535,7 @@ mod tests {
         let orders = a_document_behind(&a, &b);
         a.drop_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         assert_eq!(
             kinds(&whole),
             [OpKind::CreateCollection, OpKind::Insert, OpKind::DropCollection]
@@ -8405,7 +8568,7 @@ mod tests {
         a.finish_purges_now().unwrap();
         let second = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         assert_eq!(
             kinds(&whole),
             [
@@ -8429,8 +8592,12 @@ mod tests {
         inserted.expect("the document applies, as history");
         let held = b.get_collection("shop", "orders").unwrap();
         assert_eq!(held.created, second.created);
-        assert_eq!(b.count(&held).unwrap(), 0, "the first life's document stays out of the second");
-        assert_eq!(a.count(&second).unwrap(), 0);
+        assert_eq!(
+            b.count(&held, crate::WalkScope::Request).unwrap(),
+            0,
+            "the first life's document stays out of the second"
+        );
+        assert_eq!(a.count(&second, crate::WalkScope::Request).unwrap(), 0);
         race_hooks::assert_absorbed(race_hooks::Race::DocumentRun);
     }
 
@@ -8458,7 +8625,7 @@ mod tests {
         }
         a.drop_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         apply(&b, &theirs, &whole).unwrap();
         let documents = slice(&whole, 1, 4);
         assert!(documents.entries.iter().all(|e| e.kind == OpKind::Insert));
@@ -8479,7 +8646,12 @@ mod tests {
         b.finish_purges_now().unwrap();
         a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        apply(
+            &b,
+            &theirs,
+            &a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap(),
+        )
+        .unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().incarnation_floor.is_some());
         let before = race_hooks::replication_writes_opened();
         let history = apply(&b, &theirs, &documents).unwrap();
@@ -8495,7 +8667,7 @@ mod tests {
         let live = a.create_collection("shop", "live").unwrap();
         a.insert(&live, doc! { "_id": 1 }).unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         let before = race_hooks::replication_writes_opened();
         apply(&b, &theirs, &whole).unwrap();
         assert!(
@@ -8518,13 +8690,18 @@ mod tests {
         let b = Arc::new(b);
         let orders = a.create_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        apply(&b, &theirs, &a.entries_for_peer(Hlc::ZERO, BATCH).unwrap()).unwrap();
+        apply(
+            &b,
+            &theirs,
+            &a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap(),
+        )
+        .unwrap();
         for i in 0..3 {
             a.insert(&orders, doc! { "_id": i }).unwrap();
         }
         a.drop_collection("shop", "orders").unwrap();
         let theirs = a.version_vector().unwrap();
-        let whole = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
         assert_eq!(
             kinds(&whole),
             [
@@ -8579,7 +8756,7 @@ mod tests {
             let Some(start) = into.witnessed_vector().unwrap().behind(&theirs) else {
                 return (Ok(()), Counted::default());
             };
-            let window = from.entries_for_peer(start, BATCH).unwrap();
+            let window = from.entries_for_peer(start, BATCH, crate::WalkScope::Background).unwrap();
             let entries = serve(window.entries);
             if let Some(at) = fail {
                 count_hooks::fail_next(at);

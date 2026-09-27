@@ -14,6 +14,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Walks of the store end at the stop.** A member stopped while its peers
+  were pulling from it went on serving until the walk ended; now every walk
+  checks the stop on each row it reads. Walks that serve no client (a pull
+  served to a peer, retention, TTL expiry, a change stream finding where to
+  resume, a replicated index build, the embedding backfill) end at the signal,
+  and a client's (a backup, a query, a client's index build, a schema change's
+  confirmation) at the drain's deadline, as its request does. A member stopped
+  under its peers' pulls now exits at once, with its store closed. A vector
+  graph built at the stop is not saved, and no embedding starts once the stop
+  has begun. A pull that a stop ends is not a failed round and logs nothing
+  above debug. See [ADR-147](docs/decisions.md).
+- **`node_stopping`'s message now says the node "did not complete the
+  request"**, not that it "did not begin the write": a read the drain's
+  deadline ends is answered with it too. The code and `retry: elsewhere` are
+  unchanged.
 - **A stop now closes the store before it says the node shut down cleanly.**
   Since at least 0.39.0, a node stopped while a peer was pulling from it
   logged `shutdown complete` and wrote the clean-exit marker at once, then

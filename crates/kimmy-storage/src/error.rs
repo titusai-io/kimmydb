@@ -132,6 +132,9 @@ pub enum StopReason {
     DrainDeadline,
     /// The storage failed (ADR-188), and the process is stopping.
     StorageFailed,
+    /// The node's stop signal has come, and a walk that serves no client
+    /// ends at it ([`crate::WalkScope::Background`]).
+    Shutdown,
 }
 
 impl std::fmt::Display for StopReason {
@@ -139,6 +142,7 @@ impl std::fmt::Display for StopReason {
         f.write_str(match self {
             Self::DrainDeadline => "the node reached its shutdown deadline",
             Self::StorageFailed => "the node's storage failed, and it is stopping",
+            Self::Shutdown => "the node is shutting down",
         })
     }
 }

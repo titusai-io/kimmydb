@@ -116,7 +116,9 @@ pub(crate) fn spill_with<F: Write + Seek>(
     // The route already runs this on a blocking thread, where the wrapper
     // simply runs the walk; it is here so that no other caller can put a walk
     // of the whole store on an async worker (ADR-153).
-    let info = kimmy_storage::blocking(|| engine.backup_to(&mut out)).map_err(failed)?;
+    let info =
+        kimmy_storage::blocking(|| engine.backup_to(&mut out, kimmy_storage::WalkScope::Request))
+            .map_err(failed)?;
     let mut file = out
         .into_inner()
         .map_err(|e| failed(StorageError::Database(format!("writing a backup: {}", e.error()))))?;
@@ -177,7 +179,7 @@ mod tests {
         kimmy_storage::backup::restore(&path, &mut bytes.as_slice()).unwrap();
         let engine = Engine::open(&path).unwrap();
         let coll = engine.get_collection("shop", "orders").unwrap();
-        assert_eq!(engine.count(&coll).unwrap(), 1);
+        assert_eq!(engine.count(&coll, kimmy_storage::WalkScope::Request).unwrap(), 1);
     }
 
     #[test]

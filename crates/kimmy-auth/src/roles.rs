@@ -103,7 +103,7 @@ impl RoleStore {
     pub fn list(&self, engine: &Engine) -> Result<Vec<String>> {
         let mut names = Vec::new();
         engine
-            .for_each_doc(&self.collection, |id, _| {
+            .for_each_doc(&self.collection, kimmy_storage::WalkScope::Request, |id, _| {
                 names.push(id.to_string());
                 Ok(true)
             })

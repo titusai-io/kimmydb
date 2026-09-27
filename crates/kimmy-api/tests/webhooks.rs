@@ -326,7 +326,7 @@ async fn a_failed_delivery_does_not_advance_progress() {
     assert_eq!(outcome.failed, 1, "{outcome:?}");
     assert_eq!(outcome.delivered, 0);
     assert!(
-        dispatch::union_progress(&state, &id).is_empty(),
+        dispatch::union_progress(&state, &id).unwrap().is_empty(),
         "a refused delivery must leave progress untouched"
     );
 
@@ -610,7 +610,7 @@ async fn a_webhook_on_a_quiet_collection_does_not_fall_past_retention() {
     }
 
     let id = register(&state, &format!("http://{addr}/hook"), vec![]);
-    assert!(dispatch::union_progress(&state, &id).is_empty(), "nothing delivered yet");
+    assert!(dispatch::union_progress(&state, &id).unwrap().is_empty(), "nothing delivered yet");
 
     // Everything written so far is what the resume point has to get past.
     let before = state.engine.version_vector().unwrap();
@@ -623,7 +623,7 @@ async fn a_webhook_on_a_quiet_collection_does_not_fall_past_retention() {
     // The property the retention horizon depends on: the position moved over
     // the entries that were not this subscription's, so it is no longer sitting
     // where it was when the database started moving without it.
-    let progress = dispatch::union_progress(&state, &id);
+    let progress = dispatch::union_progress(&state, &id).unwrap();
     assert!(
         progress.covers(&before),
         "a pass that delivered nothing must still write its position forward"
@@ -649,7 +649,7 @@ async fn the_position_is_written_forward_on_a_heartbeat_not_every_pass() {
     let watched = state.engine.create_collection("shop", "orders").unwrap();
     state.engine.insert(&watched, doc! { "_id": 1 }).unwrap();
     assert_eq!(pass(&state).await.delivered, 1);
-    let settled = dispatch::union_progress(&state, &id);
+    let settled = dispatch::union_progress(&state, &id).unwrap();
 
     // Now the database moves without it.
     let busy = state.engine.create_collection("shop", "clicks").unwrap();
@@ -658,7 +658,7 @@ async fn the_position_is_written_forward_on_a_heartbeat_not_every_pass() {
     // Inside the heartbeat interval, an idle pass leaves the position alone.
     assert_eq!(pass(&state).await.delivered, 0);
     assert_eq!(
-        dispatch::union_progress(&state, &id),
+        dispatch::union_progress(&state, &id).unwrap(),
         settled,
         "a pass inside the heartbeat interval must not write"
     );
@@ -667,7 +667,7 @@ async fn the_position_is_written_forward_on_a_heartbeat_not_every_pass() {
     let mut backoff = dispatch::Backoff::default();
     pass_under(&state, &mut backoff, beating()).await;
     assert_ne!(
-        dispatch::union_progress(&state, &id),
+        dispatch::union_progress(&state, &id).unwrap(),
         settled,
         "the heartbeat must write the position forward"
     );
@@ -753,7 +753,10 @@ async fn removing_a_subscription_stops_delivery_and_clears_its_progress() {
 
     state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
     assert_eq!(pass(&state).await.delivered, 1);
-    assert!(!dispatch::union_progress(&state, &id).is_empty(), "it delivered, so it has progress");
+    assert!(
+        !dispatch::union_progress(&state, &id).unwrap().is_empty(),
+        "it delivered, so it has progress"
+    );
 
     kimmy_api::webhooks::remove(&state, &auth, "shop", "orders", &id).expect("removal");
 
@@ -767,7 +770,7 @@ async fn removing_a_subscription_stops_delivery_and_clears_its_progress() {
     assert_eq!(hits.load(Ordering::Relaxed), before, "and must not dial at all");
 
     assert!(
-        dispatch::union_progress(&state, &id).is_empty(),
+        dispatch::union_progress(&state, &id).unwrap().is_empty(),
         "its progress records must go with it"
     );
 }
@@ -1022,4 +1025,54 @@ async fn progress_from_a_peer_that_is_ahead_does_not_invalidate_this_node() {
         outcome.invalidated, 0,
         "a subscription a peer has already carried forward has missed nothing: {outcome:?}"
     );
+}
+
+/// A stop in the middle of planning invalidates nothing. The union of a
+/// subscription's progress is a walk that ends at the signal, and it used to
+/// be read as whatever it had got to: nothing, from which the subscription
+/// looked as far behind as the retention horizon, and was invalidated for
+/// good on a routine restart.
+#[tokio::test]
+async fn a_stop_while_planning_invalidates_no_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let url = format!("http://{addr}/hook");
+    let first = register_as(&state, "wh_a_first", &url, vec![]);
+    let second = register_as(&state, "wh_b_second", &url, vec![]);
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+    assert_eq!(pass(&state).await.delivered, 2, "both caught up");
+    let mut backoff = dispatch::Backoff::default();
+    pass_under(&state, &mut backoff, beating()).await;
+    state
+        .engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms(),
+            kimmy_storage::RetentionPolicy::new(0, 24 * 60 * 60),
+        )
+        .unwrap();
+    assert!(state.engine.oplog_collected_through().unwrap() > kimmy_core::Hlc::ZERO);
+
+    // The registry's two rows, then the first subscription's union, which
+    // reads every progress record; the stop comes at the first row of the
+    // second subscription's union.
+    let registry = 2;
+    let progress = state
+        .engine
+        .count(
+            &state.engine.get_collection("__kimmy", "__webhook_progress").unwrap(),
+            kimmy_storage::WalkScope::Request,
+        )
+        .unwrap();
+    state.engine.stop_walks_after_rows(registry + progress + 1);
+    let outcome = pass(&state).await;
+    assert!(state.engine.walks_stopping(), "the stop came during the pass");
+    assert_eq!(outcome.invalidated, 0, "{outcome:?}");
+    let registry = state.engine.get_collection("__kimmy", "__webhooks").unwrap();
+    for id in [first, second] {
+        let stored =
+            state.engine.get(&registry, &kimmy_core::DocId::String(id.clone())).unwrap().unwrap();
+        assert_ne!(stored.get_str("state").ok(), Some("invalidated"), "{id} was invalidated");
+    }
 }

@@ -1889,7 +1889,12 @@ mod tests {
         engine.insert(&coll, doc! { "n": 2 }).unwrap();
 
         let all = engine
-            .read_oplog_from_where(kimmy_core::Hlc::ZERO, usize::MAX, |_| true)
+            .read_oplog_from_where(
+                kimmy_core::Hlc::ZERO,
+                usize::MAX,
+                crate::WalkScope::Background,
+                |_| true,
+            )
             .unwrap()
             .entries;
         let before = engine.serve_cost();
@@ -1930,7 +1935,10 @@ mod tests {
         // The peer holds everything up to the fourth insert of this node's.
         let mut held = kimmy_core::VersionVector::new();
         held.observe(stamps[3]);
-        let all = engine.entries_for_peer(kimmy_core::Hlc::ZERO, usize::MAX).unwrap().entries;
+        let all = engine
+            .entries_for_peer(kimmy_core::Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+            .unwrap()
+            .entries;
         let passed = all.iter().filter(|e| e.stamp.hlc <= stamps[3].hlc).count() as u64;
 
         let before = engine.serve_cost();
@@ -1945,9 +1953,18 @@ mod tests {
             after.walk_buckets.iter().sum::<u64>() - before.walk_buckets.iter().sum::<u64>();
         assert_eq!(walks, 1);
         // A local read of the same range is not a window served.
-        let _ = engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap();
-        let _ =
-            engine.entries_for_peer_marked(kimmy_core::Hlc::ZERO, 10, Some(&held), &[]).unwrap();
+        let _ = engine
+            .entries_for_peer(kimmy_core::Hlc::ZERO, 10, crate::WalkScope::Background)
+            .unwrap();
+        let _ = engine
+            .entries_for_peer_marked(
+                kimmy_core::Hlc::ZERO,
+                10,
+                Some(&held),
+                &[],
+                crate::WalkScope::Background,
+            )
+            .unwrap();
         assert_eq!(engine.serve_cost().windows, after.windows);
     }
 

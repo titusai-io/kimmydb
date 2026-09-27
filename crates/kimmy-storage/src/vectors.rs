@@ -22,6 +22,7 @@ use crate::docs::WriteScope;
 use crate::engine::{WriteTxn, WriterHolder};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
+use crate::walk::WalkScope;
 
 /// What turning vectors off did; see [`Engine::disable_vectors_reporting`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -693,7 +694,9 @@ impl crate::Engine {
         let wanted = source.to_string();
         let prefix = format!("{wanted}#");
         let after = kimmy_core::keyenc::encode(&bson::Bson::String(prefix.clone()))?;
-        self.for_each_doc_after(shadow, Some(&after), |id, doc| {
+        // One document's chunks, which is bounded: `Request`, so only the drain's
+        // deadline ends it.
+        self.for_each_doc_after(shadow, Some(&after), WalkScope::Request, |id, doc| {
             // Strings sort together, so the first non-string key — or the first
             // string outside the prefix — is the end of the run.
             let DocId::String(raw) = &id else {
@@ -731,11 +734,16 @@ impl crate::Engine {
     ///
     /// It is logged at `warn` rather than passed over silently, because the
     /// other way to arrive here is genuine corruption.
-    pub fn for_each_vector<F>(&self, shadow: &CollectionMeta, mut f: F) -> Result<()>
+    pub fn for_each_vector<F>(
+        &self,
+        shadow: &CollectionMeta,
+        scope: WalkScope,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(VectorRecord) -> Result<bool>,
     {
-        self.for_each_doc(shadow, |id, doc| match decode_vector(doc) {
+        self.for_each_doc(shadow, scope, |id, doc| match decode_vector(doc) {
             Ok(record) => f(record),
             Err(e) => {
                 tracing::warn!(
@@ -1560,7 +1568,7 @@ mod tests {
 
         let mut seen = 0;
         engine
-            .for_each_vector(&shadow, |_| {
+            .for_each_vector(&shadow, crate::WalkScope::Request, |_| {
                 seen += 1;
                 Ok(true)
             })
@@ -1669,7 +1677,7 @@ mod tests {
 
         let mut seen = Vec::new();
         engine
-            .for_each_vector(&shadow, |r| {
+            .for_each_vector(&shadow, crate::WalkScope::Request, |r| {
                 seen.push(r.text);
                 Ok(true)
             })
@@ -1774,7 +1782,7 @@ mod tests {
         engine.configure_vectors("app", "docs", config(8)).unwrap();
 
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
-        let inherited = engine.count(&shadow).unwrap();
+        let inherited = engine.count(&shadow, crate::WalkScope::Request).unwrap();
         assert_eq!(
             inherited, 0,
             "a new collection must not inherit the vectors of a dropped one with the same name"

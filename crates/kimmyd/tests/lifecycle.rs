@@ -1232,3 +1232,152 @@ async fn a_panic_out_of_the_run_exits_bounded_and_leaves_no_marker() {
     assert!(log.contains("previous run did not shut down cleanly"), "{log}");
     assert!(log.contains("repairing the database after an unclean stop"), "{log}");
 }
+
+/// The HTTP base of a run that is serving.
+fn base(run: &Run) -> String {
+    format!("http://127.0.0.1:{}", run.http.get().expect("a bound port"))
+}
+
+async fn root_token(run: &Run, client: &reqwest::Client) -> String {
+    let body: serde_json::Value = client
+        .post(format!("{}/v1/auth/login", base(run)))
+        .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["token"].as_str().expect("a token").to_string()
+}
+
+/// How long each row of a walk takes under `KIMMY_TEST_WALK_ROW_MS` in the
+/// tests below: long enough that the walks they start would still be
+/// running when the stop's 22 s ran out, had they not stopped.
+const SLOW_ROW_MS: &str = "25";
+
+/// Start a node with every walk slowed on `dir`, whose store an earlier run
+/// filled; start `slow` against it, and stop the node while that runs. The
+/// stop is prompt, clean, and closes the store: exit 0, `engine closed`, the
+/// `shutdown` marker, and a next start that repairs nothing.
+async fn a_slow_walk_at_the_stop_ends_and_the_store_closes<F, Fut>(
+    dir: &Path,
+    name: &str,
+    client: &reqwest::Client,
+    slow: F,
+) -> String
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut run = Run::spawn_with(dir, name, &[("KIMMY_TEST_WALK_ROW_MS", SLOW_ROW_MS)]);
+    run.wait_ready(client).await;
+    let token = root_token(&run, client).await;
+    tokio::spawn(slow(base(&run), token));
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let (status, took) = stop(&mut run);
+    let log = run.log();
+    assert!(status.success(), "{status:?}: {log}");
+    assert!(log.contains("a test switch is set that slows every walk"), "{log}");
+    assert!(log.contains("engine closed"), "{log}");
+    assert!(took < Duration::from_secs(16), "the stop waited for the walk: {took:?}");
+    assert!(marker(dir).unwrap().contains("exit = \"shutdown\""));
+    let next = next_start_log(dir, &format!("{name}-next"), client).await;
+    assert!(!next.contains("repairing the database"), "{next}");
+    log
+}
+
+/// A backup in flight at the stop is a client's request: the drain lets it
+/// run until its deadline, and then it ends, so the store closes, rather
+/// than running on until the supervisor kills the process.
+#[tokio::test]
+async fn a_backup_in_flight_at_the_stop_ends_at_the_drain_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut fill = Run::spawn(dir.path(), "backup-fill");
+    fill.wait_ready(&client).await;
+    let token = root_token(&fill, &client).await;
+    let docs: Vec<_> = (0..600).map(|i| serde_json::json!({ "_id": i })).collect();
+    for (path, body) in [
+        ("/v1/db/shop/collections", serde_json::json!({ "name": "orders" })),
+        ("/v1/db/shop/coll/orders/bulk", serde_json::json!(docs)),
+    ] {
+        let res = client.post(format!("{}{path}", base(&fill))).bearer_auth(&token).json(&body);
+        assert!(res.send().await.unwrap().status().is_success(), "{path}");
+    }
+    assert!(stop(&mut fill).0.success());
+
+    a_slow_walk_at_the_stop_ends_and_the_store_closes(
+        dir.path(),
+        "backup-slow",
+        &client,
+        |base, token| async move {
+            let _ = reqwest::Client::new()
+                .get(format!("{base}/v1/admin/backup"))
+                .bearer_auth(token)
+                .send()
+                .await;
+        },
+    )
+    .await;
+}
+
+/// A search that builds its collection's vector graph is a client's
+/// request too: the walks that count and read the vectors end at the
+/// drain's deadline, and the build with them.
+#[tokio::test]
+async fn a_vector_graph_building_at_the_stop_ends_at_the_drain_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut fill = Run::spawn(dir.path(), "graph-fill");
+    fill.wait_ready(&client).await;
+    let token = root_token(&fill, &client).await;
+    let post = |path: &str, body: serde_json::Value| {
+        client.post(format!("{}{path}", base(&fill))).bearer_auth(&token).json(&body).send()
+    };
+    assert!(
+        post("/v1/db/shop/collections", serde_json::json!({ "name": "vec" }))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let vectors =
+        serde_json::json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 });
+    assert!(post("/v1/db/shop/coll/vec/vector", vectors).await.unwrap().status().is_success());
+    // Above the 500 below which a search is exact, so a search builds a graph.
+    let docs: Vec<_> = (0..600).map(|i| serde_json::json!({ "_id": i, "note": "n" })).collect();
+    assert!(
+        post("/v1/db/shop/coll/vec/bulk", serde_json::json!(docs))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    for i in 0..600 {
+        let res = client
+            .put(format!("{}/v1/db/shop/coll/vec/docs/{i}/vectors", base(&fill)))
+            .bearer_auth(&token)
+            .json(&serde_json::json!([{ "chunk": 0, "vector": [1.0, i as f32, 0.0], "text": "n" }]))
+            .send()
+            .await
+            .unwrap();
+        assert!(res.status().is_success());
+    }
+    assert!(stop(&mut fill).0.success());
+
+    a_slow_walk_at_the_stop_ends_and_the_store_closes(
+        dir.path(),
+        "graph-slow",
+        &client,
+        |base, token| async move {
+            let _ = reqwest::Client::new()
+                .post(format!("{base}/v1/db/shop/coll/vec/vector_search"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "vector": [1.0, 0.0, 0.0], "k": 3 }))
+                .send()
+                .await;
+        },
+    )
+    .await;
+}

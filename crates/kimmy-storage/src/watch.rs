@@ -32,6 +32,7 @@ use crate::codec;
 use crate::engine::Engine;
 use crate::error::{Result, StorageError};
 use crate::tables;
+use crate::walk::{Rows, WalkScope, WalkTable, open_walk_table};
 
 /// How many oplog entries are read per replay batch.
 const REPLAY_BATCH: usize = 1024;
@@ -332,7 +333,10 @@ impl Engine {
         walked: &mut Walked,
     ) -> Result<u64> {
         let txn = self.db().begin_read()?;
-        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        // A change stream is no request the drain waits for: its pump and
+        // upgrade are aborted after it, and its walks end at the signal.
+        let arrival =
+            open_walk_table(&txn, tables::OPLOG_ARRIVAL, self.walk(WalkScope::Background))?;
         walked.walks += 1;
         for row in arrival.range(from..)? {
             let (seq, key) = row?;
@@ -467,9 +471,11 @@ impl Engine {
     /// the vector was taken.
     fn first_arrival_beyond(&self, delivered: &VersionVector, walked: &mut Walked) -> Result<u64> {
         let txn = self.db().begin_read()?;
-        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
-        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
-        let held = txn.open_table(tables::OPLOG_HELD)?;
+        let arrival =
+            open_walk_table(&txn, tables::OPLOG_ARRIVAL, self.walk(WalkScope::Background))?;
+        let by_stamp =
+            open_walk_table(&txn, tables::OPLOG_ARRIVAL_SEQ, self.walk(WalkScope::Background))?;
+        let held = open_walk_table(&txn, tables::OPLOG_HELD, self.walk(WalkScope::Background))?;
         let servable = Engine::read_versions_in(&txn, tables::OPLOG_VERSIONS)?;
         walked.walks += 1;
         let mut walk = Walk::new(&arrival, delivered)?;
@@ -511,7 +517,8 @@ impl Engine {
     /// stream and only for the explicit `start_at` form.
     fn first_arrival_at_or_after(&self, at: Hlc, walked: &mut Walked) -> Result<u64> {
         let txn = self.db().begin_read()?;
-        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        let arrival =
+            open_walk_table(&txn, tables::OPLOG_ARRIVAL, self.walk(WalkScope::Background))?;
         walked.walks += 1;
         for row in arrival.iter()? {
             let (seq, key) = row?;
@@ -589,8 +596,9 @@ impl Engine {
         let mut last = None;
         let mut reached_tail = true;
         {
-            let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
-            let oplog = txn.open_table(tables::OPLOG)?;
+            let arrival =
+                open_walk_table(&txn, tables::OPLOG_ARRIVAL, self.walk(WalkScope::Background))?;
+            let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(WalkScope::Background))?;
             for row in arrival.range(from..)? {
                 let (seq, key) = row?;
                 last = Some(seq.value());
@@ -600,7 +608,7 @@ impl Engine {
                 };
                 out.push(codec::decode_oplog_entry(raw.value())?);
                 if out.len() >= limit {
-                    reached_tail = arrival.range(seq.value() + 1..)?.next().is_none();
+                    reached_tail = arrival.range(seq.value() + 1..)?.next().transpose()?.is_none();
                     break;
                 }
             }
@@ -646,8 +654,13 @@ impl Engine {
     /// "what do you hold after this logical time", which is a question about
     /// origin stamps. Change streams use [`Self::read_arrival_from`] instead —
     /// see [`tables::OPLOG_ARRIVAL`] for why the two differ.
-    pub fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
-        Ok(self.read_oplog_from_where(from, limit, |_| true)?.entries)
+    pub fn read_oplog_from(
+        &self,
+        from: Hlc,
+        limit: usize,
+        scope: WalkScope,
+    ) -> Result<Vec<OplogEntry>> {
+        Ok(self.read_oplog_from_where(from, limit, scope, |_| true)?.entries)
     }
 
     /// [`Self::read_oplog_from`], counting only the entries `keep` retains
@@ -669,9 +682,10 @@ impl Engine {
         &self,
         from: Hlc,
         limit: usize,
+        scope: WalkScope,
         keep: impl Fn(&OplogEntry) -> bool,
     ) -> Result<OplogWindow> {
-        self.read_oplog_from_skipping(from, limit, |_| false, keep)
+        self.read_oplog_from_skipping(from, limit, scope, |_| false, keep)
     }
 
     /// [`Self::read_oplog_from_where`], passing over every entry whose stamp
@@ -686,11 +700,12 @@ impl Engine {
         &self,
         from: Hlc,
         limit: usize,
+        scope: WalkScope,
         skip: impl Fn(&Stamp) -> bool,
         keep: impl Fn(&OplogEntry) -> bool,
     ) -> Result<OplogWindow> {
         let txn = self.db().begin_read()?;
-        let oplog = txn.open_table(tables::OPLOG)?;
+        let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(scope))?;
         let lower = codec::oplog_key_lower_bound(from);
 
         // Exhausted until something stops the scan short: an empty range is the
@@ -771,13 +786,13 @@ impl Default for Walked {
 /// [`Engine::first_arrival_beyond`] in arrival order: the first entry above
 /// the vector, one row per step.
 struct Walk<'t> {
-    rows: redb::Range<'t, u64, &'static [u8]>,
+    rows: Rows<'t, redb::Range<'t, u64, &'static [u8]>>,
     delivered: &'t VersionVector,
 }
 
 impl<'t> Walk<'t> {
     fn new(
-        arrival: &'t redb::ReadOnlyTable<u64, &'static [u8]>,
+        arrival: &'t WalkTable<'t, redb::ReadOnlyTable<u64, &'static [u8]>>,
         delivered: &'t VersionVector,
     ) -> Result<Self> {
         Ok(Self { rows: arrival.iter()?, delivered })
@@ -816,7 +831,7 @@ impl<'t> Walk<'t> {
 /// A `V` that overstates what the oplog holds, or a mark left on no entry,
 /// only adds origins, which costs rows and never changes the answer.
 struct Seek<'t> {
-    by_stamp: &'t redb::ReadOnlyTable<&'static [u8], u64>,
+    by_stamp: &'t WalkTable<'t, redb::ReadOnlyTable<&'static [u8], u64>>,
     servable: &'t VersionVector,
     delivered: &'t VersionVector,
     phase: SeekPhase<'t>,
@@ -828,15 +843,15 @@ struct Seek<'t> {
 
 enum SeekPhase<'t> {
     /// Reading the state marks, for the active origins among them.
-    Held(redb::Range<'t, &'static [u8], ()>),
+    Held(Rows<'t, redb::Range<'t, &'static [u8], ()>>),
     /// Reading the candidates' range.
-    Range(redb::Range<'t, &'static [u8], u64>),
+    Range(Rows<'t, redb::Range<'t, &'static [u8], u64>>),
 }
 
 impl<'t> Seek<'t> {
     fn new(
-        by_stamp: &'t redb::ReadOnlyTable<&'static [u8], u64>,
-        held: &'t redb::ReadOnlyTable<&'static [u8], ()>,
+        by_stamp: &'t WalkTable<'t, redb::ReadOnlyTable<&'static [u8], u64>>,
+        held: &'t WalkTable<'t, redb::ReadOnlyTable<&'static [u8], ()>>,
         servable: &'t VersionVector,
         delivered: &'t VersionVector,
     ) -> Result<Self> {
@@ -875,7 +890,7 @@ impl<'t> Seek<'t> {
                         // drops to the start of the range, and the race keeps
                         // the resume at the walk's price. Such keys are kept
                         // on purpose (`release_held_under`).
-                        Err(_) => self.lower(Hlc::ZERO),
+                        Err(_) => self.lower(Hlc::ZERO), // not a row: a mark's key.
                     }
                     return Ok(None);
                 }
@@ -1247,6 +1262,92 @@ mod tests {
         (engine, coll, dir)
     }
 
+    /// Where a stream resumes is found by walks that serve no client, so
+    /// they end at the signal: a resume from another member's token walked
+    /// for 30 s and more on a cold store (round 0420), holding the engine.
+    #[test]
+    fn a_resumes_walks_end_at_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for n in 0..5 {
+            engine.insert(&coll, bson::doc! { "_id": n }).unwrap();
+        }
+        engine.stop_walks();
+        let mut walked = Walked::default();
+        let beyond = engine.first_arrival_beyond(&VersionVector::new(), &mut walked);
+        assert!(matches!(beyond, Err(StorageError::Stopping(_))), "{beyond:?}");
+        let at = engine.first_arrival_at_or_after(Hlc::MAX, &mut walked);
+        assert!(matches!(at, Err(StorageError::Stopping(_))), "{at:?}");
+        let batch = engine.read_arrival_batch(0, 100);
+        assert!(matches!(batch, Err(StorageError::Stopping(_))), "{batch:?}");
+    }
+
+    /// And each is stopped at every row it reads, not only before its first:
+    /// one that ended its loop on the stop would answer a position or a batch
+    /// from what it had read, and a stream would resume from there. The
+    /// resume's race stops inside both of its walks, its seek through the
+    /// marks and then the range, and a batch inside its look past the limit.
+    #[test]
+    fn a_resumes_walks_end_at_the_signal_on_every_row() {
+        type Fixture = (Engine, tempfile::TempDir, Stamp);
+        let fixture = || -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let coll = engine.create_collection("shop", "orders").unwrap();
+            for n in 0..12 {
+                engine.insert(&coll, bson::doc! { "_id": n }).unwrap();
+            }
+            // A peer's marks, for the seek's first phase.
+            let peer = NodeId::from_bytes([7; 16]);
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut held = txn.open_table(tables::OPLOG_HELD).unwrap();
+                for wall_ms in 1..=4 {
+                    let stamp = Stamp::new(Hlc::new(wall_ms, 0), peer);
+                    held.insert(codec::oplog_key(&stamp).as_slice(), ()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+            let entries =
+                engine.read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Request).unwrap();
+            let middle = entries[entries.len() - 4].stamp;
+            (engine, dir, middle)
+        };
+        type Walk = fn(&Fixture) -> Result<()>;
+        let walks: &[(&str, Walk)] = &[
+            // covers: watch::Seek::new, watch::Seek::step, watch::Walk::new, watch::Walk::step
+            ("first_arrival_beyond", |(e, _, middle)| {
+                let delivered: VersionVector = [(middle.node, middle.hlc)].into_iter().collect();
+                e.first_arrival_beyond(&delivered, &mut Walked::default()).map(drop)
+            }),
+            // covers: watch::Engine::first_arrival_at_or_after
+            ("first_arrival_at_or_after", |(e, _, middle)| {
+                e.first_arrival_at_or_after(middle.hlc, &mut Walked::default()).map(drop)
+            }),
+            // covers: watch::Engine::first_arrival_stamped_after
+            ("first_arrival_stamped_after", |(e, _, middle)| {
+                e.first_arrival_stamped_after(0, *middle, &mut Walked::default()).map(drop)
+            }),
+            // covers: watch::Engine::read_arrival_batch
+            ("read_arrival_batch to the tail", |(e, _, _)| e.read_arrival_batch(0, 100).map(drop)),
+            // covers: watch::Engine::read_arrival_batch
+            ("read_arrival_batch short of it", |(e, _, _)| e.read_arrival_batch(0, 5).map(drop)),
+        ];
+        for (name, walk) in walks {
+            let rows = crate::walk::every_row::assert_stops_at_every_row(
+                name,
+                crate::WalkScope::Background,
+                false,
+                fixture,
+                |f| &f.0,
+                walk,
+            );
+            assert!(rows > 3, "{name} read {rows} rows: nothing to stop among");
+        }
+    }
+
     /// Every invalidate reason's wire name, pinned where the choice is made.
     ///
     /// `as_str` exists so a variant rename cannot silently rename a value
@@ -1297,11 +1398,14 @@ mod tests {
         let (engine, coll, _dir) = setup();
         engine.insert(&coll, doc! { "_id": 1 }).unwrap();
         engine.insert(&coll, doc! { "_id": 2 }).unwrap();
-        let tail = engine.read_oplog_from(Hlc::ZERO, 100).unwrap();
+        let tail = engine.read_oplog_from(Hlc::ZERO, 100, crate::WalkScope::Background).unwrap();
         let last = tail.last().expect("the oplog holds entries").stamp;
 
-        let window =
-            engine.read_oplog_from_where(Hlc::ZERO, 100, |entry| entry.stamp != last).unwrap();
+        let window = engine
+            .read_oplog_from_where(Hlc::ZERO, 100, crate::WalkScope::Request, |entry| {
+                entry.stamp != last
+            })
+            .unwrap();
 
         assert!(window.exhausted, "the scan ran to the end of the oplog");
         assert!(
@@ -2645,7 +2749,8 @@ mod tests {
     /// A token another member issued, covering nothing: the resume that walks
     /// the arrival index (round 0420's stall).
     fn foreign_token(engine: &Engine) -> ResumeToken {
-        let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
+        let first =
+            engine.read_oplog_from(Hlc::ZERO, 1, crate::WalkScope::Background).unwrap().remove(0);
         ResumeToken::issued(first.stamp, NodeId::generate(), VersionVector::new())
     }
 
@@ -2873,9 +2978,10 @@ mod tests {
         /// One side of the race run to its end alone.
         fn alone(engine: &Engine, delivered: &VersionVector, seek: bool) -> u64 {
             let txn = engine.db().begin_read().unwrap();
-            let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
-            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
-            let held = txn.open_table(tables::OPLOG_HELD).unwrap();
+            let walk = engine.walk(crate::WalkScope::Background);
+            let arrival = open_walk_table(&txn, tables::OPLOG_ARRIVAL, walk).unwrap();
+            let by_stamp = open_walk_table(&txn, tables::OPLOG_ARRIVAL_SEQ, walk).unwrap();
+            let held = open_walk_table(&txn, tables::OPLOG_HELD, walk).unwrap();
             let servable = Engine::read_versions_in(&txn, tables::OPLOG_VERSIONS).unwrap();
             let mut walked = Walked::default();
             let found = if seek {
@@ -3048,7 +3154,7 @@ mod tests {
                         let local = self.engine().node_id();
                         let stamps: Vec<Hlc> = self
                             .engine()
-                            .read_oplog_from(Hlc::ZERO, usize::MAX)
+                            .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
                             .unwrap()
                             .into_iter()
                             .filter(|e| e.stamp.node == local)
@@ -3061,7 +3167,7 @@ mod tests {
                     }
                     Op::Restore => {
                         let mut backup = Vec::new();
-                        self.engine().backup_to(&mut backup).unwrap();
+                        self.engine().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
                         drop(self.engine.take());
                         let dir = tempfile::tempdir().unwrap();
                         self.path = dir.path().join("kimmy.redb");
@@ -3089,7 +3195,9 @@ mod tests {
                 let engine = self.engine();
                 let servable = engine.version_vector().unwrap();
                 let witnessed = engine.witnessed_vector().unwrap();
-                let entries = engine.read_oplog_from(Hlc::ZERO, usize::MAX).unwrap();
+                let entries = engine
+                    .read_oplog_from(Hlc::ZERO, usize::MAX, crate::WalkScope::Background)
+                    .unwrap();
                 let mut all_origins: Vec<NodeId> = self.origins.to_vec();
                 all_origins.push(engine.node_id());
                 let of = |o: NodeId| -> Vec<Hlc> {

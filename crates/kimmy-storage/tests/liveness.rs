@@ -48,7 +48,7 @@ async fn durable_commits_do_not_starve_the_runtime() {
     for h in writers {
         h.await.unwrap();
     }
-    assert_eq!(engine.count(&coll).unwrap(), 4 * 15 * 40);
+    assert_eq!(engine.count(&coll, kimmy_storage::WalkScope::Request).unwrap(), 4 * 15 * 40);
     assert!(
         worst < Duration::from_millis(250),
         "a timer on the runtime fired {worst:?} late while storage was committing"

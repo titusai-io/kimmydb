@@ -998,7 +998,7 @@ fn prepare(
     // One live vector is enough to know ingestion happened. Counting them
     // decoded every vector of the collection on every search.
     let mut any = false;
-    state.engine.for_each_doc(&shadow, |_, _| {
+    state.engine.for_each_doc(&shadow, kimmy_storage::WalkScope::Request, |_, _| {
         any = true;
         Ok(false)
     })?;
@@ -1564,7 +1564,7 @@ mod tests {
         let mut all = Vec::new();
         state
             .engine
-            .for_each_vector(shadow, |r| {
+            .for_each_vector(shadow, kimmy_storage::WalkScope::Request, |r| {
                 if allowed.contains(&r.source.to_string()) {
                     let score = similarity(query, &r.vector, options.metric);
                     all.push((r.source.to_string(), r.chunk, score, r.text));

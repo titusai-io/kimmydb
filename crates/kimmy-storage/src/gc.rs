@@ -40,6 +40,7 @@ use crate::codec;
 use crate::engine::{Engine, WriterHolder, physical_now_ms};
 use crate::error::Result;
 use crate::tables;
+use crate::walk::{WalkScope, open_walk_table};
 
 /// How long each kind of garbage is retained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,11 +155,14 @@ impl Engine {
         loop {
             let expired = {
                 let txn = self.db().begin_read()?;
-                let oplog = txn.open_table(tables::OPLOG)?;
+                // Retention serves no client: its scans end at the signal, and
+                // the next pass finds the same garbage.
+                let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(WalkScope::Background))?;
                 let mut keys: Vec<Vec<u8>> = Vec::new();
                 for row in oplog.range::<&[u8]>(..bound.as_slice())? {
                     let (key, _) = row?;
                     let key = key.value();
+                    // not a row: the row's key, kept when it will not decode.
                     let Ok(stamp) = codec::decode_oplog_key(key) else {
                         // An entry whose key will not decode cannot be aged,
                         // so it is kept rather than silently dropped. Keeping
@@ -294,7 +298,7 @@ impl Engine {
         loop {
             let (expired, last, exhausted, seen) = {
                 let txn = self.db().begin_read()?;
-                let docs = txn.open_table(tables::DOCS)?;
+                let docs = open_walk_table(&txn, tables::DOCS, self.walk(WalkScope::Background))?;
                 let start = match &cursor {
                     Some((collection, key)) => {
                         std::ops::Bound::Excluded((*collection, key.as_slice()))
@@ -319,6 +323,7 @@ impl Engine {
                             });
                         }
                         Ok(_) => {}
+                        // not a row: the row's record, kept when it will not decode.
                         Err(_) => warn!("undecodable document record retained"),
                     }
                     if expired.len() >= TOMBSTONE_COLLECT_CHUNK || visited + seen >= budget {
@@ -751,14 +756,17 @@ mod tests {
         let ca = a.create_collection("db", "c").unwrap();
         a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
         a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
-        for entry in a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap().entries {
+        for entry in
+            a.entries_for_peer(Hlc::ZERO, usize::MAX, crate::WalkScope::Background).unwrap().entries
+        {
             b.apply_batch(&[entry]).unwrap();
         }
         let cb = b.get_collection("db", "c").unwrap();
         b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
         b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
         let start = a.version_vector().unwrap().get(b.node_id());
-        let entries = b.entries_for_peer(start, usize::MAX).unwrap().entries;
+        let entries =
+            b.entries_for_peer(start, usize::MAX, crate::WalkScope::Background).unwrap().entries;
         a.apply_batch(&entries).unwrap();
         (a, b, da, db)
     }

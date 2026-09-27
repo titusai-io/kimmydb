@@ -758,7 +758,11 @@ impl IndexCache {
         // Every successful build is persisted, so whatever graph a restart
         // finds is the newest one that existed. Failure to save costs the
         // next process a rebuild, not this query an answer.
-        if let Some(path) = self.snapshot_path(shadow.id) {
+        //
+        // Not once the node's stop has begun: a save writes the whole graph,
+        // and the next start builds or loads one either way.
+        let stopping = engine.walk_stop(kimmy_storage::WalkScope::Background).is_some();
+        if let Some(path) = self.snapshot_path(shadow.id).filter(|_| !stopping) {
             match index.save(&path) {
                 // `generation` was read before the build, so a write that
                 // landed during it makes this snapshot look behind — the
@@ -1283,7 +1287,7 @@ fn remove_snapshot(path: &std::path::Path, why: &'static str) -> bool {
 /// O(n) — see `access`, which caches its verdict for exactly that reason.
 pub fn count_vectors(engine: &Engine, shadow: &CollectionMeta) -> Result<usize> {
     let mut n = 0;
-    engine.for_each_vector(shadow, |_| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_| {
         n += 1;
         Ok(true)
     })?;
@@ -1676,6 +1680,22 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         (engine, shadow)
+    }
+
+    /// A graph built once the node's stop has begun serves its search, and
+    /// is not saved: a save writes the whole graph, and the next start builds
+    /// or loads one either way.
+    #[test]
+    fn a_graph_built_at_the_stop_is_not_saved() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        engine.stop_walks();
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(!path.exists(), "a graph was saved at the stop: {path:?}");
     }
 
     #[test]

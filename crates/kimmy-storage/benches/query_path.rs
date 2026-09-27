@@ -93,6 +93,7 @@ fn indexed_find(engine: &Engine, coll: &CollectionMeta, parsed: &Filter) -> usiz
             coll,
             &scan,
             CandidateOrder::ById { after: None, want: None },
+            kimmy_storage::WalkScope::Request,
             |_, _, doc| {
                 if filter::matches(parsed, &doc) {
                     matched += 1;
@@ -109,7 +110,7 @@ fn indexed_find(engine: &Engine, coll: &CollectionMeta, parsed: &Filter) -> usiz
 fn scanned_find(engine: &Engine, coll: &CollectionMeta, parsed: &Filter) -> usize {
     let mut matched = 0;
     engine
-        .for_each_doc(coll, |_id, doc| {
+        .for_each_doc(coll, kimmy_storage::WalkScope::Request, |_id, doc| {
             if filter::matches(parsed, &doc) {
                 matched += 1;
             }
