@@ -2511,8 +2511,12 @@ async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() 
 
 /// A connection has authenticated on `node` more times than one of its kinds
 /// has ended (disconnected, failed, or been cut short at a stop) since its
-/// last restart: a peer is very likely mid-pull, `AskEntries`'s walk being
-/// the only step of a served connection with no log line of its own.
+/// last restart: a peer's connection is open, which is true for the whole
+/// version exchange and the request that follows it, not only the walk
+/// `AskEntries` starts — the only step of a served connection with no log
+/// line of its own. On its own this goes true right at authentication,
+/// before any of that, so [`wait_for_a_sustained_pull_in_flight`] is what a
+/// test should call.
 fn a_peers_pull_looks_in_flight(node: &Node) -> bool {
     let log = node.log();
     let started = log.matches("peer authenticated").count();
@@ -2520,6 +2524,38 @@ fn a_peers_pull_looks_in_flight(node: &Node) -> bool {
         + log.matches("peer connection failed").count()
         + log.matches("stopped serving a peer's pull").count();
     started > ended
+}
+
+/// Wait until [`a_peers_pull_looks_in_flight`] has read true on every poll,
+/// a hundred milliseconds apart, for at least `held` running — long enough
+/// past a fresh connection's authentication, version exchange and the
+/// `AskEntries` request itself that a continuous true reading is the walk,
+/// not the handshake. A single false reading resets the clock. Gives up
+/// after [`patience`].
+///
+/// A connection's authentication alone (`a_peers_pull_looks_in_flight` on
+/// its own) is not enough: a fresh connection reads true from the instant it
+/// authenticates, before it has asked for anything, so signalling on that
+/// alone can land in the gap between one window's connection closing and the
+/// next one's handshake finishing.
+async fn wait_for_a_sustained_pull_in_flight(node: &Node, held: Duration) {
+    let deadline = std::time::Instant::now() + patience();
+    let mut held_since: Option<std::time::Instant> = None;
+    loop {
+        if a_peers_pull_looks_in_flight(node) {
+            let since = *held_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= held {
+                return;
+            }
+        } else {
+            held_since = None;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for a peer's pull to stay in flight for {held:?} running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// **The finding this change is for** (0.40.0, and since at least 0.39.0): a
@@ -2530,10 +2566,11 @@ fn a_peers_pull_looks_in_flight(node: &Node) -> bool {
 /// Node B's every walk is slowed so that the pulls A and C make of it each
 /// hold a serve walk for seconds, as a cold walk of a large oplog does, and
 /// its served window's own budget is raised past that so the row count ends
-/// it, not ADR-194's default two seconds. B is stopped once a pull looks to
-/// be mid-walk ([`a_peers_pull_looks_in_flight`]): its serve walks end at the
-/// signal, and it exits 0 promptly with the store closed (`engine closed`,
-/// the `shutdown` marker), and its next start repairs nothing.
+/// it, not ADR-194's default two seconds. B is stopped once a pull has held
+/// mid-walk for a moment ([`wait_for_a_sustained_pull_in_flight`]), not on a
+/// bare connection: its serve walks end at the signal, and it exits 0
+/// promptly with the store closed (`engine closed`, the `shutdown` marker),
+/// and its next start repairs nothing.
 ///
 /// Its drain is idle, so `close_writes` would end a request's walk at once
 /// too: this test covers the finding, and with no row checks at all the stop
@@ -2596,8 +2633,7 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
             }
         })
     };
-    eventually("a peer's pull to be in flight on B", || async { a_peers_pull_looks_in_flight(&b) })
-        .await;
+    wait_for_a_sustained_pull_in_flight(&b, Duration::from_millis(1500)).await;
 
     let started = std::time::Instant::now();
     b.signal("TERM");
@@ -2914,8 +2950,7 @@ async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
         tokio::spawn(async move { reqwest::Client::new().get(url).bearer_auth(token).send().await })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
-    eventually("a peer's pull to be in flight on B", || async { a_peers_pull_looks_in_flight(&b) })
-        .await;
+    wait_for_a_sustained_pull_in_flight(&b, Duration::from_millis(1500)).await;
     b.signal("TERM");
     let status = b.wait_exit(Duration::from_secs(60));
     writer.abort();
