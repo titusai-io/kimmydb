@@ -6493,10 +6493,28 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
     let d = node().await;
     let a = node().await;
     let coll = a.engine.create_collection("shop", "orders").unwrap();
-    seed(&a, &coll, MAX_BATCH * 40);
+    seed(&a, &coll, MAX_BATCH * 200);
+
+    // Priced, not fixed, for the same reason `a_tick_at_the_pull_ceiling`
+    // prices its interval: a pull's cost belongs to the machine. A fixed
+    // interval close to one pull's own cost would let a loaded machine's
+    // slower pulls make every reset tick open, on the correct reasoning
+    // that each one genuinely took about an interval -- proving nothing
+    // about the gate. Six times the slowest of a few priced pulls (the
+    // same margin `a_tick_at_the_pull_ceiling` starts at) keeps several
+    // pulls inside one interval without draining the whole, deliberately
+    // deep backlog in only one or two ticks either.
+    const PRICED_PULLS: usize = 8;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..PRICED_PULLS {
+        let priced = std::time::Instant::now();
+        let one = sync_once(&d.engine, a.addr, SECRET, None).await.expect("a pull to price");
+        slowest = slowest.max(priced.elapsed());
+        assert!(one.truncated, "the fixture must still be draining, or this prices nothing");
+    }
+    let interval = slowest * 6;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
-    let interval = Duration::from_millis(80);
     let mut config =
         ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), d.addr);
     config.fanout = 1;
@@ -6551,5 +6569,152 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
         opened_ticks <= expected_opens + 2,
         "opened {opened_ticks} times over {elapsed:?} at a {interval:?} interval -- about \
          {expected_opens} expected, not open on {opened_ticks} of {total_ticks} total ticks"
+    );
+}
+
+/// ADR-195's carry-forward gate stays off for a `Ceiling` end even when the
+/// contact that hit it was genuinely advancing -- a real drain, not only
+/// the wedged, moves-nothing shape ADR-157's own ceiling was written for.
+/// A peer that answers every pull with one cheap new entry, truncated,
+/// never exhausted, reaches `MAX_PULLS_PER_CONTACT` while advancing on
+/// every one of those pulls (the same shape `a_drain_deeper_than_the_ceiling_spills_to_the_next_tick_without_a_warning`
+/// reads at `INFO`, not `WARN`): resetting for it, on the reasoning that it
+/// is advancing so it "deserves" a reset the way a `Budget` end does, would
+/// have the tick spin another 128 cheap pulls back to back instead of
+/// waiting for the ordinary next tick -- exactly the unbounded-share-of-
+/// every-tick failure ADR-157 exists to prevent, just reached through
+/// `Ceiling` instead of `Budget`. The next tick after an advancing
+/// `Ceiling` end must land a full interval later, not at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
+    use kimmy_cluster::protocol::prove;
+    use kimmy_cluster::{
+        MAX_PULLS_PER_CONTACT, ReplicationConfig, RoundReport, SeedSource, replicate,
+    };
+
+    let b = node().await;
+    let coll = b.engine.create_collection("shop", "orders").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = move |n: u64| kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String(format!("d{n}"))),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+    };
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let pulls = Arc::clone(&pulls);
+        async move {
+            let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = tls.acceptor();
+                let (theirs, pulls) = (theirs.clone(), Arc::clone(&pulls));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                    let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                    let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    let welcome = Message::Welcome {
+                        node: origin,
+                        nonce: vec![7; 32],
+                        proof: prove(SECRET, &nonce, &binding),
+                    };
+                    if write_frame(&mut stream, &welcome).await.is_err() {
+                        return;
+                    }
+                    let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
+                    while let Ok(message) = read_frame(&mut stream).await {
+                        let answer = match message {
+                            Message::AskVersions { .. } => Message::Vectors {
+                                servable: theirs.clone(),
+                                witnessed: theirs.clone(),
+                            },
+                            Message::AskEntries { .. } => {
+                                let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
+                                let served = entry(n);
+                                let scanned_to = served.stamp.hlc;
+                                Message::Entries {
+                                    entries: vec![served],
+                                    scanned_to,
+                                    exhausted: false,
+                                    passed_through: None,
+                                }
+                            }
+                            _ => return,
+                        };
+                        if write_frame(&mut stream, &answer).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // Priced the same way `a_tick_at_the_pull_ceiling` is, and for the same
+    // reason: a pull's cost belongs to the machine, and the interval must
+    // never be what ends the contact -- only the ceiling may.
+    const PRICED_PULLS: usize = 8;
+    let mut slowest = Duration::ZERO;
+    for _ in 0..PRICED_PULLS {
+        let priced = std::time::Instant::now();
+        let one = sync_once(&b.engine, fake, SECRET, None).await.expect("a pull to price");
+        slowest = slowest.max(priced.elapsed());
+        assert!(one.truncated, "the fake must read as truncated, or this tests nothing: {one:?}");
+    }
+    let interval = slowest * (6 * MAX_PULLS_PER_CONTACT as u32);
+    let priced_pulls = pulls.load(Ordering::SeqCst);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![fake])], SECRET.into(), b.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(10);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + interval * 4 + Duration::from_secs(10);
+    // The first tick that actually reached the peer -- discovery and any
+    // earlier ticks before it get skipped, the same way the single-tick
+    // fixture does.
+    let (first_at, first_reset) = loop {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no tick reached the peer"))
+            .expect("the loop must keep reporting");
+        if pulls.load(Ordering::SeqCst) - priced_pulls > 0 {
+            break (tokio::time::Instant::now(), report.reset);
+        }
+    };
+    let ended_at_ceiling = pulls.load(Ordering::SeqCst) - priced_pulls >= MAX_PULLS_PER_CONTACT;
+    let second = tokio::time::timeout_at(deadline, rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("no second tick arrived"))
+        .expect("the loop must keep reporting");
+    let second_at = tokio::time::Instant::now();
+    looping.abort();
+
+    assert!(
+        ended_at_ceiling,
+        "premise: the first tick must reach the ceiling, {} pulls short of it",
+        MAX_PULLS_PER_CONTACT as i64 - (pulls.load(Ordering::SeqCst) - priced_pulls) as i64
+    );
+    assert!(!first_reset, "premise: the first tick is not itself a reset's continuation");
+    assert!(!second.reset, "an advancing Ceiling end must not schedule a reset for the next tick");
+    let gap = second_at.duration_since(first_at);
+    assert!(
+        gap >= interval - interval / 4,
+        "the tick after an advancing Ceiling end landed {gap:?} after it, well under the \
+         {interval:?} interval -- it was reset and carried forward despite ending at the ceiling"
     );
 }

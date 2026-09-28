@@ -61,11 +61,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   change, resumed a span, accepted a partial window, or raised coverage for
   another origin now resets the sync ticker to fire again at once, and
   carries that peer into the next tick ahead of its own rotation; a contact
-  whose pulls moved nothing (`ContactEnd::Ceiling`) is never reset or
-  carried, so a peer serving windows that cannot advance is still bounded
-  the way it always was. The tick's own length is still bounded by
-  `sync_interval_secs`; only the wait between a draining tick and its next
-  one changes. A member catching up by snapshot rather than by oplog window
+  that hits the pull ceiling instead (`ContactEnd::Ceiling`) is never reset
+  or carried, whether or not it was advancing, so a peer cannot spin
+  another ceiling's worth of pulls back to back on every reset. The tick's
+  own length is still bounded by `sync_interval_secs`; only the wait
+  between a draining tick and its next one changes. A member catching up
+  by snapshot rather than by oplog window
   is unaffected, and resumes at the interval's own cadence as before.
 
 ## 0.41.0 - 2026-09-28

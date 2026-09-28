@@ -20839,9 +20839,13 @@ immediately rather than waiting out the rest of `sync_interval_secs`
 workspace pins 1.53.1). The remembered peers are carried into that next
 tick's selection, ahead of the tick's own rotation.
 `ContactEnd::Ceiling` — a contact that hit `MAX_PULLS_PER_CONTACT` while
-every pull came back truncated and *not* advancing — is never reset or
-carried forward: that end exists specifically to bound a peer whose pulls
-move nothing, and resetting for one would defeat it. The tick's own deadline,
+still truncated — is never reset or carried forward, whether or not it was
+advancing: a real drain deeper than the ceiling reaches it too (logged at
+`info`, not `warn` — ADR-157's addendum), and resetting an advancing
+`Ceiling` end would let it spin another 128 pulls back to back on every
+reset instead of waiting for the ordinary next tick, the same unbounded
+share of every tick ADR-157 exists to prevent, reached through `Ceiling`
+rather than `Budget`. The tick's own deadline,
 `tick_started + sync_interval`, is untouched; this changes only what
 schedules the *next* tick, never what bounds the current one.
 

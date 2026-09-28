@@ -791,7 +791,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     report.opened = true;
                 }
                 // Carried peers first, filtered against this tick's live
-                // `peers` (ADR-157's addendum): a peer SWIM has since marked
+                // `peers` (ADR-195): a peer SWIM has since marked
                 // down, or membership has otherwise dropped, must not be
                 // dialled from stale state, and must not reappear in
                 // `LagVectors` after `lag.retain(&peers)` above already
@@ -824,7 +824,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // the tick's own length is most attributable to.
                 let mut slowest_contact: Option<(SocketAddr, Duration)> = None;
                 // Peers this tick ends `Budget` on while genuinely advancing
-                // (ADR-157's addendum): carried into `carry_forward` for the
+                // (ADR-195): carried into `carry_forward` for the
                 // next tick, which a reset then schedules immediately rather
                 // than after a full interval.
                 let mut resume_next_tick: BTreeSet<SocketAddr> = BTreeSet::new();
@@ -895,10 +895,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             report.pulls.ended(ended);
                             // Out of tick time but still advancing: carried
                             // into the next tick rather than left for a full
-                            // interval (ADR-157's addendum). Never `Ceiling`:
-                            // that end exists specifically to bound a
-                            // contact whose pulls never move anything, and
-                            // carrying it forward would defeat that.
+                            // interval (ADR-195). Never `Ceiling`, whether or
+                            // not it was advancing: resetting one would let a
+                            // peer spin another `MAX_PULLS_PER_CONTACT` pulls
+                            // back to back on every reset instead of waiting
+                            // for the ordinary next tick, the unbounded share
+                            // of every tick ADR-157 exists to prevent,
+                            // reached through `Ceiling` rather than `Budget`.
                             if ended == ContactEnd::Budget && outcome.advanced {
                                 resume_next_tick.insert(peer);
                             }

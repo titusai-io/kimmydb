@@ -87,15 +87,17 @@ impl PeerHealth {
 
     /// [`Self::select`], for a tick that has already given `slots` of this
     /// node's fanout budget to peers carried forward from a draining contact
-    /// (ADR-157's addendum): picks up to `fanout - slots` more from `peers`,
+    /// (ADR-195): picks up to `fanout - slots` more from `peers`,
     /// never one already in `excluded`, so what a tick contacts in total —
     /// carried plus freshly selected — never exceeds `fanout`.
     ///
-    /// `slots` rather than deriving it from `excluded.len()`: a carried peer
-    /// this tick's own `peers` no longer lists (SWIM marked it down since)
-    /// is filtered out by the caller before it reaches `excluded`, and still
-    /// spent a fanout slot on the tick that carried it — the caller counts
-    /// what it actually contacts, this only fills what is left.
+    /// `slots` rather than deriving it from `excluded.len()`: the caller
+    /// passes `carried.len()`, where `carried` is the carried set already
+    /// filtered against this tick's live `peers`. A carried peer that filter
+    /// dropped (SWIM marked it down since) is in neither `carried` nor
+    /// `excluded`, and spends no slot this tick at all — its removal frees
+    /// the slot for a fresh pick rather than leaving it stranded on a peer
+    /// this tick will not dial.
     pub fn select_excluding(
         &mut self,
         peers: &BTreeSet<SocketAddr>,
@@ -208,7 +210,7 @@ mod tests {
 
     #[test]
     fn carried_peers_take_fanout_slots_first() {
-        // ADR-157's addendum: a tick that already gave two of its three
+        // ADR-195: a tick that already gave two of its three
         // fanout slots to peers carried forward from a draining contact must
         // select at most one more, never three fresh on top of the two
         // carried -- the total contacted this tick, carried plus selected,
