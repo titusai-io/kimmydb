@@ -106,6 +106,17 @@ impl PurgeCounters {
         *self.last_progress.lock()
     }
 
+    /// Seeded with `last_progress`, for another crate's metrics test:
+    /// `last_progress` is private, with no public setter, so a test that
+    /// wants `kimmy_task_progress_age_seconds{task="drop_purger"}` reading
+    /// something other than the since-start fallback has no other way to
+    /// seed one. Never compiled into a build that ships (`test-hooks` is
+    /// off by default, and only a dev-dependency enables it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn for_test(last_progress: Option<Instant>) -> Self {
+        Self { last_progress: parking_lot::Mutex::new(last_progress), ..Default::default() }
+    }
+
     fn progressed(&self) {
         *self.last_progress.lock() = Some(Instant::now());
     }
