@@ -34,6 +34,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   tick's own length, which is not always the contact with the single
   slowest pull. Nothing about when the warning fires changes.
 
+- **A pull ceiling reached with no real progress could go unwarned on a busy
+  node.** In 0.41.0, `outcome.advanced` — what tells a genuinely wedged
+  contact (every pull truncated, nothing moving) from one draining
+  normally, and what the "pull ceiling reached for this peer this tick
+  with no pull moving this node's position" `WARN` is keyed on — compared
+  this node's whole witnessed vector before and after the pull; 0.40.2
+  keyed the same `WARN` on `applied > 0` alone. On a node with concurrent
+  local activity (a client write, a TTL expiry, another origin's confirm
+  push), the whole-vector comparison could read `true` from activity the
+  pull itself had nothing to do with, so a wedged contact could read as
+  advancing and the warning never fire. `outcome.advanced` now reads
+  applied entries or schema changes, a resumed span, an accepted partial
+  window, or coverage raised for another origin, judged from what the
+  pull's own window carried and committed rather than from a before/after
+  read of the whole vector — none of which anything outside the pull, or
+  already applied within it, can move.
+
 ## 0.41.0 - 2026-09-28
 
 **Roll the members one at a time. This release is not a rollback boundary: the

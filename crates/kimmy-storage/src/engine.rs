@@ -3003,6 +3003,11 @@ impl Engine {
     /// holds the batch's last run of documents, so a DDL-free batch is one
     /// commit rather than one plus one (ADR-119). Same rule as the wrapper:
     /// an origin only ever moves up.
+    ///
+    /// Purely a raise: whether any of it was *this batch's own* progress on
+    /// an origin other than this node's own is `SyncOutcome::coverage_raised`'s
+    /// question, answered separately by comparing this batch's own witnessed
+    /// vector against `mine` — not by anything this function returns.
     pub(crate) fn absorb_witnessed_in_txn(
         txn: &redb::WriteTransaction,
         seen: &kimmy_core::VersionVector,
@@ -4717,6 +4722,42 @@ mod tests {
             super::WRITER_WAIT_METER.with(|m| m.get()),
             None,
             "the thread is metering nothing once the call is gone"
+        );
+    }
+
+    /// `absorb_witnessed_in_txn`'s own contract, independent of ADR-157's
+    /// gate (`SyncOutcome::coverage_raised`, which compares the batch's own
+    /// `witnessed` against `mine`, not anything this function returns).
+    /// What this function owns: raising every origin `seen` names, this
+    /// node's own included, never lowering one.
+    #[test]
+    fn absorb_witnessed_in_txn_raises_every_origin_seen_and_never_lowers_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        let local = engine.node_id();
+        let other = kimmy_core::NodeId::generate();
+
+        let mut seen = kimmy_core::VersionVector::new();
+        seen.insert(local, Hlc::new(2_000, 0));
+        seen.insert(other, Hlc::new(1_000, 0));
+        let txn = engine.begin_write(WriterHolder::Replication).unwrap();
+        Engine::absorb_witnessed_in_txn(&txn, &seen).unwrap();
+        txn.commit().unwrap();
+        let witnessed = engine.witnessed_vector().unwrap();
+        assert_eq!(witnessed.get(local), Hlc::new(2_000, 0), "this node's own origin too");
+        assert_eq!(witnessed.get(other), Hlc::new(1_000, 0));
+
+        // A lower stamp for an origin already raised must not move it back.
+        let mut lower = kimmy_core::VersionVector::new();
+        lower.insert(other, Hlc::new(500, 0));
+        let txn = engine.begin_write(WriterHolder::Replication).unwrap();
+        Engine::absorb_witnessed_in_txn(&txn, &lower).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            engine.witnessed_vector().unwrap().get(other),
+            Hlc::new(1_000, 0),
+            "never lowers an origin already raised"
         );
     }
 

@@ -1219,7 +1219,7 @@ where
                 asked_partial,
             };
             let applied = kimmy_storage::blocking(|| {
-                engine.apply_peer_window_into(&theirs, &entries, window, &mut outcome)
+                engine.apply_peer_window_into(&theirs, Some(&mine), &entries, window, &mut outcome)
             });
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
@@ -1399,7 +1399,26 @@ where
     let after = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     // What ADR-157's ceiling counts: a pull that moved the position, which a
     // partial window can do without applying anything (ADR-194).
-    outcome.advanced = after != mine || spans_resumed;
+    //
+    // Judged from what this pull's own window did, not from diffing `mine`
+    // against `after`: the whole vector also moves on a busy node for
+    // reasons this pull had nothing to do with — a client write, a TTL
+    // expiry, another origin's confirm push landing between the two reads —
+    // which used to read as this pull having advanced when it had not.
+    // `outcome.partial` alone is enough to mean progress: a partial window
+    // this node did not ask for is never accepted (`partial_end` requires
+    // `asked_partial`), and one it did ask for is checked against the floor
+    // before it is believed (`partial_window_holds` rejects `p` at or below
+    // `start_sent`'s successor), so an accepted partial window has already
+    // been proven to have passed a point beyond where this request's own
+    // scan started — there is no case where it is accepted and did not
+    // move. `outcome.coverage_raised` is `Engine::apply_peer_window_into`'s
+    // own answer, from comparing the batch's own witnessed vector against
+    // the `held` this pull's own `AskEntries` sent (`mine`, passed into
+    // that call above) rather than against a fresh read of the current
+    // one, so it cannot be perturbed by anything outside this pull either.
+    outcome.advanced =
+        advanced(outcome.coverage_raised, outcome.applied, outcome.partial, spans_resumed);
     let mine = after;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;
@@ -2435,6 +2454,23 @@ impl PeerStalls {
     }
 }
 
+/// Whether a pull moved this node's position (ADR-157's ceiling, and the
+/// carry-forward gate this pull's contact end decides on): applied entries,
+/// a resumed span, an accepted partial window, or coverage raised for an
+/// origin other than this node's own.
+///
+/// Out of the loop for the same reason [`is_unreachable_from_a_correct_sender`]
+/// is: a decision worth a truth table and a test of its own, not four
+/// conditions inlined at the one call site. `coverage_raised` must already
+/// exclude this node's own origin by the time it reaches here — that
+/// exclusion is `kimmy_storage`'s: it compares the batch's own witnessed
+/// vector against the `held` this pull's own `AskEntries` sent, not
+/// against a fresh read of the current one, so nothing here can be
+/// perturbed by activity outside this pull.
+fn advanced(coverage_raised: bool, applied: usize, partial: bool, spans_resumed: bool) -> bool {
+    applied > 0 || spans_resumed || partial || coverage_raised
+}
+
 /// Whether a peer's `Entries` answer combines a claim no correct sender can
 /// produce: an empty batch while also reporting its tail was not reached.
 ///
@@ -2980,6 +3016,32 @@ mod tests {
             "a partial window that passed over only what this node holds"
         );
         assert!(!is_unreachable_from_a_correct_sender(50, false, p));
+    }
+
+    /// The truth table `advanced` decides. `coverage_raised` is a caller's
+    /// promise (`kimmy_storage` already excludes this node's own origin,
+    /// comparing the batch's own witnessed vector against `mine`, before it
+    /// reaches here), so this table's own job is only the disjunction: any
+    /// one signal is enough, all four false is the only false, and nothing
+    /// here should ever read this node's own activity as this pull having
+    /// moved anything.
+    #[test]
+    fn a_pull_is_advanced_by_any_one_of_its_own_signals() {
+        assert!(!advanced(false, 0, false, false), "nothing at all: not advanced");
+        assert!(advanced(false, 1, false, false), "applied alone is enough");
+        assert!(advanced(false, 0, true, false), "an accepted partial window is enough");
+        assert!(advanced(false, 0, false, true), "a resumed span is enough");
+        assert!(advanced(true, 0, false, false), "coverage raised for another origin is enough");
+        assert!(advanced(true, 1, true, true), "all four together, still advanced");
+        // The case this gate exists for: only this node's own origin moved
+        // (a client write, a TTL expiry, an unrelated confirm push) while
+        // the pull itself carried nothing, applied nothing, was not partial
+        // and resumed no span. `coverage_raised` is `false` for exactly this
+        // case, by its own contract, so the gate reads not-advanced.
+        assert!(
+            !advanced(false, 0, false, false),
+            "only this node's own origin moved -- not this pull's progress -- must not read as advanced"
+        );
     }
 
     /// A partial window's end, as the requester checks it (ADR-194): past
