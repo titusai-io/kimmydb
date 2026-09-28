@@ -6112,3 +6112,142 @@ async fn only_self_coverage_is_not_coverage_raised() {
     b.engine.apply_peer_window_into(&theirs, Some(&mine), &[], window, &mut outcome).unwrap();
     assert!(outcome.coverage_raised, "another origin rose: {outcome:?}");
 }
+
+/// [`wedged_fake`], with every `AskEntries` answer delayed: a wedged peer
+/// whose own cost, against a short sync interval, is large enough that
+/// `Contact::fits_before` (ADR-157) refuses a second pull well short of
+/// [`kimmy_cluster::MAX_PULLS_PER_CONTACT`] -- so the contact ends `Budget`
+/// on every tick, never `Ceiling`. That is exactly the shape ADR-195's gate
+/// has to get right: `ended == Budget` alone is not enough to reset and
+/// carry a peer forward, `outcome.advanced` has to hold too, and a wedged
+/// peer's `advanced` never does.
+async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
+    use kimmy_cluster::protocol::prove;
+    let coll = b
+        .engine
+        .get_collection("shop", "orders")
+        .unwrap_or_else(|_| b.engine.create_collection("shop", "orders").unwrap());
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String("d0".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+    };
+    b.engine.apply_remote(&coll, &entry).unwrap();
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = tls.acceptor();
+            let (theirs, entry) = (theirs.clone(), entry.clone());
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                    return;
+                };
+                let welcome = Message::Welcome {
+                    node: origin,
+                    nonce: vec![7; 32],
+                    proof: prove(SECRET, &nonce, &binding),
+                };
+                if write_frame(&mut stream, &welcome).await.is_err() {
+                    return;
+                }
+                let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
+                while let Ok(message) = read_frame(&mut stream).await {
+                    let answer = match message {
+                        Message::AskVersions { .. } => {
+                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
+                        }
+                        Message::AskEntries { .. } => {
+                            tokio::time::sleep(delay).await;
+                            Message::Entries {
+                                entries: vec![entry.clone()],
+                                scanned_to: entry.stamp.hlc,
+                                exhausted: false,
+                                passed_through: None,
+                            }
+                        }
+                        _ => return,
+                    };
+                    if write_frame(&mut stream, &answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    fake
+}
+
+/// ADR-195's carry-forward gate needs `advanced`, not `ContactEnd::Budget`
+/// alone: a contact that spends a tick's whole budget without moving
+/// anything must never be reset or carried into the next tick, or a peer
+/// that is merely slow -- never a peer whose pulls apply nothing new --
+/// would spin the loop back-to-back on it forever. A wedged peer answers
+/// slowly enough that every tick ends `Budget`, and if the gate carried it
+/// forward anyway, rounds would land back-to-back instead of one sync
+/// interval apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wedged_contact_ending_budget_is_never_reset_or_carried_forward() {
+    let b = node().await;
+    // Just over half the interval below: one pull's own cost already rules
+    // out a second before the tick's own deadline (`fits_before`,
+    // ADR-157), so every tick ends `Budget`, comfortably short of the
+    // ceiling, exactly the case ADR-195's addendum has to be judged
+    // against.
+    let fake = wedged_fake_slow(&b, Duration::from_millis(280)).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kimmy_cluster::RoundReport>();
+    let mut config = kimmy_cluster::ReplicationConfig::new(
+        vec![kimmy_cluster::SeedSource::Static(vec![fake])],
+        SECRET.into(),
+        "127.0.0.1:1".parse().unwrap(),
+    );
+    config.sync_interval = Duration::from_millis(500);
+    config.discovery_interval = Duration::from_millis(500);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(kimmy_cluster::replicate(Arc::clone(&b.engine), config));
+
+    let mut seen: Vec<(std::time::Instant, kimmy_cluster::RoundReport)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while seen.len() < 6 {
+        let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            looping.abort();
+            panic!("the loop stalled; only {} rounds seen", seen.len());
+        };
+        seen.push((std::time::Instant::now(), report));
+    }
+    looping.abort();
+
+    let budget_ends: u64 =
+        seen.iter().map(|(_, r)| r.pulls.contacts[kimmy_cluster::ContactEnd::Budget.slot()]).sum();
+    assert!(budget_ends > 0, "premise: the wedged peer must actually end on Budget");
+    let ceiling_ends: u64 =
+        seen.iter().map(|(_, r)| r.pulls.contacts[kimmy_cluster::ContactEnd::Ceiling.slot()]).sum();
+    assert_eq!(ceiling_ends, 0, "premise: the delay must keep every tick well short of the ceiling");
+
+    // A reset ticks back-to-back, at roughly one pull's own cost; an
+    // ordinary tick waits out the rest of the interval. Comfortably above
+    // the wedged peer's own 280 ms and comfortably below the 500 ms
+    // interval a wrongly-fired reset would skip.
+    let threshold = Duration::from_millis(420);
+    for pair in seen.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].0);
+        assert!(
+            gap >= threshold,
+            "a gap of {gap:?} between rounds against a peer that never advances -- shorter \
+             than the sync interval, so this contact was reset and carried forward despite \
+             never moving anything"
+        );
+    }
+}
