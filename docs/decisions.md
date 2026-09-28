@@ -20105,13 +20105,12 @@ What stays open is a store without the two-phase bit whose primary slot
 verifies and names such a page while the secondary is sound. Producing it
 takes damage that matches a 128-bit checksum.
 
-**This check is a stopgap, to be removed with redb 4.3.** It is reported
-upstream at https://github.com/cberner/redb/issues/1503. It goes once kimmydb depends on a redb release that
-refuses such a page without allocating it, and a test says when:
-`redb_itself_still_allocates_for_a_root_page_past_eof` opens a plain redb file
-with a root past its end and fails on the first redb that no longer reads the
-page. On that bump, delete the check, `root_ranges`, their tests and this
-paragraph together.
+**Reported upstream and declined, so this check is kimmydb's own permanent
+guard, not a stopgap.** A canary test watches redb's side:
+`redb_itself_still_allocates_for_a_root_page_past_eof` opens a plain redb
+file with a root past its end, and fails if a redb release stops reading
+the page — the moment to delete the check, `root_ranges`, their tests and
+this paragraph together.
 
 **A panic in redb's open is refused as damage.** A primary slot that verifies
 and names a root inside the file, but of the wrong order, makes redb 4.3 panic
@@ -20129,13 +20128,12 @@ panic refuses the store as damaged, with redb's message.
   `begin_writable` (`db.rs:1672`). So the sidecar is put back only if the header
   and length are as the check read them; after a recovery write-back it stays.
 
-**This catch is a stopgap too, to be removed with redb 4.3.** It is reported
-upstream at https://github.com/cberner/redb/issues/1505. It goes once kimmydb depends on a redb release
-that returns an error there instead of panicking. The signal is
-`redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`, which opens a
-plain redb file with such a root and fails on the first redb that no longer
-panics. On that bump, delete the catches, `Cleared::after_panicked_open`, their
-tests and this paragraph together.
+**Reported upstream and declined, so this catch is kimmydb's own permanent
+guard too, not a stopgap.** A canary test watches redb's side:
+`redb_itself_still_panics_on_a_verified_root_of_the_wrong_order` opens a
+plain redb file with such a root, and fails if a redb release stops
+panicking — the moment to delete the catches, `Cleared::after_panicked_open`,
+their tests and this paragraph together.
 
 **The sidecar is written before redb's open, and is put back only when redb
 wrote nothing.** It is written first on purpose: if redb 4.3 writes to the
