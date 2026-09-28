@@ -3196,25 +3196,41 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
 
 /// ADR-195: a contact that ends a tick's budget while still advancing
 /// resumes on the very next tick, not after waiting out the rest of
-/// `cluster.sync_interval_secs`. With the interval widened well past what
-/// one slowed pull costs, and a backlog that needs enough pulls to cross
-/// at least one tick boundary, the gap between one contact ending and the
-/// next stays within what that next contact's own pull count explains --
-/// nowhere near the interval a reset removes the wait for.
+/// `cluster.sync_interval_secs`.
+///
+/// `fits_before` (ADR-157) only stops a contact short of the tick's own
+/// deadline once the *slowest pull it has already made* would not fit in
+/// what is left -- so the wasted idle a reset reclaims is bounded by one
+/// pull's own cost, never more. A pull cheap next to the interval (as a
+/// fast pull always is on a healthy cluster) makes that idle gap tiny
+/// either way, reset or not, and hides the very defect this test exists to
+/// catch: it is only visible when one pull costs a large-enough share of
+/// the interval that a contact can fit just one of them before its own
+/// slowest-pull estimate refuses a second. This test's serve walk is
+/// slowed to just over half the interval for exactly that reason.
 #[tokio::test]
 #[ignore = "boots a real two-node cluster; run with --ignored"]
 async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
-    const TOTAL: i64 = 500;
+    const TOTAL: i64 = 300;
+    // Chosen so one pull's serve walk (below) costs just over half of it:
+    // a contact fits exactly one such pull, then `fits_before` refuses a
+    // second, ending `Budget` with close to half the interval still
+    // unused -- unused time a reset reclaims and a full-interval wait
+    // would otherwise burn.
+    const INTERVAL_SECS: u64 = 5;
+    // Every row A's serve walk examines from here costs 80 ms, and the
+    // walk itself stops at 2,700 ms of that cost -- just over half of
+    // `INTERVAL_SECS` -- so each pull serves roughly 33 rows and a
+    // contact fits exactly one of them before the interval's own deadline
+    // rules out a second (ADR-157's `fits_before`, judged against the
+    // slowest pull already made). TOTAL/33 pulls, one per contact, is
+    // enough to cross several tick boundaries.
+    const WALK_ROW_MS: u64 = 80;
+    const SERVE_WALK_MS: u64 = 2_700;
     let client = reqwest::Client::new();
     let (pa, pb) = (ports::choose(), ports::choose());
-    // Five seconds: long enough that waiting out the rest of it, rather
-    // than resetting immediately, reads as an unmistakably different gap
-    // from the dial-and-handshake preamble alone -- and long enough that
-    // several dozen pulls at ~300 ms each cross at least one tick boundary,
-    // so this drain cannot finish inside a single tick without ever
-    // reaching the mechanism under test.
-    let mut a = Node::spawn_with_interval("node-a", pa, &[pb], "", 5);
-    let b = Node::spawn_with_interval("node-b", pb, &[pa], "", 5);
+    let mut a = Node::spawn_with_interval("node-a", pa, &[pb], "", INTERVAL_SECS);
+    let b = Node::spawn_with_interval("node-b", pb, &[pa], "", INTERVAL_SECS);
     a.wait_ready(&client).await;
     b.wait_ready(&client).await;
     eventually("gossip to form", || all_report(&client, vec![&a, &b], 1)).await;
@@ -3241,14 +3257,11 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
         assert!(bulk.status().is_success());
     }
 
-    // Every row A's serve walk examines from here costs 40 ms, and the
-    // walk itself stops at 150 ms of that cost: three or four rows a pull,
-    // so draining TOTAL documents takes several dozen pulls, spread across
-    // several tick-budget contacts rather than one or two -- and each
-    // pull's own cost (roughly 150 ms plus a local dial and TLS handshake)
-    // stays far under the five-second interval either way.
-    let before =
-        a.restart_with(&[("KIMMY_TEST_WALK_ROW_MS", "40"), ("KIMMY_TEST_SERVE_WALK_MS", "150")]);
+    let (walk_row_ms, serve_walk_ms) = (WALK_ROW_MS.to_string(), SERVE_WALK_MS.to_string());
+    let before = a.restart_with(&[
+        ("KIMMY_TEST_WALK_ROW_MS", walk_row_ms.as_str()),
+        ("KIMMY_TEST_SERVE_WALK_MS", serve_walk_ms.as_str()),
+    ]);
     assert!(before.success(), "{before:?}");
     a.wait_ready(&client).await;
 
@@ -3318,16 +3331,18 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
     );
     // A gap between two contacts is the time from the end of one to the
     // end of the next, which includes that next contact's own multi-pull
-    // duration -- with a dozen or more pulls a contact, that duration
-    // alone can run into seconds, so a flat threshold cannot tell "waited
-    // out the interval" apart from "did a lot of its own genuine work".
-    // Bound it instead by what the next contact's own pull count can
-    // explain: a generous per-pull ceiling (well above the 300 ms serve
-    // walk budget, to cover the apply and the row-by-row cost besides)
-    // times its pulls, plus a flat slack for the dial and TLS handshake
-    // preamble. A gap the contact's own work can't account for means the
-    // rest was spent waiting out the interval instead of resuming at
-    // once.
+    // duration -- so a flat threshold cannot tell "waited out the
+    // interval" apart from "did its own genuine (slow, by design here)
+    // work". Bound it instead by what the next contact's own pull count
+    // can explain: a per-pull ceiling generous enough to cover the serve
+    // walk's own budget plus the apply and dial/handshake overhead besides,
+    // times its pulls, plus a flat slack. This has to sit strictly between
+    // the two cases it exists to tell apart: comfortably above a reset
+    // resuming at once (one pull's own cost, `SERVE_WALK_MS` plus a small
+    // constant overhead) and comfortably below waiting out the rest of
+    // `INTERVAL_SECS` first. A gap the contact's own work can't account
+    // for means the rest was spent waiting out the interval instead of
+    // resuming at once.
     //
     // That bound only holds after a contact that *advanced* -- ADR-195
     // resumes an advancing contact at once, but a contact that found
@@ -3336,8 +3351,8 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
     // drain's very last contact is exactly this: once B has everything, a
     // further contact against A that applies nothing is expected, and its
     // gap from the one before is the interval, not a bug.
-    const PER_PULL_CEILING: Duration = Duration::from_millis(600);
-    const PREAMBLE_SLACK: Duration = Duration::from_millis(500);
+    let per_pull_ceiling = Duration::from_millis(SERVE_WALK_MS + 800);
+    let preamble_slack = Duration::from_millis(300);
     let mut checked = 0usize;
     for pair in sightings.windows(2) {
         let (t0, _, advanced0) = pair[0];
@@ -3347,7 +3362,7 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
         }
         checked += 1;
         let gap = t1.duration_since(t0);
-        let allowed = PER_PULL_CEILING * pulls1 as u32 + PREAMBLE_SLACK;
+        let allowed = per_pull_ceiling * pulls1 as u32 + preamble_slack;
         assert!(
             gap <= allowed,
             "a gap of {gap:?} after an advancing contact and before a {pulls1}-pull contact -- \
