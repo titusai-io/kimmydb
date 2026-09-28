@@ -597,6 +597,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
+    stalls.set_sync_interval(config.sync_interval);
     // A snapshot this node was part-way through when it stopped resumes where
     // it left off rather than transferring everything again (ADR-161). Never
     // fatal: the record is an optimisation, and a node that will not start
@@ -621,6 +622,24 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut stale_peers: BTreeSet<NodeId> = BTreeSet::new();
     let retention_ms = config.tombstone_retention.as_millis() as u64;
 
+    // Peers a tick ended `Budget` on while genuinely advancing (ADR-157's
+    // addendum): read at the top of the *next* sync tick, alongside
+    // `health`'s own rotation, so a contact that ran out of this tick's
+    // budget while still draining is not made to wait a full interval for
+    // its next pull. Cleared by that tick's own selection, not appended to,
+    // so a peer that stops advancing simply falls out of it.
+    let mut carry_forward: BTreeSet<SocketAddr> = BTreeSet::new();
+    // Whether the tick about to run was scheduled by a reset (immediately
+    // after a draining tick) rather than by the ticker's own interval. Read
+    // and cleared at the top of the sync arm; set at the bottom of the
+    // previous one. `stalls.tick_opened()` must not run on a reset tick: it
+    // is what the repair cooldown counts in rounds (ADR-148), and that
+    // cooldown is wall-clock by design (its own doc comment), so counting a
+    // reset tick as a fresh round would let a rapid drain burn cooldown far
+    // faster than the constant's "five minutes at the default interval"
+    // reasoning assumes.
+    let mut tick_is_a_reset = false;
+
     loop {
         tokio::select! {
             _ = discovery.tick() => {
@@ -638,6 +657,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
             }
             _ = sync.tick() => {
+                // Whether the *previous* tick scheduled this one by a reset
+                // (a `Budget`-ended, advancing contact) rather than this one
+                // firing from the ticker's own interval. Consumed here, once,
+                // however this tick itself ends.
+                let this_tick_is_a_reset = std::mem::take(&mut tick_is_a_reset);
                 // When this tick began, so the tick that overran the
                 // interval is named once it ends (ADR-154). The loop cannot
                 // say anything *while* a tick is stuck — the stuck tick is
@@ -731,22 +755,51 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // A new tick, so the next pull at each peer opens that
                 // peer's contact: what the repair machinery counts in
                 // rounds is counted once per contact, not once per pull
-                // (ADR-148's cooldown is stated in wall-clock terms).
-                stalls.tick_opened();
-                // Chosen once: `select` advances its own rotation, so
-                // asking it again mid-tick would move on to other peers
-                // rather than hand back the ones this tick is draining.
-                // A peer still truncated goes to the back of the queue, so
-                // the tick round-robins its peers rather than draining one
-                // to exhaustion: a member behind on two origins advances on
-                // both, and one deep backlog does not spend the whole
-                // budget.
+                // (ADR-148's cooldown is stated in wall-clock terms) --
+                // except a tick a reset scheduled, which is a continuation
+                // of the tick that ended `Budget`, not a fresh round against
+                // any of its carried peers.
+                if !this_tick_is_a_reset {
+                    stalls.tick_opened();
+                }
+                // Carried peers first, filtered against this tick's live
+                // `peers` (ADR-157's addendum): a peer SWIM has since marked
+                // down, or membership has otherwise dropped, must not be
+                // dialled from stale state, and must not reappear in
+                // `LagVectors` after `lag.retain(&peers)` above already
+                // dropped it this tick. They take fanout's slots first, so
+                // a cluster with more draining peers than `fanout` still
+                // contacts at most `fanout` this tick; `select_excluding`
+                // fills only what is left.
+                let carried: BTreeSet<SocketAddr> =
+                    carry_forward.iter().copied().filter(|peer| peers.contains(peer)).collect();
+                carry_forward.clear();
+                let mut chosen: Vec<SocketAddr> = carried.iter().copied().collect();
+                chosen.extend(health.select_excluding(
+                    &peers,
+                    &carried,
+                    Instant::now(),
+                    carried.len(),
+                ));
+                // Chosen once: `select`/`select_excluding` advances its own
+                // rotation, so asking it again mid-tick would move on to
+                // other peers rather than hand back the ones this tick is
+                // draining. A peer still truncated goes to the back of the
+                // queue, so the tick round-robins its peers rather than
+                // draining one to exhaustion: a member behind on two origins
+                // advances on both, and one deep backlog does not spend the
+                // whole budget.
                 let mut draining: VecDeque<Contact> =
-                    health.select(&peers, Instant::now()).into_iter().map(Contact::new).collect();
+                    chosen.into_iter().map(Contact::new).collect();
                 // The contact whose pulls this tick summed to the most wall
                 // time, named in the tick-overrun warning below: the peer
                 // the tick's own length is most attributable to.
                 let mut slowest_contact: Option<(SocketAddr, Duration)> = None;
+                // Peers this tick ends `Budget` on while genuinely advancing
+                // (ADR-157's addendum): carried into `carry_forward` for the
+                // next tick, which a reset then schedules immediately rather
+                // than after a full interval.
+                let mut resume_next_tick: BTreeSet<SocketAddr> = BTreeSet::new();
                 while let Some(mut contact) = draining.pop_front() {
                     let peer = contact.peer;
                     // Sequential rather than concurrent: a round is cheap when
@@ -812,6 +865,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // How the contact ended, counted once per contact
                             // on the pull that ended it (ADR-175).
                             report.pulls.ended(ended);
+                            // Out of tick time but still advancing: carried
+                            // into the next tick rather than left for a full
+                            // interval (ADR-157's addendum). Never `Ceiling`:
+                            // that end exists specifically to bound a
+                            // contact whose pulls never move anything, and
+                            // carrying it forward would defeat that.
+                            if ended == ContactEnd::Budget && outcome.advanced {
+                                resume_next_tick.insert(peer);
+                            }
                             // A completed round, which is what re-measures the
                             // lag (ADR-187): here, on the pull that ended the
                             // contact, and never in the `Err` arm.
@@ -1022,6 +1084,17 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             contact.finish();
                         }
                     }
+                }
+                // A draining peer left with time still worth having: rather
+                // than wait out the rest of this interval, the next tick
+                // fires at once and picks it back up first (ADR-157's
+                // addendum). `MissedTickBehavior::Delay` (`ticker`, below)
+                // means this reset changes only the *next* tick's timing,
+                // not any tick's own deadline or any other peer's schedule.
+                if !resume_next_tick.is_empty() {
+                    sync.reset_immediately();
+                    carry_forward = resume_next_tick;
+                    tick_is_a_reset = true;
                 }
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms);

@@ -1705,6 +1705,13 @@ pub struct PeerStalls {
     /// its apply still reports what the apply refused, declined and skipped
     /// (ADR-177).
     applied: AppliedCounts,
+    /// How often `observe`/`observe_self` may record a repeated not-moved
+    /// sighting for the same peer (ADR-157's addendum). Zero (the default,
+    /// unset) never throttles, which is what every existing test that calls
+    /// `observe`/`observe_self` directly, contact by contact, still wants;
+    /// the replication loop sets it to `cluster.sync_interval_secs` with
+    /// [`PeerStalls::set_sync_interval`].
+    sync_interval: Duration,
 }
 
 /// The counts a committed apply produced that a round's report carries.
@@ -1908,11 +1915,28 @@ struct Stall {
     /// Consecutive checked contacts on which every remembered position came
     /// back unchanged.
     unchanged: u32,
+    /// When a not-moved sighting was last recorded (ADR-157's addendum): a
+    /// still position seen again inside `PeerStalls::sync_interval` of this
+    /// does not record a second one. A rapid run of checked contacts inside
+    /// one interval -- a reset-driven drain carrying an unrelated peer's
+    /// rotation slot along with it -- must not be able to reach
+    /// `FROZEN_CONTACTS` faster than three ordinary ticks would. A position
+    /// that *moved* is always recorded, whatever the timing: this only
+    /// throttles repeating "nothing changed".
+    last_sighted: Option<Instant>,
 }
 
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How often `observe`/`observe_self` may record a repeated not-moved
+    /// sighting for the same peer, once this node's own tick cadence is
+    /// known (ADR-157's addendum). The replication loop calls this once,
+    /// with `cluster.sync_interval_secs`, right after [`Self::new`].
+    pub fn set_sync_interval(&mut self, interval: Duration) {
+        self.sync_interval = interval;
     }
 
     /// The timing of the window the last round applied, if one was applied
@@ -2399,7 +2423,18 @@ impl PeerStalls {
         let stall = self.by_self.entry(peer).or_default();
         let still = !stall.trailing.is_empty()
             && stall.trailing.iter().all(|(origin, at)| mine_at.get(*origin) == *at);
-        stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
+        // A not-moved sighting inside `sync_interval` of the last recorded
+        // one does not count again (ADR-157's addendum): a moved position
+        // always does, whatever the timing.
+        let now = Instant::now();
+        let throttled = still
+            && stall
+                .last_sighted
+                .is_some_and(|last| now.saturating_duration_since(last) < self.sync_interval);
+        if !throttled {
+            stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
+            stall.last_sighted = Some(now);
+        }
         stall.trailing = trailing;
         // Defensive: the sync loop does not reach `Frozen` here. `peers` re-reads
         // `mine_at` every tick, and a checked contact leaves this node covering
@@ -2444,7 +2479,21 @@ impl PeerStalls {
         let stall = self.by_peer.entry(peer).or_default();
         let still = !stall.trailing.is_empty()
             && stall.trailing.iter().all(|(origin, at)| theirs.get(*origin) == *at);
-        stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
+        // A not-moved sighting inside `sync_interval` of the last recorded
+        // one does not count again (ADR-157's addendum): a moved position
+        // always does, whatever the timing. Otherwise a rapid run of checked
+        // contacts inside one interval -- a reset-driven drain carrying an
+        // unrelated peer's rotation slot along with it -- could reach
+        // `FROZEN_CONTACTS` far faster than three ordinary ticks would.
+        let now = Instant::now();
+        let throttled = still
+            && stall
+                .last_sighted
+                .is_some_and(|last| now.saturating_duration_since(last) < self.sync_interval);
+        if !throttled {
+            stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
+            stall.last_sighted = Some(now);
+        }
         stall.trailing = trailing;
         if stall.unchanged >= FROZEN_CONTACTS {
             PeerPosition::Frozen
@@ -3218,6 +3267,73 @@ mod tests {
         let level = vector(&[(me, 45), (peer, 30)]);
         assert_eq!(entries_threshold(&mine, &level, &span), Some(Hlc::new(45, 0)));
         assert_eq!(entries_threshold(&mine, &level, &[]), None);
+    }
+
+    /// ADR-157's addendum, option (i): a not-moved sighting recorded again
+    /// inside `sync_interval` of the last one does not count, so a rapid run
+    /// of checked contacts (several reset-driven ticks in a row) cannot
+    /// reach `FROZEN_CONTACTS` faster than that many intervals actually
+    /// elapsing would. A *moved* position always counts, whatever the
+    /// timing -- asserted here too, so the throttle cannot be read as
+    /// silencing everything rather than only repeated stillness.
+    #[test]
+    fn a_repeated_not_moved_sighting_inside_the_interval_does_not_count_again() {
+        let peer = node(1);
+        let me = node(2);
+        let mut stalls = PeerStalls::new();
+        stalls.set_sync_interval(Duration::from_millis(200));
+
+        let mine = vector(&[(me, 100), (peer, 5)]);
+        let theirs = vector(&[(me, 10), (peer, 5)]);
+
+        // First sighting: the memo being written, not yet a "still" count.
+        assert_eq!(stalls.observe(peer, &theirs, &mine), PeerPosition::Advancing);
+        // Immediately again, same position: inside the interval, so this
+        // must not be the second of `FROZEN_CONTACTS` -- it must not count
+        // at all.
+        for _ in 0..FROZEN_CONTACTS {
+            assert_eq!(
+                stalls.observe(peer, &theirs, &mine),
+                PeerPosition::Advancing,
+                "throttled: none of these land inside the interval"
+            );
+        }
+
+        // Past the interval, the same still position now counts -- once per
+        // sleep past it, since each recorded sighting resets the throttle's
+        // own window from itself.
+        for sighting in 1..FROZEN_CONTACTS {
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(
+                stalls.observe(peer, &theirs, &mine),
+                PeerPosition::Advancing,
+                "sighting {sighting} after the interval: not yet frozen"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            stalls.observe(peer, &theirs, &mine),
+            PeerPosition::Frozen,
+            "FROZEN_CONTACTS after the interval: now it counts"
+        );
+    }
+
+    #[test]
+    fn a_moved_position_always_counts_regardless_of_the_interval() {
+        let peer = node(1);
+        let me = node(2);
+        let mut stalls = PeerStalls::new();
+        stalls.set_sync_interval(Duration::from_secs(600)); // absurdly long: a move must ignore it
+
+        let mine = vector(&[(me, 100), (peer, 5)]);
+        for their_wall in [10u64, 20, 30, 40] {
+            let theirs = vector(&[(me, their_wall), (peer, 5)]);
+            assert_eq!(
+                stalls.observe(peer, &theirs, &mine),
+                PeerPosition::Advancing,
+                "a moved position is never throttled, however long the interval"
+            );
+        }
     }
 
     /// The truth table `divergence_probe_for` decides over `PeerStalls`

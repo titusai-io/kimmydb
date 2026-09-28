@@ -82,22 +82,47 @@ impl PeerHealth {
 
     /// Choose which peers to contact now.
     pub fn select(&mut self, peers: &BTreeSet<SocketAddr>, now: Instant) -> Vec<SocketAddr> {
-        if peers.is_empty() {
+        self.select_excluding(peers, &BTreeSet::new(), now, 0)
+    }
+
+    /// [`Self::select`], for a tick that has already given `slots` of this
+    /// node's fanout budget to peers carried forward from a draining contact
+    /// (ADR-157's addendum): picks up to `fanout - slots` more from `peers`,
+    /// never one already in `excluded`, so what a tick contacts in total —
+    /// carried plus freshly selected — never exceeds `fanout`.
+    ///
+    /// `slots` rather than deriving it from `excluded.len()`: a carried peer
+    /// this tick's own `peers` no longer lists (SWIM marked it down since)
+    /// is filtered out by the caller before it reaches `excluded`, and still
+    /// spent a fanout slot on the tick that carried it — the caller counts
+    /// what it actually contacts, this only fills what is left.
+    pub fn select_excluding(
+        &mut self,
+        peers: &BTreeSet<SocketAddr>,
+        excluded: &BTreeSet<SocketAddr>,
+        now: Instant,
+        slots: usize,
+    ) -> Vec<SocketAddr> {
+        let budget = self.fanout.saturating_sub(slots);
+        if budget == 0 || peers.is_empty() {
             return Vec::new();
         }
 
         // Peers in backoff are skipped, not counted against the fanout: three
-        // unreachable peers must not starve a reachable fourth.
+        // unreachable peers must not starve a reachable fourth. Peers already
+        // excluded (carried forward this tick) are skipped the same way, so
+        // this never hands out a peer twice in one tick.
         let ready: Vec<SocketAddr> = peers
             .iter()
             .copied()
+            .filter(|peer| !excluded.contains(peer))
             .filter(|peer| self.state.get(peer).is_none_or(|s| s.next_attempt <= now))
             .collect();
         if ready.is_empty() {
             return Vec::new();
         }
 
-        let take = self.fanout.min(ready.len());
+        let take = budget.min(ready.len());
         let start = self.cursor % ready.len();
         let chosen: Vec<SocketAddr> = (0..take).map(|i| ready[(start + i) % ready.len()]).collect();
 
@@ -179,6 +204,41 @@ mod tests {
         let mut h = health();
         let chosen = h.select(&peers(2), Instant::now());
         assert_eq!(chosen.len(), 2, "fanout is a cap, not a quota");
+    }
+
+    #[test]
+    fn carried_peers_take_fanout_slots_first() {
+        // ADR-157's addendum: a tick that already gave two of its three
+        // fanout slots to peers carried forward from a draining contact must
+        // select at most one more, never three fresh on top of the two
+        // carried -- the total contacted this tick, carried plus selected,
+        // never exceeds fanout.
+        let mut h = health();
+        let all = peers(9);
+        let carried: BTreeSet<SocketAddr> = all.iter().take(2).copied().collect();
+        let chosen = h.select_excluding(&all, &carried, Instant::now(), carried.len());
+        assert_eq!(chosen.len(), DEFAULT_FANOUT - 2, "only one slot left after two carried");
+        assert!(chosen.iter().all(|p| !carried.contains(p)), "never re-selects a carried peer");
+    }
+
+    #[test]
+    fn carried_peers_at_or_above_fanout_leave_nothing_to_select() {
+        let mut h = health();
+        let all = peers(9);
+        let carried: BTreeSet<SocketAddr> = all.iter().take(DEFAULT_FANOUT).copied().collect();
+        let chosen = h.select_excluding(&all, &carried, Instant::now(), carried.len());
+        assert!(chosen.is_empty(), "fanout is already spent by what was carried");
+    }
+
+    #[test]
+    fn select_is_select_excluding_with_nothing_carried() {
+        // `select` is a thin wrapper; this pins that it still behaves like
+        // the un-refactored version, not just that it compiles.
+        let all = peers(9);
+        let now = Instant::now();
+        let mut a = health();
+        let mut b = health();
+        assert_eq!(a.select(&all, now), b.select_excluding(&all, &BTreeSet::new(), now, 0));
     }
 
     #[test]
