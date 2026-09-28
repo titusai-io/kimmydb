@@ -10,6 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The tick-overrun warning says where the time went.** `a sync tick took
+  longer than cluster.sync_interval_secs` carried only how long the tick ran
+  and how many peers it had; diagnosing it needed a round sampler. It now
+  also carries `serve_ms`, `wait_ms` and `apply_ms` — this tick's pulls
+  summed by phase (the peer's walk and the wire; queued for this node's
+  single writer; the commits and their fsync) — and `slowest_peer` /
+  `slowest_peer_ms`, the contact whose pulls accounted for the most of the
+  tick's own length, which is not always the contact with the single
+  slowest pull. Nothing about when the warning fires changes.
+
 ## 0.41.0 - 2026-09-28
 
 **Roll the members one at a time. This release is not a rollback boundary: the

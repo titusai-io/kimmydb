@@ -3200,6 +3200,131 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     );
 }
 
+/// Captures the tick-overrun warning's fields, not just whether it fired
+/// (contrast [`Overruns`] above): where the tick's time went, summed across
+/// its pulls, and the peer its pulls summed to the most wall time against.
+/// The same hand-written-`Subscriber` shape as `Overruns`, for the same
+/// reason — one line is the whole question, and it is not worth a test-only
+/// logging dependency.
+#[derive(Clone, Default)]
+struct OverrunCapture(Arc<std::sync::Mutex<Option<OverrunFields>>>);
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct OverrunFields {
+    serve_ms: u64,
+    wait_ms: u64,
+    apply_ms: u64,
+    slowest_peer: String,
+    slowest_peer_ms: u64,
+}
+
+impl tracing::Subscriber for OverrunCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = OverrunVisitor::default();
+        event.record(&mut visitor);
+        if visitor.is_overrun {
+            *self.0.lock().unwrap() = Some(visitor.fields);
+        }
+    }
+
+    fn enter(&self, _: &tracing::Id) {}
+
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+#[derive(Default)]
+struct OverrunVisitor {
+    is_overrun: bool,
+    fields: OverrunFields,
+}
+
+impl tracing::field::Visit for OverrunVisitor {
+    /// Every field of a `warn!` call reaches a `Subscriber` through this one
+    /// method unless a `record_i64`/`record_u64`/etc. override intercepts it
+    /// first, and none does here (as `Overruns` above relies on for
+    /// `message`) — so `elapsed_secs`, `serve_ms` and the rest, though they
+    /// are `u64` values at the call site, arrive as their plain `{:?}`
+    /// rendering, and a `String` field arrives quoted.
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        match field.name() {
+            "message" if rendered.contains("a sync tick took longer") => self.is_overrun = true,
+            "serve_ms" => self.fields.serve_ms = rendered.parse().unwrap_or(0),
+            "wait_ms" => self.fields.wait_ms = rendered.parse().unwrap_or(0),
+            "apply_ms" => self.fields.apply_ms = rendered.parse().unwrap_or(0),
+            "slowest_peer_ms" => self.fields.slowest_peer_ms = rendered.parse().unwrap_or(0),
+            "slowest_peer" => self.fields.slowest_peer = rendered.trim_matches('"').to_string(),
+            _ => {}
+        }
+    }
+}
+
+/// The tick-overrun warning names why it ran long, so an operator reads the
+/// cause from the log line alone rather than needing a sampler — round
+/// 0440's teardown could only be explained by reading one: ~13 s waiting for
+/// the writer behind a replicated drop's purge, ~10 s apply, 0.1 s serve.
+///
+/// Unlike the drain-budget test above, this test wants an overrun on the
+/// very first tick, not a calibrated one that sometimes avoids it — so the
+/// interval is a millisecond, far under any real pull's cost, rather than
+/// priced against the machine.
+#[tokio::test]
+async fn the_tick_overrun_warning_names_its_phase_split_and_slowest_peer() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    const BATCHES: usize = 4;
+    let entries = MAX_BATCH * BATCHES;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &ca, entries);
+
+    let capture = OverrunCapture::default();
+    let captured = Arc::clone(&capture.0);
+    let _recording = tracing::subscriber::set_default(capture);
+
+    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_millis(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
+        tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the backlog never drained"))
+            .expect("the loop must keep reporting");
+        if captured.lock().unwrap().is_some() {
+            break;
+        }
+    }
+    looping.abort();
+
+    let fields = captured.lock().unwrap().clone().expect("a tick overran and was captured");
+    assert!(
+        fields.serve_ms + fields.wait_ms + fields.apply_ms > 0,
+        "the phase split must account for some of the tick's time: {fields:?}"
+    );
+    assert_eq!(
+        fields.slowest_peer,
+        a.addr.to_string(),
+        "the only peer this tick could have contacted: {fields:?}"
+    );
+    assert!(
+        fields.slowest_peer_ms > 0,
+        "the slowest peer's own pulls must have taken measurable time: {fields:?}"
+    );
+}
+
 /// A tick's contact with a peer at the pull ceiling, run against a fake peer,
 /// and what the tick said about it.
 ///
