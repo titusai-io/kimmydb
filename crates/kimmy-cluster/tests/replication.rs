@@ -6357,3 +6357,115 @@ async fn a_reset_tick_never_reaches_past_carried_peers_for_a_fresh_one_beyond_fa
         }
     }
 }
+
+/// ADR-195: the carried set is filtered against the tick's live `peers`
+/// before use, so a peer SWIM has since marked down must not be dialled
+/// from stale carried state, and must not reappear in `LagVectors` after
+/// `lag.retain(&peers)` already dropped it that tick.
+///
+/// Membership is dropped from inside `on_round`, synchronously between the
+/// tick that carries the peer forward and the reset tick's own read of
+/// membership -- the same race the filter exists for, made deterministic
+/// rather than timed. `peers.rs`'s loop calls `on_round` after it has
+/// already set `carry_forward` for the next tick but before it loops back
+/// to read membership again, so a removal made here is exactly the "SWIM
+/// marked it down in between" case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_carried_peer_dropped_from_membership_is_not_dialled_by_the_reset_tick() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+    use kimmy_cluster::{LagVectors, Members, ReplicationConfig, RoundReport, SeedSource, replicate};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let d = node().await;
+    let a = node().await;
+    // A second, data-free member: without it, dropping `a` empties
+    // membership, and the loop's own membership-or-discovery fallback
+    // (`Some(members) if !members.is_empty()`) would fall through to
+    // discovery, which still resolves `a` from its static seed -- a gap in
+    // *this fixture*, not the mechanism under test. A real cluster losing
+    // its only other member has the same gap; this test is about a peer
+    // SWIM drops out of a membership that stays non-empty.
+    let b = node().await;
+    let coll = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &coll, MAX_BATCH * 6);
+
+    let members = Members::default();
+    members.insert_for_test(a.addr, a.engine.node_id());
+    members.insert_for_test(b.addr, b.engine.node_id());
+    let lag = Arc::new(LagVectors::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let a_id = a.engine.node_id();
+
+    // Which node ids this tick actually contacted -- fanout is 1, so it is
+    // at most one, but its identity is exactly what the reset tick right
+    // after the drop must get right: `b` is a legitimate fresh pick once
+    // nothing is carried (the drop leaves `carry_forward` empty), `a` is
+    // not, however carried state a bug left behind.
+    let contacted_this_tick: Arc<std::sync::Mutex<Vec<kimmy_core::NodeId>>> = Arc::default();
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<(RoundReport, Vec<kimmy_core::NodeId>, bool)>();
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![a.addr, b.addr])],
+        SECRET.into(),
+        d.addr,
+    );
+    config.fanout = 1;
+    config.sync_interval = Duration::from_millis(120);
+    config.discovery_interval = Duration::from_millis(120);
+    config.members = Some(members.clone());
+    config.lag_vectors = Some(Arc::clone(&lag));
+    config.on_peer_staleness = Some(Arc::new({
+        let contacted = Arc::clone(&contacted_this_tick);
+        move |node, _| contacted.lock().unwrap().push(node)
+    }));
+    config.on_round = Some(Arc::new({
+        let members = members.clone();
+        let dropped = Arc::clone(&dropped);
+        let contacted = Arc::clone(&contacted_this_tick);
+        move |report: RoundReport| {
+            let this_tick = std::mem::take(&mut *contacted.lock().unwrap());
+            let mut is_the_drop_tick = false;
+            if !dropped.load(Ordering::SeqCst)
+                && report.pulls.contacts[kimmy_cluster::ContactEnd::Budget.slot()] > 0
+            {
+                members.remove_for_test(&a.addr);
+                dropped.store(true, Ordering::SeqCst);
+                is_the_drop_tick = true;
+            }
+            let _ = tx.send((report, this_tick, is_the_drop_tick));
+        }
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen_after_drop = 0usize;
+    loop {
+        let Ok(Some((_report, this_tick, is_the_drop_tick))) =
+            tokio::time::timeout_at(deadline, rx.recv()).await
+        else {
+            looping.abort();
+            panic!("the loop stalled before a Budget-ending tick ever appeared");
+        };
+        // The drop tick itself legitimately contacted `a` -- that contact
+        // is what triggered the drop, at the end of processing it, so it
+        // says nothing about the reset tick this test is actually about.
+        // Only the ticks after it must never see `a` again.
+        if dropped.load(Ordering::SeqCst) && !is_the_drop_tick {
+            seen_after_drop += 1;
+            assert!(
+                !this_tick.contains(&a_id),
+                "a tick after membership dropped the carried peer must not dial it, \
+                 whatever carried state a bug left behind: {this_tick:?}"
+            );
+            if seen_after_drop >= 3 {
+                break;
+            }
+        }
+    }
+    looping.abort();
+    assert_eq!(
+        lag.lag_ms(&kimmy_core::VersionVector::new(), u64::MAX),
+        0,
+        "the dropped peer's vector must not linger in LagVectors either"
+    );
+}
