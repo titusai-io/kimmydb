@@ -14,14 +14,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
-- **`kimmy_replication_lag_seconds` reads the lag again.** In 0.41.0 the
-  `/metrics` (Prometheus) rendering of `kimmy_replication_lag_seconds` always
-  read 0, whatever the lag; the JSON snapshot and the OTLP bridge read it
-  correctly. The gauge moved to a value computed fresh on every read (see
-  0.41.0 below), but only the JSON snapshot's builder was updated to read it
-  — the `/metrics` renderer kept reading the old pushed field, which nothing
-  writes to any more, so a scrape always saw 0 and an alert on it could never
-  fire. Both now go through one accessor.
+- **`kimmy_replication_lag_seconds` on `/metrics` reads the lag again.** In
+  0.41.0 the Prometheus `/metrics` page rendered `kimmy_replication_lag_seconds`
+  as 0 whatever the lag, so an alert on it could never fire; the OTLP
+  bridge's `kimmy.replication.lag` was not affected. 0.41.0 moved the gauge
+  to a value computed from each peer's last advertised vector whenever it
+  is read, but only the bridge was switched to it — `/metrics` kept reading
+  the old pushed field, which nothing writes to any more, so a scrape
+  always saw 0. Both now go through one accessor, so what 0.41.0 describes
+  for this gauge holds on `/metrics` from this release too.
 
 - **The tick-overrun warning says where the time went.** `a sync tick took
   longer than cluster.sync_interval_secs` carried only how long the tick ran

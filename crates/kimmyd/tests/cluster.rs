@@ -293,27 +293,39 @@ allowed_hosts = ["127.0.0.1"]
         res["token"].as_str().expect("a token").to_string()
     }
 
-    /// A gauge from `/metrics`, scraped like an operator would.
-    async fn gauge(&self, client: &reqwest::Client, name: &str) -> Option<u64> {
+    /// The raw text of one series from `/metrics`, scraped like an operator
+    /// would. `None` only when the series itself is absent -- shared by
+    /// [`Self::gauge`] and [`Self::gauge_f64`], so there is one place that
+    /// reads the wire text rather than two that could drift.
+    async fn scrape_value(&self, client: &reqwest::Client, name: &str) -> Option<String> {
         let body = client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()?;
         let prefix = format!("{name} ");
         body.lines()
             .find(|l| l.starts_with(&prefix))
             .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
+            .map(str::to_owned)
+    }
+
+    /// An integer gauge from `/metrics`. `None` only when the series is
+    /// absent; a series present but not an integer is a caller's mistake,
+    /// not a missing reading, and panics rather than returning `None` --
+    /// `kimmy_replication_lag_seconds` and the like render as a float in
+    /// seconds, and a `.parse::<u64>()` that silently dropped that to
+    /// `None` is what let a real regression hide behind a passing test.
+    /// Use [`Self::gauge_f64`] for a series that renders as a float.
+    async fn gauge(&self, client: &reqwest::Client, name: &str) -> Option<u64> {
+        let raw = self.scrape_value(client, name).await?;
+        Some(
+            raw.parse()
+                .unwrap_or_else(|_| panic!("`{name}` = `{raw}` is not an integer; use gauge_f64")),
+        )
     }
 
     /// [`Self::gauge`], for a gauge rendered as a float (seconds, not
-    /// milliseconds) -- `kimmy_replication_lag_seconds` and the like, which
-    /// `.parse::<u64>()` silently drops to `None` the moment a reading is
-    /// not an exact whole second.
+    /// milliseconds) -- `kimmy_replication_lag_seconds` and the like.
     async fn gauge_f64(&self, client: &reqwest::Client, name: &str) -> Option<f64> {
-        let body = client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()?;
-        let prefix = format!("{name} ");
-        body.lines()
-            .find(|l| l.starts_with(&prefix))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
+        let raw = self.scrape_value(client, name).await?;
+        Some(raw.parse().unwrap_or_else(|_| panic!("`{name}` = `{raw}` is not a float")))
     }
 
     async fn members_gauge(&self, client: &reqwest::Client) -> Option<u64> {
@@ -686,7 +698,7 @@ async fn replication_converges_through_gossip_discovered_peers() {
         let nodes = [&a, &b, &c];
         async move {
             for node in nodes {
-                if node.gauge(client, "kimmy_replication_lag_seconds").await != Some(0) {
+                if node.gauge_f64(client, "kimmy_replication_lag_seconds").await != Some(0.0) {
                     return false;
                 }
             }
@@ -2252,7 +2264,7 @@ async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_cl
     let probe = "kimmy_task_progress_age_seconds{task=\"stall_probe\"}";
     tokio::time::sleep(Duration::from_secs(2)).await;
     let first = node.gauge(&client, replication).await.expect("a replication age row");
-    assert_eq!(node.gauge(&client, "kimmy_replication_lag_seconds").await, Some(0));
+    assert_eq!(node.gauge_f64(&client, "kimmy_replication_lag_seconds").await, Some(0.0));
     assert!(
         node.gauge(&client, "kimmy_sync_failures_total").await.is_some_and(|n| n > 0),
         "premise: the rounds are failing"
@@ -3076,11 +3088,15 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
     let held = client.get(c.url(&last)).bearer_auth(&token).send().await.unwrap();
     assert!(held.status().is_success(), "premise: C holds the load");
 
-    assert_eq!(
-        b.gauge_f64(&client, "kimmy_replication_lag_seconds").await,
-        Some(0.0),
-        "premise: converged, so the gauge already reads 0 before the probe write"
-    );
+    eventually(
+        "the premise: converged, so the gauge already reads 0 before the probe write",
+        || {
+            let client = client.clone();
+            let b = &b;
+            async move { b.gauge_f64(&client, "kimmy_replication_lag_seconds").await == Some(0.0) }
+        },
+    )
+    .await;
 
     // Every walk row on C takes 30 ms from here: a walk over the load is
     // tens of seconds, wide enough to scrape mid-flight reliably.
@@ -3105,12 +3121,12 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
     // yet hold it), and require at least one non-zero reading before it
     // arrives -- the regression this test exists to catch is "always 0",
     // not "sometimes slow to update". Every reading is also checked against
-    // the real advertised vector's own clock: `lag_behind_ms` reads
-    // `now − held.wall_ms`, the age of B's held stamp for C's origin --
-    // "from-c-early", until "from-c" lands -- so it can never exceed how
-    // long it has actually been, real wall time, since that entry was
-    // written. A wrapped, overflowed, or otherwise made-up value would trip
-    // this, not just a merely-zero one.
+    // the test's own monotonic clock, started just before "from-c-early"
+    // was written: `lag_behind_ms` reads `now − held.wall_ms`, the age of
+    // B's held stamp for C's origin -- "from-c-early", until "from-c"
+    // lands -- so it can never exceed how long it has actually been, real
+    // wall time, since that entry was written. A wrapped, overflowed, or
+    // otherwise made-up value would trip this, not just a merely-zero one.
     let deadline = std::time::Instant::now() + patience() * 4;
     let mut saw_nonzero = false;
     let mut max_lag_secs = 0.0_f64;
@@ -3136,8 +3152,8 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
             assert!(
                 lag_secs <= real_elapsed_secs + 1.0,
                 "kimmy_replication_lag_seconds read {lag_secs} s, more than the {real_elapsed_secs} \
-                 s that have actually passed since B's held stamp (\"from-c-early\") was written \
-                 -- lag_behind_ms disagrees with the real advertised vector's clock"
+                 s the test's own clock says have actually passed since B's held stamp \
+                 (\"from-c-early\") was written -- lag_behind_ms disagrees with real time"
             );
         }
         assert!(

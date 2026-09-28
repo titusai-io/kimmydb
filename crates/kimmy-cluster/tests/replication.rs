@@ -2338,14 +2338,20 @@ async fn a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_diverge
 }
 
 /// The real proof that the silence claim holds: run the actual replication
-/// loop, with the actual hooks `kimmyd` wires straight into `kimmy-api`'s
-/// metrics, and watch every one of them while a stranded collection sits
+/// loop, with `on_round`, the hook `kimmyd` wires straight into
+/// `kimmy-api`'s metrics, and watch it while a stranded collection sits
 /// undetected on the level below `sync_once`'s reported fields (which the
 /// mechanism-level test above cannot use as evidence — see its own
 /// comment). `on_round` is what `kimmy_sync_failures_total`,
 /// `kimmy_sync_peers_backing_off`, `kimmy_sync_ddl_refused_total` and
-/// `kimmy_sync_divergent_collections` are pushed from; `on_lag` is what
-/// `kimmy_replication_lag_seconds` is pushed from.
+/// `kimmy_sync_divergent_collections` are pushed from. `on_lag` is a
+/// second, independent check on the same run: `kimmy_replication_lag_seconds`
+/// is not pushed from it in production — `kimmyd` wires `on_lag: None`
+/// (`node.rs`) and computes the gauge from `lag_vectors` when it is read
+/// instead — but the hook still exists on `ReplicationConfig`, and this
+/// test installs it anyway to confirm the loop never once saw a nonzero
+/// lag while the divergence stayed silent, on the same run `on_round`
+/// checked.
 #[tokio::test]
 async fn the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy()
 {
