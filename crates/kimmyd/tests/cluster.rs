@@ -99,6 +99,20 @@ impl Node {
     /// `storage` is added to the node's `[storage]` section, for a test that
     /// needs a setting the other tests do not.
     fn spawn_with(name: &'static str, cluster: u16, seeds: &[u16], storage: &str) -> Node {
+        Self::spawn_with_interval(name, cluster, seeds, storage, 1)
+    }
+
+    /// [`Self::spawn_with`], with the sync interval a test chooses rather
+    /// than the shortened default: a test proving something about the gap
+    /// *between* ticks needs the interval wide enough that the gap it is
+    /// measuring cannot be mistaken for an ordinary tick boundary.
+    fn spawn_with_interval(
+        name: &'static str,
+        cluster: u16,
+        seeds: &[u16],
+        storage: &str,
+        sync_interval_secs: u64,
+    ) -> Node {
         let dir = tempfile::tempdir().unwrap();
         let http = ports::choose();
         let seed_list =
@@ -124,7 +138,7 @@ enabled = true
 bind = "127.0.0.1:{cluster}"
 seeds = [{seed_list}]
 cluster_secret = "{CLUSTER_SECRET}"
-sync_interval_secs = 1
+sync_interval_secs = {sync_interval_secs}
 discovery_interval_secs = 2
 
 [webhooks]
@@ -3178,4 +3192,200 @@ async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_
         async move { b.gauge_f64(&client, "kimmy_replication_lag_seconds").await == Some(0.0) }
     })
     .await;
+}
+
+/// ADR-195: a contact that ends a tick's budget while still advancing
+/// resumes on the very next tick, not after waiting out the rest of
+/// `cluster.sync_interval_secs`. With the interval widened well past what
+/// one slowed pull costs, and a backlog that needs enough pulls to cross
+/// at least one tick boundary, the gap between one contact ending and the
+/// next stays within what that next contact's own pull count explains --
+/// nowhere near the interval a reset removes the wait for.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
+    const TOTAL: i64 = 500;
+    let client = reqwest::Client::new();
+    let (pa, pb) = (ports::choose(), ports::choose());
+    // Five seconds: long enough that waiting out the rest of it, rather
+    // than resetting immediately, reads as an unmistakably different gap
+    // from the dial-and-handshake preamble alone -- and long enough that
+    // several dozen pulls at ~300 ms each cross at least one tick boundary,
+    // so this drain cannot finish inside a single tick without ever
+    // reaching the mechanism under test.
+    let mut a = Node::spawn_with_interval("node-a", pa, &[pb], "", 5);
+    let b = Node::spawn_with_interval("node-b", pb, &[pa], "", 5);
+    a.wait_ready(&client).await;
+    b.wait_ready(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b], 1)).await;
+
+    let token = a.login(&client).await;
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    for batch in 0..TOTAL / 50 {
+        let docs: Vec<_> =
+            (0..50).map(|i| serde_json::json!({ "_id": batch * 50 + i })).collect();
+        let bulk = client
+            .post(a.url("/v1/db/shop/coll/orders/bulk"))
+            .bearer_auth(&token)
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(bulk.status().is_success());
+    }
+
+    // Every row A's serve walk examines from here costs 40 ms, and the
+    // walk itself stops at 150 ms of that cost: three or four rows a pull,
+    // so draining TOTAL documents takes several dozen pulls, spread across
+    // several tick-budget contacts rather than one or two -- and each
+    // pull's own cost (roughly 150 ms plus a local dial and TLS handshake)
+    // stays far under the five-second interval either way.
+    let before =
+        a.restart_with(&[("KIMMY_TEST_WALK_ROW_MS", "40"), ("KIMMY_TEST_SERVE_WALK_MS", "150")]);
+    assert!(before.success(), "{before:?}");
+    a.wait_ready(&client).await;
+
+    // "merged from peer" is logged once per CONTACT -- a whole tick's
+    // worth of pulls against one peer, not one line per pull -- so only
+    // lines seen from here count: the gossip contact that formed the
+    // cluster before any of this test's load existed would otherwise
+    // show up as a spurious, unrelated first sighting.
+    let mut seen = b.log().lines().filter(|l| l.contains("merged from peer")).count();
+    // Each sighting keeps its own contact's pull count and whether it
+    // advanced (applied, ddl, or a partial window -- the same gate ADR-195
+    // resumes on) alongside the Instant it was detected at, timestamped by
+    // this test's own clock rather than the log's embedded one: at a 20 ms
+    // poll against pulls hundreds of milliseconds apart, the poll
+    // granularity cannot hide a gap anywhere near the five-second interval
+    // it would take to be mistaken for one.
+    let mut sightings: Vec<(std::time::Instant, usize, bool)> = Vec::new();
+    let deadline = std::time::Instant::now() + patience() * 8;
+    loop {
+        let lines: Vec<String> =
+            b.log().lines().filter(|l| l.contains("merged from peer")).map(str::to_owned).collect();
+        if lines.len() > seen {
+            let now = std::time::Instant::now();
+            for line in &lines[seen..] {
+                // The pretty log format's field names and their "=" are
+                // colored separately (`with_ansi` has no terminal to
+                // auto-detect against, writing to a file), so "pulls=" is
+                // not contiguous text in the raw line without stripping the
+                // SGR escapes between them first.
+                let plain = strip_ansi(line);
+                let pulls = parse_field(&plain, "pulls=").unwrap_or(1);
+                let advanced = parse_field(&plain, "applied=").unwrap_or(0) > 0
+                    || parse_field(&plain, "ddl=").unwrap_or(0) > 0
+                    || parse_field(&plain, "partial=").unwrap_or(0) > 0;
+                sightings.push((now, pulls, advanced));
+            }
+            seen = lines.len();
+        }
+        let count_res = client
+            .post(b.url("/v1/db/shop/coll/orders/count"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "filter": {} }))
+            .send()
+            .await;
+        let done = if let Ok(res) = count_res {
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            body["count"].as_i64() == Some(TOTAL)
+        } else {
+            false
+        };
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drain never finished; B's log:\n{}",
+            b.log().lines().filter(|l| l.contains("merged from peer")).collect::<Vec<_>>().join("\n")
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        sightings.len() >= 3,
+        "the drain must take several contacts to prove anything about crossing a tick \
+         boundary: only {} sightings",
+        sightings.len()
+    );
+    // A gap between two contacts is the time from the end of one to the
+    // end of the next, which includes that next contact's own multi-pull
+    // duration -- with a dozen or more pulls a contact, that duration
+    // alone can run into seconds, so a flat threshold cannot tell "waited
+    // out the interval" apart from "did a lot of its own genuine work".
+    // Bound it instead by what the next contact's own pull count can
+    // explain: a generous per-pull ceiling (well above the 300 ms serve
+    // walk budget, to cover the apply and the row-by-row cost besides)
+    // times its pulls, plus a flat slack for the dial and TLS handshake
+    // preamble. A gap the contact's own work can't account for means the
+    // rest was spent waiting out the interval instead of resuming at
+    // once.
+    //
+    // That bound only holds after a contact that *advanced* -- ADR-195
+    // resumes an advancing contact at once, but a contact that found
+    // nothing left to pull ends `CaughtUp`, not `Budget`, and legitimately
+    // waits out the rest of the interval like any ordinary tick. The
+    // drain's very last contact is exactly this: once B has everything, a
+    // further contact against A that applies nothing is expected, and its
+    // gap from the one before is the interval, not a bug.
+    const PER_PULL_CEILING: Duration = Duration::from_millis(600);
+    const PREAMBLE_SLACK: Duration = Duration::from_millis(500);
+    let mut checked = 0usize;
+    for pair in sightings.windows(2) {
+        let (t0, _, advanced0) = pair[0];
+        let (t1, pulls1, _) = pair[1];
+        if !advanced0 {
+            continue;
+        }
+        checked += 1;
+        let gap = t1.duration_since(t0);
+        let allowed = PER_PULL_CEILING * pulls1 as u32 + PREAMBLE_SLACK;
+        assert!(
+            gap <= allowed,
+            "a gap of {gap:?} after an advancing contact and before a {pulls1}-pull contact -- \
+             allowing {allowed:?} for that contact's own cost -- is longer than its own work \
+             explains, so this pull waited out the interval instead of resuming at once"
+        );
+    }
+    assert!(
+        checked >= 2,
+        "the drain must cross at least two advancing contacts to prove anything about the \
+         reset: only {checked} pairs followed an advancing contact"
+    );
+}
+
+/// Pulls the integer value out of a `key=123` field in a log line, such as
+/// `pulls=12` in a "merged from peer" line.
+fn parse_field(line: &str, key: &str) -> Option<usize> {
+    let after = line.split_once(key)?.1;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Drops ANSI SGR escapes (`\x1b[...m`), such as the pretty log format's
+/// per-token coloring, leaving the plain text a field parser like
+/// [`parse_field`] can split on.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for nc in chars.by_ref() {
+                if nc == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
