@@ -10596,6 +10596,11 @@ line with the defect, so the assertion above has a witness that can see it).
 
 ## ADR-145 — The count half compares against a peer that is behind but standing still, and the divergence gauge says how old its reading is
 
+> **Amended by [ADR-195](#adr-195--a-draining-advancing-contact-resumes-by-reset-not-a-full-interval).**
+> `FROZEN_CONTACTS` counts sightings, and is wall-clock by its own reasoning;
+> a not-moved sighting recorded again inside `sync_interval` of the last one
+> does not count a second time. A moved position always counts.
+
 > **Refined by [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age):** the age reads the time since the process started before the first check, not 0.
 
 > **Amended by [ADR-146](#adr-146--the-divergence-gate-compares-witnessed-with-witnessed-a-peer-is-behind-only-when-it-has-not-processed-everything-this-node-has).**
@@ -11437,6 +11442,11 @@ a peer's pull ends at the signal while a client's backup keeps the drain
 busy; and a schema change in flight at the signal is confirmed in the drain.
 
 ## ADR-148 — A window is trusted only up to the vector that introduced it, and a stamp is minted only under the writer
+
+> **Amended by [ADR-195](#adr-195--a-draining-advancing-contact-resumes-by-reset-not-a-full-interval).**
+> `REPAIR_COOLDOWN_ROUNDS` counts contacts, and is wall-clock by its own
+> reasoning; a tick a reset scheduled is not a fresh contact for this count,
+> so it is skipped there.
 
 > **Amended by [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back).**
 > The pre-existing defect recorded below rather than fixed —
@@ -13451,6 +13461,11 @@ the announce job: the parts that turn the builds into a release.
    kept the target.
 
 ## ADR-157 — A sync tick drains what it can: one contact per peer, as many pulls as the interval affords
+
+> **Amended by [ADR-195](#adr-195--a-draining-advancing-contact-resumes-by-reset-not-a-full-interval).**
+> A tick's own deadline is unchanged, but a contact that spends the whole
+> budget while still advancing no longer waits out the rest of the interval:
+> the next tick is reset to fire immediately and picks it back up first.
 
 > **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
 > A pull that ended at the peer's budget is truncated, so the tick pulls again.
@@ -20789,3 +20804,166 @@ start rises through a finite oplog. Safety does not depend on this measure.
 - **The floor** can take a walk a few rows past its budget.
 - **An empty partial window** costs a write transaction for the witnessed
   vector alone.
+
+---
+
+## ADR-195 — A draining, advancing contact resumes by reset, not a full interval
+
+Amends [ADR-157](#adr-157--a-sync-tick-drains-what-it-can-one-contact-per-peer-as-many-pulls-as-the-interval-affords)
+(what ends a tick's own budget is unchanged; what happens next is not),
+[ADR-148](#adr-148--a-window-is-trusted-only-up-to-the-vector-that-introduced-it-and-a-stamp-is-minted-only-under-the-writer)
+(`REPAIR_COOLDOWN_ROUNDS`'s round count) and
+[ADR-145](#adr-145--the-count-half-compares-against-a-peer-that-is-behind-but-standing-still-and-the-divergence-gauge-says-how-old-its-reading-is)
+(`FROZEN_CONTACTS`'s sighting count).
+
+**The defect.** ADR-157 bounds one tick's own length at `sync_interval_secs`
+and round-robins its peers within it, but a contact that spends the whole
+budget still draining — `ContactEnd::Budget` — waits out the *rest* of the
+interval before its next pull, exactly as a contact that finished cleanly
+does. A member with a backlog deep enough to fill every tick's budget
+therefore advances once per interval regardless of how much more it could
+have pulled immediately: the fix in ADR-194 (a walk that stops at a budget
+and reports where) made every pull make progress, but progress still arrives
+at one tick's worth per `sync_interval_secs`, which is the same quantization
+this ADR's finding measured as ~9 s of a 24–25 s round on a restarted,
+quiet member (the other ~15 s is the walk itself, out of scope here).
+
+**Decision.** A contact that ends `Budget` while `outcome.advanced` is
+`true` — applied entries or a schema change, a resumed span, an accepted
+partial window, or coverage raised for another origin, judged from the
+pull's own window rather than a before/after read of the whole vector
+(`kimmy-cluster`'s `transport.rs`, `advanced()`) — is remembered, and if any
+contact ended that way this tick, the sync ticker is reset to fire
+immediately rather than waiting out the rest of `sync_interval_secs`
+(`tokio::time::Interval::reset_immediately`, stable since tokio 1.30; the
+workspace pins 1.53.1). The remembered peers are carried into that next
+tick's selection, ahead of the tick's own rotation.
+`ContactEnd::Ceiling` — a contact that hit `MAX_PULLS_PER_CONTACT` while
+still truncated — is never reset or carried forward, whether or not it was
+advancing: a real drain deeper than the ceiling reaches it too (logged at
+`info`, not `warn` — ADR-157's addendum), and resetting an advancing
+`Ceiling` end would let it spin another 128 pulls back to back on every
+reset instead of waiting for the ordinary next tick, the same unbounded
+share of every tick ADR-157 exists to prevent, reached through `Ceiling`
+rather than `Budget`. The tick's own deadline,
+`tick_started + sync_interval`, is untouched; this changes only what
+schedules the *next* tick, never what bounds the current one.
+
+**The carried set is filtered against the tick's live `peers` before use.**
+A peer SWIM has since marked down, or that membership has otherwise dropped,
+must not be dialled from stale state, and must not reappear in `LagVectors`
+after `lag.retain(&peers)` — run at the top of every tick, before selection —
+has already dropped it this tick. Carrying it forward uncorrected would
+resurrect an entry that removal just cleared.
+
+**Carried peers count against `fanout`.** `PeerHealth::select_excluding(peers,
+carried, now, slots)` gives carried peers their slots first and fills only
+`fanout - slots` more from the tick's own rotation, excluding anything
+already carried — so a tick contacts at most `fanout` peers whatever was
+carried into it, and the cursor `select_excluding` advances only moves past
+what it actually chose, not past peers it never touched.
+
+**Two round-counted timers, corrected to stay wall-clock under a
+reset-driven drain.** Both `REPAIR_COOLDOWN_ROUNDS` (ADR-148) and
+`FROZEN_CONTACTS` (ADR-145) are counted in rounds, but both are wall-clock
+measures by their own documentation and reasoning — sixty rounds is five
+minutes at the *default interval*, three sightings is fifteen seconds at it.
+A rapid run of reset-driven ticks, each firing the instant the last one
+emptied rather than a full interval later, would let either counter reach
+its threshold in far less wall-clock time than the constant's own reasoning
+assumes, which is a correctness question — a cooldown too short lets a
+repair replay a divergence it hasn't had time to actually resolve, and a
+freeze reached too fast reads a peer that is merely being contacted
+back-to-back, not one that has actually stopped — not a cosmetic one. The
+first cut skipped `stalls.tick_opened()` on every reset tick, which fixes a
+short reset chain but not a long one: a drain can chain resets for its
+whole length — the finding above measured one running some seventy minutes
+on a single peer — and skipping the open for all of it would freeze both
+counters' advance for every peer that whole time, which is not wall-clock
+either. What actually ships:
+
+- `replicate()` keeps `last_opened: Option<Instant>`. An *ordinary* tick
+  always opens, exactly as every tick did before this change: its own
+  cadence is the ticker's, not an elapsed-time comparison against
+  `last_opened`. A *reset* tick opens only when `tick_started` is at least
+  `sync_interval` past the value `last_opened` last recorded, so a chain of
+  any length opens about once an interval however many reset ticks fall
+  inside it. The two cannot share one comparison: `tick_started` is read a
+  few milliseconds after the ticker actually fires, so an ordinary tick's
+  own gap from the last open lands under `sync_interval` about as often as
+  over it, and gating every tick on `>=` would silently drop close to half
+  of ordinary opens to that jitter — measured at 24–26 of 40 opening at a
+  200 ms interval against a caught-up peer, no drain and no reset anywhere
+  in sight, which would have slowed `REPAIR_COOLDOWN_ROUNDS` to roughly
+  1.5× and `FROZEN_CONTACTS` detection to four or five ticks instead of
+  three on an otherwise healthy cluster.
+- `PeerStalls::tick_opened()` also clears a `counted_this_open` flag on
+  every remembered peer, in `by_peer` and `by_self` alike, alongside the
+  repair cooldown's own per-contact flag — the same "contact" the cooldown
+  counts, not a separate approximation of it. `observe`/`observe_self` set
+  the flag the first time they record a sighting after an open and throttle
+  a repeated not-moved one until the next open clears it; a position that
+  *moved* is always recorded, whatever the flag says. Every existing unit
+  test that drove `observe`/`observe_self` as a sequence of independent
+  contacts now calls `tick_opened()` before each one, which is what the
+  production loop actually does before a contact's first pull.
+- `RoundReport` carries `reset: bool` and `opened: bool`, so both the
+  reset chain's own ticks and which of them actually opened are directly
+  observable outside the loop, not only inferable from the cooldown's or
+  the throttle's downstream behaviour. `kimmy_sync_reset_ticks_total`
+  counts the former on `/metrics` and the OTLP bridge, and a resumed tick
+  logs at `DEBUG`.
+
+**The bound.** A contact only ends `Budget` when the next pull would not fit
+before the tick's deadline, and "fits" is judged against the slowest pull
+this contact has already made (ADR-157): it stops only once what is left of
+the interval is under that slowest pull, so at least `interval - slowest`
+of the tick was already spent when it stopped, and the tick's own length is
+at least one pull, `slowest` itself. A reset-driven tick's own length is
+therefore never under `max(slowest, interval - slowest)` — at least
+`interval / 2` in every case, and equal to it only when one pull happens to
+cost exactly half the interval; a pull cheap next to the interval (the
+ordinary case) makes a reset tick's floor close to the whole interval, not
+half of it. A reset-driven drain can therefore raise contacts-per-second by
+at most **~2×** while it is actively draining, never the near-zero a naive
+"fire again immediately, unconditionally" reset would allow, and the
+drained member serves back-to-back bounded walks at close to its
+steady-state serve load for the drain's duration — the same total load
+0.40.2's one unbounded walk put on it per member, delivered as consecutive
+bounded windows instead of a single long one, not a new load shape.
+
+**What this does not reach.** A member catching up by snapshot rather than
+by oplog window never produces `ContactEnd::Budget`: `pull_snapshot`'s
+`SyncOutcome` never sets `truncated` (a snapshot page has no batch-cap
+truncation to report), and `after_pull` can only return `Budget` when
+`truncated` is `true`. A snapshot round's `outcome.advanced` still reads
+`applied > 0` correctly through the `advanced()` gate above, but the contact it
+ran on can only end `CaughtUp` or (mid-page-budget) resume on the next
+*ordinary* tick — never `Budget`, so this ADR's reset and carry-forward
+never see it, and a member draining by snapshot resumes at the interval's
+own cadence exactly as it did before this change. This is a known scope
+limit, not an oversight: ADR-152's own page budget already bounds how long
+one round spends on a snapshot, and the finding this ADR answers is about
+the oplog-window path specifically.
+
+**Stop path, unaffected.** The replication task aborts at the shutdown
+signal (`shutdown.reached()`, via `kimmy_task`'s supervision), the same
+point in the sequence whether the task is mid-dial, mid-apply, mid-pull, or
+sitting on a tick a reset scheduled to fire immediately. A carried-forward
+tick is cancelled exactly as an ordinary one is; pulls are idempotent
+(ADR-171), so an abort mid-flight is safe regardless of where it lands. A
+timed stop matrix (release builds, forced-truncation and cold-drain load,
+concurrent writers, SIGTERM at both the requester and the server across many
+offsets, against a 0.41.0 baseline) measures this directly rather than
+resting on the argument alone.
+
+**Rejected.** Extending the tick's own deadline for a still-advancing
+contact, rather than ending the tick and resetting the next one: this would
+let one deep backlog spend an unbounded share of every tick indefinitely,
+which is the exact failure ADR-157 exists to prevent, and would make the
+tick-overrun warning (ADR-154) fire on every drain rather than staying rare.
+Firing the reset unconditionally, without the `interval / 2` floor a
+`Budget` end already implies: nothing here does this, but it is worth
+recording as the mechanism a naive read of "reset when there's more to do"
+would reach for, and why the two round-counted timer corrections above are
+required rather than optional the moment resets can be back-to-back.
