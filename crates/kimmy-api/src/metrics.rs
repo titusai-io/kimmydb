@@ -715,30 +715,39 @@ impl Metrics {
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How far behind in time this node is: seconds since the newest entry
-    /// it has applied from an origin a peer holds newer entries of, worst
-    /// origin over the peers reached in the last round.
-    ///
-    /// Pushed by the replication loop after each round, because that is the
-    /// only place a peer's version vector exists — the reason ADR-043 left
-    /// this out rather than guessing. Zero when caught up; grows with the
-    /// clock while a backlog drains, which the span of the missing history
-    /// did not (ADR-122).
-    ///
-    /// Milliseconds, and rendered to the millisecond (ADR-175). It was whole
-    /// seconds, truncated, which cannot read an effect of a few seconds.
+    /// Seeds the value read before a node has installed a live source
+    /// ([`Self::compute_replication_lag_with`]) — the brief window at start,
+    /// before replication runs, and any build that never replicates at all.
+    /// Superseded, for a node that does replicate, the moment its source is
+    /// installed: ADR-043's pushed design (a value the replication loop
+    /// updated after each round) was replaced by ADR-175's addendum, a
+    /// source computed fresh from each peer's last advertised vector on
+    /// every read, and no production code pushes here any more. Kept as the
+    /// fallback [`Self::replication_lag_ms_now`] reads with no source
+    /// installed, and so tests can exercise that branch on its own.
     pub fn set_replication_lag_ms(&self, ms: u64) {
         self.replication_lag_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Compute `kimmy_replication_lag_seconds` with `source` whenever it is
-    /// read, in place of the value [`Self::set_replication_lag_ms`] pushes
+    /// read, in place of the value [`Self::set_replication_lag_ms`] seeds
     /// (ADR-175's addendum): from each peer's last advertised vector, so a
     /// peer whose rounds fail still counts, and the reading moves with the
     /// clock between rounds. Installed once, when the node starts
     /// replicating; a second source is ignored.
     pub fn compute_replication_lag_with(&self, source: LagSource) {
         let _ = self.replication_lag_source.set(source);
+    }
+
+    /// The one value both `/metrics` and the JSON snapshot render for
+    /// `kimmy_replication_lag_seconds`: the live source if one is installed,
+    /// else the seeded fallback. A single accessor so the two surfaces
+    /// cannot read it two different ways again.
+    fn replication_lag_ms_now(&self) -> u64 {
+        match self.replication_lag_source.get() {
+            Some(source) => source(),
+            None => self.get(&self.replication_lag_ms),
+        }
     }
 
     /// One sync tick of the replication loop: how many rounds failed, how
@@ -1132,10 +1141,7 @@ impl Metrics {
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: readings.cluster_members,
             task_progress_age_secs: self.task_progress_ages_at(now),
-            replication_lag_ms: match self.replication_lag_source.get() {
-                Some(source) => source(),
-                None => self.get(&self.replication_lag_ms),
-            },
+            replication_lag_ms: self.replication_lag_ms_now(),
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
@@ -1605,7 +1611,7 @@ impl Metrics {
             wh_unreadable = readings.webhook_unreadable,
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = readings.cluster_members,
-            lag = self.get(&self.replication_lag_ms) as f64 / 1e3,
+            lag = self.replication_lag_ms_now() as f64 / 1e3,
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
@@ -3217,6 +3223,33 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // — but the bridge reports microseconds, so the conversion is the thing
         // that can silently be wrong.
         assert_eq!(s.latency_sum_us, 90 + 400 + 30_000);
+    }
+
+    #[test]
+    fn a_live_replication_lag_source_reaches_both_the_snapshot_and_the_render() {
+        // `the_snapshot_reads_the_same_atomics_the_render_does` above only
+        // ever seeds `replication_lag_ms` via `set_replication_lag_ms`, so it
+        // never installs a source and never exercises the `Some(source)`
+        // branch on either surface -- exactly the gap that let 0.41.0 render
+        // 0 forever while the snapshot read the source correctly. This is
+        // the regression that gap missed: a source installed, and both
+        // surfaces checked against it, not against each other.
+        let m = Metrics::default();
+        m.set_replication_lag_ms(19_250);
+        m.compute_replication_lag_with(std::sync::Arc::new(|| 12_345));
+        let now = Instant::now();
+        let readings = StorageReadings::default();
+
+        assert_eq!(
+            m.snapshot_with_at(&readings, now).replication_lag_ms,
+            12_345,
+            "the snapshot must read the installed source, not the seeded fallback"
+        );
+        let out = m.render_with_at(&readings, now);
+        assert!(
+            out.contains("kimmy_replication_lag_seconds 12.345\n"),
+            "the render must read the installed source, not the seeded fallback: {out}"
+        );
     }
 
     #[test]
