@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Timed stop matrix for ADR-195's reset/carry-forward (PR 2).
 
-The standing rule after a stop-path regression (#59: passed every test yet
-stopped in 6-10 s and exit 75) is that a stop path is timed against real
-processes, not only asserted on in a unit test. ADR-195 makes a draining
-tick reset the moment its budget runs out rather than waiting a full
-interval, and carries peers across ticks -- both are new state a SIGTERM
-mid-drain has to unwind cleanly, whatever pull or walk it lands inside of.
+The standing rule after a prior stop-path regression that passed every
+test yet stopped in 6-10 s and exited 75 is that a stop path is timed
+against real processes, not only asserted on in a unit test. ADR-195
+makes a draining tick reset the moment its budget runs out rather than
+waiting a full interval, and carries peers across ticks -- both are new
+state a SIGTERM mid-drain has to unwind cleanly, whatever pull or walk
+it lands inside of.
 
 This boots a real 3-node cluster per trial, forces one member (`a`) into an
 active drain from the moment it starts (a deep backlog plus
@@ -19,7 +20,10 @@ the drain to either (a) `b`, the member pulling from `a` (the "requester"),
 or (b) `a` itself (the "server", mid-walk). It records the exit code, the
 signal-to-exit duration, whether the log shows a clean "shutdown complete",
 and whether it shows a background task or HTTP connections still open at
-the end of the stop's window ("... aborted" / "still open").
+the end of the stop's window ("... aborted" / "still open"). After a clean
+exit it then restarts the stopped member on its own data and checks that
+start's own log too: an exit code of 0 is not proof the next start finds
+nothing to repair, a lesson learned the hard way before.
 
 Usage:
     scripts/stop-matrix.py --baseline-bin PATH --head-bin PATH [--trials N]
@@ -37,9 +41,9 @@ Each binary must be a `--release` build of `kimmyd`:
     # head-bin: <this worktree>/.cargo-target-resetcarry/release/kimmyd
 
 Pass means, for each build: no exit 137 (SIGKILL, something outlived every
-supervisor's own bound) or 75 (EXIT_UNCLEAN_SHUTDOWN) among its trials, and
-the head build's worst stop time no worse than the baseline's worst plus
-STOP_TIME_EPSILON.
+supervisor's own bound) or 75 (EXIT_UNCLEAN_SHUTDOWN) among its trials, no
+restart that found something to repair, and the head build's worst stop
+time no worse than the baseline's worst plus STOP_TIME_EPSILON.
 """
 
 import argparse
@@ -176,6 +180,23 @@ allowed_hosts = ["127.0.0.1"]
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
+    def restart(self, binary):
+        """Start a fresh process on this node's own data dir and config, its
+        prior log moved aside -- a clean-looking exit code and a clean start
+        are not the same claim, so the only way to check "the next start
+        repairs nothing" is to actually run it."""
+        self._stdout.close()
+        os.replace(self.stdout_path, self.stdout_path + ".before")
+        env = dict(os.environ)
+        env["KIMMY_ROOT_PASSWORD"] = ROOT_PASSWORD
+        self._stdout = open(self.stdout_path, "w")
+        self.proc = subprocess.Popen(
+            [binary, "--config", self.config_path],
+            stdout=self._stdout,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+
 
 def background_writers(node, token, stop_event):
     """A steady insert loop plus periodic TTL-eligible writes, on `node`,
@@ -283,6 +304,24 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
                 "timed_out": code is None,
             }
         )
+
+        # A clean exit code is not a clean start: restart the stopped
+        # member on its own data and check the next start's own read of it,
+        # not just the stop's own exit code.
+        if code == 0:
+            try:
+                target_node.restart(binary)
+                target_node.wait_ready(timeout=15)
+                restart_log = target_node.log()
+                result["restart_clean"] = (
+                    "previous run ended cleanly" in restart_log
+                    and "repairing the database" not in restart_log
+                )
+            except Exception as e:
+                result["restart_clean"] = False
+                result["restart_error"] = str(e)
+        else:
+            result["restart_clean"] = None
     finally:
         stop_writers.set()
         if writer_thread is not None:
@@ -320,6 +359,7 @@ def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, 
 def summarize(label, results):
     bad_exits = [r for r in results if r["exit_code"] in (EXIT_UNCLEAN_SHUTDOWN, EXIT_SIGKILLED) or r["timed_out"]]
     aborted = [r for r in results if r["task_aborted"] or r["connections_left_open"]]
+    dirty_restarts = [r for r in results if r["restart_clean"] is False]
     worst = max((r["stop_time_s"] for r in results), default=0.0)
     print(f"\n== {label}: {len(results)} trials, worst stop {worst:.3f}s ==")
     print(f"   bad exits (137/75/timeout): {len(bad_exits)}")
@@ -328,7 +368,10 @@ def summarize(label, results):
     print(f"   aborted background work / left-open connections: {len(aborted)}")
     for r in aborted:
         print(f"     {r}")
-    return worst, bad_exits, aborted
+    print(f"   next start was not clean (repaired, or restart itself failed): {len(dirty_restarts)}")
+    for r in dirty_restarts:
+        print(f"     {r}")
+    return worst, bad_exits, aborted, dirty_restarts
 
 
 def main():
@@ -354,9 +397,9 @@ def main():
     worsts = {}
     failed = False
     for label, results in all_results.items():
-        worst, bad_exits, aborted = summarize(label, results)
+        worst, bad_exits, aborted, dirty_restarts = summarize(label, results)
         worsts[label] = worst
-        if bad_exits or aborted:
+        if bad_exits or aborted or dirty_restarts:
             failed = True
 
     baseline_worst = worsts.get("baseline (v0.41.0)", 0.0)
