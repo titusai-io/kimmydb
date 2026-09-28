@@ -5799,3 +5799,98 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     assert_eq!(again, kimmy_cluster::Resolution::Confirmed, "{windows:?}");
     assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }
+
+/// `outcome.advanced` must answer "did *this pull* move anything", not "did
+/// this node's witnessed vector move at all between the two reads a pull
+/// takes" — the bug the independent review found: diffing the whole vector
+/// also catches a client write, a TTL expiry, or another origin's confirm
+/// push landing on the busy requester while the pull was in flight, none of
+/// which the pull itself did.
+///
+/// A caught-up pull (nothing new at the peer) is run repeatedly while a
+/// background task hammers the requester with local writes of its own, at
+/// real wall-clock concurrency. Every such pull must still read
+/// `advanced: false` — which the fix guarantees by construction (it never
+/// reads the whole-vector diff this bug lived in), not by winning a race: at
+/// the concurrency this test can reach, redb's MVCC reads land on a
+/// consistent snapshot too quickly to reliably straddle the two reads a
+/// wall-clock test could exploit, so this asserts the invariant the fix
+/// establishes rather than reproducing the old failure on demand.
+#[tokio::test]
+async fn a_caught_up_pull_does_not_read_as_advanced_from_the_requesters_own_concurrent_writes() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "from-a" }).unwrap();
+    // One pull to converge B with A, so every later pull from A is caught up:
+    // nothing new to carry, which is the only shape this test wants.
+    let first = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(first.applied, 1, "the fixture's premise: B converges with A in one pull");
+
+    // B's own collection, written locally throughout the test — unrelated to
+    // anything A ever sends, so any effect on `advanced` can only be the bug
+    // this test exists to catch.
+    let scratch = b.engine.create_collection("shop", "scratch").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    // `spawn_blocking`, not `spawn`: `Engine::insert` is a synchronous call
+    // with no await point, and this test's `#[tokio::test]` runtime is
+    // current-thread (the default) — a tight loop of it inside a plain
+    // `spawn`ed task would never yield, starving the very `sync_once` calls
+    // below of the executor and hanging the test rather than racing them.
+    let writer = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&b.engine);
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                engine.insert(&scratch, doc! { "_id": format!("local-{i}") }).unwrap();
+                i += 1;
+            }
+            i
+        }
+    });
+
+    const PULLS: usize = 500;
+    let mut outcomes = Vec::with_capacity(PULLS);
+    for _ in 0..PULLS {
+        outcomes.push(sync_once(&b.engine, a.addr, SECRET, None).await.unwrap());
+    }
+    stop.store(true, Ordering::Relaxed);
+    let written = writer.await.unwrap();
+    // Not a fixed threshold: how far the writer gets against 500 pulls
+    // depends on ambient load (this ran at 31 alongside the rest of the
+    // suite, and over 100 alone), so this only checks the writer ran at
+    // all, not how far.
+    assert!(written > 0, "the writer thread must have run, or this races nothing: {written}");
+
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome.applied, 0, "A had nothing new to give pull {i}: {outcome:?}");
+        assert!(
+            !outcome.advanced,
+            "pull {i} carried nothing from A and must not read as advanced just because B was \
+             writing its own documents at the same time: {outcome:?}"
+        );
+    }
+}
+
+/// The other side of the same gate: a window that genuinely brings the
+/// *first-ever* entry from an origin this node has never witnessed anything
+/// from must read as advanced. This is the case a naive per-origin exclusion
+/// of `mine`'s entries (rather than `after`'s) would miss: an origin absent
+/// from `mine`'s map entirely has nothing for `mine.iter()` to find.
+#[tokio::test]
+async fn a_windows_first_ever_entry_from_a_new_origin_reads_as_advanced() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    // Nothing pulled from A yet, so A's origin is one B has never witnessed
+    // anything from at all — absent from B's vector, not merely at Hlc::ZERO
+    // in it.
+    a.engine.insert(&ca, doc! { "_id": "a-first-write" }).unwrap();
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(outcome.applied, 1, "{outcome:?}");
+    assert!(outcome.advanced, "a brand-new origin's first entry is progress: {outcome:?}");
+}

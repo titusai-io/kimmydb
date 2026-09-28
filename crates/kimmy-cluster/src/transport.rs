@@ -1399,7 +1399,24 @@ where
     let after = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     // What ADR-157's ceiling counts: a pull that moved the position, which a
     // partial window can do without applying anything (ADR-194).
-    outcome.advanced = after != mine || spans_resumed;
+    //
+    // Judged from what this pull's own window did, not from diffing `mine`
+    // against `after`: the whole vector also moves on a busy node for
+    // reasons this pull had nothing to do with — a client write, a TTL
+    // expiry, another origin's confirm push landing between the two reads —
+    // which used to read as this pull having advanced when it had not.
+    // `outcome.partial` alone is enough to mean progress: a partial window
+    // this node did not ask for is never accepted (`partial_end` requires
+    // `asked_partial`), and one it did ask for is checked against the floor
+    // before it is believed (`partial_window_holds` rejects `p` at or below
+    // `start_sent`'s successor), so an accepted partial window has already
+    // been proven to have passed a point beyond where this request's own
+    // scan started — there is no case where it is accepted and did not
+    // move. `outcome.coverage_raised` is computed inside the batch's own
+    // commit transaction (`Engine::apply_peer_window_into`), so it cannot
+    // be perturbed by anything outside that transaction either.
+    outcome.advanced =
+        outcome.applied > 0 || spans_resumed || outcome.partial || outcome.coverage_raised;
     let mine = after;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;

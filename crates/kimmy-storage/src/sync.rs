@@ -244,8 +244,18 @@ pub struct SyncOutcome {
     /// witnessed vector rose, or a span it names resumes further on. What
     /// ADR-157's ceiling counts, since a partial window can advance the
     /// position without applying anything (ADR-194). Set only by
-    /// `kimmy-cluster`'s `sync_once`.
+    /// `kimmy-cluster`'s `sync_once`, from `applied`, `partial` and
+    /// `coverage_raised` below, plus the span-resume signal `sync_once`
+    /// alone can see.
     pub advanced: bool,
+    /// Whether applying this batch raised the witnessed vector for an
+    /// origin *other than this node's own*, computed inside the batch's own
+    /// commit transaction (`Engine::absorb_witnessed_in_txn`), not from a
+    /// before/after read of the whole vector: the latter is also moved by
+    /// unrelated local activity landing between the two reads on a busy
+    /// node (a client write, a TTL expiry, another origin's push), which is
+    /// not this batch's progress. Set by [`Engine::apply_peer_window_into`].
+    pub coverage_raised: bool,
     /// Whether this round was spent repairing (ADR-148): re-serving the
     /// peer's oplog from below this node's position, or pulling its
     /// snapshot, because a divergence had been confirmed against it or a
@@ -1193,7 +1203,8 @@ impl Engine {
         // bookkeeping, and it used to cost it every time.
         if !witnessed.is_empty() {
             let txn = self.witness_txn(run)?;
-            Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
+            outcome.coverage_raised |=
+                Engine::absorb_witnessed_in_txn(txn, &witnessed, self.node_id())?;
         }
         #[cfg(any(test, feature = "test-hooks"))]
         if count_hooks::fails(count_hooks::Fail::BeforeLastCommit) {

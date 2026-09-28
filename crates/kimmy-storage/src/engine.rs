@@ -2992,7 +2992,7 @@ impl Engine {
             return Ok(());
         }
         let txn = self.begin_write(WriterHolder::Replication)?;
-        Self::absorb_witnessed_in_txn(&txn, seen)?;
+        Self::absorb_witnessed_in_txn(&txn, seen, self.node_id())?;
         txn.commit()?;
         Ok(())
     }
@@ -3003,14 +3003,35 @@ impl Engine {
     /// holds the batch's last run of documents, so a DDL-free batch is one
     /// commit rather than one plus one (ADR-119). Same rule as the wrapper:
     /// an origin only ever moves up.
+    ///
+    /// Returns whether any origin *other than* `local` was raised to a stamp
+    /// *above* [`Hlc::ZERO`]: this batch's own coverage, computed from
+    /// `raise_version`'s per-origin answer in the same transaction the
+    /// coverage commits in, rather than from a before/after read of the
+    /// whole vector outside it. A caller that diffed the whole vector around
+    /// this call instead would also catch unrelated local activity landing
+    /// between the two reads on a busy node — a client write, a TTL expiry,
+    /// another origin's push — and call that this batch's own progress. See
+    /// `SyncOutcome::coverage_raised`.
+    ///
+    /// The zero exclusion matters: `raise_version` reports an origin it has
+    /// never stored a row for as raised regardless of the stamp, including
+    /// `Hlc::ZERO` — the value an empty, non-exhausted window's clamp merges
+    /// in for an origin this node has not reached (ADR-126/127's U1). That
+    /// row conveys nothing (the origin still reads as never-witnessed to
+    /// every reader of the vector), so it must not read as this batch having
+    /// made progress.
     pub(crate) fn absorb_witnessed_in_txn(
         txn: &redb::WriteTransaction,
         seen: &kimmy_core::VersionVector,
-    ) -> Result<()> {
+        local: NodeId,
+    ) -> Result<bool> {
+        let mut raised_other = false;
         for (node, hlc) in seen.iter() {
-            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
+            let raised = raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
+            raised_other |= raised && node != local && hlc > Hlc::ZERO;
         }
-        Ok(())
+        Ok(raised_other)
     }
 
     /// Record that a stamp has been processed, whatever came of it.
