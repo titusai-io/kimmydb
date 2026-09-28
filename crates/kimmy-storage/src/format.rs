@@ -297,16 +297,15 @@ fn root_past_end(header: &[u8], slot: usize, len: u64) -> Option<(std::ops::Rang
 /// Refuse a store whose commit slot names a root page that ends past the
 /// file, where redb would read it.
 ///
-/// **This is kimmydb's own permanent check, not a stopgap.** redb 4.3
-/// refuses a root of order above 20 before reading it, but one of order 20
-/// or less it reads into a zero-filled buffer of the page's length first, up to
-/// 4 GiB, and only then fails at the file's end. Under a 2 GiB memory limit
-/// that start is OOM-killed rather than refused. redb's maintainer has ruled
-/// this out of scope, reported upstream: a commit slot whose checksum
-/// verifies but names a root past the file is not corruption redb is asked
-/// to detect. `format::tests::redb_itself_still_allocates_for_a_root_page_past_eof`
-/// is a canary, not a removal trigger — it tells us if redb's behaviour here
-/// ever changes — and this check and `root_ranges` stay regardless.
+/// **Reported upstream and declined, so this is kimmydb's own permanent
+/// check, not a stopgap.** redb 4.3 refuses a root of order above 20 before
+/// reading it, but one of order 20 or less it reads into a zero-filled
+/// buffer of the page's length first, up to 4 GiB, and only then fails at
+/// the file's end. Under a 2 GiB memory limit that start is OOM-killed
+/// rather than refused. A canary test watches redb's side:
+/// `format::tests::redb_itself_still_allocates_for_a_root_page_past_eof`
+/// fails if a redb release stops allocating the page, and the check,
+/// `root_ranges`, their tests and this paragraph can then go together.
 ///
 /// Which slot redb reads decides what is checked, as redb 4.3 decides it
 /// (`header.rs`, `select_primary_slot`). With the two-phase bit, which every
@@ -397,17 +396,16 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
 
 /// [`read_only_fallback`], with a panic in redb refused as damage.
 ///
-/// **This is kimmydb's own permanent catch, not a stopgap.** A primary slot
-/// that verifies but names a root of the wrong order, one that still lies
-/// inside the file, makes redb 4.3 panic in its first tree read
-/// (`btree.rs:1112`, `types.rs:721`) rather than return `Corrupted`. A
-/// read-only open never writes, and no sidecar has been written yet. The same
-/// holds for the read-write open ([`Cleared::after_panicked_open`]). redb's
-/// maintainer has ruled this out of scope, reported upstream: a
-/// checksum-valid slot naming a bad root is not corruption redb is asked to
-/// detect. `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
-/// is a canary, not a removal trigger — it tells us if redb's behaviour here
-/// ever changes — and both catches and that test stay regardless.
+/// **Reported upstream and declined, so this is kimmydb's own permanent
+/// catch, not a stopgap.** A primary slot that verifies but names a root of
+/// the wrong order, one that still lies inside the file, makes redb 4.3
+/// panic in its first tree read (`btree.rs:1112`, `types.rs:721`) rather
+/// than return `Corrupted`. A read-only open never writes, and no sidecar
+/// has been written yet. The same holds for the read-write open
+/// ([`Cleared::after_panicked_open`]). A canary test watches redb's side:
+/// `format::tests::redb_itself_still_panics_on_a_verified_root_of_the_wrong_order`
+/// fails if a redb release stops panicking, and both catches and that test
+/// can then go together.
 fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -> Result<Prior> {
     #[cfg(test)]
     let started = std::time::Instant::now();
@@ -1799,16 +1797,13 @@ mod tests {
     /// itself, with nothing in front of it, panics on a commit slot that
     /// verifies and names a root of the wrong order inside the file, where it
     /// should return an error. The store is a plain redb file of 500 rows.
-    /// redb's maintainer has ruled this out of scope, reported upstream, so
-    /// the catches are permanent, and this is a canary rather than a removal
-    /// trigger.
-    ///
-    /// **If a redb bump ever makes this fail, because both opens now return
-    /// an error,** that is the moment to delete
+    /// Reported upstream and declined, so the catches are permanent, and
+    /// this test is the canary: if a redb bump ever makes it fail, because
+    /// both opens now return an error, that is the moment to delete
     /// `read_only_fallback_unless_it_panics`, `Cleared::after_panicked_open`,
     /// the catch in `Engine::open_cleared`, this test and the tests of the
     /// catch together, and the paragraph in ADR-190's addendum that names
-    /// them — not before.
+    /// them.
     #[test]
     fn redb_itself_still_panics_on_a_verified_root_of_the_wrong_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -1871,14 +1866,11 @@ mod tests {
     /// the 16,384 KiB page on macOS), while a redb that refused the page
     /// without allocating it would rise by close to nothing.
     ///
-    /// redb's maintainer has ruled this out of scope, reported upstream, so
-    /// [`check_roots`] is permanent, and this is a canary rather than a
-    /// removal trigger.
-    ///
-    /// **If a redb bump ever makes this fail, because redb no longer
-    /// allocates such a page,** that is the moment to delete `check_roots`,
-    /// `root_ranges`, this test and the tests of the check together, and the
-    /// paragraph in ADR-190's addendum that names them — not before.
+    /// Reported upstream and declined, so [`check_roots`] is permanent, and
+    /// this test is the canary: if a redb bump ever makes it fail, because
+    /// redb no longer allocates such a page, that is the moment to delete
+    /// `check_roots`, `root_ranges`, this test and the tests of the check
+    /// together, and the paragraph in ADR-190's addendum that names them.
     #[test]
     fn redb_itself_still_allocates_for_a_root_page_past_eof() {
         const ORDER: u8 = 12;
