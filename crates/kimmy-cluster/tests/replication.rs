@@ -6477,3 +6477,79 @@ async fn a_carried_peer_dropped_from_membership_is_not_dialled_by_the_reset_tick
         "the dropped peer's vector must not linger in LagVectors either"
     );
 }
+
+/// ADR-195: a reset chain opens about once `sync_interval_secs`, whatever
+/// mix of ordinary and reset ticks fills that interval -- never once a
+/// tick. A chain that opened every reset tick would let
+/// `REPAIR_COOLDOWN_ROUNDS` and the not-moved-sighting throttle behind
+/// `FROZEN_CONTACTS` both advance in far less wall-clock time than either
+/// constant's own reasoning assumes; a chain deep enough to run several
+/// intervals, most of its ticks resets, is what tells the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let d = node().await;
+    let a = node().await;
+    let coll = a.engine.create_collection("shop", "orders").unwrap();
+    seed(&a, &coll, MAX_BATCH * 40);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let interval = Duration::from_millis(80);
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), d.addr);
+    config.fanout = 1;
+    config.sync_interval = interval;
+    config.discovery_interval = interval;
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
+
+    let start = tokio::time::Instant::now();
+    let deadline = start + Duration::from_secs(30);
+    let (mut total_ticks, mut opened_ticks, mut reset_ticks) = (0usize, 0usize, 0usize);
+    let chain_ended_at = loop {
+        let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            looping.abort();
+            panic!(
+                "the loop stalled; {total_ticks} ticks so far, {opened_ticks} opened, \
+                 {reset_ticks} resets"
+            );
+        };
+        total_ticks += 1;
+        opened_ticks += usize::from(report.opened);
+        reset_ticks += usize::from(report.reset);
+        let now = tokio::time::Instant::now();
+        // The tick right after the chain: a reset chain ran (reset_ticks
+        // > 0 already) and this tick was not one of it, either because the
+        // peer caught up or because it fell back to waiting out the
+        // interval -- either way, the chain this test measures is over.
+        if reset_ticks > 0 && !report.reset {
+            break now;
+        }
+    };
+    looping.abort();
+    let elapsed = chain_ended_at.duration_since(start);
+
+    assert!(
+        reset_ticks >= 3,
+        "premise: this needs a real reset chain, several ticks long, not one or two: \
+         {reset_ticks} reset ticks over {total_ticks} total"
+    );
+    assert!(
+        total_ticks > opened_ticks,
+        "premise: some of the reset chain's ticks must not have opened, or this proves \
+         nothing: {total_ticks} total, {opened_ticks} opened"
+    );
+
+    // About one open per interval elapsed, generous slack either side for
+    // the first tick, scheduling jitter and the chain's own tail.
+    let expected_opens = (elapsed.as_secs_f64() / interval.as_secs_f64()).ceil() as usize;
+    assert!(
+        opened_ticks <= expected_opens + 2,
+        "opened {opened_ticks} times over {elapsed:?} at a {interval:?} interval -- about \
+         {expected_opens} expected, not open on {opened_ticks} of {total_ticks} total ticks"
+    );
+}
