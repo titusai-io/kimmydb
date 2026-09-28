@@ -86,7 +86,7 @@ pub fn encode_into(value: &Bson, out: &mut Vec<u8>) -> Result<()> {
         }
 
         Bson::Decimal128(_) => {
-            return Err(Error::UnsupportedOperator(
+            return Err(Error::InvalidQuery(
                 "Decimal128 cannot be used as an index key or _id".to_string(),
             ));
         }

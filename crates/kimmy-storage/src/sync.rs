@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
 use crate::walk::{WalkScope, open_walk_table};
-use crate::watch::OplogWindow;
+use crate::watch::{ExamineBudget, OplogWindow};
 
 /// What applying a batch of replicated entries did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -236,6 +236,16 @@ pub struct SyncOutcome {
     /// Set only by `kimmy-cluster`'s `sync_once`, like the three fields
     /// above.
     pub truncated: bool,
+    /// Whether this pull's window ended at the sender's budget (ADR-194): a
+    /// partial window, which the `merged from peer` line counts. Set only by
+    /// `kimmy-cluster`'s `sync_once`.
+    pub partial: bool,
+    /// Whether this pull moved this node's position against the peer: its
+    /// witnessed vector rose, or a span it names resumes further on. What
+    /// ADR-157's ceiling counts, since a partial window can advance the
+    /// position without applying anything (ADR-194). Set only by
+    /// `kimmy-cluster`'s `sync_once`.
+    pub advanced: bool,
     /// Whether this round was spent repairing (ADR-148): re-serving the
     /// peer's oplog from below this node's position, or pulling its
     /// snapshot, because a divergence had been confirmed against it or a
@@ -442,6 +452,25 @@ struct Introduced<'a> {
     theirs: &'a VersionVector,
     scanned_to: Hlc,
     exhausted: bool,
+    /// Where the sender's budget ended the window (ADR-194), counted only
+    /// when this node asked for a partial window.
+    passed_through: Option<Stamp>,
+    asked_partial: bool,
+}
+
+/// Where a window a peer served ended, as the peer said (ADR-127, ADR-194).
+#[derive(Clone, Copy, Debug)]
+pub struct PeerWindow {
+    /// The last stamp the peer's scan examined.
+    pub scanned_to: Hlc,
+    /// Whether the scan reached the end of the peer's oplog.
+    pub exhausted: bool,
+    /// The full stamp of the last row the peer examined, when its budget
+    /// ended the window.
+    pub passed_through: Option<Stamp>,
+    /// Whether this node's request asked for a partial window: a
+    /// `passed_through` it did not ask for is ignored.
+    pub asked_partial: bool,
 }
 
 /// Where a served window ends, for [`coverage_up_to`].
@@ -628,13 +657,28 @@ impl Engine {
         exhausted: bool,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
+        let window =
+            PeerWindow { scanned_to, exhausted, passed_through: None, asked_partial: false };
+        self.apply_peer_window_into(theirs, entries, window, outcome)
+    }
+
+    /// [`Self::apply_peer_batch_into`], for a window whose end the peer
+    /// stated in full (ADR-194): a partial window this node asked for, which
+    /// the sender's budget ended at `passed_through`, is covered through that
+    /// stamp, however few entries it carried.
+    pub fn apply_peer_window_into(
+        &self,
+        theirs: &VersionVector,
+        entries: &[OplogEntry],
+        window: PeerWindow,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
+        let PeerWindow { scanned_to, exhausted, passed_through, asked_partial } = window;
+        let introduced =
+            Introduced { theirs, scanned_to, exhausted, passed_through, asked_partial };
         self.test_apply_delay();
         let (applied, waited) = crate::engine::metered_writer_wait(|| {
-            self.apply_batch_absorbing_into(
-                entries,
-                Some(Introduced { theirs, scanned_to, exhausted }),
-                outcome,
-            )
+            self.apply_batch_absorbing_into(entries, Some(introduced), outcome)
         });
         outcome.writer_wait = waited;
         applied
@@ -740,7 +784,23 @@ impl Engine {
         marked: &[MarkedRange],
         scope: WalkScope,
     ) -> Result<OplogWindow> {
-        self.entries_for_peer_counting(from, limit, held, marked, scope, &std::cell::Cell::new(0))
+        let passed = std::cell::Cell::new(0);
+        self.entries_for_peer_counting(from, limit, held, marked, scope, &passed, None)
+    }
+
+    /// [`Self::entries_for_peer_holding`], ended by `budget` (ADR-194): a
+    /// schema change's confirmation push, which walks the same range a pull
+    /// does and holds its request while it does.
+    pub fn entries_for_peer_within(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        scope: WalkScope,
+        budget: ExamineBudget,
+    ) -> Result<OplogWindow> {
+        let passed = std::cell::Cell::new(0);
+        self.entries_for_peer_counting(from, limit, held, &[], scope, &passed, Some(budget))
     }
 
     /// [`Self::entries_for_peer_marked`], for a window this node is serving a
@@ -749,12 +809,16 @@ impl Engine {
     /// serving — a walk costs what it scans, not what it sends. The one caller
     /// is the replication listener; a local read of the same range, such as
     /// webhook delivery's, is not a window served and is not counted.
+    ///
+    /// `budget` ends the walk early (ADR-194): the partial window a requester
+    /// that asked for one gets, and the hard cap on one that did not.
     pub fn serve_entries_to_peer(
         &self,
         from: Hlc,
         limit: usize,
         held: Option<&VersionVector>,
         marked: &[MarkedRange],
+        budget: Option<ExamineBudget>,
     ) -> Result<OplogWindow> {
         let passed = std::cell::Cell::new(0u64);
         let walk = crate::hold_meter::Scope::walk();
@@ -767,6 +831,7 @@ impl Engine {
             marked,
             WalkScope::Background,
             &passed,
+            budget,
         );
         let walked = walked_from.elapsed();
         let (read, _) = walk.finish();
@@ -778,6 +843,12 @@ impl Engine {
 
     /// The walk behind both, adding every entry it examines and does not
     /// return to `passed`.
+    ///
+    /// **The floor is measured from where the scan starts**, the lowest span
+    /// when that is below `from` (ADR-194): a budgeted walk ends only past
+    /// `start`'s successor, so whatever the budget, the next request's scan
+    /// starts further on.
+    #[allow(clippy::too_many_arguments)]
     fn entries_for_peer_counting(
         &self,
         from: Hlc,
@@ -786,10 +857,11 @@ impl Engine {
         marked: &[MarkedRange],
         scope: WalkScope,
         passed: &std::cell::Cell<u64>,
+        budget: Option<ExamineBudget>,
     ) -> Result<OplogWindow> {
         let marked = if held.is_some() { marked } else { &[] };
         let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
-        self.read_oplog_from_skipping(
+        self.read_oplog_budgeted(
             start,
             limit,
             scope,
@@ -804,6 +876,7 @@ impl Engine {
                 passed.set(passed.get() + u64::from(!keep));
                 keep
             },
+            budget.map(|budget| (budget, start.successor())),
         )
     }
 
@@ -1091,11 +1164,21 @@ impl Engine {
         // What the window proved beyond the entries themselves: to its end
         // as the peer reported it, clamped to what it actually carried, or
         // to just before the entry the batch stopped at.
-        if let Some(Introduced { theirs, scanned_to, exhausted }) = introduced {
-            let end = match (stopped_at, exhausted) {
-                (Some(stop), _) => WindowEnd::Before(stop),
-                (None, true) => WindowEnd::Exhausted,
-                (None, false) => match entries.last() {
+        if let Some(Introduced { theirs, scanned_to, exhausted, passed_through, asked_partial }) =
+            introduced
+        {
+            // A `passed_through` this node did not ask for is not believed.
+            let partial = passed_through.filter(|_| asked_partial);
+            let end = match (stopped_at, exhausted, partial) {
+                (Some(stop), _, _) => WindowEnd::Before(stop),
+                (None, true, _) => WindowEnd::Exhausted,
+                // A partial window this node asked for (ADR-194): every row
+                // the sender examined through `p` was delivered, withheld or
+                // passed over as held, so the window reaches `p`, entries or
+                // none. The transport checked `p` against the entries and the
+                // floor before this ran.
+                (None, false, Some(p)) => WindowEnd::Through(p),
+                (None, false, None) => match entries.last() {
                     Some(last) if last.stamp.hlc <= scanned_to => WindowEnd::Through(last.stamp),
                     Some(last) => WindowEnd::Through(Stamp::new(scanned_to, last.stamp.node)),
                     None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
@@ -5793,7 +5876,7 @@ mod tests {
         assert!(
             matches!(
                 kimmy_core::PartialFilter::parse(&filter),
-                Err(kimmy_core::Error::UnsupportedOperator(_))
+                Err(kimmy_core::Error::UnsupportedOperator { .. })
             ),
             "premise: this build refuses that filter for its operator: {:?}",
             kimmy_core::PartialFilter::parse(&filter)
@@ -7661,6 +7744,7 @@ mod tests {
             entries: window.entries[..n].to_vec(),
             scanned_to: window.entries[n - 1].stamp.hlc,
             exhausted: false,
+            passed_through: None,
         }
     }
 
@@ -7779,6 +7863,7 @@ mod tests {
             entries: whole.entries[..1].to_vec(),
             scanned_to: whole.entries[0].stamp.hlc,
             exhausted: false,
+            passed_through: None,
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
@@ -7908,6 +7993,7 @@ mod tests {
             entries: whole.entries[..2].to_vec(),
             scanned_to: whole.entries[1].stamp.hlc,
             exhausted: false,
+            passed_through: None,
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
@@ -7949,6 +8035,7 @@ mod tests {
             entries: window.entries[from..to].to_vec(),
             scanned_to: window.entries[to - 1].stamp.hlc,
             exhausted: to == window.entries.len() && window.exhausted,
+            passed_through: None,
         }
     }
 
@@ -8054,6 +8141,7 @@ mod tests {
                 .collect(),
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
+            passed_through: None,
         };
         assert_eq!(kinds(&after), [OpKind::DropCollection, OpKind::CreateCollection]);
 
@@ -8201,6 +8289,7 @@ mod tests {
             entries: vec![whole.entries[index].clone(), whole.entries[drop].clone()],
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
+            passed_through: None,
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), after);
@@ -8248,6 +8337,7 @@ mod tests {
             entries: vec![whole.entries[creates[0]].clone(), whole.entries[configure1].clone()],
             scanned_to: whole.entries[configure1].stamp.hlc,
             exhausted: false,
+            passed_through: None,
         };
         apply(&b, &theirs, &held).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
@@ -8259,6 +8349,7 @@ mod tests {
             ],
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
+            passed_through: None,
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), after);
@@ -8458,6 +8549,7 @@ mod tests {
             scanned_to: entries.last().unwrap().stamp.hlc,
             entries,
             exhausted: false,
+            passed_through: None,
         };
 
         // The configuration first, then the drop.
@@ -8881,6 +8973,227 @@ mod tests {
                 counts,
                 "{fail:?}: {delivered:?} then {re_served:?}"
             );
+        }
+    }
+}
+
+/// A served window ended by its budget, and what the requester keeps of it
+/// (ADR-194): at the unit level, with the budget's time at zero, so every
+/// window ends at its floor.
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::watch::ExamineBudget;
+    use bson::doc;
+    use kimmy_core::{CollectionId, DocId, NodeId};
+
+    /// A budget with no time: every window ends at the first row past its
+    /// floor.
+    const NO_TIME: ExamineBudget =
+        ExamineBudget { time: std::time::Duration::ZERO, rows: u64::MAX };
+
+    fn engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+    }
+
+    fn origin(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn insert(collection: CollectionId, node: NodeId, hlc: Hlc) -> OplogEntry {
+        let id = format!("{}-{}-{}", node, hlc.wall_ms, hlc.counter);
+        OplogEntry {
+            stamp: Stamp::new(hlc, node),
+            kind: OpKind::Insert,
+            collection,
+            doc_id: Some(DocId::String(id.clone())),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+        }
+    }
+
+    /// A sender holding `db.c`, and three origins' inserts above its
+    /// creation, their walls from four milliseconds and counters from three,
+    /// so the origins tie at every stamp. The stamps, ascending.
+    fn sender() -> (Engine, tempfile::TempDir, Vec<Stamp>) {
+        let (sender, dir) = engine();
+        let coll = sender.create_collection("db", "c").unwrap();
+        let base =
+            sender.version_vector().unwrap().iter().map(|(_, h)| h.wall_ms).max().unwrap() + 1;
+        let mut stamps = Vec::new();
+        for node in [origin(0x10), origin(0x80), origin(0xf0)] {
+            for wall in base..base + 4 {
+                for counter in 0..3 {
+                    let entry = insert(coll.id, node, Hlc::new(wall, counter));
+                    sender.apply_remote(&coll, &entry).unwrap();
+                    stamps.push(entry.stamp);
+                }
+            }
+        }
+        stamps.sort();
+        (sender, dir, stamps)
+    }
+
+    /// With no time, a window ends at the first row whose timestamp is past
+    /// the floor, `start`'s successor, which ties there do not pass: every row
+    /// at the floor is examined first, and the next row ends it.
+    #[test]
+    fn with_no_time_a_window_ends_at_the_first_row_past_its_floor() {
+        let (sender, _dir, stamps) = sender();
+        for start in stamps.iter().map(|s| s.hlc).collect::<std::collections::BTreeSet<_>>() {
+            let floor = start.successor();
+            let window =
+                sender.serve_entries_to_peer(start, usize::MAX, None, &[], Some(NO_TIME)).unwrap();
+            match stamps.iter().find(|s| s.hlc > floor) {
+                Some(first_past) => {
+                    let p = window.passed_through.expect("ended by the budget");
+                    assert_eq!(p, *first_past, "from {start:?}");
+                    assert_eq!(window.scanned_to, p.hlc);
+                    assert!(!window.exhausted);
+                    assert!(window.entries.iter().all(|e| e.stamp <= p));
+                    let examined = stamps.iter().filter(|s| s.hlc >= start && **s <= p).count();
+                    assert_eq!(window.entries.len(), examined, "every row through p was served");
+                }
+                None => {
+                    assert_eq!(window.passed_through, None, "from {start:?}");
+                    assert!(window.exhausted);
+                }
+            }
+        }
+    }
+
+    /// A requester draining at no time, against the vector the sender
+    /// advertised once: each pull's start is past the last, the drain ends,
+    /// and the requester holds everything, with no entry skipped.
+    #[test]
+    fn with_no_time_a_drain_rises_on_every_pull_and_ends_with_everything() {
+        let (sender, _dir, stamps) = sender();
+        let (requester, _rdir) = engine();
+        // The collection, as a first whole window would bring it.
+        let theirs = sender.version_vector().unwrap();
+        let mut last_start = None;
+        let mut pulls = 0;
+        loop {
+            let mine = requester.witnessed_vector().unwrap();
+            let Some(start) = mine.behind(&theirs) else { break };
+            assert!(last_start.is_none_or(|last| start > last), "{start:?} after {last_start:?}");
+            last_start = Some(start);
+            let window = sender
+                .serve_entries_to_peer(start, usize::MAX, Some(&mine), &[], Some(NO_TIME))
+                .unwrap();
+            let peer_window = PeerWindow {
+                scanned_to: window.scanned_to,
+                exhausted: window.exhausted,
+                passed_through: window.passed_through,
+                asked_partial: true,
+            };
+            let mut outcome = SyncOutcome::default();
+            requester
+                .apply_peer_window_into(&theirs, &window.entries, peer_window, &mut outcome)
+                .unwrap();
+            pulls += 1;
+            assert!(pulls <= stamps.len() + 2, "the drain did not end");
+            if window.exhausted {
+                break;
+            }
+        }
+        let coll = requester.get_collection("db", "c").expect("the collection arrived");
+        let mut held = 0;
+        requester
+            .for_each_doc(&coll, crate::WalkScope::Request, |_, _| {
+                held += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(held, stamps.len(), "every insert arrived");
+        assert!(requester.witnessed_vector().unwrap().covers(&theirs));
+    }
+
+    /// A `passed_through` the requester did not ask for is not believed: the
+    /// window is read as a sender before ADR-194 would have meant it, and an
+    /// empty one that did not reach the tail claims nothing.
+    #[test]
+    fn an_end_nobody_asked_for_claims_nothing() {
+        let (sender, _dir, stamps) = sender();
+        let (requester, _rdir) = engine();
+        let theirs = sender.version_vector().unwrap();
+        let p = stamps[10];
+        let window = PeerWindow {
+            scanned_to: p.hlc,
+            exhausted: false,
+            passed_through: Some(p),
+            asked_partial: false,
+        };
+        let mut outcome = SyncOutcome::default();
+        requester.apply_peer_window_into(&theirs, &[], window, &mut outcome).unwrap();
+        let claimed = requester.witnessed_vector().unwrap();
+        assert!(claimed.iter().all(|(_, hlc)| hlc == Hlc::ZERO), "nothing claimed: {claimed:?}");
+        let asked = PeerWindow { asked_partial: true, ..window };
+        requester.apply_peer_window_into(&theirs, &[], asked, &mut outcome).unwrap();
+        assert!(
+            requester.witnessed_vector().unwrap().get(p.node) >= p.hlc,
+            "asked for, the same window covers its origin through p"
+        );
+    }
+
+    /// A partial window that carries an entry for a collection this node
+    /// lacks ends before that entry, not at `p`: the batch stops there, and
+    /// a claim through `p` would cover the entries after it that were never
+    /// applied (ADR-148's hole). The stop's arm must come before the partial
+    /// window's.
+    #[test]
+    fn a_partial_window_stopped_at_a_collection_this_node_lacks_ends_before_it() {
+        let (requester, _dir) = engine();
+        let held = requester.create_collection("db", "c").unwrap();
+        let lacked = CollectionId::derive("db", "lacked");
+        let base =
+            requester.version_vector().unwrap().iter().map(|(_, h)| h.wall_ms).max().unwrap() + 1;
+        let (a, b, c) = (origin(0x10), origin(0x80), origin(0xf0));
+        let before = insert(held.id, a, Hlc::new(base, 0));
+        let stop = insert(lacked, b, Hlc::new(base + 1, 0));
+        let after = insert(held.id, a, Hlc::new(base + 2, 0));
+        let p = Stamp::new(Hlc::new(base + 3, 0), c);
+        let theirs: VersionVector =
+            [(a, after.stamp.hlc), (b, stop.stamp.hlc), (c, p.hlc)].into_iter().collect();
+        let window = PeerWindow {
+            scanned_to: p.hlc,
+            exhausted: false,
+            passed_through: Some(p),
+            asked_partial: true,
+        };
+        let entries = [before.clone(), stop.clone(), after];
+        let mut outcome = SyncOutcome::default();
+        requester.apply_peer_window_into(&theirs, &entries, window, &mut outcome).unwrap();
+        assert_eq!(outcome.unknown.as_ref().map(|u| u.stamp), Some(stop.stamp), "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "only the entry before the stop");
+        let witnessed = requester.witnessed_vector().unwrap();
+        for node in [a, b, c] {
+            let reached = Stamp::new(witnessed.get(node), node);
+            assert!(reached < stop.stamp, "{node} is covered to {reached:?}, past the stop");
+        }
+        assert!(witnessed.get(a) >= before.stamp.hlc, "the entry before the stop is covered");
+    }
+
+    /// A pull that names a span below where it asks from, and one that only
+    /// names spans, asking from the highest stamp the sender advertises: the
+    /// scan starts at the lowest span, and the floor is measured from there.
+    #[test]
+    fn the_floor_is_measured_from_the_lowest_span_not_from_from() {
+        let (sender, _dir, stamps) = sender();
+        let theirs = sender.version_vector().unwrap();
+        let lowest = stamps[3];
+        let top = theirs.iter().map(|(_, hlc)| hlc).max().unwrap();
+        // The requester holds everything: only the span is asked for.
+        let held = theirs.clone();
+        let span = MarkedRange { origin: lowest.node, from: lowest.hlc, through: top };
+        for from in [top, stamps[20].hlc] {
+            let window = sender
+                .serve_entries_to_peer(from, usize::MAX, Some(&held), &[span], Some(NO_TIME))
+                .unwrap();
+            let p = window.passed_through.expect("ended by the budget");
+            assert!(p.hlc > lowest.hlc.successor(), "{p:?} is past the span's floor");
+            let first_past = stamps.iter().find(|s| s.hlc > lowest.hlc.successor()).unwrap();
+            assert_eq!(p, *first_past, "from {from:?}: the first row past the span's floor");
         }
     }
 }

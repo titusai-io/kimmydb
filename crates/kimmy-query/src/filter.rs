@@ -127,7 +127,9 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
                 "$not must be applied to a field, e.g. {field: {$not: {$gt: 5}}}".into(),
             ));
         }
-        other => return Err(Error::UnsupportedOperator(format!("${other}"))),
+        other => {
+            return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
+        }
     })
 }
 
@@ -272,7 +274,9 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
             })),
             _ => return Err(Error::InvalidQuery("$not requires a document or regex".into())),
         },
-        other => return Err(Error::UnsupportedOperator(format!("${other}"))),
+        other => {
+            return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
+        }
     })
 }
 
@@ -1127,7 +1131,7 @@ mod tests {
         // filter parser's own error variants, not as a distinct kind.
         assert!(matches!(
             parse(&doc! { "$expr": { "$nope": 1 } }),
-            Err(Error::UnsupportedOperator(_))
+            Err(Error::UnsupportedOperator { .. })
         ));
         assert!(matches!(parse(&doc! { "$expr": { "$gt": ["$a"] } }), Err(Error::InvalidQuery(_))));
         // A `$$name` nothing binds is still refused before a document is read.

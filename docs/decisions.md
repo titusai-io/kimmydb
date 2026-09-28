@@ -7619,6 +7619,11 @@ and `a_held_position_with_no_batch_is_still_one_commit`.
 
 ## ADR-126 — A batch's entry cap is spent after the filter, not before it
 
+> **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
+> A window served to a pull that asks `partial` may also end at the walk's
+> budget, before the cap is spent, with `passed_through` saying where. Such a
+> window can hold fewer than `limit` entries, or none, and is not exhausted.
+
 **Decision.** `Engine::entries_for_peer` counts only the entries it will
 actually ship towards the batch limit. The oplog read takes a predicate —
 `Engine::read_oplog_from_where`, which `read_oplog_from` is now a thin call
@@ -7704,6 +7709,13 @@ property test `a_window_that_is_not_a_tail_never_witnesses_past_what_it_delivere
 ---
 
 ## ADR-127 — The peer reports where its window ended; the receiver never infers it
+
+> **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
+> U1 becomes U1': a window that is not exhausted either holds `limit` kept
+> entries, or was asked `partial` and ended at the budget, stating its last
+> examined stamp. The receiver takes that stamp as the window's end
+> (`Through`), after checking it against the entries, `scanned_to` and the
+> progress floor. An empty window of that kind is not malformed.
 
 **Decision.** `Message::Entries` carries `scanned_to: Hlc` and
 `exhausted: bool` beside its entries — the last stamp the sender's scan
@@ -13438,6 +13450,11 @@ the announce job: the parts that turn the builds into a release.
 
 ## ADR-157 — A sync tick drains what it can: one contact per peer, as many pulls as the interval affords
 
+> **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
+> A pull that ended at the peer's budget is truncated, so the tick pulls again.
+> The ceiling's warning counts pulls that advanced this node's position, not
+> entries applied. The `merged from peer` line gains `partial`.
+
 **Decision.** A tick of the anti-entropy loop keeps pulling from a peer while
 the pull before it came back truncated by the batch cap, until either a pull
 comes back short of the cap or the tick has spent a wall-clock budget. The
@@ -15794,6 +15811,12 @@ elsewhere would be set without evidence.
 
 ## ADR-171 — A served window passes over what the puller has already processed
 
+> **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
+> The skip had no bound on the rows it examined, so after a large load a pull
+> from a quiet member walked the whole load on every round and timed out. A
+> served walk now stops at a budget of time and rows, once past a progress
+> floor, and the puller keeps what it covered.
+
 **Decision.** A window served to a peer skips every oplog entry whose stamp is
 at or below the requester's `held` vector for that entry's own origin
 (`Engine::entries_for_peer_holding`). `held` is the witnessed vector the
@@ -17524,6 +17547,33 @@ renaming `kimmy.sync.contacts.failed` alone. `kimmy_backup_duration_seconds` kee
 - **Per scrape or export:** one copy of the report.
 - **The lag gauge's type on the bridge** changes from integer to double. The
   changelog says so for a pipeline that typed it.
+
+**Addendum, 2026-09-27: the lag gauge counts a peer whose rounds fail**
+(ADR-194).
+The gauge was the maximum over the tick's *successful* contacts, set after
+each tick. So a peer this node failed against every time read as the last good
+round said, usually 0: in round 0430's cold trial, one member read 0 while it
+missed another's writes for minutes, every pull timing out.
+
+- **What is kept:** whenever a round has read a peer's vectors, whether it then
+  succeeds or fails, the loop stores that peer's advertised vector. A round
+  that fails before its vectors keeps the one stored last. The entry is
+  dropped when membership no longer lists the peer as live, a member SWIM
+  marked down included, which the loop checks every tick.
+- **What is read:** at each scrape or export, the gauge is the maximum over the
+  stored peers of `lag_behind_ms(this node's witnessed vector now, that peer's
+  stored vector, now)`. It is computed at the read, as ADR-187's gauges are.
+- **So it never freezes:** `now` advances, so a peer still ahead reads as lag
+  that grows until the entries arrive. And it clears as soon as they arrive
+  by any route, a third member included, because the witnessed vector is read
+  at the scrape.
+- **What does not change:** the measure itself (ADR-122, ADR-054), the
+  millisecond resolution above, and the reading between ticks. A peer's
+  entries written after its last round are not in its stored vector, so they
+  read 0 until the next round, as before. `kimmy_sync_entry_wait_seconds`
+  still shows that wait.
+- **The `HELP` texts** of this gauge and of `kimmy_sync_failures_total`,
+  which said a failed round reports no lag, are rewritten.
 
 ---
 
@@ -20455,3 +20505,287 @@ promise; and a change that reaches the wire is named in the CHANGELOG, which is
 where the clients' update starts. Anyone using the CLI or a client library has
 no current release of it; the releases before this one carried the CLI's
 archives.
+
+---
+
+## ADR-194 — A serve walk is bounded by what it examines, and a partial window keeps the requester's progress
+
+Amends ADR-126 and ADR-127 (U1 becomes U1'), ADR-171 (the cap it left out)
+and ADR-157 (what the ceiling's warning counts).
+
+**The defect.** A pull asks from one stamp: the requester's position on
+whichever origin it trails most (`VersionVector::behind`). ADR-171's skip
+passes over every row the requester already holds, but it has no cap on the
+rows it examines: it decodes only each key, and redb still reads every leaf
+page. A round has a fixed 30 s. A window that never arrives keeps nothing, and
+under U1 an empty window that is not exhausted was malformed, so no answer
+short of the whole walk could carry progress. After a large load on one
+member, every pull from a quiet member repeated the same walk, timed out at
+30 s, and kept nothing. That member's writes never reached its peers. Round
+0430's cold trial showed it: a 2 GB walk on every pull, and a member that
+missed the quiet writer's 200, 400 and then 600 documents across three
+restarts, with `sync round timed out` against it every tick.
+
+**Decision.** A walk served to a request that asks for it stops at a budget,
+and answers with where it stopped. The requester takes that as coverage.
+
+- **The budget** is counted over every row examined: kept, withheld as a
+  `UniqueViolation`, or skipped. It is **2 s** from the walk's first row, or
+  **65,536 rows** (64 × `MAX_BATCH`), whichever comes first, checked per row
+  after the row is examined. Time is the primary limit, well inside the 30 s
+  round, so about two pulls fit a 5 s tick. Rows bound a warm walk's page-cache
+  churn. There is no bytes limit, and there is no configuration: these are
+  constants.
+- **The progress floor.** The budget may end the walk only after a row whose
+  `hlc > successor(start)`, where `start` is the scan start: `from`, or the
+  lowest named span's `from` if that is lower. For a marks-only pull `from` is
+  the requester's own maximum, so the scan start is its lowest span. Past the
+  floor the walk stops at the next check, so the floor costs at most about two
+  rows per origin past the budget.
+- **The wire.** Two defaulted fields, on the `witnessed` / `held` / `marked`
+  precedent (ADR-097, ADR-172):
+  `AskEntries { …, partial: bool }` and
+  `Entries { …, passed_through: Option<Stamp> }`. Every pull that sends
+  `held` sets `partial`, a marks-only pull included. A repair replay sends no
+  `held` (ADR-148) and keeps every row, so it still fills at `limit`.
+  `passed_through` is the full stamp of the last row examined, set only when
+  the budget ended the walk; then `scanned_to` is its `hlc`, `exhausted` is
+  false, and `entries` may hold fewer than `limit`, or none.
+- **The requester's window end.** `Introduced` carries `passed_through` and
+  whether this request asked `partial`. A window with no stop and not
+  exhausted, whose end was asked for, ends `Through(p)`. An end nobody asked
+  for is ignored, and ADR-127's clamp applies as before.
+- **Checks.** Each of these answers `Malformed`, with a `WARN` naming the
+  peer: `p` below the last entry sent; `p.hlc` not equal to `scanned_to`; and
+  `p.hlc` not above `successor(start)`, with `start` computed from what this
+  request sent.
+- **Durable with the batch.** `coverage_up_to(theirs, Through(p))` joins the
+  batch's witnessed raise, written by `absorb_witnessed_in_txn` in the last
+  transaction of the run. An empty partial window opens a transaction for the
+  vector alone. The coverage commits with the entries or not at all, and a
+  later timeout in the round keeps it (ADR-177).
+- **Span resume points.** `marks_served` takes `p` in place of the last entry
+  when it is set, with the same tie rule. A span's origin that sorts at or
+  before `p.node` resumes at `successor(p.hlc)`, and one that sorts after it
+  resumes at `p.hlc`. Either way the result is at least the span's `from`.
+- **The transport.** A window is unreachable from a correct sender when it
+  carries no entries, is not exhausted, and is not a partial window this node
+  asked for. It is truncated, so another pull may follow in the tick
+  (ADR-157), when it is not exhausted and either ended at the budget or
+  deferred fewer entries than it carried.
+- **The hard cap on a walk nobody can take in part.** A walk served to a
+  request without `partial`, from a build before this one, ends at 30 s from
+  its first row. The requester has timed out by then and could not take a
+  partial window anyway. The listener ends the connection quietly with a
+  `debug` line, as it does when the node is stopping: this is not a serve
+  failure, and `kimmy_sync_serve_failures_total` does not move. There is no
+  per-peer map and no new `StopReason`. The walk keeps its background walk
+  scope, so a stop still ends it first.
+- **The push.** The confirmation push of ADR-143 and ADR-191 walks with the
+  same budget. A push ended by it sends nothing and returns `NothingSent`
+  with `unreached`, as the beyond-horizon path does. Its waiters resolve
+  pending, and anti-entropy carries the change. `Push` itself is unchanged
+  on the wire.
+- **ADR-157's ceiling** warns on a contact that reached the pull ceiling with
+  no pull that **advanced** this node's position (coverage rose, or a span
+  resumed), where it counted entries applied. A partial window drains while
+  applying nothing.
+- **The `merged from peer` line** gains `partial`: this contact's pulls that
+  ended at the sender's budget. The line is logged when anything was applied
+  or any pull was partial.
+
+**The test switches.** `KIMMY_TEST_SERVE_WALK_ROWS` and
+`KIMMY_TEST_SERVE_WALK_MS` set the budget for every window this process
+serves and every confirmation push it makes. They ship in the binary, like `KIMMY_TEST_WALK_ROW_MS`, and every
+start where either is set logs a `WARN` naming it, with whether the value was
+understood.
+
+**Mixed versions.**
+
+| Requester → sender | What happens |
+|---|---|
+| new → new | partial windows; every pull progresses |
+| new → 0.40.x or earlier | `partial` is ignored; today's uncapped window, and no new failure. The livelock stays until the **sender** is rolled |
+| 0.40.x or earlier → new | no `partial`; today's window and U1, unchanged, and the sender's walk ends at the 30 s cap |
+
+Relief needs both ends of a pull on this release: the quiet member that serves
+and the peers that pull from it. There is no stored-format change, and this
+is not a rollback boundary: an older build ignores both fields, and coverage
+already committed from partial windows is an ordinary witnessed raise.
+
+### Why nothing is lost
+
+**U1'** replaces U1. A correct sender's window that is not exhausted either
+holds exactly `limit` kept entries and no `passed_through`, as before, or was
+asked with `partial` and ended by the budget. If the budget ended it, it
+carries `p`, the stamp of the last row examined, with `p` at or above its last
+entry and `p.hlc > successor(start)`. Every row in `[start, p]` was then
+delivered, withheld as a violation (ADR-029), or skipped because its `hlc` is
+at or below `held` for its origin outside every named span. A request without
+`partial` is never ended by the budget, so U1 holds for it exactly.
+
+Two premises carry the argument:
+- **P1: `theirs` is read before the window.** The sender answers
+  `AskVersions` before it serves `AskEntries` on the same connection, and the
+  window is read afterwards in one read transaction.
+- **P2: ADR-148's invariant.** The sender holds, for every origin, every entry
+  at or below its servable position, or the entry that superseded it. So an
+  entry that reaches it after `theirs` was read is above `theirs` for its
+  origin.
+
+P2 has two exceptions already, and a partial window inherits both unchanged:
+entries retention collected below the servable position (the horizon check
+runs before the walk, and the race between them is an old residual), and
+coverage a snapshot granted over state without entries (ADR-036, ADR-160,
+ADR-167, ADR-172). A partial window makes the same `Through` claim a truncated
+window always made. It ends at an examined row rather than a kept one, which
+neither widens nor narrows either exception.
+
+**Per origin.** Coverage raises `witnessed[o]` to `min(theirs[o], reach_o(p))`,
+where `reach_o(p)` is `p.hlc` if `o` sorts at or before `p.node`, and
+`p.hlc.predecessor()` otherwise. Take any entry `e` of `o` above `held[o]` and
+at or below that, outside the two exceptions:
+1. `e` was in the window's snapshot, since `e.hlc ≤ theirs[o]` (P1, P2).
+2. `e` is in the scanned range. `start ≤ held[o]` for every origin the
+   requester trails, and for one it does not trail nothing is raised. `e ≤ p`
+   by the tie rule.
+3. `e` was not skipped, since the skip needs `e.hlc ≤ held[o]`.
+4. So `e` was delivered, or withheld as a violation (ADR-127).
+
+An entry that arrives after `theirs` was read has `hlc > theirs[o]`, which is
+at least the raise, so it is never claimed. An entry above `theirs` in the
+window is deferred (ADR-148). On the requester's side a stale `held` only
+understates. Only the witnessed vector is raised, so invariant I is untouched.
+As for `exhausted` (ADR-127), a lying sender can overstate `p` within the
+floor and the `theirs` bound, and that cannot be checked.
+
+**Why a drain ends.** Measured against a fixed advertised vector, each pull's
+next scan start strictly rises. An origin lagging at `start` is raised to at
+least `p.hlc.predecessor()`, which is above `start` by the floor, or stops
+lagging at its advertised position. A span at `start` resumes past `p`. Every
+other term is already above `start` and only rises. The next *actual* start
+can be lower in three cases, each a recorded event:
+- a new mark below a span's resume point, which only a snapshot or a repair
+  adds, once each (ADR-172);
+- `MARKS_REASK_AFTER`, after 300 s in which a span went unserved, which a
+  drain never reaches because it serves the span on every pull;
+- an origin that newly lags below `start` because the sender gained entries of
+  it after silence. With the next pull's fresh `theirs` the drain restarts at
+  that origin's position, once per such write.
+
+Each restart is budgeted and progresses the same way, and between events the
+start rises through a finite oplog. Safety does not depend on this measure.
+
+### Rejected, and deferred
+
+- **Skipping on `OPLOG_ARRIVAL_SEQ` instead of walking the oplog.** Every
+  writer keeps the index's key set equal to the oplog's, but only a length
+  count at open enforces it, and a missing index row on a path that claims
+  coverage would be a silent loss. It would need an in-transaction length
+  guard with a fallback. Revisit once the drain rate is measured.
+- **A per-origin start or index** (ADR-171's option B): a stored-format change.
+- **The repair direction and scoped replays**, which go together. This ADR
+  removes their trigger: under ADR-168 the count half defers while either
+  member trails the other and moves.
+- **One walk per peer, a `WalkStop` extension, a new `StopReason`.** With the
+  budget and the 30 s cap, no serve walk outlives its requester by more than
+  30 s.
+- **Per-peer gauges, a "peer up but failing" `WARN`, and partial-window
+  counters.** The existing `sync round failed … failures` `WARN`, the lag
+  gauge as ADR-175's addendum below computes it, and the merge line's
+  `partial` cover the round check. Labels by node id are decided when those
+  come.
+- **A bytes limit, configuration, or budget negotiation on the wire.** Rows and
+  time bound the walk. `partial` is a plain bool.
+
+### Tests, and where they differ from the design
+
+- **The repro** (`kimmyd`, `cluster.rs`,
+  `a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere`).
+  It loads 2,200 documents on A. C runs with `KIMMY_TEST_WALK_ROW_MS=25` and
+  `KIMMY_TEST_SERVE_WALK_ROWS=500`, with the time limit lifted. C then writes
+  once. The test reads R, C's oplog length, and asserts that the write reaches
+  A and B and that each requester's `partial` counts sum to **floor(R / 500)**.
+  The design said ceil(R / 500), which counted the pull that reaches the tail:
+  that pull finds fewer than a budget of rows ahead, so it ends exhausted, not
+  partial. A partial window's end is re-examined by the next pull when an
+  origin sorts after `p.node` (the tie rule): a row or two per pull. So the
+  test asserts, as a premise, that R lies away from a multiple of 500 by more
+  than that. There is no wall-clock assertion, only a guard against a hang.
+  On `main` the test fails at its guard: no pull from C completes.
+- **At unit level, time zero** (`kimmy-storage`, `sync.rs`, `budget_tests`).
+  Every window ends at the first row past its floor; a drain rises on every
+  pull and ends with everything; the floor is measured from the lowest span,
+  not from `from`; an end nobody asked for claims nothing; a partial window
+  that carries an entry for a collection the requester lacks ends before that
+  entry, not at `p`, so the stop's arm must come before the partial window's.
+  In `kimmy-cluster`, `transport.rs`: the three checks, and a zero-entry
+  partial window with a span.
+- **Mixed versions** (`protocol.rs`): both fields cross a version boundary in
+  both directions, and read back as `false` and `None` when absent.
+- **The property** (`transport.rs`, `partial_windows_never_skip`, 48 cases).
+  A sender with three or four origins, whose walls come from a narrow range so
+  ties fall at window ends, including unique-key collisions it withholds. A
+  requester with random `held`, held marks and a modelled snapshot grant: the
+  grant applies entries in the held position and raises the witnessed vector.
+  Writes land between pulls, and inside a pull between the sender's vectors
+  and its window through a relay. Each pull's budget is 1 to 40 rows with no
+  time limit, or a time already spent, which ends the window at its progress
+  floor. The drain runs until it ends. After every pull it checks (a) every
+  insert in the sender's final oplog at or below the requester's position is
+  held there as a document (a granted entry is, since the grant applied it);
+  (b) the next scan start rose, against that pull's `theirs`; and that a
+  partial window was treated as truncated. At the end it checks (c) the
+  requester equals one placed the same and pulled with no budget at all, and
+  that every mark was released. It does not generate a collection the
+  requester lacks; the storage test above covers that stop.
+- **The push** (`confirm.rs`,
+  `a_push_whose_walk_runs_past_its_budget_sends_nothing`): a member 40
+  entries behind, well under the batch cap, and a push budget of 5 rows, set
+  through the confirmer's test hooks rather than the process-wide switch. The
+  push resolves pending for the budget, and no window is sent.
+- **Mutants**, run under bash with each suite on a timeout. All 13 are killed,
+  and the unmutated control passes:
+
+  | # | Mutant | Killed by |
+  |---|---|---|
+  | 1 | `passed_through` set to the row after the last examined | three storage budget tests, property (a) |
+  | 2 | `Through(p)` built with the last kept entry's node | property (a) |
+  | 3 | the floor measured from `from`, not the scan start | the storage span-floor test, the zero-entry span test |
+  | 4 | the floor removed | the storage budget tests, the zero-entry span test, the `Malformed` check in the property |
+  | 5 | the skip applied inside named spans | the property's marks-released check |
+  | 6 | `passed_through` accepted without `partial` | `an_end_nobody_asked_for_claims_nothing` |
+  | 7 | `window_truncated` left at the old condition | the property's partial ⇒ truncated check |
+  | 8 | coverage not capped by `theirs` | property (c) |
+  | 9 | `theirs` read after the window | property (a), six transport unit tests |
+  | 10 | span resume from `p` without the tie rule | the property's marks-released check, `peer_stalls_resume_each_span_past_what_the_peer_served` |
+  | 11 | `marks_served` keeps the last entry | the zero-entry span test |
+  | 12 | the partial window's arm matched before the stop's | `a_partial_window_stopped_at_a_collection_this_node_lacks_ends_before_it` |
+  | 13 | the push sends a window its walk's budget ended | `a_push_whose_walk_runs_past_its_budget_sends_nothing` |
+
+  Three differ from the design. **Mutant 5** survived (a), because an entry
+  inside a span is one the requester holds as state. It needed the modelled
+  grant and the marks-released check. **Mutant 7** cannot be caught by the
+  repro's pull count: each of its walks takes about 12.5 s, so a tick makes one
+  pull per peer either way. **Mutant 11** is caught by a deterministic test
+  rather than by (b), `a_partial_window_that_carries_nothing_moves_its_span_on`
+  (the zero-entry span test above). It collects one origin's entries from the sender
+  (`collect_oplog_entry_for_test`, under `test-hooks`), so a partial window
+  over a span carries nothing and only `p` can move the span on.
+- **The lag gauge, the cap, the switches and the stop.** The lag is computed
+  from each peer's last vector, grows with the clock, clears when the entries
+  arrive, and drops a peer membership no longer lists as live. A round that fails after
+  the vectors still records them. A whole window past the cap ends the
+  connection with no serve failure counted. A start with either switch set
+  says so. The walk-stop guard (`walks_stop.rs`) names the budgeted walk.
+
+### Costs
+
+- **A drain is paced by the budget.** A requester behind by R rows takes
+  about R / 65,536 pulls, at up to 2 s each, rather than one pull that never
+  completes. The per-row cost on a cold store is to be re-measured on the
+  round's cold trial. The figure of about 6.5 ms a row was taken under about
+  eleven orphaned walks and a 2 GB replay.
+- **The floor** can take a walk a few rows past its budget.
+- **An empty partial window** costs a write transaction for the witnessed
+  vector alone.

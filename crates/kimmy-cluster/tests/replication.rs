@@ -3308,6 +3308,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                                     entries: vec![served],
                                     scanned_to,
                                     exhausted: false,
+                                    passed_through: None,
                                 }
                             }
                             _ => return,

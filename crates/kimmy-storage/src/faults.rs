@@ -64,6 +64,26 @@ impl Engine {
         txn.commit().expect("the commit");
     }
 
+    /// Remove one entry's oplog row and its arrival rows, as retention's
+    /// collection of it would, and leave the vectors as they are: covered,
+    /// and no longer there to serve (the first exception to ADR-148's
+    /// invariant, which ADR-194's tests model).
+    pub fn collect_oplog_entry_for_test(&self, stamp: &kimmy_core::Stamp) {
+        let key = crate::codec::oplog_key(stamp);
+        let txn = self.begin_write(WriterHolder::Ddl).expect("the writer");
+        {
+            let mut oplog = txn.open_table(tables::OPLOG).expect("the oplog");
+            oplog.remove(key.as_slice()).expect("the removal");
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).expect("the index");
+            let seq = by_stamp.remove(key.as_slice()).expect("the removal").map(|seq| seq.value());
+            if let Some(seq) = seq {
+                let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).expect("the index");
+                arrival.remove(seq).expect("the removal");
+            }
+        }
+        txn.commit().expect("the commit");
+    }
+
     /// Overwrite one document's record with bytes that do not decode, so a
     /// write that re-reads it fails.
     pub fn corrupt_document_for_test(&self, coll: &CollectionMeta, id: &kimmy_core::DocId) {

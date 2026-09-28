@@ -190,6 +190,14 @@ operator "$typo"`, a bad sort direction and a bad `$size` are each a `400` —
 so a `200` here reads as an answer rather than as a mistake. Send the code
 rather than the alias wherever the spelling is not being read by a person.
 
+**The quoted slot in `unsupported operator "…"` holds the operator and nothing
+else**, as the request spelled it, so a client can match or log it. Where there
+is more to say, it follows after a colon: a partial index's filter refuses `$or`
+as `unsupported operator "$or": it cannot appear in a partialFilterExpression:
+…`, and an expression refuses `$$NOW` as `unsupported operator "$$NOW": a
+system variable this build does not have; …`. Before 0.41.0 some refusals put
+that whole sentence inside the quotes.
+
 **`$type` is applied to array elements as well as to the value**, which
 follows from [rule 2](#2-paths-traverse-into-arrays) and is the consequence
 worth stating: `{"mixed": [1, 2, 3]}` matches `{"$type": "array"}` **and**

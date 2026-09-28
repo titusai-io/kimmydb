@@ -1615,6 +1615,18 @@ impl Engine {
         }
     }
 
+    /// Apply `entry` as held state, as a snapshot page's document is
+    /// (`Position::Hold`): in the oplog with a mark on it, not in position.
+    /// For another crate's test of what a pull does with held marks
+    /// (ADR-172, ADR-194).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn apply_held_for_test(&self, coll: &CollectionMeta, entry: &OplogEntry) -> Result<()> {
+        let txn = self.begin_write(WriterHolder::Replication)?;
+        self.apply_remote_in_txn(&txn, coll, entry, Position::Hold)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Whether [`Self::stop_walks`] has been called.
     pub fn walks_stopping(&self) -> bool {
         self.walks_stopping.load(std::sync::atomic::Ordering::SeqCst)
