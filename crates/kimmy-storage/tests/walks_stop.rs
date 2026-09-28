@@ -69,7 +69,7 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "watch::Walk::step",
     // The oplog window served to a peer, pushed to confirm a write, or read
     // for a client.
-    "watch::Engine::read_oplog_from_skipping",
+    "watch::Engine::read_oplog_budgeted",
 ];
 
 /// Functions that iterate a table without checking the stop, as

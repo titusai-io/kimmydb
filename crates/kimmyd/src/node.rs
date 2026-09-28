@@ -472,6 +472,21 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         );
         parsed
     });
+    // The budget a window served to a peer gets (ADR-194), smaller so a test
+    // of a real node can see a drain in a known number of partial windows.
+    let serve_walk = ["KIMMY_TEST_SERVE_WALK_ROWS", "KIMMY_TEST_SERVE_WALK_MS"].map(|name| {
+        std::env::var(name).ok().map(|value| {
+            let parsed = value.parse::<u64>().ok();
+            warn!(
+                switch = name,
+                value = %value,
+                recognised = parsed.is_some(),
+                "a test switch is set that changes the budget of every window this node serves \
+                 and every schema-change push it makes, on purpose; unset it outside a test"
+            );
+            parsed
+        })
+    });
     if let Some(what) = kimmy_task::test_kill_requested() {
         // The line says what is set, and the value says what it will do -- which
         // may be nothing. The prefix used to promise "will stop a background
@@ -952,6 +967,11 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // act: armed later than startup so it can never turn a start into a crash
     // loop, and can never be mistaken for a startup failure.
     kimmy_task::arm_test_kills();
+    if let [rows, ms] = &serve_walk
+        && (rows.is_some() || ms.is_some())
+    {
+        kimmy_storage::set_test_serve_walk_budget(rows.flatten(), ms.flatten());
+    }
     if let Some(Some(delay)) = walk_row_delay {
         kimmy_storage::walk::set_test_walk_row_delay(delay);
     }
@@ -1951,6 +1971,20 @@ async fn spawn_cluster(
         }
     }
 
+    // Each peer's last advertised vector, which the loop keeps and the lag
+    // gauge is computed from whenever it is read (ADR-175's addendum), so a
+    // peer whose rounds fail still counts and the reading moves with the
+    // clock.
+    let lag_vectors = std::sync::Arc::new(kimmy_cluster::LagVectors::default());
+    state.metrics.compute_replication_lag_with({
+        let (lag, engine) = (std::sync::Arc::clone(&lag_vectors), std::sync::Arc::clone(&engine));
+        std::sync::Arc::new(move || match engine.witnessed_vector() {
+            Ok(witnessed) => lag.lag_ms(&witnessed, kimmy_storage::physical_now_ms()),
+            // A scrape that cannot read the vector reads no lag rather than
+            // failing; the storage failure has its own signals (ADR-188).
+            Err(_) => 0,
+        })
+    });
     let replicating = kimmy_task::supervise(
         "replication",
         shutdown.clone(),
@@ -1990,11 +2024,9 @@ async fn spawn_cluster(
                 // dashboard closely. There is nothing here to get in the wrong
                 // order (ADR-135).
                 on_round: Some(round_hook(state.clone(), |state| &state.metrics)),
-                // The replication loop is the only place a peer's version vector
-                // exists, so lag is pushed from there into the gauge (ADR-046).
-                on_lag: Some(std::sync::Arc::new(move |ms| {
-                    state.metrics.set_replication_lag_ms(ms);
-                })),
+                // Nothing pushed: the gauge is computed from these when read.
+                on_lag: None,
+                lag_vectors: Some(lag_vectors),
             },
         ),
     );

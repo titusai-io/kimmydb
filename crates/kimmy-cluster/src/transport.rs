@@ -207,6 +207,23 @@ impl ServeFailure {
     }
 }
 
+/// What a served walk may examine (ADR-194): the budget a window asked for
+/// in part ends at, and the cap on one asked for whole.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServeBudgets {
+    pub(crate) partial: kimmy_storage::ExamineBudget,
+    /// [`REQUEST_TIMEOUT`]: the requester of a whole window has stopped
+    /// waiting by then, and cannot take one in part.
+    pub(crate) whole: Duration,
+}
+
+impl ServeBudgets {
+    /// What a node serves its peers with, read when a connection is served.
+    pub(crate) fn serving() -> Self {
+        Self { partial: kimmy_storage::ExamineBudget::serve(), whole: REQUEST_TIMEOUT }
+    }
+}
+
 /// Serve peer requests until the listener fails, building the TLS here.
 ///
 /// For callers with no startup to fail — the tests, and the in-crate helpers.
@@ -298,6 +315,7 @@ pub async fn serve_with(
                 on_pushed.as_ref(),
                 on_failed.as_ref(),
                 peer,
+                ServeBudgets::serving(),
             )
             .await;
         });
@@ -349,6 +367,7 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
 /// Serve one authenticated-or-not peer connection to its end, and say how it
 /// ended: a clean close at `debug`, anything else at `WARN` and to
 /// `on_failed`, which is what makes a serve failure visible outside the log.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection<S>(
     engine: &Engine,
     stream: S,
@@ -357,10 +376,11 @@ async fn serve_connection<S>(
     on_pushed: Option<&PushHook>,
     on_failed: Option<&ServeFailHook>,
     peer: impl std::fmt::Display,
+    budgets: ServeBudgets,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed).await else {
+    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed, budgets).await else {
         return;
     };
     // One line per connection, not a warning per push: the refusal ends the
@@ -393,12 +413,16 @@ async fn serve_connection<S>(
     }
 }
 
+/// `budgets` bounds each window's walk (ADR-194): one asked for in part ends
+/// at its budget, and one asked for whole at the cap, which its requester
+/// cannot take in part and has stopped waiting for by then.
 async fn serve_peer<S>(
     engine: &Engine,
     mut stream: S,
     secret: &str,
     binding: &[u8],
     on_pushed: Option<&PushHook>,
+    budgets: ServeBudgets,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -437,7 +461,7 @@ where
                     engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
             }
-            Message::AskEntries { from, limit, held, marked } => {
+            Message::AskEntries { from, limit, held, marked, partial } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
                 // never learn what had been collected. Judged per origin when
@@ -466,8 +490,16 @@ where
                 // Off the worker: passing over what the peer holds can walk the
                 // retained oplog to reach the first entry it lacks, in one read
                 // transaction (ADR-153).
+                // Bounded by what it examines (ADR-194): a requester that
+                // can take a partial window gets one at the budget, however
+                // few entries it holds, and one that cannot is cut off at
+                // the round it will have given up on by then.
+                let budget = match partial {
+                    true => budgets.partial,
+                    false => kimmy_storage::ExamineBudget::time(budgets.whole),
+                };
                 let window = match kimmy_storage::blocking(|| {
-                    engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked)
+                    engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked, Some(budget))
                 }) {
                     Ok(window) => window,
                     // The walk ended at this node's stop, so it can close its
@@ -479,6 +511,18 @@ where
                     }
                     Err(e) => return Err(ProtocolError::Local(e.to_string())),
                 };
+
+                // A whole window asked for, and the cap reached first: the
+                // requester has timed out by now, and cannot take a partial
+                // window, so nothing is sent. The connection ends as it does
+                // at the stop, quietly: not a serve failure.
+                if !partial && window.passed_through.is_some() {
+                    debug!(
+                        cap_ms = budgets.whole.as_millis() as u64,
+                        "ended a peer's pull at the cap on a window it cannot take in part"
+                    );
+                    return Ok(());
+                }
 
                 // Large entries can put a full batch over the frame limit. Failing the
                 // write would drop the connection, and the same oversized batch is the
@@ -494,6 +538,7 @@ where
                                 entries: window.entries,
                                 scanned_to: window.scanned_to,
                                 exhausted: window.exhausted,
+                                passed_through: window.passed_through,
                             },
                         )
                         .await?
@@ -889,6 +934,8 @@ where
         }
     };
     let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
+    // For the lag gauge, whatever becomes of the round from here.
+    stalls.vectors_read.push((peer, theirs.clone()));
 
     // What we have *seen*, not what we could serve. Asking against the
     // servable vector re-requests everything a node processed without
@@ -993,6 +1040,14 @@ where
     // its horizon per origin rather than by the threshold alone.
     let mut limit = MAX_BATCH;
     let held = if replay_floor.is_some() { None } else { Some(mine.clone()) };
+    // Every pull that says what it holds can take a partial window (ADR-194):
+    // the sender's walk passes over what `held` covers, and that is the walk
+    // a budget bounds. A replay sends no `held` and keeps every row it reads,
+    // so it fills at `limit` as it always did.
+    let asked_partial = held.is_some();
+    // Where the sender's scan starts, as this request names it: the floor a
+    // partial window must pass is measured from here.
+    let start_sent = marked.iter().map(|span| span.from).fold(from, Hlc::min);
     // From the ask to the answer, retry included (ADR-175). Read only for a
     // window: a snapshot is not asked for here, and its pages are not a pull.
     let asked = std::time::Instant::now();
@@ -1018,7 +1073,13 @@ where
         _ => {
             write_frame(
                 stream,
-                &Message::AskEntries { from, limit, held: held.clone(), marked: marked.clone() },
+                &Message::AskEntries {
+                    from,
+                    limit,
+                    held: held.clone(),
+                    marked: marked.clone(),
+                    partial: asked_partial,
+                },
             )
             .await?;
             read_frame(stream).await?
@@ -1036,8 +1097,14 @@ where
         }
         limit = fits;
         warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
-        write_frame(stream, &Message::AskEntries { from, limit, held, marked: marked.clone() })
-            .await?;
+        let retry = Message::AskEntries {
+            from,
+            limit,
+            held,
+            marked: marked.clone(),
+            partial: asked_partial,
+        };
+        write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
     }
 
@@ -1054,6 +1121,8 @@ where
     // a whole interval per batch. Narrower than `!window_exhausted` — see
     // where it is set below, and `SyncOutcome::truncated`.
     let mut window_truncated = false;
+    // Whether a span this request named resumes further on for it.
+    let mut spans_resumed = false;
     let mut outcome = match answer {
         // The batch, and what it proved: an exhausted window is the peer's
         // whole tail, any other ends at the stamp the peer says it scanned
@@ -1067,7 +1136,20 @@ where
         // could make a lie (ADR-127). The decision lives in storage
         // (`coverage_up_to`), where it is tested between engines
         // without a network.
-        Message::Entries { entries, scanned_to, exhausted } => {
+        Message::Entries { entries, scanned_to, exhausted, passed_through } => {
+            // Where the sender's budget ended the window, when this request
+            // asked for a partial one; one nobody asked for is not believed,
+            // and the window is read as it always was (ADR-194).
+            let partial_end = passed_through.filter(|_| asked_partial);
+            if let Some(p) = partial_end
+                && let Err(why) = partial_window_holds(p, &entries, scanned_to, start_sent)
+            {
+                warn!(%peer, ?from, ?p, "peer answered a partial window it cannot have served: {why}");
+                return Err(ProtocolError::Malformed(format!(
+                    "peer at {peer} answered a partial window from {from:?} it cannot have \
+                     served: {why}"
+                )));
+            }
             // A correct sender cannot produce an empty, non-exhausted
             // window: `read_oplog_from_where` only stops short of the
             // limit by reaching the true end of the oplog, and it never
@@ -1082,7 +1164,7 @@ where
             // genuine signal into the same bucket as an unremarkable
             // capped pull, and a failed round is exactly the shape
             // `kimmy_sync_failures_total` exists to make visible.
-            if is_unreachable_from_a_correct_sender(entries.len(), exhausted) {
+            if is_unreachable_from_a_correct_sender(entries.len(), exhausted, partial_end) {
                 // Logged unconditionally, not left to the caller's
                 // generic per-peer failure debounce: that debounce is
                 // right for the ordinary noise of a peer going up and
@@ -1130,8 +1212,14 @@ where
             // single writer — and a worker held that long stalls every task
             // queued behind it, `/metrics` among them (ADR-153). A collection
             // drop no longer purges here; it only buries (ADR-189).
+            let window = kimmy_storage::PeerWindow {
+                scanned_to,
+                exhausted,
+                passed_through: partial_end,
+                asked_partial,
+            };
             let applied = kimmy_storage::blocking(|| {
-                engine.apply_peer_batch_into(&theirs, &entries, scanned_to, exhausted, &mut outcome)
+                engine.apply_peer_window_into(&theirs, &entries, window, &mut outcome)
             });
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
@@ -1189,17 +1277,22 @@ where
             // introduced it with left this node's position exactly where it
             // was. Pulling again on either would spend the tick's budget
             // asking the same question.
-            window_truncated = !exhausted && !stopped && outcome.deferred < entries.len();
+            // A partial window moved this node's position by what it passed
+            // through, however few entries it carried, so pulling again moves
+            // it further (ADR-194).
+            window_truncated = !exhausted
+                && !stopped
+                && (partial_end.is_some() || outcome.deferred < entries.len());
+            outcome.partial = partial_end.is_some();
             // Where each span this request named resumes against this peer
             // (ADR-172). A batch stopped at a collection this node lacks did
             // not take what it carried past the stop, so it moves nothing.
             if !marked.is_empty() && !stopped {
-                stalls.marks_served(
-                    their_node,
-                    entries.last().map(|entry| entry.stamp),
-                    exhausted,
-                    std::time::Instant::now(),
-                );
+                // A partial window ends at what it passed through, not at
+                // its last entry, with the same tie rule (ADR-194).
+                let ended = partial_end.or_else(|| entries.last().map(|entry| entry.stamp));
+                spans_resumed = exhausted || ended.is_some();
+                stalls.marks_served(their_node, ended, exhausted, std::time::Instant::now());
             }
             match (repair, &outcome.unknown) {
                 // A replay under way: done when it reached the tail,
@@ -1303,7 +1396,11 @@ where
     // stamps all lay within a second (ADR-122). `theirs` is a round old
     // by now, so this is a floor — a peer that raced ahead during the
     // round shows up next round.
-    let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+    let after = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+    // What ADR-157's ceiling counts: a pull that moved the position, which a
+    // partial window can do without applying anything (ADR-194).
+    outcome.advanced = after != mine || spans_resumed;
+    let mine = after;
     outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
     outcome.exhausted = window_exhausted;
     outcome.truncated = window_truncated;
@@ -1532,6 +1629,9 @@ pub enum PeerPosition {
 #[derive(Debug, Default)]
 pub struct PeerStalls {
     by_peer: HashMap<NodeId, Stall>,
+    /// The vectors rounds have read since the loop last took them: each
+    /// peer's `theirs`, for the lag gauge (ADR-175's addendum).
+    vectors_read: Vec<(SocketAddr, VersionVector)>,
     /// Where this node stood behind each peer when its probe count was read,
     /// on the origins it then trailed that peer on (ADR-168) — the mirror of
     /// `by_peer`, so a member that is itself draining a backlog is not read
@@ -1801,6 +1901,12 @@ impl PeerStalls {
     /// succeed (ADR-175).
     pub fn take_pull(&mut self) -> Option<kimmy_storage::PullTiming> {
         self.pulled.take()
+    }
+
+    /// The vectors the rounds since this was last taken read from their
+    /// peers, whether or not the rounds went on to succeed.
+    pub fn take_vectors_read(&mut self) -> Vec<(SocketAddr, VersionVector)> {
+        std::mem::take(&mut self.vectors_read)
     }
 
     /// What the applies since this was last taken refused, declined and
@@ -2342,8 +2448,40 @@ impl PeerStalls {
 /// every ordinary capped pull on a busy cluster, which is the overwhelming
 /// common case this function must leave alone. See the truth table in this
 /// function's own tests for the one cell that is actually the error.
-fn is_unreachable_from_a_correct_sender(entries_len: usize, exhausted: bool) -> bool {
-    entries_len == 0 && !exhausted
+fn is_unreachable_from_a_correct_sender(
+    entries_len: usize,
+    exhausted: bool,
+    partial_end: Option<kimmy_core::Stamp>,
+) -> bool {
+    // A partial window this node asked for may be empty and not exhausted:
+    // the sender's budget ended it among entries this node holds (ADR-194).
+    entries_len == 0 && !exhausted && partial_end.is_none()
+}
+
+/// Whether a partial window's end is one a correct sender could have
+/// reported (ADR-194): at or past its last entry, at the stamp its scan says
+/// it reached, and past the floor, the successor of where this request
+/// asked the scan to start. `Err` with what it breaks.
+fn partial_window_holds(
+    p: kimmy_core::Stamp,
+    entries: &[OplogEntry],
+    scanned_to: Hlc,
+    start_sent: Hlc,
+) -> Result<(), String> {
+    if let Some(last) = entries.last()
+        && p < last.stamp
+    {
+        return Err(format!("it ends at {p:?}, before its last entry at {:?}", last.stamp));
+    }
+    if p.hlc != scanned_to {
+        return Err(format!("it ends at {p:?}, but says its scan reached {scanned_to:?}"));
+    }
+    if p.hlc <= start_sent.successor() {
+        return Err(format!(
+            "it ends at {p:?}, not past the floor after {start_sent:?} where the scan began"
+        ));
+    }
+    Ok(())
 }
 
 /// Ask the peer what it holds, and compare against what this node holds
@@ -2732,7 +2870,17 @@ pub(crate) mod test_serving {
         let binding = crate::tls::binding(stream.get_ref().1).unwrap();
         let ended = Arc::new(parking_lot::Mutex::new(None));
         let recording = Recording { inner: stream, ended: Arc::clone(&ended) };
-        serve_connection(&engine, recording, secret, &binding, None, None, peer).await;
+        serve_connection(
+            &engine,
+            recording,
+            secret,
+            &binding,
+            None,
+            None,
+            peer,
+            ServeBudgets::serving(),
+        )
+        .await;
         ended.lock().take()
     }
 
@@ -2784,6 +2932,7 @@ pub(crate) mod test_serving {
                             None,
                             Some(&hook),
                             peer,
+                            ServeBudgets::serving(),
                         )
                         .await;
                     }
@@ -2807,21 +2956,62 @@ mod tests {
     #[test]
     fn only_an_empty_non_exhausted_batch_is_unreachable_from_a_correct_sender() {
         assert!(
-            is_unreachable_from_a_correct_sender(0, false),
+            is_unreachable_from_a_correct_sender(0, false, None),
             "the one cell that is the error: nothing shipped, tail not reached"
         );
         assert!(
-            !is_unreachable_from_a_correct_sender(0, true),
+            !is_unreachable_from_a_correct_sender(0, true, None),
             "an empty batch because the peer's whole tail really was empty"
         );
         assert!(
-            !is_unreachable_from_a_correct_sender(50, false),
+            !is_unreachable_from_a_correct_sender(50, false, None),
             "an ordinary capped pull -- the regression a `!exhausted` shortcut would introduce"
         );
         assert!(
-            !is_unreachable_from_a_correct_sender(50, true),
+            !is_unreachable_from_a_correct_sender(50, true, None),
             "a full batch that happened to reach the tail on its last entry"
         );
+        // A partial window this node asked for (ADR-194): empty and not
+        // exhausted is what the sender's budget makes of a stretch this node
+        // holds all of.
+        let p = Some(kimmy_core::Stamp::new(Hlc::new(9, 0), node(1)));
+        assert!(
+            !is_unreachable_from_a_correct_sender(0, false, p),
+            "a partial window that passed over only what this node holds"
+        );
+        assert!(!is_unreachable_from_a_correct_sender(50, false, p));
+    }
+
+    /// A partial window's end, as the requester checks it (ADR-194): past
+    /// its last entry, at the stamp its scan reached, and past the floor
+    /// after where this request asked the scan to start. Anything else is
+    /// refused as malformed.
+    #[test]
+    fn a_partial_windows_end_is_checked_against_its_entries_its_scan_and_its_floor() {
+        let at = |wall, node_id| kimmy_core::Stamp::new(Hlc::new(wall, 0), node(node_id));
+        let entry = |stamp: kimmy_core::Stamp| OplogEntry {
+            stamp,
+            kind: kimmy_core::OpKind::Insert,
+            collection: CollectionId(1),
+            doc_id: None,
+            body: None,
+        };
+        let start = Hlc::new(10, 0);
+        let p = at(20, 5);
+        assert!(partial_window_holds(p, &[], p.hlc, start).is_ok(), "empty, past the floor");
+        assert!(partial_window_holds(p, &[entry(at(20, 5))], p.hlc, start).is_ok(), "at its entry");
+        assert!(partial_window_holds(p, &[entry(at(15, 9))], p.hlc, start).is_ok());
+        let before_last = partial_window_holds(p, &[entry(at(20, 6))], p.hlc, start);
+        assert!(before_last.is_err(), "it ends before its own last entry");
+        let elsewhere = partial_window_holds(p, &[], Hlc::new(21, 0), start);
+        assert!(elsewhere.is_err(), "its scan says it reached somewhere else");
+        let at_the_floor = at(10, 5);
+        assert!(
+            partial_window_holds(at_the_floor, &[], at_the_floor.hlc, start).is_err(),
+            "not past the floor"
+        );
+        let floor = kimmy_core::Stamp::new(start.successor(), node(5));
+        assert!(partial_window_holds(floor, &[], floor.hlc, start).is_err(), "at the floor itself");
     }
 
     fn node(n: u128) -> NodeId {
@@ -3352,6 +3542,39 @@ mod tests {
         assert!(stalls.without_witnessed.contains(&their_node), "and noted as answering without");
         assert_eq!(outcome.divergent, Some(std::collections::BTreeSet::new()), "the check ran");
     }
+    /// A round that fails after the peer's vectors arrived still leaves them
+    /// for the lag gauge (ADR-175's addendum): a peer whose every round
+    /// fails, as in round 0430, counts towards the lag rather than vanishing
+    /// from it.
+    #[tokio::test]
+    async fn a_round_that_fails_after_the_vectors_still_records_them() {
+        use tokio::io::DuplexStream;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut ahead = VersionVector::new();
+        ahead.insert(node(7), Hlc::new(5_000, 0));
+
+        async fn fake_peer(mut stream: DuplexStream, servable: VersionVector) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("the round opens by asking for both vectors, got {other:?}"),
+            }
+            let answer = Message::Vectors { servable: servable.clone(), witnessed: servable };
+            write_frame(&mut stream, &answer).await.unwrap();
+            // Asked for entries, it hangs up: the round fails here.
+            let _ = read_frame(&mut stream).await;
+        }
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(theirs, ahead.clone()));
+        let mut stalls = PeerStalls::new();
+        let failed = sync_over(&engine, ours, addr, node(7), None, &mut stalls).await;
+        peer.await.unwrap();
+        assert!(failed.is_err(), "the round failed: {failed:?}");
+        assert_eq!(stalls.take_vectors_read(), [(addr, ahead)], "its vectors are kept");
+        assert!(stalls.take_vectors_read().is_empty(), "taken once");
+    }
+
     /// ADR-148 at the wire: a peer whose window carries entries above the
     /// vector it advertised for their origin. The receiver applies nothing
     /// above that vector, witnesses exactly what the vector promised, and
@@ -3395,7 +3618,12 @@ mod tests {
                 other => panic!("expected AskEntries, got {other:?}"),
             }
             let scanned_to = window.last().unwrap().stamp.hlc;
-            let entries = Message::Entries { entries: window, scanned_to, exhausted: true };
+            let entries = Message::Entries {
+                entries: window,
+                scanned_to,
+                exhausted: true,
+                passed_through: None,
+            };
             write_frame(&mut stream, &entries).await.unwrap();
             // The window was taken whole up to the advertised vector, so the
             // round reached the tail the peer announced and runs the check —
@@ -3498,7 +3726,12 @@ mod tests {
                 other => panic!("expected AskEntries, got {other:?}"),
             }
             let scanned_to = window.last().unwrap().stamp.hlc;
-            let entries = Message::Entries { entries: window, scanned_to, exhausted: false };
+            let entries = Message::Entries {
+                entries: window,
+                scanned_to,
+                exhausted: false,
+                passed_through: None,
+            };
             write_frame(&mut stream, &entries).await.unwrap();
         }
 
@@ -3570,7 +3803,8 @@ mod tests {
                 other => panic!("expected AskEntries, got {other:?}"),
             }
             let scanned_to = window.last().unwrap().stamp.hlc;
-            let entries = Message::Entries { entries: window, scanned_to, exhausted };
+            let entries =
+                Message::Entries { entries: window, scanned_to, exhausted, passed_through: None };
             write_frame(&mut stream, &entries).await.unwrap();
             if exhausted {
                 match read_frame(&mut stream).await.unwrap() {
@@ -4419,6 +4653,59 @@ mod tests {
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
 
+    /// A window asked for whole, whose walk reaches the cap first, is not
+    /// sent in part: the requester cannot take it, and has given up by then.
+    /// The connection ends quietly, a debug line and no serve failure, and
+    /// the walk ends with it rather than running on for nobody (ADR-194).
+    #[tokio::test]
+    async fn a_whole_window_past_the_cap_ends_the_connection_without_a_failure() {
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        for i in 0..50 {
+            b.insert(&orders, bson::doc! { "_id": i }).unwrap();
+        }
+        // A requester that holds all of it: every row is passed over, and
+        // only the cap can end the walk short of the tail.
+        let held = b.version_vector().unwrap();
+
+        const SECRET: &str = "a-cap-test-secret";
+        const BINDING: &[u8] = b"a-cap-test-binding";
+        let failures = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hook: ServeFailHook = {
+            let failures = Arc::clone(&failures);
+            Arc::new(move |reason| failures.lock().push(reason))
+        };
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving = serve_connection(
+            &b,
+            theirs,
+            SECRET,
+            BINDING,
+            None,
+            Some(&hook),
+            "peer",
+            ServeBudgets { whole: Duration::ZERO, ..ServeBudgets::serving() },
+        );
+        let asking = async {
+            open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
+            let ask = Message::AskEntries {
+                from: Hlc::ZERO,
+                limit: MAX_BATCH,
+                held: Some(held),
+                marked: Vec::new(),
+                partial: false,
+            };
+            write_frame(&mut ours, &ask).await.unwrap();
+            read_frame(&mut ours).await
+        };
+        let ((), answer) = tokio::join!(serving, asking);
+        assert!(matches!(answer, Err(ProtocolError::Closed)), "no window was sent: {answer:?}");
+        assert_eq!(*failures.lock(), [], "the cap is not a serve failure");
+    }
+
     /// A pushed window this node cannot apply is answered with a `Fault`
     /// naming why, not a hang-up. The pusher reports the member pending with
     /// what it reads; a closed connection told it only "peer closed the
@@ -4439,7 +4726,8 @@ mod tests {
         const SECRET: &str = "a-push-test-secret";
         const BINDING: &[u8] = b"a-push-test-binding";
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let serving = async { serve_peer(&b, theirs, SECRET, BINDING, None).await };
+        let serving =
+            async { serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving()).await };
         let pushing = async {
             open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
             let push = Message::Push {
@@ -4486,7 +4774,9 @@ mod tests {
             }
         });
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let serving = async { serve_peer(b, theirs, SECRET, BINDING, Some(&hook)).await };
+        let serving = async {
+            serve_peer(b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving()).await
+        };
         let pushing = async {
             open_handshake(&pusher, &mut ours, SECRET, BINDING).await.unwrap();
             let scanned_to = entries.last().unwrap().stamp.hlc;
@@ -4525,7 +4815,16 @@ mod tests {
             Arc::new(move |reason| seen.lock().unwrap().push(reason))
         };
         let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let serving = serve_connection(&engine, theirs, SECRET, BINDING, None, Some(&hook), "peer");
+        let serving = serve_connection(
+            &engine,
+            theirs,
+            SECRET,
+            BINDING,
+            None,
+            Some(&hook),
+            "peer",
+            ServeBudgets::serving(),
+        );
         tokio::join!(serving, client(ours, peer));
         std::mem::take(&mut *seen.lock().unwrap())
     }
@@ -4668,7 +4967,9 @@ mod tests {
             }
         });
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let serving = async { serve_peer(&b, theirs, SECRET, BINDING, Some(&hook)).await };
+        let serving = async {
+            serve_peer(&b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving()).await
+        };
         let pushing = async {
             open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
             let mut answered = Vec::new();
@@ -4886,7 +5187,12 @@ mod tests {
         let scanned_to = window.last().unwrap().stamp.hlc;
         write_frame(
             &mut stream,
-            &Message::Entries { entries: window, scanned_to, exhausted: true },
+            &Message::Entries {
+                entries: window,
+                scanned_to,
+                exhausted: true,
+                passed_through: None,
+            },
         )
         .await
         .unwrap();
@@ -5173,7 +5479,12 @@ mod tests {
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
             let scanned_to = window.last().unwrap().stamp.hlc;
-            let entries = Message::Entries { entries: window, scanned_to, exhausted: false };
+            let entries = Message::Entries {
+                entries: window,
+                scanned_to,
+                exhausted: false,
+                passed_through: None,
+            };
             write_frame(&mut stream, &entries).await.unwrap();
             let _ = read_frame(&mut stream).await;
         }
@@ -5296,5 +5607,535 @@ mod tests {
         let failures = served.failures.lock().clone();
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(failures.iter().all(|f| matches!(f, ServeFailure::Io)), "{failures:?}");
+    }
+}
+
+/// **A partial window never skips an entry** (ADR-194; the design note's
+/// §4.4). Real stores, driven through the real round against the real serve,
+/// with budgets of one to five rows and no time, until the drain ends.
+///
+/// The sender holds inserts from three or four origins whose walls come from
+/// a few milliseconds, so origins tie at window ends, and some collide on a
+/// unique index, so it holds violations it withholds (ADR-029). The requester
+/// holds a random position on each origin, and on some a modelled snapshot
+/// grant: entries up to a point held as state (`Position::Hold`), and its
+/// position raised over them without a window, so its pulls name spans
+/// (ADR-167, ADR-172). Writes land on the sender between pulls, and between
+/// its answer of the vectors and its window, through a relay between the two
+/// (P1); each lands above what the sender advertised of its origin at that
+/// moment (P2), and some land below where the last window ended.
+///
+/// After every pull: **(a)** every insert of every origin at or below the
+/// requester's position is there, against the sender's oplog as it now
+/// stands; **(b)** computed with that pull's advertised vector, the next
+/// request's scan start is past this one's, for any pull that did not reach
+/// the tail. At the end, **(c)** the requester holds what one that pulled the
+/// same sender without a budget holds, and no mark at or below its position:
+/// each was served in a span and released.
+///
+/// Not generated: a collection the requester lacks (which only the ADR-148
+/// hole makes, and which stops a window before any budget), and the two
+/// exceptions to P2, retention and a snapshot's grant.
+#[cfg(test)]
+mod partial_windows_never_skip {
+    use super::*;
+    use bson::doc;
+    use kimmy_core::{DocId, IndexField, OpKind, Stamp};
+    use proptest::prelude::*;
+    use tokio::io::AsyncWriteExt;
+
+    const SECRET: &str = "a-partial-window-secret";
+    const BINDING: &[u8] = b"a-partial-window-binding";
+
+    /// Origins to write as, across the byte range node ids sort by.
+    const ORIGINS: [u8; 4] = [0x10, 0x60, 0xa0, 0xf0];
+
+    #[derive(Clone, Debug)]
+    struct Write {
+        origin: usize,
+        wall: u64,
+        counter: u16,
+        /// Takes the unique key of the write before it, so the sender mints
+        /// a violation it never ships.
+        collides: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Case {
+        origins: usize,
+        initial: Vec<Write>,
+        /// Per origin, how many of its initial writes the requester holds.
+        held: Vec<usize>,
+        /// Initial writes the requester holds as state, above its position.
+        marks: Vec<usize>,
+        /// Writes landing on the sender after pull `n`.
+        between: Vec<(usize, Write)>,
+        /// Writes landing on the sender inside pull `n`, between its vectors
+        /// and its window.
+        within: Vec<(usize, Write)>,
+        /// Each pull's budget, cycled: rows with no time limit, or 0 for a
+        /// pull whose time is spent at once, so it ends at the progress
+        /// floor.
+        budgets: Vec<u64>,
+    }
+
+    fn write() -> impl Strategy<Value = Write> {
+        (0..4usize, 0..6u64, 0..3u16, proptest::bool::weighted(0.1))
+            .prop_map(|(origin, wall, counter, collides)| Write { origin, wall, counter, collides })
+    }
+
+    fn case() -> impl Strategy<Value = Case> {
+        (
+            3..=4usize,
+            proptest::collection::vec(write(), 8..32),
+            proptest::collection::vec(0..16usize, 4),
+            proptest::collection::vec(0..32usize, 0..4),
+            proptest::collection::vec((0..16usize, write()), 0..6),
+            proptest::collection::vec((0..16usize, write()), 0..4),
+            proptest::collection::vec(0..=40u64, 1..6),
+        )
+            .prop_map(|(origins, initial, held, marks, between, within, budgets)| Case {
+                origins,
+                initial,
+                held,
+                marks,
+                between,
+                within,
+                budgets,
+            })
+    }
+
+    /// Stamps writes: an origin's walls from a few milliseconds above `base`,
+    /// always above what the sender holds of that origin (P2), and unique.
+    struct Stamper {
+        base: u64,
+        origins: usize,
+        used: std::collections::BTreeSet<Stamp>,
+        next_u: i64,
+        last_u: i64,
+    }
+
+    impl Stamper {
+        fn node(&self, write: &Write) -> kimmy_core::NodeId {
+            kimmy_core::NodeId::from_bytes([ORIGINS[write.origin % self.origins]; 16])
+        }
+
+        /// Stamp `write` above `floor`, the sender's position on its origin,
+        /// and make it an insert of a document of its own.
+        fn entry(
+            &mut self,
+            coll: &kimmy_storage::CollectionMeta,
+            write: &Write,
+            floor: Hlc,
+        ) -> OplogEntry {
+            let node = self.node(write);
+            let mut hlc = Hlc::new(self.base + write.wall, write.counter);
+            while hlc <= floor || self.used.contains(&Stamp::new(hlc, node)) {
+                hlc = hlc.successor();
+            }
+            self.used.insert(Stamp::new(hlc, node));
+            let u = if write.collides && self.last_u > 0 {
+                self.last_u
+            } else {
+                self.next_u += 1;
+                self.next_u
+            };
+            self.last_u = u;
+            let id = format!("{node}-{}-{}", hlc.wall_ms, hlc.counter);
+            OplogEntry {
+                stamp: Stamp::new(hlc, node),
+                kind: OpKind::Insert,
+                collection: coll.id,
+                doc_id: Some(DocId::String(id.clone())),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": id, "u": u }).unwrap()),
+            }
+        }
+
+        /// Land `write` on the sender, above what it holds of the origin.
+        fn land(&mut self, sender: &Engine, write: &Write) {
+            let coll = sender.get_collection("db", "c").unwrap();
+            let floor = sender.version_vector().unwrap().get(self.node(write));
+            let entry = self.entry(&coll, write, floor);
+            sender.apply_remote(&coll, &entry).unwrap();
+        }
+    }
+
+    fn engine() -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+    }
+
+    /// Every entry of the sender's oplog, in stamp order.
+    fn oplog(engine: &Engine) -> Vec<OplogEntry> {
+        engine.read_oplog_from(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Request).unwrap()
+    }
+
+    /// A requester placed as the case says: the sender's own schema, the
+    /// case's prefix of each origin in order, and its marks.
+    fn placed(case: &Case, sender: &Engine) -> (Engine, tempfile::TempDir) {
+        let (requester, dir) = engine();
+        let entries = oplog(sender);
+        let own: Vec<OplogEntry> =
+            entries.iter().filter(|e| e.stamp.node == sender.node_id()).cloned().collect();
+        requester.apply_batch(&own[..2]).unwrap();
+        let coll = requester.get_collection("db", "c").unwrap();
+        for (i, byte) in ORIGINS.iter().take(case.origins).enumerate() {
+            let node = kimmy_core::NodeId::from_bytes([*byte; 16]);
+            let of: Vec<OplogEntry> = entries
+                .iter()
+                .filter(|e| e.stamp.node == node && e.kind == OpKind::Insert)
+                .cloned()
+                .collect();
+            let n = case.held[i] % (of.len() + 1);
+            if n > 0 {
+                requester.apply_batch(&of[..n]).unwrap();
+            }
+        }
+        // A modelled snapshot grant (ADR-167, ADR-172): every insert of an
+        // origin up to a picked one arrives as held state, as a snapshot's
+        // pages bring it, and the position rises over them without a window,
+        // as the grant raises it. So the marks lie at or below the position,
+        // where only a span the pull names serves them and releases them.
+        let inserts: Vec<&OplogEntry> =
+            entries.iter().filter(|e| e.kind == OpKind::Insert).collect();
+        for pick in &case.marks {
+            let grant = inserts[pick % inserts.len()].stamp;
+            let mine = requester.witnessed_vector().unwrap();
+            if grant.hlc <= mine.get(grant.node) {
+                continue;
+            }
+            for entry in inserts.iter().filter(|e| {
+                e.stamp.node == grant.node && e.stamp.hlc > mine.get(grant.node) && e.stamp <= grant
+            }) {
+                requester.apply_held_for_test(&coll, entry).unwrap();
+            }
+            let granted: VersionVector = [(grant.node, grant.hlc)].into_iter().collect();
+            requester.absorb_witnessed(&granted).unwrap();
+        }
+        (requester, dir)
+    }
+
+    /// The serve budget for a case's `budgets` entry: `rows` examined with
+    /// no time limit, or, for 0, a time already spent, which ends a window
+    /// at its progress floor whatever the rows.
+    fn budget(rows: u64) -> kimmy_storage::ExamineBudget {
+        match rows {
+            0 => kimmy_storage::ExamineBudget { time: Duration::ZERO, rows: u64::MAX },
+            rows => kimmy_storage::ExamineBudget { time: Duration::MAX, rows },
+        }
+    }
+
+    /// No budget at all: the comparison requester of oracle (c).
+    const UNBUDGETED: kimmy_storage::ExamineBudget =
+        kimmy_storage::ExamineBudget { time: Duration::MAX, rows: u64::MAX };
+
+    /// One pull as a node makes it, handshake and round, against the
+    /// sender's serve with `partial` as the budget a partial window gets;
+    /// `within` lands on the sender once it has answered the vectors,
+    /// before its window. The outcome, and where the request asked the scan
+    /// to start.
+    async fn pull(
+        requester: &Engine,
+        sender: &Engine,
+        stalls: &mut PeerStalls,
+        partial: kimmy_storage::ExamineBudget,
+        within: impl FnOnce(),
+    ) -> (Result<kimmy_storage::SyncOutcome, ProtocolError>, Option<Hlc>) {
+        let (mut ours, near) = tokio::io::duplex(MAX_FRAME);
+        let (far, theirs) = tokio::io::duplex(MAX_FRAME);
+        let budgets = ServeBudgets { partial, whole: REQUEST_TIMEOUT };
+        let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets);
+        let asked: std::cell::Cell<Option<Hlc>> = std::cell::Cell::new(None);
+        let relaying = async {
+            let (mut near_read, mut near_write) = tokio::io::split(near);
+            let (mut far_read, mut far_write) = tokio::io::split(far);
+            let mut within = Some(within);
+            let forward = async {
+                while let Ok(message) = read_frame(&mut near_read).await {
+                    if let Message::AskEntries { from, marked, .. } = &message {
+                        asked.set(Some(marked.iter().map(|s| s.from).fold(*from, Hlc::min)));
+                        if let Some(within) = within.take() {
+                            within();
+                        }
+                    }
+                    if write_frame(&mut far_write, &message).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = far_write.shutdown().await;
+            };
+            let back = async {
+                let _ = tokio::io::copy(&mut far_read, &mut near_write).await;
+                let _ = near_write.shutdown().await;
+            };
+            tokio::join!(forward, back);
+        };
+        let pulling = async {
+            open_handshake(requester, &mut ours, SECRET, BINDING).await.unwrap();
+            let peer = "127.0.0.1:9".parse().unwrap();
+            let outcome =
+                sync_over(requester, &mut ours, peer, sender.node_id(), None, stalls).await;
+            drop(ours);
+            outcome
+        };
+        let (_, (), outcome) = tokio::join!(serving, relaying, pulling);
+        (outcome, asked.get())
+    }
+
+    /// Where the next request would ask the scan to start, against `theirs`:
+    /// as a round computes it, from the requester's position and the spans it
+    /// would name, resumed where `stalls` recorded. `None` when there would
+    /// be nothing to ask.
+    fn next_start(
+        requester: &Engine,
+        sender: kimmy_core::NodeId,
+        stalls: &PeerStalls,
+        theirs: &VersionVector,
+    ) -> Option<Hlc> {
+        let mine = requester.witnessed_vector().unwrap();
+        let named: Vec<kimmy_storage::MarkedRange> =
+            requester
+                .held_marks_covered_by(&mine)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(span, _)| {
+                    let through = span.through.min(theirs.get(span.origin));
+                    let from = stalls
+                        .marks_asked
+                        .get(&(sender, span.origin))
+                        .map_or(span.from, |asked| asked.resume.max(span.from));
+                    (through >= span.from && from <= through)
+                        .then_some(kimmy_storage::MarkedRange { from, through, ..span })
+                })
+                .collect();
+        let from = entries_threshold(&mine, theirs, &named)?;
+        Some(named.iter().map(|span| span.from).fold(from, Hlc::min))
+    }
+
+    /// Oracle (a): every insert the sender holds of an origin, at or below
+    /// the requester's position on it, is a document the requester holds.
+    fn nothing_skipped(requester: &Engine, sender: &Engine) -> Result<(), String> {
+        let mine = requester.witnessed_vector().unwrap();
+        let coll = requester.get_collection("db", "c").unwrap();
+        for entry in oplog(sender).into_iter().filter(|e| e.kind == OpKind::Insert) {
+            if entry.stamp.hlc <= mine.get(entry.stamp.node) {
+                let id = entry.doc_id.clone().unwrap();
+                if requester.get(&coll, &id).unwrap().is_none() {
+                    return Err(format!(
+                        "{:?} is at or below the position {:?} and was never delivered",
+                        entry.stamp,
+                        mine.get(entry.stamp.node)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What a requester ends with, for (c): its documents, and its position
+    /// and oplog on every origin but its own.
+    fn held(requester: &Engine) -> (Vec<String>, Vec<(kimmy_core::NodeId, Hlc)>, Vec<Stamp>) {
+        let coll = requester.get_collection("db", "c").unwrap();
+        let mut docs = Vec::new();
+        requester
+            .for_each_doc(&coll, kimmy_storage::WalkScope::Request, |_, doc| {
+                docs.push(doc.get_str("_id").unwrap_or_default().to_string());
+                Ok(true)
+            })
+            .unwrap();
+        docs.sort();
+        let me = requester.node_id();
+        let position =
+            requester.witnessed_vector().unwrap().iter().filter(|(n, _)| *n != me).collect();
+        let stamps =
+            oplog(requester).into_iter().map(|e| e.stamp).filter(|s| s.node != me).collect();
+        (docs, position, stamps)
+    }
+
+    async fn run(case: Case) -> Result<(), String> {
+        let (sender, _sdir) = engine();
+        sender.create_collection("db", "c").unwrap();
+        let unique = vec![IndexField::ascending("u")];
+        sender.create_index("db", "c", unique, true, Some("by_u".into())).unwrap();
+        let base =
+            sender.version_vector().unwrap().iter().map(|(_, h)| h.wall_ms).max().unwrap() + 1;
+        let mut stamper =
+            Stamper { base, origins: case.origins, used: Default::default(), next_u: 0, last_u: 0 };
+        for write in &case.initial {
+            stamper.land(&sender, write);
+        }
+        let (requester, _rdir) = placed(&case, &sender);
+        let (unbudgeted, _udir) = placed(&case, &sender);
+
+        // The drain is over at a pull that reached the tail after every write
+        // landed: past the last pull a write lands after or within.
+        let last_between = case.between.iter().map(|(n, _)| *n).max();
+        let last_within = case.within.iter().map(|(n, _)| *n).max();
+        let mut stalls = PeerStalls::new();
+        let mut pulls = 0usize;
+        loop {
+            let theirs = sender.version_vector().unwrap();
+            let rows = budget(case.budgets[pulls % case.budgets.len()]);
+            let within: Vec<Write> =
+                case.within.iter().filter(|(n, _)| *n == pulls).map(|(_, w)| w.clone()).collect();
+            let (outcome, start) = pull(&requester, &sender, &mut stalls, rows, || {
+                for write in &within {
+                    stamper.land(&sender, write);
+                }
+            })
+            .await;
+            let outcome = outcome.map_err(|e| format!("pull {pulls} failed: {e}"))?;
+            nothing_skipped(&requester, &sender)
+                .map_err(|e| format!("(a) after pull {pulls}: {e}"))?;
+            // A partial window moved the position, however little it carried,
+            // so the loop pulls again at once rather than a tick later
+            // (ADR-157, ADR-194).
+            if outcome.partial && !outcome.truncated {
+                return Err(format!("pull {pulls} ended at the budget and was not truncated"));
+            }
+            if let Some(start) = start
+                && !outcome.exhausted
+            {
+                match next_start(&requester, sender.node_id(), &stalls, &theirs) {
+                    Some(next) if next <= start => {
+                        return Err(format!(
+                            "(b) after pull {pulls}: the next start {next:?} is not past {start:?}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            for (_, write) in case.between.iter().filter(|(n, _)| *n == pulls) {
+                stamper.land(&sender, write);
+            }
+            // A write that landed within this pull came after its vectors, so
+            // the window deferred it: it too is still to come.
+            let writes_to_come = last_between.is_some_and(|last| pulls <= last)
+                || last_within.is_some_and(|last| pulls <= last);
+            pulls += 1;
+            if outcome.exhausted && !writes_to_come {
+                break;
+            }
+            if pulls > 2_000 {
+                return Err("the drain did not end".into());
+            }
+        }
+
+        // (c): the same sender, pulled whole by a requester placed the same.
+        let mut whole = PeerStalls::new();
+        loop {
+            let (outcome, _) = pull(&unbudgeted, &sender, &mut whole, UNBUDGETED, || {}).await;
+            if outcome.map_err(|e| format!("an unbudgeted pull failed: {e}"))?.exhausted {
+                break;
+            }
+        }
+        // Every mark at or below where the requester now stands was served
+        // in a span and released (ADR-169, ADR-172): a span the walk passed
+        // over as held would leave its marks for ever.
+        let position = requester.witnessed_vector().unwrap();
+        let unreleased = requester.held_marks_covered_by(&position).unwrap();
+        if !unreleased.is_empty() {
+            return Err(format!(
+                "(c) marks at or below the position were never released: {unreleased:?}"
+            ));
+        }
+        let (budgeted, whole) = (held(&requester), held(&unbudgeted));
+        if budgeted != whole {
+            return Err(format!(
+                "(c) the budgeted requester ended with {budgeted:?}, the whole one with {whole:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A span whose marked entries this sender no longer holds, collected
+    /// as retention collects them (P2's first exception), among more held
+    /// rows than a budget examines: the partial window carries nothing, and
+    /// the span must still resume past where it ended, or every pull starts
+    /// where the last one did (the design note's mutant 11). A span's own
+    /// entries, where the sender holds them, are served and released, and
+    /// its next mark is where the next scan starts, so only entries the
+    /// sender lacks leave a partial window empty.
+    #[test]
+    fn a_partial_window_that_carries_nothing_moves_its_span_on() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            // Origin 0 writes a little, origin 1 a lot in between.
+            let initial: Vec<Write> = (0..40u64)
+                .map(|i| Write {
+                    origin: usize::from(i % 8 != 0),
+                    wall: i / 8,
+                    counter: (i % 8) as u16,
+                    collides: false,
+                })
+                .collect();
+            let case = Case {
+                origins: 3,
+                initial,
+                // All of origin 1 held; origin 0 only through a grant.
+                held: vec![0, 35, 0, 0],
+                marks: vec![32],
+                between: Vec::new(),
+                within: Vec::new(),
+                budgets: vec![1],
+            };
+            let (sender, _sdir) = engine();
+            sender.create_collection("db", "c").unwrap();
+            let unique = vec![IndexField::ascending("u")];
+            sender.create_index("db", "c", unique, true, Some("by_u".into())).unwrap();
+            let base =
+                sender.version_vector().unwrap().iter().map(|(_, h)| h.wall_ms).max().unwrap() + 1;
+            let mut stamper = Stamper {
+                base,
+                origins: case.origins,
+                used: Default::default(),
+                next_u: 0,
+                last_u: 0,
+            };
+            for write in &case.initial {
+                stamper.land(&sender, write);
+            }
+            let (requester, _rdir) = placed(&case, &sender);
+            let theirs = sender.version_vector().unwrap();
+            let mine = requester.witnessed_vector().unwrap();
+            assert!(!requester.held_marks_covered_by(&mine).unwrap().is_empty(), "premise: a span");
+            // The sender collects origin 0's entries but its last, which its
+            // vector still covers.
+            let quiet = kimmy_core::NodeId::from_bytes([ORIGINS[0]; 16]);
+            let of_quiet: Vec<Stamp> =
+                oplog(&sender).iter().map(|e| e.stamp).filter(|s| s.node == quiet).collect();
+            for stamp in &of_quiet[..of_quiet.len() - 1] {
+                sender.collect_oplog_entry_for_test(stamp);
+            }
+            let mut stalls = PeerStalls::new();
+            let mut empty_partials = 0;
+            for pull_no in 0..200 {
+                let (outcome, start) =
+                    pull(&requester, &sender, &mut stalls, budget(1), || {}).await;
+                let outcome = outcome.unwrap();
+                if outcome.exhausted {
+                    break;
+                }
+                empty_partials += usize::from(outcome.partial && outcome.total() == 0);
+                let start = start.expect("a request was made");
+                let next = next_start(&requester, sender.node_id(), &stalls, &theirs);
+                assert!(
+                    next.is_none_or(|next| next > start),
+                    "pull {pull_no}: {next:?} after {start:?}"
+                );
+            }
+            assert!(empty_partials > 0, "premise: a partial window carried nothing");
+        });
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        #[test]
+        fn a_partial_window_never_skips_an_entry(case in case()) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let result = runtime.block_on(run(case));
+            prop_assert!(result.is_ok(), "{}", result.unwrap_err());
+        }
     }
 }

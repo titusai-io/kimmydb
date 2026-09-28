@@ -685,7 +685,7 @@ impl TelemetryGuard {
             f64_observable_gauge,
             "kimmy.replication.lag",
             "s",
-            "Seconds since the newest peer entry applied locally where a peer holds newer, worst peer in the last round, to the millisecond. Reads 0 once a round's pull reached the vector the peer advertised, including while entries written since wait for the next round.",
+            "Seconds this node trails its peers, to the millisecond, computed when read from each peer's last advertised vector, successful round or not. Reads 0 once every peer's advertised entries are here.",
             |s| s.replication_lag_ms as f64 / 1e3
         );
         // Where sync pulls spend their time (ADR-175). The two histograms'

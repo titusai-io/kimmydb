@@ -70,10 +70,11 @@ pub use snapshot::{
     SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
-    EntryWait, MarkedRange, PullTiming, SyncOutcome, UnknownCollection, WindowEnd, coverage_up_to,
-    lacks_collected, lag_behind_ms, lag_beyond_horizon_ms,
+    EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,
+    coverage_up_to, lacks_collected, lag_behind_ms, lag_beyond_horizon_ms,
 };
 pub use vectors::{VectorWrite, VectorsOff};
 pub use watch::{
-    ChangeEvent, ChangeStream, InvalidateReason, OplogWindow, WatchOptions, WatchScope,
+    ChangeEvent, ChangeStream, ExamineBudget, InvalidateReason, OplogWindow, WatchOptions,
+    WatchScope, set_test_serve_walk_budget,
 };

@@ -1411,6 +1411,32 @@ async fn a_listener_out_of_descriptors_says_so() {
     assert!(status.success(), "{status:?}: {}", run.log());
 }
 
+/// The serve budget's test switches ship in the binary (ADR-194), so a start
+/// where either is set says so, as the other test switches do, with whether
+/// the value was understood.
+#[tokio::test]
+async fn a_start_with_a_serve_walk_switch_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(
+        dir.path(),
+        "serve-walk",
+        &[("KIMMY_TEST_SERVE_WALK_ROWS", "500"), ("KIMMY_TEST_SERVE_WALK_MS", "soon")],
+    );
+    run.wait_ready(&client).await;
+    let log = run.log();
+    let switch = |name: &str| {
+        log.lines()
+            .find(|l| l.contains("changes the budget of every window") && l.contains(name))
+            .unwrap_or_else(|| panic!("no line for {name}: {log}"))
+            .to_string()
+    };
+    assert!(switch("KIMMY_TEST_SERVE_WALK_ROWS").contains("recognised=true"));
+    assert!(switch("KIMMY_TEST_SERVE_WALK_MS").contains("recognised=false"));
+    let (status, _) = stop(&mut run);
+    assert!(status.success(), "{status:?}");
+}
+
 /// Pinned as it is, and out of the stop's scope: a SIGTERM before the node
 /// serves finds no handler yet, and ends the process with the signal and no
 /// marker.
