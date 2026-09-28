@@ -40,6 +40,10 @@ hnsw_rs = "0.3.4"
 # features on `fastembed` above keep it off OpenSSL/native-tls, unlike its
 # defaults.
 local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
+# WorkerCounters::for_test, which seeds a chosen last_progress and non-zero
+# counts for another crate's tests. Off by default; kimmy-api's
+# dev-dependency enables it, same shape as kimmy-storage's `test-hooks`.
+test-hooks = []
 
 [dev-dependencies]
 criterion.workspace = true

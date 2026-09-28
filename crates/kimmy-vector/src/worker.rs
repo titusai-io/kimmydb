@@ -480,6 +480,36 @@ impl WorkerCounters {
         *self.last_progress.lock() = Some(std::time::Instant::now());
     }
 
+    /// A counter set with every field named here, for another crate's
+    /// metrics test: `last_progress` is private, with no public setter, so
+    /// a test that wants `kimmy_task_progress_age_seconds{task="embedding_worker"}`
+    /// reading something other than the since-start fallback has no other
+    /// way to seed one. Never compiled into a build that ships (`test-hooks`
+    /// is off by default, and only a dev-dependency enables it).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_test(
+        last_progress: Option<std::time::Instant>,
+        documents_embedded: u64,
+        chunks_embedded: u64,
+        deferred: u64,
+        skipped_not_owned: u64,
+        skipped_no_shadow: u64,
+        failures: u64,
+        transport: [u64; 4],
+    ) -> Self {
+        Self {
+            documents_embedded: AtomicU64::new(documents_embedded),
+            chunks_embedded: AtomicU64::new(chunks_embedded),
+            deferred: AtomicU64::new(deferred),
+            skipped_not_owned: AtomicU64::new(skipped_not_owned),
+            skipped_no_shadow: AtomicU64::new(skipped_no_shadow),
+            failures: AtomicU64::new(failures),
+            transport: transport.map(AtomicU64::new),
+            last_progress: parking_lot::Mutex::new(last_progress),
+        }
+    }
+
     fn embedded(&self, chunks: usize) {
         self.documents_embedded.fetch_add(1, Ordering::Relaxed);
         self.chunks_embedded.fetch_add(chunks as u64, Ordering::Relaxed);
