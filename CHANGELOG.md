@@ -38,7 +38,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   unchanged, and so are the vectors: a batch embedded with each model before
   and after is bit-identical. The build this matters to is one made with the
   `local-embeddings` feature; the default build and the container image do
-  not include it.
+  not include it. fastembed now also sends `HF_TOKEN`, when it is set, with a
+  model download (to an `HF_ENDPOINT` mirror too); before, only the
+  `huggingface-cli login` token was used.
 
 ### Fixed
 
