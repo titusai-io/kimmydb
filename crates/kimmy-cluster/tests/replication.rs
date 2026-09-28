@@ -6251,3 +6251,109 @@ async fn a_wedged_contact_ending_budget_is_never_reset_or_carried_forward() {
         );
     }
 }
+
+/// ADR-195's addendum: carried peers take `fanout`'s slots first
+/// (`PeerHealth::select_excluding`, already proven pure in `health.rs`'s
+/// `carried_peers_at_or_above_fanout_leave_nothing_to_select`), but that
+/// only holds if `peers.rs`'s own loop hands `select_excluding` the right
+/// `slots` -- `carried.len()`, not e.g. a stale or zero count. With more
+/// draining peers than `fanout`, this proves the wiring: a tick whose
+/// carried set already spends the whole fanout must not reach for a fresh
+/// peer on top of it.
+///
+/// Three peers, each seeded past several `MAX_BATCH`-sized pulls, with
+/// `fanout` at 2: the first tick can only afford two of them (fanout caps a
+/// fresh selection the same as a carried one), and a short interval ends
+/// both of those two contacts on `Budget` while still advancing -- both
+/// carried into the reset tick. If the wiring passed the wrong slot count,
+/// the reset tick would have room left to reach for the third, untouched
+/// peer; correctly wired, it has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_tick_never_reaches_past_carried_peers_for_a_fresh_one_beyond_fanout() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+    use kimmy_cluster::{Members, ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let d = node().await;
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        let p = node().await;
+        let coll = p.engine.create_collection("shop", "orders").unwrap();
+        seed(&p, &coll, MAX_BATCH * 6);
+        peers.push(p);
+    }
+    let peer_ids: BTreeSet<kimmy_core::NodeId> = peers.iter().map(|p| p.engine.node_id()).collect();
+
+    let members = Members::default();
+    for p in &peers {
+        members.insert_for_test(p.addr, p.engine.node_id());
+    }
+
+    let contacted_this_tick: Arc<std::sync::Mutex<Vec<kimmy_core::NodeId>>> = Arc::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(RoundReport, Vec<kimmy_core::NodeId>)>();
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(peers.iter().map(|p| p.addr).collect())],
+        SECRET.into(),
+        d.addr,
+    );
+    config.fanout = 2;
+    config.sync_interval = Duration::from_millis(120);
+    config.discovery_interval = Duration::from_millis(120);
+    config.members = Some(members);
+    config.on_peer_staleness = Some(Arc::new({
+        let contacted = Arc::clone(&contacted_this_tick);
+        move |node, _| contacted.lock().unwrap().push(node)
+    }));
+    config.on_round = Some(Arc::new({
+        let contacted = Arc::clone(&contacted_this_tick);
+        move |report| {
+            let this_tick = std::mem::take(&mut *contacted.lock().unwrap());
+            let _ = tx.send((report, this_tick));
+        }
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut ticks: Vec<Vec<kimmy_core::NodeId>> = Vec::new();
+    loop {
+        let Ok(Some((report, this_tick))) = tokio::time::timeout_at(deadline, rx.recv()).await
+        else {
+            looping.abort();
+            panic!(
+                "the loop stalled before two carried peers ever appeared; ticks so far: {ticks:?}"
+            );
+        };
+        assert!(
+            this_tick.iter().all(|id| peer_ids.contains(id)),
+            "only ever this test's own three peers, never a stray one: {this_tick:?}"
+        );
+        let budget_and_advanced = report.pulls.contacts[kimmy_cluster::ContactEnd::Budget.slot()];
+        ticks.push(this_tick.clone());
+        // The first tick that carries two forward: fanout is 2, so a tick
+        // contacting two peers that both end Budget while advancing is
+        // exactly the shape whose *next* tick this test is about -- and
+        // with fanout at 2, no tick can carry more than two regardless of
+        // the bug this guards against, so seeing two here is this fixture's
+        // own premise, not yet the property under test.
+        if this_tick.len() == 2 && budget_and_advanced == 2 {
+            let carried: BTreeSet<kimmy_core::NodeId> = this_tick.into_iter().collect();
+            let (report, next_tick) = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .expect("the reset tick must fire")
+                .expect("the loop is running");
+            looping.abort();
+            let next: BTreeSet<kimmy_core::NodeId> = next_tick.into_iter().collect();
+            assert_eq!(
+                next, carried,
+                "the reset tick contacted {next:?}, but only {carried:?} was carried forward -- \
+                 fanout is 2, already spent by the carried set, so nothing was left to reach a \
+                 fresh peer with"
+            );
+            assert!(
+                report.pulls.contacts[kimmy_cluster::ContactEnd::Budget.slot()] > 0
+                    || report.pulls.contacts[kimmy_cluster::ContactEnd::CaughtUp.slot()] > 0,
+                "premise: the reset tick actually ran against the carried peers: {report:?}"
+            );
+            return;
+        }
+    }
+}
