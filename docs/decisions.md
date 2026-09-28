@@ -20595,10 +20595,10 @@ and answers with where it stopped. The requester takes that as coverage.
   or any pull was partial.
 
 **The test switches.** `KIMMY_TEST_SERVE_WALK_ROWS` and
-`KIMMY_TEST_SERVE_WALK_MS` set the budget for every window this process
-serves and every confirmation push it makes. They ship in the binary, like `KIMMY_TEST_WALK_ROW_MS`, and every
-start where either is set logs a `WARN` naming it, with whether the value was
-understood.
+`KIMMY_TEST_SERVE_WALK_MS` set the budget for every window this process serves
+and every confirmation push it makes. They ship in the binary, like
+`KIMMY_TEST_WALK_ROW_MS`, and every start where either is set logs a `WARN`
+naming it, with whether the value was understood.
 
 **Mixed versions.**
 
