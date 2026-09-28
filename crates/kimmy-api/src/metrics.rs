@@ -382,8 +382,6 @@ pub struct MetricsSnapshot {
     /// since start. The histograms' buckets are on `/metrics` alone; their
     /// sums and counts, and the counters, are what the bridge carries.
     pub sync_pulls: kimmy_cluster::PullReport,
-    /// Worst runtime scheduling delay since the last scrape, microseconds.
-    pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
     pub tls_reloads_failed: u64,
     pub jwks_refresh_ok: u64,
@@ -421,9 +419,6 @@ pub struct Metrics {
     /// buckets; its count is `backups`.
     backup_buckets: [AtomicU64; BACKUP_BUCKETS_US.len()],
     backup_sum_us: AtomicU64,
-    /// Milliseconds (ADR-175): what the loop last pushed, read only when no
-    /// `replication_lag_source` is installed.
-    replication_lag_ms: AtomicU64,
     /// The gauge computed when it is read, from each peer's last advertised
     /// vector (ADR-175's addendum): what a node that replicates installs,
     /// once. A `OnceLock`, so a scrape calls it with no lock held.
@@ -551,7 +546,6 @@ impl Default for Metrics {
             latency_count: AtomicU64::new(0),
             backup_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             backup_sum_us: AtomicU64::new(0),
-            replication_lag_ms: AtomicU64::new(0),
             replication_lag_source: std::sync::OnceLock::new(),
             sync_pulls: parking_lot::Mutex::new(kimmy_cluster::PullReport::default()),
             sync_failures: AtomicU64::new(0),
@@ -715,30 +709,23 @@ impl Metrics {
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// How far behind in time this node is: seconds since the newest entry
-    /// it has applied from an origin a peer holds newer entries of, worst
-    /// origin over the peers reached in the last round.
-    ///
-    /// Pushed by the replication loop after each round, because that is the
-    /// only place a peer's version vector exists — the reason ADR-043 left
-    /// this out rather than guessing. Zero when caught up; grows with the
-    /// clock while a backlog drains, which the span of the missing history
-    /// did not (ADR-122).
-    ///
-    /// Milliseconds, and rendered to the millisecond (ADR-175). It was whole
-    /// seconds, truncated, which cannot read an effect of a few seconds.
-    pub fn set_replication_lag_ms(&self, ms: u64) {
-        self.replication_lag_ms.store(ms, Ordering::Relaxed);
-    }
-
     /// Compute `kimmy_replication_lag_seconds` with `source` whenever it is
-    /// read, in place of the value [`Self::set_replication_lag_ms`] pushes
-    /// (ADR-175's addendum): from each peer's last advertised vector, so a
-    /// peer whose rounds fail still counts, and the reading moves with the
-    /// clock between rounds. Installed once, when the node starts
+    /// read (ADR-175's addendum): from each peer's last advertised vector,
+    /// so a peer whose rounds fail still counts, and the reading moves with
+    /// the clock between rounds. Installed once, when the node starts
     /// replicating; a second source is ignored.
     pub fn compute_replication_lag_with(&self, source: LagSource) {
         let _ = self.replication_lag_source.set(source);
+    }
+
+    /// The one value both `/metrics` and the OTLP bridge's snapshot render
+    /// for `kimmy_replication_lag_seconds`: the live source if one is
+    /// installed, else 0 — a node that has not started replicating, or
+    /// never will (clustering off), has no lag to report. A single
+    /// accessor so the two surfaces cannot read it two different ways
+    /// again.
+    fn replication_lag_ms_now(&self) -> u64 {
+        self.replication_lag_source.get().map_or(0, |source| source())
     }
 
     /// One sync tick of the replication loop: how many rounds failed, how
@@ -1132,10 +1119,7 @@ impl Metrics {
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: readings.cluster_members,
             task_progress_age_secs: self.task_progress_ages_at(now),
-            replication_lag_ms: match self.replication_lag_source.get() {
-                Some(source) => source(),
-                None => self.get(&self.replication_lag_ms),
-            },
+            replication_lag_ms: self.replication_lag_ms_now(),
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
@@ -1165,7 +1149,6 @@ impl Metrics {
             sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
             sync_pulls: *self.sync_pulls.lock(),
-            runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
             jwks_refresh_ok: self.get(&self.jwks_refresh_ok),
@@ -1605,7 +1588,7 @@ impl Metrics {
             wh_unreadable = readings.webhook_unreadable,
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = readings.cluster_members,
-            lag = self.get(&self.replication_lag_ms) as f64 / 1e3,
+            lag = self.replication_lag_ms_now() as f64 / 1e3,
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
@@ -2017,8 +2000,10 @@ mod tests {
         // readings now (ADR-187), in `distinct_readings`.
         m.set_webhook_backlog(17);
         // Not a whole number of seconds: the gauge renders milliseconds
-        // (ADR-175), and a render that truncated would print 19.
-        m.set_replication_lag_ms(19_250);
+        // (ADR-175), and a render that truncated would print 19. A live
+        // source, not the (now-deleted) pushed field: every reader of this
+        // fixture must see the branch a replicating node actually takes.
+        m.compute_replication_lag_with(std::sync::Arc::new(|| 19_250));
         // Two ticks: the counters accumulate, the backoff level, the
         // divergence count and the check's instant are each replaced. A
         // render that printed the first tick's level, or a level that
@@ -2993,6 +2978,30 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_commits {}\n", s.commits));
         expect(&format!("kimmy_fsyncs {}\n", s.fsyncs));
         expect(&format!("kimmy_commits_grouped_total {}\n", s.commits_grouped));
+        expect(&format!("kimmy_write_lock_wait_timeouts_total {}\n", s.write_lock_wait_timeouts));
+        expect(&format!(
+            "kimmy_write_lock_held_seconds_max {}\n",
+            s.write_lock_held_max_us as f64 / 1e6
+        ));
+        for holder in kimmy_storage::WriterHolder::ALL {
+            let row = holder.slot();
+            let label = holder.label();
+            expect(&format!(
+                "kimmy_write_lock_held_seconds_sum{{holder=\"{label}\"}} {}\n",
+                s.write_lock_held_us[row] as f64 / 1e6
+            ));
+            expect(&format!(
+                "kimmy_write_lock_held_seconds_count{{holder=\"{label}\"}} {}\n",
+                s.write_lock_holds[row]
+            ));
+        }
+        expect(&format!("kimmy_oplog_entries {}\n", s.oplog_entries));
+        expect(&format!("kimmy_oplog_verified_entries {}\n", s.oplog_verified.rows));
+        expect(&format!("kimmy_oplog_verified_logical_bytes {}\n", s.oplog_verified.logical_bytes));
+        expect(&format!(
+            "kimmy_oplog_verified_walk_seconds {}\n",
+            s.oplog_verified.elapsed_ms as f64 / 1e3
+        ));
         expect(&format!("kimmy_storage_bytes {}\n", s.storage_bytes));
         if cfg!(feature = "storage-cache-metrics") {
             expect(&format!("kimmy_storage_cache_bytes {}\n", s.storage_cache.used_bytes));
@@ -3040,9 +3049,17 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_webhook_subscriptions{{state=\"invalidated\"}} {}\n",
             s.webhook_invalidated
         ));
+        expect(&format!(
+            "kimmy_webhook_subscriptions{{state=\"unreadable\"}} {}\n",
+            s.webhook_unreadable
+        ));
         expect(&format!("kimmy_webhook_backlog_seconds {}\n", s.webhook_backlog_secs));
         expect(&format!("kimmy_cluster_members {}\n", s.cluster_members));
         expect(&format!("kimmy_replication_lag_seconds {}\n", s.replication_lag_ms as f64 / 1e3));
+        for (i, writer) in PROGRESS_WRITERS.into_iter().enumerate() {
+            let Some(age) = s.task_progress_age_secs[i] else { continue };
+            expect(&format!("kimmy_task_progress_age_seconds{{task=\"{writer}\"}} {age}\n"));
+        }
         expect(&format!("kimmy_sync_failures_total {}\n", s.sync_failures));
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
@@ -3220,6 +3237,29 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
     }
 
     #[test]
+    fn a_live_replication_lag_source_reaches_both_the_snapshot_and_the_render() {
+        // A minimal, focused regression test for exactly the gap that let
+        // 0.41.0 render 0 forever while the snapshot read the source
+        // correctly: a source installed, and both surfaces checked against
+        // it directly, not against each other.
+        let m = Metrics::default();
+        m.compute_replication_lag_with(std::sync::Arc::new(|| 12_345));
+        let now = Instant::now();
+        let readings = StorageReadings::default();
+
+        assert_eq!(
+            m.snapshot_with_at(&readings, now).replication_lag_ms,
+            12_345,
+            "the snapshot must read the installed source, not the seeded fallback"
+        );
+        let out = m.render_with_at(&readings, now);
+        assert!(
+            out.contains("kimmy_replication_lag_seconds 12.345\n"),
+            "the render must read the installed source, not the seeded fallback: {out}"
+        );
+    }
+
+    #[test]
     fn statuses_land_in_the_right_class() {
         let m = Metrics::default();
         for status in [200, 201, 204] {
@@ -3244,7 +3284,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // before this ever saw them, so every reading was a whole second,
         // truncated, and an effect of a few seconds could not be read.
         let m = Metrics::default();
-        m.set_replication_lag_ms(6_384);
+        m.compute_replication_lag_with(std::sync::Arc::new(|| 6_384));
         let out = m.render();
         assert!(out.contains("kimmy_replication_lag_seconds 6.384\n"), "{out}");
         assert_eq!(m.snapshot().replication_lag_ms, 6_384, "the bridge reads the same value");
@@ -3521,15 +3561,13 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
 
     #[test]
     fn the_pushed_gauges_render_what_was_pushed() {
-        // Each of these is *set* from somewhere else — the replication loop,
-        // the dispatcher, the certificate reloader — and every existing
-        // assertion about them checks a value a broken setter would also
-        // produce: the cluster harness waits for replication lag to reach
-        // **zero**, which is exactly what a setter that does nothing reports.
-        // A non-zero value is the only one that distinguishes the two.
+        // Each of these is *set* from somewhere else — the replication
+        // loop's tick report, the dispatcher, the certificate reloader —
+        // rather than computed live at the read the way the lag gauge is
+        // (see `a_live_replication_lag_source_reaches_both_the_snapshot_and_the_render`
+        // and `the_lag_gauge_reads_to_the_millisecond` for that one).
         let m = Metrics::default();
         let now = Instant::now() + Duration::from_secs(100);
-        m.set_replication_lag_ms(7_000);
         m.record_sync_round(&kimmy_cluster::RoundReport {
             failed: 1,
             backing_off: 1,
@@ -3579,7 +3617,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         m.record_jwks_refresh(false);
 
         let out = m.render_at(now);
-        assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
         // The failure signals are pushed per tick: counters accumulate across
         // ticks, the backoff level is the latest tick's (ADR-123).
         assert!(out.contains("kimmy_sync_failures_total 3"), "{out}");

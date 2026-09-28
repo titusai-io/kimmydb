@@ -293,14 +293,39 @@ allowed_hosts = ["127.0.0.1"]
         res["token"].as_str().expect("a token").to_string()
     }
 
-    /// A gauge from `/metrics`, scraped like an operator would.
-    async fn gauge(&self, client: &reqwest::Client, name: &str) -> Option<u64> {
+    /// The raw text of one series from `/metrics`, scraped like an operator
+    /// would. `None` only when the series itself is absent -- shared by
+    /// [`Self::gauge`] and [`Self::gauge_f64`], so there is one place that
+    /// reads the wire text rather than two that could drift.
+    async fn scrape_value(&self, client: &reqwest::Client, name: &str) -> Option<String> {
         let body = client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()?;
         let prefix = format!("{name} ");
         body.lines()
             .find(|l| l.starts_with(&prefix))
             .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
+            .map(str::to_owned)
+    }
+
+    /// An integer gauge from `/metrics`. `None` only when the series is
+    /// absent; a series present but not an integer is a caller's mistake,
+    /// not a missing reading, and panics rather than returning `None` --
+    /// `kimmy_replication_lag_seconds` and the like render as a float in
+    /// seconds, and a `.parse::<u64>()` that silently dropped that to
+    /// `None` is what let a real regression hide behind a passing test.
+    /// Use [`Self::gauge_f64`] for a series that renders as a float.
+    async fn gauge(&self, client: &reqwest::Client, name: &str) -> Option<u64> {
+        let raw = self.scrape_value(client, name).await?;
+        Some(
+            raw.parse()
+                .unwrap_or_else(|_| panic!("`{name}` = `{raw}` is not an integer; use gauge_f64")),
+        )
+    }
+
+    /// [`Self::gauge`], for a gauge rendered as a float (seconds, not
+    /// milliseconds) -- `kimmy_replication_lag_seconds` and the like.
+    async fn gauge_f64(&self, client: &reqwest::Client, name: &str) -> Option<f64> {
+        let raw = self.scrape_value(client, name).await?;
+        Some(raw.parse().unwrap_or_else(|_| panic!("`{name}` = `{raw}` is not a float")))
     }
 
     async fn members_gauge(&self, client: &reqwest::Client) -> Option<u64> {
@@ -673,7 +698,7 @@ async fn replication_converges_through_gossip_discovered_peers() {
         let nodes = [&a, &b, &c];
         async move {
             for node in nodes {
-                if node.gauge(client, "kimmy_replication_lag_seconds").await != Some(0) {
+                if node.gauge_f64(client, "kimmy_replication_lag_seconds").await != Some(0.0) {
                     return false;
                 }
             }
@@ -2239,7 +2264,7 @@ async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_cl
     let probe = "kimmy_task_progress_age_seconds{task=\"stall_probe\"}";
     tokio::time::sleep(Duration::from_secs(2)).await;
     let first = node.gauge(&client, replication).await.expect("a replication age row");
-    assert_eq!(node.gauge(&client, "kimmy_replication_lag_seconds").await, Some(0));
+    assert_eq!(node.gauge_f64(&client, "kimmy_replication_lag_seconds").await, Some(0.0));
     assert!(
         node.gauge(&client, "kimmy_sync_failures_total").await.is_some_and(|n| n > 0),
         "premise: the rounds are failing"
@@ -2973,4 +2998,184 @@ async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
         "the serve walk ran on {:.1} s into the drain, as a request's would\n{log}",
         stopped - signal
     );
+}
+
+/// The finding: on 0.41.0 `kimmy_replication_lag_seconds` reads 0
+/// regardless of how far behind a member actually is. Round 0440's sampler
+/// found 0 non-zero readings out of 16,021 samples across three members;
+/// rounds 0420 and 0430 (0.40.x) saw 80-201 non-zero readings per replica,
+/// up to 72-235 s. This is a HIGH regression on the gauge an operator's
+/// alert depends on (ADR-046, ADR-122).
+///
+/// Same shape as `a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere`
+/// above, because it needs the same thing that test needs: a real, sustained
+/// gap between what C has written and what B has pulled, wide enough to
+/// scrape mid-flight rather than race a single poll against it. C's serve
+/// walk is slowed (`KIMMY_TEST_WALK_ROW_MS`) so a single new write still
+/// takes many seconds to reach B, and B's `kimmy_replication_lag_seconds` is
+/// polled throughout: it must read non-zero while the write is in flight,
+/// and clear once it lands.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn kimmy_replication_lag_seconds_reads_non_zero_while_a_member_trails_and_clears_once_it_catches_up()
+ {
+    const LOAD: usize = 2_200;
+    let client = reqwest::Client::new();
+    let (a, b, mut c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    // C writes once, early, on the collection every member already has: so
+    // B witnesses C's origin *before* the probe write below, matching the
+    // finding's own shape ("kimmy1 provably trailed kimmy2, an origin it
+    // had applied from") rather than a never-seen origin, which reads 0 by
+    // design (ADR-122) and would prove nothing about this regression.
+    let c_token = c.login(&client).await;
+    eventually("the collection to reach C before it writes to it", || {
+        let client = client.clone();
+        let url = c.url("/v1/db/shop/collections");
+        let tok = c_token.clone();
+        async move {
+            let Ok(res) = client.get(url).bearer_auth(&tok).send().await else {
+                return false;
+            };
+            res.text().await.is_ok_and(|body| body.contains("\"orders\""))
+        }
+    })
+    .await;
+    // `lag_behind_ms` reads `now − held.wall_ms`: the age of the newest
+    // entry from this origin B has *applied*, not of whatever C writes
+    // next (sync.rs). Once "from-c" lands B's held stamp moves to it, but
+    // until then this early write is B's held stamp for C's origin, and the
+    // real bound the gauge answers to is its age, not "from-c"'s.
+    let held_stamp_written = std::time::Instant::now();
+    let wrote_early = client
+        .post(c.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&c_token)
+        .json(&serde_json::json!({ "_id": "from-c-early" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(wrote_early.status().is_success(), "{}", wrote_early.text().await.unwrap());
+    for batch in 0..LOAD / 550 {
+        let docs: Vec<_> =
+            (0..550).map(|i| serde_json::json!({ "_id": batch * 550 + i })).collect();
+        let bulk = client
+            .post(a.url("/v1/db/shop/coll/orders/bulk"))
+            .bearer_auth(&token)
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(bulk.status().is_success());
+    }
+    pulls_settle(&client, &[&a, &b, &c]).await;
+    let held_early = client
+        .get(b.url("/v1/db/shop/coll/orders/docs/from-c-early"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(held_early.status().is_success(), "premise: B has already witnessed C's origin");
+    let last = format!("/v1/db/shop/coll/orders/docs/{}", LOAD - 1);
+    let held = client.get(c.url(&last)).bearer_auth(&token).send().await.unwrap();
+    assert!(held.status().is_success(), "premise: C holds the load");
+
+    eventually(
+        "the premise: converged, so the gauge already reads 0 before the probe write",
+        || {
+            let client = client.clone();
+            let b = &b;
+            async move { b.gauge_f64(&client, "kimmy_replication_lag_seconds").await == Some(0.0) }
+        },
+    )
+    .await;
+
+    // Every walk row on C takes 30 ms from here: a walk over the load is
+    // tens of seconds, wide enough to scrape mid-flight reliably.
+    let before = c.restart_with(&[
+        ("KIMMY_TEST_WALK_ROW_MS", "30"),
+        ("KIMMY_TEST_SERVE_WALK_ROWS", "500"),
+        ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
+    ]);
+    assert!(before.success(), "{before:?}");
+    c.wait_ready(&client).await;
+    let c_token = c.login(&client).await;
+    let wrote = client
+        .post(c.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&c_token)
+        .json(&serde_json::json!({ "_id": "from-c" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(wrote.status().is_success(), "{}", wrote.text().await.unwrap());
+
+    // Poll B's gauge while the write is provably still in flight (B does not
+    // yet hold it), and require at least one non-zero reading before it
+    // arrives -- the regression this test exists to catch is "always 0",
+    // not "sometimes slow to update". Every reading is also checked against
+    // the test's own monotonic clock, started just before "from-c-early"
+    // was written: `lag_behind_ms` reads `now − held.wall_ms`, the age of
+    // B's held stamp for C's origin -- "from-c-early", until "from-c"
+    // lands -- so it can never exceed how long it has actually been, real
+    // wall time, since that entry was written. A wrapped, overflowed, or
+    // otherwise made-up value would trip this, not just a merely-zero one.
+    let deadline = std::time::Instant::now() + patience() * 4;
+    let mut saw_nonzero = false;
+    let mut max_lag_secs = 0.0_f64;
+    loop {
+        let has_it = client
+            .get(b.url("/v1/db/shop/coll/orders/docs/from-c"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success();
+        if has_it {
+            break;
+        }
+        let lag = b.gauge_f64(&client, "kimmy_replication_lag_seconds").await;
+        if let Some(lag_secs) = lag {
+            if lag_secs > 0.0 {
+                saw_nonzero = true;
+                max_lag_secs = max_lag_secs.max(lag_secs);
+            }
+            let real_elapsed_secs = held_stamp_written.elapsed().as_secs_f64();
+            assert!(
+                lag_secs <= real_elapsed_secs + 1.0,
+                "kimmy_replication_lag_seconds read {lag_secs} s, more than the {real_elapsed_secs} \
+                 s the test's own clock says have actually passed since B's held stamp \
+                 (\"from-c-early\") was written -- lag_behind_ms disagrees with real time"
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "C's write never reached B; B's log:\n{}",
+            b.log().lines().filter(|l| l.contains("sync round")).collect::<Vec<_>>().join("\n")
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        saw_nonzero,
+        "kimmy_replication_lag_seconds never read non-zero while B provably trailed C \
+         (held an origin's entry, then a later one from the same origin had not arrived) -- \
+         the gauge is stuck at 0 (max observed: {max_lag_secs} s)"
+    );
+
+    // And it clears once the write has actually landed -- not stuck non-zero
+    // either, which would be the opposite failure.
+    eventually("the lag gauge to clear once B holds the write", || {
+        let client = client.clone();
+        let b = &b;
+        async move { b.gauge_f64(&client, "kimmy_replication_lag_seconds").await == Some(0.0) }
+    })
+    .await;
 }
