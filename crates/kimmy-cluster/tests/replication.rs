@@ -6527,7 +6527,14 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
     let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
 
     let start = tokio::time::Instant::now();
-    let deadline = start + Duration::from_secs(30);
+    // Priced off the same `interval` the ticks themselves run at, not a
+    // fixed wall-clock constant: on a loaded machine a slower `slowest`
+    // pull prices a longer `interval`, and the whole chain -- dozens of
+    // ticks draining `MAX_BATCH * 200` entries -- scales with it. A fixed
+    // 30 s deadline here once failed on a shared CI runner after only 10
+    // ticks, far short of a real chain, while comfortably sufficient
+    // locally.
+    let deadline = start + interval * 100 + Duration::from_secs(60);
     let (mut total_ticks, mut opened_ticks, mut reset_ticks) = (0usize, 0usize, 0usize);
     let chain_ended_at = loop {
         let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
@@ -6750,7 +6757,10 @@ async fn an_ordinary_tick_against_a_caught_up_peer_always_opens() {
 
     const TICKS: usize = 40;
     let mut seen = Vec::with_capacity(TICKS);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // 40 ticks at 200 ms nominal is 8 s; a shared, loaded CI runner earns
+    // a wide margin over that rather than a tight one; see the other
+    // reset-chain test's own note on a fixed deadline failing there.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while seen.len() < TICKS {
         let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
             looping.abort();
