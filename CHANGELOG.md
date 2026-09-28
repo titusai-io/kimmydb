@@ -10,7 +10,25 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.41.1 - 2026-09-28
+
+**Roll the members one at a time. This release is not a rollback boundary:
+0.41.0 opens a store 0.41.1 has run on, and a member rolls back by starting
+it on 0.41.0. `kimmy_replication_lag_seconds` on `/metrics` works again:
+0.41.0 always rendered it 0 whatever the lag, so an alert on it could never
+fire. A draining, advancing contact resumes at once instead of waiting out
+the rest of the sync interval, so a long-quiet member's first write after a
+large load elsewhere reaches its peers much sooner. The pull-ceiling `WARN`
+gate now reads a pull's own local progress rather than a before/after read
+of the whole vector, so it no longer goes silent on a node with concurrent
+local activity. The tick-overrun `WARN` now names where the time went —
+`serve_ms`, `wait_ms` and `apply_ms`, and the slowest peer. The `apply`
+phase no longer counts the moment a multi-thread runtime hands a blocking
+closure off to another worker. The new `kimmy_sync_reset_ticks_total`
+counts ticks a reset resumed. And a documentation note: an origin this
+node has never applied anything from — a member that has never written, or
+a new member's first writes — contributes nothing to the lag gauge, not
+even the length of a silence.**
 
 ### Fixed
 
@@ -51,6 +69,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   read of the whole vector — none of which anything outside the pull, or
   already applied within it, can move.
 
+- **`kimmy_sync_pull_seconds{phase="apply"}` no longer counts the runtime
+  handoff before it runs.** On a multi-thread runtime, `kimmy_storage`'s
+  `blocking()` calls `tokio::task::block_in_place`, which hands this
+  worker's queued tasks to another worker before the closure runs, and can
+  itself take a moment under real load — longer still if every other
+  worker is already blocked and the runtime has to start one. Timed from
+  before that handoff, `apply`'s reported duration could include time that
+  was neither this batch's own work nor a wait for the writer, misleading
+  an operator into reading the apply path itself as slow. The timer now
+  starts inside the closure, so a pull's total time growing without a
+  matching rise in any of the three named phases is unaccounted-for time
+  before the apply, not the apply path itself.
+
 - **A draining, advancing contact resumes at once instead of waiting a full
   `cluster.sync_interval_secs`.** A tick that spends its whole budget still
   draining a backlog — `ContactEnd::Budget` — used to wait out the rest of
@@ -66,8 +97,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   another ceiling's worth of pulls back to back on every reset. The tick's
   own length is still bounded by `sync_interval_secs`; only the wait
   between a draining tick and its next one changes. A member catching up
-  by snapshot rather than by oplog window
-  is unaffected, and resumes at the interval's own cadence as before.
+  by snapshot rather than by oplog window is unaffected, and resumes at
+  the interval's own cadence as before. The new `kimmy_sync_reset_ticks_total`
+  counts how many of a node's ticks were one of these resumptions, and
+  each also logs a `DEBUG` line.
 
 ## 0.41.0 - 2026-09-28
 
