@@ -4831,6 +4831,53 @@ mod tests {
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
 
+    /// ADR-195: a reset tick is a continuation of the tick that ended
+    /// `Budget`, not a fresh round against any of its carried peers
+    /// (`peers.rs`'s own loop calls `tick_opened` only when
+    /// `!this_tick_is_a_reset`) -- so however many reset ticks a rapid
+    /// drain fires back-to-back, they must spend no more of the repair
+    /// cooldown than the one ordinary tick they continue. This pins the
+    /// call pattern the loop actually uses: `tick_opened` once per ordinary
+    /// tick, skipped on every reset tick that follows one, one `repair_due`
+    /// a tick either way (this node's own single pull against an
+    /// already-caught-up peer). Flipping the skip -- calling `tick_opened`
+    /// on the reset ticks too, exactly the bug this guards against -- makes
+    /// the cooldown clear after the first ordinary tick's reset run alone,
+    /// long before `REPAIR_COOLDOWN_ROUNDS` ordinary ticks have passed.
+    #[test]
+    fn a_reset_tick_does_not_spend_an_extra_contact_of_the_repair_cooldown() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        stalls.tick_opened();
+        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        stalls.repair_finished(peer);
+
+        for _ in 1..REPAIR_COOLDOWN_ROUNDS {
+            // One ordinary tick, opening the peer's contact for it...
+            stalls.tick_opened();
+            assert_eq!(stalls.repair_due(peer), None);
+            // ...followed by several reset ticks continuing it, which must
+            // not call `tick_opened` and so must not move the cooldown
+            // either -- a drain firing resets back-to-back is still the
+            // one contact its first, Budget-ending tick opened.
+            for _ in 0..5 {
+                assert_eq!(stalls.repair_due(peer), None, "a reset tick is not a fresh contact");
+            }
+            assert!(
+                !stalls.plan_repair(peer, collection, Repair::Snapshot),
+                "cooling down, however many reset ticks ran"
+            );
+        }
+        stalls.tick_opened();
+        assert_eq!(stalls.repair_due(peer), None);
+        assert!(
+            stalls.plan_repair(peer, collection, Repair::Snapshot),
+            "cooled down after REPAIR_COOLDOWN_ROUNDS ordinary ticks, not before"
+        );
+    }
+
     /// A window asked for whole, whose walk reaches the cap first, is not
     /// sent in part: the requester cannot take it, and has given up by then.
     /// The connection ends quietly, a debug line and no serve failure, and
