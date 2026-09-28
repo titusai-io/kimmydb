@@ -51,6 +51,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   read of the whole vector — none of which anything outside the pull, or
   already applied within it, can move.
 
+- **A draining, advancing contact resumes at once instead of waiting a full
+  `cluster.sync_interval_secs`.** A tick that spends its whole budget still
+  draining a backlog — `ContactEnd::Budget` — used to wait out the rest of
+  the interval before its next pull, the same as a tick that finished
+  cleanly, so a member behind enough to fill every tick's budget advanced
+  only once per interval regardless of how much more it could pull right
+  away. A contact that ends `Budget` while it applied entries or a schema
+  change, resumed a span, accepted a partial window, or raised coverage for
+  another origin now resets the sync ticker to fire again at once, and
+  carries that peer into the next tick ahead of its own rotation; a contact
+  whose pulls moved nothing (`ContactEnd::Ceiling`) is never reset or
+  carried, so a peer serving windows that cannot advance is still bounded
+  the way it always was. The tick's own length is still bounded by
+  `sync_interval_secs`; only the wait between a draining tick and its next
+  one changes. A member catching up by snapshot rather than by oplog window
+  is unaffected, and resumes at the interval's own cadence as before.
+
 ## 0.41.0 - 2026-09-28
 
 **Roll the members one at a time. This release is not a rollback boundary: the
