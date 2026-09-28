@@ -5800,22 +5800,22 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }
 
-/// `outcome.advanced` must answer "did *this pull* move anything", not "did
-/// this node's witnessed vector move at all between the two reads a pull
-/// takes" — the bug the independent review found: diffing the whole vector
-/// also catches a client write, a TTL expiry, or another origin's confirm
-/// push landing on the busy requester while the pull was in flight, none of
-/// which the pull itself did.
+/// SMOKE TEST, not the regression test for the bug the independent review
+/// found. The regression tests are deterministic and live elsewhere:
+/// `transport::tests::a_pull_is_advanced_by_any_one_of_its_own_signals` (the
+/// pure `advanced` gate) and
+/// `engine::tests::absorb_witnessed_in_txn_excludes_the_local_origin_from_coverage_raised`
+/// (the local-origin exclusion, at the engine level). Neither needs a race:
+/// the fix removed the whole-vector diff the old bug lived in, so there is
+/// nothing left to race against.
 ///
-/// A caught-up pull (nothing new at the peer) is run repeatedly while a
-/// background task hammers the requester with local writes of its own, at
-/// real wall-clock concurrency. Every such pull must still read
-/// `advanced: false` — which the fix guarantees by construction (it never
-/// reads the whole-vector diff this bug lived in), not by winning a race: at
-/// the concurrency this test can reach, redb's MVCC reads land on a
-/// consistent snapshot too quickly to reliably straddle the two reads a
-/// wall-clock test could exploit, so this asserts the invariant the fix
-/// establishes rather than reproducing the old failure on demand.
+/// This test is kept anyway as an end-to-end sanity check under real
+/// concurrency, documented honestly: reverting the fix and running this
+/// test does **not** make it fail, up to 5,000 iterations tried while
+/// diagnosing it — redb's MVCC reads land on a consistent snapshot too
+/// quickly to reliably straddle the old code's two reads on this machine.
+/// Do not read a pass here as proof of anything the two tests above do not
+/// already prove deterministically.
 #[tokio::test]
 async fn a_caught_up_pull_does_not_read_as_advanced_from_the_requesters_own_concurrent_writes() {
     let a = node().await;

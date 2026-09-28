@@ -4741,6 +4741,41 @@ mod tests {
         );
     }
 
+    /// `absorb_witnessed_in_txn`'s own contract (ADR-157's gate depends on
+    /// it): raising only this node's own origin is not reported as coverage
+    /// raised, but a genuine other origin is. Deterministic, at the engine
+    /// level, rather than via a pull and a race — the local exclusion is a
+    /// plain per-origin check, and there is nothing to race against it.
+    #[test]
+    fn absorb_witnessed_in_txn_excludes_the_local_origin_from_coverage_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        let local = engine.node_id();
+        let other = kimmy_core::NodeId::generate();
+
+        // A window whose only effect is on this node's own origin -- what a
+        // local write, seeded here directly rather than through a pull,
+        // would raise if it were (wrongly) folded into this check.
+        let mut mine_only = kimmy_core::VersionVector::new();
+        mine_only.insert(local, Hlc::new(1_000, 0));
+        let txn = engine.begin_write(WriterHolder::Replication).unwrap();
+        let raised = Engine::absorb_witnessed_in_txn(&txn, &mine_only, local).unwrap();
+        txn.commit().unwrap();
+        assert!(!raised, "raising only this node's own origin is not this batch's progress");
+
+        // A genuine other origin, for contrast against the same call: this
+        // one must report it, or the exclusion would be silencing everything
+        // rather than just the local origin.
+        let mut other_too = kimmy_core::VersionVector::new();
+        other_too.insert(local, Hlc::new(2_000, 0));
+        other_too.insert(other, Hlc::new(1_000, 0));
+        let txn = engine.begin_write(WriterHolder::Replication).unwrap();
+        let raised = Engine::absorb_witnessed_in_txn(&txn, &other_too, local).unwrap();
+        txn.commit().unwrap();
+        assert!(raised, "a genuine other origin must still read as raised");
+    }
+
     /// A file backend that counts the bytes redb asks it for.
     ///
     /// What an open *reads* is not observable from outside otherwise: redb's
