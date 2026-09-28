@@ -10,7 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.41.0 - 2026-09-28
+
+**Roll the members one at a time. This release is not a rollback boundary: the
+schema is still 4 and redb still 4.3, so 0.40.2 opens a store 0.41.0 has run
+on, and a member rolls back by starting it on 0.40.2. A quiet member's writes
+now reach its peers after a large load elsewhere: an unbounded pull walk of the
+oplog outlasted its round and made no progress, tick after tick. The walk now
+stops at a budget and answers a partial window, so every pull makes progress —
+but both ends of a pull need 0.41.0; an older peer still gets the walk's old 30
+s cap. OTLP exports are retried by default, so a collector that is briefly down
+loses fewer spans and metrics. `kimmy_replication_lag_seconds` now counts a
+peer whose rounds fail, computed when read, so it rises (and an alert on it may
+fire) for a peer this node cannot pull from while it holds newer entries, where
+it used to read 0. Peer TLS's `close_notify` ends the `peer connection failed`
+WARN noise on every replication round; a peer that hangs up mid-handshake now
+counts as `reason="unauthenticated"` instead of `io`, so an alert on it may
+fire during a rolling restart. `unsupported operator "…"` refusals now quote
+the operator and put the reason after it: only the message changes, and the
+status, code and retry class are unchanged. `local-embeddings` builds move to
+fastembed 7.1, with identical vectors and models.**
 
 ### Changed
 
