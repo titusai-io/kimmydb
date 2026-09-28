@@ -204,6 +204,13 @@ pub struct RoundReport {
     /// draining it at once instead of after a full `sync_interval_secs`.
     /// True for every tick in a reset chain, not only the first.
     pub reset: bool,
+    /// Whether this tick called `stalls.tick_opened()` (ADR-195): about
+    /// once `sync_interval_secs` has passed since the last one did,
+    /// whether the ticks in between were ordinary or a chain of resets.
+    /// What `REPAIR_COOLDOWN_ROUNDS` and the not-moved-sighting throttle
+    /// behind `FROZEN_CONTACTS` both advance on — never true on every tick
+    /// of a reset chain, or either constant's wall-clock reasoning breaks.
+    pub opened: bool,
 }
 
 /// Upper bounds of `kimmy_sync_pull_seconds`, in microseconds (ADR-175).
@@ -781,6 +788,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 {
                     stalls.tick_opened();
                     last_opened = Some(tick_started);
+                    report.opened = true;
                 }
                 // Carried peers first, filtered against this tick's live
                 // `peers` (ADR-157's addendum): a peer SWIM has since marked

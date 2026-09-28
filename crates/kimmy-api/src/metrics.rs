@@ -2045,6 +2045,7 @@ mod tests {
             entries_skipped_purge_pending: 77,
             repair_rounds: 76,
             reset: true,
+            opened: true,
             pulls: pulls_observed([3, 40, 700], 1_024, Some(1_500), 115, [101, 102, 103, 104]),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
@@ -2066,6 +2067,7 @@ mod tests {
             entries_skipped_purge_pending: 1,
             repair_rounds: 1,
             reset: false,
+            opened: true,
             // A wait of 45 s: past the old 10 s top, so the golden reads the
             // buckets a long wait for the writer lands in (ADR-175).
             pulls: pulls_observed([8, 45_000, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
@@ -3608,6 +3610,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
@@ -3629,6 +3632,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_ddl_applied_push(11);
@@ -3838,6 +3842,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         };
         let age_in = |out: &str| -> u64 {
