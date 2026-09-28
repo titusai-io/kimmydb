@@ -2509,16 +2509,31 @@ async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() 
     }
 }
 
+/// A connection has authenticated on `node` more times than one of its kinds
+/// has ended (disconnected, failed, or been cut short at a stop) since its
+/// last restart: a peer is very likely mid-pull, `AskEntries`'s walk being
+/// the only step of a served connection with no log line of its own.
+fn a_peers_pull_looks_in_flight(node: &Node) -> bool {
+    let log = node.log();
+    let started = log.matches("peer authenticated").count();
+    let ended = log.matches("peer disconnected").count()
+        + log.matches("peer connection failed").count()
+        + log.matches("stopped serving a peer's pull").count();
+    started > ended
+}
+
 /// **The finding this change is for** (0.40.0, and since at least 0.39.0): a
 /// member stopped while its peers are pulling from it kept serving the walk
 /// in flight until it ended, so a supervisor killed it at its stop timeout
 /// and its next start repaired the whole store.
 ///
 /// Node B's every walk is slowed so that the pulls A and C make of it each
-/// hold a serve walk for seconds, as a cold walk of a large oplog does. B is
-/// stopped while they pull: its serve walks end at the signal, and it exits
-/// 0 promptly with the store closed (`engine closed`, the `shutdown` marker),
-/// and its next start repairs nothing.
+/// hold a serve walk for seconds, as a cold walk of a large oplog does, and
+/// its served window's own budget is raised past that so the row count ends
+/// it, not ADR-194's default two seconds. B is stopped once a pull looks to
+/// be mid-walk ([`a_peers_pull_looks_in_flight`]): its serve walks end at the
+/// signal, and it exits 0 promptly with the store closed (`engine closed`,
+/// the `shutdown` marker), and its next start repairs nothing.
 ///
 /// Its drain is idle, so `close_writes` would end a request's walk at once
 /// too: this test covers the finding, and with no row checks at all the stop
@@ -2551,10 +2566,14 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
     );
     pulls_settle(&client, &[&a, &b, &c]).await;
 
-    // Every row of every walk on B takes 25 ms from here: a pull of its
-    // oplog walks hundreds, so its peers' pulls keep serve walks in flight.
+    // Every row of every walk on B takes 25 ms from here, and a served
+    // window's budget is 500 rows with its time lifted out of the way, so a
+    // pull of its oplog holds a serve walk in flight for seconds, not just
+    // ADR-194's default two: its peers' pulls keep serve walks in flight.
     let before = b.restart_with(&[
         ("KIMMY_TEST_WALK_ROW_MS", "25"),
+        ("KIMMY_TEST_SERVE_WALK_ROWS", "500"),
+        ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
         ("RUST_LOG", "info,kimmy_cluster::transport=debug"),
     ]);
     assert!(before.success(), "{before:?}");
@@ -2577,7 +2596,8 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
             }
         })
     };
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    eventually("a peer's pull to be in flight on B", || async { a_peers_pull_looks_in_flight(&b) })
+        .await;
 
     let started = std::time::Instant::now();
     b.signal("TERM");
@@ -2856,11 +2876,16 @@ async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
     );
     pulls_settle(&client, &[&a, &b, &c]).await;
 
-    // 200 ms a row on B: a pull of a few new entries is a serve walk of
-    // seconds, and a backup of the store outlasts the drain.
+    // 200 ms a row on B, and a served window's budget 60 rows with its time
+    // lifted out of the way: a pull of a few new entries is a serve walk of
+    // a dozen seconds by that row count, not cut short by ADR-194's default
+    // two, so it is reliably still open when the signal arrives, and a
+    // backup of the store outlasts the drain.
     assert!(
         b.restart_with(&[
             ("KIMMY_TEST_WALK_ROW_MS", "200"),
+            ("KIMMY_TEST_SERVE_WALK_ROWS", "60"),
+            ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
             ("RUST_LOG", "info,kimmy_cluster::transport=debug"),
         ])
         .success()
@@ -2889,6 +2914,8 @@ async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
         tokio::spawn(async move { reqwest::Client::new().get(url).bearer_auth(token).send().await })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
+    eventually("a peer's pull to be in flight on B", || async { a_peers_pull_looks_in_flight(&b) })
+        .await;
     b.signal("TERM");
     let status = b.wait_exit(Duration::from_secs(60));
     writer.abort();
