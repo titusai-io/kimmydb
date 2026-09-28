@@ -18,7 +18,6 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Optional: only compiled with the `local-embeddings` feature.
-# Optional: only compiled with the `local-embeddings` feature.
 #
 # default-features = false is load-bearing. The defaults pull native-tls
 # (OpenSSL) on top of ONNX Runtime, so a build needs libssl-dev as well; the
@@ -36,8 +35,10 @@ hnsw_rs = "0.3.4"
 
 [features]
 # In-process ONNX embedding. Off by default: it pulls ONNX Runtime as native
-# binaries plus OpenSSL — hundreds of megabytes and a separate runtime, a
-# different order of cost from the `ring` the build already carries (ADR-016).
+# binaries — hundreds of megabytes and a separate runtime, a different order
+# of cost from the `ring` the build already carries (ADR-016). The rustls
+# features on `fastembed` above keep it off OpenSSL/native-tls, unlike its
+# defaults.
 local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
 
 [dev-dependencies]

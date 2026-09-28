@@ -129,4 +129,25 @@ mod tests {
         assert_eq!(LocalProvider::expected_dim("bge-large-en-v1.5"), Some(1024));
         assert_eq!(LocalProvider::expected_dim("unknown"), None);
     }
+
+    /// The only test in this module that runs fastembed itself: the 174 above
+    /// resolve model names and check dimensions, never ONNX Runtime. Not run
+    /// by default because it downloads bge-small-en-v1.5 into the fastembed
+    /// cache on its first run in an environment (tens of megabytes) and takes
+    /// seconds even cached, for a fixed batch.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads and runs a real ONNX model; run with --ignored"]
+    async fn a_real_model_embeds_a_batch_at_its_dimension_and_unit_norm() {
+        let provider = LocalProvider::new("bge-small-en-v1.5", 384).expect("bge-small loads");
+        let texts =
+            ["a red panda climbing a tree".to_string(), "quarterly revenue guidance".to_string()];
+        let vectors = provider.embed(&texts).await.expect("a real batch embeds");
+
+        assert_eq!(vectors.len(), texts.len());
+        for v in &vectors {
+            assert_eq!(v.len(), 384, "bge-small-en-v1.5 is 384-wide");
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "bge-small normalizes its output: {norm}");
+        }
+    }
 }

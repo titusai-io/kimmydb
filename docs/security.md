@@ -1488,8 +1488,10 @@ advisory is ignored, the reason is written beside it in the file; read it
 there rather than here, so that the file and the reasoning cannot drift.
 
 The policy covers the **default feature set**, the build that ships.
-`local-embeddings` knowingly pulls ONNX Runtime and OpenSSL, and is outside
-the ban for the same reason it is outside `scripts/check-native-deps.sh`.
+`local-embeddings` knowingly pulls ONNX Runtime, and is outside the ban for
+the same reason it is outside `scripts/check-native-deps.sh`; it does not
+pull OpenSSL — `fastembed` is built with `default-features = false` and its
+rustls variants instead of its own defaults.
 
 **The licensing line is checked, not assumed.** The allowlist cannot say
 that the Apache-2.0 client must not *depend* on an AGPL crate;

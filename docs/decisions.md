@@ -381,9 +381,11 @@ the guarantee or refusing the feature outright.
 ONNX inference lives behind a `local-embeddings` cargo feature, off by default,
 and is *rejected at configuration time* in a build that lacks it.
 
-**Why.** `fastembed` pulls native ONNX Runtime **and**, by default, OpenSSL, and
-roughly triples the image. A zero-config default that quietly costs
-cross-compilation and hundreds of megabytes is not zero-cost.
+**Why.** `fastembed` defaults to native ONNX Runtime **and** OpenSSL
+(native-tls); kimmydb builds it with `default-features = false` and its
+rustls variants instead, so `local-embeddings` never pulls OpenSSL, but ONNX
+Runtime alone still roughly triples the image. A zero-config default that
+quietly costs cross-compilation and hundreds of megabytes is not zero-cost.
 
 > **Corrected 2026-08-08.** This originally argued the feature would "undo the
 > pure-Rust property" behind ADR-001 and ADR-016. That property was already
