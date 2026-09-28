@@ -114,7 +114,7 @@ is a comparison rather than a state machine, and re-embedding is idempotent.
 
 | Piece | Planned | Built |
 |---|---|---|
-| Providers | `fastembed` local ONNX as the zero-config default | ✅ trait + OpenAI / Ollama / custom HTTP. **`byo` is the default; local is feature-gated** — its native ONNX + OpenSSL dependencies would undo the pure-Rust property ([Deviations](deviations.md)) |
+| Providers | `fastembed` local ONNX as the zero-config default | ✅ trait + OpenAI / Ollama / custom HTTP. **`byo` is the default; local is feature-gated** — its native ONNX Runtime dependency is hundreds of megabytes and a separate runtime, a different order of cost from the rest of the build ([Deviations](deviations.md)) |
 | Index | HNSW via `hnswlib-rs` | ✅ HNSW via **`hnsw_rs`** — `hnswlib-rs` requires nightly Rust (`#![feature(f16)]` in a dependency) |
 | Index selection | — | ✅ `IndexCache` chooses approximate above **500** vectors (originally 2000, lowered once measured — [Benchmarks](benchmarks.md)), exact below, with a 30 s rebuild interval |
 | Persistence | Snapshot the graph, replay newer entries on startup | ✅ **Built in M8**, with count-validated adoption instead of entry replay. Correctness still does not depend on it: a corrupt snapshot is discarded, a behind one serves once and rebuilds |

@@ -33,12 +33,14 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-gnu",
 ]
-# The default feature set — the build that ships — not `--all-features`. The
-# opt-in `local-embeddings` feature (ADR-021) knowingly pulls ONNX Runtime and
-# OpenSSL, and checking it here would either fail the ban below or force the
-# ban to carry an exception for the one thing it exists to catch. This is the
-# same scope scripts/check-native-deps.sh checks, for the same reason.
-all-features = false
+# Every feature, `local-embeddings` (ADR-021) included: it pulls ONNX
+# Runtime as native binaries, hundreds of megabytes, but nothing this policy
+# bans, so checking it here makes "local-embeddings stays off OpenSSL" a
+# thing the ban enforces rather than only a comment asserts.
+# scripts/check-native-deps.sh stays scoped to the default build instead —
+# ONNX Runtime is native by design, so a native-code diff there would be
+# noise, not a finding.
+all-features = true
 
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]

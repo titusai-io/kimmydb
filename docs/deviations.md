@@ -855,8 +855,10 @@ was found by running the failure path rather than only the happy one.
 
 **Built.** Behind a `local-embeddings` cargo feature, off by default.
 
-**Why.** Its dependencies pull native ONNX Runtime *and* OpenSSL, and roughly
-triple the image. Raised and agreed before building.
+**Why.** `fastembed`'s dependencies default to native ONNX Runtime *and*
+OpenSSL; kimmydb's `default-features = false` plus its rustls variants keep
+`local-embeddings` off OpenSSL, but ONNX Runtime alone still roughly triples
+the image. Raised and agreed before building.
 
 **One of the original reasons no longer holds.** This was justified partly by
 preserving a pure-Rust build, which the entry above shows was already untrue

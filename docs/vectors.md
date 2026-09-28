@@ -166,10 +166,13 @@ endpoint host or profile name, and the key variable's name.
 failing later on the first write — a misconfiguration should surface when you
 make it, not when traffic arrives. The reason it is not the default at all is
 recorded in [Deviations](deviations.md): its dependencies pull native ONNX
-Runtime *and* OpenSSL — hundreds of megabytes and a separate runtime. Note the
-default build is **not** free of a native toolchain and has not been since M2;
-that claim was corrected in [ADR-016](decisions.md). ONNX is still gated because
-it is a different order of cost, not because the build is otherwise pristine.
+Runtime — hundreds of megabytes and a separate runtime. (`fastembed` defaults
+to OpenSSL too, but the `local-embeddings` feature builds it with
+`default-features = false` and rustls variants instead, so this build never
+pulls it.) Note the default build is **not** free of a native toolchain and
+has not been since M2; that claim was corrected in [ADR-016](decisions.md).
+ONNX is still gated because it is a different order of cost, not because the
+build is otherwise pristine.
 
 ### Chunking
 
