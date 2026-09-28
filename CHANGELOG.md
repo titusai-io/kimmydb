@@ -77,6 +77,34 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   that were never about an operator, a `Decimal128` index key or `_id` and a
   `$dateToString` specifier, are `invalid query: …` instead. Every one is
   still a `400 bad_request`, retry `no`.
+- **A quiet member's writes reach its peers after a large load elsewhere.**
+  A pull asks a peer for what it lacks from one position, and the peer walks
+  its oplog from there, passing over what the puller holds. That walk had no
+  bound. After a large load on one member, a pull from a member that had been
+  quiet walked the whole load, outlasted the round's 30 s and kept nothing,
+  and every later pull did the same. So that member's writes never reached
+  its peers: they logged `sync round failed; backing off` with `sync round
+  timed out` against it every tick. The walk now stops after 2 s or 65,536
+  rows examined, and answers with the entries it found and how far it walked.
+  The puller takes that as covered, so every pull makes progress. The
+  `merged from peer` line gains `partial`: the contact's pulls that ended at
+  the peer's budget. **Both ends of a pull need 0.41.0** for this. A 0.41.0
+  member serving an older one ends its walk at 30 s instead, where the older
+  one has already given up, and closes the connection quietly. The wire gains
+  two fields an older build ignores. No stored format changes, so this is
+  not a rollback boundary. A schema change's confirmation push walks with the
+  same budget, and a push past it leaves the change to anti-entropy. See
+  ADR-194 and [Operations](docs/operations.md).
+- **`kimmy_replication_lag_seconds` counts a peer whose rounds fail.** It was
+  measured after each successful round, so a peer this node could not pull
+  from read as 0 however far behind it was, as it did for minutes on a test
+  cluster stuck as the entry above describes. It is now computed when read,
+  from each peer's last advertised vector, recorded even when the round then
+  failed, against this node's position now. So it grows with the clock while
+  entries are missing and clears as soon as they arrive, by any route. A peer
+  membership no longer lists as live, one marked down included, stops
+  counting. The `HELP` texts of the gauge and of `kimmy_sync_failures_total`
+  say so.
 
 ## 0.40.2 - 2026-09-27
 

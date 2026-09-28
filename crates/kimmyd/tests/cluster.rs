@@ -2363,6 +2363,152 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
     drop(silent);
 }
 
+/// **The sync livelock after a large one-origin load** (HIGH, round 0430;
+/// since ADR-171, v0.29.0). A member that stayed quiet through a large load
+/// on another serves its peers' pulls from their position on its own origin,
+/// from before the load, and the walk passes over the whole load they already
+/// hold. Uncapped, past the round's fixed 30 s it timed out, kept nothing,
+/// and the next round walked the same rows, so the quiet member's own writes
+/// never left it. Now the walk ends at a budget and answers a partial window,
+/// whose end the requester keeps, so each pull starts further on (ADR-194).
+///
+/// Deterministic and small: C's every walk row is slowed
+/// (`KIMMY_TEST_WALK_ROW_MS`), so a walk over A's 2,200-document load would
+/// take about 55 s, past the round's budget, as a cold walk of 2 GB did on the
+/// lab host; and C's serve budget is 500 rows with the time lifted
+/// (`KIMMY_TEST_SERVE_WALK_*`), so each window is about 12.5 s, inside it.
+/// Then C takes one write, which must reach A and B, each draining C in
+/// exactly as many partial windows as C's oplog holds whole budgets of rows.
+/// On a build before the budget, the write never reaches them.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() {
+    const LOAD: usize = 2_200;
+    let client = reqwest::Client::new();
+    let (a, b, mut c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success());
+    for batch in 0..LOAD / 550 {
+        let docs: Vec<_> =
+            (0..550).map(|i| serde_json::json!({ "_id": batch * 550 + i })).collect();
+        let bulk = client
+            .post(a.url("/v1/db/shop/coll/orders/bulk"))
+            .bearer_auth(&token)
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(bulk.status().is_success());
+    }
+    pulls_settle(&client, &[&a, &b, &c]).await;
+    let last = format!("/v1/db/shop/coll/orders/docs/{}", LOAD - 1);
+    let held = client.get(c.url(&last)).bearer_auth(&token).send().await.unwrap();
+    assert!(held.status().is_success(), "premise: C holds the load");
+
+    // Every walk row on C takes 25 ms from here: a walk over the load, 50 s.
+    let before = c.restart_with(&[
+        ("KIMMY_TEST_WALK_ROW_MS", "25"),
+        ("KIMMY_TEST_SERVE_WALK_ROWS", "500"),
+        ("KIMMY_TEST_SERVE_WALK_MS", "600000"),
+    ]);
+    assert!(before.success(), "{before:?}");
+    c.wait_ready(&client).await;
+    let c_token = c.login(&client).await;
+    let wrote = client
+        .post(c.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&c_token)
+        .json(&serde_json::json!({ "_id": "from-c" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(wrote.status().is_success(), "{}", wrote.text().await.unwrap());
+
+    // What C's oplog holds now, the write included: every row a pull from
+    // it walks, from the start of the log.
+    let rows = c.gauge(&client, "kimmy_oplog_entries").await.expect("C's oplog length");
+    // A partial window's end is re-examined by the next pull when an origin
+    // sorts after the node its last row belongs to (the coverage rule's tie,
+    // ADR-148): a row or two a pull, three origins at most. A load well away
+    // from a multiple of the budget keeps that from moving the count.
+    let (budget, margin) = (500, 3 * 4);
+    assert!(
+        rows % budget > margin && rows % budget < budget - margin,
+        "premise: {rows} rows sit too near a multiple of {budget} for an exact count"
+    );
+
+    // A guard against a hang only: the assertions below are the pulls.
+    let started = std::time::Instant::now();
+    let guard = patience() * 4;
+    loop {
+        let got = client
+            .get(a.url("/v1/db/shop/coll/orders/docs/from-c"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        if got.status().is_success() {
+            break;
+        }
+        assert!(
+            started.elapsed() < guard,
+            "C's write never reached A; A's log:\n{}",
+            a.log().lines().filter(|l| l.contains("sync round")).collect::<Vec<_>>().join("\n")
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eventually("the write to reach B", || {
+        let url = b.url("/v1/db/shop/coll/orders/docs/from-c");
+        let (client, token) = (client.clone(), token.clone());
+        async move {
+            client.get(url).bearer_auth(&token).send().await.is_ok_and(|r| r.status().is_success())
+        }
+    })
+    .await;
+
+    // Each requester drained C on its own: every pull while more than a
+    // budget of rows lay ahead ended at the budget, a partial window, and the
+    // one after reached the tail and carried the write (ADR-194).
+    let from_c = format!("peer=127.0.0.1:{}", c.cluster);
+    // The log is coloured: `peer`, `=` and the value each sit in escapes.
+    let plain = |line: &str| {
+        let mut out = String::with_capacity(line.len());
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                chars.by_ref().find(|c| *c == 'm');
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    for (name, node) in [("A", &a), ("B", &b)] {
+        let partial: u64 = node
+            .log()
+            .lines()
+            .map(plain)
+            .filter(|l| l.contains("merged from peer") && l.contains(&from_c))
+            .filter_map(|l| {
+                let value = l.split("partial=").nth(1)?.split_whitespace().next()?;
+                value.parse::<u64>().ok()
+            })
+            .sum();
+        assert_eq!(
+            partial,
+            rows / budget,
+            "{name} drained C's {rows} rows in {partial} partial windows"
+        );
+    }
+}
+
 /// **The finding this change is for** (0.40.0, and since at least 0.39.0): a
 /// member stopped while its peers are pulling from it kept serving the walk
 /// in flight until it ended, so a supervisor killed it at its stop timeout
