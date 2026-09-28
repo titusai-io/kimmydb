@@ -15,7 +15,7 @@
 //! per-token cost.
 
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use tokio::sync::Mutex;
 
 use crate::error::{Result, VectorError};
@@ -33,7 +33,7 @@ pub struct LocalProvider {
 impl LocalProvider {
     pub fn new(model: &str, dim: usize) -> Result<Self> {
         let embedding_model = resolve_model(model)?;
-        let inner = TextEmbedding::try_new(InitOptions::new(embedding_model)).map_err(|e| {
+        let inner = TextEmbedding::try_new(TextInitOptions::new(embedding_model)).map_err(|e| {
             VectorError::ModelUnavailable { model: model.to_string(), detail: e.to_string() }
         })?;
 
