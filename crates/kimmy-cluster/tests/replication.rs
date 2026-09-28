@@ -5989,3 +5989,105 @@ async fn a_wedged_pull_with_a_foreign_push_mid_apply_is_not_advanced() {
     assert!(outcome.truncated, "{outcome:?}");
     assert!(!outcome.advanced, "a push mid-pull is not the pull's progress: {outcome:?}");
 }
+
+/// A fake peer, never caught up: pull 1 serves a fresh entry, every later
+/// pull re-serves that same entry, unexhausted.
+async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
+    use kimmy_cluster::protocol::prove;
+    let coll = b.engine.create_collection("shop", "orders").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String("d0".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+    };
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = tls.acceptor();
+            let (theirs, entry) = (theirs.clone(), entry.clone());
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                    return;
+                };
+                let welcome = Message::Welcome {
+                    node: origin,
+                    nonce: vec![7; 32],
+                    proof: prove(SECRET, &nonce, &binding),
+                };
+                if write_frame(&mut stream, &welcome).await.is_err() {
+                    return;
+                }
+                let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
+                while let Ok(message) = read_frame(&mut stream).await {
+                    let answer = match message {
+                        Message::AskVersions { .. } => {
+                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
+                        }
+                        Message::AskEntries { .. } => Message::Entries {
+                            entries: vec![entry.clone()],
+                            scanned_to: entry.stamp.hlc,
+                            exhausted: false,
+                            passed_through: None,
+                        },
+                        _ => return,
+                    };
+                    if write_frame(&mut stream, &answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    fake
+}
+
+/// Pull 1 advances, pull 2 (same stalls, as within one contact) moves
+/// nothing: pull 2 must read advanced=false against its own `held`.
+#[tokio::test]
+async fn a_second_pull_of_a_contact_is_judged_against_its_own_held() {
+    let b = node().await;
+    let fake = advance_then_wedge(&b).await;
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&b.engine, fake, SECRET, None, &mut stalls).await.unwrap();
+    assert!(first.truncated && first.applied == 1 && first.advanced, "{first:?}");
+    for i in 0..3 {
+        let next = sync_once_with(&b.engine, fake, SECRET, None, &mut stalls).await.unwrap();
+        assert!(next.truncated, "{next:?}");
+        assert!(!next.coverage_raised && !next.advanced, "pull {} moved nothing: {next:?}", i + 2);
+    }
+}
+
+/// Only this node's own origin rises in a window's coverage: not progress.
+#[tokio::test]
+async fn only_self_coverage_is_not_coverage_raised() {
+    let b = node().await;
+    let local = b.engine.node_id();
+    let other = kimmy_core::NodeId::generate();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(local, Hlc::new(u64::MAX / 4, 0));
+    let mut outcome = kimmy_storage::SyncOutcome::default();
+    let window = kimmy_storage::PeerWindow {
+        scanned_to: Hlc::ZERO,
+        exhausted: true,
+        passed_through: None,
+        asked_partial: false,
+    };
+    b.engine.apply_peer_window_into(&theirs, Some(&mine), &[], window, &mut outcome).unwrap();
+    assert!(!outcome.coverage_raised, "only self rose: {outcome:?}");
+    theirs.insert(other, Hlc::new(5, 0));
+    let mine = b.engine.witnessed_vector().unwrap();
+    let mut outcome = kimmy_storage::SyncOutcome::default();
+    b.engine.apply_peer_window_into(&theirs, Some(&mine), &[], window, &mut outcome).unwrap();
+    assert!(outcome.coverage_raised, "another origin rose: {outcome:?}");
+}

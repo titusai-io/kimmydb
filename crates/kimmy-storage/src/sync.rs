@@ -248,9 +248,9 @@ pub struct SyncOutcome {
     /// `coverage_raised` below, plus the span-resume signal `sync_once`
     /// alone can see.
     pub advanced: bool,
-    /// Whether this batch's own coverage rose above `mine` -- this node's
-    /// witnessed vector as of the round's start, the one `AskEntries` sent
-    /// as `held` -- for an origin *other than this node's own*: an applied
+    /// Whether this batch's own coverage rose above `mine` -- the `held`
+    /// this pull's own `AskEntries` sent -- for an origin *other than this
+    /// node's own*: an applied
     /// entry, a schema change, a released held mark or a superseded entry
     /// all count, since each is real progress on that origin whether or not
     /// it left its own row in `OPLOG_WITNESSED` to raise (`applied`,
@@ -468,14 +468,13 @@ pub struct UnknownCollection {
 #[derive(Clone, Copy, Debug)]
 struct Introduced<'a> {
     theirs: &'a VersionVector,
-    /// This node's own witnessed vector as of the start of the round this
-    /// window answers — the vector `AskEntries` sent as `held` — read once,
-    /// before any of this round's own entries applied. What
+    /// The `held` this pull's own `AskEntries` sent, not a fresh read: what
     /// `SyncOutcome::coverage_raised` compares the batch's own coverage
-    /// against: a *later*, freshly re-read `mine` would also move for
-    /// reasons this round had nothing to do with (ADR-157's ceiling; see
-    /// `SyncOutcome::coverage_raised`).
-    mine: &'a VersionVector,
+    /// against (ADR-157's ceiling). `None` on a path with no pull behind
+    /// it to hold one — a push, or a caller that does not read
+    /// `coverage_raised` — which skips the comparison rather than reading
+    /// this node's own current vector as a stand-in.
+    mine: Option<&'a VersionVector>,
     scanned_to: Hlc,
     exhausted: bool,
     /// Where the sender's budget ended the window (ADR-194), counted only
@@ -685,14 +684,11 @@ impl Engine {
     ) -> Result<()> {
         let window =
             PeerWindow { scanned_to, exhausted, passed_through: None, asked_partial: false };
-        // Not the live pull path (transport.rs reads `mine` once, before the
-        // round's own network exchange, and passes that same snapshot down),
-        // so a fresh read here is the closest available stand-in: nothing
-        // between it and this batch's own application should move this
-        // node's own vector, since the call is synchronous and this is not
-        // the path a client write races.
-        let mine = self.witnessed_vector()?;
-        self.apply_peer_window_into(theirs, &mine, entries, window, outcome)
+        // Not the live pull path: a push (transport.rs, confirm.rs) and a
+        // repair replay both land here with no pull's own `held` behind
+        // them, and neither reads `outcome.coverage_raised`, so there is
+        // nothing to compare it against and no reason to pay a read for one.
+        self.apply_peer_window_into(theirs, None, entries, window, outcome)
     }
 
     /// [`Self::apply_peer_batch_into`], for a window whose end the peer
@@ -700,13 +696,14 @@ impl Engine {
     /// the sender's budget ended at `passed_through`, is covered through that
     /// stamp, however few entries it carried.
     ///
-    /// `mine` is this node's own witnessed vector as of the round's start —
-    /// what was sent as `held` — not re-read here: see
-    /// [`SyncOutcome::coverage_raised`].
+    /// `mine` is the `held` this pull's own `AskEntries` sent, not re-read
+    /// here: see [`SyncOutcome::coverage_raised`]. `None` for a caller with
+    /// no pull behind this window, or that does not read
+    /// `coverage_raised`.
     pub fn apply_peer_window_into(
         &self,
         theirs: &VersionVector,
-        mine: &VersionVector,
+        mine: Option<&VersionVector>,
         entries: &[OplogEntry],
         window: PeerWindow,
         outcome: &mut SyncOutcome,
@@ -1248,23 +1245,16 @@ impl Engine {
         // A batch that wrote nothing at its end commits nothing: nothing
         // after this can fail, so its decisions stand as they are.
         run.last_committed = true;
-        // Whether this batch's own coverage moved an origin other than this
-        // node's own, compared against `mine` -- the vector as it stood at
-        // the round's start, before any of this batch's own entries applied
-        // -- not against whether the raise above found anything left to do:
-        // a document or a schema change each already raise their own origin
-        // the moment they are appended (ADR-054, ADR-140), so by the time
-        // the merge above runs for an *exhausted* window, the raise it
-        // triggers is frequently a no-op that was never this check's
-        // signal. Comparing two plain vectors instead of trusting that
-        // return value is what a batch's own progress on a foreign origin
-        // actually is, covering an applied entry, a schema change, a
-        // released held mark and a superseded entry alike, in one rule
-        // (ADR-157's ceiling). Set only now, after the commit above
-        // succeeded: nothing this batch decided is final until then
-        // (ADR-177), and `coverage_raised` is no exception.
-        let local = self.node_id();
-        if let Some(Introduced { mine, .. }) = introduced {
+        // Whether this batch's own coverage rose above `mine` -- the `held`
+        // this pull's own `AskEntries` sent -- for an origin other than
+        // this node's own: an applied entry, a schema change, a released
+        // held mark and a superseded entry all count alike (ADR-157's
+        // ceiling). Set only now, after the commit above succeeded
+        // (ADR-177). Skipped when there is no `mine` to compare against: a
+        // push, a repair replay, or any other caller that does not read
+        // `coverage_raised`.
+        if let Some(Introduced { mine: Some(mine), .. }) = introduced {
+            let local = self.node_id();
             outcome.coverage_raised |=
                 witnessed.iter().any(|(node, hlc)| node != local && hlc > mine.get(node));
         }
@@ -9153,7 +9143,13 @@ mod budget_tests {
             };
             let mut outcome = SyncOutcome::default();
             requester
-                .apply_peer_window_into(&theirs, &mine, &window.entries, peer_window, &mut outcome)
+                .apply_peer_window_into(
+                    &theirs,
+                    Some(&mine),
+                    &window.entries,
+                    peer_window,
+                    &mut outcome,
+                )
                 .unwrap();
             pulls += 1;
             assert!(pulls <= stamps.len() + 2, "the drain did not end");
@@ -9190,11 +9186,11 @@ mod budget_tests {
         };
         let mut outcome = SyncOutcome::default();
         let mine = requester.witnessed_vector().unwrap();
-        requester.apply_peer_window_into(&theirs, &mine, &[], window, &mut outcome).unwrap();
+        requester.apply_peer_window_into(&theirs, Some(&mine), &[], window, &mut outcome).unwrap();
         let claimed = requester.witnessed_vector().unwrap();
         assert!(claimed.iter().all(|(_, hlc)| hlc == Hlc::ZERO), "nothing claimed: {claimed:?}");
         let asked = PeerWindow { asked_partial: true, ..window };
-        requester.apply_peer_window_into(&theirs, &mine, &[], asked, &mut outcome).unwrap();
+        requester.apply_peer_window_into(&theirs, Some(&mine), &[], asked, &mut outcome).unwrap();
         assert!(
             requester.witnessed_vector().unwrap().get(p.node) >= p.hlc,
             "asked for, the same window covers its origin through p"
@@ -9229,7 +9225,9 @@ mod budget_tests {
         let entries = [before.clone(), stop.clone(), after];
         let mut outcome = SyncOutcome::default();
         let mine = requester.witnessed_vector().unwrap();
-        requester.apply_peer_window_into(&theirs, &mine, &entries, window, &mut outcome).unwrap();
+        requester
+            .apply_peer_window_into(&theirs, Some(&mine), &entries, window, &mut outcome)
+            .unwrap();
         assert_eq!(outcome.unknown.as_ref().map(|u| u.stamp), Some(stop.stamp), "{outcome:?}");
         assert_eq!(outcome.applied, 1, "only the entry before the stop");
         let witnessed = requester.witnessed_vector().unwrap();

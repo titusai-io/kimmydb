@@ -1219,7 +1219,7 @@ where
                 asked_partial,
             };
             let applied = kimmy_storage::blocking(|| {
-                engine.apply_peer_window_into(&theirs, &mine, &entries, window, &mut outcome)
+                engine.apply_peer_window_into(&theirs, Some(&mine), &entries, window, &mut outcome)
             });
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
@@ -1414,10 +1414,9 @@ where
     // scan started — there is no case where it is accepted and did not
     // move. `outcome.coverage_raised` is `Engine::apply_peer_window_into`'s
     // own answer, from comparing the batch's own witnessed vector against
-    // `mine` as it stood at this round's start (the `mine` passed into
-    // that call, above, before the network exchange) rather than against a
-    // fresh read of the current one, so it cannot be perturbed by anything
-    // outside this pull either.
+    // the `held` this pull's own `AskEntries` sent (`mine`, passed into
+    // that call above) rather than against a fresh read of the current
+    // one, so it cannot be perturbed by anything outside this pull either.
     outcome.advanced =
         advanced(outcome.coverage_raised, outcome.applied, outcome.partial, spans_resumed);
     let mine = after;
@@ -2465,9 +2464,9 @@ impl PeerStalls {
 /// conditions inlined at the one call site. `coverage_raised` must already
 /// exclude this node's own origin by the time it reaches here — that
 /// exclusion is `kimmy_storage`'s: it compares the batch's own witnessed
-/// vector against `mine`, the vector this round sent as `held`, not against
-/// a fresh read of the current one, so nothing here can be perturbed by
-/// activity outside this pull.
+/// vector against the `held` this pull's own `AskEntries` sent, not
+/// against a fresh read of the current one, so nothing here can be
+/// perturbed by activity outside this pull.
 fn advanced(coverage_raised: bool, applied: usize, partial: bool, spans_resumed: bool) -> bool {
     applied > 0 || spans_resumed || partial || coverage_raised
 }

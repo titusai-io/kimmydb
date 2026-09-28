@@ -3007,13 +3007,7 @@ impl Engine {
     /// Purely a raise: whether any of it was *this batch's own* progress on
     /// an origin other than this node's own is `SyncOutcome::coverage_raised`'s
     /// question, answered separately by comparing this batch's own witnessed
-    /// vector against `mine` — not by anything this function returns. An
-    /// earlier version answered it here, from `raise_version`'s per-origin
-    /// return, which reported nothing whenever a document or a schema
-    /// change in the same batch had already durably raised the very origin
-    /// this call was about to check (each raises its own origin the moment
-    /// it is applied, ADR-054, ADR-140) — a false negative for exactly the
-    /// batches most likely to be this batch's own progress.
+    /// vector against `mine` — not by anything this function returns.
     pub(crate) fn absorb_witnessed_in_txn(
         txn: &redb::WriteTransaction,
         seen: &kimmy_core::VersionVector,
@@ -4733,14 +4727,9 @@ mod tests {
 
     /// `absorb_witnessed_in_txn`'s own contract, independent of ADR-157's
     /// gate (`SyncOutcome::coverage_raised`, which compares the batch's own
-    /// `witnessed` against `mine`, not by anything this function returns
-    /// (an earlier version reported it here, from `raise_version`'s
-    /// per-origin return, which read nothing whenever a document or a
-    /// schema change in the same batch had already durably raised the very
-    /// origin this call was about to check — a false negative for exactly
-    /// the batches most likely to be genuine progress). What this function
-    /// still owns: raising every origin `seen` names, this node's own
-    /// included, never lowering one.
+    /// `witnessed` against `mine`, not anything this function returns).
+    /// What this function owns: raising every origin `seen` names, this
+    /// node's own included, never lowering one.
     #[test]
     fn absorb_witnessed_in_txn_raises_every_origin_seen_and_never_lowers_one() {
         let dir = tempfile::tempdir().unwrap();
