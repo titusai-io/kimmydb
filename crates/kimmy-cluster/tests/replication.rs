@@ -3206,21 +3206,6 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     );
 }
 
-// A wall-clock, in-process end-to-end test of the reset+carry-forward
-// mechanism was tried here and dropped, for the same reason PR 1's
-// concurrent-writes test is kept only as a documented smoke test: on this
-// fixture, one pull's own real work (dial, TLS, apply) is close enough in
-// magnitude to the interval that "wait removed by a reset" cannot be
-// reliably separated from "work a reset does not touch" by timing alone,
-// without a slow-walk test hook to force a bigger separation -- exactly the
-// kind of race PR 1's review said not to chase. The mechanism's correctness
-// is covered deterministically instead: `health::tests::carried_peers_*`
-// (the fanout accounting `select_excluding` does), and by reading
-// `peers.rs`'s `resume_next_tick` / `carry_forward` / `tick_is_a_reset`
-// wiring directly, which is small and linear enough to verify by
-// inspection. The existing `a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval`
-// above still proves the mechanism does not violate ADR-157's own contract.
-
 /// Captures the tick-overrun warning's fields, not just whether it fired
 /// (contrast [`Overruns`] above): where the tick's time went, summed across
 /// its pulls, and the peer its pulls summed to the most wall time against.

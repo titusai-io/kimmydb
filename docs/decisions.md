@@ -20874,33 +20874,54 @@ its threshold in far less wall-clock time than the constant's own reasoning
 assumes, which is a correctness question — a cooldown too short lets a
 repair replay a divergence it hasn't had time to actually resolve, and a
 freeze reached too fast reads a peer that is merely being contacted
-back-to-back, not one that has actually stopped — not a cosmetic one:
+back-to-back, not one that has actually stopped — not a cosmetic one. The
+first cut skipped `stalls.tick_opened()` on every reset tick, which fixes a
+short reset chain but not a long one: a drain can chain resets for its
+whole length — the finding above measured one running some seventy minutes
+on a single peer — and skipping the open for all of it would freeze both
+counters' advance for every peer that whole time, which is not wall-clock
+either. What actually ships:
 
-- `stalls.tick_opened()` — what `REPAIR_COOLDOWN_ROUNDS` counts, once per
-  contact rather than once per pull (ADR-148) — is skipped on a tick a reset
-  scheduled. A reset tick is a continuation of the tick that ended `Budget`,
-  not a fresh round against any of its carried peers.
-- `PeerStalls` takes a `sync_interval` (`set_sync_interval`, called once by
-  the replication loop right after `PeerStalls::new`; defaulted to zero —
-  unthrottled — so every existing test that calls `observe`/`observe_self`
-  directly is unaffected). A not-moved sighting recorded again inside that
-  interval of the last one does not count a second time toward
-  `FROZEN_CONTACTS`; a position that *moved* is always recorded, whatever
-  the timing. This is ruled option (i) of the choices considered: throttle
-  the *recording*, rather than changing what `FROZEN_CONTACTS` means or
-  gating carry-forward on the peer's stall state, because it leaves both
-  constants' existing "N at the default interval" reasoning true by
-  construction instead of by coincidence.
+- `replicate()` keeps `last_opened: Option<Instant>`, and calls
+  `stalls.tick_opened()` only when `tick_started` is at least
+  `sync_interval` past the value `last_opened` last recorded (or on the very
+  first tick). This needs no reset/ordinary distinction: an ordinary tick
+  already fires about `sync_interval` after the one before it, so it opens
+  under exactly the same rule a reset tick does, and a chain of any length
+  opens about once an interval regardless of how many ticks — reset or
+  ordinary — fall inside it.
+- `PeerStalls::tick_opened()` also clears a `counted_this_open` flag on
+  every remembered peer, in `by_peer` and `by_self` alike, alongside the
+  repair cooldown's own per-contact flag — the same "contact" the cooldown
+  counts, not a separate approximation of it. `observe`/`observe_self` set
+  the flag the first time they record a sighting after an open and throttle
+  a repeated not-moved one until the next open clears it; a position that
+  *moved* is always recorded, whatever the flag says. Every existing unit
+  test that drove `observe`/`observe_self` as a sequence of independent
+  contacts now calls `tick_opened()` before each one, which is what the
+  production loop actually does before a contact's first pull.
+- `RoundReport` carries `reset: bool` and `opened: bool`, so both the
+  reset chain's own ticks and which of them actually opened are directly
+  observable outside the loop, not only inferable from the cooldown's or
+  the throttle's downstream behaviour. `kimmy_sync_reset_ticks_total`
+  counts the former on `/metrics` and the OTLP bridge, and a resumed tick
+  logs at `DEBUG`.
 
 **The bound.** A contact only ends `Budget` when the next pull would not fit
 before the tick's deadline, and "fits" is judged against the slowest pull
-this contact has already made (ADR-157) — so a tick that ends `Budget` has
-already spent close to the whole of its own interval. A reset-driven drain
-can therefore raise contacts-per-second by at most **~2×** while it is
-actively draining (each reset tick is at least `interval / 2` long, never
-the near-zero a naive "fire again immediately, unconditionally" reset would
-allow), and the drained member serves back-to-back bounded walks at close to
-its steady-state serve load for the drain's duration — the same total load
+this contact has already made (ADR-157): it stops only once what is left of
+the interval is under that slowest pull, so at least `interval - slowest`
+of the tick was already spent when it stopped, and the tick's own length is
+at least one pull, `slowest` itself. A reset-driven tick's own length is
+therefore never under `max(slowest, interval - slowest)` — at least
+`interval / 2` in every case, and equal to it only when one pull happens to
+cost exactly half the interval; a pull cheap next to the interval (the
+ordinary case) makes a reset tick's floor close to the whole interval, not
+half of it. A reset-driven drain can therefore raise contacts-per-second by
+at most **~2×** while it is actively draining, never the near-zero a naive
+"fire again immediately, unconditionally" reset would allow, and the
+drained member serves back-to-back bounded walks at close to its
+steady-state serve load for the drain's duration — the same total load
 0.40.2's one unbounded walk put on it per member, delivered as consecutive
 bounded windows instead of a single long one, not a new load shape.
 

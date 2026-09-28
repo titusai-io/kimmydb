@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Timed stop matrix for ADR-195's reset/carry-forward (PR 2).
+"""Timed stop matrix for ADR-195's reset/carry-forward.
 
 The standing rule after a prior stop-path regression that passed every
 test yet stopped in 6-10 s and exited 75 is that a stop path is timed
@@ -13,17 +13,22 @@ This boots a real 3-node cluster per trial, forces one member (`a`) into an
 active drain from the moment it starts (a deep backlog plus
 KIMMY_TEST_WALK_ROW_MS/KIMMY_TEST_SERVE_WALK_MS -- process-global env vars,
 fine here since each trial is its own process, not a parallel `cargo test`),
-runs background load throughout (a steady insert loop, a TTL collection
-expiring every second, one index/DDL create fired just before the signal so
-it is genuinely in flight), and sends SIGTERM at a randomized offset into
-the drain to either (a) `b`, the member pulling from `a` (the "requester"),
-or (b) `a` itself (the "server", mid-walk). It records the exit code, the
+runs background load throughout on both the member about to be signalled
+and a third, otherwise idle member (a steady insert loop, a TTL collection
+expiring every second, one index/DDL create fired without waiting for it
+just before the signal, so it is genuinely in flight rather than already
+acknowledged), and sends SIGTERM at a randomized offset into the drain to
+either (a) `b`, the member pulling from `a` (the "requester"), or (b) `a`
+itself (the "server", mid-walk). It records the exit code (any nonzero
+value, not a fixed list -- a process a supervisor had to SIGKILL reports a
+negative signal number here, not the 128+signal a shell would show), the
 signal-to-exit duration, whether the log shows a clean "shutdown complete",
-and whether it shows a background task or HTTP connections still open at
-the end of the stop's window ("... aborted" / "still open"). After a clean
-exit it then restarts the stopped member on its own data and checks that
-start's own log too: an exit code of 0 is not proof the next start finds
-nothing to repair, a lesson learned the hard way before.
+whether a reset chain (ADR-195) was logged in progress right at the signal,
+and whether the log shows a background task, HTTP connections, schema-change
+push drivers or a write still going at the end of the stop's window. After
+a clean exit it then restarts the stopped member on its own data and checks
+that start's own log too: an exit code of 0 is not proof the next start
+finds nothing to repair.
 
 Usage:
     scripts/stop-matrix.py --baseline-bin PATH --head-bin PATH [--trials N]
@@ -40,10 +45,12 @@ Each binary must be a `--release` build of `kimmyd`:
         cargo build --release -p kimmyd
     # head-bin: <this worktree>/.cargo-target-resetcarry/release/kimmyd
 
-Pass means, for each build: no exit 137 (SIGKILL, something outlived every
-supervisor's own bound) or 75 (EXIT_UNCLEAN_SHUTDOWN) among its trials, no
-restart that found something to repair, and the head build's worst stop
-time no worse than the baseline's worst plus STOP_TIME_EPSILON.
+Pass means, for each build: every trial exits 0 with a logged "shutdown
+complete" and no sign of a background task, an HTTP connection, a push
+driver or a write left running at the stop window's end, no restart that
+found something to repair, and the head build's worst stop time no worse
+than the baseline's worst plus STOP_TIME_EPSILON. `--seed` is random unless
+given, and always printed, so a failing run can be reproduced exactly.
 """
 
 import argparse
@@ -70,11 +77,16 @@ CLUSTER_SECRET = "stop-matrix-cluster-secret"
 # jitter on this machine.
 STOP_TIME_EPSILON_S = 0.25
 
-# Exit codes a clean or an acceptable-but-unclean stop may end on.
-# kimmy_task::EXIT_UNCLEAN_SHUTDOWN and the SIGKILL a supervisor never
-# reaches are both a stop-path failure, not a possible outcome to allow.
-EXIT_UNCLEAN_SHUTDOWN = 75
-EXIT_SIGKILLED = 137
+# A clean stop is exit 0 with the marker logged -- nothing else. Python's
+# subprocess reports a process a supervisor had to kill as a *negative*
+# signal number (SIGKILL is -9), never the 128+signal a shell would show,
+# so checking against a fixed list of "known bad" codes such as 137 misses
+# every such death; only a positive check for the one good outcome catches
+# all of them.
+# The reset-chain marker peers.rs logs at DEBUG (ADR-195), and the module
+# path RUST_LOG must enable for it to appear.
+RESET_LOG_MARKER = "sync tick resumed at once"
+RESET_LOG_TARGET = "kimmy_cluster::peers=debug"
 
 
 def choose_port() -> int:
@@ -128,6 +140,7 @@ allowed_hosts = ["127.0.0.1"]
             f.write(config)
         env = dict(os.environ)
         env["KIMMY_ROOT_PASSWORD"] = ROOT_PASSWORD
+        env["RUST_LOG"] = f"info,{RESET_LOG_TARGET}"
         if extra_env:
             env.update(extra_env)
         self.stdout_path = os.path.join(self.dir, "stdout.log")
@@ -233,7 +246,7 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
     names = ["a", "b", "c"]
     nodes = []
     stop_writers = threading.Event()
-    writer_thread = None
+    writer_threads = []
     result = {
         "trial": trial_label,
         "target": target,
@@ -269,24 +282,43 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
             docs = [{"_id": f"seed-{batch}-{i}"} for i in range(50)]
             http("POST", a.url("/v1/db/shop/coll/orders/bulk"), docs, token)
 
-        writer_thread = threading.Thread(target=background_writers, args=(c, token, stop_writers), daemon=True)
-        writer_thread.start()
+        # Load on both the member about to be signalled and a third,
+        # otherwise idle one: the target's own stop path is what this trial
+        # is timing, so its own background writes, TTL expiry and DDL push
+        # are what it has to unwind, not only another member's.
+        target_node = b if target == "requester" else a
+        writer_threads = [
+            threading.Thread(target=background_writers, args=(node, token, stop_writers), daemon=True)
+            for node in (target_node, c)
+        ]
+        for wt in writer_threads:
+            wt.start()
 
         time.sleep(offset_s)
-        # One DDL create fired just before the signal, so it is genuinely
-        # in flight rather than settled by the time the signal lands.
-        try:
-            http(
+
+        # A reset chain (ADR-195) logged in progress right at the signal:
+        # the last few lines before it include the DEBUG marker a resumed
+        # tick logs, meaning the signal landed mid-chain rather than
+        # between chains or on an ordinary tick.
+        pre_signal_log = target_node.log()
+        recent = pre_signal_log.splitlines()[-5:]
+        result["reset_in_progress_at_signal"] = any(RESET_LOG_MARKER in l for l in recent)
+
+        # One DDL create, fired without waiting for its response, so it is
+        # genuinely still in flight rather than already acknowledged by the
+        # time the signal lands.
+        ddl_thread = threading.Thread(
+            target=lambda: http(
                 "POST",
                 c.url("/v1/db/shop/coll/live/indexes"),
                 {"fields": [{"path": "n"}], "name": f"ddl-{trial_label}"},
                 token,
-                timeout=1,
-            )
-        except Exception:
-            pass
+                timeout=5,
+            ),
+            daemon=True,
+        )
+        ddl_thread.start()
 
-        target_node = b if target == "requester" else a
         before = time.monotonic()
         target_node.signal_term()
         code = target_node.wait_exit(timeout=30)
@@ -301,6 +333,8 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
                 "clean_marker": "shutdown complete" in log,
                 "task_aborted": "still stopping" in log and "aborted" in log,
                 "connections_left_open": "HTTP connections were still open" in log,
+                "push_drivers_running": "schema-change push drivers were still running" in log,
+                "write_still_in_progress": "a write was still in progress" in log,
                 "timed_out": code is None,
             }
         )
@@ -324,8 +358,8 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
             result["restart_clean"] = None
     finally:
         stop_writers.set()
-        if writer_thread is not None:
-            writer_thread.join(timeout=2)
+        for wt in writer_threads:
+            wt.join(timeout=2)
         for n in nodes:
             n.kill_if_alive()
         for n in nodes:
@@ -341,7 +375,7 @@ def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, 
     n = 0
     for target in targets:
         for i in range(per_target):
-            offset = rng.uniform(0.3, 4.0)
+            offset = rng.uniform(2.0, 30.0)
             n += 1
             label_i = f"{label}/{target}/{i}"
             print(f"  [{label_i}] offset={offset:.2f}s ...", file=sys.stderr, flush=True)
@@ -349,7 +383,8 @@ def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, 
             results.append(r)
             print(
                 f"    exit={r['exit_code']} stop_time={r['stop_time_s']}s "
-                f"clean={r['clean_marker']} aborted={r['task_aborted']}",
+                f"clean={r['clean_marker']} reset_in_progress={r['reset_in_progress_at_signal']} "
+                f"aborted={r['task_aborted']}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -357,15 +392,32 @@ def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, 
 
 
 def summarize(label, results):
-    bad_exits = [r for r in results if r["exit_code"] in (EXIT_UNCLEAN_SHUTDOWN, EXIT_SIGKILLED) or r["timed_out"]]
-    aborted = [r for r in results if r["task_aborted"] or r["connections_left_open"]]
+    # Any exit other than a clean 0, or a 0 whose log never actually shows
+    # the clean marker, is a stop-path failure -- not a fixed list of
+    # "known bad" codes, which a negative signal-death code would slip past.
+    bad_exits = [
+        r for r in results if r["timed_out"] or r["exit_code"] != 0 or not r["clean_marker"]
+    ]
+    aborted = [
+        r
+        for r in results
+        if r["task_aborted"]
+        or r["connections_left_open"]
+        or r["push_drivers_running"]
+        or r["write_still_in_progress"]
+    ]
     dirty_restarts = [r for r in results if r["restart_clean"] is False]
     worst = max((r["stop_time_s"] for r in results), default=0.0)
+    resets = sum(1 for r in results if r["reset_in_progress_at_signal"])
     print(f"\n== {label}: {len(results)} trials, worst stop {worst:.3f}s ==")
-    print(f"   bad exits (137/75/timeout): {len(bad_exits)}")
+    print(f"   trials where a reset chain was logged in progress at the signal: {resets}")
+    print(f"   bad exits (nonzero, timed out, or no clean marker): {len(bad_exits)}")
     for r in bad_exits:
         print(f"     {r}")
-    print(f"   aborted background work / left-open connections: {len(aborted)}")
+    print(
+        f"   aborted background work, left-open connections, a push driver or a write "
+        f"still going: {len(aborted)}"
+    )
     for r in aborted:
         print(f"     {r}")
     print(f"   next start was not clean (repaired, or restart itself failed): {len(dirty_restarts)}")
@@ -381,13 +433,18 @@ def main():
     p.add_argument("--trials", type=int, default=24, help="total trials per build, split across targets")
     p.add_argument("--walk-row-ms", type=int, default=25)
     p.add_argument("--serve-walk-ms", type=int, default=700)
-    p.add_argument("--seed-batches", type=int, default=30, help="50 docs each")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed-batches", type=int, default=60, help="50 docs each")
+    p.add_argument(
+        "--seed", type=int, default=None, help="offsets' random seed; random and printed if omitted"
+    )
     p.add_argument("--json-out", help="write the raw per-trial results here as JSON")
     args = p.parse_args()
+    if args.seed is None:
+        args.seed = random.SystemRandom().randrange(2**32)
+    print(f"seed: {args.seed}", file=sys.stderr)
 
     all_results = {}
-    for label, binary in [("baseline (v0.41.0)", args.baseline_bin), ("head (PR 2)", args.head_bin)]:
+    for label, binary in [("v0.41.0", args.baseline_bin), ("this change", args.head_bin)]:
         print(f"\n### {label}: {args.trials} trials ###", file=sys.stderr)
         results = run_matrix(
             binary, label, args.trials, args.walk_row_ms, args.serve_walk_ms, args.seed_batches, args.seed
@@ -402,8 +459,8 @@ def main():
         if bad_exits or aborted or dirty_restarts:
             failed = True
 
-    baseline_worst = worsts.get("baseline (v0.41.0)", 0.0)
-    head_worst = worsts.get("head (PR 2)", 0.0)
+    baseline_worst = worsts.get("v0.41.0", 0.0)
+    head_worst = worsts.get("this change", 0.0)
     regression = head_worst > baseline_worst + STOP_TIME_EPSILON_S
     print(
         f"\n== worst stop time: baseline {baseline_worst:.3f}s, head {head_worst:.3f}s "
