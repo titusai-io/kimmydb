@@ -5205,11 +5205,13 @@ async fn a_self_side_held_still_is_compared_and_its_real_difference_found() {
 
     let mut stalls = kimmy_cluster::transport::PeerStalls::new();
     for contact in 1..=kimmy_cluster::FROZEN_CONTACTS {
+        stalls.tick_opened();
         let outcome =
             sync_once_with(&b.engine, a.addr, SECRET, stuck.clone(), &mut stalls).await.unwrap();
         assert!(outcome.count_probe_deferred, "contact {contact}: not yet still: {outcome:?}");
     }
     for contact in 0..2 {
+        stalls.tick_opened();
         let outcome =
             sync_once_with(&b.engine, a.addr, SECRET, stuck.clone(), &mut stalls).await.unwrap();
         assert_eq!(

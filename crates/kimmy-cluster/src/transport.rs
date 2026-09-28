@@ -1705,13 +1705,6 @@ pub struct PeerStalls {
     /// its apply still reports what the apply refused, declined and skipped
     /// (ADR-177).
     applied: AppliedCounts,
-    /// How often `observe`/`observe_self` may record a repeated not-moved
-    /// sighting for the same peer (ADR-157's addendum). Zero (the default,
-    /// unset) never throttles, which is what every existing test that calls
-    /// `observe`/`observe_self` directly, contact by contact, still wants;
-    /// the replication loop sets it to `cluster.sync_interval_secs` with
-    /// [`PeerStalls::set_sync_interval`].
-    sync_interval: Duration,
 }
 
 /// The counts a committed apply produced that a round's report carries.
@@ -1915,28 +1908,19 @@ struct Stall {
     /// Consecutive checked contacts on which every remembered position came
     /// back unchanged.
     unchanged: u32,
-    /// When a not-moved sighting was last recorded (ADR-157's addendum): a
-    /// still position seen again inside `PeerStalls::sync_interval` of this
-    /// does not record a second one. A rapid run of checked contacts inside
-    /// one interval -- a reset-driven drain carrying an unrelated peer's
-    /// rotation slot along with it -- must not be able to reach
-    /// `FROZEN_CONTACTS` faster than three ordinary ticks would. A position
-    /// that *moved* is always recorded, whatever the timing: this only
-    /// throttles repeating "nothing changed".
-    last_sighted: Option<Instant>,
+    /// Whether a not-moved sighting has already been recorded for this peer
+    /// since its contact was last opened (ADR-195): a still position seen
+    /// again before the next open does not record a second one. Cleared by
+    /// [`PeerStalls::tick_opened`], on the same open a checked contact's
+    /// several pulls, or a whole chain of reset ticks continuing one, share.
+    /// A position that *moved* is always recorded, whatever this flag says:
+    /// it only throttles repeating "nothing changed".
+    counted_this_open: bool,
 }
 
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// How often `observe`/`observe_self` may record a repeated not-moved
-    /// sighting for the same peer, once this node's own tick cadence is
-    /// known (ADR-157's addendum). The replication loop calls this once,
-    /// with `cluster.sync_interval_secs`, right after [`Self::new`].
-    pub fn set_sync_interval(&mut self, interval: Duration) {
-        self.sync_interval = interval;
     }
 
     /// The timing of the window the last round applied, if one was applied
@@ -2090,16 +2074,24 @@ impl PeerStalls {
         }
     }
 
-    /// A sync tick has begun, so the next pull at each peer opens that
-    /// peer's contact for this tick (ADR-157).
-    ///
-    /// What [`Self::repair_due`] counts against [`REPAIR_COOLDOWN_ROUNDS`]
-    /// is contacts, and a tick's several pulls at one peer are one contact;
-    /// this is what tells them apart. The loop calls it once per tick,
-    /// before the tick's first pull.
+    /// A tick has opened, so the next pull at each peer opens that peer's
+    /// contact for it: what [`Self::repair_due`] counts against
+    /// [`REPAIR_COOLDOWN_ROUNDS`], and what `observe`/`observe_self` may
+    /// record one repeated not-moved sighting against before
+    /// [`FROZEN_CONTACTS`] (ADR-145), both count once per open, not once
+    /// per pull or per tick. The replication loop calls this about once
+    /// `cluster.sync_interval_secs` (ADR-195), whether that interval held
+    /// one ordinary tick or a whole chain of reset ticks continuing one
+    /// draining contact.
     pub fn tick_opened(&mut self) {
         for repairs in self.repairs.values_mut() {
             repairs.counted = false;
+        }
+        for stall in self.by_peer.values_mut() {
+            stall.counted_this_open = false;
+        }
+        for stall in self.by_self.values_mut() {
+            stall.counted_this_open = false;
         }
     }
 
@@ -2423,17 +2415,13 @@ impl PeerStalls {
         let stall = self.by_self.entry(peer).or_default();
         let still = !stall.trailing.is_empty()
             && stall.trailing.iter().all(|(origin, at)| mine_at.get(*origin) == *at);
-        // A not-moved sighting inside `sync_interval` of the last recorded
-        // one does not count again (ADR-157's addendum): a moved position
-        // always does, whatever the timing.
-        let now = Instant::now();
-        let throttled = still
-            && stall
-                .last_sighted
-                .is_some_and(|last| now.saturating_duration_since(last) < self.sync_interval);
+        // A not-moved sighting already recorded since this contact was last
+        // opened does not count again (ADR-195): a moved position always
+        // does, whatever the timing.
+        let throttled = still && stall.counted_this_open;
         if !throttled {
             stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
-            stall.last_sighted = Some(now);
+            stall.counted_this_open = true;
         }
         stall.trailing = trailing;
         // Defensive: the sync loop does not reach `Frozen` here. `peers` re-reads
@@ -2479,20 +2467,16 @@ impl PeerStalls {
         let stall = self.by_peer.entry(peer).or_default();
         let still = !stall.trailing.is_empty()
             && stall.trailing.iter().all(|(origin, at)| theirs.get(*origin) == *at);
-        // A not-moved sighting inside `sync_interval` of the last recorded
-        // one does not count again (ADR-157's addendum): a moved position
-        // always does, whatever the timing. Otherwise a rapid run of checked
-        // contacts inside one interval -- a reset-driven drain carrying an
-        // unrelated peer's rotation slot along with it -- could reach
-        // `FROZEN_CONTACTS` far faster than three ordinary ticks would.
-        let now = Instant::now();
-        let throttled = still
-            && stall
-                .last_sighted
-                .is_some_and(|last| now.saturating_duration_since(last) < self.sync_interval);
+        // A not-moved sighting already recorded since this contact was last
+        // opened does not count again (ADR-195): a moved position always
+        // does, whatever the timing. Otherwise a rapid run of pulls inside
+        // one open -- several pulls of one contact, or a whole chain of
+        // reset ticks continuing it -- could reach `FROZEN_CONTACTS` far
+        // faster than three actually-opened contacts would.
+        let throttled = still && stall.counted_this_open;
         if !throttled {
             stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
-            stall.last_sighted = Some(now);
+            stall.counted_this_open = true;
         }
         stall.trailing = trailing;
         if stall.unchanged >= FROZEN_CONTACTS {
@@ -3269,61 +3253,60 @@ mod tests {
         assert_eq!(entries_threshold(&mine, &level, &[]), None);
     }
 
-    /// ADR-157's addendum, option (i): a not-moved sighting recorded again
-    /// inside `sync_interval` of the last one does not count, so a rapid run
-    /// of checked contacts (several reset-driven ticks in a row) cannot
-    /// reach `FROZEN_CONTACTS` faster than that many intervals actually
-    /// elapsing would. A *moved* position always counts, whatever the
+    /// ADR-195: a not-moved sighting recorded again before the contact's
+    /// next open does not count, so several pulls of one contact -- or a
+    /// whole chain of reset ticks continuing it, none of which reopen it --
+    /// cannot reach `FROZEN_CONTACTS` faster than that many actually-opened
+    /// contacts would. A *moved* position always counts, whatever the
     /// timing -- asserted here too, so the throttle cannot be read as
     /// silencing everything rather than only repeated stillness.
     #[test]
-    fn a_repeated_not_moved_sighting_inside_the_interval_does_not_count_again() {
+    fn a_repeated_not_moved_sighting_since_the_contact_last_opened_does_not_count_again() {
         let peer = node(1);
         let me = node(2);
         let mut stalls = PeerStalls::new();
-        stalls.set_sync_interval(Duration::from_millis(200));
 
         let mine = vector(&[(me, 100), (peer, 5)]);
         let theirs = vector(&[(me, 10), (peer, 5)]);
 
+        stalls.tick_opened();
         // First sighting: the memo being written, not yet a "still" count.
         assert_eq!(stalls.observe(peer, &theirs, &mine), PeerPosition::Advancing);
-        // Immediately again, same position: inside the interval, so this
-        // must not be the second of `FROZEN_CONTACTS` -- it must not count
-        // at all.
+        // Immediately again, same position, no reopen in between: this must
+        // not be the second of `FROZEN_CONTACTS` -- it must not count at all.
         for _ in 0..FROZEN_CONTACTS {
             assert_eq!(
                 stalls.observe(peer, &theirs, &mine),
                 PeerPosition::Advancing,
-                "throttled: none of these land inside the interval"
+                "throttled: none of these reopened the contact"
             );
         }
 
-        // Past the interval, the same still position now counts -- once per
-        // sleep past it, since each recorded sighting resets the throttle's
-        // own window from itself.
+        // Once the contact reopens, the same still position counts again --
+        // once per open, since each recorded sighting sets the flag the next
+        // open clears.
         for sighting in 1..FROZEN_CONTACTS {
-            std::thread::sleep(Duration::from_millis(250));
+            stalls.tick_opened();
             assert_eq!(
                 stalls.observe(peer, &theirs, &mine),
                 PeerPosition::Advancing,
-                "sighting {sighting} after the interval: not yet frozen"
+                "sighting {sighting} after reopening: not yet frozen"
             );
         }
-        std::thread::sleep(Duration::from_millis(250));
+        stalls.tick_opened();
         assert_eq!(
             stalls.observe(peer, &theirs, &mine),
             PeerPosition::Frozen,
-            "FROZEN_CONTACTS after the interval: now it counts"
+            "FROZEN_CONTACTS opens later: now it counts"
         );
     }
 
     #[test]
-    fn a_moved_position_always_counts_regardless_of_the_interval() {
+    fn a_moved_position_always_counts_whether_or_not_the_contact_reopened() {
         let peer = node(1);
         let me = node(2);
         let mut stalls = PeerStalls::new();
-        stalls.set_sync_interval(Duration::from_secs(600)); // absurdly long: a move must ignore it
+        stalls.tick_opened(); // once, at the start -- never again below
 
         let mine = vector(&[(me, 100), (peer, 5)]);
         for their_wall in [10u64, 20, 30, 40] {
@@ -3331,8 +3314,39 @@ mod tests {
             assert_eq!(
                 stalls.observe(peer, &theirs, &mine),
                 PeerPosition::Advancing,
-                "a moved position is never throttled, however long the interval"
+                "a moved position is never throttled, opened or not"
             );
+        }
+    }
+
+    /// The complement of the throttle test above: an ordinary tick opens
+    /// every contact it checks (ADR-195's `last_opened` fires about once
+    /// `sync_interval`, which is exactly ordinary cadence when nothing is
+    /// draining), so a still position seen on every one of those ticks
+    /// counts every time -- reaching `Frozen` in exactly `FROZEN_CONTACTS`
+    /// checked contacts, the same as before this throttle existed at all.
+    #[test]
+    fn an_opened_contact_every_tick_counts_every_still_sighting() {
+        let peer = node(1);
+        let me = node(2);
+        let mut stalls = PeerStalls::new();
+
+        let mine = vector(&[(me, 100), (peer, 5)]);
+        let theirs = vector(&[(me, 10), (peer, 5)]);
+
+        // The baseline sighting: the memo being written, not yet a "still"
+        // count, whether or not the contact that wrote it was opened.
+        stalls.tick_opened();
+        assert_eq!(stalls.observe(peer, &theirs, &mine), PeerPosition::Advancing);
+
+        for sighting in 0..FROZEN_CONTACTS {
+            stalls.tick_opened();
+            let position = stalls.observe(peer, &theirs, &mine);
+            if sighting + 1 < FROZEN_CONTACTS {
+                assert_eq!(position, PeerPosition::Advancing, "sighting {sighting}");
+            } else {
+                assert_eq!(position, PeerPosition::Frozen, "the {sighting}th opened sighting");
+            }
         }
     }
 
@@ -3365,16 +3379,19 @@ mod tests {
         }
 
         // Behind and frozen: the same processed position comes back on
-        // contact after contact. The first sighting is the memo being
-        // written, the next `FROZEN_CONTACTS` are it standing still, and
-        // the probe goes out on the last of those.
+        // contact after contact, each its own opened one (ADR-195). The
+        // first sighting is the memo being written, the next
+        // `FROZEN_CONTACTS` are it standing still, and the probe goes out
+        // on the last of those.
         let mut stalls = PeerStalls::new();
         let theirs = vector(&[(me, 50), (peer, 5)]);
         for sighting in 1..=FROZEN_CONTACTS {
+            stalls.tick_opened();
             let position = stalls.observe(peer, &theirs, &mine);
             assert_eq!(position, PeerPosition::Advancing, "sighting {sighting}: not yet frozen");
             assert!(divergence_probe_for(probe(), position).deferred, "sighting {sighting}");
         }
+        stalls.tick_opened();
         let position = stalls.observe(peer, &theirs, &mine);
         assert_eq!(position, PeerPosition::Frozen, "unchanged for FROZEN_CONTACTS contacts");
         assert_eq!(
@@ -3421,17 +3438,22 @@ mod tests {
         let third = node(3);
         let mut stalls = PeerStalls::new();
 
-        // What the peer has processed, on each contact.
+        // What the peer has processed, on each contact -- each its own
+        // opened contact, as a real tick's first pull always is (ADR-195).
         let theirs = vector(&[(me, 50), (peer, 5)]);
+        stalls.tick_opened();
         stalls.observe(peer, &theirs, &vector(&[(me, 100), (peer, 5)]));
         // This node writes more: its own origin moves, the peer's position
         // there does not.
+        stalls.tick_opened();
         stalls.observe(peer, &theirs, &vector(&[(me, 200), (peer, 5)]));
         // This node pulls a third member's writes the peer has none of: a
         // new trailing origin appears at the peer's position of zero.
+        stalls.tick_opened();
         stalls.observe(peer, &theirs, &vector(&[(me, 300), (peer, 5), (third, 40)]));
         // The peer takes a local write: its own origin moves, which is never
         // in the map.
+        stalls.tick_opened();
         let theirs_wrote = vector(&[(me, 50), (peer, 9)]);
         let mine = vector(&[(me, 300), (peer, 5), (third, 40)]);
         assert_eq!(
@@ -3474,13 +3496,16 @@ mod tests {
             assert_eq!(gate, CountGate { probe: None, deferred: true }, "at {my_wall}");
         }
 
-        // Wedged: the same position comes back.
+        // Wedged: the same position comes back, each contact its own opened
+        // one (ADR-195).
         let mut stalls = PeerStalls::new();
         let stuck = vector(&[(me, 50), (peer, 40)]);
         for sighting in 1..=FROZEN_CONTACTS {
+            stalls.tick_opened();
             let position = stalls.observe_self(peer, &their_servable, Some(&stuck));
             assert_eq!(position, PeerPosition::Advancing, "sighting {sighting}: not yet frozen");
         }
+        stalls.tick_opened();
         let position = stalls.observe_self(peer, &their_servable, Some(&stuck));
         assert_eq!(position, PeerPosition::Frozen, "unchanged for FROZEN_CONTACTS contacts");
         assert_eq!(
@@ -3598,13 +3623,15 @@ mod tests {
 
         // The same peer on the servable vector: what the gate did before,
         // and what it still does for a peer that did not say what it has
-        // processed.
+        // processed. Each contact its own opened one (ADR-195).
         let mut stalls = PeerStalls::new();
         for _ in 0..FROZEN_CONTACTS {
+            stalls.tick_opened();
             let position = stalls.observe(peer, &their_servable, &mine);
             assert_eq!(position, PeerPosition::Advancing, "behind on what it can serve");
             assert!(divergence_probe_for(probe(), position).deferred);
         }
+        stalls.tick_opened();
         assert_eq!(
             stalls.observe(peer, &their_servable, &mine),
             PeerPosition::Frozen,

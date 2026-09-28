@@ -198,6 +198,12 @@ pub struct RoundReport {
     /// had waited, and how each contact ended (ADR-175). Counters and
     /// histograms, summed over the tick.
     pub pulls: PullReport,
+    /// Whether this tick was scheduled by a reset rather than by the
+    /// ticker's own interval (ADR-195): the previous tick ended `Budget`
+    /// while still advancing on at least one peer, and this one continues
+    /// draining it at once instead of after a full `sync_interval_secs`.
+    /// True for every tick in a reset chain, not only the first.
+    pub reset: bool,
 }
 
 /// Upper bounds of `kimmy_sync_pull_seconds`, in microseconds (ADR-175).
@@ -597,7 +603,6 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
-    stalls.set_sync_interval(config.sync_interval);
     // A snapshot this node was part-way through when it stopped resumes where
     // it left off rather than transferring everything again (ADR-161). Never
     // fatal: the record is an optimisation, and a node that will not start
@@ -632,13 +637,27 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // Whether the tick about to run was scheduled by a reset (immediately
     // after a draining tick) rather than by the ticker's own interval. Read
     // and cleared at the top of the sync arm; set at the bottom of the
-    // previous one. `stalls.tick_opened()` must not run on a reset tick: it
-    // is what the repair cooldown counts in rounds (ADR-148), and that
-    // cooldown is wall-clock by design (its own doc comment), so counting a
-    // reset tick as a fresh round would let a rapid drain burn cooldown far
-    // faster than the constant's "five minutes at the default interval"
-    // reasoning assumes.
+    // previous one, and carried onto `RoundReport::reset` for the tick it
+    // names.
     let mut tick_is_a_reset = false;
+    // When `stalls.tick_opened()` last ran (ADR-195): what `REPAIR_COOLDOWN_ROUNDS`
+    // (ADR-148) and the not-moved-sighting throttle behind `FROZEN_CONTACTS`
+    // (ADR-145) both count against, in place of "every tick that is not a
+    // reset". Both constants are wall-clock by their own reasoning — sixty
+    // rounds is five minutes at the default interval, three sightings is
+    // fifteen seconds at it — and a reset chain can run far longer than one
+    // tick: ADR-157's own measured case was some seventy minutes of a
+    // single peer draining. Gating the open on "not a reset tick" would
+    // have opened every one of those minutes' worth of reset ticks as a
+    // fresh contact for every OTHER peer's rotation slot they carried along
+    // with them, freezing both counters' advance for the whole chain rather
+    // than letting them advance at the wall-clock rate their constants
+    // assume. Gating on elapsed time instead needs no reset/ordinary
+    // distinction at all: an ordinary tick already fires about
+    // `sync_interval` after the last one, so it opens under exactly the
+    // same rule a reset tick does — one opened tick per interval, in every
+    // mode.
+    let mut last_opened: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -752,15 +771,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // and ADR-154's overrun warning goes on meaning a tick that
                 // was stuck rather than a tick that was busy.
                 let deadline = tick_started + config.sync_interval;
-                // A new tick, so the next pull at each peer opens that
-                // peer's contact: what the repair machinery counts in
-                // rounds is counted once per contact, not once per pull
-                // (ADR-148's cooldown is stated in wall-clock terms) --
-                // except a tick a reset scheduled, which is a continuation
-                // of the tick that ended `Budget`, not a fresh round against
-                // any of its carried peers.
-                if !this_tick_is_a_reset {
+                // What the repair cooldown (ADR-148) and the not-moved
+                // sighting throttle behind `FROZEN_CONTACTS` (ADR-145) both
+                // count against: not every tick, but about once an interval,
+                // whatever mix of ordinary and reset ticks that interval
+                // held (ADR-195, and `last_opened`'s own comment above).
+                if last_opened
+                    .is_none_or(|last| tick_started.saturating_duration_since(last) >= config.sync_interval)
+                {
                     stalls.tick_opened();
+                    last_opened = Some(tick_started);
                 }
                 // Carried peers first, filtered against this tick's live
                 // `peers` (ADR-157's addendum): a peer SWIM has since marked
@@ -1087,14 +1107,22 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
                 // A draining peer left with time still worth having: rather
                 // than wait out the rest of this interval, the next tick
-                // fires at once and picks it back up first (ADR-157's
-                // addendum). `MissedTickBehavior::Delay` (`ticker`, below)
-                // means this reset changes only the *next* tick's timing,
-                // not any tick's own deadline or any other peer's schedule.
+                // fires at once and picks it back up first (ADR-195).
+                // `MissedTickBehavior::Delay` (`ticker`, below) means this
+                // reset changes only the *next* tick's timing, not any
+                // tick's own deadline or any other peer's schedule.
                 if !resume_next_tick.is_empty() {
                     sync.reset_immediately();
                     carry_forward = resume_next_tick;
                     tick_is_a_reset = true;
+                }
+                report.reset = this_tick_is_a_reset;
+                if this_tick_is_a_reset {
+                    debug!(
+                        carried = carried.len(),
+                        "sync tick resumed at once, continuing a draining contact rather than \
+                         waiting out the rest of the interval"
+                    );
                 }
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms);
