@@ -416,6 +416,21 @@ fn after_pull(truncated: bool, fits: bool, pulls: usize) -> AfterPull {
     }
 }
 
+/// Whether `peer`'s `took` makes it the new slowest contact of the tick,
+/// against `current` — the tick-overrun warning's `slowest_peer` (ADR-154).
+/// Out of the loop for the same reason `after_pull` is: one decision with a
+/// test of its own, made once per contact end rather than three times inline.
+fn slower(
+    current: Option<(SocketAddr, Duration)>,
+    peer: SocketAddr,
+    took: Duration,
+) -> Option<(SocketAddr, Duration)> {
+    match current {
+        Some((_, d)) if d >= took => current,
+        _ => Some((peer, took)),
+    }
+}
+
 /// What the loop reports after every sync tick. See [`RoundReport`].
 pub type RoundHook = Arc<dyn Fn(RoundReport) + Send + Sync>;
 
@@ -728,6 +743,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // budget.
                 let mut draining: VecDeque<Contact> =
                     health.select(&peers, Instant::now()).into_iter().map(Contact::new).collect();
+                // The contact whose pulls this tick summed to the most wall
+                // time, named in the tick-overrun warning below: the peer
+                // the tick's own length is most attributable to.
+                let mut slowest_contact: Option<(SocketAddr, Duration)> = None;
                 while let Some(mut contact) = draining.pop_front() {
                     let peer = contact.peer;
                     // Sequential rather than concurrent: a round is cheap when
@@ -939,6 +958,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     report(node, stale.then_some(outcome.behind_ms));
                                 }
                             }
+                            slowest_contact = slower(slowest_contact, contact.peer, contact.total_took);
                             contact.finish();
                         }
                         // This node's own stop ended the round: a walk or an
@@ -952,6 +972,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // count says how a running node's contacts end,
                             // and the last round of a process's life is none
                             // of its four ends.
+                            // This pull's own time was never folded into
+                            // `contact.total_took` (`pulled()` runs only on
+                            // `Ok`), so it is added here.
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
                             contact.finish();
                         }
                         // A peer being unreachable is the normal state of a
@@ -992,6 +1017,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             }
                             // Whatever earlier pulls of this contact merged
                             // is still merged, and still worth one line.
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
                             contact.finish();
                         }
                     }
@@ -1032,10 +1059,33 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // interval apart, so a stall of any length is one line.
                 let tick_took = tick_started.elapsed();
                 if tick_took >= config.sync_interval {
+                    // Where the tick's time went, so the line answers its own
+                    // question rather than sending an operator to a sampler:
+                    // this tick's pulls, serve (the peer's walk and the
+                    // wire), wait (queued for this node's single writer) and
+                    // apply (the commits and their fsync), summed across
+                    // every contact (`report.pulls`'s histograms, reset each
+                    // tick at its start). And which peer accounts for most
+                    // of the tick's own length: the contact whose pulls
+                    // summed to the most wall time, not the one with the
+                    // single slowest pull, since a tick's length is the sum
+                    // of what it spent on each peer in turn (ADR-157: the
+                    // rounds run one after another inside the tick).
+                    let slowest_peer = slowest_contact.map_or_else(
+                        || "none".to_string(),
+                        |(peer, _)| peer.to_string(),
+                    );
+                    let slowest_peer_ms =
+                        slowest_contact.map_or(0, |(_, took)| took.as_millis() as u64);
                     warn!(
                         elapsed_secs = tick_took.as_secs(),
                         interval_secs = config.sync_interval.as_secs(),
                         peers = peers.len(),
+                        serve_ms = report.pulls.serve.sum_us / 1_000,
+                        wait_ms = report.pulls.wait.sum_us / 1_000,
+                        apply_ms = report.pulls.apply.sum_us / 1_000,
+                        slowest_peer,
+                        slowest_peer_ms,
                         "a sync tick took longer than cluster.sync_interval_secs; \
                          kimmy_sync_divergent_collections was not re-examined while it ran"
                     );
@@ -1088,6 +1138,10 @@ struct Contact {
     /// The longest any of this contact's pulls took, and the estimate of
     /// what the next one would cost.
     slowest: Duration,
+    /// Every one of this contact's pulls, summed: what a tick-overrun
+    /// warning (ADR-154) names as the slowest peer, since that is the peer
+    /// a tick's own length is most attributable to.
+    total_took: Duration,
 }
 
 impl Contact {
@@ -1102,6 +1156,7 @@ impl Contact {
             advanced: 0,
             total: 0,
             slowest: Duration::ZERO,
+            total_took: Duration::ZERO,
         }
     }
 
@@ -1140,6 +1195,7 @@ impl Contact {
         self.advanced += usize::from(outcome.advanced);
         self.total += outcome.total();
         self.slowest = self.slowest.max(took);
+        self.total_took += took;
     }
 
     /// Whether another pull of this contact can be expected to finish before
@@ -1352,6 +1408,43 @@ mod tests {
         assert_eq!(
             after_pull(true, true, MAX_PULLS_PER_CONTACT),
             AfterPull::End(ContactEnd::Ceiling)
+        );
+    }
+
+    #[test]
+    fn the_slowest_contact_is_the_one_whose_pulls_summed_to_the_most_time() {
+        // The tick-overrun warning's `slowest_peer` (ADR-154): the contact a
+        // tick's own length is most attributable to, not the first one seen
+        // or the one with the single slowest pull.
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        assert_eq!(
+            slower(None, a, Duration::from_millis(5)),
+            Some((a, Duration::from_millis(5))),
+            "the first contact is the slowest so far by default"
+        );
+
+        let after_a = slower(None, a, Duration::from_secs(1));
+        assert_eq!(
+            slower(after_a, b, Duration::from_millis(1)),
+            after_a,
+            "a faster contact does not displace a slower one already recorded"
+        );
+        assert_eq!(
+            slower(after_a, b, Duration::from_secs(2)),
+            Some((b, Duration::from_secs(2))),
+            "a slower contact does displace it"
+        );
+
+        // A tie keeps the earlier contact rather than churning on equal
+        // times: `slower` is called once per contact end, in the order they
+        // ended, so keeping `current` on a tie is what makes the result the
+        // *first* of equally slow contacts, not an arbitrary one.
+        assert_eq!(
+            slower(Some((a, Duration::from_secs(1))), b, Duration::from_secs(1)),
+            Some((a, Duration::from_secs(1))),
+            "a tie keeps the contact already recorded"
         );
     }
 
