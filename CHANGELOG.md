@@ -25,17 +25,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   slowest pull. Nothing about when the warning fires changes.
 
 - **A pull ceiling reached with no real progress could go unwarned on a busy
-  node.** `outcome.advanced` — what tells a genuinely wedged contact (every
-  pull truncated, nothing moving) from one draining normally, and what the
-  "pull ceiling reached for this peer this tick with no pull moving this
-  node's position" `WARN` is keyed on — compared this node's whole witnessed
-  vector before and after the pull. On a node with concurrent local activity
-  (a client write, a TTL expiry, another origin's confirm push), that
+  node, or with a wrongly-warned one on a quiet schema change.** In 0.41.0,
+  `outcome.advanced` — what tells a genuinely wedged contact (every pull
+  truncated, nothing moving) from one draining normally, and what the "pull
+  ceiling reached for this peer this tick with no pull moving this node's
+  position" `WARN` is keyed on — compared this node's whole witnessed
+  vector before and after the pull; 0.40.2 keyed the same `WARN` on
+  `applied > 0` alone. On a node with concurrent local activity (a client
+  write, a TTL expiry, another origin's confirm push), the whole-vector
   comparison could read `true` from activity the pull itself had nothing to
-  do with, so a wedged contact could read as advancing and the warning never
-  fire. It now reads applied entries, a resumed span, an accepted partial
-  window, or coverage raised for another origin *inside the pull's own
-  commit transaction* — none of which anything outside the pull can move.
+  do with, so a wedged contact could read as advancing and the warning
+  never fire — and the opposite failure, a pull whose own progress was
+  entirely a schema change could read `false` and warn wrongly, since a
+  replicated DDL entry raises its own origin's witnessed marker the moment
+  it applies, ahead of the one place that comparison used to look.
+  `outcome.advanced` now reads applied entries or schema changes, a resumed
+  span, an accepted partial window, or coverage raised for another origin,
+  judged from what the pull's own window carried and committed rather than
+  from a before/after read of the whole vector — none of which anything
+  outside the pull, or already applied within it, can move.
 
 ## 0.41.0 - 2026-09-28
 

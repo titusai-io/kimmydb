@@ -5800,80 +5800,6 @@ async fn a_push_stops_at_a_creation_waiting_for_the_receivers_purge_and_says_so(
     assert!(b.engine.get_collection("shop", "orders").is_ok(), "created once the purge is done");
 }
 
-/// SMOKE TEST, not the regression test for the bug the independent review
-/// found. The regression tests are deterministic and live elsewhere:
-/// `transport::tests::a_pull_is_advanced_by_any_one_of_its_own_signals` (the
-/// pure `advanced` gate) and
-/// `engine::tests::absorb_witnessed_in_txn_excludes_the_local_origin_from_coverage_raised`
-/// (the local-origin exclusion, at the engine level). Neither needs a race:
-/// the fix removed the whole-vector diff the old bug lived in, so there is
-/// nothing left to race against.
-///
-/// This test is kept anyway as an end-to-end sanity check under real
-/// concurrency, documented honestly: reverting the fix and running this
-/// test does **not** make it fail, up to 5,000 iterations tried while
-/// diagnosing it — redb's MVCC reads land on a consistent snapshot too
-/// quickly to reliably straddle the old code's two reads on this machine.
-/// Do not read a pass here as proof of anything the two tests above do not
-/// already prove deterministically.
-#[tokio::test]
-async fn a_caught_up_pull_does_not_read_as_advanced_from_the_requesters_own_concurrent_writes() {
-    let a = node().await;
-    let b = node().await;
-
-    let ca = a.engine.create_collection("shop", "orders").unwrap();
-    a.engine.insert(&ca, doc! { "_id": "from-a" }).unwrap();
-    // One pull to converge B with A, so every later pull from A is caught up:
-    // nothing new to carry, which is the only shape this test wants.
-    let first = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
-    assert_eq!(first.applied, 1, "the fixture's premise: B converges with A in one pull");
-
-    // B's own collection, written locally throughout the test — unrelated to
-    // anything A ever sends, so any effect on `advanced` can only be the bug
-    // this test exists to catch.
-    let scratch = b.engine.create_collection("shop", "scratch").unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    // `spawn_blocking`, not `spawn`: `Engine::insert` is a synchronous call
-    // with no await point, and this test's `#[tokio::test]` runtime is
-    // current-thread (the default) — a tight loop of it inside a plain
-    // `spawn`ed task would never yield, starving the very `sync_once` calls
-    // below of the executor and hanging the test rather than racing them.
-    let writer = tokio::task::spawn_blocking({
-        let engine = Arc::clone(&b.engine);
-        let stop = Arc::clone(&stop);
-        move || {
-            let mut i = 0usize;
-            while !stop.load(Ordering::Relaxed) {
-                engine.insert(&scratch, doc! { "_id": format!("local-{i}") }).unwrap();
-                i += 1;
-            }
-            i
-        }
-    });
-
-    const PULLS: usize = 500;
-    let mut outcomes = Vec::with_capacity(PULLS);
-    for _ in 0..PULLS {
-        outcomes.push(sync_once(&b.engine, a.addr, SECRET, None).await.unwrap());
-    }
-    stop.store(true, Ordering::Relaxed);
-    let written = writer.await.unwrap();
-    // Not a fixed threshold: how far the writer gets against 500 pulls
-    // depends on ambient load (this ran at 31 alongside the rest of the
-    // suite, and over 100 alone), so this only checks the writer ran at
-    // all, not how far.
-    assert!(written > 0, "the writer thread must have run, or this races nothing: {written}");
-
-    for (i, outcome) in outcomes.iter().enumerate() {
-        assert_eq!(outcome.applied, 0, "A had nothing new to give pull {i}: {outcome:?}");
-        assert!(
-            !outcome.advanced,
-            "pull {i} carried nothing from A and must not read as advanced just because B was \
-             writing its own documents at the same time: {outcome:?}"
-        );
-    }
-}
-
 /// The other side of the same gate: a window that genuinely brings the
 /// *first-ever* entry from an origin this node has never witnessed anything
 /// from must read as advanced. This is the case a naive per-origin exclusion
@@ -5893,4 +5819,173 @@ async fn a_windows_first_ever_entry_from_a_new_origin_reads_as_advanced() {
     let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(outcome.applied, 1, "{outcome:?}");
     assert!(outcome.advanced, "a brand-new origin's first entry is progress: {outcome:?}");
+}
+
+/// A pull that applies only a schema change moved the position: a
+/// replicated DDL entry raises its own origin's witnessed marker the
+/// moment it applies (`Engine::append_replicated_ddl`), same as a document
+/// does, so `coverage_raised`'s answer must come from comparing this
+/// batch's own coverage against `mine`, not from whether raising the
+/// origin again at the end of the batch found anything left to do.
+#[tokio::test]
+async fn a_ddl_only_pull_reads_as_advanced() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "x" }).unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    a.engine.create_collection("shop", "second").unwrap();
+    let before = b.engine.witnessed_vector().unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let after = b.engine.witnessed_vector().unwrap();
+    assert_ne!(before, after, "the premise: the position moved");
+    assert_eq!((outcome.applied, outcome.ddl), (0, 1), "{outcome:?}");
+    assert!(outcome.advanced, "a DDL-only pull moved the position: {outcome:?}");
+}
+
+/// A pull whose only entry is superseded (LWW loss) still moved the
+/// position: nothing appends it, so this is the one case where the batch's
+/// final coverage merge is the *only* raise of that origin -- the shape the
+/// old, return-value-based `coverage_raised` happened to get right, and the
+/// one the broad rewrite must not get wrong on the way to fixing the rest.
+#[tokio::test]
+async fn a_superseded_only_pull_reads_as_advanced() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "seed" }).unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    a.engine.insert(&ca, doc! { "_id": "x", "v": 1 }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "x", "v": 2 }).unwrap();
+    let before = b.engine.witnessed_vector().unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let after = b.engine.witnessed_vector().unwrap();
+    assert_ne!(before, after, "the premise: the position moved");
+    assert_eq!((outcome.applied, outcome.superseded), (0, 1), "{outcome:?}");
+    assert!(outcome.coverage_raised, "{outcome:?}");
+    assert!(outcome.advanced, "{outcome:?}");
+}
+
+/// A fake peer that serves, unexhausted, one entry B already holds: a
+/// wedged contact whose every pull moves nothing. Used in place of a real,
+/// quickly-caught-up node for the two tests below: `sync_once` against a
+/// caught-up peer takes the early return in `sync_round` before it ever
+/// reaches the `advanced` gate (nothing to pull means nothing to judge), so
+/// a test built that way passes whether or not the gate itself is correct.
+/// A wedged peer is never caught up, so every pull genuinely reaches it.
+async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
+    use kimmy_cluster::protocol::prove;
+    let coll = b
+        .engine
+        .get_collection("shop", "orders")
+        .unwrap_or_else(|_| b.engine.create_collection("shop", "orders").unwrap());
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String("d0".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "d0" }).unwrap()),
+    };
+    b.engine.apply_remote(&coll, &entry).unwrap();
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = tls.acceptor();
+            let (theirs, entry) = (theirs.clone(), entry.clone());
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                    return;
+                };
+                let welcome = Message::Welcome {
+                    node: origin,
+                    nonce: vec![7; 32],
+                    proof: prove(SECRET, &nonce, &binding),
+                };
+                if write_frame(&mut stream, &welcome).await.is_err() {
+                    return;
+                }
+                let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
+                while let Ok(message) = read_frame(&mut stream).await {
+                    let answer = match message {
+                        Message::AskVersions { .. } => {
+                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
+                        }
+                        Message::AskEntries { .. } => Message::Entries {
+                            entries: vec![entry.clone()],
+                            scanned_to: entry.stamp.hlc,
+                            exhausted: false,
+                            passed_through: None,
+                        },
+                        _ => return,
+                    };
+                    if write_frame(&mut stream, &answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    fake
+}
+
+/// A wedged pull, with a local write landing inside its (slowed) apply,
+/// between `mine` and `after`: `advanced` must read this as no progress,
+/// since nothing here is from the peer.
+#[tokio::test]
+async fn a_wedged_pull_with_a_local_write_mid_apply_is_not_advanced() {
+    let b = node().await;
+    let fake = wedged_fake(&b).await;
+    let quiet = sync_once(&b.engine, fake, SECRET, None).await.unwrap();
+    assert!(quiet.truncated && !quiet.advanced, "premise: wedged: {quiet:?}");
+    let scratch = b.engine.create_collection("shop", "scratch").unwrap();
+    b.engine.slow_peer_applies(Duration::from_millis(400));
+    let writer = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&b.engine);
+        move || {
+            std::thread::sleep(Duration::from_millis(150));
+            engine.insert(&scratch, doc! { "_id": "local-mid-pull" }).unwrap();
+        }
+    });
+    let outcome = sync_once(&b.engine, fake, SECRET, None).await.unwrap();
+    writer.await.unwrap();
+    assert!(outcome.truncated, "{outcome:?}");
+    assert!(!outcome.advanced, "a local write mid-pull is not the pull's progress: {outcome:?}");
+}
+
+/// The same with another origin's entries (as a confirm push) landing
+/// mid-apply.
+#[tokio::test]
+async fn a_wedged_pull_with_a_foreign_push_mid_apply_is_not_advanced() {
+    let b = node().await;
+    let c = node().await;
+    let fake = wedged_fake(&b).await;
+    let cc = c.engine.create_collection("shop", "fromc").unwrap();
+    c.engine.insert(&cc, doc! { "_id": "from-c" }).unwrap();
+    let from_c = c
+        .engine
+        .entries_for_peer(Hlc::ZERO, usize::MAX, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .entries;
+    b.engine.slow_peer_applies(Duration::from_millis(400));
+    let pusher = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&b.engine);
+        move || {
+            std::thread::sleep(Duration::from_millis(150));
+            engine.apply_batch(&from_c).unwrap()
+        }
+    });
+    let outcome = sync_once(&b.engine, fake, SECRET, None).await.unwrap();
+    assert!(pusher.await.unwrap().applied > 0);
+    assert!(outcome.truncated, "{outcome:?}");
+    assert!(!outcome.advanced, "a push mid-pull is not the pull's progress: {outcome:?}");
 }

@@ -1219,7 +1219,7 @@ where
                 asked_partial,
             };
             let applied = kimmy_storage::blocking(|| {
-                engine.apply_peer_window_into(&theirs, &entries, window, &mut outcome)
+                engine.apply_peer_window_into(&theirs, &mine, &entries, window, &mut outcome)
             });
             #[cfg(test)]
             std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
@@ -1412,9 +1412,12 @@ where
     // `start_sent`'s successor), so an accepted partial window has already
     // been proven to have passed a point beyond where this request's own
     // scan started — there is no case where it is accepted and did not
-    // move. `outcome.coverage_raised` is computed inside the batch's own
-    // commit transaction (`Engine::apply_peer_window_into`), so it cannot
-    // be perturbed by anything outside that transaction either.
+    // move. `outcome.coverage_raised` is `Engine::apply_peer_window_into`'s
+    // own answer, from comparing the batch's own witnessed vector against
+    // `mine` as it stood at this round's start (the `mine` passed into
+    // that call, above, before the network exchange) rather than against a
+    // fresh read of the current one, so it cannot be perturbed by anything
+    // outside this pull either.
     outcome.advanced =
         advanced(outcome.coverage_raised, outcome.applied, outcome.partial, spans_resumed);
     let mine = after;
@@ -2461,9 +2464,10 @@ impl PeerStalls {
 /// is: a decision worth a truth table and a test of its own, not four
 /// conditions inlined at the one call site. `coverage_raised` must already
 /// exclude this node's own origin by the time it reaches here — that
-/// exclusion lives in `Engine::absorb_witnessed_in_txn`, computed inside the
-/// batch's own commit transaction, so nothing here can be perturbed by
-/// activity outside that transaction.
+/// exclusion is `kimmy_storage`'s: it compares the batch's own witnessed
+/// vector against `mine`, the vector this round sent as `held`, not against
+/// a fresh read of the current one, so nothing here can be perturbed by
+/// activity outside this pull.
 fn advanced(coverage_raised: bool, applied: usize, partial: bool, spans_resumed: bool) -> bool {
     applied > 0 || spans_resumed || partial || coverage_raised
 }
@@ -3016,11 +3020,12 @@ mod tests {
     }
 
     /// The truth table `advanced` decides. `coverage_raised` is a caller's
-    /// promise (`Engine::absorb_witnessed_in_txn` already excludes this
-    /// node's own origin before it reaches here), so this table's own job is
-    /// only the disjunction: any one signal is enough, all four false is the
-    /// only false, and nothing here should ever read this node's own
-    /// activity as this pull having moved anything.
+    /// promise (`kimmy_storage` already excludes this node's own origin,
+    /// comparing the batch's own witnessed vector against `mine`, before it
+    /// reaches here), so this table's own job is only the disjunction: any
+    /// one signal is enough, all four false is the only false, and nothing
+    /// here should ever read this node's own activity as this pull having
+    /// moved anything.
     #[test]
     fn a_pull_is_advanced_by_any_one_of_its_own_signals() {
         assert!(!advanced(false, 0, false, false), "nothing at all: not advanced");

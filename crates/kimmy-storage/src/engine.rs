@@ -2992,7 +2992,7 @@ impl Engine {
             return Ok(());
         }
         let txn = self.begin_write(WriterHolder::Replication)?;
-        Self::absorb_witnessed_in_txn(&txn, seen, self.node_id())?;
+        Self::absorb_witnessed_in_txn(&txn, seen)?;
         txn.commit()?;
         Ok(())
     }
@@ -3004,34 +3004,24 @@ impl Engine {
     /// commit rather than one plus one (ADR-119). Same rule as the wrapper:
     /// an origin only ever moves up.
     ///
-    /// Returns whether any origin *other than* `local` was raised to a stamp
-    /// *above* [`Hlc::ZERO`]: this batch's own coverage, computed from
-    /// `raise_version`'s per-origin answer in the same transaction the
-    /// coverage commits in, rather than from a before/after read of the
-    /// whole vector outside it. A caller that diffed the whole vector around
-    /// this call instead would also catch unrelated local activity landing
-    /// between the two reads on a busy node — a client write, a TTL expiry,
-    /// another origin's push — and call that this batch's own progress. See
-    /// `SyncOutcome::coverage_raised`.
-    ///
-    /// The zero exclusion matters: `raise_version` reports an origin it has
-    /// never stored a row for as raised regardless of the stamp, including
-    /// `Hlc::ZERO` — the value an empty, non-exhausted window's clamp merges
-    /// in for an origin this node has not reached (ADR-126/127's U1). That
-    /// row conveys nothing (the origin still reads as never-witnessed to
-    /// every reader of the vector), so it must not read as this batch having
-    /// made progress.
+    /// Purely a raise: whether any of it was *this batch's own* progress on
+    /// an origin other than this node's own is `SyncOutcome::coverage_raised`'s
+    /// question, answered separately by comparing this batch's own witnessed
+    /// vector against `mine` — not by anything this function returns. An
+    /// earlier version answered it here, from `raise_version`'s per-origin
+    /// return, which reported nothing whenever a document or a schema
+    /// change in the same batch had already durably raised the very origin
+    /// this call was about to check (each raises its own origin the moment
+    /// it is applied, ADR-054, ADR-140) — a false negative for exactly the
+    /// batches most likely to be this batch's own progress.
     pub(crate) fn absorb_witnessed_in_txn(
         txn: &redb::WriteTransaction,
         seen: &kimmy_core::VersionVector,
-        local: NodeId,
-    ) -> Result<bool> {
-        let mut raised_other = false;
+    ) -> Result<()> {
         for (node, hlc) in seen.iter() {
-            let raised = raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
-            raised_other |= raised && node != local && hlc > Hlc::ZERO;
+            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
         }
-        Ok(raised_other)
+        Ok(())
     }
 
     /// Record that a stamp has been processed, whatever came of it.
@@ -4741,39 +4731,45 @@ mod tests {
         );
     }
 
-    /// `absorb_witnessed_in_txn`'s own contract (ADR-157's gate depends on
-    /// it): raising only this node's own origin is not reported as coverage
-    /// raised, but a genuine other origin is. Deterministic, at the engine
-    /// level, rather than via a pull and a race — the local exclusion is a
-    /// plain per-origin check, and there is nothing to race against it.
+    /// `absorb_witnessed_in_txn`'s own contract, independent of ADR-157's
+    /// gate (`SyncOutcome::coverage_raised`, which compares the batch's own
+    /// `witnessed` against `mine`, not by anything this function returns
+    /// (an earlier version reported it here, from `raise_version`'s
+    /// per-origin return, which read nothing whenever a document or a
+    /// schema change in the same batch had already durably raised the very
+    /// origin this call was about to check — a false negative for exactly
+    /// the batches most likely to be genuine progress). What this function
+    /// still owns: raising every origin `seen` names, this node's own
+    /// included, never lowering one.
     #[test]
-    fn absorb_witnessed_in_txn_excludes_the_local_origin_from_coverage_raised() {
+    fn absorb_witnessed_in_txn_raises_every_origin_seen_and_never_lowers_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let engine = Engine::open(&path).unwrap();
         let local = engine.node_id();
         let other = kimmy_core::NodeId::generate();
 
-        // A window whose only effect is on this node's own origin -- what a
-        // local write, seeded here directly rather than through a pull,
-        // would raise if it were (wrongly) folded into this check.
-        let mut mine_only = kimmy_core::VersionVector::new();
-        mine_only.insert(local, Hlc::new(1_000, 0));
+        let mut seen = kimmy_core::VersionVector::new();
+        seen.insert(local, Hlc::new(2_000, 0));
+        seen.insert(other, Hlc::new(1_000, 0));
         let txn = engine.begin_write(WriterHolder::Replication).unwrap();
-        let raised = Engine::absorb_witnessed_in_txn(&txn, &mine_only, local).unwrap();
+        Engine::absorb_witnessed_in_txn(&txn, &seen).unwrap();
         txn.commit().unwrap();
-        assert!(!raised, "raising only this node's own origin is not this batch's progress");
+        let witnessed = engine.witnessed_vector().unwrap();
+        assert_eq!(witnessed.get(local), Hlc::new(2_000, 0), "this node's own origin too");
+        assert_eq!(witnessed.get(other), Hlc::new(1_000, 0));
 
-        // A genuine other origin, for contrast against the same call: this
-        // one must report it, or the exclusion would be silencing everything
-        // rather than just the local origin.
-        let mut other_too = kimmy_core::VersionVector::new();
-        other_too.insert(local, Hlc::new(2_000, 0));
-        other_too.insert(other, Hlc::new(1_000, 0));
+        // A lower stamp for an origin already raised must not move it back.
+        let mut lower = kimmy_core::VersionVector::new();
+        lower.insert(other, Hlc::new(500, 0));
         let txn = engine.begin_write(WriterHolder::Replication).unwrap();
-        let raised = Engine::absorb_witnessed_in_txn(&txn, &other_too, local).unwrap();
+        Engine::absorb_witnessed_in_txn(&txn, &lower).unwrap();
         txn.commit().unwrap();
-        assert!(raised, "a genuine other origin must still read as raised");
+        assert_eq!(
+            engine.witnessed_vector().unwrap().get(other),
+            Hlc::new(1_000, 0),
+            "never lowers an origin already raised"
+        );
     }
 
     /// A file backend that counts the bytes redb asks it for.
