@@ -5242,6 +5242,22 @@ async fn while_one_member_keeps_writing_the_count_half_against_it_stays_quiet() 
 const SLOW: Duration = Duration::from_millis(400);
 const FLOOR: Duration = Duration::from_millis(350);
 
+/// [`SLOW`] and [`FLOOR`], widened for the three phase tests below
+/// (`a_pull_that_waits_for_the_writer_says_so_apart_from_applying`,
+/// `a_pull_whose_commit_is_slow_says_so_in_apply`,
+/// `a_pull_from_a_slow_peer_says_so_in_serve`). Those three assert that an
+/// *unrelated* phase reads under `FLOOR` — in particular `apply`, whose
+/// commits fsync (the puller here is `Durable`, the default, per
+/// ADR-088) — and `SLOW`/`FLOOR`'s 50 ms margin left no room for an
+/// occasional slow fsync on a loaded, shared disk (a CI runner) to cross
+/// it: one CI run measured `apply` at 371.80 ms against `FLOOR = 350 ms`,
+/// on a batch whose apply commits twice (the collection's own DDL commit,
+/// then the fifty inserts'). 1 s of margin between an injected delay and
+/// the floor an unrelated phase must stay under comfortably absorbs that,
+/// at the cost of a few more seconds of wall time per phase test.
+const PHASE_SLOW: Duration = Duration::from_millis(1_500);
+const PHASE_FLOOR: Duration = Duration::from_secs(1);
+
 /// A plain TCP relay to `target` that holds every chunk the far side sends
 /// back for `delay` before passing it on. The TLS inside is untouched: it is
 /// a slow wire, not a party to the conversation.
@@ -5300,51 +5316,51 @@ async fn pull_timed(
 async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
     let (a, b) = a_source_holding(50).await;
 
-    // Something else holds the puller's writer for twice `SLOW` from before
-    // the pull starts, so whatever the handshake costs, the batch still
-    // queues for well past the floor.
+    // Something else holds the puller's writer for twice `PHASE_SLOW` from
+    // before the pull starts, so whatever the handshake costs, the batch
+    // still queues for well past the floor.
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let engine = Arc::clone(&b.engine);
     let holder = std::thread::spawn(move || {
         let _hold = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
         held_tx.send(()).unwrap();
-        std::thread::sleep(2 * SLOW);
+        std::thread::sleep(2 * PHASE_SLOW);
     });
     held_rx.recv().unwrap();
 
     let (_, pull) = pull_timed(&b.engine, a.addr).await;
     holder.join().unwrap();
 
-    assert!(pull.wait >= FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
-    assert!(pull.apply < FLOOR, "and is not also counted as applying: {pull:?}");
-    assert!(pull.serve < FLOOR, "nor as serving: {pull:?}");
+    assert!(pull.wait >= PHASE_FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
+    assert!(pull.apply < PHASE_FLOOR, "and is not also counted as applying: {pull:?}");
+    assert!(pull.serve < PHASE_FLOOR, "nor as serving: {pull:?}");
     assert_eq!(pull.entries, 51, "the creation and the fifty documents: {pull:?}");
 }
 
 #[tokio::test]
 async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
     let (a, b) = a_source_holding(50).await;
-    // Every commit on the puller waits `SLOW` for the shared flush: work
-    // the batch does after taking the writer, not a wait for it.
-    b.engine.set_durability(kimmy_storage::DurabilityClass::Coalesced, SLOW);
+    // Every commit on the puller waits `PHASE_SLOW` for the shared flush:
+    // work the batch does after taking the writer, not a wait for it.
+    b.engine.set_durability(kimmy_storage::DurabilityClass::Coalesced, PHASE_SLOW);
 
     let (_, pull) = pull_timed(&b.engine, a.addr).await;
 
-    assert!(pull.apply >= FLOOR, "a slow commit is the apply phase: {pull:?}");
-    assert!(pull.wait < FLOOR, "not a wait for the writer: {pull:?}");
-    assert!(pull.serve < FLOOR, "nor serving: {pull:?}");
+    assert!(pull.apply >= PHASE_FLOOR, "a slow commit is the apply phase: {pull:?}");
+    assert!(pull.wait < PHASE_FLOOR, "not a wait for the writer: {pull:?}");
+    assert!(pull.serve < PHASE_FLOOR, "nor serving: {pull:?}");
 }
 
 #[tokio::test]
 async fn a_pull_from_a_slow_peer_says_so_in_serve() {
     let (a, b) = a_source_holding(50).await;
-    let slow = slow_relay(a.addr, SLOW).await;
+    let slow = slow_relay(a.addr, PHASE_SLOW).await;
 
     let (_, pull) = pull_timed(&b.engine, slow).await;
 
-    assert!(pull.serve >= FLOOR, "a slow answer is the serve phase: {pull:?}");
-    assert!(pull.wait < FLOOR, "{pull:?}");
-    assert!(pull.apply < FLOOR, "{pull:?}");
+    assert!(pull.serve >= PHASE_FLOOR, "a slow answer is the serve phase: {pull:?}");
+    assert!(pull.wait < PHASE_FLOOR, "{pull:?}");
+    assert!(pull.apply < PHASE_FLOOR, "{pull:?}");
 }
 
 #[tokio::test]

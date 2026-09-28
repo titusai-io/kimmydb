@@ -1204,7 +1204,6 @@ where
                 .iter()
                 .find(|entry| entry.stamp.hlc > mine.get(entry.stamp.node))
                 .map(|entry| kimmy_storage::EntryWait::at(entry.stamp.hlc.wall_ms, now_ms));
-            let applying = std::time::Instant::now();
             let mut outcome = SyncOutcome::default();
             // Off the async worker. An apply takes as long as the work its
             // entries carry — an index build files every document of its
@@ -1218,12 +1217,34 @@ where
                 passed_through: partial_end,
                 asked_partial,
             };
-            let applied = kimmy_storage::blocking(|| {
-                engine.apply_peer_window_into(&theirs, Some(&mine), &entries, window, &mut outcome)
+            #[cfg(test)]
+            std::thread::sleep(test_hooks::BEFORE_APPLY_TAKES.with(|t| t.get()));
+            // Timed from inside the closure, not around `blocking()`: on a
+            // multi-thread runtime `blocking` is `block_in_place`, which can
+            // itself take a moment to hand this worker's queued tasks to
+            // another before the closure runs (longer still if every other
+            // worker is already blocked and the runtime must start one) —
+            // real time, but neither this batch's own work nor a wait for
+            // the writer, so it belongs in neither `apply` nor `wait`
+            // rather than being misread as either.
+            let (applied, apply_time) = kimmy_storage::blocking(|| {
+                let started = std::time::Instant::now();
+                let applied = engine.apply_peer_window_into(
+                    &theirs,
+                    Some(&mine),
+                    &entries,
+                    window,
+                    &mut outcome,
+                );
+                (applied, started.elapsed())
             });
             #[cfg(test)]
-            std::thread::sleep(test_hooks::APPLY_TAKES.with(|t| t.get()));
-            clock.applied_for(applying.elapsed());
+            let apply_time = {
+                let extra = test_hooks::APPLY_TAKES.with(|t| t.get());
+                std::thread::sleep(extra);
+                apply_time + extra
+            };
+            clock.applied_for(apply_time);
             // Recorded whether or not the batch then errored: the outcome
             // holds only what a commit made final, and what none did is
             // served again and counted then (ADR-177).
@@ -1243,7 +1264,7 @@ where
             let pull = kimmy_storage::PullTiming {
                 serve: served,
                 wait: outcome.writer_wait,
-                apply: applying.elapsed().saturating_sub(outcome.writer_wait),
+                apply: apply_time.saturating_sub(outcome.writer_wait),
                 entries: entries.len(),
                 oldest_lacked,
             };
@@ -2868,6 +2889,15 @@ pub(crate) mod test_hooks {
     thread_local! {
         /// Slept after a round's window is applied, inside the apply's time.
         pub static APPLY_TAKES: std::cell::Cell<std::time::Duration> =
+            const { std::cell::Cell::new(std::time::Duration::ZERO) };
+        /// Slept just before `kimmy_storage::blocking`'s closure is called —
+        /// standing in for whatever real delay can land between deciding to
+        /// apply and the closure's own first instruction actually running
+        /// (`block_in_place` provisioning a worker on a saturated runtime,
+        /// among others): real time, but neither this batch's own work nor a
+        /// wait for the writer, so it must show up in neither `apply` nor
+        /// `wait`.
+        pub static BEFORE_APPLY_TAKES: std::cell::Cell<std::time::Duration> =
             const { std::cell::Cell::new(std::time::Duration::ZERO) };
     }
 }
@@ -5492,6 +5522,60 @@ mod tests {
         assert_eq!(outcome.applied, 1, "{outcome:?}");
         assert_eq!(stalls.take_applied().ddl_refused, 1, "the refused definition is counted");
         assert_eq!(engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(), 1);
+    }
+
+    /// Whatever real delay lands between deciding to apply and the closure
+    /// that does it actually starting -- `block_in_place` provisioning a
+    /// worker on a saturated multi-thread runtime, among others -- is
+    /// neither this batch's own work nor a wait for the writer, and must
+    /// not be misread as either. `BEFORE_APPLY_TAKES` stands in for it
+    /// directly, since nothing in this process can reliably force a real
+    /// scheduling delay of a chosen size.
+    #[tokio::test]
+    async fn apply_excludes_a_delay_before_its_own_closure_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let insert = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+            kind: kimmy_core::OpKind::Insert,
+            collection: orders.id,
+            doc_id: Some(kimmy_core::DocId::Int64(1)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+        };
+        let mut theirs = VersionVector::new();
+        theirs.insert(origin, Hlc::new(4_000, 0));
+
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(a_prompt_peer(peer_end, theirs, vec![insert], true));
+        let mut stalls = PeerStalls::new();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let delay = Duration::from_millis(400);
+        let floor = Duration::from_millis(350);
+        test_hooks::BEFORE_APPLY_TAKES.with(|t| t.set(delay));
+
+        let started = Instant::now();
+        let round = sync_over_within(
+            &engine,
+            ours,
+            addr,
+            node(9),
+            None,
+            &mut stalls,
+            Duration::from_secs(5),
+        )
+        .await;
+        let took = started.elapsed();
+
+        test_hooks::BEFORE_APPLY_TAKES.with(|t| t.set(Duration::ZERO));
+        peer.await.unwrap();
+
+        round.expect("the peer answered at once");
+        let pull = stalls.take_pull().expect("a window was pulled");
+        assert!(took >= delay, "the injected delay must have actually happened: {took:?}");
+        assert!(pull.apply < floor, "not this batch's own work: {pull:?}");
+        assert!(pull.wait < floor, "not a wait for the writer either: {pull:?}");
     }
 
     /// ADR-177: what an apply refused is counted when it commits, not only

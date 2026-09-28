@@ -2018,6 +2018,24 @@ mod tests {
         // source, not the (now-deleted) pushed field: every reader of this
         // fixture must see the branch a replicating node actually takes.
         m.compute_replication_lag_with(std::sync::Arc::new(|| 19_250));
+        // Every embed_* series a distinct value, and a `last_progress` of
+        // its own (87 s ago) so "embedding_worker"'s row is not the
+        // since-start fallback every other writer with no counters
+        // installed reads.
+        m.set_vector_counters(std::sync::Arc::new(kimmy_vector::WorkerCounters::for_test(
+            Some(now - Duration::from_secs(87)),
+            301,
+            302,
+            303,
+            304,
+            305,
+            306,
+            [311, 312, 313, 314],
+        )));
+        // Likewise "drop_purger"'s row (89 s ago).
+        m.set_purge_counters(std::sync::Arc::new(kimmy_storage::PurgeCounters::for_test(Some(
+            now - Duration::from_secs(89),
+        ))));
         // Two ticks: the counters accumulate, the backoff level, the
         // divergence count and the check's instant are each replaced. A
         // render that printed the first tick's level, or a level that
@@ -2607,8 +2625,8 @@ kimmy_task_retries_total{task=\"vector_index_invalidator\"} 0
 kimmy_task_retries_total{task=\"webhook_dispatcher\"} 0
 # HELP kimmy_task_progress_age_seconds Seconds since a background writer last completed its work, computed when this page is read: a completed replication round, a stall-probe wake, a dispatcher pass, an embedding flush or idle turn. Since the process started before the first, never 0. Alert on this, and read the gauges a writer sets only while its age is fresh: a dead, stuck or retrying writer leaves them at their last value. A writer this node does not run has no row.
 # TYPE kimmy_task_progress_age_seconds gauge
-kimmy_task_progress_age_seconds{task=\"drop_purger\"} 99
-kimmy_task_progress_age_seconds{task=\"embedding_worker\"} 99
+kimmy_task_progress_age_seconds{task=\"drop_purger\"} 89
+kimmy_task_progress_age_seconds{task=\"embedding_worker\"} 87
 kimmy_task_progress_age_seconds{task=\"replication\"} 81
 kimmy_task_progress_age_seconds{task=\"stall_probe\"} 83
 kimmy_task_progress_age_seconds{task=\"webhook_dispatcher\"} 85
@@ -2776,28 +2794,28 @@ kimmy_jwks_refresh_total{outcome=\"ok\"} 22
 kimmy_jwks_refresh_total{outcome=\"failed\"} 1
 # HELP kimmy_embed_documents_total Documents whose vectors this node wrote.
 # TYPE kimmy_embed_documents_total counter
-kimmy_embed_documents_total 0
+kimmy_embed_documents_total 301
 # HELP kimmy_embed_chunks_total Provider inputs embedded - the closest proxy for provider spend.
 # TYPE kimmy_embed_chunks_total counter
-kimmy_embed_chunks_total 0
+kimmy_embed_chunks_total 302
 # HELP kimmy_embed_deferred_total Foreign-written documents held for a later re-check.
 # TYPE kimmy_embed_deferred_total counter
-kimmy_embed_deferred_total 0
+kimmy_embed_deferred_total 303
 # HELP kimmy_embed_skipped_not_owned_total Documents dropped un-embedded because another node owns embedding - the duplicate provider calls this counts replacing is the 3x amplification measured in the August 2026 load test.
 # TYPE kimmy_embed_skipped_not_owned_total counter
-kimmy_embed_skipped_not_owned_total 0
+kimmy_embed_skipped_not_owned_total 304
 # HELP kimmy_embed_skipped_no_shadow_total Documents and scans skipped because a collection is configured for vectors and its shadow collection is not on this node. Should read 0; rising means a configuration without the collection its vectors are stored in.
 # TYPE kimmy_embed_skipped_no_shadow_total counter
-kimmy_embed_skipped_no_shadow_total 0
+kimmy_embed_skipped_no_shadow_total 305
 # HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.
 # TYPE kimmy_embed_failures_total counter
-kimmy_embed_failures_total 0
+kimmy_embed_failures_total 306
 # HELP kimmy_embed_provider_errors_total Provider calls that failed before a response, by what failed: connect (DNS, TCP, TLS), timeout, reset (the far side closed an open connection), other.
 # TYPE kimmy_embed_provider_errors_total counter
-kimmy_embed_provider_errors_total{kind=\"connect\"} 0
-kimmy_embed_provider_errors_total{kind=\"timeout\"} 0
-kimmy_embed_provider_errors_total{kind=\"reset\"} 0
-kimmy_embed_provider_errors_total{kind=\"other\"} 0
+kimmy_embed_provider_errors_total{kind=\"connect\"} 311
+kimmy_embed_provider_errors_total{kind=\"timeout\"} 312
+kimmy_embed_provider_errors_total{kind=\"reset\"} 313
+kimmy_embed_provider_errors_total{kind=\"other\"} 314
 # HELP kimmy_embed_provider_requests_total Embedding provider calls answered, documents and search queries alike - compare with the provider's own request count.
 # TYPE kimmy_embed_provider_requests_total counter
 kimmy_embed_provider_requests_total 0
@@ -3251,6 +3269,24 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.sync_serve.walk_sum_us as f64 / 1e6
         ));
         expect(&format!("kimmy_sync_serve_walk_seconds_count {}\n", s.sync_serve.windows));
+
+        expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
+        expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
+        expect(&format!("kimmy_embed_deferred_total {}\n", s.embed_deferred));
+        expect(&format!("kimmy_embed_skipped_not_owned_total {}\n", s.embed_skipped_not_owned));
+        expect(&format!("kimmy_embed_skipped_no_shadow_total {}\n", s.embed_skipped_no_shadow));
+        expect(&format!("kimmy_embed_failures_total {}\n", s.embed_failures));
+        for (kind, failures) in kimmy_vector::TransportKind::ALL.iter().zip(s.embed_transport) {
+            expect(&format!(
+                "kimmy_embed_provider_errors_total{{kind=\"{}\"}} {failures}\n",
+                kind.as_str()
+            ));
+        }
+        // Process-global (`kimmy_vector::provider_totals`), not from
+        // `vector_counters`: both surfaces already read it directly, so
+        // this only needs to agree with itself, not with a fixed value.
+        expect(&format!("kimmy_embed_provider_requests_total {}\n", s.embed_provider_requests));
+        expect(&format!("kimmy_embed_provider_tokens_total {}\n", s.embed_provider_tokens));
 
         // Not a rendered series of its own — the histogram prints it in seconds
         // — but the bridge reports microseconds, so the conversion is the thing
