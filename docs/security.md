@@ -1487,11 +1487,14 @@ rustls" quietly stops being true. Crates come from crates.io only. Where an
 advisory is ignored, the reason is written beside it in the file; read it
 there rather than here, so that the file and the reasoning cannot drift.
 
-The policy covers the **default feature set**, the build that ships.
-`local-embeddings` knowingly pulls ONNX Runtime, and is outside the ban for
-the same reason it is outside `scripts/check-native-deps.sh`; it does not
-pull OpenSSL — `fastembed` is built with `default-features = false` and its
-rustls variants instead of its own defaults.
+The policy covers **every feature**, `local-embeddings` (ADR-021) included:
+it knowingly pulls ONNX Runtime, native code the ban does not reach, but
+nothing else — `fastembed` is built with `default-features = false` and its
+rustls variants instead of its own defaults, so the ban enforces that the
+feature stays off OpenSSL rather than a comment merely asserting it.
+`scripts/check-native-deps.sh` stays scoped to the default feature set, the
+build that ships: ONNX Runtime is native by design, so a native-code diff
+there would be noise, not a finding.
 
 **The licensing line is checked, not assumed.** The allowlist cannot say
 that the Apache-2.0 client must not *depend* on an AGPL crate;
