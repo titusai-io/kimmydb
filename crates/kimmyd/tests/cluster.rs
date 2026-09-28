@@ -3245,8 +3245,7 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
         .unwrap();
     assert!(created.status().is_success());
     for batch in 0..TOTAL / 50 {
-        let docs: Vec<_> =
-            (0..50).map(|i| serde_json::json!({ "_id": batch * 50 + i })).collect();
+        let docs: Vec<_> = (0..50).map(|i| serde_json::json!({ "_id": batch * 50 + i })).collect();
         let bulk = client
             .post(a.url("/v1/db/shop/coll/orders/bulk"))
             .bearer_auth(&token)
@@ -3318,7 +3317,11 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
         assert!(
             std::time::Instant::now() < deadline,
             "the drain never finished; B's log:\n{}",
-            b.log().lines().filter(|l| l.contains("merged from peer")).collect::<Vec<_>>().join("\n")
+            b.log()
+                .lines()
+                .filter(|l| l.contains("merged from peer"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

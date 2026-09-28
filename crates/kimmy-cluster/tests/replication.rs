@@ -6234,7 +6234,10 @@ async fn a_wedged_contact_ending_budget_is_never_reset_or_carried_forward() {
     assert!(budget_ends > 0, "premise: the wedged peer must actually end on Budget");
     let ceiling_ends: u64 =
         seen.iter().map(|(_, r)| r.pulls.contacts[kimmy_cluster::ContactEnd::Ceiling.slot()]).sum();
-    assert_eq!(ceiling_ends, 0, "premise: the delay must keep every tick well short of the ceiling");
+    assert_eq!(
+        ceiling_ends, 0,
+        "premise: the delay must keep every tick well short of the ceiling"
+    );
 
     // A reset ticks back-to-back, at roughly one pull's own cost; an
     // ordinary tick waits out the rest of the interval. Comfortably above
@@ -6289,7 +6292,8 @@ async fn a_reset_tick_never_reaches_past_carried_peers_for_a_fresh_one_beyond_fa
     }
 
     let contacted_this_tick: Arc<std::sync::Mutex<Vec<kimmy_core::NodeId>>> = Arc::default();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(RoundReport, Vec<kimmy_core::NodeId>)>();
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<(RoundReport, Vec<kimmy_core::NodeId>)>();
     let mut config = ReplicationConfig::new(
         vec![SeedSource::Static(peers.iter().map(|p| p.addr).collect())],
         SECRET.into(),
@@ -6373,7 +6377,9 @@ async fn a_reset_tick_never_reaches_past_carried_peers_for_a_fresh_one_beyond_fa
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_carried_peer_dropped_from_membership_is_not_dialled_by_the_reset_tick() {
     use kimmy_cluster::protocol::MAX_BATCH;
-    use kimmy_cluster::{LagVectors, Members, ReplicationConfig, RoundReport, SeedSource, replicate};
+    use kimmy_cluster::{
+        LagVectors, Members, ReplicationConfig, RoundReport, SeedSource, replicate,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let d = node().await;
