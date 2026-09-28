@@ -83,9 +83,14 @@ STOP_TIME_EPSILON_S = 0.25
 # so checking against a fixed list of "known bad" codes such as 137 misses
 # every such death; only a positive check for the one good outcome catches
 # all of them.
-# The reset-chain marker peers.rs logs at DEBUG (ADR-195), and the module
-# path RUST_LOG must enable for it to appear.
-RESET_LOG_MARKER = "sync tick resumed at once"
+# The reset-tick marker peers.rs logs at DEBUG (ADR-195), and the module
+# path RUST_LOG must enable for it to appear. Logged at the *start* of a
+# reset tick, so seeing it in the last few lines before the signal means
+# that tick had just begun -- it may still be running its pulls, or may
+# already have finished and moved on to whatever came after it; either
+# way, a reset was underway close enough to the signal to be relevant to
+# the stop this trial is timing.
+RESET_LOG_MARKER = "reset tick starting"
 RESET_LOG_TARGET = "kimmy_cluster::peers=debug"
 
 
@@ -239,8 +244,13 @@ def background_writers(node, token, stop_event):
         time.sleep(0.05)
 
 
-def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches, trial_label):
-    """target: 'requester' (signals b) or 'server' (signals a)."""
+def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_batches, trial_label):
+    """target: 'requester' (signals b) or 'server' (signals a). `index` is
+    this trial's position within its (target, build) group -- with a
+    shared seed, the same (target, index) pair draws the same offset on
+    both builds, which is what lets a caller pair them up afterwards
+    rather than comparing group averages that a few unlucky offsets could
+    skew either way."""
     http_ports = [choose_port() for _ in range(3)]
     cluster_ports = [choose_port() for _ in range(3)]
     names = ["a", "b", "c"]
@@ -250,6 +260,7 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
     result = {
         "trial": trial_label,
         "target": target,
+        "index": index,
         "offset_s": round(offset_s, 3),
     }
     try:
@@ -296,10 +307,11 @@ def run_trial(binary, target, offset_s, walk_row_ms, serve_walk_ms, seed_batches
 
         time.sleep(offset_s)
 
-        # A reset chain (ADR-195) logged in progress right at the signal:
-        # the last few lines before it include the DEBUG marker a resumed
-        # tick logs, meaning the signal landed mid-chain rather than
-        # between chains or on an ordinary tick.
+        # A reset tick (ADR-195) started close enough to the signal to be
+        # relevant: the last few lines before it include the DEBUG marker
+        # a reset tick logs at its own start, meaning the signal landed
+        # near an active reset chain rather than between chains or on an
+        # ordinary tick.
         pre_signal_log = target_node.log()
         recent = pre_signal_log.splitlines()[-5:]
         result["reset_in_progress_at_signal"] = any(RESET_LOG_MARKER in l for l in recent)
@@ -379,7 +391,7 @@ def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, 
             n += 1
             label_i = f"{label}/{target}/{i}"
             print(f"  [{label_i}] offset={offset:.2f}s ...", file=sys.stderr, flush=True)
-            r = run_trial(binary, target, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i)
+            r = run_trial(binary, target, i, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i)
             results.append(r)
             print(
                 f"    exit={r['exit_code']} stop_time={r['stop_time_s']}s "
@@ -426,6 +438,36 @@ def summarize(label, results):
     return worst, bad_exits, aborted, dirty_restarts
 
 
+def pair_and_compare(baseline_results, head_results):
+    """With a shared seed, trial i of a (target, build) group draws the
+    same offset on both builds, so pairing by (target, index) compares
+    like against like -- a fixed set of harder or easier offsets in one
+    build's run and not the other's cannot inflate or hide a group
+    average's gap the way it could between two independently-averaged
+    groups. Prints the worst and mean per-pair delta (head minus
+    baseline) and returns the worst."""
+    by_key = {(r["target"], r["index"]): r for r in baseline_results}
+    deltas = []
+    for head in head_results:
+        key = (head["target"], head["index"])
+        base = by_key.get(key)
+        if base is None:
+            continue
+        deltas.append((key, head["stop_time_s"] - base["stop_time_s"], base["stop_time_s"], head["stop_time_s"]))
+    if not deltas:
+        print("\n== paired comparison: no matching (target, index) pairs found ==")
+        return 0.0
+    deltas.sort(key=lambda d: d[1], reverse=True)
+    worst_key, worst_delta, worst_base, worst_head = deltas[0]
+    mean_delta = sum(d[1] for d in deltas) / len(deltas)
+    print(
+        f"\n== paired comparison ({len(deltas)} pairs, same offset each): "
+        f"worst delta {worst_delta:+.3f}s at {worst_key} (baseline {worst_base:.3f}s, "
+        f"head {worst_head:.3f}s), mean delta {mean_delta:+.3f}s =="
+    )
+    return worst_delta
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--baseline-bin", required=True, help="release kimmyd built from v0.41.0")
@@ -461,13 +503,19 @@ def main():
 
     baseline_worst = worsts.get("v0.41.0", 0.0)
     head_worst = worsts.get("this change", 0.0)
-    regression = head_worst > baseline_worst + STOP_TIME_EPSILON_S
     print(
         f"\n== worst stop time: baseline {baseline_worst:.3f}s, head {head_worst:.3f}s "
         f"(epsilon {STOP_TIME_EPSILON_S}s) =="
     )
-    if regression:
-        print("FAIL: head's worst stop time regressed past the baseline plus epsilon")
+
+    # The regression check itself is on the paired deltas, not the group
+    # worsts above: a handful of harder offsets landing in one build's run
+    # and not the other's can move a group's worst or its average without
+    # either build actually being slower to stop, and a shared seed makes
+    # comparing like-for-like free.
+    worst_pair_delta = pair_and_compare(all_results.get("v0.41.0", []), all_results.get("this change", []))
+    if worst_pair_delta > STOP_TIME_EPSILON_S:
+        print(f"FAIL: the worst same-offset pair regressed by {worst_pair_delta:.3f}s, past epsilon")
         failed = True
 
     if args.json_out:

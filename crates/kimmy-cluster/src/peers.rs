@@ -647,23 +647,27 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // previous one, and carried onto `RoundReport::reset` for the tick it
     // names.
     let mut tick_is_a_reset = false;
-    // When `stalls.tick_opened()` last ran (ADR-195): what `REPAIR_COOLDOWN_ROUNDS`
-    // (ADR-148) and the not-moved-sighting throttle behind `FROZEN_CONTACTS`
-    // (ADR-145) both count against, in place of "every tick that is not a
-    // reset". Both constants are wall-clock by their own reasoning — sixty
-    // rounds is five minutes at the default interval, three sightings is
-    // fifteen seconds at it — and a reset chain can run far longer than one
-    // tick: ADR-157's own measured case was some seventy minutes of a
-    // single peer draining. Gating the open on "not a reset tick" would
-    // have opened every one of those minutes' worth of reset ticks as a
-    // fresh contact for every OTHER peer's rotation slot they carried along
-    // with them, freezing both counters' advance for the whole chain rather
-    // than letting them advance at the wall-clock rate their constants
-    // assume. Gating on elapsed time instead needs no reset/ordinary
-    // distinction at all: an ordinary tick already fires about
-    // `sync_interval` after the last one, so it opens under exactly the
-    // same rule a reset tick does — one opened tick per interval, in every
-    // mode.
+    // When `stalls.tick_opened()` last ran (ADR-195): what a *reset* tick's
+    // own open is gated on. An ordinary tick always opens, exactly as every
+    // tick did before this change — its own cadence is the ticker's, not
+    // this variable's, and gating it on an elapsed-time comparison too would
+    // read as jitter: `tick_started` is taken a few milliseconds after the
+    // ticker actually fired, so an ordinary tick's own gap from the last
+    // open lands under `sync_interval` as often as over it, and a strict
+    // `>=` would silently drop close to half of ordinary opens with no
+    // drain and no reset anywhere in sight. A reset tick opens only once
+    // `sync_interval` has actually passed since the last open, because a
+    // reset chain can run far longer than one tick — ADR-157's own measured
+    // case was some seventy minutes of a single peer draining — and opening
+    // every one of those minutes' worth of reset ticks as a fresh contact
+    // for every OTHER peer's rotation slot they carried along with them
+    // would freeze `REPAIR_COOLDOWN_ROUNDS` (ADR-148) and the not-moved-
+    // sighting throttle behind `FROZEN_CONTACTS` (ADR-145) for the whole
+    // chain, not just slow their advance the way `>=` jitter does — both
+    // are wall-clock by their own reasoning (sixty rounds is five minutes
+    // at the default interval, three sightings is fifteen seconds at it),
+    // and neither should be able to reach its threshold in far less
+    // wall-clock time than that, whichever direction the timing tips.
     let mut last_opened: Option<Instant> = None;
 
     loop {
@@ -688,6 +692,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // firing from the ticker's own interval. Consumed here, once,
                 // however this tick itself ends.
                 let this_tick_is_a_reset = std::mem::take(&mut tick_is_a_reset);
+                if this_tick_is_a_reset {
+                    debug!(
+                        "reset tick starting, continuing a draining contact rather than \
+                         waiting out the rest of the interval"
+                    );
+                }
                 // When this tick began, so the tick that overran the
                 // interval is named once it ends (ADR-154). The loop cannot
                 // say anything *while* a tick is stuck — the stuck tick is
@@ -780,11 +790,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 let deadline = tick_started + config.sync_interval;
                 // What the repair cooldown (ADR-148) and the not-moved
                 // sighting throttle behind `FROZEN_CONTACTS` (ADR-145) both
-                // count against: not every tick, but about once an interval,
-                // whatever mix of ordinary and reset ticks that interval
-                // held (ADR-195, and `last_opened`'s own comment above).
-                if last_opened
-                    .is_none_or(|last| tick_started.saturating_duration_since(last) >= config.sync_interval)
+                // count against: every ordinary tick, exactly as before this
+                // change, plus a reset tick only once an interval has
+                // actually passed since the last open (ADR-195). An
+                // ordinary tick's own gap from the last open is not reliably
+                // `>= sync_interval` by a strict comparison -- `tick_started`
+                // is read a few milliseconds after the ticker actually fired,
+                // so an ordinary cadence lands a hair under the interval as
+                // often as over it, and gating every tick on that comparison
+                // would silently drop close to half of ordinary opens to
+                // timer jitter, with no drain and no reset in sight.
+                if !this_tick_is_a_reset
+                    || last_opened
+                        .is_none_or(|last| tick_started.saturating_duration_since(last) >= config.sync_interval)
                 {
                     stalls.tick_opened();
                     last_opened = Some(tick_started);
@@ -1128,13 +1146,6 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     tick_is_a_reset = true;
                 }
                 report.reset = this_tick_is_a_reset;
-                if this_tick_is_a_reset {
-                    debug!(
-                        carried = carried.len(),
-                        "sync tick resumed at once, continuing a draining contact rather than \
-                         waiting out the rest of the interval"
-                    );
-                }
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms);
                 }

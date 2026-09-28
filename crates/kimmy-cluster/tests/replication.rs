@@ -6719,3 +6719,53 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
          {interval:?} interval -- it was reset and carried forward despite ending at the ceiling"
     );
 }
+
+/// ADR-195: an ordinary tick -- no backlog, no reset in sight -- always
+/// opens, exactly as every tick did before this change. `tick_started` is
+/// read a few milliseconds after the ticker actually fires, so an ordinary
+/// tick's own gap from the last open lands under `sync_interval` as often
+/// as over it; gating every tick on `>= sync_interval` (rather than only a
+/// reset tick) would silently drop close to half of ordinary opens to that
+/// jitter, slowing `REPAIR_COOLDOWN_ROUNDS` and the not-moved-sighting
+/// throttle behind `FROZEN_CONTACTS` even on a fully caught-up cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_tick_against_a_caught_up_peer_always_opens() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let d = node().await;
+    let a = node().await;
+    // No backlog at all: every contact ends `CaughtUp` at once, so
+    // `resume_next_tick` is always empty and no tick here is ever a reset
+    // -- this is purely the ordinary-tick side of the gate.
+    let interval = Duration::from_millis(200);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), d.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = interval;
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
+
+    const TICKS: usize = 40;
+    let mut seen = Vec::with_capacity(TICKS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while seen.len() < TICKS {
+        let Ok(Some(report)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            looping.abort();
+            panic!("the loop stalled; {} ticks so far", seen.len());
+        };
+        assert!(!report.reset, "premise: no backlog exists to reset over: {report:?}");
+        seen.push(report.opened);
+    }
+    looping.abort();
+
+    let opened = seen.iter().filter(|&&o| o).count();
+    assert_eq!(
+        opened, TICKS,
+        "{opened} of {TICKS} ordinary ticks opened -- every one should, since none of them \
+         is a reset and an ordinary tick's own cadence is the ticker's, not an elapsed-time \
+         comparison against it"
+    );
+}
