@@ -377,6 +377,12 @@ pub struct MetricsSnapshot {
     /// oplog from below this node's position or pulling its snapshot, on
     /// the strength of a confirmed divergence or a stopped batch.
     pub sync_repair_rounds: u64,
+    /// Sync ticks scheduled by a reset rather than by `sync_interval_secs`
+    /// (ADR-195): the previous tick ended a peer's contact still draining
+    /// and this one resumed it at once. Rising steadily, tick after tick,
+    /// is a peer with a deep enough backlog to fill every tick's budget;
+    /// it stops once that peer catches up.
+    pub sync_reset_ticks: u64,
     /// Where sync pulls spent their time, how long what they carried had
     /// waited, and how contacts ended (ADR-175): the loop's report, summed
     /// since start. The histograms' buckets are on `/metrics` alone; their
@@ -476,6 +482,7 @@ pub struct Metrics {
     sync_entries_skipped_beyond_advertised: AtomicU64,
     sync_entries_skipped_purge_pending: AtomicU64,
     sync_repair_rounds: AtomicU64,
+    sync_reset_ticks: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
@@ -569,6 +576,7 @@ impl Default for Metrics {
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
             sync_entries_skipped_purge_pending: AtomicU64::new(0),
             sync_repair_rounds: AtomicU64::new(0),
+            sync_reset_ticks: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             runtime_stall_otlp_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
@@ -797,6 +805,7 @@ impl Metrics {
             round.entries_skipped_purge_pending as u64,
         );
         self.sync_repair_rounds.fetch_add(round.repair_rounds as u64, Ordering::Relaxed);
+        self.sync_reset_ticks.fetch_add(u64::from(round.reset), Ordering::Relaxed);
         self.sync_pulls.lock().add(&round.pulls);
     }
 
@@ -1148,6 +1157,7 @@ impl Metrics {
             sync_held_marks_released: readings.held_marks_released,
             sync_held_marks: readings.held_marks,
             sync_repair_rounds: self.get(&self.sync_repair_rounds),
+            sync_reset_ticks: self.get(&self.sync_reset_ticks),
             sync_pulls: *self.sync_pulls.lock(),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -1492,6 +1502,9 @@ impl Metrics {
              # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.\n\
              # TYPE kimmy_sync_repair_rounds_total counter\n\
              kimmy_sync_repair_rounds_total {sync_repair_rounds}\n\
+             # HELP kimmy_sync_reset_ticks_total Sync ticks scheduled by a reset rather than by cluster.sync_interval_secs: the previous tick ended a peer's contact still draining and this one resumed it at once instead of waiting out the rest of the interval. Rising steadily, tick after tick, is a peer with a backlog deep enough to fill every tick's budget; it stops once that peer catches up.\n\
+             # TYPE kimmy_sync_reset_ticks_total counter\n\
+             kimmy_sync_reset_ticks_total {sync_reset_ticks}\n\
              # HELP kimmy_sync_pulled_entries_total Entries sync pulls carried from peers, whatever became of each - applied, superseded, a schema change or left for a later window. Divide the growth of kimmy_sync_pull_seconds_sum{{phase=\"apply\"}} by the growth of this for what applying one entry costs, whatever size the batches were.\n\
              # TYPE kimmy_sync_pulled_entries_total counter\n\
              kimmy_sync_pulled_entries_total {sync_pulled_entries}\n\
@@ -1611,6 +1624,7 @@ impl Metrics {
             sync_held_released = readings.held_marks_released,
             sync_held_marks = readings.held_marks,
             sync_repair_rounds = self.get(&self.sync_repair_rounds),
+            sync_reset_ticks = self.get(&self.sync_reset_ticks),
             sync_pulled_entries = pulls.entries,
             sync_entry_wait_ahead = pulls.entry_wait_ahead,
             sync_ended_caught_up = pulls.contacts[kimmy_cluster::ContactEnd::CaughtUp.slot()],
@@ -2030,6 +2044,7 @@ mod tests {
             entries_skipped_beyond_advertised: 74,
             entries_skipped_purge_pending: 77,
             repair_rounds: 76,
+            reset: true,
             pulls: pulls_observed([3, 40, 700], 1_024, Some(1_500), 115, [101, 102, 103, 104]),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
@@ -2050,6 +2065,7 @@ mod tests {
             entries_skipped_beyond_advertised: 1,
             entries_skipped_purge_pending: 1,
             repair_rounds: 1,
+            reset: false,
             // A wait of 45 s: past the old 10 s top, so the golden reads the
             // buckets a long wait for the writer lands in (ADR-175).
             pulls: pulls_observed([8, 45_000, 3_000], 81, Some(45_000), 2, [10, 10, 10, 10]),
@@ -2733,6 +2749,9 @@ kimmy_sync_held_marks 54
 # HELP kimmy_sync_repair_rounds_total Sync rounds spent repairing against a peer: re-serving its oplog from the divergent collection's creation, or pulling its snapshot, after the divergence check confirmed a collection against it or a batch stopped at a collection this node lacks. Rising is a repair under way; it stops when the repair reaches the peer's tail.
 # TYPE kimmy_sync_repair_rounds_total counter
 kimmy_sync_repair_rounds_total 77
+# HELP kimmy_sync_reset_ticks_total Sync ticks scheduled by a reset rather than by cluster.sync_interval_secs: the previous tick ended a peer's contact still draining and this one resumed it at once instead of waiting out the rest of the interval. Rising steadily, tick after tick, is a peer with a backlog deep enough to fill every tick's budget; it stops once that peer catches up.
+# TYPE kimmy_sync_reset_ticks_total counter
+kimmy_sync_reset_ticks_total 1
 # HELP kimmy_sync_pulled_entries_total Entries sync pulls carried from peers, whatever became of each - applied, superseded, a schema change or left for a later window. Divide the growth of kimmy_sync_pull_seconds_sum{phase=\"apply\"} by the growth of this for what applying one entry costs, whatever size the batches were.
 # TYPE kimmy_sync_pulled_entries_total counter
 kimmy_sync_pulled_entries_total 1105
@@ -3126,6 +3145,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_sync_held_marks_released_total {}\n", s.sync_held_marks_released));
         expect(&format!("kimmy_sync_held_marks {}\n", s.sync_held_marks));
         expect(&format!("kimmy_sync_repair_rounds_total {}\n", s.sync_repair_rounds));
+        expect(&format!("kimmy_sync_reset_ticks_total {}\n", s.sync_reset_ticks));
         expect(&format!("kimmy_sync_pulled_entries_total {}\n", s.sync_pulls.entries));
         expect(&format!("kimmy_sync_entry_wait_ahead_total {}\n", s.sync_pulls.entry_wait_ahead));
         for end in kimmy_cluster::ContactEnd::ALL {
@@ -3367,12 +3387,13 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // ADR-178, one scalar for embedding skipped for want of a shadow;
         // since ADR-180, one for schema changes a snapshot restore re-logged;
         // since ADR-181, one for expiry declined by the partial filter;
-        // since ADR-184, one retry counter per supervised task; and since
+        // since ADR-184, one retry counter per supervised task; since
         // ADR-185, one for documents an index holds because its partial
-        // filter could not decide them.
+        // filter could not decide them; and since ADR-195, one for sync
+        // ticks a reset scheduled.
         assert_eq!(
             samples,
-            107 + 6
+            108 + 6
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT
@@ -3586,6 +3607,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
+            reset: false,
             pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_sync_round(&kimmy_cluster::RoundReport {
@@ -3606,6 +3628,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
+            reset: false,
             pulls: kimmy_cluster::PullReport::default(),
         });
         m.record_ddl_applied_push(11);
@@ -3814,6 +3837,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_beyond_advertised: 0,
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
+            reset: false,
             pulls: kimmy_cluster::PullReport::default(),
         };
         let age_in = |out: &str| -> u64 {

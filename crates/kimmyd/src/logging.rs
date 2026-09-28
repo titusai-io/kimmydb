@@ -1172,6 +1172,13 @@ impl TelemetryGuard {
             "Sync rounds spent repairing against a peer: re-serving its oplog from below this node's position, or pulling its snapshot.",
             sync_repair_rounds
         );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.reset_ticks",
+            "{tick}",
+            "Sync ticks scheduled by a reset rather than by sync_interval_secs: the previous tick ended a peer's contact still draining and this one resumed it at once.",
+            sync_reset_ticks
+        );
 
         // The embedding worker. Every one of these reads 0 on a node where the
         // worker is disabled, which is the distinction an operator is looking
