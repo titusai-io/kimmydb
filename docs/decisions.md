@@ -20882,14 +20882,21 @@ on a single peer — and skipping the open for all of it would freeze both
 counters' advance for every peer that whole time, which is not wall-clock
 either. What actually ships:
 
-- `replicate()` keeps `last_opened: Option<Instant>`, and calls
-  `stalls.tick_opened()` only when `tick_started` is at least
-  `sync_interval` past the value `last_opened` last recorded (or on the very
-  first tick). This needs no reset/ordinary distinction: an ordinary tick
-  already fires about `sync_interval` after the one before it, so it opens
-  under exactly the same rule a reset tick does, and a chain of any length
-  opens about once an interval regardless of how many ticks — reset or
-  ordinary — fall inside it.
+- `replicate()` keeps `last_opened: Option<Instant>`. An *ordinary* tick
+  always opens, exactly as every tick did before this change: its own
+  cadence is the ticker's, not an elapsed-time comparison against
+  `last_opened`. A *reset* tick opens only when `tick_started` is at least
+  `sync_interval` past the value `last_opened` last recorded, so a chain of
+  any length opens about once an interval however many reset ticks fall
+  inside it. The two cannot share one comparison: `tick_started` is read a
+  few milliseconds after the ticker actually fires, so an ordinary tick's
+  own gap from the last open lands under `sync_interval` about as often as
+  over it, and gating every tick on `>=` would silently drop close to half
+  of ordinary opens to that jitter — measured at 24–26 of 40 opening at a
+  200 ms interval against a caught-up peer, no drain and no reset anywhere
+  in sight, which would have slowed `REPAIR_COOLDOWN_ROUNDS` to roughly
+  1.5× and `FROZEN_CONTACTS` detection to four or five ticks instead of
+  three on an otherwise healthy cluster.
 - `PeerStalls::tick_opened()` also clears a `counted_this_open` flag on
   every remembered peer, in `by_peer` and `by_self` alike, alongside the
   repair cooldown's own per-contact flag — the same "contact" the cooldown
