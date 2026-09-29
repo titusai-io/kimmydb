@@ -10,7 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.42.0 - 2026-09-29
+
+**Roll the members one at a time. This release is not a rollback boundary:
+it changes no stored format (schema 4, redb 4.3.0, the verified-vector epoch
+1, all as in 0.41.1), so 0.41.1 opens a store 0.42.0 has run on, and a member
+rolls back by starting it on 0.41.1. `$addToSet` now identifies a member the
+way `$group` identifies a bucket, so a caller can see fewer members than
+before: `1`, `1.0` and a long `1` are one, every `NaN` is one, `0.0` and
+`-0.0` are one, `null` and `undefined` are one, and a string and a symbol of
+the same text are one. A `Decimal128` operand to `$addToSet`, which was
+refused, is now accepted. The documented alert on
+`kimmy_sync_divergence_check_age_seconds` is now drain-aware, so it no longer
+pages on a healthy drain (documentation only).** The details follow.
 
 **`$addToSet` now treats values as one member the way `$group` treats them
 as one bucket.** Before, it kept every `NaN` it met and kept `1`, `1.0` and
