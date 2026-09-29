@@ -88,7 +88,8 @@ const WALKS: [&str; 24] = [
 /// Functions that walk, matched as a name of their own and not where they are
 /// defined: a vector search with no graph to use scores every stored vector,
 /// and a keyword search reads every chunk's text.
-const WALKING_FUNCTIONS: [&str; 2] = ["vector_search(", "keyword_search("];
+const WALKING_FUNCTIONS: [&str; 4] =
+    ["vector_search(", "keyword_search(", "load_jobs(", "union_progress("];
 
 /// Walks allowed outside a `blocking(` in their own file, per file, each
 /// bounded by something other than the data a client stored or run under a
@@ -98,8 +99,8 @@ const BOUNDED: [(&str, usize, &str); 7] = [
     (
         "dispatch.rs",
         2,
-        "`load_jobs` and `union_progress`, called only from `dispatch_once`'s plan, which \
-         runs whole under `blocking`",
+        "the bodies of `load_jobs` and `union_progress`, whose calls are held to `blocking` \
+         through `WALKING_FUNCTIONS`: `dispatch_once` makes them inside its plan's wrap",
     ),
     (
         "index.rs",

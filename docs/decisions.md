@@ -21500,13 +21500,19 @@ looks for more calls:
 - every form of `.entries_for_peer` and `.read_oplog_`;
 - `.for_each_vector(`;
 - `.modify_where(` and `.find_and_modify(`;
-- `vector_search(` and `keyword_search(` as calls, not as definitions.
+- `vector_search(`, `keyword_search(`, `load_jobs(` and `union_progress(` as
+  calls, not as definitions.
 
 It no longer allows `webhooks.rs` its walk. Its allowances now include walks
 covered at a caller it does not follow, each with its reason:
-- `load_jobs` and `union_progress`, which run inside the dispatcher's plan;
+- the bodies of `load_jobs` and `union_progress`, whose calls it checks, and
+  which the dispatcher makes inside its plan's wrap;
 - the vector graph build and `count_vectors`, inside `IndexCache::access`;
 - the bodies of the two vector scans, whose calls it checks.
+
+The graph build and `count_vectors` are the one allowance whose cover it does
+not check: they are reached through `IndexCache::access` several calls up, and
+a new caller of either outside that path would pass it unseen.
 
 The guard is textual, and `pass` reaches `expire_documents` through a function
 call it does not follow, so the test below covers the TTL pass instead.
