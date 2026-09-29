@@ -662,6 +662,33 @@ fn operations_lists_every_series_the_metrics_endpoint_exposes() {
 /// carries no `maximum` for it, and `tests/openapi.rs` insists on that — so
 /// this is the only thing holding the numbers in the guide to the constants.
 #[test]
+fn the_divergence_age_alert_is_written_drain_aware() {
+    // The check is deferred in every contact that ends `budget`, so a healthy
+    // drain climbs the age for as long as it lasts (ADR-187's addendum). An
+    // alert written as "age above k x interval" alone pages on every large
+    // drop or load, and one that leaves out the failure leg goes quiet on a
+    // member whose every round fails. Both the row and the alerts section
+    // carry both legs.
+    let series = "kimmy_sync_divergence_check_age_seconds";
+    let section = section(OPERATIONS, METRICS_SECTION);
+    let row = section
+        .iter()
+        .find(|line| line.trim_start().starts_with(&format!("| `{series}`")))
+        .expect("the age has a row in the metrics table");
+    let alerts: String = OPERATIONS
+        .lines()
+        .skip_while(|line| !line.contains("Write it drain-aware"))
+        .take(40)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (place, text) in [("the metrics row", *row), ("the alerts section", alerts.as_str())] {
+        assert!(text.contains("kimmy_sync_contacts_total{ended=\"budget\"}"), "{place}: the drain");
+        assert!(text.contains("kimmy_sync_failures_total"), "{place}: the failure leg");
+    }
+    assert!(alerts.contains("increase(kimmy_sync_contacts_total{ended=\"budget\"}"), "the example");
+}
+
+#[test]
 fn vectors_states_the_k_clamp_the_server_applies() {
     use kimmy_api::vectors::{DEFAULT_K, MAX_K};
     let thousands = |n: usize| {

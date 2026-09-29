@@ -10,6 +10,18 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+The documented alert on `kimmy_sync_divergence_check_age_seconds` no longer
+pages on a healthy drain. The divergence check is deferred in every contact
+that ends `budget`, so the age climbs for as long as a member is draining a
+backlog (71 s on 0.41.1). `docs/operations.md` now says to alert on it above
+*k* × `cluster.sync_interval_secs` only while
+`kimmy_sync_contacts_total{ended="budget"}` has not risen over the window, or
+while `kimmy_sync_failures_total` has, with a PromQL example, and ADR-187
+carries the corrected derivation. Documentation only: nothing the server does
+has changed.
+
 ## 0.41.1 - 2026-09-28
 
 **Roll the members one at a time. This release is not a rollback boundary:
