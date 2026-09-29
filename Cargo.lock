@@ -2599,6 +2599,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "bson",
  "clap",
  "futures",
  "http-body-util",

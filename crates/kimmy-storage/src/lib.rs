@@ -67,9 +67,12 @@ pub use hold_meter::{
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
+#[cfg(feature = "test-hooks")]
+pub use migrate::make_schema_3_for_test;
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,
+    set_test_open_step_pause,
 };
 pub use purge::PurgeCounters;
 pub use snapshot::{

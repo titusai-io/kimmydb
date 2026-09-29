@@ -69,6 +69,10 @@ http-body-util = "0.1"
 rcgen.workspace = true
 tempfile.workspace = true
 tokio-rustls.workspace = true
+# A test builds the store a schema 3 node leaves, to stop a real node in the
+# middle of migrating it.
+kimmy-storage = { workspace = true, features = ["test-hooks"] }
+bson.workspace = true
 # For the cluster harness: an HTTP client and JSON for driving real spawned
 # nodes. Both already in the workspace tree; no new dependencies.
 reqwest.workspace = true

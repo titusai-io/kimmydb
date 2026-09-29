@@ -2204,7 +2204,7 @@ impl Engine {
                     // start walks again. Nothing is recorded, and the vector is
                     // not raised.
                     if crate::open_progress::open_stop_requested() {
-                        return Ok((false, walk));
+                        return Ok((false, walk, false));
                     }
                 }
                 walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
@@ -2325,6 +2325,13 @@ impl Engine {
             return Ok(());
         }
         let (raised, walk, arrival_differs) = Self::rebuild_version_vector_if_stale(db)?;
+        // A stop asked for during the open ended the walk, which leaves the vector
+        // unverified and the next start walking again: nothing was checked, and
+        // nothing is said to have been.
+        if crate::open_progress::open_stop_requested() {
+            info!("the verification walk was ended by a stop; the next start walks again");
+            return Ok(());
+        }
         info!(
             elapsed_ms = walk.elapsed_ms,
             rows = walk.rows,

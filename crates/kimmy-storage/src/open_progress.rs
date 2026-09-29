@@ -83,6 +83,23 @@ static SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// `KIMMY_TEST_OPEN_STEP_MS`: how long each migration step waits after its
+/// commit, for a test that needs to stop an open between two of them.
+static TEST_STEP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Make every migration step wait `pause` after its commit (0 for none). A test
+/// switch, set once before the open.
+pub fn set_test_open_step_pause(pause: Duration) {
+    TEST_STEP_MS.store(u64::try_from(pause.as_millis()).unwrap_or(u64::MAX), Relaxed);
+}
+
+/// The wait [`set_test_open_step_pause`] asked for, in slices so a stop ends it.
+pub(crate) fn test_step_pause() {
+    let until = Instant::now() + Duration::from_millis(TEST_STEP_MS.load(Relaxed));
+    while Instant::now() < until && !open_stop_requested() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -169,11 +186,11 @@ mod tests {
             .len() as u64;
         assert!(rows > 8_192, "the fixture must be longer than one check interval: {rows}");
 
-        let (_, whole) = Engine::rebuild_version_vector_if_stale(engine.db()).unwrap();
+        let (_, whole, _) = Engine::rebuild_version_vector_if_stale(engine.db()).unwrap();
         assert_eq!(whole.rows, rows, "with no stop the walk reads the whole oplog");
 
         THIS_THREAD_STOPS.with(|stops| stops.set(true));
-        let (raised, abandoned) = Engine::rebuild_version_vector_if_stale(engine.db()).unwrap();
+        let (raised, abandoned, _) = Engine::rebuild_version_vector_if_stale(engine.db()).unwrap();
         THIS_THREAD_STOPS.with(|stops| stops.set(false));
         assert!(!raised);
         assert_eq!(abandoned.rows, 8_192, "abandoned at the first check");

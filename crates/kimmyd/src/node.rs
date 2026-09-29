@@ -135,7 +135,7 @@ pub async fn run(config: Config) -> RunEnd {
             let closed = served.closed;
             end.writes_open = closed.is_err();
             end.outcome = served.outcome.and(closed);
-            end.engine = Some(served.engine);
+            end.engine = served.engine;
         }
         Err(e) => end.outcome = Err(e),
     }
@@ -206,7 +206,7 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
         None => Ok(()),
         Some(engine) => close_engine(engine, deadline, stop_by, test_stop),
     };
-    let result = record_outcome(&data_dir, outcome, closed);
+    let result = record_outcome(&data_dir, outcome, closed, held.is_some());
     drop(held);
     result
 }
@@ -294,7 +294,8 @@ const DROP_PURGER_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// A run that served, and how serving ended.
 struct Served {
-    engine: Arc<Engine>,
+    /// `None` for a stop that ended the open itself: there is no engine to close.
+    engine: Option<Arc<Engine>>,
     /// `Ok` for a stop at the signal; the error serving ended on otherwise.
     outcome: Result<()>,
     /// The close to writes, made the moment serving ended: `Err` when a
@@ -374,6 +375,60 @@ impl TestStop {
     }
 }
 
+/// A run whose stop came before it served: the listener ends, the store (if it
+/// was opened) is closed to writes, and the run concludes as a clean stop.
+async fn ended_before_serving(
+    serving: ServerTask,
+    engine: Option<Arc<Engine>>,
+    stop_by: Arc<std::sync::OnceLock<std::time::Instant>>,
+) -> Served {
+    let _ = stop_by.set(std::time::Instant::now() + STOP_BUDGET);
+    let outcome = match tokio::time::timeout(Duration::from_secs(2), serving).await {
+        Ok(Ok(connections)) => {
+            let _ = tokio::time::timeout(Duration::from_secs(2), connections).await;
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(()),
+    };
+    let closed = match &engine {
+        Some(engine) => close_for_exit(engine, WRITES_CLOSE_CAP),
+        None => Ok(()),
+    };
+    Served { engine, outcome: outcome.context("serving"), closed, stop_by, test_stop: None }
+}
+
+/// A failure before the store was opened, which `record_outcome` needs to tell
+/// from one after it: with no hold on the data directory, such a start cannot
+/// know the directory is its own, and writes nothing into it.
+#[derive(Debug)]
+struct BeforeOpen;
+
+impl std::fmt::Display for BeforeOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the start failed before the store was opened")
+    }
+}
+
+/// Says, once per 30 s per phase, that the store is still opening, with the
+/// phase's age: what makes an open that hangs visible in the log (ADR-198).
+struct OpenWatch {
+    last: Option<(kimmy_storage::OpenPhase, u64)>,
+}
+
+impl OpenWatch {
+    const EVERY: Duration = Duration::from_secs(30);
+
+    fn due(&mut self, open: &kimmy_storage::OpenSnapshot) -> bool {
+        let slot = open.phase_age.as_secs() / Self::EVERY.as_secs();
+        if slot == 0 || self.last == Some((open.phase, slot)) {
+            return false;
+        }
+        self.last = Some((open.phase, slot));
+        true
+    }
+}
+
 async fn start_and_serve(config: Config) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -397,6 +452,12 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // is ignored until the supervisor's kill). After `previous_run`, which
     // reads and sets aside the last run's verdict from files alone, so a bind
     // that fails is a failed start that inherits it like any other.
+    // Before the first task is spawned, the listener's included: a supervised
+    // death needs somewhere to record itself, and a panic anywhere needs to
+    // reach the structured log rather than bare stderr (ADR-184).
+    if !crate::supervision::install(config.storage.data_dir.clone()) {
+        anyhow::bail!("the supervision hooks were installed twice; this is a programming error");
+    }
     let early = EarlySignal::install();
     // A start that fails before it opens the store still says what it
     // inherited: the last run's verdict was set aside above, and the failed
@@ -404,7 +465,7 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // is written here, since the banner it normally follows is not reached.
     let failed_before_open = |e: anyhow::Error| {
         lifecycle::announce(&config.storage.data_dir, &previous);
-        e
+        e.context(BeforeOpen)
     };
     // Loaded before binding, so a bad certificate is a startup failure rather
     // than a handshake error for whoever connects first.
@@ -439,6 +500,40 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         Arc::clone(&accept_slot),
     ));
     info!(bind = %local, "HTTP listener bound; the store is opening, and only /healthz and /readyz answer until it is up");
+    // A phase that lasts is said, every 30 s, with its age.
+    // UNSUPERVISED: a watcher whose end is the open's; it has nothing to
+    // restart and holds no engine.
+    tokio::spawn({
+        let engine_slot = Arc::clone(&engine_slot);
+        async move {
+            let mut watch = OpenWatch { last: None };
+            while engine_slot.get().is_none() && !kimmy_storage::open_stop_requested() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let open = kimmy_storage::open_snapshot();
+                if watch.due(&open) {
+                    warn!(
+                        phase = open.phase.label(),
+                        phase_age_secs = open.phase_age.as_secs(),
+                        done = open.done,
+                        total = open.total,
+                        "the store is still opening"
+                    );
+                }
+            }
+        }
+    });
+    if let Ok(value) = std::env::var("KIMMY_TEST_OPEN_STEP_MS") {
+        let ms = value.parse::<u64>().ok();
+        warn!(
+            KIMMY_TEST_OPEN_STEP_MS = %value,
+            recognised = ms.is_some(),
+            "a test switch is set that makes every step of a migration wait on purpose; unset \
+             KIMMY_TEST_OPEN_STEP_MS outside a test"
+        );
+        if let Some(ms) = ms {
+            kimmy_storage::set_test_open_step_pause(Duration::from_millis(ms));
+        }
+    }
 
     // A test switch that makes the open last: the store opens only after this
     // many seconds, so a test can see what a node answers while it opens, and
@@ -459,10 +554,25 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             }
         }
     }
-    let engine = Arc::new(
-        Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize))
-            .with_context(|| format!("opening database {}", path.display()))?,
-    );
+    let engine = match Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize)) {
+        Ok(engine) => Arc::new(engine),
+        // A stop asked for during a migration ends the open at a safe point,
+        // between two of its one-commit steps. That is the stop being honoured,
+        // not a failed start: it concludes as a clean shutdown with no engine,
+        // and the next start resumes from the migration's markers (ADR-198).
+        Err(kimmy_storage::StorageError::Stopping(_)) if early.signalled() => {
+            info!(
+                "a stop was asked for while the store was opening, and the open ended at a safe \
+                 point; stopping without serving"
+            );
+            return Ok(ended_before_serving(serving, None, Arc::default()).await);
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("opening database {}", path.display()))
+            );
+        }
+    };
     kimmy_storage::set_open_phase(kimmy_storage::OpenPhase::Starting);
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     // Validation already refused anything else; the fallback is only so a
@@ -491,13 +601,7 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // under the identity of the run that is reporting it.
     lifecycle::announce(&config.storage.data_dir, &previous);
 
-    // Before the first task is spawned: a supervised death needs somewhere to
-    // record itself, and a panic anywhere needs to reach the structured log
-    // rather than bare stderr (ADR-184).
-    if !crate::supervision::install(config.storage.data_dir.clone()) {
-        anyhow::bail!("the supervision hooks were installed twice; this is a programming error");
-    }
-    // And the storage engine's: an I/O error leaves it serving nothing, so the
+    // The storage engine's: an I/O error leaves it serving nothing, so the
     // process stops to be restarted (ADR-188). Installed as soon as there is an
     // engine; a failure during the open itself fails the start instead.
     if !crate::supervision::install_storage_reaction(&engine, config.storage.data_dir.clone()) {
@@ -520,22 +624,22 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         // stopped at a safe point), and the node stops without serving, with a
         // clean marker. Nothing else has been started.
         info!("a stop was asked for while the store was opening; stopping without serving");
-        let outcome = match tokio::time::timeout(Duration::from_secs(2), serving).await {
-            Ok(Ok(connections)) => {
-                let _ = tokio::time::timeout(Duration::from_secs(2), connections).await;
-                Ok(())
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Ok(()),
-        };
-        let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
-        return Ok(Served {
-            engine,
-            outcome: outcome.context("serving"),
-            closed,
-            stop_by: Arc::clone(&stop.by),
-            test_stop: None,
-        });
+        return Ok(ended_before_serving(serving, Some(engine), Arc::clone(&stop.by)).await);
+    }
+
+    // A test switch that makes the start after the open last, so a test can
+    // stop a node in the phase `starting`. Announced like the others.
+    if let Ok(value) = std::env::var("KIMMY_TEST_START_DELAY_SECS") {
+        let secs = value.parse::<u64>().ok();
+        warn!(
+            KIMMY_TEST_START_DELAY_SECS = %value,
+            recognised = secs.is_some(),
+            "a test switch is set that delays the end of the start on purpose; unset \
+             KIMMY_TEST_START_DELAY_SECS outside a test"
+        );
+        if let Some(secs) = secs {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+        }
     }
 
     // A test switch that stops a background task on purpose. It is in the
@@ -1024,10 +1128,6 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         None
     };
 
-    // Loaded before binding, so a bad certificate is a startup failure rather
-    // than a handshake error for whoever connects first.
-    let tls = load_tls(&config).await?;
-
     // Only with TLS configured: with it off there is no file to watch, so
     // there is no task to run (ADR-049).
     let cert_reloader = match (&tls, config.server.tls.pair()) {
@@ -1051,7 +1151,11 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // an exit of this run no longer carries it (ADR-190's lifecycle half).
     lifecycle::settle(&config.storage.data_dir);
 
-    if tls.is_some() {
+    if stop.by.get().is_some() {
+        // A stop asked for while the node started: it stops as soon as serving
+        // is entered, and does not say it serves.
+        info!("a stop was asked for while the node was starting; stopping");
+    } else if tls.is_some() {
         info!(
             bind = %local,
             poll_secs = CERT_POLL_INTERVAL.as_secs(),
@@ -1227,7 +1331,13 @@ async fn start_and_serve(config: Config) -> Result<Served> {
 
     // `run` closes the engine to writes, and `conclude` closes it and then
     // writes the exit marker, in that order.
-    Ok(Served { engine, outcome: served, closed, stop_by: Arc::clone(&stop.by), test_stop })
+    Ok(Served {
+        engine: Some(engine),
+        outcome: served,
+        closed,
+        stop_by: Arc::clone(&stop.by),
+        test_stop,
+    })
 }
 
 /// Close the engine to writes, waiting up to `cap` for one in progress; an
@@ -1275,6 +1385,7 @@ fn record_outcome(
     data_dir: &std::path::Path,
     outcome: Result<()>,
     closed: std::result::Result<(), String>,
+    locked: bool,
 ) -> Result<()> {
     match (outcome, closed) {
         (outcome, Err(cause)) => {
@@ -1299,6 +1410,15 @@ fn record_outcome(
         // write, and `run` has already logged it.
         (Err(e), Ok(())) if e.downcast_ref::<lifecycle::InUse>().is_some() => Err(e),
         (Err(e), Ok(())) if lifecycle::store_in_use(&e) => {
+            lifecycle::leave(data_dir);
+            info!(error = format!("{e:#}"), "exiting on an error");
+            Err(e)
+        }
+        // No hold on the directory (the filesystem cannot lock), and the start
+        // failed before it opened the store: it cannot know the directory is
+        // its own, and a live node's may be, so it puts back what it set aside
+        // and writes nothing.
+        (Err(e), Ok(())) if !locked && e.downcast_ref::<BeforeOpen>().is_some() => {
             lifecycle::leave(data_dir);
             info!(error = format!("{e:#}"), "exiting on an error");
             Err(e)
@@ -2645,6 +2765,53 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+
+    /// A start that failed before it opened the store, and holds no lock on
+    /// the directory, cannot know the directory is its own: it puts back the
+    /// marker it set aside and writes none. With the lock held it records the
+    /// failed start as before.
+    #[test]
+    fn a_failure_before_the_open_without_the_directory_lock_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let marker = data.join("kimmy.last-exit");
+        std::fs::write(&marker, "exit = \"shutdown\"\n").unwrap();
+        let database = data.join(DATABASE_FILE);
+        let failed = || anyhow::anyhow!("binding: in use").context(BeforeOpen);
+
+        let _ = lifecycle::previous_run(data, &database);
+        assert!(!marker.exists(), "the start sets the marker aside");
+        let _ = record_outcome(data, Err(failed()), Ok(()), false);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "exit = \"shutdown\"\n");
+        assert!(!data.join("kimmy.last-exit.previous").exists());
+
+        let _ = lifecycle::previous_run(data, &database);
+        let _ = record_outcome(data, Err(failed()), Ok(()), true);
+        assert!(
+            std::fs::read_to_string(&marker).unwrap().contains("exit = \"error\""),
+            "with the lock the failed start is recorded"
+        );
+    }
+
+    /// The watcher says a phase once per 30 s, not before the first 30 s, and
+    /// says it again for a new phase.
+    #[test]
+    fn a_long_phase_is_said_once_per_thirty_seconds() {
+        use kimmy_storage::{OpenPhase, OpenSnapshot};
+        let at = |phase, secs| OpenSnapshot {
+            phase,
+            phase_age: Duration::from_secs(secs),
+            done: 0,
+            total: 0,
+        };
+        let mut watch = OpenWatch { last: None };
+        assert!(!watch.due(&at(OpenPhase::Verifying, 29)));
+        assert!(watch.due(&at(OpenPhase::Verifying, 30)));
+        assert!(!watch.due(&at(OpenPhase::Verifying, 45)));
+        assert!(watch.due(&at(OpenPhase::Verifying, 61)));
+        assert!(!watch.due(&at(OpenPhase::Counting, 3)));
+        assert!(watch.due(&at(OpenPhase::Counting, 31)));
+    }
     use std::net::SocketAddr;
 
     use axum::extract::ConnectInfo;

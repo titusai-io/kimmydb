@@ -21287,12 +21287,17 @@ estimate of the open.
 **Decision.**
 
 - **The order of a start is: hold the data directory, read the last run's verdict
-  (`previous_run`, from files alone), install the stop handler, load the TLS
-  material, bind the HTTP port, and only then open the store.** A port that cannot
-  be bound and a certificate that cannot be read are start failures before the
-  store is touched: no store file is created, no sidecar written, and the last
-  run's verdict is inherited by the failed start like any other's, and announced
-  in the log where the banner it normally follows was not reached. A second
+  (`previous_run`, from files alone), install the supervision hooks and the stop
+  handler, load the TLS material, bind the HTTP port, and only then open the
+  store.** The certificate is loaded once, there, and the configuration that
+  loads it is the one the listener serves and the reloader replaces, so a rotated
+  certificate reaches the listener. A port that cannot be bound and a
+  certificate that cannot be read are start failures before the store is touched:
+  no store file is created, no sidecar written, and the last run's verdict is
+  inherited by the failed start like any other's, and announced in the log where
+  the banner it normally follows was not reached. Where the filesystem cannot
+  lock the directory, a start cannot know the directory is its own, so a failure
+  before the open there puts back the marker it set aside and writes none. A second
   process on the same directory fails at the hold, before any of it, and leaves
   everything as it was.
 - **Until the node's router is installed, the listener is `front::Front`.**
@@ -21323,7 +21328,14 @@ estimate of the open.
   its marker, and an interrupted migration resumes from the markers) and by
   **abandoning the verification walk** (nothing is recorded, the version vector is
   not raised, and the next start walks again). Otherwise the open finishes and the
-  node stops **without serving**, with a clean exit marker.
+  node stops **without serving**, with a clean exit marker. **A stop that ends a
+  migration at its safe point is that stop being honoured, not a failed start**:
+  `Engine::open` returns the stop, and the run concludes as a clean shutdown with
+  no engine to close (exit 0, `exit = "shutdown"`), and the next start resumes
+  from the markers. A stop that comes after the open, while the node starts, ends
+  it as soon as serving is entered and does not log that it serves. **An open
+  that lasts is said**: a `WARN` naming the phase, its age and its count, once
+  per 30 s per phase.
 - **A hung open is not ended by the product.** With liveness truthful, a node
   whose open never finishes is green on `/healthz`. It is visible (`phase_age_seconds`
   on `/readyz`, and the log's line per phase), and an operator who wants a ceiling
@@ -21376,5 +21388,12 @@ route including `/v1/version` and `/metrics` refused, nothing logged), the order
 of the bind, the banner and serving, the swap; a stop during the open (heard, no
 waiting for the open, never serving, clean marker); a bind that fails (no banner,
 no store file). A storage test that a stop abandons the verification walk at its
-first check. Each guard was broken and its test failed.
+first check. A schema 3 store stopped between two migration steps
+(`KIMMY_TEST_OPEN_STEP_MS`, which makes each step wait, announced like the
+others): exit 0, a `shutdown` marker, no serving, and the next start resumes
+without a repair. A stop after the open, with `KIMMY_TEST_START_DELAY_SECS`
+(never logs that it serves). A rotated certificate presented by the listener
+after SIGHUP, read from a handshake. A failure before the open without the
+directory lock leaves the marker as it was. Each guard was broken and its test
+failed. Each guard was broken and its test failed.
 

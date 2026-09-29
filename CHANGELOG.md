@@ -53,7 +53,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   container) used to wait for the supervisor's kill, and stops the node at a safe
   point or once the open finishes, without serving. A port that cannot be bound or
   a certificate that cannot be read now fails the start before the store is opened,
-  with nothing in the data directory touched. **The documented Kubernetes manifest
+  before the store is touched. **The documented Kubernetes manifest
   changes**: the startup probe is on `/healthz` (its arithmetic no longer matters),
   and the StatefulSet is `podManagementPolicy: Parallel`, which is immutable on an
   existing one (`kubectl delete statefulset <name> --cascade=orphan`, then apply

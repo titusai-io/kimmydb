@@ -791,7 +791,7 @@ open is heard, and stops the node at its next safe point (between the
 migration's per-index steps, or by abandoning the verification walk); otherwise
 the open finishes and the node stops without serving, with a clean exit marker.
 A port that cannot be bound, or a certificate that cannot be read, fails the
-start **before the store is opened**: nothing in the data directory is touched,
+start **before the store is opened**: the store is not touched,
 and the last run's verdict is inherited by the failed start as by any other.
 
 ### Metrics
