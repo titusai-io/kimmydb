@@ -202,6 +202,9 @@ impl Backoff {
 /// An error when the records could not all be read, the node's stop
 /// included: a union of the ones that were would be lower than the truth, and
 /// a subscription planned from it could be invalidated as fallen behind.
+///
+/// A walk of every node's progress records: the dispatcher calls it inside the
+/// plan's `blocking` (ADR-199).
 pub fn union_progress(
     state: &SharedState,
     subscription: &str,
@@ -218,34 +221,30 @@ pub fn union_progress(
         Err(e) => return Err(e),
     };
     let prefix = format!("{subscription}:");
-    // Off the async worker (ADR-199): the collection holds a record per
-    // subscription per member, and subscriptions are a client's to add.
-    kimmy_storage::blocking(|| {
-        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
-            if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
-                && let Ok(vector) = document.get_document("delivered")
-            {
-                for (node, hlc) in vector {
-                    // The HLC is stored as its own byte encoding rather than a
-                    // string: it has no `FromStr`, and its wall clock is a `u64`
-                    // that BSON cannot hold as an integer above `i64::MAX` — the
-                    // bug that once stopped half of all collections replicating.
-                    let bson::Bson::Binary(binary) = hlc else {
-                        continue;
-                    };
-                    let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
-                        continue;
-                    };
-                    let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
-                        continue;
-                    };
-                    let mut one = VersionVector::new();
-                    one.insert(node, Hlc::from_bytes(bytes));
-                    union.merge(&one);
-                }
+    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
+        if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
+            && let Ok(vector) = document.get_document("delivered")
+        {
+            for (node, hlc) in vector {
+                // The HLC is stored as its own byte encoding rather than a
+                // string: it has no `FromStr`, and its wall clock is a `u64`
+                // that BSON cannot hold as an integer above `i64::MAX` — the
+                // bug that once stopped half of all collections replicating.
+                let bson::Bson::Binary(binary) = hlc else {
+                    continue;
+                };
+                let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
+                    continue;
+                };
+                let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
+                    continue;
+                };
+                let mut one = VersionVector::new();
+                one.insert(node, Hlc::from_bytes(bytes));
+                union.merge(&one);
             }
-            Ok(true)
-        })
+        }
+        Ok(true)
     })?;
     Ok(union)
 }
@@ -264,7 +263,8 @@ pub fn forget_progress(state: &SharedState, subscription: &str) {
     };
     let prefix = format!("{subscription}:");
     let mut stale = Vec::new();
-    // Off the async worker, as the dispatcher's own reads of it are (ADR-199).
+    // The walk is subscriptions times members, and subscriptions are a
+    // client's to add: off the async worker (ADR-199).
     let listed = kimmy_storage::blocking(|| {
         state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
             if let Ok(id) = document.get_str("_id")
@@ -614,53 +614,52 @@ pub struct SubscriptionCounts {
 /// other subscription still loads. The scrape counts it as `unreadable`. A
 /// record missing a field is still skipped, silently; that is a delivery
 /// defect of its own and is not changed here.
+///
+/// A walk of the registry: the dispatcher calls it inside the plan's
+/// `blocking` (ADR-199).
 fn load_jobs(state: &SharedState) -> kimmy_storage::Result<Vec<Job>> {
     let Some(meta) = registry(&state.engine)? else {
         return Ok(Vec::new());
     };
     let mut jobs = Vec::new();
-    // Off the async worker, as the scrape's count of the same registry is
-    // (ADR-199).
-    kimmy_storage::blocking(|| {
-        state.engine.for_each_doc_or_undecodable(
-            &meta,
-            kimmy_storage::WalkScope::Background,
-            |key, document| {
-                let Some(document) = document else {
-                    let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
-                    warn!(record = %key, "a webhook registry record does not decode; it is skipped");
-                    return Ok(true);
-                };
-                let (Ok(id), Ok(url), Ok(secret), Ok(db), Ok(coll)) = (
-                    document.get_str("_id"),
-                    document.get_str("url"),
-                    document.get_str("secret"),
-                    document.get_str("database"),
-                    document.get_str("collection"),
-                ) else {
-                    return Ok(true);
-                };
-                // Derived rather than stored, so a collection dropped and recreated
-                // under the same name keeps working — ids come from the name (ADR-031).
-                let collection_id = kimmy_core::ids::CollectionId::derive(db, coll).0;
-                let operations = document
-                    .get_array("operations")
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                    .unwrap_or_default();
-                jobs.push(Job {
-                    id: id.to_string(),
-                    url: url.to_string(),
-                    secret: secret.to_string(),
-                    database: db.to_string(),
-                    collection: coll.to_string(),
-                    collection_id,
-                    operations,
-                    invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
-                });
-                Ok(true)
-            },
-        )
-    })?;
+    state.engine.for_each_doc_or_undecodable(
+        &meta,
+        kimmy_storage::WalkScope::Background,
+        |key, document| {
+            let Some(document) = document else {
+                let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                warn!(record = %key, "a webhook registry record does not decode; it is skipped");
+                return Ok(true);
+            };
+            let (Ok(id), Ok(url), Ok(secret), Ok(db), Ok(coll)) = (
+                document.get_str("_id"),
+                document.get_str("url"),
+                document.get_str("secret"),
+                document.get_str("database"),
+                document.get_str("collection"),
+            ) else {
+                return Ok(true);
+            };
+            // Derived rather than stored, so a collection dropped and recreated
+            // under the same name keeps working — ids come from the name (ADR-031).
+            let collection_id = kimmy_core::ids::CollectionId::derive(db, coll).0;
+            let operations = document
+                .get_array("operations")
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            jobs.push(Job {
+                id: id.to_string(),
+                url: url.to_string(),
+                secret: secret.to_string(),
+                database: db.to_string(),
+                collection: coll.to_string(),
+                collection_id,
+                operations,
+                invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
+            });
+            Ok(true)
+        },
+    )?;
     Ok(jobs)
 }
 
@@ -703,168 +702,178 @@ pub async fn dispatch_once(
     let now_ms = kimmy_storage::physical_now_ms();
 
     // --- Phase 1: plan, serially -------------------------------------------
-    let jobs = match load_jobs(state) {
-        Ok(jobs) => jobs,
-        Err(kimmy_storage::StorageError::Stopping(reason)) => {
-            debug!(%reason, "webhook dispatch ended: this node is shutting down");
-            return outcome;
-        }
-        Err(e) => {
-            // Nothing is written: no backlog and no progress, so the
-            // dispatcher's age goes on rising until a pass can read the
-            // registry again.
-            warn!(error = %e, "could not read the webhook registry; nothing was dispatched");
-            return outcome;
-        }
-    };
-    backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
     // Any read in the plan that failed. The pass still delivers what it could
     // plan, but it reports neither a backlog nor progress: a subscription whose
     // read failed was not measured, and a backlog without it would be a
     // healthy value after a failed read (ADR-187).
     let mut read_failed = false;
-    for job in jobs {
-        if !crate::ownership::owns(&job.id, me, members) {
-            outcome.skipped_not_owner += 1;
-            continue;
-        }
-        if job.invalidated {
-            continue;
-        }
-
-        let mut progress = match union_progress(state, &job.id) {
-            Ok(progress) => progress,
-            // The node is stopping: the pass ends quietly, planning nothing
-            // from a union it did not finish reading.
+    // Off the async worker, whole (ADR-199): the registry, each
+    // subscription's progress and its oplog window are walks, subscriptions
+    // are a client's to add, and the plan awaits nothing, so one hand-off
+    // covers it. `true` when the pass ends here.
+    let ended = kimmy_storage::blocking(|| {
+        let jobs = match load_jobs(state) {
+            Ok(jobs) => jobs,
             Err(kimmy_storage::StorageError::Stopping(reason)) => {
                 debug!(%reason, "webhook dispatch ended: this node is shutting down");
-                return outcome;
-            }
-            // Not measured, and not planned: a lower union than the truth
-            // could invalidate a subscription that is not behind.
-            Err(e) => {
-                warn!(subscription = %job.id, error = %e, "could not read a subscription's progress");
-                read_failed = true;
-                continue;
-            }
-        };
-        // `behind` answers "from where must I read", which is the same question
-        // anti-entropy asks of a peer. `None` means the subscription's progress
-        // already covers everything this node holds — it is caught up, and
-        // there is nothing to read, invalidate or deliver.
-        let current = match state.engine.version_vector() {
-            Ok(current) => current,
-            Err(e) => {
-                warn!(subscription = %job.id, error = %e, "could not read this node's version vector");
-                read_failed = true;
-                continue;
-            }
-        };
-        let Some(from) = progress.behind(&current) else {
-            continue;
-        };
-
-        // Backoff is checked after the progress read but before the oplog scan
-        // and the delivery. Reading a small system collection is not what one
-        // dead endpoint must not cost the others; dialling it is.
-        if !backoff.ready(&job.id) {
-            // Counted as backlog even though the scan is skipped: a
-            // subscription is only in backoff because a delivery carrying
-            // events just failed, so it is precisely the one falling behind.
-            // The resume point's age is the honest approximation available
-            // without reading the oplog.
-            backlog_ms = backlog_ms.max(now_ms.saturating_sub(from.wall_ms));
-            outcome.skipped_backoff += 1;
-            continue;
-        }
-
-        // The events this subscription still needs may have been collected.
-        // `from` is where it must resume; if that is behind the retention
-        // horizon, the range no longer exists anywhere.
-        if let Ok(horizon) = state.engine.oplog_collected_through()
-            && horizon > Hlc::ZERO
-            && from < horizon
-        {
-            invalidate(
-                state,
-                &job.id,
-                "delivery fell behind storage.oplog_retention_secs; the events it had not \
-                 delivered have been collected",
-            );
-            outcome.invalidated += 1;
-            continue;
-        }
-
-        // Off the async worker (ADR-199): a window can pass over far more of
-        // the oplog than it returns.
-        let scanned = match kimmy_storage::blocking(|| {
-            state.engine.entries_for_peer(from, BATCH * 4, kimmy_storage::WalkScope::Background)
-        }) {
-            Ok(window) => window.entries,
-            // The node is stopping: the pass ends quietly, and the next
-            // start's delivers what this one did not.
-            Err(kimmy_storage::StorageError::Stopping(reason)) => {
-                debug!(%reason, "webhook dispatch ended: this node is shutting down");
-                return outcome;
+                return true;
             }
             Err(e) => {
-                warn!(subscription = %job.id, error = %e, "could not read the oplog for a subscription");
-                read_failed = true;
-                continue;
+                // Nothing is written: no backlog and no progress, so the
+                // dispatcher's age goes on rising until a pass can read the
+                // registry again.
+                warn!(error = %e, "could not read the webhook registry; nothing was dispatched");
+                return true;
             }
         };
-        let batch: Vec<OplogEntry> = scanned
-            .iter()
-            .filter(|e| wanted(e, job.collection_id, &job.operations))
-            .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
-            .take(BATCH)
-            .cloned()
-            .collect();
+        backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
+        for job in jobs {
+            if !crate::ownership::owns(&job.id, me, members) {
+                outcome.skipped_not_owner += 1;
+                continue;
+            }
+            if job.invalidated {
+                continue;
+            }
 
-        if batch.is_empty() {
-            // Nothing here was this subscription's — every entry belonged to
-            // another collection or another operation. Progress still advances
-            // over them, because deciding an entry is not yours *is* the work,
-            // and a position that never moves is one the retention horizon
-            // eventually overtakes. A webhook on a quiet collection in a busy
-            // database would otherwise be invalidated for falling behind events
-            // it was never going to be sent.
-            //
-            // Safe by construction: `scanned` is contiguous from `from`, and
-            // nothing in it matched `wanted`, so nothing deliverable is being
-            // stepped over.
-            //
-            // Written forward on a heartbeat rather than every pass. Recording
-            // progress is itself a write, so it appends the very entry the next
-            // pass reads; doing it every tick would have an idle node writing
-            // to the oplog — and replicating it — every two seconds forever.
-            // Once a minute is far more often than retention needs and rare
-            // enough to cost nothing. See `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
-            let stale =
-                now_ms.saturating_sub(from.wall_ms) >= limits.progress_heartbeat.as_millis() as u64;
-            if stale {
-                for entry in &scanned {
-                    progress.observe(entry.stamp);
+            let mut progress = match union_progress(state, &job.id) {
+                Ok(progress) => progress,
+                // The node is stopping: the pass ends quietly, planning nothing
+                // from a union it did not finish reading.
+                Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                    debug!(%reason, "webhook dispatch ended: this node is shutting down");
+                    return true;
                 }
-                if let Err(e) = record_progress(state, &job.id, &progress) {
-                    warn!(subscription = %job.id, error = %e, "could not record webhook progress");
+                // Not measured, and not planned: a lower union than the truth
+                // could invalidate a subscription that is not behind.
+                Err(e) => {
+                    warn!(subscription = %job.id, error = %e, "could not read a subscription's progress");
+                    read_failed = true;
+                    continue;
                 }
+            };
+            // `behind` answers "from where must I read", which is the same question
+            // anti-entropy asks of a peer. `None` means the subscription's progress
+            // already covers everything this node holds — it is caught up, and
+            // there is nothing to read, invalidate or deliver.
+            let current = match state.engine.version_vector() {
+                Ok(current) => current,
+                Err(e) => {
+                    warn!(subscription = %job.id, error = %e, "could not read this node's version vector");
+                    read_failed = true;
+                    continue;
+                }
+            };
+            let Some(from) = progress.behind(&current) else {
+                continue;
+            };
+
+            // Backoff is checked after the progress read but before the oplog scan
+            // and the delivery. Reading a small system collection is not what one
+            // dead endpoint must not cost the others; dialling it is.
+            if !backoff.ready(&job.id) {
+                // Counted as backlog even though the scan is skipped: a
+                // subscription is only in backoff because a delivery carrying
+                // events just failed, so it is precisely the one falling behind.
+                // The resume point's age is the honest approximation available
+                // without reading the oplog.
+                backlog_ms = backlog_ms.max(now_ms.saturating_sub(from.wall_ms));
+                outcome.skipped_backoff += 1;
+                continue;
             }
-            continue;
-        }
 
-        // Backlog is the age of the oldest event this subscription has **not
-        // delivered**, and it is only measured here — where there demonstrably
-        // is one. Deriving it from the resume point instead would have an idle,
-        // fully caught-up subscription report a backlog that grows with the
-        // clock, which is an alert firing for a webhook that is working.
-        if let Some(oldest) = batch.first() {
-            backlog_ms = backlog_ms.max(now_ms.saturating_sub(oldest.stamp.hlc.wall_ms));
-        }
+            // The events this subscription still needs may have been collected.
+            // `from` is where it must resume; if that is behind the retention
+            // horizon, the range no longer exists anywhere.
+            if let Ok(horizon) = state.engine.oplog_collected_through()
+                && horizon > Hlc::ZERO
+                && from < horizon
+            {
+                invalidate(
+                    state,
+                    &job.id,
+                    "delivery fell behind storage.oplog_retention_secs; the events it had not \
+                     delivered have been collected",
+                );
+                outcome.invalidated += 1;
+                continue;
+            }
 
-        let delivery = assemble(&job, &batch, limits.max_payload_bytes);
-        let events = delivery.stamps.len();
-        planned.push(Planned { job, progress, delivery, events });
+            let scanned = match state.engine.entries_for_peer(
+                from,
+                BATCH * 4,
+                kimmy_storage::WalkScope::Background,
+            ) {
+                Ok(window) => window.entries,
+                // The node is stopping: the pass ends quietly, and the next
+                // start's delivers what this one did not.
+                Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                    debug!(%reason, "webhook dispatch ended: this node is shutting down");
+                    return true;
+                }
+                Err(e) => {
+                    warn!(subscription = %job.id, error = %e, "could not read the oplog for a subscription");
+                    read_failed = true;
+                    continue;
+                }
+            };
+            let batch: Vec<OplogEntry> = scanned
+                .iter()
+                .filter(|e| wanted(e, job.collection_id, &job.operations))
+                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .take(BATCH)
+                .cloned()
+                .collect();
+
+            if batch.is_empty() {
+                // Nothing here was this subscription's — every entry belonged to
+                // another collection or another operation. Progress still advances
+                // over them, because deciding an entry is not yours *is* the work,
+                // and a position that never moves is one the retention horizon
+                // eventually overtakes. A webhook on a quiet collection in a busy
+                // database would otherwise be invalidated for falling behind events
+                // it was never going to be sent.
+                //
+                // Safe by construction: `scanned` is contiguous from `from`, and
+                // nothing in it matched `wanted`, so nothing deliverable is being
+                // stepped over.
+                //
+                // Written forward on a heartbeat rather than every pass. Recording
+                // progress is itself a write, so it appends the very entry the next
+                // pass reads; doing it every tick would have an idle node writing
+                // to the oplog — and replicating it — every two seconds forever.
+                // Once a minute is far more often than retention needs and rare
+                // enough to cost nothing. See `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
+                let stale = now_ms.saturating_sub(from.wall_ms)
+                    >= limits.progress_heartbeat.as_millis() as u64;
+                if stale {
+                    for entry in &scanned {
+                        progress.observe(entry.stamp);
+                    }
+                    if let Err(e) = record_progress(state, &job.id, &progress) {
+                        warn!(subscription = %job.id, error = %e, "could not record webhook progress");
+                    }
+                }
+                continue;
+            }
+
+            // Backlog is the age of the oldest event this subscription has **not
+            // delivered**, and it is only measured here — where there demonstrably
+            // is one. Deriving it from the resume point instead would have an idle,
+            // fully caught-up subscription report a backlog that grows with the
+            // clock, which is an alert firing for a webhook that is working.
+            if let Some(oldest) = batch.first() {
+                backlog_ms = backlog_ms.max(now_ms.saturating_sub(oldest.stamp.hlc.wall_ms));
+            }
+
+            let delivery = assemble(&job, &batch, limits.max_payload_bytes);
+            let events = delivery.stamps.len();
+            planned.push(Planned { job, progress, delivery, events });
+        }
+        false
+    });
+    if ended {
+        return outcome;
     }
 
     if !read_failed {

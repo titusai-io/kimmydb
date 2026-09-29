@@ -103,10 +103,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   The pass ran on one of the async runtime's workers, and while it walked a TTL
   index's expired range, that worker ran nothing else. On the member that owned
   the TTL collections, the stop signal was measured arriving up to 0.74 s late.
-  The pass, the webhook dispatcher's reads of its registry, progress and oplog,
-  the `unkeyed` and `undecidable` counts in index listings, the webhook listing,
-  and vector search's exact and keyword scans now run off the worker, as request
-  scans have since ADR-153. Nothing they return changes
+  The pass, the webhook dispatcher's plan, the `unkeyed` and `undecidable`
+  counts in index listings, the webhook listing, the match of an `update`,
+  `delete` or `find_and_modify` that scans the collection, and vector search's
+  exact and keyword scans now run off the worker, as read scans have since
+  ADR-153. Nothing they return changes
   ([ADR-199](docs/decisions.md)).
 
 ## 0.42.0 - 2026-09-29

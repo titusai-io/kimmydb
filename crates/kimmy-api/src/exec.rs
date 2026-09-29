@@ -1184,7 +1184,12 @@ pub fn update(
         now: now_millis(),
         expected,
     };
-    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
+    // A scan's candidates, and a multikey range's fallback, are the whole
+    // collection walked in the write transaction: off the async worker
+    // (ADR-199).
+    let outcome = kimmy_storage::blocking(|| {
+        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
+    })?;
 
     let mut body = json!({
         "matched": outcome.matched,
@@ -1432,7 +1437,10 @@ pub fn find_and_modify(
         expected,
     };
 
-    let outcome = state.engine.find_and_modify(&meta, &candidates, &modify)?;
+    // As `update`'s: a scan walks the collection in the write transaction
+    // (ADR-199).
+    let outcome =
+        kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
 
     let returned = match spec.return_document {
         ReturnDocument::Before => outcome.before.clone(),
@@ -1494,7 +1502,12 @@ pub fn delete(
         now: now_millis(),
         expected,
     };
-    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
+    // A scan's candidates, and a multikey range's fallback, are the whole
+    // collection walked in the write transaction: off the async worker
+    // (ADR-199).
+    let outcome = kimmy_storage::blocking(|| {
+        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
+    })?;
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {

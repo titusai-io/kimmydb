@@ -12366,6 +12366,11 @@ for the frame each side of an upgrade sees; and by the existing
 real loop, which now pull one collection.
 ## ADR-153 — A read's walk runs under `block_in_place`; a primary-key probe stays on the worker
 
+> **Extended by [ADR-199](#adr-199--a-background-tasks-storage-walk-runs-under-blocking-its-point-reads-stay-on-the-worker).**
+> A background task's storage walk runs under `blocking` too, and its point
+> reads stay on the worker. The same audit took the index counts, the write
+> path's scan, the webhook listings and the vector scans off the worker.
+
 **Decision.** The two walking access paths of `exec::visit_matching` — an
 index range through `visit_index_candidates` and the collection through
 `for_each_record_after` — run inside `kimmy_storage::blocking`, the same
@@ -12554,8 +12559,9 @@ the oplog. It is a format decision, and is not taken here.
 is not inside the parentheses of a `blocking(` call, followed by bracket depth
 so a closure of any length is seen through. Walks bounded by
 something other than client data are counted per file, each with its reason:
-the webhook registry and delivery bookkeeping, the node registry,
-`sample_documents` at its limit, and the vector emptiness check. The check is
+the node registry, `sample_documents` at its limit, and the vector emptiness
+check. The webhook registry and delivery bookkeeping were counted here as well,
+until ADR-199 took them off the worker. The check is
 textual, and it reads the request crates only: a walk reached through a
 helper whose name is not on its list is not seen, and neither is a walk in
 `kimmy-cluster`, whose two are listed above. That is the limit of what it
@@ -21397,7 +21403,6 @@ after SIGHUP, read from a handshake. A failure before the open without the
 directory lock leaves the marker as it was. Each guard was broken and its test
 failed. Each guard was broken and its test failed.
 
-
 ## ADR-199 — A background task's storage walk runs under `blocking`; its point reads stay on the worker
 
 Extends
@@ -21421,14 +21426,17 @@ measurable fraction of one page read, and nothing to a walk.
 - **The TTL pass** runs whole under `blocking` in `expiry::run`. The pass is
   walks and deletes with nothing to await, and it runs once an interval, so one
   hand-off covers it.
-- **The webhook dispatcher** wraps each read on its own: the registry
-  (`load_jobs`), a subscription's progress records (`union_progress`) and its
-  oplog window (`entries_for_peer`). The delivery between those reads awaits
-  the network, which cannot run inside `blocking`. ADR-153's guard had allowed
-  the first two as bounded by subscriptions times members. But subscriptions
-  are a client's to add, which is why the scrape's count of the same registry
-  was already under `blocking` (ADR-187). And a window can pass over far more
-  of the oplog than it returns.
+- **The webhook dispatcher's plan** runs whole under `blocking` in
+  `dispatch_once`. The plan reads the registry (`load_jobs`), then each owned
+  subscription's progress records (`union_progress`) and oplog window
+  (`entries_for_peer`), and it awaits nothing: every delivery is in the phase
+  after it. So one hand-off covers the plan, the heartbeat's progress writes
+  and the invalidations included. The apply phase's progress writes stay on the
+  worker, one document each, as ADR-153's addendum leaves document writes.
+  ADR-153's guard had allowed the two walks as bounded by subscriptions times
+  members. But subscriptions are a client's to add, which is why the scrape's
+  count of the same registry was already under `blocking` (ADR-187). And a
+  window can pass over far more of the oplog than it returns.
 
 The same audit, over every walk reached from async code in `kimmy-api`,
 `kimmy-mcp`, `kimmy-vector` and `kimmyd`, found request paths that ADR-153 and
@@ -21439,6 +21447,13 @@ its addenda missed. Each now runs under `blocking`:
   index, which can be the whole collection.
 - **A webhook listing** reads the whole registry, and **a webhook removal**
   lists its progress records.
+- **An `update`, a `delete` and a `find_and_modify`** match inside their write
+  transaction (`Engine::modify_where`, `Engine::find_and_modify`). With no
+  usable index, or on a multikey range's fallback, the match is a walk of the
+  whole collection, and only the wait for the writer was under `blocking`. The
+  call now runs whole under `blocking` in `exec`, which covers the routes and
+  the MCP tools alike. `begin_write`'s own `blocking` inside it then runs
+  inline.
 - **A vector search with no graph to use** scores every stored vector, and
   **hybrid search's keyword half** tokenizes every stored chunk. ADR-153 moved
   the filter's candidate page off the worker, but not these scans.
@@ -21455,27 +21470,46 @@ Left on the worker, each bounded by something other than client data:
 - the vector emptiness check;
 - a keyed search's read of each admitted document's chunks;
 - `only_live`'s stamps;
-- the dispatcher's metadata and version-vector reads.
+- the catalogue listings, `list_databases` and `list_collections`, in the
+  `exec` listings, the metrics readings and the MCP resource list. They are
+  metadata-sized, and grow only with the databases and collections clients
+  create.
 
 **Alternatives.**
 
-- *A dedicated thread for the TTL loop.* Rejected: the dispatcher cannot move
-  there, because it awaits deliveries between its reads, and one rule for both
-  tasks is easier to hold to than two.
+- *A dedicated thread for each loop.* Rejected: the dispatcher awaits its
+  deliveries, so it would need a runtime of its own on that thread, and a
+  wrap around its plan is the same one line the TTL pass takes. One mechanism
+  is easier to hold to than two.
+- *A wrap per dispatcher read.* The first form of this change did that: one
+  hand-off for the registry and up to two per owned subscription. The plan has
+  no await in it, so one wrap does the same work with one hand-off.
 - *Wrapping inside `Engine::expire_documents`.* Not taken: it has one caller,
   and wrapping the pass also takes its catalogue listing off the worker. The
   storage crate wraps `watch` and `ChangeStream::next` itself because they have
   callers in two crates.
 
-**Cost.** One thread hand-off per TTL pass. A dispatcher pass makes one for
-the registry, then one or two for each subscription it owns.
+**Cost.** One thread hand-off per TTL pass, one per dispatcher pass, and one
+per `update`, `delete` and `find_and_modify`. For a write that matches by
+`_id`, the last is not an extra one: it moves the hand-off `begin_write`
+already made to before the match, and the inner one then runs inline.
 
-**The guard.** `walks_leave_the_worker.rs` now also looks for
-`.unkeyed_count(`, `.undecidable_count(`, `.entries_for_peer(`,
-`::vector_search(` and `::keyword_search(`. It no longer allows `webhooks.rs`
-and `dispatch.rs` their bounded walks. The guard is textual, and `pass` reaches
-`expire_documents` through a function call it does not follow, so the test
-below covers the TTL pass instead.
+**The guard.** `walks_leave_the_worker.rs` now also reads `kimmyd`, and it
+looks for more calls:
+- `.unkeyed_count(` and `.undecidable_count(`;
+- every form of `.entries_for_peer` and `.read_oplog_`;
+- `.for_each_vector(`;
+- `.modify_where(` and `.find_and_modify(`;
+- `vector_search(` and `keyword_search(` as calls, not as definitions.
+
+It no longer allows `webhooks.rs` its walk. Its allowances now include walks
+covered at a caller it does not follow, each with its reason:
+- `load_jobs` and `union_progress`, which run inside the dispatcher's plan;
+- the vector graph build and `count_vectors`, inside `IndexCache::access`;
+- the bodies of the two vector scans, whose calls it checks.
+
+The guard is textual, and `pass` reaches `expire_documents` through a function
+call it does not follow, so the test below covers the TTL pass instead.
 
 **Test.** `crates/kimmy-api/tests/expiry_off_worker.rs` runs `expiry::run` on a
 one-worker runtime over 200 expired documents, with each walked row slowed to
