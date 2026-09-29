@@ -8,8 +8,9 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
+use crate::aggregate::group_key;
 use crate::filter::{self, Filter};
 use crate::path;
 use crate::shape::{self, SortKey};
@@ -818,10 +819,12 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
 
         OpKind::AddToSet(values) => {
             let mut items = as_array(&current, &op.path)?;
+            // Members are identified as `$group` identifies a bucket, not by
+            // the canonical order: a stored `Decimal128` ranks equal to every
+            // number there, so it would swallow the add (ADR-186).
+            let mut keys: HashSet<Vec<u8>> = items.iter().map(group_key).collect();
             for value in values {
-                let present =
-                    items.iter().any(|item| canonical_cmp(item, value) == Ordering::Equal);
-                if !present {
+                if keys.insert(group_key(value)) {
                     items.push(value.clone());
                 }
             }
@@ -1932,6 +1935,27 @@ mod decimal128 {
         let add = parse(&doc! { "$addToSet": { "xs": { "$each": [3, 9.9] } } }).unwrap();
         apply(&add, &mut d, 0).unwrap();
         assert_eq!(d.get_array("xs").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn add_to_set_identifies_members_as_group_does_against_stored_elements() {
+        // A stored `Decimal128` ranks equal to every number in the canonical
+        // order, so the 5 was judged present and dropped (ADR-186).
+        let mut d = doc! { "_id": 1, "t": [dec("1")] };
+        let add = parse(&doc! { "$addToSet": { "t": 5 } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("t").unwrap(), &vec![dec("1"), Bson::Int32(5)]);
+        // One number in another width is still the same member.
+        let mut d = doc! { "_id": 1, "t": [1] };
+        let add = parse(&doc! { "$addToSet": { "t": 1.0 } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("t").unwrap(), &vec![Bson::Int32(1)]);
+        // Members of one `$each` are de-duplicated against each other too.
+        let mut d = doc! { "_id": 1, "t": [] };
+        let add = parse(&doc! { "$addToSet": { "t": { "$each": [f64::NAN, f64::NAN, 2, 2.0] } } })
+            .unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("t").unwrap().len(), 2);
     }
 
     #[test]
