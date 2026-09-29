@@ -22,7 +22,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - **`kimmy_sync_serve_walk_path_total{path,walk}`** counts the windows a member
   served by the kind of request (`walk`: `serve`, a peer's pull, or `push`, the
   push a schema change's confirmation makes) and by the path that read them
-  (`keys`, `linear`, `fallback_length`, `fallback_missing_body`;
+  (`keys`, `linear`, `fallback_length`, `fallback_missing_body`,
+  `fallback_error`;
   [docs/operations.md](docs/operations.md)). A nonzero fallback is a bug or
   damage, and is logged. `KIMMY_TEST_SERVE_WALK_PATH=linear`
   is a test switch that reads every window the old way.

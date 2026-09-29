@@ -875,6 +875,14 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.fallback_error",
+            "{window}",
+            "Windows served by a peer pull that were read by the `fallback_error` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::FallbackError.slot()]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.serve_walk_path.push.keys",
             "{window}",
             "Windows served by a confirmation push that were read by the `keys` path.",
@@ -904,6 +912,14 @@ impl TelemetryGuard {
             "Windows served by a confirmation push that were read by the `fallback_missing_body` path.",
             |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
                 [kimmy_storage::WalkPath::FallbackMissingBody.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.fallback_error",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `fallback_error` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::FallbackError.slot()]
         );
         observe!(
             u64_observable_counter,

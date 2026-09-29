@@ -6850,6 +6850,7 @@ mod partial_windows_never_skip {
         if at(kimmy_storage::WalkPath::Keys) == 0
             || at(kimmy_storage::WalkPath::FallbackLength) != 0
             || at(kimmy_storage::WalkPath::FallbackMissingBody) != 0
+            || at(kimmy_storage::WalkPath::FallbackError) != 0
         {
             return Err(format!("the windows were not all read by the key walk: {paths:?}"));
         }

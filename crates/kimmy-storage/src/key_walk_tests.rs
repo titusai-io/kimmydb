@@ -607,9 +607,8 @@ fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
             .unwrap()
     };
     assert_eq!(served, expected, "the serve is the linear window");
-    let slot = |s: &crate::ServeSnapshot| {
-        s.paths[ServeWalk::Serve.slot()][WalkPath::FallbackMissingBody.slot()]
-    };
+    let slot =
+        |s: &crate::ServeSnapshot| s.paths[ServeWalk::Serve.slot()][WalkPath::FallbackError.slot()];
     assert_eq!(slot(&after) - slot(&before), 1);
 }
 
@@ -645,4 +644,289 @@ fn the_linear_walk_after_a_fallback_has_only_the_time_that_was_left() {
     let (left, _) = crate::sync::after_attempt(budget, Duration::from_secs(9)).unwrap();
     assert_eq!(left.time, Duration::ZERO);
     assert!(crate::sync::after_attempt(None, Duration::from_secs(1)).is_none());
+}
+
+// -- The repair keeps positions (ADR-197) ------------------------------------
+
+fn arrival_positions(engine: &Engine) -> Vec<(u64, Vec<u8>)> {
+    let txn = engine.db().begin_read().unwrap();
+    let arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+    redb::ReadableTable::iter(&arrival)
+        .unwrap()
+        .map(|row| {
+            let (seq, key) = row.unwrap();
+            (seq.value(), key.value().to_vec())
+        })
+        .collect()
+}
+
+/// Rows in arrival order whose stamp order is not: entries relayed late, with
+/// a lower stamp than the local ones that came before them.
+fn relayed_late() -> Vec<Row> {
+    let at = [0u64, 1, 2, 3, 4, 5, 6, 7, 2, 4, 8, 9, 3, 10, 11, 12];
+    at.iter()
+        .enumerate()
+        .map(|(i, at)| Row { origin: if i < 8 { 0 } else { 1 + i % 3 }, at: *at, violation: false })
+        .collect()
+}
+
+/// A store whose arrival index the counts cannot see is wrong: a position
+/// missing (and its stamp half), a stray position, a second position naming a
+/// stamp, and a stray key in the stamp half. Returns the store's path and
+/// the positions before the damage.
+fn damaged_store(
+    dir: &tempfile::TempDir,
+    rows: &[Row],
+) -> (std::path::PathBuf, Vec<(u64, Vec<u8>)>) {
+    let path = dir.path().join("kimmy.redb");
+    let engine = Engine::open(&path).unwrap();
+    write(&engine, rows);
+    let before = arrival_positions(&engine);
+    let txn = engine.begin_write(WriterHolder::Write).unwrap();
+    {
+        let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+        let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+        // Lost from the index, both halves: the middle of the order.
+        let lost = codec::oplog_key(&stamp_of(&rows[10]));
+        let lost_seq = by_stamp.remove(lost.as_slice()).unwrap().unwrap().value();
+        assert!(arrival.remove(lost_seq).unwrap().is_some());
+        // A position for an entry the oplog does not hold, beyond the end.
+        let gone = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+        arrival.insert(5_003u64, gone.as_slice()).unwrap();
+        by_stamp.insert(gone.as_slice(), 5_003u64).unwrap();
+        // A second position naming a stamp that has one.
+        let named = codec::oplog_key(&stamp_of(&rows[2]));
+        arrival.insert(5_001u64, named.as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    engine.close().unwrap();
+    (path, before)
+}
+
+/// The repair is not a renumbering: arrival order and every surviving position
+/// are what they were; a stray and a duplicate position are dropped; the entry
+/// the index lost takes the next position past the highest ever issued.
+#[test]
+fn the_repair_keeps_every_surviving_position_and_appends_what_the_index_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = relayed_late();
+    let (path, before) = damaged_store(&dir, &rows);
+    let engine = crate::verified::test_support::forcing(|| Engine::open(&path).unwrap());
+    let after = arrival_positions(&engine);
+
+    let lost = codec::oplog_key(&stamp_of(&rows[10]));
+    let mut expected: Vec<(u64, Vec<u8>)> =
+        before.iter().filter(|(_, k)| k.as_slice() != lost.as_slice()).cloned().collect();
+    expected.push((5_004, lost.to_vec()));
+    assert_eq!(after, expected);
+    assert!(
+        before.windows(2).any(|w| w[0].1 > w[1].1),
+        "premise: arrival order is not stamp order in this store"
+    );
+
+    // Both halves are the oplog's, and agree with each other.
+    let txn = engine.db().begin_read().unwrap();
+    let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+    let oplog = txn.open_table(tables::OPLOG).unwrap();
+    for (seq, key) in &after {
+        assert_eq!(by_stamp.get(key.as_slice()).unwrap().unwrap().value(), *seq);
+        assert!(oplog.get(key.as_slice()).unwrap().is_some());
+    }
+    assert_eq!(redb::ReadableTableMetadata::len(&by_stamp).unwrap(), after.len() as u64);
+    assert_eq!(redb::ReadableTableMetadata::len(&oplog).unwrap(), after.len() as u64);
+}
+
+/// A store from before the index existed has no positions: every entry takes
+/// one in stamp order, from 0.
+#[test]
+fn a_store_with_no_arrival_index_is_numbered_in_stamp_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let rows: Vec<Row> =
+        (0..20u64).map(|i| Row { origin: (i % 3) as usize, at: i, violation: false }).collect();
+    {
+        let engine = Engine::open(&path).unwrap();
+        write(&engine, &rows);
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        {
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+            for row in &rows {
+                let key = codec::oplog_key(&stamp_of(row));
+                let seq = by_stamp.remove(key.as_slice()).unwrap().unwrap().value();
+                arrival.remove(seq).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        engine.close().unwrap();
+    }
+    let engine = Engine::open(&path).unwrap();
+    let positions = arrival_positions(&engine);
+    assert_eq!(positions.len(), rows.len());
+    assert!(positions.iter().enumerate().all(|(i, (seq, _))| *seq == i as u64));
+    assert!(positions.windows(2).all(|w| w[0].1 < w[1].1), "in stamp order");
+}
+
+/// A change stream resumed from a token at a stamp reads on from that stamp's
+/// position; an entry relayed after it (with a lower stamp) must still be
+/// delivered once the index has been repaired.
+#[tokio::test]
+async fn a_stream_resumed_after_the_repair_still_delivers_the_relayed_entry() {
+    use crate::watch::{ChangeEvent, WatchOptions, WatchScope};
+    use kimmy_core::ResumeToken;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let (token, coll_id, relayed_id) = {
+        let engine = Engine::open(&path).unwrap();
+        let coll = engine.create_collection("app", "docs").unwrap();
+        for n in 0..3i64 {
+            engine.insert(&coll, bson::doc! { "_id": n }).unwrap();
+        }
+        let local = engine.read_arrival_from(0, 100).unwrap().pop().unwrap().stamp;
+        // Relayed after the local writes, stamped long before them.
+        let relayed = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), node(2)),
+            kind: OpKind::Insert,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 99i64 }).unwrap()),
+        };
+        assert!(engine.apply_remote(&coll, &relayed).unwrap());
+        // Damage the index the way the counts cannot see.
+        let victim = engine.read_arrival_from(0, 100).unwrap()[0].stamp;
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        {
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+            assert!(by_stamp.remove(codec::oplog_key(&victim).as_slice()).unwrap().is_some());
+            let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+            by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
+        }
+        txn.commit().unwrap();
+        let token = ResumeToken::from_stamp(local);
+        engine.close().unwrap();
+        (token, coll.id, 99i64)
+    };
+    let engine = crate::verified::test_support::forcing(|| Engine::open(&path).unwrap());
+    let mut stream = engine
+        .watch(
+            WatchScope::Collection(coll_id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        )
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next(&engine))
+        .await
+        .expect("the relayed entry is delivered")
+        .expect("the stream is open");
+    match event {
+        ChangeEvent::Change { entry, .. } => {
+            assert_eq!(entry.doc_id, Some(kimmy_core::DocId::Int64(relayed_id)));
+        }
+        other => panic!("expected the relayed change, got {other:?}"),
+    }
+}
+
+/// The record says the vector is verified, so it is written only after the
+/// repair has committed: a failure inside the repair or just after it leaves no
+/// record, and the next open walks and repairs again. The damage is what the
+/// counts cannot see, so the verification walk is what finds it.
+#[test]
+fn no_record_is_written_until_the_repair_has_committed() {
+    let rows = relayed_late();
+    let stamp_half = |engine: &Engine| -> Vec<Vec<u8>> {
+        let txn = engine.db().begin_read().unwrap();
+        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+        redb::ReadableTable::iter(&by_stamp)
+            .unwrap()
+            .map(|r| r.unwrap().0.value().to_vec())
+            .collect()
+    };
+    for after_commit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (damaged, oplog_keys) = {
+            let engine = Engine::open(&path).unwrap();
+            write(&engine, &rows);
+            let txn = engine.begin_write(WriterHolder::Write).unwrap();
+            {
+                let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+                let key = codec::oplog_key(&stamp_of(&rows[10]));
+                assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
+                let stray = codec::oplog_key(&Stamp::new(at(9_000), node(3)));
+                by_stamp.insert(stray.as_slice(), 999_999u64).unwrap();
+            }
+            txn.commit().unwrap();
+            let damaged = stamp_half(&engine);
+            let txn = engine.db().begin_read().unwrap();
+            let oplog_keys: Vec<Vec<u8>> =
+                redb::ReadableTable::iter(&txn.open_table(tables::OPLOG).unwrap())
+                    .unwrap()
+                    .map(|r| r.unwrap().0.value().to_vec())
+                    .collect();
+            drop(txn);
+            engine.close().unwrap();
+            (damaged, oplog_keys)
+        };
+        assert_ne!(damaged, oplog_keys, "premise: the stamp half is damaged");
+        let schema = crate::migrate::SCHEMA_VERSION;
+        // Nothing says the vector is verified, so the open walks.
+        {
+            let db = redb::Database::open(&path).unwrap();
+            crate::verified::test_support::write_raw(&db, &[]);
+            assert!(crate::verified::read_db(&db, schema).unwrap().is_none());
+        }
+
+        let failed = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                if after_commit {
+                    crate::verified::test_support::fail_after_the_arrival_repair();
+                } else {
+                    crate::index::clear_hooks::keep_keys_of("the arrival index by stamp");
+                }
+                Engine::open(&path).map(drop).map_err(|e| e.to_string())
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(
+            failed.is_err(),
+            "the injected failure fails the open (after_commit: {after_commit})"
+        );
+
+        let db = redb::Database::open(&path).unwrap();
+        assert!(
+            crate::verified::read_db(&db, schema).unwrap().is_none(),
+            "no record while the repair is unfinished (after_commit: {after_commit})"
+        );
+        drop(db);
+
+        // After the failure inside the repair the store is as it was; after the
+        // one past its commit it is repaired: either way the reopen ends whole
+        // and records.
+        let engine = Engine::open(&path).unwrap();
+        assert!(engine.version_vector_verified().unwrap().is_some(), "the reopen records it");
+        assert_eq!(stamp_half(&engine), oplog_keys, "and the index is the oplog's");
+    }
+}
+
+/// A serve that fails on a body no walk can decode served no window, so it
+/// does not use up the fallback line's ten-minute slot: the next fallback that
+/// does serve one is still due its line.
+#[test]
+fn a_serve_that_fails_does_not_use_the_fallback_lines_slot() {
+    let (engine, _dir) = engine();
+    let rows: Vec<Row> =
+        (0..20u64).map(|i| Row { origin: (i % 3) as usize, at: i, violation: false }).collect();
+    write(&engine, &rows);
+    let txn = engine.begin_write(WriterHolder::Write).unwrap();
+    {
+        let mut oplog = txn.open_table(tables::OPLOG).unwrap();
+        let key = codec::oplog_key(&stamp_of(&rows[15]));
+        oplog.insert(key.as_slice(), [0xFFu8; 4].as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+    let held = held_of(&[Some(5), Some(5), Some(5), None]);
+    let served = engine.serve_entries_to_peer(Hlc::ZERO, 1000, Some(&held), &[], None);
+    assert!(served.is_err(), "the linear walk meets the same body: no window is served");
+    assert!(engine.serve_counters().fallback_is_due_a_line(), "and the line's slot is still free");
 }

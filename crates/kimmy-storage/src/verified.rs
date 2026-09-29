@@ -147,6 +147,17 @@ pub(crate) mod test_support {
     thread_local! {
         static FAIL_BEFORE_THE_RAISE_COMMITS: Cell<bool> = const { Cell::new(false) };
         static FORCED: Cell<bool> = const { Cell::new(false) };
+        static FAIL_AFTER_THE_ARRIVAL_REPAIR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fail the next open on this thread just after the arrival index's repair
+    /// commits and before the record is written.
+    pub(crate) fn fail_after_the_arrival_repair() {
+        FAIL_AFTER_THE_ARRIVAL_REPAIR.with(|f| f.set(true));
+    }
+
+    pub(crate) fn fails_after_the_arrival_repair() -> bool {
+        FAIL_AFTER_THE_ARRIVAL_REPAIR.with(|f| f.replace(false))
     }
 
     /// Run `f` with the opens on this thread walking, as

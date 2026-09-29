@@ -685,7 +685,7 @@ impl ServeWalk {
 /// (`keys`), by the linear walk of the oplog that reads every body (`linear`,
 /// which a request that names nothing held always takes), or by the linear
 /// walk after the keys gave up because the two tables disagreed, or the index
-/// could not be read (`fallback_length`, `fallback_missing_body`). A fixed set,
+/// could not be read (`fallback_length`, `fallback_missing_body`, `fallback_error`). A fixed set,
 /// so the series is always all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WalkPath {
@@ -693,12 +693,18 @@ pub enum WalkPath {
     Linear,
     FallbackLength,
     FallbackMissingBody,
+    FallbackError,
 }
 
 impl WalkPath {
-    pub const COUNT: usize = 4;
-    pub const ALL: [Self; Self::COUNT] =
-        [Self::Keys, Self::Linear, Self::FallbackLength, Self::FallbackMissingBody];
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Keys,
+        Self::Linear,
+        Self::FallbackLength,
+        Self::FallbackMissingBody,
+        Self::FallbackError,
+    ];
 
     pub const fn slot(self) -> usize {
         self as usize
@@ -710,6 +716,7 @@ impl WalkPath {
             Self::Linear => "linear",
             Self::FallbackLength => "fallback_length",
             Self::FallbackMissingBody => "fallback_missing_body",
+            Self::FallbackError => "fallback_error",
         }
     }
 }

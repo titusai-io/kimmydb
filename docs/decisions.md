@@ -21175,9 +21175,15 @@ worth of news.
   is not counted twice. A fallback is logged once per ten minutes and counted.
 - **The open's verification walk reads the two key sets in step** when it walks
   the oplog, and a difference the counts cannot see is **repaired in that open**:
-  both arrival tables are rebuilt from the oplog, and only then is the record
-  written (a crash before it leaves the record unwritten, so the next open walks
-  again). It is logged. The walk runs only when the version vector is not
+  the arrival index is repaired from the oplog **keeping every position whose
+  stamp is still in the oplog**, dropping the rest, appending the stamps it
+  lacks past the highest position ever issued, and rebuilding the stamp half
+  from the positions, all in one transaction; only then is the record written (a
+  crash before it leaves the record unwritten, so the next open walks again).
+  Not renumbered in stamp order: a position is what a change stream's token
+  names, and a relayed entry arrives after higher-stamped local ones, so a
+  renumbering would move it below a token that had passed it and the stream
+  would skip it. It is logged. The walk runs only when the version vector is not
   already recorded as verified (ADR-173): after a schema change, after a restore
   (a backup omits the record), or with `KIMMY_VERIFY_OPLOG_AT_OPEN=1`; **not**
   after an unclean stop. So on a live member the repair rarely runs, and the
@@ -21186,15 +21192,15 @@ worth of news.
   cold on a live layout, 89 s and 55,000 reads on top of the `OPLOG` walk.
 - **A key walk that cannot use the index is not a failed serve.** An error
   reading the index (a storage error, or a key that does not decode) falls back
-  to the linear walk and is counted as a `fallback_missing_body`; an error
+  to the linear walk and is counted as a `fallback_error`; an error
   reading or decoding a *body* is the same error the linear walk would raise,
   and stays one. The linear walk that follows has **only the time the key walk
   did not spend**, so a window served on a damaged path stays inside the budget
   the caller set (the rows and the floor are unchanged).
 - **A metric says which path each window took:**
   `kimmy_sync_serve_walk_path_total{path,walk}`, with `walk` `serve` (a pull) or
-  `push` (a confirmation's push) and `path` `keys`, `linear`, `fallback_length`
-  or `fallback_missing_body`. A push is read once and counted once: the re-read
+  `push` (a confirmation's push) and `path` `keys`, `linear`, `fallback_length`,
+  `fallback_missing_body` or `fallback_error`. A push is read once and counted once: the re-read
   that fits it to its frame is not a second window, as a pull's is, because
   `kimmy_sync_served_windows_total` counts a pull's. A push is not in
   `kimmy_sync_served_windows_total`, so the two kinds are told apart. On the
@@ -21207,7 +21213,7 @@ worth of news.
 **What it measured.** On a live member's store, cold, over the newest 650k rows of
 a requester that held everything: the key walk **16.3–16.6 s, 16,712 reads,
 66 MiB**, against the linear walk's **23.5–25.3 s, 79,500 reads, 968 MiB**: about
-15 times fewer bytes and 5 times fewer reads, and **1.4 times the wall time** on
+15 times fewer bytes and 5 times fewer reads, while the linear walk takes 1.4× as long on
 that rotational disk, where a fragmented store makes each read cost about a
 millisecond. On SSD-class storage the same 16.7k reads take a second or two. A
 compact copy of the same store (restored from a backup, its pages sequential)

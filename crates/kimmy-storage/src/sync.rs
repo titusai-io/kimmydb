@@ -992,26 +992,42 @@ impl Engine {
                     passed.set(before);
                     path = match why {
                         crate::watch::KeyWalkFallback::Length => WalkPath::FallbackLength,
-                        crate::watch::KeyWalkFallback::MissingBody
-                        | crate::watch::KeyWalkFallback::Index => WalkPath::FallbackMissingBody,
+                        crate::watch::KeyWalkFallback::MissingBody => WalkPath::FallbackMissingBody,
+                        crate::watch::KeyWalkFallback::Index => WalkPath::FallbackError,
                     };
                     // The attempt spent part of the window's time; the linear walk
                     // has what is left, so a window served on the damaged path
                     // stays inside the budget the caller set.
                     budget = after_attempt(budget, attempted.elapsed());
-                    if served.is_some() && self.serve_counters().fallback_is_due_a_line() {
-                        tracing::warn!(
-                            reason = path.label(),
-                            "the oplog and its arrival index disagree, so a served window was \
-                             read by the linear walk; this is a bug or damage, and is counted in \
-                             kimmy_sync_serve_walk_path_total"
-                        );
-                    }
                 }
             }
         }
         let window = self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
         record(path);
+        // Said only once the linear walk has served the window: when it failed
+        // as well (a body that cannot be decoded), no window was served and
+        // the error is the report, so the line's ten-minute slot is kept for a
+        // fallback that did serve.
+        if path != WalkPath::Keys
+            && path != WalkPath::Linear
+            && served.is_some()
+            && self.serve_counters().fallback_is_due_a_line()
+        {
+            let why = match path {
+                WalkPath::FallbackLength => {
+                    "the oplog and its arrival index hold a different number of rows"
+                }
+                WalkPath::FallbackMissingBody => {
+                    "a key of the arrival index has no body in the oplog"
+                }
+                _ => "the arrival index or a body could not be read",
+            };
+            tracing::warn!(
+                reason = path.label(),
+                "{why}, so a served window was read by the linear walk instead of the key walk; \
+                 this is a bug or damage, and is counted in kimmy_sync_serve_walk_path_total"
+            );
+        }
         Ok(window)
     }
 

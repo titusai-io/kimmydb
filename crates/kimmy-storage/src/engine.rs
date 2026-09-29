@@ -1226,7 +1226,7 @@ impl Engine {
             );
         }
         // After the arrival index, whose end the counts' mark is compared
-        // against: a rebuilt index renumbers positions, and the counts are
+        // against: a repaired index appends positions, and the counts are
         // rebuilt with it (ADR-174).
         {
             let started = std::time::Instant::now();
@@ -1932,9 +1932,10 @@ impl Engine {
     /// written alongside an oplog append and collected alongside an oplog
     /// removal, so a length mismatch is the only way it can diverge.
     ///
-    /// Existing history is ordered by stamp, which is correct: everything
-    /// written before this index existed was locally originated, and for local
-    /// writes arrival order *is* stamp order.
+    /// History from before the index existed is ordered by stamp, which is
+    /// correct: everything written before it was locally originated, and for
+    /// local writes arrival order *is* stamp order. Positions already issued
+    /// are never renumbered.
     fn rebuild_arrival_index_if_stale(db: &Database) -> Result<()> {
         {
             let txn = db.begin_read()?;
@@ -1968,54 +1969,84 @@ impl Engine {
             }
         }
 
-        Self::rebuild_arrival_index_from_oplog(db)
+        Self::repair_arrival_index_from_oplog(db)
     }
 
-    /// Rebuild both arrival tables from the oplog, renumbering the positions.
-    fn rebuild_arrival_index_from_oplog(db: &Database) -> Result<()> {
+    /// Repair the arrival index against the oplog **without renumbering**.
+    ///
+    /// Every position whose stamp is still in the oplog is kept where it is:
+    /// a position is what a change stream's token names (`resume_point`
+    /// resumes at the position of the stamp it holds, plus one), and an entry
+    /// relayed from a peer arrives after higher-stamped local ones, so a
+    /// renumbering in stamp order would move it below a token that had already
+    /// passed it and the stream would skip it. A position whose stamp is gone
+    /// from the oplog, or a second position naming a stamp, is dropped. A stamp
+    /// with no position takes the next one, past the highest ever issued (a
+    /// dropped position is never reused), in stamp order: on a store that
+    /// predates the index that is every entry, from 0, which is correct
+    /// because everything written before the index existed was local, where
+    /// arrival order is stamp order. The stamp half is then rebuilt from the
+    /// positions. One transaction: a failure leaves the index as it was.
+    ///
+    /// Memory: the surviving stamps, 26 bytes a row, held sorted for the merge
+    /// with the oplog. A repair path, run when damage is found, never in
+    /// normal operation.
+    fn repair_arrival_index_from_oplog(db: &Database) -> Result<()> {
         let txn = db.begin_write()?;
-        let rebuilt = {
+        let (kept, dropped, appended) = {
             let oplog = txn.open_table(tables::OPLOG)?;
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
-            // Cleared by key, a batch at a time, never with `retain`: see
-            // `index::clear_index_entries` for what `retain` costs. Both
-            // tables are one row per oplog entry.
-            loop {
-                let batch: Vec<u64> = arrival
-                    .iter()?
-                    .take(crate::index::CLEAR_BATCH)
-                    .map(|row| Ok(row?.0.value()))
-                    .collect::<Result<_>>()?;
-                if batch.is_empty() {
-                    break;
-                }
-                let mut gone = 0;
-                for seq in &batch {
-                    #[cfg(test)]
-                    if crate::index::clear_hooks::keeps("the arrival index") {
-                        continue;
-                    }
-                    gone += usize::from(arrival.remove(*seq)?.is_some());
-                }
-                crate::index::ensure_removed(batch.len(), gone, "the arrival index")?;
-            }
-            Self::clear_stamp_half(&mut by_stamp)?;
 
-            let mut seq = 0u64;
+            let mut next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
+            let mut surviving: Vec<(Vec<u8>, u64)> = Vec::new();
+            let mut strays: Vec<u64> = Vec::new();
+            for row in arrival.iter()? {
+                let (seq, stamp) = row?;
+                if oplog.get(stamp.value())?.is_some() {
+                    surviving.push((stamp.value().to_vec(), seq.value()));
+                } else {
+                    strays.push(seq.value());
+                }
+            }
+            // Positions ascend, so the sort is stable on them: of two positions
+            // naming one stamp, the first is kept.
+            surviving.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut kept = 0u64;
+            let mut stamps: Vec<Vec<u8>> = Vec::with_capacity(surviving.len());
+            for (stamp, seq) in surviving {
+                if stamps.last() == Some(&stamp) {
+                    strays.push(seq);
+                } else {
+                    stamps.push(stamp);
+                    kept += 1;
+                }
+            }
+
+            let mut appended = 0u64;
             for row in oplog.iter()? {
                 let (key, _) = row?;
-                arrival.insert(seq, key.value())?;
-                by_stamp.insert(key.value(), seq)?;
-                seq += 1;
+                if stamps.binary_search_by(|have| have.as_slice().cmp(key.value())).is_err() {
+                    arrival.insert(next, key.value())?;
+                    next += 1;
+                    appended += 1;
+                }
             }
-            seq
+            let dropped = strays.len() as u64;
+            for seq in strays {
+                arrival.remove(seq)?;
+            }
+
+            Self::clear_stamp_half(&mut by_stamp)?;
+            for row in arrival.iter()? {
+                let (seq, key) = row?;
+                by_stamp.insert(key.value(), seq.value())?;
+            }
+            (kept, dropped, appended)
         };
         txn.commit()?;
 
-        if rebuilt > 0 {
-            info!(entries = rebuilt, "rebuilt the oplog arrival index");
-        }
+        info!(kept, dropped, appended, "repaired the oplog arrival index, keeping every position");
         Ok(())
     }
 
@@ -2248,12 +2279,18 @@ impl Engine {
         if arrival_differs {
             warn!(
                 "the oplog and its arrival index hold different sets of keys although their \
-                 counts agree; rebuilding the index from the oplog before this node serves. \
+                 counts agree; repairing the index from the oplog before this node serves. \
                  This is a bug or damage"
             );
-            Self::rebuild_arrival_index_from_oplog(db)?;
+            Self::repair_arrival_index_from_oplog(db)?;
             // Only now: the record says the vector is verified, and a crash before
             // the repair leaves it unwritten, so the next open walks again.
+            #[cfg(test)]
+            if crate::verified::test_support::fails_after_the_arrival_repair() {
+                return Err(StorageError::Database(
+                    "a failure injected after the arrival repair commits".into(),
+                ));
+            }
             let txn = db.begin_write()?;
             crate::verified::write(&txn, Self::current_schema(db)?, &walk)?;
             txn.commit()?;
@@ -7126,8 +7163,9 @@ mod clearing {
 
     #[test]
     fn an_arrival_rebuild_whose_keys_do_not_go_stops_instead_of_spinning() {
-        // Each of the rebuild's two clears, on its own.
-        for table in ["the arrival index", "the arrival index by stamp"] {
+        // The repair clears the stamp half only: the positions are kept.
+        {
+            let table = "the arrival index by stamp";
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("kimmy.redb");
             one_arrival_row_short(&path);

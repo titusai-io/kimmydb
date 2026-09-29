@@ -131,12 +131,20 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("engine::Engine::read_versions_in", "a version vector: one row per origin"),
     (
-        "engine::Engine::rebuild_arrival_index_from_oplog",
+        "engine::Engine::repair_arrival_index_from_oplog",
         "at open, before the node serves or has a stop to answer",
     ),
     (
         "key_walk_tests::the_verification_walk_repairs_a_pair_the_counts_cannot_see_before_it_records",
         "test code reading a store of forty rows it wrote itself",
+    ),
+    (
+        "key_walk_tests::arrival_positions",
+        "test code reading a store of sixteen rows it wrote itself",
+    ),
+    (
+        "key_walk_tests::no_record_is_written_until_the_repair_has_committed",
+        "test code reading a store of sixteen rows it wrote itself",
     ),
     (
         "engine::Engine::rebuild_stamp_half_from_positions",
