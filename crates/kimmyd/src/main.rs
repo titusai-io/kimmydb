@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod front;
 mod lifecycle;
 mod logging;
 mod node;

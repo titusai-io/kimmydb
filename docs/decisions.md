@@ -21263,4 +21263,118 @@ the linear window with the path and the passed count counted once; the path
 counted by kind of request; the verification walk finding a compensating pair;
 and the key-set invariant over the `verified.rs` generator. Each guard was
 broken and its test failed.
+---
+
+## ADR-198 — The HTTP port is bound before the store opens, and answers only its two probes until it is up
+
+Amends [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns)'s
+prerequisite (probe allowances sized to the open) and
+[ADR-188](#adr-188--a-storage-engine-that-hits-an-io-error-stops-the-process)'s
+`/readyz` (which now also answers while the store opens).
+
+**The defect.** `start_and_serve` opened the store first and bound the HTTP
+port last, so nothing answered `/healthz` while `Engine::open` ran. The open
+walks the retained oplog (46 s per 10 million entries with the store cached,
+far more cold), runs the schema 4 migration (8 µs per document per partial
+index), and repairs the file after an unclean stop, and the documented
+StatefulSet gave liveness Kubernetes' defaults, which restart a container after
+about 30 s of failed checks. So an open longer than that was killed and begun
+again for ever, and the migration's per-index markers made it worst: every index
+shorter than the allowance completed, and one longer than it never did. The
+documented workaround was a startup probe sized to twice the operator's own
+estimate of the open.
+
+**Decision.**
+
+- **The order of a start is: hold the data directory, read the last run's verdict
+  (`previous_run`, from files alone), install the stop handler, load the TLS
+  material, bind the HTTP port, and only then open the store.** A port that cannot
+  be bound and a certificate that cannot be read are start failures before the
+  store is touched: no store file is created, no sidecar written, and the last
+  run's verdict is inherited by the failed start like any other's, and announced
+  in the log where the banner it normally follows was not reached. A second
+  process on the same directory fails at the hold, before any of it, and leaves
+  everything as it was.
+- **Until the node's router is installed, the listener is `front::Front`.**
+  `GET /healthz` is 200. `GET /readyz` is 503 in the API's error envelope
+  (`error: starting`, `retry: elsewhere`) with `status: opening`, `phase`,
+  `phase_age_seconds`, and `done` and `total` when the phase counts. **Every
+  other route is 503 `starting`, `retry: elsewhere`, with no `Retry-After`**,
+  `/v1/version` and `/metrics` included: a roll polls `/v1/version` to decide a
+  member is up, and a member that answered it while opening would send the roll
+  on. The answer is built without logging: a probe every few seconds would be a
+  line each.
+- **The swap is one `OnceLock`, installed where the bind used to be**, after the
+  cluster, the background writers and the sweeps have started: `serving HTTP and
+  WebSocket` is logged there, `lifecycle::settle` runs there, and from then on
+  every request goes to the router at the cost of one atomic load. The Front is a
+  `fallback_service` inside the same `into_make_service_with_connect_info` as
+  before, so the connect-info a request carries is unchanged.
+- **The open reports its phase**: `repairing` (redb's repair, no count), `opening`,
+  `migrating` (`done` of `total` indexes), `verifying` (rows of the oplog),
+  `counting` (the live-count rebuild) and `starting` (open, tasks not yet up). A
+  process-wide record (`kimmy_storage::open_snapshot`), because one store opens at
+  a time. A `WARN`/`INFO` line per phase is logged as before.
+- **A stop asked for during the open is heard.** The signal handler is installed
+  at the bind. The process is PID 1 in its container, and a signal to PID 1 with no
+  handler is ignored until the supervisor's kill, so before this a stop during the
+  open waited for `SIGKILL`. The stop is acted on at the two points that can take
+  it safely: **between the migration's per-index steps** (each is one commit with
+  its marker, and an interrupted migration resumes from the markers) and by
+  **abandoning the verification walk** (nothing is recorded, the version vector is
+  not raised, and the next start walks again). Otherwise the open finishes and the
+  node stops **without serving**, with a clean exit marker.
+- **A hung open is not ended by the product.** With liveness truthful, a node
+  whose open never finishes is green on `/healthz`. It is visible (`phase_age_seconds`
+  on `/readyz`, and the log's line per phase), and an operator who wants a ceiling
+  watches for it. This is accepted rather than solved: no timer in the product can
+  tell a slow open from a stuck one.
+- **The documented manifest** puts the **startup probe on `/healthz`**, not
+  `/readyz`: while a startup probe is configured Kubernetes runs neither the
+  liveness nor the readiness probe until it succeeds, so one on `/readyz` would
+  hold both off for the whole of a long open or a long catch-up and kill a node that
+  is doing what it should, over and over. Liveness stays on `/healthz` and
+  readiness on `/readyz`, and the StatefulSet is **`podManagementPolicy: Parallel`**
+  so a pod that is not ready by design does not hold the others down behind it. That
+  field is immutable: move an existing deployment with `kubectl delete statefulset
+  <name> --cascade=orphan` and apply the manifest again. It changes only creation
+  and deletion order; a rolling update still replaces pods one at a time.
+- **`starting` is a new stable error code**, `503`, retry class `elsewhere`.
+
+**Why.** Raising thresholds makes an operator guess the worst open, and a
+migration longer than the guess never finishes. Listening before the open is the
+only fix that makes the guess unnecessary, and its cost is a defined answer for
+every route on a listener with no engine, which the Front gives with one rule:
+only the two probes answer.
+
+**What this changes for tooling.** A tool that treated any answer from the port as
+"up" must poll `/readyz`: `/healthz` is now green through the open. The lifecycle,
+cluster and benchmark harnesses and the stop matrix wait on `/readyz` and read the
+port from the bind line. A deploy loop that polls `/v1/version` keeps working,
+because that route is refused until the node is up.
+
+**Rejected.**
+- *A second, temporary server on the bound socket, handed over at the end.* It
+  needs its own TLS path and a handover of a listening socket that a router swap
+  does not.
+- *Keeping the startup probe on `/readyz` with a large threshold.* A catch-up is
+  as long as the data is large; no threshold is right.
+- *Ending a slow open at a timeout.* Redb's open and repair are not interruptible
+  and a slow one is indistinguishable from a stuck one.
+
+**No rollback boundary.** No stored format changes, and nothing is written earlier
+or later than before; only the order of the bind and the open, and a new answer on
+the port during the open.
+
+### Test
+
+Unit tests of the Front (every route class while opening, the swap once, a phase
+with and without a count). Lifecycle tests with `KIMMY_TEST_OPEN_DELAY_SECS`
+(a test switch that delays the open, announced at `WARN` like the others): the
+probes during the open (`/healthz` 200, `/readyz` 503 with a phase, every other
+route including `/v1/version` and `/metrics` refused, nothing logged), the order
+of the bind, the banner and serving, the swap; a stop during the open (heard, no
+waiting for the open, never serving, clean marker); a bind that fails (no banner,
+no store file). A storage test that a stop abandons the verification walk at its
+first check. Each guard was broken and its test failed.
 

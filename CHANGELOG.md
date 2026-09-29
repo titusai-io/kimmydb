@@ -41,6 +41,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   same reads take a second or two. Nothing about which entries are served,
   their order, the window's end or the budget changes, no format changes, and
   the change needs no rollback boundary ([ADR-197](docs/decisions.md)).
+- **The HTTP port is bound before the store opens, and answers only its two probes
+  until the store is up** ([ADR-198](docs/decisions.md)). `/healthz` is green from
+  the bind, through an open of any length, and `/readyz` answers `503` with the
+  phase the open is in (`repairing`, `opening`, `migrating`, `verifying`,
+  `counting`, `starting`), how long it has lasted and how far through it is. Every
+  other route, `/v1/version` and `/metrics` included, answers `503 starting` (a new
+  error code, `retry: elsewhere`) until the node is up. **A tool that treated any
+  answer from the port as "up" must poll `/readyz`**; one that polls `/v1/version`
+  keeps working. A stop during the open is heard, where the process (PID 1 in its
+  container) used to wait for the supervisor's kill, and stops the node at a safe
+  point or once the open finishes, without serving. A port that cannot be bound or
+  a certificate that cannot be read now fails the start before the store is opened,
+  with nothing in the data directory touched. **The documented Kubernetes manifest
+  changes**: the startup probe is on `/healthz` (its arithmetic no longer matters),
+  and the StatefulSet is `podManagementPolicy: Parallel`, which is immutable on an
+  existing one (`kubectl delete statefulset <name> --cascade=orphan`, then apply
+  again). No rollback boundary.
 - **Breaking: a filter's `$type` alias and `$regex` flag are checked, and an
   unknown one is a `400`.** `{"$type": "boolean"}`, `{"$type": "Int"}` and
   `{"$type": []}` returned `200` with no matches, and `{"$regex": "s",
@@ -66,6 +83,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A node whose open outlasts the liveness probe is no longer killed and begun
+  again for ever.** Nothing listened until the open finished, so the documented
+  manifest's liveness probe (Kubernetes' defaults, about 30 s) restarted any node
+  whose open, or schema 4 migration, took longer, and a migration whose longest index
+  outlasted the allowance never finished. The port is now bound first
+  ([ADR-198](docs/decisions.md)).
 - **The replication listener no longer spins on an accept error.** When the
   process ran out of file descriptors (`EMFILE`, `ENFILE`) or memory, the
   replication listener's `accept` failed again at once, because the pending

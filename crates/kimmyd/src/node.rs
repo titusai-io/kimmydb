@@ -388,10 +388,82 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // file, and a database with no marker beside it is what an unclean exit
     // looks like (ADR-147). Announced after the banner below.
     let previous = lifecycle::previous_run(&config.storage.data_dir, &path);
+
+    // The HTTP port is bound before the store is opened (ADR-198), so that an
+    // open of minutes answers `/healthz` and says on `/readyz` what it is
+    // doing instead of being a port nothing listens on. The signal handler is
+    // installed with it, so a stop asked for during the open is heard (the
+    // process is PID 1 in its container, and a signal to PID 1 with no handler
+    // is ignored until the supervisor's kill). After `previous_run`, which
+    // reads and sets aside the last run's verdict from files alone, so a bind
+    // that fails is a failed start that inherits it like any other.
+    let early = EarlySignal::install();
+    // A start that fails before it opens the store still says what it
+    // inherited: the last run's verdict was set aside above, and the failed
+    // start carries it on (`lifecycle::record`); the line an operator looks for
+    // is written here, since the banner it normally follows is not reached.
+    let failed_before_open = |e: anyhow::Error| {
+        lifecycle::announce(&config.storage.data_dir, &previous);
+        e
+    };
+    // Loaded before binding, so a bad certificate is a startup failure rather
+    // than a handshake error for whoever connects first.
+    let tls = load_tls(&config).await.map_err(failed_before_open)?;
+    let listener = tokio::net::TcpListener::bind(config.server.bind)
+        .await
+        .with_context(|| format!("binding {}", config.server.bind))
+        .map_err(failed_before_open)?;
+    let local = listener.local_addr().unwrap_or(config.server.bind);
+    let front = crate::front::Front::new();
+    // Filled once the engine and the metrics exist: the drain deadline's hook
+    // and the accept-error counter.
+    let engine_slot: Arc<std::sync::OnceLock<Arc<Engine>>> = Arc::default();
+    let accept_slot: AcceptErrorSlot = Arc::default();
+    let serving = ServerTask::start(serve(
+        listener,
+        front.clone(),
+        tls.clone(),
+        early.wait(),
+        DRAIN_TIMEOUT,
+        {
+            let engine_slot = Arc::clone(&engine_slot);
+            // At the drain deadline, a request that commits in more than one
+            // transaction stops before its next one (ADR-192): not at the
+            // signal, so one that can finish inside the drain does.
+            move || {
+                if let Some(engine) = engine_slot.get() {
+                    engine.set_stopping();
+                }
+            }
+        },
+        Arc::clone(&accept_slot),
+    ));
+    info!(bind = %local, "HTTP listener bound; the store is opening, and only /healthz and /readyz answer until it is up");
+
+    // A test switch that makes the open last: the store opens only after this
+    // many seconds, so a test can see what a node answers while it opens, and
+    // stop one. In the shipped binary like the other switches, and announced.
+    if let Ok(value) = std::env::var("KIMMY_TEST_OPEN_DELAY_SECS") {
+        let secs = value.parse::<u64>().ok();
+        warn!(
+            KIMMY_TEST_OPEN_DELAY_SECS = %value,
+            recognised = secs.is_some(),
+            "a test switch is set that delays the opening of the store on purpose; unset \
+             KIMMY_TEST_OPEN_DELAY_SECS outside a test"
+        );
+        if let Some(secs) = secs {
+            kimmy_storage::set_open_phase(kimmy_storage::OpenPhase::Opening);
+            let until = std::time::Instant::now() + Duration::from_secs(secs);
+            while std::time::Instant::now() < until && !kimmy_storage::open_stop_requested() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
     let engine = Arc::new(
         Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize))
             .with_context(|| format!("opening database {}", path.display()))?,
     );
+    kimmy_storage::set_open_phase(kimmy_storage::OpenPhase::Starting);
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
@@ -435,6 +507,36 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // task ending during the drain is a stop rather than a death.
     let shutdown = kimmy_task::Shutdown::new();
     let stop = Stop { shutdown: shutdown.clone(), engine: Arc::clone(&engine), by: Arc::default() };
+    let _ = engine_slot.set(Arc::clone(&engine));
+    // The stop is announced at the signal, before anything drains, so that a
+    // supervised task ending during the drain is a stop rather than a death.
+    // A signal that came during the open announces here, at once.
+    early.on_signal({
+        let stop = stop.clone();
+        move || stop.begin()
+    });
+    if early.signalled() {
+        // A stop asked for while the store opened: the open finished (or was
+        // stopped at a safe point), and the node stops without serving, with a
+        // clean marker. Nothing else has been started.
+        info!("a stop was asked for while the store was opening; stopping without serving");
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), serving).await {
+            Ok(Ok(connections)) => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), connections).await;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(()),
+        };
+        let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
+        return Ok(Served {
+            engine,
+            outcome: outcome.context("serving"),
+            closed,
+            stop_by: Arc::clone(&stop.by),
+            test_stop: None,
+        });
+    }
 
     // A test switch that stops a background task on purpose. It is in the
     // shipped binary so that the tests drive the binary that ships, so every
@@ -945,10 +1047,6 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     // a dashboard could lose (ADR-187).
     state.metrics.fix_progress_writers(&kimmy_task::started());
 
-    let listener = tokio::net::TcpListener::bind(config.server.bind)
-        .await
-        .with_context(|| format!("binding {}", config.server.bind))?;
-    let local = listener.local_addr().unwrap_or(config.server.bind);
     // Serving from here on: what this start inherited has been announced, and
     // an exit of this run no longer carries it (ADR-190's lifecycle half).
     lifecycle::settle(&config.storage.data_dir);
@@ -1027,25 +1125,13 @@ async fn start_and_serve(config: Config) -> Result<Served> {
              are read, write, sync_data, set_len and len"
         );
     }
-    // At the drain deadline, a request that commits in more than one
-    // transaction stops before its next one (ADR-192): not at the signal, so
-    // one that can finish inside the drain does.
-    let stopping = {
-        let engine = Arc::clone(&engine);
-        move || engine.set_stopping()
-    };
     // An accept error that is the HTTP listener's own, counted beside the
     // cluster listener's on `kimmy_accept_errors_total{listener}`.
     let on_accept_error = accept_error_hook(Arc::clone(&state), |state| &state.metrics);
-    let serving = serve(
-        listener,
-        app,
-        tls,
-        announced(stop.clone()),
-        DRAIN_TIMEOUT,
-        stopping,
-        Some(on_accept_error.clone()),
-    );
+    let _ = accept_slot.set(on_accept_error.clone());
+    // The swap: from here the listener that has been answering as an opening
+    // node hands every request to the node's router (ADR-198).
+    front.install(app);
     let served = match test_stop {
         Some(TestStop::PanicInRun) => {
             panic!("node::run panicked on purpose (KIMMY_TEST_STOP=panic_in_run)")
@@ -1678,14 +1764,19 @@ pub async fn probe_oidc(oidc: &OidcConfig) -> Result<usize> {
 /// client-visible errors.
 async fn serve(
     listener: tokio::net::TcpListener,
-    app: axum::Router,
+    front: crate::front::Front,
     tls: Option<RustlsConfig>,
     signal: impl std::future::Future<Output = ()> + Send + 'static,
     drain: Duration,
     on_drain_deadline: impl FnOnce() + Send + 'static,
-    on_accept_error: Option<kimmy_cluster::AcceptErrorHook>,
+    on_accept_error: AcceptErrorSlot,
 ) -> Result<Connections> {
-    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // The whole service is the front: before the node's router is installed it
+    // answers as an opening node does, and after, it hands every request to
+    // that router (ADR-198).
+    let service = axum::Router::new()
+        .fallback_service(front)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     // The drain begins at `signal` and ends `drain` after it. Plain HTTP used
     // to wait for every in-flight request however long it took, so a request
@@ -1787,15 +1878,17 @@ impl axum::extract::connect_info::Connected<Peer> for std::net::SocketAddr {
 /// paths, at most once a second.
 struct Accepting {
     listener: tokio::net::TcpListener,
-    /// Told of each error that is the listener's own, for the counter.
-    on_error: Option<kimmy_cluster::AcceptErrorHook>,
+    /// Told of each error that is the listener's own, for the counter. Filled
+    /// once the node's metrics exist, which is after the listener is serving
+    /// (ADR-198): an error before then is logged and not counted.
+    on_error: AcceptErrorSlot,
     logged: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Accepting {
     fn from_std(
         listener: std::net::TcpListener,
-        on_error: Option<kimmy_cluster::AcceptErrorHook>,
+        on_error: AcceptErrorSlot,
     ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::from_std(listener)?;
         Ok(Self { listener, on_error, logged: std::sync::Mutex::new(None) })
@@ -1812,7 +1905,7 @@ impl Accepting {
             debug!(%error, "a connection failed before it was accepted");
             return;
         }
-        if let Some(hook) = &self.on_error {
+        if let Some(hook) = self.on_error.get() {
             hook(kimmy_cluster::AcceptListener::Http);
         }
         let now = std::time::Instant::now();
@@ -1831,7 +1924,11 @@ impl Accepting {
 impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
     async fn bind_to(addr: Peer) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr.0).await?;
-        Ok(Self { listener, on_error: None, logged: std::sync::Mutex::new(None) })
+        Ok(Self {
+            listener,
+            on_error: AcceptErrorSlot::default(),
+            logged: std::sync::Mutex::new(None),
+        })
     }
 
     async fn accept_stream(&self) -> std::io::Result<(tokio::net::TcpStream, Peer)> {
@@ -1850,6 +1947,9 @@ impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
 }
 
 use kimmy_cluster::accept_error_is_the_listeners;
+
+/// Where the HTTP listener's accept-error counter is put once the metrics exist.
+type AcceptErrorSlot = Arc<std::sync::OnceLock<kimmy_cluster::AcceptErrorHook>>;
 
 /// The end of every HTTP connection's task, which [`serve`] hands back: the
 /// drain closes what is left at its deadline, and this is when those tasks
@@ -2388,15 +2488,127 @@ fn bootstrap_users(engine: &Engine, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Wait for the shutdown signal, then announce it **before** returning.
+/// The shutdown signal, heard from the bind on (ADR-198).
 ///
-/// The announcement has to happen before anything drains, because every
-/// supervised task reads it to tell a stop from a death. Putting it here rather
-/// than after `serve` returns makes the ordering structural: there is no path
-/// from the signal to a drained server that skips it.
-async fn announced(stop: Stop) {
-    shutdown_signal().await;
-    stop.begin();
+/// The handler is installed when the listener is bound, before the store
+/// opens, and what it does with a signal is fixed here: **announce the stop
+/// first** (`on_signal`), and only then let the waiters go. The announcement
+/// has to happen before anything drains, because every supervised task reads it
+/// to tell a stop from a death, and putting it here makes the ordering
+/// structural: there is no path from the signal to a drained server that skips
+/// it. A signal that comes while the store is still opening has nothing to
+/// announce to yet; the announcement is made the moment one is registered.
+/// The open in progress is asked to stop at its next safe point.
+struct EarlySignal {
+    state: std::sync::Mutex<EarlyState>,
+    fired: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct EarlyState {
+    fired: bool,
+    announce: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl EarlySignal {
+    fn install() -> Arc<Self> {
+        let (fired, _) = tokio::sync::watch::channel(false);
+        let signal = Arc::new(Self { state: Default::default(), fired });
+        // UNSUPERVISED: the signal listener, whose return is the stop itself;
+        // there is nothing for a supervisor to restart or to say.
+        tokio::spawn({
+            let signal = Arc::clone(&signal);
+            async move {
+                shutdown_signal().await;
+                signal.fire();
+            }
+        });
+        signal
+    }
+
+    fn fire(&self) {
+        kimmy_storage::request_open_stop();
+        let announce = {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.fired = true;
+            state.announce.take()
+        };
+        if let Some(announce) = announce {
+            announce();
+        }
+        self.fired.send_replace(true);
+    }
+
+    /// Run `announce` at the signal, or now if it has come.
+    fn on_signal(&self, announce: impl FnOnce() + Send + 'static) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.fired {
+            drop(state);
+            announce();
+        } else {
+            state.announce = Some(Box::new(announce));
+        }
+    }
+
+    fn signalled(&self) -> bool {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fired
+    }
+
+    /// Resolves once the stop has been announced.
+    fn wait(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.fired.subscribe();
+        async move {
+            let _ = rx.wait_for(|fired| *fired).await;
+        }
+    }
+}
+
+/// The HTTP server, running from the bind: awaited where serving is awaited,
+/// and aborted if it is dropped, as it is when a start fails after the bind.
+struct ServerTask(Option<tokio::task::JoinHandle<Result<Connections>>>);
+
+impl ServerTask {
+    fn start(
+        server: impl std::future::Future<Output = Result<Connections>> + Send + 'static,
+    ) -> Self {
+        // UNSUPERVISED: the HTTP server, whose end is serving's end and is
+        // awaited by the run itself (`ServerTask` as a future).
+        Self(Some(tokio::spawn(server)))
+    }
+}
+
+impl std::future::Future for ServerTask {
+    type Output = Result<Connections>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Some(handle) = self.0.as_mut() else {
+            return std::task::Poll::Ready(Err(anyhow::anyhow!(
+                "the HTTP server was polled twice"
+            )));
+        };
+        match std::pin::Pin::new(handle).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(joined) => {
+                self.0 = None;
+                std::task::Poll::Ready(
+                    joined.unwrap_or_else(|e| {
+                        Err(anyhow::anyhow!("the HTTP server task ended: {e}"))
+                    }),
+                )
+            }
+        }
+    }
+}
+
+impl Drop for ServerTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Resolve on SIGINT or SIGTERM.
@@ -3051,7 +3263,9 @@ mod tests {
         });
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
-        let accepting = Accepting::from_std(std_listener, Some(hook)).unwrap();
+        let slot = AcceptErrorSlot::default();
+        assert!(slot.set(hook).is_ok());
+        let accepting = Accepting::from_std(std_listener, slot).unwrap();
         accepting.note(&std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
         accepting.note(&std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -3088,7 +3302,7 @@ mod tests {
         let drain = Duration::from_millis(400);
         let served = tokio::spawn(serve(
             listener,
-            app,
+            crate::front::Front::ready(app),
             None,
             async move {
                 let _ = signalled.await;
@@ -3097,7 +3311,7 @@ mod tests {
             move || {
                 let _ = stopped.send(tokio::time::Instant::now());
             },
-            None,
+            Default::default(),
         ));
 
         // A request in flight that will never finish.
@@ -3141,14 +3355,14 @@ mod tests {
         let drain = Duration::from_millis(400);
         let served = tokio::spawn(serve(
             listener,
-            app,
+            crate::front::Front::ready(app),
             None,
             async move {
                 let _ = signalled.await;
             },
             drain,
             || {},
-            None,
+            Default::default(),
         ));
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"GET / HTTP/1.1\r\nHost").await.unwrap();
@@ -3176,7 +3390,16 @@ mod tests {
         tokio::spawn(async move {
             // Nothing shuts this down: the test drops it when it is finished.
             let signal = std::future::pending::<()>();
-            let _ = serve(listener, app, tls, signal, DRAIN_TIMEOUT, || {}, None).await;
+            let _ = serve(
+                listener,
+                crate::front::Front::ready(app),
+                tls,
+                signal,
+                DRAIN_TIMEOUT,
+                || {},
+                Default::default(),
+            )
+            .await;
         });
         addr
     }

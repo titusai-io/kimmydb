@@ -414,7 +414,20 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
              growth step, so allow the two added together"
         );
     }
+    if total > 0 {
+        crate::open_progress::set_open_phase_of(
+            crate::open_progress::OpenPhase::Migrating,
+            total as u64,
+        );
+    }
     for (n, (meta, index, documents)) in plan.indexes.iter().enumerate() {
+        // The safe point of a stop asked for during the open: between indexes,
+        // each of which is one commit with its marker, so an interrupted
+        // migration resumes from the markers on the next start.
+        if crate::open_progress::open_stop_requested() {
+            return Err(crate::StorageError::Stopping(crate::StopReason::Shutdown));
+        }
+        crate::open_progress::set_open_done(n as u64);
         let started = std::time::Instant::now();
         info!(
             n = n + 1,

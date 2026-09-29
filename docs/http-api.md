@@ -759,6 +759,13 @@ All three are unauthenticated so a load balancer can probe them without
 credentials. `/healthz` is liveness; `/readyz` proves the storage engine
 actually responds, so a node with a wedged database is taken out of rotation.
 
+**A node answers these from the moment it binds its port, before its store is
+open** ([ADR-198](decisions.md)). Until the store is open `/healthz` is `200`
+and `/readyz` is `503` in the error envelope (`error: starting`, `retry:
+elsewhere`) with `status: opening`, `phase`, `phase_age_seconds`, and `done` and
+`total` when the phase counts; every other route, `/v1/version` and `/metrics`
+included, answers `503 starting`.
+
 Metrics deliberately expose **counts only** — naming collections there would
 leak your schema to anything that can reach the port.
 
@@ -1160,6 +1167,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
+| 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

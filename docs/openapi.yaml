@@ -234,7 +234,8 @@ paths:
       description: |
         Proves the storage engine responds, so a node with a wedged database is
         taken out of rotation rather than served. Also the cheapest way for a
-        client to learn which node it reached.
+        client to learn which node it reached. A node answers `503` here while
+        its store opens, from the moment it binds its port.
       security: []
       responses:
         "200":
@@ -250,6 +251,28 @@ paths:
                   node:
                     type: string
                     description: This node's id.
+        "503":
+          description: |
+            Not ready. While the node's store is opening the body is the error
+            envelope (`error: starting`) with `status: opening`, `phase`
+            (`repairing`, `opening`, `migrating`, `verifying`, `counting` or
+            `starting`), `phase_age_seconds`, and `done` and `total` when the
+            phase counts. It is also the answer of a node whose storage engine
+            has hit an I/O error.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      status: { const: opening }
+                      phase:
+                        type: string
+                        enum: [repairing, opening, migrating, verifying, counting, starting]
+                      phase_age_seconds: { type: number }
+                      done: { type: integer }
+                      total: { type: integer }
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /metrics:
@@ -3010,6 +3033,7 @@ components:
         | `outcome_unknown` | 500 | verify | A write reached the storage engine's durability step and then failed: it **may or may not have been applied**, and if it was, it replicates. Read the target back before sending it again, unless the write is idempotent. Details are logged, never returned |
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
+        | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
         - payload_too_large
@@ -3034,6 +3058,7 @@ components:
         - outcome_unknown
         - partially_applied
         - node_stopping
+        - starting
 
     Capability:
       type: string

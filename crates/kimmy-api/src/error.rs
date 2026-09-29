@@ -88,6 +88,11 @@ pub enum ErrorCode {
     /// written, and another member serves (ADR-192). An expected refusal,
     /// not a fault.
     NodeStopping,
+    /// This node has bound its port and is still starting: its store is
+    /// opening, or its tasks are, and it answers only the two probes until
+    /// then (ADR-198). Nothing was read or written, and another member
+    /// serves.
+    Starting,
 }
 
 /// What a client may do about a failure.
@@ -176,7 +181,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 23] = [
+    pub const ALL: [ErrorCode; 24] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -200,6 +205,7 @@ impl ErrorCode {
         Self::OutcomeUnknown,
         Self::PartiallyApplied,
         Self::NodeStopping,
+        Self::Starting,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -228,6 +234,7 @@ impl ErrorCode {
             Self::OutcomeUnknown => "outcome_unknown",
             Self::PartiallyApplied => "partially_applied",
             Self::NodeStopping => "node_stopping",
+            Self::Starting => "starting",
         }
     }
 
@@ -290,6 +297,9 @@ impl ErrorCode {
             Self::PartiallyApplied => Retry::Verify,
             // The node is going away; a peer holds the same data.
             Self::NodeStopping => Retry::Elsewhere,
+            // The node is not serving yet, and no timing it could honour is
+            // known: another member answers now, and this one when it is up.
+            Self::Starting => Retry::Elsewhere,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -398,6 +408,10 @@ impl ErrorCode {
             Self::PartiallyApplied => Some(LogLevel::Error),
             // A shutdown doing its job: worth a line, not a page.
             Self::NodeStopping => Some(LogLevel::Warn),
+            // A start doing its job. The daemon's own answer while it opens
+            // logs nothing (a probe every few seconds would be a line each);
+            // this level is for a route that reaches a router mid-swap.
+            Self::Starting => Some(LogLevel::Warn),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -1059,7 +1073,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 23] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 24] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1086,6 +1100,7 @@ mod tests {
             (OutcomeUnknown, Some(LogLevel::Error)),
             (PartiallyApplied, Some(LogLevel::Error)),
             (NodeStopping, Some(LogLevel::Warn)),
+            (Starting, Some(LogLevel::Warn)),
             (Misconfigured, Some(LogLevel::Error)),
             (Snapshot, Some(LogLevel::Error)),
         ];

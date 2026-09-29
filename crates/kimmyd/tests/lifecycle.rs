@@ -148,7 +148,8 @@ jwt_secret = "{JWT_SECRET}"
         Run { child: std::sync::Mutex::new(child), pid, http: bound, stdout }
     }
 
-    /// Wait until the node answers `/healthz`, failing at once, with its
+    /// Wait until the node answers `/readyz`, which it does only once its store
+    /// is open (it answers `/healthz` from the bind, ADR-198), failing at once, with its
     /// log, if it exits first rather than waiting out `PATIENCE`.
     async fn wait_ready(&self, client: &reqwest::Client) {
         if let Err(why) = self.try_ready(client, ports::BOUND_HTTP_LINE).await {
@@ -174,7 +175,7 @@ jwt_secret = "{JWT_SECRET}"
                 }
             }
             if let Some(port) = self.http.get()
-                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/healthz")).send().await
+                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/readyz")).send().await
                 && res.status().is_success()
             {
                 return Ok(());
@@ -387,8 +388,8 @@ async fn a_start_that_serves_settles_what_it_inherited() {
     assert!(!marker.contains("previous") && !marker.contains("failed_start"), "{marker}");
 }
 
-/// Hold a port, so a start opens its database, cannot bind, and fails
-/// before it serves; return the start's log.
+/// Hold a port, so a start cannot bind and fails before it opens its
+/// database (the bind comes first, ADR-198); return the start's log.
 fn a_start_that_fails_to_bind(dir: &Path, name: &str) -> String {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
@@ -1486,8 +1487,8 @@ async fn a_stop_over_tls_closes_the_store() {
     let deadline = Instant::now() + PATIENCE;
     loop {
         if let ports::Bound::Port(port) =
-            ports::bound_http_port(&run.stdout, "serving HTTPS", run.pid, &[])
-            && let Ok(res) = client.get(format!("https://localhost:{port}/healthz")).send().await
+            ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[])
+            && let Ok(res) = client.get(format!("https://localhost:{port}/readyz")).send().await
             && res.status().is_success()
         {
             break;
@@ -1670,4 +1671,113 @@ async fn a_vector_graph_building_at_the_stop_ends_at_the_drain_deadline() {
         },
     )
     .await;
+}
+
+/// The port a node bound, read from its log at the bind: before its store is
+/// open, when a probe already has something to ask (ADR-198).
+async fn wait_bound(run: &Run) -> u16 {
+    let deadline = Instant::now() + PATIENCE;
+    let mut line_wait = ports::LineWait::default();
+    loop {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        match line_wait.judge(bound, ports::BOUND_HTTP_LINE) {
+            Ok(Some(port)) => return port,
+            Ok(None) => {}
+            Err(why) => panic!("{why}; log: {}", run.log()),
+        }
+        assert!(Instant::now() < deadline, "never bound; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// A node whose store takes seconds to open answers `/healthz` from the bind,
+/// says on `/readyz` what it is doing, refuses everything else (`/v1/version`
+/// included, which a roll polls), and then serves, with no connection lost at
+/// the swap.
+#[tokio::test]
+async fn a_node_answers_its_probes_while_its_store_opens_and_serves_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "opening", &[("KIMMY_TEST_OPEN_DELAY_SECS", "5")]);
+    let port = wait_bound(&run).await;
+    let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+    let opened_by = Instant::now() + Duration::from_secs(5);
+
+    // Liveness is up from the bind; readiness says what it is doing.
+    let health = client.get(url("/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "{}", run.log());
+    let ready = client.get(url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 503);
+    let body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(body["error"], "starting", "{body}");
+    assert_eq!(body["retry"], "elsewhere", "{body}");
+    assert_eq!(body["status"], "opening", "{body}");
+    assert_eq!(body["phase"], "opening", "{body}");
+    assert!(body["phase_age_seconds"].is_number(), "{body}");
+
+    // Everything else is refused, the two a roll and a scrape use included,
+    // with no Retry-After (another member is the answer).
+    for path in ["/v1/version", "/metrics", "/v1/db/shop/collections"] {
+        let refused = client.get(url(path)).send().await.unwrap();
+        assert_eq!(refused.status(), 503, "{path}");
+        assert!(refused.headers().get("retry-after").is_none(), "{path}");
+        let body: serde_json::Value = refused.json().await.unwrap();
+        assert_eq!(body["error"], "starting", "{path}: {body}");
+    }
+    // The probes are not logged, however many the open receives.
+    assert!(!run.log().contains("request failed"), "{}", run.log());
+
+    // It becomes ready, and a request is answered by the router.
+    run.wait_ready(&client).await;
+    assert!(Instant::now() >= opened_by - Duration::from_secs(1), "the open was not delayed");
+    let version = client.get(url("/v1/version")).send().await.unwrap();
+    assert_eq!(version.status(), 200, "{}", run.log());
+    let log = run.log();
+    let bound = log.find("HTTP listener bound").expect("the bind is logged");
+    let serving = log.find("serving HTTP and WebSocket").expect("serving is logged");
+    let started = log.find("starting kimmyd").expect("the banner is logged");
+    assert!(bound < started && started < serving, "bind, then open, then serving: {log}");
+
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// A stop asked for while the store opens is heard (the handler is installed
+/// at the bind), ends the wait, and stops the node without serving, with a
+/// clean marker.
+#[tokio::test]
+async fn a_stop_during_the_open_stops_the_node_without_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::spawn_with(dir.path(), "stopped", &[("KIMMY_TEST_OPEN_DELAY_SECS", "40")]);
+    let port = wait_bound(&run).await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client.get(format!("http://127.0.0.1:{port}/healthz")).send().await.unwrap().status(),
+        200
+    );
+
+    let before = Instant::now();
+    run.signal("TERM");
+    let status = run.wait_exit();
+    let took = before.elapsed();
+    assert!(status.success(), "{status:?}: {}", run.log());
+    assert!(took < Duration::from_secs(10), "the stop waited for the whole open: {took:?}");
+    let log = run.log();
+    assert!(log.contains("stopping without serving"), "{log}");
+    assert!(!log.contains("serving HTTP and WebSocket"), "it must never serve: {log}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
+/// A bind that fails is a start that never opened the store: no store file was
+/// created, and the last run's verdict is inherited by the failed start.
+#[tokio::test]
+async fn a_bind_that_fails_never_opens_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = a_start_that_fails_to_bind(dir.path(), "unbindable");
+    assert!(log.contains("Address already in use"), "{log}");
+    assert!(!log.contains("starting kimmyd"), "the banner follows the open: {log}");
+    assert!(
+        !dir.path().join("data").join("kimmy.redb").exists(),
+        "an address that cannot be bound must not create the store"
+    );
 }

@@ -167,7 +167,7 @@ allowed_hosts = ["127.0.0.1"]
             if self.proc.poll() is not None:
                 raise RuntimeError(f"{self.name} exited before it was ready:\n{self.log()}")
             try:
-                http("GET", self.url("/healthz"), timeout=1)
+                http("GET", self.url("/readyz"), timeout=1)
                 return
             except Exception:
                 time.sleep(0.05)
