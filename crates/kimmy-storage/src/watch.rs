@@ -538,6 +538,28 @@ impl Engine {
         Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
     }
 
+    /// The time of the entry `rows` arrival positions before the newest one, or
+    /// zero when the oplog holds fewer: where a drain that covers only the
+    /// newest `rows` entries starts. Two bounded reads, no walk. For the serve
+    /// walk's bench (`examples/serve_walk_bench.rs`), which times a requester
+    /// that trails the tail by about that many rows; not a public contract.
+    #[doc(hidden)]
+    pub fn arrival_tail_start(&self, rows: u64) -> Result<Hlc> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        let Some((last, _)) = arrival.last()? else {
+            return Ok(Hlc::ZERO);
+        };
+        let target = last.value().saturating_sub(rows);
+        if target == 0 {
+            return Ok(Hlc::ZERO);
+        }
+        match arrival.range(target..)?.next() {
+            Some(row) => Ok(codec::decode_oplog_key(row?.1.value())?.hlc),
+            None => Ok(Hlc::ZERO),
+        }
+    }
+
     /// The oldest arrival position still retained.
     ///
     /// A stream whose next position is below this has had its replay range
@@ -728,7 +750,24 @@ impl Engine {
         budget: Option<(ExamineBudget, Hlc)>,
     ) -> Result<OplogWindow> {
         let txn = self.db().begin_read()?;
-        let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(scope))?;
+        self.read_oplog_linear_in(&txn, from, limit, scope, skip, keep, budget)
+    }
+
+    /// [`Self::read_oplog_budgeted`] in a read transaction the caller holds:
+    /// one linear walk of `OPLOG`, every row's key decoded, a body read only
+    /// for a row the skip does not name.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_oplog_linear_in(
+        &self,
+        txn: &redb::ReadTransaction,
+        from: Hlc,
+        limit: usize,
+        scope: WalkScope,
+        skip: impl Fn(&Stamp) -> bool,
+        keep: impl Fn(&OplogEntry) -> bool,
+        budget: Option<(ExamineBudget, Hlc)>,
+    ) -> Result<OplogWindow> {
+        let oplog = open_walk_table(txn, tables::OPLOG, self.walk(scope))?;
         let lower = codec::oplog_key_lower_bound(from);
 
         // Exhausted until something stops the scan short: an empty range is the
@@ -768,6 +807,99 @@ impl Engine {
         }
         Ok(window)
     }
+
+    /// The same window as [`Self::read_oplog_linear_in`], read from the keys of
+    /// `OPLOG_ARRIVAL_SEQ`, which hold the same stamps in the same order in
+    /// pages about twenty times denser: a body is read from `OPLOG` only for a
+    /// row the skip does not name. **`None` means the two tables disagreed**,
+    /// and says which way, for the caller to walk linearly instead.
+    ///
+    /// **Why the rest is unchanged.** The loop body is the linear one with the
+    /// row source swapped: the same `skip` on the key, the same `keep` on the
+    /// decoded entry *before* a row counts towards `limit` (ADR-126), the same
+    /// `scanned_to` after every examined row, the same budget check after it
+    /// with the caller's floor, and the same `examined` count, so a row-budget
+    /// window ends at the same row in both. Point reads of bodies are inside the
+    /// timed loop, so they count towards the time budget; the stop is checked
+    /// by the key iterator before every row, so it is honoured between them.
+    ///
+    /// **The guard.** In this transaction the two tables must hold the same
+    /// number of rows (each table's count is in its header: no page is read),
+    /// and every key of a row not skipped must have a body. A short
+    /// `OPLOG_ARRIVAL_SEQ` fails the first; a dangling key fails the second. The
+    /// pair it cannot see, a row missing from the index made up by a dangling
+    /// key that is skipped or lies beyond the window, is one no live build
+    /// writes (every writer maintains both in one transaction and the open
+    /// repairs a short stamp half, `rebuild_arrival_index_if_stale`); ADR-197
+    /// states the residual.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_oplog_by_arrival_keys_in(
+        &self,
+        txn: &redb::ReadTransaction,
+        from: Hlc,
+        limit: usize,
+        scope: WalkScope,
+        skip: impl Fn(&Stamp) -> bool,
+        keep: impl Fn(&OplogEntry) -> bool,
+        budget: Option<(ExamineBudget, Hlc)>,
+    ) -> Result<std::result::Result<OplogWindow, KeyWalkFallback>> {
+        let oplog = open_walk_table(txn, tables::OPLOG, self.walk(scope))?;
+        let by_stamp = open_walk_table(txn, tables::OPLOG_ARRIVAL_SEQ, self.walk(scope))?;
+        if by_stamp.len()? != oplog.len()? {
+            return Ok(Err(KeyWalkFallback::Length));
+        }
+        let lower = codec::oplog_key_lower_bound(from);
+
+        let mut window = OplogWindow { exhausted: true, ..OplogWindow::default() };
+        let mut examined = 0u64;
+        let mut first_row: Option<std::time::Instant> = None;
+        for row in by_stamp.range(lower.as_slice()..)? {
+            let (key, _) = row?;
+            let stamp = codec::decode_oplog_key(key.value())?;
+            let started = *first_row.get_or_insert_with(std::time::Instant::now);
+            examined += 1;
+            if skip(&stamp) {
+                window.scanned_to = stamp.hlc;
+            } else {
+                let Some(body) = oplog.get(key.value())? else {
+                    return Ok(Err(KeyWalkFallback::MissingBody));
+                };
+                let entry = codec::decode_oplog_entry(body.value())?;
+                window.scanned_to = entry.stamp.hlc;
+                if keep(&entry) {
+                    window.entries.push(entry);
+                    if window.entries.len() >= limit {
+                        window.exhausted = false;
+                        break;
+                    }
+                }
+            }
+            if let Some((budget, floor)) = budget
+                && stamp.hlc > floor
+                && budget.spent(examined, started.elapsed())
+            {
+                window.exhausted = false;
+                window.passed_through = Some(stamp);
+                break;
+            }
+        }
+        Ok(Ok(window))
+    }
+}
+
+/// Why a key walk of `OPLOG_ARRIVAL_SEQ` gave up for a linear walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyWalkFallback {
+    /// The two tables held a different number of rows.
+    Length,
+    /// A key of a row that was not skipped had no body in `OPLOG`.
+    MissingBody,
+    /// The walk failed for a reason other than the stop, an error reading the
+    /// index or a key of it that does not decode among them. That is not the
+    /// serve's failure while the oplog can be read directly, so the caller
+    /// answers from the oplog, and if the oplog fails the same way, that is the
+    /// error.
+    Index,
 }
 
 /// One window of the oplog, read from a starting stamp: what the caller keeps,
@@ -844,6 +976,23 @@ static TEST_SERVE_WALK_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// `KIMMY_TEST_SERVE_WALK_MS`: its time, `u64::MAX` for the default.
 static TEST_SERVE_WALK_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `KIMMY_TEST_SERVE_WALK_PATH=linear`: every served window is read by the
+/// linear walk, whatever the requester holds, so one binary can be timed on
+/// both paths.
+static TEST_SERVE_WALK_LINEAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force the linear walk for every served window, for the whole process. In
+/// the shipped binary, like the switches above; the daemon logs it when set.
+pub fn set_test_serve_walk_linear(linear: bool) {
+    TEST_SERVE_WALK_LINEAR.store(linear, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_test_serve_walk_linear`] is in force.
+pub(crate) fn serve_walk_forced_linear() -> bool {
+    TEST_SERVE_WALK_LINEAR.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Set what [`ExamineBudget::serve`] gives, for the whole process: `rows`
 /// and `ms`, each `None` for its default. In the shipped binary, like

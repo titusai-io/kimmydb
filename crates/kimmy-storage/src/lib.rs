@@ -43,6 +43,9 @@ pub use verified::VerifiedWalk;
 pub use walk::WalkScope;
 pub mod watch;
 
+#[cfg(test)]
+mod key_walk_tests;
+
 pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
@@ -59,7 +62,7 @@ pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use hold_meter::{
     Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
-    ServeSnapshot,
+    ServeSnapshot, ServeWalk, WalkPath,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
@@ -76,5 +79,5 @@ pub use sync::{
 pub use vectors::{VectorWrite, VectorsOff};
 pub use watch::{
     ChangeEvent, ChangeStream, ExamineBudget, InvalidateReason, OplogWindow, WatchOptions,
-    WatchScope, set_test_serve_walk_budget,
+    WatchScope, set_test_serve_walk_budget, set_test_serve_walk_linear,
 };

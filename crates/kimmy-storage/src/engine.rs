@@ -1226,7 +1226,7 @@ impl Engine {
             );
         }
         // After the arrival index, whose end the counts' mark is compared
-        // against: a rebuilt index renumbers positions, and the counts are
+        // against: a repaired index appends positions, and the counts are
         // rebuilt with it (ADR-174).
         {
             let started = std::time::Instant::now();
@@ -1932,9 +1932,10 @@ impl Engine {
     /// written alongside an oplog append and collected alongside an oplog
     /// removal, so a length mismatch is the only way it can diverge.
     ///
-    /// Existing history is ordered by stamp, which is correct: everything
-    /// written before this index existed was locally originated, and for local
-    /// writes arrival order *is* stamp order.
+    /// History from before the index existed is ordered by stamp, which is
+    /// correct: everything written before it was locally originated, and for
+    /// local writes arrival order *is* stamp order. Positions already issued
+    /// are never renumbered.
     fn rebuild_arrival_index_if_stale(db: &Database) -> Result<()> {
         {
             let txn = db.begin_read()?;
@@ -1968,49 +1969,120 @@ impl Engine {
             }
         }
 
+        Self::repair_arrival_index_from_oplog(db)
+    }
+
+    /// Repair the arrival index against the oplog **without renumbering**.
+    ///
+    /// Every position whose stamp is still in the oplog is kept where it is:
+    /// a position is what a change stream's token names (`resume_point`
+    /// resumes at the position of the stamp it holds, plus one), and an entry
+    /// relayed from a peer arrives after higher-stamped local ones, so a
+    /// renumbering in stamp order would move it below a token that had already
+    /// passed it and the stream would skip it. A position whose stamp is gone
+    /// from the oplog, or a second position naming a stamp, is dropped.
+    ///
+    /// **A stamp with no position row takes the position the stamp half still
+    /// names for it**, when that position is free: either half alone can be
+    /// the one that lost the row, and the other still knows where the entry
+    /// arrived. Only a stamp neither half knows takes the next position, past
+    /// the highest ever issued (a dropped position is never reused), in stamp
+    /// order: on a store that predates the index that is every entry, from 0,
+    /// which is correct because everything written before the index existed
+    /// was local, where arrival order is stamp order. The stamp half is then
+    /// rebuilt from the positions. One transaction: a failure leaves the index
+    /// as it was.
+    ///
+    /// Memory: the surviving stamps, 26 bytes a row, held sorted for the merge
+    /// with the oplog. A repair path, run when damage is found, never in
+    /// normal operation.
+    fn repair_arrival_index_from_oplog(db: &Database) -> Result<()> {
+        let stamp_key = |bytes: &[u8]| -> Result<[u8; codec::STAMP_LEN]> {
+            <[u8; codec::STAMP_LEN]>::try_from(bytes)
+                .map_err(|_| StorageError::Corrupt("an arrival index key is not a stamp".into()))
+        };
         let txn = db.begin_write()?;
-        let rebuilt = {
+        let (kept, dropped, recovered, appended) = {
             let oplog = txn.open_table(tables::OPLOG)?;
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
-            // Cleared by key, a batch at a time, never with `retain`: see
-            // `index::clear_index_entries` for what `retain` costs. Both
-            // tables are one row per oplog entry.
-            loop {
-                let batch: Vec<u64> = arrival
-                    .iter()?
-                    .take(crate::index::CLEAR_BATCH)
-                    .map(|row| Ok(row?.0.value()))
-                    .collect::<Result<_>>()?;
-                if batch.is_empty() {
-                    break;
-                }
-                let mut gone = 0;
-                for seq in &batch {
-                    #[cfg(test)]
-                    if crate::index::clear_hooks::keeps("the arrival index") {
-                        continue;
-                    }
-                    gone += usize::from(arrival.remove(*seq)?.is_some());
-                }
-                crate::index::ensure_removed(batch.len(), gone, "the arrival index")?;
-            }
-            Self::clear_stamp_half(&mut by_stamp)?;
 
-            let mut seq = 0u64;
+            // Past the highest position either half has ever named.
+            let mut next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
+            for row in by_stamp.iter()? {
+                let (key, seq) = row?;
+                // A stray key for an entry the oplog no longer holds names no
+                // position anything can resume at.
+                if oplog.get(key.value())?.is_some() {
+                    next = next.max(seq.value() + 1);
+                }
+            }
+            let mut surviving: Vec<([u8; codec::STAMP_LEN], u64)> = Vec::new();
+            let mut strays: Vec<u64> = Vec::new();
+            for row in arrival.iter()? {
+                let (seq, stamp) = row?;
+                if oplog.get(stamp.value())?.is_some() {
+                    surviving.push((stamp_key(stamp.value())?, seq.value()));
+                } else {
+                    strays.push(seq.value());
+                }
+            }
+            // Positions ascend, so the sort is stable on them: of two positions
+            // naming one stamp, the first is kept.
+            surviving.sort_by_key(|row| row.0);
+            let mut kept = 0u64;
+            let mut stamps: Vec<[u8; codec::STAMP_LEN]> = Vec::with_capacity(surviving.len());
+            for (stamp, seq) in surviving {
+                if stamps.last() == Some(&stamp) {
+                    strays.push(seq);
+                } else {
+                    stamps.push(stamp);
+                    kept += 1;
+                }
+            }
+            let dropped = strays.len() as u64;
+            // Removed first, so a position a stray held is free for the stamp
+            // half to hand back.
+            for seq in strays {
+                arrival.remove(seq)?;
+            }
+
+            let (mut recovered, mut appended) = (0u64, 0u64);
             for row in oplog.iter()? {
                 let (key, _) = row?;
-                arrival.insert(seq, key.value())?;
-                by_stamp.insert(key.value(), seq)?;
-                seq += 1;
+                if stamps.binary_search_by(|have| have.as_slice().cmp(key.value())).is_ok() {
+                    continue;
+                }
+                let named = by_stamp.get(key.value())?.map(|seq| seq.value());
+                match named {
+                    Some(seq) if seq < next && arrival.get(seq)?.is_none() => {
+                        arrival.insert(seq, key.value())?;
+                        recovered += 1;
+                    }
+                    _ => {
+                        arrival.insert(next, key.value())?;
+                        next += 1;
+                        appended += 1;
+                    }
+                }
             }
-            seq
+
+            Self::clear_stamp_half(&mut by_stamp)?;
+            for row in arrival.iter()? {
+                let (seq, key) = row?;
+                by_stamp.insert(key.value(), seq.value())?;
+            }
+            (kept, dropped, recovered, appended)
         };
         txn.commit()?;
 
-        if rebuilt > 0 {
-            info!(entries = rebuilt, "rebuilt the oplog arrival index");
-        }
+        info!(
+            kept,
+            dropped,
+            recovered,
+            appended,
+            "repaired the oplog arrival index, keeping every position"
+        );
         Ok(())
     }
 
@@ -2074,9 +2146,13 @@ impl Engine {
     /// written before the vector existed, or one an older build appended to.
     pub(crate) fn rebuild_version_vector_if_stale(
         db: &Database,
-    ) -> Result<(bool, crate::verified::VerifiedWalk)> {
+    ) -> Result<(bool, crate::verified::VerifiedWalk, bool)> {
         let started = std::time::Instant::now();
         let mut walk = crate::verified::VerifiedWalk::default();
+        // Whether the arrival index's keys are the oplog's, read in step with
+        // it: the two counts agree when a row is missing from one and a stray
+        // stands in the other, and only reading both says so (ADR-197).
+        let mut arrival_differs = false;
         let mut actual = kimmy_core::VersionVector::new();
         {
             let txn = db.begin_read()?;
@@ -2102,14 +2178,23 @@ impl Engine {
             // walk ADR-153 measured as the dominant cost of opening a large
             // database. Empty is the overwhelmingly common case.
             let any_held = !held.is_empty()?;
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let mut arrival = by_stamp.iter()?;
             for row in oplog.iter()? {
                 let (key, value) = row?;
+                match arrival.next().transpose()? {
+                    Some((other, _)) if other.value() == key.value() => {}
+                    _ => arrival_differs = true,
+                }
                 walk.rows += 1;
                 walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
                 if any_held && held.get(key.value())?.is_some() {
                     continue;
                 }
                 actual.observe(codec::decode_oplog_key(key.value())?);
+            }
+            if arrival.next().is_some() {
+                arrival_differs = true;
             }
         }
         walk.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -2141,7 +2226,11 @@ impl Engine {
                 seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
-        crate::verified::write(&txn, schema, &walk)?;
+        // Not when the walk found the arrival index damaged: the caller repairs
+        // it first and records after (`verify_version_vector_at_open`).
+        if !arrival_differs {
+            crate::verified::write(&txn, schema, &walk)?;
+        }
         // A failure before the raise commits, for the test that the record
         // cannot land without the raise it describes.
         #[cfg(test)]
@@ -2158,7 +2247,7 @@ impl Engine {
                 "raised the version vector to cover the oplog entries appended in position"
             );
         }
-        Ok((raised, walk))
+        Ok((raised, walk, arrival_differs))
     }
 
     /// Check the version vector against the oplog at open, unless the record
@@ -2173,6 +2262,12 @@ impl Engine {
     /// What a skip gives up: the walk decoded every oplog key, so an
     /// undecodable one failed the open. Skipped, it surfaces at the first read
     /// that reaches it.
+    /// Beside the vector, the walk reads the arrival index's keys in step with
+    /// the oplog's (ADR-197): the two counts agree when a row is missing from
+    /// one and a stray stands in the other, and only reading both says so. **A
+    /// difference is repaired in this open**: both arrival tables are rebuilt
+    /// from the oplog, and only then is the record written, so a store that
+    /// was found damaged is never recorded verified while it is.
     fn verify_version_vector_at_open(db: &Database) -> Result<()> {
         let schema = Self::current_schema(db)?;
         if !crate::verified::forced()
@@ -2209,7 +2304,7 @@ impl Engine {
             }
             return Ok(());
         }
-        let (raised, walk) = Self::rebuild_version_vector_if_stale(db)?;
+        let (raised, walk, arrival_differs) = Self::rebuild_version_vector_if_stale(db)?;
         info!(
             elapsed_ms = walk.elapsed_ms,
             rows = walk.rows,
@@ -2217,6 +2312,25 @@ impl Engine {
             raised,
             "checked the version vector against the oplog"
         );
+        if arrival_differs {
+            warn!(
+                "the oplog and its arrival index hold different sets of keys although their \
+                 counts agree; repairing the index from the oplog before this node serves. \
+                 This is a bug or damage"
+            );
+            Self::repair_arrival_index_from_oplog(db)?;
+            // Only now: the record says the vector is verified, and a crash before
+            // the repair leaves it unwritten, so the next open walks again.
+            #[cfg(test)]
+            if crate::verified::test_support::fails_after_the_arrival_repair() {
+                return Err(StorageError::Database(
+                    "a failure injected after the arrival repair commits".into(),
+                ));
+            }
+            let txn = db.begin_write()?;
+            crate::verified::write(&txn, Self::current_schema(db)?, &walk)?;
+            txn.commit()?;
+        }
         Ok(())
     }
 
@@ -7085,8 +7199,9 @@ mod clearing {
 
     #[test]
     fn an_arrival_rebuild_whose_keys_do_not_go_stops_instead_of_spinning() {
-        // Each of the rebuild's two clears, on its own.
-        for table in ["the arrival index", "the arrival index by stamp"] {
+        // The repair clears the stamp half only: the positions are kept.
+        {
+            let table = "the arrival index by stamp";
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("kimmy.redb");
             one_arrival_row_short(&path);

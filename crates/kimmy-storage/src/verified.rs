@@ -147,6 +147,17 @@ pub(crate) mod test_support {
     thread_local! {
         static FAIL_BEFORE_THE_RAISE_COMMITS: Cell<bool> = const { Cell::new(false) };
         static FORCED: Cell<bool> = const { Cell::new(false) };
+        static FAIL_AFTER_THE_ARRIVAL_REPAIR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fail the next open on this thread just after the arrival index's repair
+    /// commits and before the record is written.
+    pub(crate) fn fail_after_the_arrival_repair() {
+        FAIL_AFTER_THE_ARRIVAL_REPAIR.with(|f| f.set(true));
+    }
+
+    pub(crate) fn fails_after_the_arrival_repair() -> bool {
+        FAIL_AFTER_THE_ARRIVAL_REPAIR.with(|f| f.replace(false))
     }
 
     /// Run `f` with the opens on this thread walking, as
@@ -689,6 +700,27 @@ mod tests {
         ]
     }
 
+    /// The keys of `OPLOG` and of `OPLOG_ARRIVAL_SEQ`, compared in order.
+    fn arrival_index_keys_match_the_oplog(engine: &Engine) -> Result<(), String> {
+        use redb::{ReadableDatabase, ReadableTable};
+        let txn = engine.db().begin_read().map_err(|e| e.to_string())?;
+        let oplog = txn.open_table(crate::tables::OPLOG).map_err(|e| e.to_string())?;
+        let by_stamp =
+            txn.open_table(crate::tables::OPLOG_ARRIVAL_SEQ).map_err(|e| e.to_string())?;
+        let keys = |t: &dyn Fn() -> Vec<Vec<u8>>| t();
+        let a = keys(&|| oplog.iter().unwrap().map(|r| r.unwrap().0.value().to_vec()).collect());
+        let b = keys(&|| by_stamp.iter().unwrap().map(|r| r.unwrap().0.value().to_vec()).collect());
+        if a == b {
+            Ok(())
+        } else {
+            Err(format!(
+                "the arrival index's keys differ from the oplog's: {} against {}",
+                b.len(),
+                a.len()
+            ))
+        }
+    }
+
     struct Store {
         dirs: Vec<tempfile::TempDir>,
         path: PathBuf,
@@ -864,6 +896,13 @@ mod tests {
         fn check(&mut self, after: &Op) {
             self.close();
             self.open();
+            // Whatever wrote the store, the oplog and the arrival index hold
+            // the same keys, which the key walk of served windows leans on
+            // (ADR-197): a row in one and not the other, made up for by a
+            // stray in the other, keeps their counts equal and is caught only
+            // here.
+            arrival_index_keys_match_the_oplog(self.engine())
+                .unwrap_or_else(|e| panic!("{e}, after {after:?}"));
             if self.engine().version_vector_verified().unwrap().is_some() {
                 a_walk_would_raise_nothing(self.engine())
                     .unwrap_or_else(|e| panic!("a record stands over {e}, after {after:?}"));
@@ -912,8 +951,10 @@ mod tests {
     const READERS: [&str; 7] = ["get", "iter", "range", "len", "is_empty", "first", "last"];
 
     /// The writers audited for I, as (file, function). `faults.rs` is test
-    /// and `test-hooks` code as a whole, so it is exempt as a file.
-    const AUDITED_FILES: [&str; 1] = ["faults.rs"];
+    /// and `test-hooks` code as a whole, and `key_walk_tests.rs` is test code
+    /// that damages the store on purpose to show what the key walk does about
+    /// it, so both are exempt as files.
+    const AUDITED_FILES: [&str; 2] = ["faults.rs", "key_walk_tests.rs"];
     const AUDITED_FNS: [(&str, &str); 10] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "raise_version"),

@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use crate::docs::RemoteApplied;
 use crate::engine::{Engine, WriteTxn, WriterHolder};
 use crate::error::Result;
+use crate::hold_meter::{ServeWalk, WalkPath};
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
 use crate::walk::{WalkScope, open_walk_table};
@@ -604,6 +605,16 @@ impl MarkedRange {
     }
 }
 
+/// What is left of a window's budget once the key walk that gave up has spent
+/// `spent` of its time. The rows are the linear walk's own count, and the floor
+/// is unchanged, so the window still ends past where it began.
+pub(crate) fn after_attempt(
+    budget: Option<(ExamineBudget, Hlc)>,
+    spent: std::time::Duration,
+) -> Option<(ExamineBudget, Hlc)> {
+    budget.map(|(b, floor)| (ExamineBudget { time: b.time.saturating_sub(spent), ..b }, floor))
+}
+
 impl Engine {
     /// Merge a batch a peer served in answer to `AskEntries`, and record what
     /// the batch proved about coverage.
@@ -820,7 +831,7 @@ impl Engine {
         scope: WalkScope,
     ) -> Result<OplogWindow> {
         let passed = std::cell::Cell::new(0);
-        self.entries_for_peer_counting(from, limit, held, marked, scope, &passed, None)
+        self.entries_for_peer_counting(from, limit, held, marked, scope, &passed, None, None)
     }
 
     /// [`Self::entries_for_peer_holding`], ended by `budget` (ADR-194): a
@@ -835,7 +846,32 @@ impl Engine {
         budget: ExamineBudget,
     ) -> Result<OplogWindow> {
         let passed = std::cell::Cell::new(0);
-        self.entries_for_peer_counting(from, limit, held, &[], scope, &passed, Some(budget))
+        self.entries_for_peer_counting(
+            from,
+            limit,
+            held,
+            &[],
+            scope,
+            &passed,
+            Some(budget),
+            Some(ServeWalk::Push),
+        )
+    }
+
+    /// [`Self::entries_for_peer_within`] again, for the same request: the walk a
+    /// window that did not fit its frame is read once more with. Not counted,
+    /// so one confirmation push is one push window (a pull's re-walk is counted,
+    /// as `kimmy_sync_served_windows_total` says it is).
+    pub fn entries_for_peer_refit(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        scope: WalkScope,
+        budget: ExamineBudget,
+    ) -> Result<OplogWindow> {
+        let passed = std::cell::Cell::new(0);
+        self.entries_for_peer_counting(from, limit, held, &[], scope, &passed, Some(budget), None)
     }
 
     /// [`Self::entries_for_peer_marked`], for a window this node is serving a
@@ -867,6 +903,7 @@ impl Engine {
             WalkScope::Background,
             &passed,
             budget,
+            Some(ServeWalk::Serve),
         );
         let walked = walked_from.elapsed();
         let (read, _) = walk.finish();
@@ -883,6 +920,19 @@ impl Engine {
     /// when that is below `from` (ADR-194): a budgeted walk ends only past
     /// `start`'s successor, so whatever the budget, the next request's scan
     /// starts further on.
+    ///
+    /// **Which walk reads it (ADR-197).** A request that names what the
+    /// requester holds skips most of what it walks, and the skip needs only a
+    /// key, so it is read from the keys of `OPLOG_ARRIVAL_SEQ`, which hold the
+    /// same stamps in the same order in pages about twenty times denser, with a
+    /// body read from `OPLOG` only for a row that is served or withheld. A
+    /// request that names nothing skips nothing, and a body point read per row
+    /// would only cost more, so it walks `OPLOG` as it always did. If the two
+    /// tables disagree the key walk gives up (see
+    /// [`Engine::read_oplog_by_arrival_keys_in`]) and the linear walk answers,
+    /// **in the same read transaction**, with `passed` put back as it was so
+    /// the abandoned attempt is not counted twice. `served` names the kind of
+    /// request for the path counter, and is `None` for a local read.
     #[allow(clippy::too_many_arguments)]
     fn entries_for_peer_counting(
         &self,
@@ -893,26 +943,92 @@ impl Engine {
         scope: WalkScope,
         passed: &std::cell::Cell<u64>,
         budget: Option<ExamineBudget>,
+        served: Option<ServeWalk>,
     ) -> Result<OplogWindow> {
         let marked = if held.is_some() { marked } else { &[] };
         let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
-        self.read_oplog_budgeted(
-            start,
-            limit,
-            scope,
-            |stamp| {
-                let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
-                    && !marked.iter().any(|span| span.contains(stamp));
-                passed.set(passed.get() + u64::from(skip));
-                skip
-            },
-            |entry| {
-                let keep = entry.kind != OpKind::UniqueViolation;
-                passed.set(passed.get() + u64::from(!keep));
-                keep
-            },
-            budget.map(|budget| (budget, start.successor())),
-        )
+        let skip = |stamp: &Stamp| {
+            let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
+                && !marked.iter().any(|span| span.contains(stamp));
+            passed.set(passed.get() + u64::from(skip));
+            skip
+        };
+        let keep = |entry: &OplogEntry| {
+            let keep = entry.kind != OpKind::UniqueViolation;
+            passed.set(passed.get() + u64::from(!keep));
+            keep
+        };
+        let budget = budget.map(|budget| (budget, start.successor()));
+        let record = |path: WalkPath| {
+            if let Some(walk) = served {
+                self.serve_counters().record_path(walk, path);
+            }
+        };
+
+        let txn = self.db().begin_read()?;
+        let mut path = WalkPath::Linear;
+        let mut budget = budget;
+        if held.is_some() && !crate::watch::serve_walk_forced_linear() {
+            let attempted = std::time::Instant::now();
+            let before = passed.get();
+            let tried: Result<std::result::Result<OplogWindow, crate::watch::KeyWalkFallback>> =
+                match self
+                    .read_oplog_by_arrival_keys_in(&txn, start, limit, scope, skip, keep, budget)
+                {
+                    // The stop ends the serve, as it ends the linear walk.
+                    Err(e @ crate::error::StorageError::Stopping(_)) => return Err(e),
+                    // Anything else went wrong reading the derived index (or a body
+                    // the linear walk will meet as well): the oplog answers, and
+                    // says the same thing if it fails the same way.
+                    Err(_) => Ok(Err(crate::watch::KeyWalkFallback::Index)),
+                    Ok(tried) => Ok(tried),
+                };
+            match tried? {
+                Ok(window) => {
+                    record(WalkPath::Keys);
+                    return Ok(window);
+                }
+                Err(why) => {
+                    passed.set(before);
+                    path = match why {
+                        crate::watch::KeyWalkFallback::Length => WalkPath::FallbackLength,
+                        crate::watch::KeyWalkFallback::MissingBody => WalkPath::FallbackMissingBody,
+                        crate::watch::KeyWalkFallback::Index => WalkPath::FallbackError,
+                    };
+                    // The attempt spent part of the window's time; the linear walk
+                    // has what is left, so a window served on the damaged path
+                    // stays inside the budget the caller set.
+                    budget = after_attempt(budget, attempted.elapsed());
+                }
+            }
+        }
+        let window = self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
+        record(path);
+        // Said only once the linear walk has served the window: when it failed
+        // as well (a body that cannot be decoded), no window was served and
+        // the error is the report, so the line's ten-minute slot is kept for a
+        // fallback that did serve.
+        if path != WalkPath::Keys
+            && path != WalkPath::Linear
+            && served.is_some()
+            && self.serve_counters().fallback_is_due_a_line()
+        {
+            let why = match path {
+                WalkPath::FallbackLength => {
+                    "the oplog and its arrival index hold a different number of rows"
+                }
+                WalkPath::FallbackMissingBody => {
+                    "a key of the arrival index has no body in the oplog"
+                }
+                _ => "the arrival index or a body could not be read",
+            };
+            tracing::warn!(
+                reason = path.label(),
+                "{why}, so a served window was read by the linear walk instead of the key walk; \
+                 this is a bug or damage, and is counted in kimmy_sync_serve_walk_path_total"
+            );
+        }
+        Ok(window)
     }
 
     /// The spans of each origin's history this node holds as state at or below

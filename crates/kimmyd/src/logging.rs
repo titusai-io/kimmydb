@@ -843,6 +843,86 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.keys",
+            "{window}",
+            "Windows served by a peer pull that were read by the `keys` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::Keys.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.linear",
+            "{window}",
+            "Windows served by a peer pull that were read by the `linear` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::Linear.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.fallback_length",
+            "{window}",
+            "Windows served by a peer pull that were read by the `fallback_length` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::FallbackLength.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.fallback_missing_body",
+            "{window}",
+            "Windows served by a peer pull that were read by the `fallback_missing_body` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::FallbackMissingBody.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.serve.fallback_error",
+            "{window}",
+            "Windows served by a peer pull that were read by the `fallback_error` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Serve.slot()]
+                [kimmy_storage::WalkPath::FallbackError.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.keys",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `keys` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::Keys.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.linear",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `linear` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::Linear.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.fallback_length",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `fallback_length` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::FallbackLength.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.fallback_missing_body",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `fallback_missing_body` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::FallbackMissingBody.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.serve_walk_path.push.fallback_error",
+            "{window}",
+            "Windows served by a confirmation push that were read by the `fallback_error` path.",
+            |s| s.sync_serve.paths[kimmy_storage::ServeWalk::Push.slot()]
+                [kimmy_storage::WalkPath::FallbackError.slot()]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.failures",
             "{round}",
             "Anti-entropy rounds against a peer that failed, any cause.",

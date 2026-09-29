@@ -679,8 +679,10 @@ impl Confirmer {
                      cannot replicate"
                 )));
             }
+            // The same push read again to fit its frame, not a second push
+            // window: it is not counted.
             window = match kimmy_storage::blocking(|| {
-                engine.entries_for_peer_within(
+                engine.entries_for_peer_refit(
                     from,
                     fits,
                     Some(&held),

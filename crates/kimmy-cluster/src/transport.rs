@@ -6842,6 +6842,19 @@ mod partial_windows_never_skip {
             }
         }
 
+        // The windows above were read from the arrival index's keys and by no
+        // fallback: a silent fall back to the linear walk would pass every
+        // oracle here and exercise nothing of the key walk (ADR-197).
+        let paths = sender.serve_cost().paths[kimmy_storage::ServeWalk::Serve.slot()];
+        let at = |path: kimmy_storage::WalkPath| paths[path.slot()];
+        if at(kimmy_storage::WalkPath::Keys) == 0
+            || at(kimmy_storage::WalkPath::FallbackLength) != 0
+            || at(kimmy_storage::WalkPath::FallbackMissingBody) != 0
+            || at(kimmy_storage::WalkPath::FallbackError) != 0
+        {
+            return Err(format!("the windows were not all read by the key walk: {paths:?}"));
+        }
+
         // (c): the same sender, pulled whole by a requester placed the same.
         let mut whole = PeerStalls::new();
         loop {

@@ -487,6 +487,19 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             parsed
         })
     });
+    // Every served window read by the linear walk, so one binary can be timed
+    // on both paths (ADR-197).
+    let serve_walk_path = std::env::var("KIMMY_TEST_SERVE_WALK_PATH").ok().map(|value| {
+        let linear = value == "linear";
+        warn!(
+            switch = "KIMMY_TEST_SERVE_WALK_PATH",
+            value = %value,
+            recognised = linear || value == "keys",
+            "a test switch is set that chooses how every window this node serves is read, on \
+             purpose; unset it outside a test"
+        );
+        linear
+    });
     if let Some(what) = kimmy_task::test_kill_requested() {
         // The line says what is set, and the value says what it will do -- which
         // may be nothing. The prefix used to promise "will stop a background
@@ -971,6 +984,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         && (rows.is_some() || ms.is_some())
     {
         kimmy_storage::set_test_serve_walk_budget(rows.flatten(), ms.flatten());
+    }
+    if let Some(linear) = serve_walk_path {
+        kimmy_storage::set_test_serve_walk_linear(linear);
     }
     if let Some(Some(delay)) = walk_row_delay {
         kimmy_storage::walk::set_test_walk_row_delay(delay);

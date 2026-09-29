@@ -69,7 +69,8 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "watch::Walk::step",
     // The oplog window served to a peer, pushed to confirm a write, or read
     // for a client.
-    "watch::Engine::read_oplog_budgeted",
+    "watch::Engine::read_oplog_by_arrival_keys_in",
+    "watch::Engine::read_oplog_linear_in",
 ];
 
 /// Functions that iterate a table without checking the stop, as
@@ -84,6 +85,14 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "test support, built only with test-hooks: damages the store on purpose",
     ),
     ("divergence::next_probe", "an in-memory set's range, not a table"),
+    (
+        "key_walk_tests::the_oplog_and_its_arrival_index_hold_the_same_keys",
+        "test code reading a store of a hundred rows it wrote itself",
+    ),
+    (
+        "watch::Engine::arrival_tail_start",
+        "one row: the first arrival position at or above a target, for the serve walk's bench",
+    ),
     (
         "docs::WriteScope::for_each_doc",
         "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192)",
@@ -122,8 +131,20 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("engine::Engine::read_versions_in", "a version vector: one row per origin"),
     (
-        "engine::Engine::rebuild_arrival_index_if_stale",
+        "engine::Engine::repair_arrival_index_from_oplog",
         "at open, before the node serves or has a stop to answer",
+    ),
+    (
+        "key_walk_tests::the_verification_walk_repairs_a_pair_the_counts_cannot_see_before_it_records",
+        "test code reading a store of forty rows it wrote itself",
+    ),
+    (
+        "key_walk_tests::arrival_positions",
+        "test code reading a store of sixteen rows it wrote itself",
+    ),
+    (
+        "key_walk_tests::no_record_is_written_until_the_repair_has_committed",
+        "test code reading a store of sixteen rows it wrote itself",
     ),
     (
         "engine::Engine::rebuild_stamp_half_from_positions",
@@ -1071,7 +1092,7 @@ fn walk_table_problems(body: &str) -> Vec<String> {
             }
             let call = after.strip_prefix('.').map_or("", |c| c);
             let walks = ["range", "iter"].iter().any(|m| call.starts_with(m));
-            let bounded = ["get(", "first(", "last(", "insert(", "remove("]
+            let bounded = ["get(", "len(", "first(", "last(", "insert(", "remove("]
                 .iter()
                 .any(|m| call.starts_with(m));
             if !(bounded || (walks && code.contains("Rows {"))) {
