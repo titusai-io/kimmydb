@@ -99,6 +99,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   every ten seconds while the errors continue. A peer whose connection went away
   before it was accepted is neither waited on nor counted. The HTTP listener
   already waited 50 ms and logged at `ERROR`, and does both as before.
+- **The TTL pass no longer holds up the stop signal and other background work.**
+  The pass ran on one of the async runtime's workers, and while it walked a TTL
+  index's expired range, that worker ran nothing else. On the member that owned
+  the TTL collections, the stop signal was measured arriving up to 0.74 s late.
+  The pass, the webhook dispatcher's reads of its registry, progress and oplog,
+  the `unkeyed` and `undecidable` counts in index listings, the webhook listing,
+  and vector search's exact and keyword scans now run off the worker, as request
+  scans have since ADR-153. Nothing they return changes
+  ([ADR-199](docs/decisions.md)).
 
 ## 0.42.0 - 2026-09-29
 

@@ -254,13 +254,17 @@ pub fn list(state: &SharedState, auth: &Auth, db: &str, coll: &str) -> Result<Va
 
     let meta = registry(state)?;
     let mut out = Vec::new();
-    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
-        let matches = document.get_str("database").is_ok_and(|d| d == db)
-            && document.get_str("collection").is_ok_and(|c| c == coll);
-        if matches {
-            out.push(Subscription::to_json(&document));
-        }
-        Ok(true)
+    // The whole registry, every collection's subscriptions, which clients add:
+    // off the async worker, as the scrape's count of it is (ADR-199).
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
+            let matches = document.get_str("database").is_ok_and(|d| d == db)
+                && document.get_str("collection").is_ok_and(|c| c == coll);
+            if matches {
+                out.push(Subscription::to_json(&document));
+            }
+            Ok(true)
+        })
     })?;
 
     Ok(json!({ "webhooks": out, "count": out.len() }))

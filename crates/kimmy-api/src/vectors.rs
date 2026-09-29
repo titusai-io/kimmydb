@@ -906,7 +906,10 @@ fn knn_joined(
     let set = allowed.map(|(a, _)| &a.set);
     match state.vectors.access(&state.engine, shadow, config.metric, config.dim) {
         Access::Approximate(index) => index.search(&state.engine, shadow, query, options, set),
-        Access::Exact => search::vector_search(&state.engine, shadow, query, options, set),
+        // Every stored vector scored: a walk, off the async worker (ADR-199).
+        Access::Exact => kimmy_storage::blocking(|| {
+            search::vector_search(&state.engine, shadow, query, options, set)
+        }),
     }
     .map_err(vector_error)
 }
@@ -953,8 +956,12 @@ pub async fn run_hybrid_search(
     // The overlap gate applies to the lexical half only. A document it drops
     // here is still in `dense` if the dense half ranked it, and keeps that
     // contribution: the gate removes lexical evidence, not documents.
-    let lexical = search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap)
-        .map_err(vector_error)?;
+    // Every stored chunk's text tokenized: a walk, off the async worker
+    // (ADR-199).
+    let lexical = kimmy_storage::blocking(|| {
+        search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap)
+    })
+    .map_err(vector_error)?;
 
     let fused = search::weighted_reciprocal_rank_fusion(
         &[(dense.as_slice(), weights.dense as f32), (lexical.as_slice(), weights.lexical as f32)],

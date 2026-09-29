@@ -36,7 +36,7 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 17] = [
+const WALKS: [&str; 22] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -45,6 +45,16 @@ const WALKS: [&str; 17] = [
     ".count(&",
     ".live_unique_violations(",
     ".backup_to(",
+    // An index's unkeyed or undecidable run, which can be every document.
+    ".unkeyed_count(",
+    ".undecidable_count(",
+    // An oplog window from a position: it can pass over far more than it
+    // returns.
+    ".entries_for_peer(",
+    // A vector search with no graph to use scores every stored vector, and a
+    // keyword search reads every chunk's text.
+    "::vector_search(",
+    "::keyword_search(",
     // A peer's window: as long as whatever its entries carry, an index build
     // or a collection drop included.
     ".apply_peer_batch_into(",
@@ -66,9 +76,7 @@ const WALKS: [&str; 17] = [
 
 /// Walks allowed on the worker, per file, each bounded by something other than
 /// the data a client stored.
-const BOUNDED: [(&str, usize, &str); 5] = [
-    ("webhooks.rs", 1, "the webhook registry: one document per subscription"),
-    ("dispatch.rs", 3, "webhook jobs and delivery progress: subscriptions times members"),
+const BOUNDED: [(&str, usize, &str); 3] = [
     ("topology.rs", 1, "the node registry: one document per member"),
     ("schema.rs", 1, "sample_documents stops at its limit"),
     ("vectors.rs", 1, "the emptiness check stops at the first live vector"),

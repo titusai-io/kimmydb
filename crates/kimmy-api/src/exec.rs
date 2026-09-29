@@ -1607,9 +1607,15 @@ fn create_index_stamped(
     // What the backfill could not key, read back from the index it just
     // built: the one number a client creating an index over existing data
     // most wants beside `multikey`, and the listing reports the same field.
+    // Each count walks its run of the index, which can be every document:
+    // off the async worker (ADR-199).
     let meta = state.engine.get_collection(db, coll)?;
-    let unkeyed = state.engine.unkeyed_count(&meta, index.id)?;
-    let undecidable = state.engine.undecidable_count(&meta, index.id)?;
+    let (unkeyed, undecidable) = kimmy_storage::blocking(|| {
+        Ok::<_, kimmy_storage::StorageError>((
+            state.engine.unkeyed_count(&meta, index.id)?,
+            state.engine.undecidable_count(&meta, index.id)?,
+        ))
+    })?;
     Ok((index_to_json(&index, unkeyed, undecidable), index.created))
 }
 
@@ -1692,13 +1698,18 @@ pub fn list_indexes(
     authorize(state, auth, Action::Read, db, coll)?;
     let meta = state.engine.get_collection(db, coll)?;
     let mut indexes = Vec::with_capacity(meta.indexes.len());
-    for index in &meta.indexes {
-        indexes.push(index_to_json(
-            index,
-            state.engine.unkeyed_count(&meta, index.id)?,
-            state.engine.undecidable_count(&meta, index.id)?,
-        ));
-    }
+    // Each count walks its run of the index, which can be every document:
+    // off the async worker, once for the listing (ADR-199).
+    kimmy_storage::blocking(|| {
+        for index in &meta.indexes {
+            indexes.push(index_to_json(
+                index,
+                state.engine.unkeyed_count(&meta, index.id)?,
+                state.engine.undecidable_count(&meta, index.id)?,
+            ));
+        }
+        Ok::<_, kimmy_storage::StorageError>(())
+    })?;
     Ok(json!({ "indexes": indexes }))
 }
 

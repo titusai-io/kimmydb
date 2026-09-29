@@ -218,30 +218,34 @@ pub fn union_progress(
         Err(e) => return Err(e),
     };
     let prefix = format!("{subscription}:");
-    state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
-        if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
-            && let Ok(vector) = document.get_document("delivered")
-        {
-            for (node, hlc) in vector {
-                // The HLC is stored as its own byte encoding rather than a
-                // string: it has no `FromStr`, and its wall clock is a `u64`
-                // that BSON cannot hold as an integer above `i64::MAX` — the
-                // bug that once stopped half of all collections replicating.
-                let bson::Bson::Binary(binary) = hlc else {
-                    continue;
-                };
-                let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
-                    continue;
-                };
-                let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
-                    continue;
-                };
-                let mut one = VersionVector::new();
-                one.insert(node, Hlc::from_bytes(bytes));
-                union.merge(&one);
+    // Off the async worker (ADR-199): the collection holds a record per
+    // subscription per member, and subscriptions are a client's to add.
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Background, |_id, document| {
+            if document.get_str("_id").is_ok_and(|id| id.starts_with(&prefix))
+                && let Ok(vector) = document.get_document("delivered")
+            {
+                for (node, hlc) in vector {
+                    // The HLC is stored as its own byte encoding rather than a
+                    // string: it has no `FromStr`, and its wall clock is a `u64`
+                    // that BSON cannot hold as an integer above `i64::MAX` — the
+                    // bug that once stopped half of all collections replicating.
+                    let bson::Bson::Binary(binary) = hlc else {
+                        continue;
+                    };
+                    let (Ok(node), bytes) = (node.parse(), binary.bytes.as_slice()) else {
+                        continue;
+                    };
+                    let Ok(bytes) = <[u8; kimmy_core::HLC_ENCODED_LEN]>::try_from(bytes) else {
+                        continue;
+                    };
+                    let mut one = VersionVector::new();
+                    one.insert(node, Hlc::from_bytes(bytes));
+                    union.merge(&one);
+                }
             }
-        }
-        Ok(true)
+            Ok(true)
+        })
     })?;
     Ok(union)
 }
@@ -260,7 +264,8 @@ pub fn forget_progress(state: &SharedState, subscription: &str) {
     };
     let prefix = format!("{subscription}:");
     let mut stale = Vec::new();
-    let listed =
+    // Off the async worker, as the dispatcher's own reads of it are (ADR-199).
+    let listed = kimmy_storage::blocking(|| {
         state.engine.for_each_doc(&meta, kimmy_storage::WalkScope::Request, |_id, document| {
             if let Ok(id) = document.get_str("_id")
                 && id.starts_with(&prefix)
@@ -268,7 +273,8 @@ pub fn forget_progress(state: &SharedState, subscription: &str) {
                 stale.push(id.to_string());
             }
             Ok(true)
-        });
+        })
+    });
     // What was listed is removed either way; the rest stays for no reader,
     // as a failed removal below does.
     if let Err(e) = listed {
@@ -613,44 +619,48 @@ fn load_jobs(state: &SharedState) -> kimmy_storage::Result<Vec<Job>> {
         return Ok(Vec::new());
     };
     let mut jobs = Vec::new();
-    state.engine.for_each_doc_or_undecodable(
-        &meta,
-        kimmy_storage::WalkScope::Background,
-        |key, document| {
-            let Some(document) = document else {
-                let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
-                warn!(record = %key, "a webhook registry record does not decode; it is skipped");
-                return Ok(true);
-            };
-            let (Ok(id), Ok(url), Ok(secret), Ok(db), Ok(coll)) = (
-                document.get_str("_id"),
-                document.get_str("url"),
-                document.get_str("secret"),
-                document.get_str("database"),
-                document.get_str("collection"),
-            ) else {
-                return Ok(true);
-            };
-            // Derived rather than stored, so a collection dropped and recreated
-            // under the same name keeps working — ids come from the name (ADR-031).
-            let collection_id = kimmy_core::ids::CollectionId::derive(db, coll).0;
-            let operations = document
-                .get_array("operations")
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            jobs.push(Job {
-                id: id.to_string(),
-                url: url.to_string(),
-                secret: secret.to_string(),
-                database: db.to_string(),
-                collection: coll.to_string(),
-                collection_id,
-                operations,
-                invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
-            });
-            Ok(true)
-        },
-    )?;
+    // Off the async worker, as the scrape's count of the same registry is
+    // (ADR-199).
+    kimmy_storage::blocking(|| {
+        state.engine.for_each_doc_or_undecodable(
+            &meta,
+            kimmy_storage::WalkScope::Background,
+            |key, document| {
+                let Some(document) = document else {
+                    let key: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                    warn!(record = %key, "a webhook registry record does not decode; it is skipped");
+                    return Ok(true);
+                };
+                let (Ok(id), Ok(url), Ok(secret), Ok(db), Ok(coll)) = (
+                    document.get_str("_id"),
+                    document.get_str("url"),
+                    document.get_str("secret"),
+                    document.get_str("database"),
+                    document.get_str("collection"),
+                ) else {
+                    return Ok(true);
+                };
+                // Derived rather than stored, so a collection dropped and recreated
+                // under the same name keeps working — ids come from the name (ADR-031).
+                let collection_id = kimmy_core::ids::CollectionId::derive(db, coll).0;
+                let operations = document
+                    .get_array("operations")
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                jobs.push(Job {
+                    id: id.to_string(),
+                    url: url.to_string(),
+                    secret: secret.to_string(),
+                    database: db.to_string(),
+                    collection: coll.to_string(),
+                    collection_id,
+                    operations,
+                    invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
+                });
+                Ok(true)
+            },
+        )
+    })?;
     Ok(jobs)
 }
 
@@ -785,11 +795,11 @@ pub async fn dispatch_once(
             continue;
         }
 
-        let scanned = match state.engine.entries_for_peer(
-            from,
-            BATCH * 4,
-            kimmy_storage::WalkScope::Background,
-        ) {
+        // Off the async worker (ADR-199): a window can pass over far more of
+        // the oplog than it returns.
+        let scanned = match kimmy_storage::blocking(|| {
+            state.engine.entries_for_peer(from, BATCH * 4, kimmy_storage::WalkScope::Background)
+        }) {
             Ok(window) => window.entries,
             // The node is stopping: the pass ends quietly, and the next
             // start's delivers what this one did not.

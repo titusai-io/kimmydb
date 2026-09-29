@@ -21397,3 +21397,88 @@ after SIGHUP, read from a handshake. A failure before the open without the
 directory lock leaves the marker as it was. Each guard was broken and its test
 failed. Each guard was broken and its test failed.
 
+
+## ADR-199 — A background task's storage walk runs under `blocking`; its point reads stay on the worker
+
+Extends
+[ADR-153](#adr-153--a-reads-walk-runs-under-block_in_place-a-primary-key-probe-stays-on-the-worker)
+from requests to background tasks.
+
+**The defect.** The TTL loop ran `expiry::pass` inline on a tokio worker. The
+pass walks each owned TTL index's expired range, stopping at the node's stop,
+then point-reads and deletes each candidate. Only the wait for the writer,
+`begin_write` and the commit went through `kimmy_storage::blocking`. While the
+walk ran, its worker polled nothing else. Tasks queued on it waited, and so did
+the runtime's I/O, timer and signal driver whenever no other worker was free to
+poll it. A stop matrix measured the stop signal reaching a member up to 0.74 s
+late, only on the member that owned the TTL collections. With the pass under
+`blocking`, none of 30 stops showed the delay.
+
+**Decision.** A background task's storage walk runs under `blocking`. Its point
+reads stay on the worker, as a request's do under ADR-153: a hand-off costs a
+measurable fraction of one page read, and nothing to a walk.
+
+- **The TTL pass** runs whole under `blocking` in `expiry::run`. The pass is
+  walks and deletes with nothing to await, and it runs once an interval, so one
+  hand-off covers it.
+- **The webhook dispatcher** wraps each read on its own: the registry
+  (`load_jobs`), a subscription's progress records (`union_progress`) and its
+  oplog window (`entries_for_peer`). The delivery between those reads awaits
+  the network, which cannot run inside `blocking`. ADR-153's guard had allowed
+  the first two as bounded by subscriptions times members. But subscriptions
+  are a client's to add, which is why the scrape's count of the same registry
+  was already under `blocking` (ADR-187). And a window can pass over far more
+  of the oplog than it returns.
+
+The same audit, over every walk reached from async code in `kimmy-api`,
+`kimmy-mcp`, `kimmy-vector` and `kimmyd`, found request paths that ADR-153 and
+its addenda missed. Each now runs under `blocking`:
+
+- **An index's `unkeyed` and `undecidable` counts**, in the answer to an index
+  creation, the index listing and `describe_collection`. Each walks a run of the
+  index, which can be the whole collection.
+- **A webhook listing** reads the whole registry, and **a webhook removal**
+  lists its progress records.
+- **A vector search with no graph to use** scores every stored vector, and
+  **hybrid search's keyword half** tokenizes every stored chunk. ADR-153 moved
+  the filter's candidate page off the worker, but not these scans.
+
+Verified already off the worker: the retention collector, the vector cache's
+build and count (inside `IndexCache::access`), the backfill's listing, change
+streams, the replicated applies, and the walks ADR-153's addenda list. The
+`kimmyd` walks outside those are in test code.
+
+Left on the worker, each bounded by something other than client data:
+
+- the node registry in `/v1/topology`;
+- `sample_documents` at its limit;
+- the vector emptiness check;
+- a keyed search's read of each admitted document's chunks;
+- `only_live`'s stamps;
+- the dispatcher's metadata and version-vector reads.
+
+**Alternatives.**
+
+- *A dedicated thread for the TTL loop.* Rejected: the dispatcher cannot move
+  there, because it awaits deliveries between its reads, and one rule for both
+  tasks is easier to hold to than two.
+- *Wrapping inside `Engine::expire_documents`.* Not taken: it has one caller,
+  and wrapping the pass also takes its catalogue listing off the worker. The
+  storage crate wraps `watch` and `ChangeStream::next` itself because they have
+  callers in two crates.
+
+**Cost.** One thread hand-off per TTL pass. A dispatcher pass makes one for
+the registry, then one or two for each subscription it owns.
+
+**The guard.** `walks_leave_the_worker.rs` now also looks for
+`.unkeyed_count(`, `.undecidable_count(`, `.entries_for_peer(`,
+`::vector_search(` and `::keyword_search(`. It no longer allows `webhooks.rs`
+and `dispatch.rs` their bounded walks. The guard is textual, and `pass` reaches
+`expire_documents` through a function call it does not follow, so the test
+below covers the TTL pass instead.
+
+**Test.** `crates/kimmy-api/tests/expiry_off_worker.rs` runs `expiry::run` on a
+one-worker runtime over 200 expired documents, with each walked row slowed to
+5 ms. A spawned task measures how late a 10 ms timer fires while the pass runs.
+With the wrap, the worst was about 2.5 ms over a pass of about 2.5 s. With the
+wrap removed, the test failed at 1.23 s late.
