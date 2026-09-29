@@ -10357,17 +10357,16 @@ async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
 
     // The update operators that compare their operand against every
     // element refuse one too. Before they did, `$pull` of a Decimal128
-    // emptied an array of its numbers and `$addToSet` added nothing, with
-    // a `200` either way.
+    // emptied an array of its numbers, with a `200`. `$addToSet` does not
+    // compare: a member is identified by its bytes (ADR-186), so it takes one.
     let arrays = json!({ "_id": 4, "xs": [1, 2.5, "s", 3], "ys": [1, 2], "zs": [7, 8] });
     let res = server.post(docs, Some(&token), arrays.clone()).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     for update in [
         json!({ "$pull": { "xs": dec } }),
         json!({ "$pullAll": { "zs": [dec] } }),
-        json!({ "$addToSet": { "ys": dec } }),
-        json!({ "$addToSet": { "ys": { "$each": [dec] } } }),
         json!({ "$min": { "xs": dec } }),
+        json!({ "$max": { "xs": dec } }),
     ] {
         let res = server
             .post(
@@ -10382,7 +10381,23 @@ async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
         assert!(message.contains("Decimal128"), "{update}: {message}");
     }
     let untouched = server.get(&format!("{docs}/4"), Some(&token)).await;
-    assert_eq!(untouched.body, arrays, "nothing was pulled or added");
+    assert_eq!(untouched.body, arrays, "nothing was pulled");
+    // A Decimal128 arriving as extended JSON is added intact, once.
+    for update in [
+        json!({ "$addToSet": { "ys": dec } }),
+        json!({ "$addToSet": { "ys": { "$each": [dec, dec] } } }),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/v/update",
+                Some(&token),
+                json!({ "filter": { "_id": 4 }, "update": update }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{update}: {:?}", res.body);
+    }
+    let added = server.get(&format!("{docs}/4"), Some(&token)).await;
+    assert_eq!(added.body["ys"], json!([1, 2, dec]), "{:?}", added.body);
 }
 
 // ---------------------------------------------------------------------------

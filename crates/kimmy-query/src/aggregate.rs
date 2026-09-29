@@ -695,7 +695,7 @@ fn value_at<'a>(doc: &'a Document, p: &str) -> Option<&'a Bson> {
 /// a grouping key is not a place to fail the whole query over a type that is
 /// merely awkward to order, so that falls back to a debug rendering: distinct
 /// values stay distinct, they simply do not participate in cross-type equality.
-fn group_key(value: &Bson) -> Vec<u8> {
+pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
     kimmy_core::keyenc::encode(value).unwrap_or_else(|_| format!("raw:{value:?}").into_bytes())
 }
 
@@ -970,7 +970,9 @@ enum AccState {
     MinMax(Option<Bson>),
     FirstLast(Option<Bson>),
     Push(Vec<Bson>),
-    AddToSet(Vec<Bson>),
+    /// The members in first-seen order, and the [`group_key`] of each, which
+    /// is what makes two values one member (ADR-186).
+    AddToSet(Vec<Bson>, std::collections::HashSet<Vec<u8>>),
 }
 
 fn group(
@@ -1027,7 +1029,7 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
         Accumulator::First(_) | Accumulator::Last(_) => AccState::FirstLast(None),
         Accumulator::Push(_) => AccState::Push(Vec::new()),
-        Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new()),
+        Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
     }
 }
 
@@ -1067,11 +1069,11 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
             *current = Some(e.eval_in(scope)?);
         }
         (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval_in(scope)?),
-        (AccState::AddToSet(items), Accumulator::AddToSet(e)) => {
+        (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
             let v = e.eval_in(scope)?;
-            // Linear scan rather than a hash set: `Bson` is not `Hash`, and a
-            // set is small in every case that is not already refused by the cap.
-            if !items.iter().any(|existing| existing == &v) {
+            // A member is identified the way `$group` identifies a bucket, and
+            // the first occurrence stays (ADR-186).
+            if keys.insert(group_key(&v)) {
                 items.push(v);
             }
         }
@@ -1090,7 +1092,7 @@ fn finish(state: AccState) -> Bson {
         AccState::Avg(_, 0) => Bson::Null,
         AccState::Avg(total, n) => Bson::Double(total / n as f64),
         AccState::MinMax(v) | AccState::FirstLast(v) => v.unwrap_or(Bson::Null),
-        AccState::Push(items) | AccState::AddToSet(items) => Bson::Array(items),
+        AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
     }
 }
 
@@ -1636,6 +1638,125 @@ mod tests {
         .unwrap();
         assert_eq!(out[0].get_array("all").unwrap().len(), 3);
         assert_eq!(out[0].get_array("distinct").unwrap().len(), 2);
+    }
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    /// Seventeen values that exercise every way two values can be one member or
+    /// two: NaN against itself, one number in three widths, signed zeros, the
+    /// two nulls, documents differing in key order and in a nested width,
+    /// `Decimal128`s by their bytes, and a string against a symbol.
+    fn set_corpus() -> Vec<Bson> {
+        vec![
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::NAN),
+            Bson::Int32(1),
+            Bson::Double(1.0),
+            Bson::Int64(1),
+            Bson::Double(-0.0),
+            Bson::Double(0.0),
+            Bson::Null,
+            Bson::Undefined,
+            dec("1"),
+            dec("1.0"),
+            dec("1"),
+            Bson::Document(doc! { "a": 1, "b": 2 }),
+            Bson::Document(doc! { "b": 2, "a": 1 }),
+            Bson::Document(doc! { "a": 1.0, "b": 2 }),
+            Bson::String("s".into()),
+            Bson::Symbol("s".into()),
+        ]
+    }
+
+    fn as_docs(values: &[Bson]) -> Vec<Document> {
+        values.iter().map(|v| doc! { "v": v.clone() }).collect()
+    }
+
+    fn members(values: &[Bson]) -> Vec<Bson> {
+        let out =
+            run(vec![doc! {"$group": {"_id": null, "s": {"$addToSet": "$v"}}}], as_docs(values))
+                .unwrap();
+        out[0].get_array("s").unwrap().clone()
+    }
+
+    fn keys_of(values: &[Bson]) -> std::collections::BTreeSet<Vec<u8>> {
+        values.iter().map(group_key).collect()
+    }
+
+    #[test]
+    fn add_to_set_members_are_the_buckets_group_makes() {
+        let corpus = set_corpus();
+        let buckets: Vec<Bson> = run(vec![doc! {"$group": {"_id": "$v"}}], as_docs(&corpus))
+            .unwrap()
+            .into_iter()
+            .map(|d| d.get("_id").unwrap().clone())
+            .collect();
+        let got = members(&corpus);
+        // Premises: a set that is empty or collapses everything would satisfy
+        // the equality below.
+        assert_eq!(buckets.len(), 9, "buckets: {buckets:?}");
+        assert_eq!(got.len(), 9, "members: {got:?}");
+        assert_eq!(keys_of(&got), keys_of(&buckets));
+        // One member per key, and each is the first of its kind in input order.
+        assert_eq!(keys_of(&got).len(), got.len());
+        for member in &got {
+            let first = corpus.iter().find(|v| group_key(v) == group_key(member)).unwrap();
+            assert!(
+                format!("{first:?}") == format!("{member:?}"),
+                "kept {member:?}, first seen {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_holding_a_decimal128_is_identified_by_its_rendering() {
+        // `keyenc` refuses a `Decimal128` anywhere in a value, so the whole
+        // value is identified by its rendering and `1` against `1.0` no longer
+        // collapses inside it. `$group` does the same, and the two agree.
+        let pairs = [
+            (
+                Bson::Document(doc! { "a": 1, "d": dec("1") }),
+                Bson::Document(doc! { "a": 1.0, "d": dec("1") }),
+            ),
+            (
+                Bson::Array(vec![Bson::Double(0.0), dec("1")]),
+                Bson::Array(vec![Bson::Double(-0.0), dec("1")]),
+            ),
+        ];
+        for (x, y) in pairs {
+            let both = [x, y];
+            let buckets = run(vec![doc! {"$group": {"_id": "$v"}}], as_docs(&both)).unwrap();
+            assert_eq!(buckets.len(), 2, "{both:?}");
+            assert_eq!(members(&both).len(), 2, "{both:?}");
+        }
+    }
+
+    #[test]
+    fn add_to_set_members_do_not_depend_on_input_order() {
+        // `Decimal128` ranks equal to every number in the canonical order, so a
+        // set built on that order kept `[1, 2]` from one order and `[Dec(5)]`
+        // from the other.
+        for order in
+            [[Bson::Int32(1), dec("5"), Bson::Int32(2)], [dec("5"), Bson::Int32(1), Bson::Int32(2)]]
+        {
+            assert_eq!(members(&order).len(), 3, "{order:?}");
+        }
+        let corpus = set_corpus();
+        let expected = keys_of(&members(&corpus));
+        assert_eq!(expected.len(), 9);
+        let mut reversed = corpus.clone();
+        reversed.reverse();
+        let mut orders = vec![reversed];
+        for shift in 1..corpus.len() {
+            let mut rotated = corpus.clone();
+            rotated.rotate_left(shift);
+            orders.push(rotated);
+        }
+        for order in orders {
+            assert_eq!(keys_of(&members(&order)), expected, "{order:?}");
+        }
     }
 
     #[test]
