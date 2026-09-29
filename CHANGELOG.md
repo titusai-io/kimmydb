@@ -32,6 +32,16 @@ which was refused, now succeeds, the `Decimal128` being one member only with
 the same bytes; `$min`, `$max`, `$pull` and `$pullAll` still refuse one. See
 ADR-186.
 
+The documented alert on `kimmy_sync_divergence_check_age_seconds` no longer
+pages on a healthy drain. The divergence check is deferred in every contact
+that ends `budget`, so the age climbs for as long as a member is draining a
+backlog (71 s on 0.41.1). `docs/operations.md` now says to alert on it above
+*k* × `cluster.sync_interval_secs` only while
+`kimmy_sync_contacts_total{ended="budget"}` has not risen over the window, or
+while `kimmy_sync_failures_total` has, with a PromQL example, and ADR-187
+carries the corrected derivation. Documentation only: nothing the server does
+has changed.
+
 ## 0.41.1 - 2026-09-28
 
 **Roll the members one at a time. This release is not a rollback boundary:
