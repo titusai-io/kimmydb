@@ -69,6 +69,7 @@ async fn listen(
         secret.to_string(),
         Some(hook),
         None,
+        None,
         tls,
     ));
     (addr, serving, pushed)
@@ -4087,6 +4088,7 @@ async fn listen_with(
         listener,
         SECRET.to_string(),
         Some(hook),
+        None,
         None,
         tls,
     ));

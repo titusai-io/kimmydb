@@ -1407,6 +1407,22 @@ async fn a_listener_out_of_descriptors_says_so() {
     let line = run.log().lines().find(|l| l.contains("could not accept")).unwrap().to_string();
     assert!(line.contains("ERROR") && line.contains("error"), "{line}");
     drop(held);
+    // Recovered, and it counted: once the descriptors are back the node
+    // answers, and `/metrics` says the HTTP listener had accept errors of its
+    // own, on the series the replication listener shares.
+    let series = "kimmy_accept_errors_total{listener=\"http\"} ";
+    let deadline = Instant::now() + PATIENCE;
+    let count = loop {
+        assert!(Instant::now() < deadline, "the node did not recover: {}", run.log());
+        if let Ok(body) = client.get(format!("http://127.0.0.1:{port}/metrics")).send().await
+            && let Ok(body) = body.text().await
+            && let Some(rest) = body.split(series).nth(1)
+        {
+            break rest.lines().next().unwrap().parse::<u64>().unwrap();
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    assert!(count > 0, "descriptor exhaustion was not counted");
     let (status, _) = stop(&mut run);
     assert!(status.success(), "{status:?}: {}", run.log());
 }

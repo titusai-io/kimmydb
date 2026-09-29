@@ -1018,7 +1018,18 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         let engine = Arc::clone(&engine);
         move || engine.set_stopping()
     };
-    let serving = serve(listener, app, tls, announced(stop.clone()), DRAIN_TIMEOUT, stopping);
+    // An accept error that is the HTTP listener's own, counted beside the
+    // cluster listener's on `kimmy_accept_errors_total{listener}`.
+    let on_accept_error = accept_error_hook(Arc::clone(&state), |state| &state.metrics);
+    let serving = serve(
+        listener,
+        app,
+        tls,
+        announced(stop.clone()),
+        DRAIN_TIMEOUT,
+        stopping,
+        Some(on_accept_error.clone()),
+    );
     let served = match test_stop {
         Some(TestStop::PanicInRun) => {
             panic!("node::run panicked on purpose (KIMMY_TEST_STOP=panic_in_run)")
@@ -1656,6 +1667,7 @@ async fn serve(
     signal: impl std::future::Future<Output = ()> + Send + 'static,
     drain: Duration,
     on_drain_deadline: impl FnOnce() + Send + 'static,
+    on_accept_error: Option<kimmy_cluster::AcceptErrorHook>,
 ) -> Result<Connections> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
@@ -1715,7 +1727,8 @@ async fn serve(
         }
     });
 
-    let listener = Accepting::from_std(std_listener).context("preparing the listener")?;
+    let listener =
+        Accepting::from_std(std_listener, on_accept_error).context("preparing the listener")?;
     let server = axum_server::Server::<Peer>::from_listener(listener).handle(handle.clone());
     match tls {
         Some(tls) => {
@@ -1758,45 +1771,58 @@ impl axum::extract::connect_info::Connected<Peer> for std::net::SocketAddr {
 /// paths, at most once a second.
 struct Accepting {
     listener: tokio::net::TcpListener,
+    /// Told of each error that is the listener's own, for the counter.
+    on_error: Option<kimmy_cluster::AcceptErrorHook>,
     logged: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl Accepting {
-    fn from_std(listener: std::net::TcpListener) -> std::io::Result<Self> {
+    fn from_std(
+        listener: std::net::TcpListener,
+        on_error: Option<kimmy_cluster::AcceptErrorHook>,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        Ok(Self { listener, logged: std::sync::Mutex::new(None) })
+        Ok(Self { listener, on_error, logged: std::sync::Mutex::new(None) })
+    }
+
+    /// Say what an accept error was: a client's own (debug, not counted) or
+    /// the listener's (counted, and logged at most once a second).
+    fn note(&self, error: &std::io::Error) {
+        // One client's connection that failed before it was accepted is
+        // that client's, not the listener's: at debug, as `axum::serve`
+        // skipped it, so a port scan or a health check's churn raises no
+        // alarm.
+        if !accept_error_is_the_listeners(error.kind()) {
+            debug!(%error, "a connection failed before it was accepted");
+            return;
+        }
+        if let Some(hook) = &self.on_error {
+            hook(kimmy_cluster::AcceptListener::Http);
+        }
+        let now = std::time::Instant::now();
+        let mut logged = self.logged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if logged.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
+            *logged = Some(now);
+            error!(
+                %error,
+                "could not accept an HTTP connection; new clients are refused until \
+                 this clears, and the listener keeps trying"
+            );
+        }
     }
 }
 
 impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
     async fn bind_to(addr: Peer) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr.0).await?;
-        Ok(Self { listener, logged: std::sync::Mutex::new(None) })
+        Ok(Self { listener, on_error: None, logged: std::sync::Mutex::new(None) })
     }
 
     async fn accept_stream(&self) -> std::io::Result<(tokio::net::TcpStream, Peer)> {
         match self.listener.accept().await {
             Ok((stream, addr)) => Ok((stream, Peer(addr))),
-            // One client's connection that failed before it was accepted is
-            // that client's, not the listener's: at debug, as `axum::serve`
-            // skipped it, so a port scan or a health check's churn raises no
-            // alarm.
-            Err(error) if !accept_error_is_the_listeners(error.kind()) => {
-                debug!(%error, "a connection failed before it was accepted");
-                Err(error)
-            }
             Err(error) => {
-                let now = std::time::Instant::now();
-                let mut logged =
-                    self.logged.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1)) {
-                    *logged = Some(now);
-                    error!(
-                        %error,
-                        "could not accept an HTTP connection; new clients are refused until \
-                         this clears, and the listener keeps trying"
-                    );
-                }
+                self.note(&error);
                 Err(error)
             }
         }
@@ -1807,13 +1833,7 @@ impl axum_server::AddrListener<tokio::net::TcpStream, Peer> for Accepting {
     }
 }
 
-/// Whether an accept that failed with `kind` is the listener's failure, one
-/// that refuses every client until it clears (out of descriptors, of buffers,
-/// of memory), rather than one client's connection that went away first.
-fn accept_error_is_the_listeners(kind: std::io::ErrorKind) -> bool {
-    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
-    !matches!(kind, ConnectionAborted | ConnectionReset | ConnectionRefused)
-}
+use kimmy_cluster::accept_error_is_the_listeners;
 
 /// The end of every HTTP connection's task, which [`serve`] hands back: the
 /// drain closes what is left at its deadline, and this is when those tasks
@@ -1865,6 +1885,8 @@ async fn spawn_cluster(
     let on_pushed = pushed_hook(Arc::clone(&state), |state| &state.metrics);
     // A peer connection this node failed to serve, and why.
     let on_failed = serve_failed_hook(Arc::clone(&state), |state| &state.metrics);
+    // An accept error that is this listener's own, and which listener.
+    let on_accept_error = accept_error_hook(Arc::clone(&state), |state| &state.metrics);
     // Built before the node commits to serving. `serve_with` used to build it
     // and return on failure, which made a fatal condition fatal to that task
     // only: the node went on serving while no peer could pull from it. With
@@ -1884,6 +1906,7 @@ async fn spawn_cluster(
             secret.clone(),
             Some(on_pushed),
             Some(on_failed),
+            Some(on_accept_error),
             cluster_tls,
         ),
     );
@@ -2065,6 +2088,16 @@ fn serve_failed_hook<T: Send + Sync + 'static>(
     metrics: fn(&T) -> &kimmy_api::Metrics,
 ) -> kimmy_cluster::ServeFailHook {
     Arc::new(move |reason| metrics(&owner).record_sync_serve_failure(reason))
+}
+
+/// Where an accept error that was a listener's own lands on its metrics:
+/// `kimmy_accept_errors_total{listener}`. A function, for the reason
+/// `pushed_hook` is one.
+fn accept_error_hook<T: Send + Sync + 'static>(
+    owner: Arc<T>,
+    metrics: fn(&T) -> &kimmy_api::Metrics,
+) -> kimmy_cluster::AcceptErrorHook {
+    Arc::new(move |listener| metrics(&owner).record_accept_error(listener))
 }
 
 /// Where a tick of the replication loop lands on this node's metrics: what
@@ -2988,6 +3021,29 @@ mod tests {
         }
     }
 
+    /// The HTTP listener counts an accept error that is its own, under its
+    /// own label, and one that is a client's going away is not counted.
+    #[tokio::test]
+    async fn the_http_listener_counts_only_its_own_accept_errors() {
+        let counted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hook: kimmy_cluster::AcceptErrorHook = Arc::new({
+            let counted = Arc::clone(&counted);
+            move |listener| {
+                assert_eq!(listener, kimmy_cluster::AcceptListener::Http);
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let accepting = Accepting::from_std(std_listener, Some(hook)).unwrap();
+        accepting.note(&std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
+        accepting.note(&std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        accepting.note(&std::io::Error::from_raw_os_error(24));
+        accepting.note(&std::io::Error::from_raw_os_error(23));
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_plain_drain_is_bounded_and_the_stop_comes_at_its_end() {
         static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3025,6 +3081,7 @@ mod tests {
             move || {
                 let _ = stopped.send(tokio::time::Instant::now());
             },
+            None,
         ));
 
         // A request in flight that will never finish.
@@ -3075,6 +3132,7 @@ mod tests {
             },
             drain,
             || {},
+            None,
         ));
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"GET / HTTP/1.1\r\nHost").await.unwrap();
@@ -3102,7 +3160,7 @@ mod tests {
         tokio::spawn(async move {
             // Nothing shuts this down: the test drops it when it is finished.
             let signal = std::future::pending::<()>();
-            let _ = serve(listener, app, tls, signal, DRAIN_TIMEOUT, || {}).await;
+            let _ = serve(listener, app, tls, signal, DRAIN_TIMEOUT, || {}, None).await;
         });
         addr
     }
