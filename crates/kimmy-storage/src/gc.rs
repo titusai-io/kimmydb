@@ -122,6 +122,7 @@ impl Engine {
         // rescan after a crash is bounded by what retention keeps, and a pass
         // with nothing to collect commits nothing (ADR-200).
         if oplog_removed > 0 {
+            self.trim_violation_rows()?;
             self.advance_violations_through()?;
         }
         let outcome = GcOutcome {
@@ -202,6 +203,44 @@ impl Engine {
         Ok(removed)
     }
 
+    /// Self-healing, once per pass that removed entries: a violations row below
+    /// the oldest entry the oplog still holds names nothing, whoever collected
+    /// the entry (a build that does not know the table does not remove its
+    /// rows), so it goes. The table is one row per violation entry, so this
+    /// reads a handful of keys and not the oplog; the scan is a read, and the
+    /// write is taken only when there is something to remove (ADR-200).
+    fn trim_violation_rows(&self) -> Result<()> {
+        let stale: Vec<Vec<u8>> = {
+            let txn = self.db().begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let Some((oldest, _)) = oplog.first()? else { return Ok(()) };
+            let oldest = oldest.value().to_vec();
+            let table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            let mut stale = Vec::new();
+            for row in table.iter()? {
+                let (row_key, _) = row?;
+                if crate::violations_table::stamp_of(row_key.value())
+                    .is_some_and(|stamp| stamp < oldest.as_slice())
+                {
+                    stale.push(row_key.value().to_vec());
+                }
+            }
+            stale
+        };
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Retention)?;
+        {
+            let mut table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            for row_key in &stale {
+                table.remove(row_key.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Remove `keys` from the oplog and its arrival index, and record the
     /// horizon they leave behind, in one transaction.
     fn remove_oplog_entries(&self, keys: &[Vec<u8>]) -> Result<usize> {
@@ -256,26 +295,6 @@ impl Engine {
                     arrival.remove(seq.value())?;
                 }
                 held.remove(key.as_slice())?;
-            }
-            // Self-healing: a violations row below the oldest entry the oplog
-            // still holds names nothing, whoever collected the entry (a build
-            // that does not know the table does not remove its rows), so it goes
-            // too. The table is one row per violation, so this reads a handful
-            // of keys and not the oplog (ADR-200).
-            if let Some((oldest, _)) = oplog.first()? {
-                let oldest = oldest.value().to_vec();
-                let mut stale: Vec<Vec<u8>> = Vec::new();
-                for row in violations.iter()? {
-                    let (row_key, _) = row?;
-                    if crate::violations_table::stamp_of(row_key.value())
-                        .is_some_and(|stamp| stamp < oldest.as_slice())
-                    {
-                        stale.push(row_key.value().to_vec());
-                    }
-                }
-                for row_key in stale {
-                    violations.remove(row_key.as_slice())?;
-                }
             }
             crate::live_count::carry_mark(
                 &txn,

@@ -320,6 +320,12 @@ impl TelemetryGuard {
             WriterHolder::Rewind,
             "a rewind to a point in time, which runs only in a process that never serves"
         );
+        held_by!(
+            "kimmy.write_lock.held_seconds.violations",
+            "kimmy.write_lock.holds.violations",
+            WriterHolder::Violations,
+            "the short write that records what a scan of the oplog found for the unique-violations table"
+        );
         // What each holder's holds were made of (ADR-176): every column of
         // `kimmy_write_lock_held_{component,phase}_seconds_total`,
         // `_io_bytes_total`, `_write_estimated_seconds_total` and

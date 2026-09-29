@@ -13,9 +13,10 @@
 //! disagree with the entry about what the violation says. **A sentinel row**,
 //! key `[0x00]` (one byte, which sorts before every 34-byte row), holds
 //! `through`, a stamp key: **every violation entry at or below it is in the
-//! table.** The marker lives in the table it describes so that a backup, which
-//! copies only the tables it lists (`verified.rs`), can never carry one without
-//! the other.
+//! table.** The marker lives in the table it describes, so the two cannot be
+//! separated. **A backup does not carry the table** (`verified.rs` names the
+//! tables a backup copies, and this is not among them): a restore starts with no
+//! table and no `through`, and the backfill completes it from zero.
 //!
 //! **Maintenance is one way in.** [`crate::engine::append_oplog_at`] inserts the
 //! row whenever the entry is a `UniqueViolation`; retention and a rewind remove
@@ -38,6 +39,22 @@ use crate::error::Result;
 use crate::tables;
 use crate::walk::{WalkScope, open_walk_table};
 use crate::watch::ExamineBudget;
+
+/// `KIMMY_TEST_VIOLATIONS_FROM_OPLOG`'s state: answer `/violations` by walking
+/// the oplog even when the table is ready, so one binary and one store can be
+/// measured both ways (the allocation test's control).
+static TEST_FROM_OPLOG: AtomicBool = AtomicBool::new(false);
+
+/// Force the oplog walk for every `/violations` call, for the whole process.
+/// A test switch: it changes what a call reads and never what it answers.
+pub fn set_test_violations_from_oplog(on: bool) {
+    TEST_FROM_OPLOG.store(on, Relaxed);
+}
+
+/// Whether the route must walk the oplog whatever the table says.
+pub(crate) fn test_forces_oplog() -> bool {
+    TEST_FROM_OPLOG.load(Relaxed)
+}
 
 /// The sentinel row's key: one byte, before every collection's rows.
 pub(crate) const SENTINEL: &[u8] = &[0x00];
@@ -112,6 +129,8 @@ struct Scan {
     found: Vec<Vec<u8>>,
     last: Option<Vec<u8>>,
     scanned: u64,
+    /// The scan reached the end of its range rather than its budget.
+    exhausted: bool,
 }
 
 /// What one backfill step did.
@@ -148,10 +167,16 @@ impl Engine {
     ///
     /// **The read is outside the writer**: a read transaction, header-only,
     /// budgeted as ADR-194 budgets a walk (time, then rows), so a cold scan
-    /// never holds the single writer. **The write is short**: it point-reads
-    /// only the violation keys found (one retention collected meanwhile is
-    /// skipped), inserts their rows, and advances `through` to the last stamp
-    /// scanned, or the tail if that is lower. `Background` scope: a stop ends it.
+    /// never holds the single writer. **The write is short** (held as
+    /// [`WriterHolder::Violations`]): it point-reads only the violation keys
+    /// found (one retention collected meanwhile is skipped), inserts their rows,
+    /// and advances `through`. **A scan that used up its range, not its budget,
+    /// sets `through` to the tail as the writer sees it and the table is ready**:
+    /// every entry appended after the scan's snapshot went through
+    /// `append_oplog_at` in this process, which maintains the table, so nothing
+    /// above the snapshot is missing, and under steady writes a step that
+    /// stopped at its snapshot's tail could never finish (ADR-200). `Background`
+    /// scope: a stop ends it.
     pub fn violations_backfill_step(&self, budget: ExamineBudget) -> Result<BackfillStep> {
         if self.violations().ready() {
             return Ok(BackfillStep { done: true, scanned: 0, found: 0 });
@@ -160,18 +185,17 @@ impl Engine {
         #[cfg(test)]
         test_hooks::run(self);
         self.violations().backfilled_rows.fetch_add(scan.scanned, Relaxed);
-        let Some(last) = scan.last else {
-            // Nothing above `through`: complete, if the oplog's tail is at it.
-            return self.finish_violations_backfill(0, 0);
-        };
-        let kept = self.record_violations_backfill(&scan.found, last)?;
-        self.finish_violations_backfill(scan.scanned, kept)
+        let (kept, done) = self.record_violations_backfill(&scan)?;
+        if done {
+            self.violations().set_ready();
+        }
+        Ok(BackfillStep { done, scanned: scan.scanned, found: kept })
     }
 
     /// The read half of a step: the stretch of the oplog above `through`, up to
     /// the budget, and the row keys of the violation entries in it.
     fn violations_backfill_scan(&self, budget: ExamineBudget) -> Result<Scan> {
-        let mut scan = Scan { found: Vec::new(), last: None, scanned: 0 };
+        let mut scan = Scan { found: Vec::new(), last: None, scanned: 0, exhausted: true };
         let txn = self.db().begin_read()?;
         let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(WalkScope::Background))?;
         let table =
@@ -196,6 +220,7 @@ impl Engine {
             }
             scan.last = Some(key.value().to_vec());
             if budget.spent_after(scan.scanned, started.elapsed()) {
+                scan.exhausted = false;
                 break;
             }
         }
@@ -203,15 +228,18 @@ impl Engine {
     }
 
     /// The write half: insert the rows found (skipping an entry retention
-    /// collected since the scan) and advance `through` to `last`, or to the tail
-    /// if that is lower. Answers the rows kept.
-    fn record_violations_backfill(&self, found: &[Vec<u8>], last: Vec<u8>) -> Result<u64> {
-        let txn = self.begin_write(WriterHolder::Retention)?;
+    /// collected since the scan) and advance `through`: to the tail as it is now
+    /// when the scan used up its range, otherwise to the last stamp scanned or
+    /// the tail if that is lower. Answers the rows kept, and whether the table is
+    /// now complete through the tail.
+    fn record_violations_backfill(&self, scan: &Scan) -> Result<(u64, bool)> {
+        let txn = self.begin_write(WriterHolder::Violations)?;
         let mut kept = 0u64;
+        let done;
         {
             let oplog = txn.open_table(tables::OPLOG)?;
             let mut table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
-            for row in found {
+            for row in &scan.found {
                 if let Some(stamp) = stamp_of(row)
                     && oplog.get(stamp)?.is_some()
                 {
@@ -220,33 +248,27 @@ impl Engine {
                 }
             }
             let tail = oplog.last()?.map(|(k, _)| k.value().to_vec());
-            let through = match tail {
-                Some(tail) if tail.as_slice() < last.as_slice() => tail,
-                _ => last,
+            let through = match (&tail, &scan.last) {
+                // Nothing in the oplog: complete, and there is no stamp to name.
+                (None, _) => None,
+                (Some(tail), _) if scan.exhausted => Some(tail.clone()),
+                (Some(tail), Some(last)) => Some(if tail.as_slice() < last.as_slice() {
+                    tail.clone()
+                } else {
+                    last.clone()
+                }),
+                (Some(_), None) => None,
             };
-            let current = through_of(&table)?;
-            if current.as_deref().is_none_or(|c| c < through.as_slice()) {
-                table.insert(SENTINEL, through.as_slice())?;
+            done = tail.is_none() || through.as_deref().is_some_and(|t| Some(t) >= tail.as_deref());
+            if let Some(through) = through {
+                let current = through_of(&table)?;
+                if current.as_deref().is_none_or(|c| c < through.as_slice()) {
+                    table.insert(SENTINEL, through.as_slice())?;
+                }
             }
         }
         txn.commit()?;
-        Ok(kept)
-    }
-
-    /// After a step's commit: ready if `through` has reached the tail.
-    fn finish_violations_backfill(&self, scanned: u64, found: u64) -> Result<BackfillStep> {
-        let txn = self.db().begin_read()?;
-        let oplog = txn.open_table(tables::OPLOG)?;
-        let table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
-        let done = match (oplog.last()?.map(|(k, _)| k.value().to_vec()), through_of(&table)?) {
-            (None, _) => true,
-            (Some(tail), Some(through)) => through.as_slice() >= tail.as_slice(),
-            (Some(_), None) => false,
-        };
-        if done {
-            self.violations().set_ready();
-        }
-        Ok(BackfillStep { done, scanned, found })
+        Ok((kept, done))
     }
 
     /// Advance `through` to the oplog's tail, in a retention pass, when the
@@ -279,22 +301,41 @@ impl Engine {
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     use crate::engine::Engine;
 
-    type Hook = Box<dyn Fn(&Engine)>;
+    type Hook = Rc<dyn Fn(&Engine)>;
 
     thread_local! {
         static BETWEEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static EVERY: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
+    /// Run `hook` once, between the next step's read and its write.
     pub(crate) fn between_read_and_write(hook: impl Fn(&Engine) + 'static) {
-        BETWEEN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        BETWEEN.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
+
+    /// Run `hook` between the read and the write of every step from now on, on
+    /// this thread: a writer that overtakes every step.
+    pub(crate) fn between_read_and_write_every(hook: impl Fn(&Engine) + 'static) {
+        EVERY.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
+
+    /// Stop running the repeating hook.
+    pub(crate) fn clear_every() {
+        EVERY.with(|h| *h.borrow_mut() = None);
     }
 
     pub(super) fn run(engine: &Engine) {
-        // Taken, so the hook runs once and its own calls do not recurse.
-        if let Some(hook) = BETWEEN.with(|h| h.borrow_mut().take()) {
+        // Taken, so the once-hook runs once and its own calls do not recurse.
+        let once = BETWEEN.with(|h| h.borrow_mut().take());
+        if let Some(hook) = once {
+            hook(engine);
+        }
+        let every = EVERY.with(|h| h.borrow().clone());
+        if let Some(hook) = every {
             hook(engine);
         }
     }

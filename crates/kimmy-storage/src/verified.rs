@@ -963,7 +963,7 @@ mod tests {
     /// its tests read, so all three are exempt as files.
     const AUDITED_FILES: [&str; 3] =
         ["faults.rs", "key_walk_tests.rs", "violations_table_tests.rs"];
-    const AUDITED_FNS: [(&str, &str); 13] = [
+    const AUDITED_FNS: [(&str, &str); 14] = [
         ("engine.rs", "append_oplog_at"),
         ("engine.rs", "decide_violations_ready"),
         ("violations_table.rs", "record_violations_backfill"),
@@ -974,6 +974,7 @@ mod tests {
         ("engine.rs", "rebuild_version_vector_if_stale"),
         ("engine.rs", "reset_version_vector_to_oplog"),
         ("gc.rs", "remove_oplog_entries"),
+        ("gc.rs", "trim_violation_rows"),
         ("rewind.rs", "rewind_to"),
         ("backup.rs", "restore_with"),
         ("migrate.rs", "rewrite_oplog"),

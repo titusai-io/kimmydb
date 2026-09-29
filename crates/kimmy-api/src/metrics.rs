@@ -2505,6 +2505,16 @@ kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 13
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 14
 kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 18
 kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"30\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"300\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"+Inf\"} 15
+kimmy_write_lock_held_seconds_sum{holder=\"violations\"} 19.5
+kimmy_write_lock_held_seconds_count{holder=\"violations\"} 15
 # HELP kimmy_write_lock_held_component_seconds_total Seconds holds of the storage writer spent, by holder and by what the holding thread was doing. read, write, sync: inside the storage file's page reads, page writes and fsyncs. cpu: on the CPU outside those - B-tree work over cached pages, encoding, index keys, bookkeeping. off_cpu: the rest - off the CPU outside any file call, which is scheduler delay or a wait on a lock inside the storage engine. The five add up to kimmy_write_lock_held_seconds_sum. off_cpu is a residual, so anything the other four fail to capture lands there too; read it beside kimmy_write_lock_held_write_estimated_seconds_total. cpu and off_cpu leave out holds counted in kimmy_write_lock_held_cpu_unmeasured_total.
 # TYPE kimmy_write_lock_held_component_seconds_total counter
 kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"read\"} 0.101
@@ -2567,6 +2577,11 @@ kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"writ
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"sync\"} 1.203
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"cpu\"} 1.204
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"off_cpu\"} 1.205
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"read\"} 1.301
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"write\"} 1.302
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"sync\"} 1.303
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"cpu\"} 1.304
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"off_cpu\"} 1.305
 # HELP kimmy_write_lock_held_phase_seconds_total Seconds holds of the storage writer spent, by holder and by where in the transaction. work: from taking the writer to asking to commit, the whole hold of one that aborted. counts: writing the collections' live document counts, once per transaction. commit: the storage engine's commit, its page writes and fsync, to letting go. The three add up to kimmy_write_lock_held_seconds_sum.
 # TYPE kimmy_write_lock_held_phase_seconds_total counter
 kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"work\"} 0.111
@@ -2605,6 +2620,9 @@ kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"commit\"
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"work\"} 1.211
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"counts\"} 1.212
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"commit\"} 1.213
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"work\"} 1.311
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"counts\"} 1.312
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"commit\"} 1.313
 # HELP kimmy_write_lock_held_io_bytes_total Bytes holds of the storage writer read from and wrote to the storage file, by holder. Beside the read and write components: more bytes is more pages, and the same bytes in more seconds is slower pages.
 # TYPE kimmy_write_lock_held_io_bytes_total counter
 kimmy_write_lock_held_io_bytes_total{holder=\"write\",io=\"read\"} 1001
@@ -2631,6 +2649,8 @@ kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"read\"} 11001
 kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"write\"} 11002
 kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"read\"} 12001
 kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"write\"} 12002
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"read\"} 13001
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"write\"} 13002
 # HELP kimmy_write_lock_held_write_estimated_seconds_total Seconds of page writes, inside holds of the storage writer, whose CPU time was estimated from a sample rather than read. The most by which cpu and off_cpu in kimmy_write_lock_held_component_seconds_total can be misattributed between each other, in either direction; 0 for a hold of 32 page writes or fewer, which is measured exactly.
 # TYPE kimmy_write_lock_held_write_estimated_seconds_total counter
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"write\"} 0.121
@@ -2645,6 +2665,7 @@ kimmy_write_lock_held_write_estimated_seconds_total{holder=\"expiry\"} 0.921
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"embedding\"} 1.021
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"durability\"} 1.121
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"rewind\"} 1.221
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"violations\"} 1.321
 # HELP kimmy_write_lock_held_overcounted_total Holds of the storage writer whose measured components came to more than the hold, past the clocks' tolerance: something was counted twice. Should read 0; it cannot see a component that was missed, which lands in off_cpu instead.
 # TYPE kimmy_write_lock_held_overcounted_total counter
 kimmy_write_lock_held_overcounted_total{holder=\"write\"} 61
@@ -2659,6 +2680,7 @@ kimmy_write_lock_held_overcounted_total{holder=\"expiry\"} 69
 kimmy_write_lock_held_overcounted_total{holder=\"embedding\"} 70
 kimmy_write_lock_held_overcounted_total{holder=\"durability\"} 71
 kimmy_write_lock_held_overcounted_total{holder=\"rewind\"} 72
+kimmy_write_lock_held_overcounted_total{holder=\"violations\"} 73
 # HELP kimmy_write_lock_held_cpu_unmeasured_total Holds of the storage writer, of any holder, whose thread CPU time could not be read, so they are not in the cpu and off_cpu components. Rises on every hold on a platform without a per-thread CPU clock; 0 on Linux and macOS.
 # TYPE kimmy_write_lock_held_cpu_unmeasured_total counter
 kimmy_write_lock_held_cpu_unmeasured_total 99

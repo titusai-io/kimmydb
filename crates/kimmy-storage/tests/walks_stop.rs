@@ -122,6 +122,11 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "engine::Engine::create_collection_in_txn",
         "the registry, and one row of each table: whether an id is free",
     ),
+    (
+        "engine::Engine::decide_violations_ready",
+        "at open, before the node serves or has a stop to answer: the violations table's rows, \
+         cleared when its marker is above the oplog's tail",
+    ),
     ("engine::Engine::drop_database", "one row: whether a database has a collection left"),
     (
         "engine::Engine::list_collections",
@@ -176,9 +181,9 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("gc::Engine::collect_dropped_indexes", "the dropped-index registry: one row per drop"),
     (
-        "gc::Engine::remove_oplog_entries",
-        "the violations table's rows below the oldest oplog entry, one row per violation entry, \
-         inside a retention write that close_writes bounds (ADR-200)",
+        "gc::Engine::trim_violation_rows",
+        "the violations table: one row per retained violation entry, read in a retention pass \
+         that serves no client (ADR-200)",
     ),
     (
         "violations_table_tests::in_oplog",

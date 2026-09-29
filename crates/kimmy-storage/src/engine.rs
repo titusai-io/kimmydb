@@ -351,6 +351,10 @@ pub enum WriterHolder {
     /// whole set of what takes the writer, rather than the part of it a
     /// scrape happens to see.
     Rewind,
+    /// The pass that completes the unique-violations table (ADR-200): the
+    /// short write that records what a scan of the oplog found. Never the scan
+    /// itself, which is a read.
+    Violations,
 }
 
 impl WriterHolder {
@@ -369,10 +373,11 @@ impl WriterHolder {
         Self::Embedding,
         Self::Durability,
         Self::Rewind,
+        Self::Violations,
     ];
 
     /// How many there are; the width of every per-holder array.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// The word a metric label and a log line name this holder by.
     ///
@@ -394,6 +399,7 @@ impl WriterHolder {
             Self::Embedding => "embedding",
             Self::Durability => "durability",
             Self::Rewind => "rewind",
+            Self::Violations => "violations",
         }
     }
 
@@ -4585,7 +4591,15 @@ impl Engine {
                          tail, which only a rewind by a build that does not maintain it leaves; \
                          it is rebuilt from the oplog in the background"
                     );
-                    table.remove(crate::violations_table::SENTINEL)?;
+                    // Every row goes with it: the table is untrusted, and a ready
+                    // table is then structurally the oplog's violations.
+                    let keys: Vec<Vec<u8>> = table
+                        .iter()?
+                        .map(|row| Ok(row?.0.value().to_vec()))
+                        .collect::<Result<_>>()?;
+                    for key in keys {
+                        table.remove(key.as_slice())?;
+                    }
                     false
                 }
                 _ => false,

@@ -1,7 +1,14 @@
-//! What `/violations` costs in heap, measured (ADR-200). The route read the
+//! What `/violations` costs in heap, measured cold (ADR-200). The route read the
 //! whole retained oplog to find its few records; from the table it reads the
-//! records only, so its allocation follows the number of violations and not
-//! the size of the oplog.
+//! records only, so what its first call allocates after a reopen follows the
+//! number of violations and not the size of the oplog.
+//!
+//! **Cold, because warm proves nothing**: with the pages in redb's cache a walk
+//! of the oplog allocates nothing either. Each measurement is the first call
+//! after the store is reopened with the smallest page cache, so every page the
+//! route touches is read, and a read allocates. **The oplog walk is the
+//! control**, forced by a test switch on the same store: it must grow with the
+//! oplog, or the measurement could not tell the two routes apart.
 //!
 //! Its own binary, with a counting `#[global_allocator]`, for the reason
 //! `count_allocations.rs` gives.
@@ -12,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bson::doc;
 use kimmy_core::{DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp};
-use kimmy_storage::{Engine, IndexField, WalkScope};
+use kimmy_storage::{Engine, ExamineBudget, IndexField, WalkScope};
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
@@ -38,6 +45,8 @@ static ALLOCATOR: Counting = Counting;
 static MEASURING: Mutex<()> = Mutex::new(());
 
 const DOC_BYTES: usize = 32 * 1024;
+/// The smallest page cache the store allows.
+const CACHE: usize = 8 * 1024 * 1024;
 
 fn allocated_by<T>(f: impl FnOnce() -> T) -> (usize, T) {
     let before = ALLOCATED.load(Ordering::Relaxed);
@@ -45,14 +54,10 @@ fn allocated_by<T>(f: impl FnOnce() -> T) -> (usize, T) {
     (ALLOCATED.load(Ordering::Relaxed) - before, out)
 }
 
-/// An engine whose oplog holds `documents` large entries, with `violations`
-/// unique violations spread evenly among them.
-fn store(
-    documents: usize,
-    violations: usize,
-) -> (Engine, kimmy_storage::CollectionMeta, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+/// A store at `path` whose oplog holds `documents` large entries, with
+/// `violations` unique violations spread evenly among them, closed.
+fn build(path: &std::path::Path, documents: usize, violations: usize) {
+    let engine = Engine::open(path).unwrap();
     engine.create_collection("app", "docs").unwrap();
     let field = IndexField { path: "email".into(), descending: false };
     engine.create_index("app", "docs", vec![field], true, None).unwrap();
@@ -89,36 +94,59 @@ fn store(
         }
     }
     assert_eq!(made, violations);
-    (engine, coll, dir)
+    engine.close().unwrap();
 }
 
-fn cost(documents: usize, violations: usize) -> (usize, usize) {
-    let (engine, coll, _dir) = store(documents, violations);
-    assert!(engine.violations_table_ready());
-    // Once, so what is measured is the route and not first-use setup.
-    engine.live_unique_violations(&coll, None, WalkScope::Request).unwrap();
+/// What the first `/violations` call allocates on a store reopened cold, by the
+/// table (`from_oplog` false) or by the oplog walk (true).
+fn cold_first_call(documents: usize, violations: usize, from_oplog: bool) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    build(&path, documents, violations);
+
+    // Completing the table takes an open, the backfill, and a close: through is
+    // then at the tail, and the next open finds the table ready.
+    {
+        let engine = Engine::open_with_cache(&path, Some(CACHE)).unwrap();
+        let budget = ExamineBudget { time: std::time::Duration::from_secs(600), rows: 1_000 };
+        while !engine.violations_backfill_step(budget).unwrap().done {}
+        engine.close().unwrap();
+    }
+    let engine = Engine::open_with_cache(&path, Some(CACHE)).unwrap();
+    assert!(engine.violations_table_ready(), "a completed table is ready at the next open");
+    let coll = engine.get_collection("app", "docs").unwrap();
+    kimmy_storage::violations_table::set_test_violations_from_oplog(from_oplog);
     let (bytes, live) =
         allocated_by(|| engine.live_unique_violations(&coll, None, WalkScope::Request).unwrap());
+    kimmy_storage::violations_table::set_test_violations_from_oplog(false);
     assert_eq!(live.len(), violations);
-    (bytes, live.len())
+    bytes
 }
 
+/// The table's first call is flat as the oplog grows fourfold, with no violations
+/// and with fifty spread across it, and the oplog walk on the same stores is not:
+/// the control that shows the measurement can tell them apart.
 #[test]
-fn with_no_violations_the_route_allocates_nothing_that_follows_the_oplog() {
+fn the_first_call_after_a_reopen_follows_the_violations_and_not_the_oplog() {
     let _measuring = MEASURING.lock().unwrap();
-    let (small, _) = cost(64, 0);
-    let (large, _) = cost(256, 0);
-    assert!(small < DOC_BYTES && large < DOC_BYTES, "small {small}, large {large}");
-    assert!(large <= small + 4_096, "4x the oplog, {small} then {large} bytes");
-}
-
-#[test]
-fn with_fifty_violations_spread_across_the_oplog_it_follows_the_violations() {
-    let _measuring = MEASURING.lock().unwrap();
-    let (small, _) = cost(200, 50);
-    let (large, _) = cost(800, 50);
-    // A body read per record, not per entry: far less than the 200 documents'
-    // worth the oplog walk would touch, and the same at 4x the oplog.
-    assert!(small < 50 * DOC_BYTES / 4, "{small} bytes for 50 violations");
-    assert!(large <= small + small / 8 + 4_096, "4x the oplog, {small} then {large} bytes");
+    for (small, large, violations) in [(64, 256, 0), (200, 800, 50)] {
+        let table =
+            (cold_first_call(small, violations, false), cold_first_call(large, violations, false));
+        let oplog =
+            (cold_first_call(small, violations, true), cold_first_call(large, violations, true));
+        assert!(
+            oplog.1 >= oplog.0 * 2,
+            "the control must grow with the oplog ({violations} violations): {oplog:?}"
+        );
+        assert!(
+            table.1 <= table.0 + table.0 / 2 + 64 * 1024,
+            "the table's first call is flat as the oplog grows fourfold \
+             ({violations} violations): {table:?}"
+        );
+        assert!(
+            table.1 * 4 <= oplog.1,
+            "the table reads far less than the oplog walk ({violations} violations): \
+             table {table:?}, oplog {oplog:?}"
+        );
+    }
 }

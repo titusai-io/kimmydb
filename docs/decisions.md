@@ -21549,28 +21549,43 @@ the workload wanted, for an answer that is usually empty.
 - **One way in.** `append_oplog_at` inserts the row when the entry is a
   `UniqueViolation`, in the entry's own transaction, so a re-appended entry is
   idempotent. Retention removes the row with the entry (the header of the
-  removed value says whose it was) and also trims rows below the oldest entry
-  the oplog still holds, so a row left by a build that does not remove it goes
-  at the next pass. A rewind removes the rows of the entries it discards.
+  removed value says whose it was) and, once per pass that removed entries,
+  trims rows below the oldest entry the oplog still holds (a read of the small
+  table, and a write only when there is something to remove), so a row left by
+  a build that does not remove it goes at the next pass. A rewind removes the rows of the entries it discards.
 - **A sentinel row, key `[0x00]`, holds `through`, a stamp key: every violation
   entry at or below it is in the table.** It lives in the table it describes,
-  so a backup, which copies only the tables `verified.rs` lists, cannot carry
-  one without the other (the table is in that list).
+  so the two cannot be separated. **A backup does not carry the table**
+  (`verified.rs` names the tables a backup copies, and this is not among them),
+  so a restore starts with no table and no `through`, and the backfill
+  completes it from zero.
 - **Completeness is recovered from the store, so there is no version marker and
   no rollback boundary.** At open the table is *ready* when `through` is at the
   oplog's tail (or the oplog is empty). Otherwise (a store from before the
   table, or one a build that does not know it wrote to) a background pass scans
   the oplog from `through`, and `/violations` walks the oplog until it is done.
   A `through` **above** the tail can only be a rewind by a build that does not
-  know the table, and is cleared, so the pass starts from zero.
+  know the table, and is cleared together with every row, so the pass starts
+  from zero and a ready table is structurally the oplog's violations.
 - **The backfill is bounded and never holds the writer for its scan.** Each
   step reads a stretch of the oplog in a read transaction, header only, under
   the serve budget (ADR-194: 2 s, 65,536 rows), with the stop honoured per row
   (`Background` scope). It then takes the writer, as a retention hold, only to
   point-read the violation keys it found (one collected meanwhile is skipped),
   insert their rows, and advance `through` to the last stamp scanned or the
-  tail if that is lower. It runs in the retention collector's task before its
-  first pass, so no task and no writer label is added.
+  tail if that is lower. **A scan that has used up its range (it was not ended
+  by its budget) sets `through` to the tail as the writer sees it, and the
+  table is ready.** That is sound because every entry appended after the scan's
+  snapshot went through `append_oplog_at` in this process, which maintains the
+  table: local and replicated appends alike, and nothing else writes the oplog
+  while the store is open. Without it a step could never finish under steady
+  writes, since a commit between the scan and the write leaves the tail ahead.
+  It runs in the retention collector's task, **interleaved with its passes**
+  (a step, then a pass if one is due), so retention is never held off by a
+  backfill. The backfill's write is held as `WriterHolder::Violations`
+  (`holder="violations"` in `kimmy_write_lock_held_seconds`), so its holds are
+  attributable; retention's trim of stale rows is held under the retention
+  label, since it is part of a retention pass.
 - **`through` advances in retention only**, and only when the table is ready
   and the pass removed entries: not at a clean close, where a rescan after a
   crash is bounded by what retention keeps and a close gains no write.
@@ -21578,11 +21593,11 @@ the workload wanted, for an answer that is usually empty.
   `kimmy_violations_backfill_rows_total` and
   `kimmy_violations_walk_path_total{path="table"|"oplog"}`.
 
-**Measured.** A counting allocator over an oplog of 64 and 256 documents of
-32 KiB with no violations: the route allocates under one document's worth at
-both sizes and does not grow with the oplog; with 50 violations spread across
-an oplog of 200 and of 800 documents it allocates the same at both, and a
-body read per record, not per entry.
+**Measured.** A counting allocator over the first call after a reopen with a
+small page cache (so the pages are read, not held), on an oplog of documents of
+32 KiB: the route's allocation stays flat as the oplog grows fourfold, with no
+violations and with 50 spread across it, while the oplog walk, kept as a control
+by a test switch, grows with it.
 
 **Rejected.**
 

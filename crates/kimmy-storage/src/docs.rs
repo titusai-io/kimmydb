@@ -1330,7 +1330,7 @@ impl Engine {
         // redb's page cache. Not ready (a backfill still running, or the table
         // never built), the oplog walk below, which is also what the table's
         // tests compare it against.
-        if self.violations_table_ready() {
+        if self.violations_table_ready() && !crate::violations_table::test_forces_oplog() {
             self.violations().note_call(true);
             return self.live_unique_violations_from_table(coll, index, scope);
         }
