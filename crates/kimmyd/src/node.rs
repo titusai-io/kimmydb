@@ -2647,12 +2647,17 @@ impl EarlySignal {
     }
 
     fn fire(&self) {
-        kimmy_storage::request_open_stop();
+        // `fired` before the open is asked to stop: a migration that sees the
+        // request unwinds at once, and `start_and_serve` reads `signalled()` on
+        // the error it returns. With the order the other way round, that read
+        // could find it unset, and a stop honoured would be recorded as a failed
+        // start.
         let announce = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.fired = true;
             state.announce.take()
         };
+        kimmy_storage::request_open_stop();
         if let Some(announce) = announce {
             announce();
         }
