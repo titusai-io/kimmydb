@@ -19685,7 +19685,7 @@ They remove the elements that **match**, and matching is `find`'s rule: a stored
 
 ### Tests
 
-The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the two update cases. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails the stored-`Decimal128` test. A pair of values holding a nested `Decimal128` is pinned as two members and two buckets.
+The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the update cases: a stored `Decimal128` beside a number, `1` against `1.0`, the exact array an `$each` keeps (`[NaN, 2]`), stored duplicates left as they are, and a `Decimal128` operand plain, in `$each` and nested. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails `add_to_set_identifies_members_as_group_does_against_stored_elements`, and re-adding the operand refusal for `$addToSet` fails `add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes`. A pair of values holding a nested `Decimal128` is pinned as two members and two buckets.
 
 ---
 

@@ -1940,6 +1940,39 @@ mod decimal128 {
     }
 
     #[test]
+    fn add_to_set_identifies_members_as_group_does_against_stored_elements() {
+        // A stored `Decimal128` ranks equal to every number in the canonical
+        // order, so the 5 was judged present and dropped (ADR-186).
+        let mut d = doc! { "_id": 1, "t": [dec("1")] };
+        let add = parse(&doc! { "$addToSet": { "t": 5 } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("t").unwrap(), &vec![dec("1"), Bson::Int32(5)]);
+        // One number in another width is still the same member.
+        let mut d = doc! { "_id": 1, "t": [1] };
+        let add = parse(&doc! { "$addToSet": { "t": 1.0 } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("t").unwrap(), &vec![Bson::Int32(1)]);
+        // Members of one `$each` are de-duplicated against each other too, and
+        // the first of each kind stays: the integer 2, not the double.
+        let mut d = doc! { "_id": 1, "t": [] };
+        let add = parse(&doc! { "$addToSet": { "t": { "$each": [f64::NAN, f64::NAN, 2, 2.0] } } })
+            .unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        let t = d.get_array("t").unwrap();
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert!(matches!(t[0], Bson::Double(n) if n.is_nan()), "{t:?}");
+        assert_eq!(t[1], Bson::Int32(2), "{t:?}");
+        // Duplicates already stored are never rewritten.
+        let mut d = doc! { "_id": 1, "t": [1, 1.0] };
+        let add = parse(&doc! { "$addToSet": { "t": 2 } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(
+            d.get_array("t").unwrap(),
+            &vec![Bson::Int32(1), Bson::Double(1.0), Bson::Int32(2)]
+        );
+    }
+
+    #[test]
     fn add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes() {
         let add = |update: Document, stored: Vec<Bson>| {
             let mut d = doc! { "_id": 1, "t": stored };

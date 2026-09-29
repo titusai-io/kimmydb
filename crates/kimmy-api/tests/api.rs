@@ -10366,6 +10366,7 @@ async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
         json!({ "$pull": { "xs": dec } }),
         json!({ "$pullAll": { "zs": [dec] } }),
         json!({ "$min": { "xs": dec } }),
+        json!({ "$max": { "xs": dec } }),
     ] {
         let res = server
             .post(
