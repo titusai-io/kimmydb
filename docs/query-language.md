@@ -351,7 +351,7 @@ both — mixing them is rejected rather than guessed at.
 | `$inc` `$mul` | Arithmetic; a missing field starts at `0` |
 | `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups); a `Decimal128` operand is refused, because that order cannot compare one |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
-| `$addToSet` | Append only if not already present (canonical equality); takes `$each`. A `Decimal128` operand is refused: it would compare equal to every number and add nothing |
+| `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)): `2` and `2.0` are one, and a `Decimal128` is never the same member as a number; takes `$each`. A `Decimal128` operand is taken, and is the same member only as a `Decimal128` with the same bytes. |
 | `$pull` `$pop` | Remove matching elements / one end. A `$pull` operand holding a `Decimal128` is refused: it would compare equal to every number and remove them all |
 | `$pullAll` | Remove every element equal to **any** value in a list; a `Decimal128` in the list is refused for the same reason |
 | `$rename` | Move a field |
@@ -645,8 +645,9 @@ holding a Decimal128`. Either
 way the update is refused and nothing is written. Only the documents the
 filter matched are checked:
 narrow the filter past them, sort by another field, or store the value as a
-double or a long. The same applies to `$min`, `$max`, `$addToSet`, `$pull`
-and `$pullAll`, which compare their operand and refuse a Decimal128 one.
+double or a long. The same applies to `$min`, `$max`, `$pull` and
+`$pullAll`, which compare their operand and refuse a Decimal128 one;
+`$addToSet` does not compare, and takes one.
 
 ```javascript
 { "projection": { "item": 1, "qty": 1 } }          // inclusion (+ _id)

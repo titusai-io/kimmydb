@@ -153,7 +153,7 @@ The comparator has the same gap: `canonical_cmp` ranks a `Decimal128` equal
 to every other number, because it has nothing exact to compare. That is why
 a Decimal128 is refused wherever a query would compare on a caller's behalf
 — as a filter operand, an expression literal, a partial index's bound, the
-operand of `$min`, `$max`, `$addToSet`, `$pull` or `$pullAll`, or a sort key
+operand of `$min`, `$max`, `$pull` or `$pullAll`, or a sort key
 a matching document holds — rather than
 matched against everything numeric or placed nowhere in particular among the
 numbers ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).

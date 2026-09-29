@@ -155,7 +155,7 @@ wrong quietly:
 | `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean | Ignored | `null` |
 | `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
-| `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them | — nothing is unusable |
+| `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them, and `undefined` is that same member | — nothing is unusable |
 
 Two consequences worth spelling out. **`$sum` and `$avg` disagree about a
 group with nothing to work on**: `0` against `null`, because a total of
@@ -177,10 +177,16 @@ answers one document holding `0`. See [Stages](#stages).
 promoting to a double only when a double arrives or an `i64` sum would
 overflow. `$avg` is a double whenever it has an answer at all — it never
 returns an integer, and the one thing it returns that is not a double is the
-`null` above. `$addToSet` compares elements **structurally**, not by the
-canonical order `$group`'s own `_id` uses, so
-`5`, `5.0` and `{"$numberLong": "5"}` are one bucket as a grouping key and
-three distinct members of a set.
+`null` above. `$addToSet` identifies its members the way `$group` identifies a bucket
+([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)),
+keeping the first of each in input order: `5`, `5.0` and `{"$numberLong": "5"}`
+are one member, every `NaN` is one, `0.0` and `-0.0` are one, and `null` and
+`undefined` are one. Two documents are one member only with their keys in the
+same order, and two `Decimal128`s only with the same bytes; a `Decimal128` is
+never the same member as a number. A value holding a `Decimal128` anywhere,
+nested or in an array, cannot be key-encoded and is identified by its
+rendering, so inside it `1` and `1.0` are not one member; `$group` does the
+same.
 
 ---
 

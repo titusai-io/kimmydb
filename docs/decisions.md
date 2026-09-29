@@ -19093,7 +19093,7 @@ The seven sites are the build, the stamp merge and the restore's relog in `creat
 
 - **Derived by the compiler.** `PartialEq` was removed from every type that holds a client-supplied `Bson`, `Document` or float and reaches metadata, replication or query plans: 26 types, among them `IndexMeta`, `CollectionMeta`, `IndexCreate`, the snapshot page types and the protocol `Message`, `PartialFilter`, and the query `Filter`, `Expr` and `Update` trees. The workspace's non-test code then compiled. So no production code compares whole values of any of those types.
 - **Enumerated by reading, for the fields.** A foreign type's `==` cannot be removed, so every non-test `==` and `!=` in `kimmy-core`, `kimmy-query`, `kimmy-storage` and `kimmy-cluster` was read. The only client-valued field in stored metadata that can hold a float is `IndexMeta::partial_filter`, and it is compared in exactly two places, `definition_is` and `differences`, both now fixed. The comparisons that are correct as they are: the version-vector comparison (HLC integers, an early return rather than a retry), stamp comparisons in conditional writes, vector configurations (`Eq`, no floats), byte comparisons in garbage collection and the live count, and the `canonical_cmp` equalities in the query engine, which are a total order.
-- **One look-alike outside the class.** `$addToSet` de-duplicates with `Bson`'s `==`, so it keeps every `NaN` it meets, and keeps `1` and `1.0` as two members. That is query semantics, with no retry and no definition behind it, and it is recorded as its own finding rather than changed here.
+- **One look-alike outside the class.** `$addToSet` de-duplicates with `Bson`'s `==`, so it keeps every `NaN` it meets, and keeps `1` and `1.0` as two members. That is query semantics, with no retry and no definition behind it, and it is recorded as its own finding rather than changed here ([ADR-186](#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)).
 - **Retry by recursion** cannot be grepped for reliably, so it was enumerated by reading every function in `kimmy-storage` that calls itself, and a review repeated it across the workspace: four functions retry that way, the ones above, at seven sites. All four are loops now.
 
 The unbounded recursion was already recorded as a known shape, *recorded and not queued*. A `NaN` is what made it fatal, and that is the argument for fixing a shape when you find it rather than filing it.
@@ -19633,6 +19633,59 @@ Every row above was run alone on the final tree, across `kimmy-core`, `kimmy-sto
 `a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s.
 
 The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` stated the rule as "outside the filter means absent", which stopped being the whole truth. It is renamed and widened rather than left to contradict the code.
+
+---
+
+## ADR-186 — A set's members are identified the way `$group` identifies a bucket
+
+**Decision.** `$addToSet` keeps one member per `$group` key, the first in input order. The key is `group_key`: the `keyenc` encoding the indexes use, with a `Decimal128`, which `keyenc` refuses ([ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding)), identified by its raw bytes. The aggregation accumulator and the `$addToSet` update operator take the same identity, the update against the elements already stored.
+
+### The defect
+
+The accumulator de-duplicated with `Bson`'s `==`, which is structural: `f64`'s equality for doubles and never equal across variants. Every `NaN` was a new member, `1`, `1.0` and `1_i64` were three, and so were `0.0` and `-0.0`, and `null` and `undefined`. On a 17-value corpus `$addToSet` kept 14 members where `$group` on the same values made 9 buckets. "The distinct values of `$k`" already means `group_key` here, through `$group: {_id: "$k"}` and the keys `$lookup` collects, so two spellings of one question answered differently.
+
+The update operator compared with `canonical_cmp`, which ranks a `Decimal128` equal to **every** number ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). Its operand was refused when it held one, but a stored element can hold one: `$addToSet: {t: 5}` on `{t: [Decimal128("1")]}` judged the 5 already present and dropped it, silently.
+
+### What changes for a caller
+
+| Values in | Members before | Members after |
+|---|---|---|
+| `1`, `1.0`, `1_i64` | three | one |
+| `NaN`, `NaN` | two | one |
+| `0.0`, `-0.0` | two | one |
+| `null`, `undefined` | two | one |
+| the string `"s"`, the symbol `"s"` | two | one |
+| `{a: 1, b: 2}`, `{b: 2, a: 1}` | two | two: nested key order counts, as `find` counts it |
+| `Decimal128("1.0")`, `Decimal128("1.00")` | two | two: one member only with the same bytes |
+| `Decimal128("1")`, `1` | two | two: the order cannot rank a `Decimal128` against a number, so neither is the other |
+
+**A value holding a `Decimal128` anywhere, nested or in an array, is identified by its rendering.** `keyenc` cannot encode it, so the whole value falls back to the raw form and the collapses above do not happen inside it: `{a: 1, d: Decimal128("1")}` and `{a: 1.0, d: Decimal128("1")}` are two members, as are `[0.0, Decimal128("1")]` and `[-0.0, Decimal128("1")]`. `$group` makes the same two buckets, so the two still agree.
+
+Stored `[Decimal128("1")]` plus `$addToSet: {t: 5}` now gives `[Decimal128("1"), 5]`. Stored `[1]` plus `{t: 1.0}` stays `[1]`.
+
+### Properties
+
+- **It is an equivalence**: reflexive (`NaN` is one member), symmetric and transitive.
+- **It agrees with the canonical order wherever that order is an equivalence**: `keyenc` is property-tested to sort exactly as `canonical_cmp` does.
+- **It is hashable**, so the accumulator keeps a set of keys rather than scanning its members.
+
+### Considered and rejected
+
+- **`canonical_cmp` as the equality.** A `Decimal128` equal to every number makes it non-transitive, so the set depends on input order: `[1, Decimal128("5"), 2]` keeps `[1, 2]` and `[Decimal128("5"), 1, 2]` keeps `[Decimal128("5")]`. An accumulator cannot refuse the value as an update's `$pull` operand can, because it is stored data, and failing an aggregation over one field would be worse.
+- **Exact bytes.** Makes `NaN` one member but keeps `1` and `1.0` apart, disagreeing with `$group`, the indexes and every filter.
+- **Structural `==`.** The behaviour this replaces.
+
+### The operand refusal is lifted for `$addToSet`, and stands for the other four
+
+`$addToSet` refused an operand holding a `Decimal128`, with the rest of `$min`, `$max`, `$pull` and `$pullAll`, because the canonical order ranks one equal to every number: an add would have been judged present and dropped. That hazard is the canonical order deciding membership, and it no longer does. A `Decimal128` operand, plain, inside `$each`, or nested in a document or array, is identified by its bytes, so it is a duplicate only of a `Decimal128` with the same bytes, and a request that was refused now succeeds. `$min`, `$max`, `$pull` and `$pullAll` still compare through the canonical order, so their refusal, and its message, stand.
+
+### `$pull` and `$pullAll` are unchanged, on purpose
+
+They remove the elements that **match**, and matching is `find`'s rule: a stored `Decimal128` satisfies `{k: 7}` ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). A set's membership is a different question from a filter's match. Answering both with one rule would mean either a filter that stopped matching what `find` matches, or a set whose members depend on the order they arrived in. The asymmetry is the point; it is not an inconsistency to fix.
+
+### Tests
+
+The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the update cases: a stored `Decimal128` beside a number, `1` against `1.0`, the exact array an `$each` keeps (`[NaN, 2]`), stored duplicates left as they are, and a `Decimal128` operand plain, in `$each` and nested. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails `add_to_set_identifies_members_as_group_does_against_stored_elements`, and re-adding the operand refusal for `$addToSet` fails `add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes`. A pair of values holding a nested `Decimal128` is pinned as two members and two buckets.
 
 ---
 
