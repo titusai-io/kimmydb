@@ -868,7 +868,7 @@ place for it — it ranks equal to every other number — so a filter that let
 one through would match every numeric value of the field. A sort over a
 field where a matching document holds one is refused naming the document
 (*cannot sort by "v": document 3 holds a Decimal128 there*), and the update
-operators that compare their operand — `$min`, `$max`, `$addToSet`, `$pull`,
+operators that compare their operand — `$min`, `$max`, `$pull`,
 `$pullAll` — refuse one (*`$pull` cannot compare a Decimal128 operand*);
 `$type: "decimal"` finds such documents without comparing them
 ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).

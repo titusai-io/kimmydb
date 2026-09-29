@@ -15,15 +15,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 **`$addToSet` now treats values as one member the way `$group` treats them
 as one bucket.** Before, it kept every `NaN` it met and kept `1`, `1.0` and
 `{"$numberLong": "1"}` as three members, `0.0` and `-0.0` as two, and `null`
-and `undefined` as two. Now each of those is one member, the first seen. Two
-documents with their keys in a different order are still two members, two
-`Decimal128`s are one member only with the same bytes, and a `Decimal128` is
-never the same member as a number. The `$addToSet` update operator takes the
-same identity against the elements already stored: it used to drop an add
-next to a stored `Decimal128` (`[Decimal128("1")]` plus `5` stayed as it was)
-and now gives `[Decimal128("1"), 5]`. A caller that counted on `1` and `1.0`
-being two members, or on the number of `NaN`s, sees fewer members.
-`$pull` and `$pullAll` are unchanged. See ADR-186.
+and `undefined` as two, and a string and a symbol of the same text as two.
+Now each of those is one member, the first seen, and so is every DBPointer.
+Two documents with their keys in a different order are still two members,
+two `Decimal128`s are one member only with the same bytes, and a
+`Decimal128` is never the same member as a number. A value holding a
+`Decimal128` anywhere, nested or in an array, is identified by its
+rendering, so inside it `1` and `1.0` stay two members, as `$group` keeps
+them two buckets. The `$addToSet` update operator takes the same identity
+against the elements already stored: it used to drop an add next to a stored
+`Decimal128` (`[Decimal128("1")]` plus `5` stayed as it was) and now gives
+`[Decimal128("1"), 5]`. A caller that counted on `1` and `1.0` being two
+members, or on the number of `NaN`s, sees fewer members. `$pull` and
+`$pullAll` are unchanged. An `$addToSet` whose operand holds a `Decimal128`,
+which was refused, now succeeds, the `Decimal128` being one member only with
+the same bytes; `$min`, `$max`, `$pull` and `$pullAll` still refuse one. See
+ADR-186.
 
 ## 0.41.1 - 2026-09-28
 

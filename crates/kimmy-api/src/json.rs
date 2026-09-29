@@ -329,6 +329,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_decimal128_operand_in_extended_json_reaches_add_to_set_intact() {
+        // ADR-186: `$addToSet` takes the operand and identifies it by its
+        // bytes, so the JSON boundary must hand it over as a `Decimal128`
+        // rather than a nested document.
+        let update = json_to_bson(&json!({
+            "$addToSet": { "t": { "$numberDecimal": "1" } }
+        }))
+        .unwrap();
+        let Bson::Document(update) = update else { panic!("not a document") };
+        assert_eq!(
+            update.get_document("$addToSet").unwrap().get("t"),
+            Some(&Bson::Decimal128("1".parse().unwrap()))
+        );
+        let parsed = kimmy_query::update::parse(&update).expect("accepted");
+        let mut stored = bson::doc! { "t": [1] };
+        kimmy_query::update::apply(&parsed, &mut stored, 0).unwrap();
+        assert_eq!(stored.get_array("t").unwrap().len(), 2);
+    }
+
     fn round_trip(value: Value) -> Value {
         bson_to_json(&json_to_bson(&value).unwrap())
     }

@@ -452,15 +452,19 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "unset" => OpKind::Unset,
         "inc" => OpKind::Inc(numeric(arg)?),
         "mul" => OpKind::Mul(numeric(arg)?),
-        // These five compare their operand against what is stored — `$min`
-        // and `$max` against the value, `$addToSet`, `$pull` and `$pullAll`
-        // against every element — and the canonical order ranks a Decimal128
-        // equal to every other number. Let through, a `$pull` of one would
-        // empty an array of its numbers and an `$addToSet` of one would add
-        // nothing, silently. `$set` and `$push` take any value; these only
+        // These four compare their operand against what is stored — `$min`
+        // and `$max` against the value, `$pull` and `$pullAll` against every
+        // element — and the canonical order ranks a Decimal128 equal to every
+        // other number. Let through, a `$pull` of one would empty an array of
+        // its numbers, silently. `$set` and `$push` take any value; these only
         // what they can compare. Checked over the whole operand, so a
-        // Decimal128 inside `$each` or a condition document counts.
-        "min" | "max" | "addToSet" | "pull" | "pullAll" if kimmy_core::holds_decimal128(arg) => {
+        // Decimal128 inside a condition document counts.
+        //
+        // `$addToSet` is not among them: a set's members are identified by
+        // their group key, with a Decimal128 by its bytes, so no comparison
+        // decides membership and a Decimal128 operand is well defined
+        // (ADR-186).
+        "min" | "max" | "pull" | "pullAll" if kimmy_core::holds_decimal128(arg) => {
             return Err(Error::InvalidUpdate(format!(
                 "${op} cannot compare a Decimal128 operand: it has no exact key encoding in this \
                  engine and ranks equal to every other number; use $set, or a double or a long"
@@ -1910,14 +1914,11 @@ mod decimal128 {
     }
 
     #[test]
-    fn the_set_and_pull_operators_refuse_an_operand_they_cannot_compare() {
+    fn the_pull_operators_refuse_an_operand_they_cannot_compare() {
         // Each compares its operand against every element; let through, a
-        // `$pull` of a Decimal128 emptied `[1, 2.5, "s", 3]` down to `["s"]`
-        // and an `$addToSet` of one added nothing, both silently.
+        // `$pull` of a Decimal128 emptied `[1, 2.5, "s", 3]` down to `["s"]`,
+        // silently.
         for update in [
-            doc! { "$addToSet": { "xs": dec("9.9") } },
-            doc! { "$addToSet": { "xs": { "$each": [1, dec("9.9")] } } },
-            doc! { "$addToSet": { "xs": { "n": dec("9.9") } } },
             doc! { "$pull": { "xs": dec("1.5") } },
             doc! { "$pull": { "xs": { "$gt": dec("1.5") } } },
             doc! { "$pull": { "xs": { "n": dec("1.5") } } },
@@ -1926,6 +1927,7 @@ mod decimal128 {
             let msg = parse(&update).expect_err("refused").to_string();
             let op = update.keys().next().unwrap();
             assert!(msg.contains(op) && msg.contains("Decimal128"), "{update}: {msg}");
+            assert!(msg.contains("ranks equal to every other number"), "{update}: {msg}");
         }
         // The same operators over a double behave as ever.
         let mut d = doc! { "_id": 1, "xs": [1, 2.5, "s", 3] };
@@ -1938,24 +1940,27 @@ mod decimal128 {
     }
 
     #[test]
-    fn add_to_set_identifies_members_as_group_does_against_stored_elements() {
-        // A stored `Decimal128` ranks equal to every number in the canonical
-        // order, so the 5 was judged present and dropped (ADR-186).
-        let mut d = doc! { "_id": 1, "t": [dec("1")] };
-        let add = parse(&doc! { "$addToSet": { "t": 5 } }).unwrap();
-        apply(&add, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("t").unwrap(), &vec![dec("1"), Bson::Int32(5)]);
-        // One number in another width is still the same member.
-        let mut d = doc! { "_id": 1, "t": [1] };
-        let add = parse(&doc! { "$addToSet": { "t": 1.0 } }).unwrap();
-        apply(&add, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("t").unwrap(), &vec![Bson::Int32(1)]);
-        // Members of one `$each` are de-duplicated against each other too.
-        let mut d = doc! { "_id": 1, "t": [] };
-        let add = parse(&doc! { "$addToSet": { "t": { "$each": [f64::NAN, f64::NAN, 2, 2.0] } } })
-            .unwrap();
-        apply(&add, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("t").unwrap().len(), 2);
+    fn add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes() {
+        let add = |update: Document, stored: Vec<Bson>| {
+            let mut d = doc! { "_id": 1, "t": stored };
+            let parsed = parse(&update).unwrap_or_else(|e| panic!("refused {update}: {e}"));
+            apply(&parsed, &mut d, 0).unwrap();
+            d.get_array("t").unwrap().clone()
+        };
+        let one = || doc! { "$addToSet": { "t": dec("1") } };
+        // A number is not a `Decimal128`, whichever is stored.
+        assert_eq!(add(one(), vec![Bson::Int32(1)]), vec![Bson::Int32(1), dec("1")]);
+        // The same bytes are the same member.
+        assert_eq!(add(one(), vec![dec("1")]), vec![dec("1")]);
+        // Different bytes are two members.
+        assert_eq!(add(one(), vec![dec("1.0")]), vec![dec("1.0"), dec("1")]);
+        // Inside `$each`, and in a document or array operand.
+        let each = doc! { "$addToSet": { "t": { "$each": [dec("1"), dec("1"), 1] } } };
+        assert_eq!(add(each, vec![]), vec![dec("1"), Bson::Int32(1)]);
+        let nested = doc! { "$addToSet": { "t": { "n": dec("1") } } };
+        assert_eq!(add(nested, vec![]), vec![Bson::Document(doc! { "n": dec("1") })]);
+        let array = doc! { "$addToSet": { "t": [dec("1")] } };
+        assert_eq!(add(array, vec![]), vec![Bson::Array(vec![dec("1")])]);
     }
 
     #[test]

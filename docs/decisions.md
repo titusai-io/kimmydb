@@ -19644,7 +19644,7 @@ The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` s
 
 The accumulator de-duplicated with `Bson`'s `==`, which is structural: `f64`'s equality for doubles and never equal across variants. Every `NaN` was a new member, `1`, `1.0` and `1_i64` were three, and so were `0.0` and `-0.0`, and `null` and `undefined`. On a 17-value corpus `$addToSet` kept 14 members where `$group` on the same values made 9 buckets. "The distinct values of `$k`" already means `group_key` here, through `$group: {_id: "$k"}` and the keys `$lookup` collects, so two spellings of one question answered differently.
 
-The update operator compared with `canonical_cmp`, which ranks a `Decimal128` equal to **every** number ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). Its operand is refused when it holds one, but a stored element can hold one: `$addToSet: {t: 5}` on `{t: [Decimal128("1")]}` judged the 5 already present and dropped it, silently.
+The update operator compared with `canonical_cmp`, which ranks a `Decimal128` equal to **every** number ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). Its operand was refused when it held one, but a stored element can hold one: `$addToSet: {t: 5}` on `{t: [Decimal128("1")]}` judged the 5 already present and dropped it, silently.
 
 ### What changes for a caller
 
@@ -19659,6 +19659,8 @@ The update operator compared with `canonical_cmp`, which ranks a `Decimal128` eq
 | `Decimal128("1.0")`, `Decimal128("1.00")` | two | two: one member only with the same bytes |
 | `Decimal128("1")`, `1` | two | two: the order cannot rank a `Decimal128` against a number, so neither is the other |
 
+**A value holding a `Decimal128` anywhere, nested or in an array, is identified by its rendering.** `keyenc` cannot encode it, so the whole value falls back to the raw form and the collapses above do not happen inside it: `{a: 1, d: Decimal128("1")}` and `{a: 1.0, d: Decimal128("1")}` are two members, as are `[0.0, Decimal128("1")]` and `[-0.0, Decimal128("1")]`. `$group` makes the same two buckets, so the two still agree.
+
 Stored `[Decimal128("1")]` plus `$addToSet: {t: 5}` now gives `[Decimal128("1"), 5]`. Stored `[1]` plus `{t: 1.0}` stays `[1]`.
 
 ### Properties
@@ -19669,9 +19671,13 @@ Stored `[Decimal128("1")]` plus `$addToSet: {t: 5}` now gives `[Decimal128("1"),
 
 ### Considered and rejected
 
-- **`canonical_cmp` as the equality.** A `Decimal128` equal to every number makes it non-transitive, so the set depends on input order: `[1, Decimal128("5"), 2]` keeps `[1, 2]` and `[Decimal128("5"), 1, 2]` keeps `[Decimal128("5")]`. An accumulator cannot refuse the value as an update operand can, because it is stored data, and failing an aggregation over one field would be worse.
+- **`canonical_cmp` as the equality.** A `Decimal128` equal to every number makes it non-transitive, so the set depends on input order: `[1, Decimal128("5"), 2]` keeps `[1, 2]` and `[Decimal128("5"), 1, 2]` keeps `[Decimal128("5")]`. An accumulator cannot refuse the value as an update's `$pull` operand can, because it is stored data, and failing an aggregation over one field would be worse.
 - **Exact bytes.** Makes `NaN` one member but keeps `1` and `1.0` apart, disagreeing with `$group`, the indexes and every filter.
 - **Structural `==`.** The behaviour this replaces.
+
+### The operand refusal is lifted for `$addToSet`, and stands for the other four
+
+`$addToSet` refused an operand holding a `Decimal128`, with the rest of `$min`, `$max`, `$pull` and `$pullAll`, because the canonical order ranks one equal to every number: an add would have been judged present and dropped. That hazard is the canonical order deciding membership, and it no longer does. A `Decimal128` operand, plain, inside `$each`, or nested in a document or array, is identified by its bytes, so it is a duplicate only of a `Decimal128` with the same bytes, and a request that was refused now succeeds. `$min`, `$max`, `$pull` and `$pullAll` still compare through the canonical order, so their refusal, and its message, stand.
 
 ### `$pull` and `$pullAll` are unchanged, on purpose
 
@@ -19679,7 +19685,7 @@ They remove the elements that **match**, and matching is `find`'s rule: a stored
 
 ### Tests
 
-The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the two update cases. Setting the identity back to `==` fails the differential; setting it back to `canonical_cmp` fails order independence.
+The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the two update cases. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails the stored-`Decimal128` test. A pair of values holding a nested `Decimal128` is pinned as two members and two buckets.
 
 ---
 

@@ -1711,6 +1711,29 @@ mod tests {
     }
 
     #[test]
+    fn a_value_holding_a_decimal128_is_identified_by_its_rendering() {
+        // `keyenc` refuses a `Decimal128` anywhere in a value, so the whole
+        // value is identified by its rendering and `1` against `1.0` no longer
+        // collapses inside it. `$group` does the same, and the two agree.
+        let pairs = [
+            (
+                Bson::Document(doc! { "a": 1, "d": dec("1") }),
+                Bson::Document(doc! { "a": 1.0, "d": dec("1") }),
+            ),
+            (
+                Bson::Array(vec![Bson::Double(0.0), dec("1")]),
+                Bson::Array(vec![Bson::Double(-0.0), dec("1")]),
+            ),
+        ];
+        for (x, y) in pairs {
+            let both = [x, y];
+            let buckets = run(vec![doc! {"$group": {"_id": "$v"}}], as_docs(&both)).unwrap();
+            assert_eq!(buckets.len(), 2, "{both:?}");
+            assert_eq!(members(&both).len(), 2, "{both:?}");
+        }
+    }
+
+    #[test]
     fn add_to_set_members_do_not_depend_on_input_order() {
         // `Decimal128` ranks equal to every number in the canonical order, so a
         // set built on that order kept `[1, 2]` from one order and `[Dec(5)]`
