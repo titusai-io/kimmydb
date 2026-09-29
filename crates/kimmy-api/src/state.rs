@@ -250,6 +250,21 @@ impl AppState {
             // meaning "membership entries" even during the moment a moved
             // node is known at two addresses. 0 with clustering off.
             cluster_members: self.members().map_or(0, |m| m.snapshot().len() as u64),
+            // How this member sees its peers by what they last said about
+            // themselves, and the peers a yielding class waits on (ADR-201).
+            ownership: {
+                let mut reading = self.members().map_or_else(Default::default, |m| {
+                    crate::metrics::OwnershipReading {
+                        peers: m.peer_state_counts(),
+                        unconfirmed: kimmy_cluster::OwnerClass::ALL
+                            .map(|class| m.unconfirmed_peers(class).len() as u64),
+                        ..Default::default()
+                    }
+                });
+                // Counted as blocks arrive, whether or not membership is up.
+                reading.undecodable = kimmy_cluster::facts_undecodable_total();
+                reading
+            },
         })
     }
 

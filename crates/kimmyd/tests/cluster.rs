@@ -629,6 +629,30 @@ async fn gossip_forms_and_survives_a_stall_and_a_death() {
     .await;
 }
 
+/// Each member hears the others' blocks on the replication contact: three real
+/// nodes each see both peers as eligible, none unknown, none catching up or
+/// yielding (ADR-201).
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn every_member_hears_every_other_members_block() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    for node in [&a, &b, &c] {
+        eventually("a member to see both peers as eligible", || async {
+            node.gauge(&client, "kimmy_ownership_peers{state=\"eligible\"}").await == Some(2)
+        })
+        .await;
+        for other in ["ineligible_catching_up", "ineligible_yielding", "unknown", "stale"] {
+            let series = format!("kimmy_ownership_peers{{state=\"{other}\"}}");
+            assert_eq!(node.gauge(&client, &series).await, Some(0), "{series}");
+        }
+        for class in ["ttl", "webhooks", "embeddings"] {
+            let series = format!("kimmy_yield_unconfirmed_peers{{class=\"{class}\"}}");
+            assert_eq!(node.gauge(&client, &series).await, Some(0), "{series}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Replication through gossip
 // ---------------------------------------------------------------------------

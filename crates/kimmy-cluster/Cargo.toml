@@ -12,7 +12,7 @@ description = "Leaderless gossip membership and oplog anti-entropy for KimmyDB"
 kimmy-core.workspace = true
 kimmy-task.workspace = true
 kimmy-storage.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "net", "time", "macros", "io-util"] }
@@ -27,6 +27,7 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"
 parking_lot.workspace = true
+serde_bytes.workspace = true
 postcard = { version = "1", features = ["alloc"] }
 # SWIM membership. MPL-2.0 — permitted for an unmodified dependency, and
 # recorded in docs/decisions.md rather than left for someone to discover in a

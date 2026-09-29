@@ -610,6 +610,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
+    // The peers a yielding class is waiting on, said once per interval each.
+    let mut unconfirmed_warned = crate::facts::UnconfirmedWarn::default();
+    // What the lease on a peer's block is derived from (ADR-201).
+    if let Some(members) = &config.members {
+        members.configure_lease(config.sync_interval, config.fanout);
+    }
     // A snapshot this node was part-way through when it stopped resumes where
     // it left off rather than transferring everything again (ADR-161). Never
     // fatal: the record is an optimisation, and a node that will not start
@@ -708,6 +714,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // line that says afterwards how long it was and that it was
                 // this loop.
                 let tick_started = Instant::now();
+                // This member's own block goes on every request of the tick
+                // (ADR-201): the loop reads it once, from the cache, and a
+                // peer that answers has read it.
+                let sent_facts = config.members.as_ref().and_then(Members::local_facts);
+                stalls.set_local_facts(sent_facts.as_ref().map(|(facts, _)| facts.clone()));
                 // A subset, not everyone: anti-entropy is transitive, so a
                 // write reaches the cluster through intermediate peers without
                 // every node contacting every other one every interval.
@@ -868,6 +879,43 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         if let Some(lag) = &config.lag_vectors {
                             lag.record(peer, theirs);
                         }
+                    }
+                    if let Some(members) = &config.members {
+                        for peer in stalls.take_facts_undecodable() {
+                            members.note_undecodable(peer, Instant::now());
+                        }
+                    }
+                    // What the peer said about itself, and that it read ours.
+                    for (node, facts) in stalls.take_facts_read() {
+                        if let Some(members) = &config.members {
+                            members.record_peer_facts(node, facts, Instant::now());
+                            if let Some((_, generation)) = &sent_facts {
+                                members.note_read_by(node, *generation);
+                            }
+                        }
+                    }
+                    if let Some(members) = &config.members {
+                        let mut waiting = Vec::new();
+                        for class in crate::facts::OwnerClass::ALL {
+                            for peer in members.unconfirmed_peers(class) {
+                                waiting.push((class, peer));
+                                if unconfirmed_warned.due(
+                                    class,
+                                    peer,
+                                    Instant::now(),
+                                    crate::health::WARN_INTERVAL,
+                                ) {
+                                    warn!(
+                                        class = class.label(),
+                                        %peer,
+                                        "a peer has not read this member's block, which says it \
+                                         yields the class; this member keeps owning the class \
+                                         until every live peer has read it"
+                                    );
+                                }
+                            }
+                        }
+                        unconfirmed_warned.retain(&waiting);
                     }
                     if let Some(pull) = stalls.take_pull() {
                         report.pulls.pulled(&pull);

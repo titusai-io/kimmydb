@@ -2133,6 +2133,22 @@ async fn spawn_cluster(
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("starting cluster TLS, which cluster.enabled requires")?,
     );
+    // The live member set, made here so the replication server can record what
+    // a peer says about itself and answer with this member's own block
+    // (ADR-201). Only with membership: it is what a peer's block is kept in.
+    let live = config.cluster.membership.then(kimmy_cluster::Members::default);
+    if let Some(live) = &live {
+        live.configure_lease(
+            Duration::from_secs(config.cluster.sync_interval_secs),
+            config.cluster.fanout,
+        );
+        live.set_facts_source(crate::facts::source(
+            Arc::downgrade(&engine),
+            uuid::Uuid::new_v4().as_bytes().to_vec(),
+            config.storage.ttl_interval_secs == 0,
+            !config.vector.worker_enabled,
+        ));
+    }
     let serving = kimmy_task::supervise(
         "replication_server",
         shutdown.clone(),
@@ -2144,6 +2160,7 @@ async fn spawn_cluster(
             Some(on_failed),
             Some(on_accept_error),
             cluster_tls,
+            live.clone(),
         ),
     );
 
@@ -2159,7 +2176,7 @@ async fn spawn_cluster(
             .await
             .with_context(|| format!("binding the membership socket on {}", config.cluster.bind))?;
 
-        let live = kimmy_cluster::Members::default();
+        let live = live.clone().expect("made above when membership is on");
         let (tx, feed) = kimmy_cluster::SeedFeed::channel();
         // The same secret the replication handshake uses: membership is
         // authenticated too, so an unauthenticated node cannot join the member

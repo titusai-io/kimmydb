@@ -1097,6 +1097,7 @@ mod tests {
             None,
             None,
             Arc::new(crate::tls::ClusterTls::new().unwrap()),
+            None,
         ));
         Member { engine, addr, served, serving, _dir: dir }
     }

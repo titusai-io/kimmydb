@@ -956,6 +956,69 @@ impl TelemetryGuard {
                 [kimmy_storage::WalkPath::FallbackError.slot()]
         );
         observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.peers.eligible",
+            "{peer}",
+            "Live peers eligible to own work by the block they last sent.",
+            |s| s.ownership.peers[kimmy_cluster::PeerState::Eligible.slot()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.peers.ineligible_catching_up",
+            "{peer}",
+            "Live peers whose catching-up marker is set, which no class overrides.",
+            |s| s.ownership.peers[kimmy_cluster::PeerState::IneligibleCatchingUp.slot()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.peers.ineligible_yielding",
+            "{peer}",
+            "Live peers that have given up at least one class.",
+            |s| s.ownership.peers[kimmy_cluster::PeerState::IneligibleYielding.slot()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.peers.unknown",
+            "{peer}",
+            "Live peers that have sent no block yet: an older version, or one not yet heard.",
+            |s| s.ownership.peers[kimmy_cluster::PeerState::Unknown.slot()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.peers.stale",
+            "{peer}",
+            "Live peers whose block is past its lease with no fresh one.",
+            |s| s.ownership.peers[kimmy_cluster::PeerState::Stale.slot()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.yield.unconfirmed_peers.ttl",
+            "{peer}",
+            "Live peers that have not read this member's block while it yields ttl.",
+            |s| s.ownership.unconfirmed[0]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.yield.unconfirmed_peers.webhooks",
+            "{peer}",
+            "Live peers that have not read this member's block while it yields webhooks.",
+            |s| s.ownership.unconfirmed[1]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.yield.unconfirmed_peers.embeddings",
+            "{peer}",
+            "Live peers that have not read this member's block while it yields embeddings.",
+            |s| s.ownership.unconfirmed[2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.ownership.facts_undecodable",
+            "{block}",
+            "Blocks a peer sent about itself that did not decode and were treated as none.",
+            |s| s.ownership.undecodable
+        );
+        observe!(
             u64_observable_counter,
             "kimmy.sync.failures",
             "{round}",

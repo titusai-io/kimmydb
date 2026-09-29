@@ -32,6 +32,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   reads its own table and which way each call was answered
   ([docs/operations.md](docs/operations.md)).
 
+- **Each member says on the replication contact what it can own, and its peers keep it**
+  ([ADR-201](docs/decisions.md)): whether it is catching up, which collections it holds a
+  TTL index on, whether expiry or the embedding worker is switched off, and (defined, and
+  always false for now) which classes of work it has stopped owning. It rides an optional
+  block on `Vectors` and `AskVersions`; an older build ignores it and is treated as
+  unknown, and nothing changes on disk, so a mixed cluster behaves as before and a
+  rollback is safe. `kimmy_ownership_peers{state}` and `kimmy_yield_unconfirmed_peers{class}`
+  show how a member sees its peers ([docs/operations.md](docs/operations.md)). This change
+  only carries and keeps the block; who owns what changes with the next change.
+
 ### Changed
 
 - **A member that restarted reads far less to be served when it holds almost
