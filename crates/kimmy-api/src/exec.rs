@@ -1184,7 +1184,12 @@ pub fn update(
         now: now_millis(),
         expected,
     };
-    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
+    // A scan's candidates, and a multikey range's fallback, are the whole
+    // collection walked in the write transaction: off the async worker
+    // (ADR-199).
+    let outcome = kimmy_storage::blocking(|| {
+        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
+    })?;
 
     let mut body = json!({
         "matched": outcome.matched,
@@ -1432,7 +1437,10 @@ pub fn find_and_modify(
         expected,
     };
 
-    let outcome = state.engine.find_and_modify(&meta, &candidates, &modify)?;
+    // As `update`'s: a scan walks the collection in the write transaction
+    // (ADR-199).
+    let outcome =
+        kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
 
     let returned = match spec.return_document {
         ReturnDocument::Before => outcome.before.clone(),
@@ -1494,7 +1502,12 @@ pub fn delete(
         now: now_millis(),
         expected,
     };
-    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
+    // A scan's candidates, and a multikey range's fallback, are the whole
+    // collection walked in the write transaction: off the async worker
+    // (ADR-199).
+    let outcome = kimmy_storage::blocking(|| {
+        state.engine.modify_where(&meta, &candidates, &modify, stop_after)
+    })?;
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {
@@ -1607,9 +1620,15 @@ fn create_index_stamped(
     // What the backfill could not key, read back from the index it just
     // built: the one number a client creating an index over existing data
     // most wants beside `multikey`, and the listing reports the same field.
+    // Each count walks its run of the index, which can be every document:
+    // off the async worker (ADR-199).
     let meta = state.engine.get_collection(db, coll)?;
-    let unkeyed = state.engine.unkeyed_count(&meta, index.id)?;
-    let undecidable = state.engine.undecidable_count(&meta, index.id)?;
+    let (unkeyed, undecidable) = kimmy_storage::blocking(|| {
+        Ok::<_, kimmy_storage::StorageError>((
+            state.engine.unkeyed_count(&meta, index.id)?,
+            state.engine.undecidable_count(&meta, index.id)?,
+        ))
+    })?;
     Ok((index_to_json(&index, unkeyed, undecidable), index.created))
 }
 
@@ -1692,13 +1711,18 @@ pub fn list_indexes(
     authorize(state, auth, Action::Read, db, coll)?;
     let meta = state.engine.get_collection(db, coll)?;
     let mut indexes = Vec::with_capacity(meta.indexes.len());
-    for index in &meta.indexes {
-        indexes.push(index_to_json(
-            index,
-            state.engine.unkeyed_count(&meta, index.id)?,
-            state.engine.undecidable_count(&meta, index.id)?,
-        ));
-    }
+    // Each count walks its run of the index, which can be every document:
+    // off the async worker, once for the listing (ADR-199).
+    kimmy_storage::blocking(|| {
+        for index in &meta.indexes {
+            indexes.push(index_to_json(
+                index,
+                state.engine.unkeyed_count(&meta, index.id)?,
+                state.engine.undecidable_count(&meta, index.id)?,
+            ));
+        }
+        Ok::<_, kimmy_storage::StorageError>(())
+    })?;
     Ok(json!({ "indexes": indexes }))
 }
 

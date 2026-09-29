@@ -1,5 +1,5 @@
-//! Every storage walk reached from a request or a replication round runs under
-//! `kimmy_storage::blocking`.
+//! Every storage walk reached from a request, a replication round or a
+//! background task runs under `kimmy_storage::blocking`.
 //!
 //! [ADR-153](../../../docs/decisions.md) moved `exec::visit_matching`'s walks
 //! off the async worker and said every read verb that walks goes through that
@@ -13,8 +13,8 @@
 //! `blocking(` call — the name on its own, so `nonblocking(` is not cover —
 //! which the scan follows by bracket depth, so a closure of any length is seen
 //! through. The walks that are allowed inline are counted
-//! per file with the reason they are bounded, so a new walk in one of those
-//! files still fails here.
+//! per file with their reason, so a new walk in one of those files still fails
+//! here.
 //!
 //! **A replication round is held to the same rule.** Applying a peer's window
 //! ran on the async worker, inside the round's poll, and that apply can take as
@@ -28,6 +28,14 @@
 //! stream is not in `WALKS`: `Engine::watch` and `ChangeStream::next` run their
 //! own reads under `blocking`, since a resume on a member that did not issue the
 //! token walks the arrival index (round 0420), so no caller can leave them out.
+//!
+//! **So are the background tasks** (ADR-199). The TTL pass ran inline on a
+//! worker, and on the member that owned the TTL collections the stop signal was
+//! measured arriving up to 0.74 s late; the webhook dispatcher walked its
+//! registry, progress and oplog window inline too. They live in `kimmy-api`,
+//! which is read already, and `kimmyd`, whose own loops are read too. The TTL
+//! pass reaches `expire_documents` through a function this scan does not
+//! follow, so `expiry_off_worker.rs` holds it to the rule instead.
 
 mod source;
 
@@ -36,7 +44,7 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 17] = [
+const WALKS: [&str; 24] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -45,6 +53,19 @@ const WALKS: [&str; 17] = [
     ".count(&",
     ".live_unique_violations(",
     ".backup_to(",
+    // An index's unkeyed or undecidable run, which can be every document.
+    ".unkeyed_count(",
+    ".undecidable_count(",
+    // An oplog window from a position, in each of its forms: it can pass over
+    // far more than it returns.
+    ".entries_for_peer",
+    ".read_oplog_",
+    // Every stored vector of a collection.
+    ".for_each_vector(",
+    // A write over what a filter matches: with no usable index, or a multikey
+    // range's fallback, the whole collection walked in the write transaction.
+    ".modify_where(",
+    ".find_and_modify(",
     // A peer's window: as long as whatever its entries carry, an index build
     // or a collection drop included.
     ".apply_peer_batch_into(",
@@ -64,12 +85,36 @@ const WALKS: [&str; 17] = [
     ".disable_vectors(",
 ];
 
-/// Walks allowed on the worker, per file, each bounded by something other than
-/// the data a client stored.
-const BOUNDED: [(&str, usize, &str); 5] = [
-    ("webhooks.rs", 1, "the webhook registry: one document per subscription"),
-    ("dispatch.rs", 3, "webhook jobs and delivery progress: subscriptions times members"),
+/// Functions that walk, matched as a name of their own and not where they are
+/// defined: a vector search with no graph to use scores every stored vector,
+/// and a keyword search reads every chunk's text.
+const WALKING_FUNCTIONS: [&str; 4] =
+    ["vector_search(", "keyword_search(", "load_jobs(", "union_progress("];
+
+/// Walks allowed outside a `blocking(` in their own file, per file, each
+/// bounded by something other than the data a client stored or run under a
+/// `blocking` at a caller this scan does not follow.
+const BOUNDED: [(&str, usize, &str); 7] = [
     ("topology.rs", 1, "the node registry: one document per member"),
+    (
+        "dispatch.rs",
+        2,
+        "the bodies of `load_jobs` and `union_progress`, whose calls are held to `blocking` \
+         through `WALKING_FUNCTIONS`: `dispatch_once` makes them inside its plan's wrap",
+    ),
+    (
+        "index.rs",
+        1,
+        "the graph build's read of every vector, reached only from `IndexCache::access`'s \
+         `blocking`",
+    ),
+    ("cache.rs", 1, "`count_vectors`, reached only from `IndexCache::access`'s `blocking`"),
+    (
+        "search.rs",
+        2,
+        "the bodies of `vector_search` and `keyword_search`, whose calls are held to \
+         `blocking` through `WALKING_FUNCTIONS`",
+    ),
     ("schema.rs", 1, "sample_documents stops at its limit"),
     ("vectors.rs", 1, "the emptiness check stops at the first live vector"),
 ];
@@ -178,7 +223,12 @@ fn uncovered_in(name: &str, body: &str) -> Vec<(String, usize, String)> {
                     open.push(depth);
                     continue;
                 }
-                if open.is_empty() && WALKS.iter().any(|w| rest.starts_with(w)) {
+                // A walking function as a name of its own, called rather than
+                // defined: `run_vector_search(` and `fn vector_search(` are not it.
+                let called = named
+                    && !code[..at].trim_end().ends_with("fn")
+                    && WALKING_FUNCTIONS.iter().any(|w| rest.starts_with(w));
+                if open.is_empty() && (called || WALKS.iter().any(|w| rest.starts_with(w))) {
                     found.push((name.to_string(), n + 1, line.trim().to_string()));
                 }
                 match rest.as_bytes()[0] {
@@ -199,16 +249,19 @@ fn uncovered_in(name: &str, body: &str) -> Vec<(String, usize, String)> {
 }
 
 #[test]
-fn every_walk_reached_from_a_request_or_a_round_runs_under_blocking() {
+fn every_walk_reached_from_a_request_a_round_or_a_task_runs_under_blocking() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut offenders = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for dir in [
         crates.join("kimmy-api/src"),
         crates.join("kimmy-mcp/src"),
         crates.join("kimmy-cluster/src"),
         crates.join("kimmy-vector/src"),
+        crates.join("kimmyd/src"),
     ] {
         let found = uncovered(&dir);
+        seen.extend(found.iter().map(|(f, _, _)| f.clone()));
         let mut files: Vec<&str> = found.iter().map(|(f, _, _)| f.as_str()).collect();
         files.dedup();
         for file in files {
@@ -218,20 +271,20 @@ fn every_walk_reached_from_a_request_or_a_round_runs_under_blocking() {
                 offenders.extend(here.iter().map(|(f, n, l)| format!("{f}:{n}: {l}")));
             }
         }
-        for (file, n, _) in BOUNDED {
-            if dir.ends_with("kimmy-api/src") && !found.iter().any(|(f, _, _)| f == file) && n > 0 {
-                offenders.push(format!(
-                    "{file}: the {n} bounded walk(s) allowed here are gone; lower the count"
-                ));
-            }
+    }
+    for (file, n, _) in BOUNDED {
+        if n > 0 && !seen.iter().any(|f| f == file) {
+            offenders.push(format!(
+                "{file}: the {n} bounded walk(s) allowed here are gone; lower the count"
+            ));
         }
     }
     assert!(
         offenders.is_empty(),
         "these storage walks run on the async worker, where a walk holds the worker for \
-         as long as the data it reads and `/metrics` queues behind it (ADR-153). Wrap each \
-         in `kimmy_storage::blocking`, or, if it is bounded by something other than client \
-         data, count it in BOUNDED with the reason:\n  {}",
+         as long as the data it reads and `/metrics` queues behind it (ADR-153, ADR-199). \
+         Wrap each in `kimmy_storage::blocking`, or, if it is bounded by something other than \
+         client data or covered at its caller, count it in BOUNDED with the reason:\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -258,4 +311,15 @@ fn the_walk_reads_past_a_test_hook_and_not_into_a_test_module() {
     let tests = "fn production() {}\n\n#[cfg(test)]\nmod tests {\n    \
                  fn t() {\n        engine.apply_peer_batch(&theirs);\n    }\n}\n";
     assert!(uncovered_in("tests.rs", tests).is_empty());
+}
+
+#[test]
+fn a_walking_function_is_seen_where_it_is_called_and_not_where_it_is_defined() {
+    let body = "pub fn vector_search(engine: &Engine) {}\n\
+                pub async fn run_vector_search() {}\n\
+                fn knn() { search::vector_search(&engine); }\n\
+                fn hybrid() { keyword_search(&engine); }\n";
+    let found = uncovered_in("functions.rs", body);
+    let lines: Vec<usize> = found.iter().map(|(_, n, _)| *n).collect();
+    assert_eq!(lines, [3, 4], "only the two calls are walks: {found:?}");
 }

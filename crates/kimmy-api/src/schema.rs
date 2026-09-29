@@ -114,13 +114,18 @@ pub fn describe_collection(
         .collect();
 
     let mut indexes = Vec::with_capacity(meta.indexes.len());
-    for index in &meta.indexes {
-        indexes.push(index_to_json(
-            index,
-            state.engine.unkeyed_count(&meta, index.id)?,
-            state.engine.undecidable_count(&meta, index.id)?,
-        ));
-    }
+    // Each count walks its run of the index, which can be every document
+    // (ADR-199).
+    kimmy_storage::blocking(|| {
+        for index in &meta.indexes {
+            indexes.push(index_to_json(
+                index,
+                state.engine.unkeyed_count(&meta, index.id)?,
+                state.engine.undecidable_count(&meta, index.id)?,
+            ));
+        }
+        Ok::<_, kimmy_storage::StorageError>(())
+    })?;
 
     Ok(json!({
         "database": db,

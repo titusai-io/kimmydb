@@ -161,7 +161,12 @@ pub async fn run(
         // up with no owner at all.
         let live: BTreeSet<NodeId> = members.as_ref().map(|m| m.node_ids()).unwrap_or_default();
 
-        let outcome = pass(&state.engine, me, &live, physical_now_ms());
+        // Off the async worker (ADR-199). The pass walks each owned TTL
+        // index's expired range and deletes what it finds; inline, the worker
+        // it held could not poll the runtime's I/O and timer driver, and the
+        // stop signal reached the member owning the collections up to 0.74 s
+        // late.
+        let outcome = kimmy_storage::blocking(|| pass(&state.engine, me, &live, physical_now_ms()));
         // Recorded even though zero-valued calls are common, because summing
         // this across a cluster is how "one document, one delete" stays a
         // measured property rather than a claim in a comment.
