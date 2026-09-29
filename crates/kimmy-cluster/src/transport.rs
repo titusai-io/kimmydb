@@ -127,6 +127,208 @@ pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
 /// error on this side, with why, for `kimmy_sync_serve_failures_total`.
 pub type ServeFailHook = Arc<dyn Fn(ServeFailure) + Send + Sync>;
 
+/// Called once per accept error that is the listener's own, with which
+/// listener it was, for `kimmy_accept_errors_total`.
+pub type AcceptErrorHook = Arc<dyn Fn(AcceptListener) + Send + Sync>;
+
+/// Which of the node's listeners an accept error came from: a fixed set, so
+/// the series is always all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AcceptListener {
+    /// The replication listener, [`serve_with`].
+    Cluster,
+    /// The HTTP listener, which lives in the daemon.
+    Http,
+}
+
+impl AcceptListener {
+    pub const COUNT: usize = 2;
+    pub const ALL: [Self; Self::COUNT] = [Self::Cluster, Self::Http];
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cluster => "cluster",
+            Self::Http => "http",
+        }
+    }
+}
+
+/// Whether an accept that failed with `error` is the listener's failure, one
+/// that refuses every client until it clears (out of descriptors, of buffers,
+/// of memory), rather than one client's connection that failed first.
+///
+/// The second kind is a connection the kernel had already queued: it was
+/// aborted, reset or refused, or on Linux `accept(2)` reports the network
+/// error the new socket is carrying (see [`pending_connection_error`]). Each
+/// belongs to that one client, and the next `accept` is not affected. Anything
+/// else, an unknown errno included, is treated as the listener's own, which
+/// costs a short wait and errs toward not spinning.
+pub fn accept_error_is_the_listeners(error: &io::Error) -> bool {
+    use io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    !matches!(error.kind(), ConnectionAborted | ConnectionReset | ConnectionRefused)
+        && !pending_connection_error(error)
+}
+
+/// The errors Linux's `accept(2)` may return for the connection it is
+/// accepting rather than for the listener: the "pending" network errors of the
+/// man page.
+///
+/// **`EPERM` is not one of them**, though a firewall rule can return it for
+/// one connection: a security module or a seccomp policy that denies `accept`
+/// itself answers `EPERM` before the connection is dequeued, so it stays
+/// queued and every retry fails the same way. Treated as one client's error
+/// it would bring back the loop that spins on a core.
+#[cfg(target_os = "linux")]
+fn pending_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pending_connection_error(_: &io::Error) -> bool {
+    false
+}
+
+/// The first wait after a listener-level accept error.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(50);
+
+/// The longest wait between attempts, so a listener that has been failing
+/// for a while notices descriptors coming back within a second.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// The least time between two `WARN`s about accept errors. Every error is
+/// counted; only the log is thinned, because a node out of descriptors fails
+/// about once per back-off for as long as it stays out.
+const ACCEPT_WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// What the accept loop has seen of consecutive listener-level errors: how
+/// long to wait after the next one, and when it last said so.
+///
+/// A failed `accept` on `EMFILE` leaves the connection in the kernel's queue,
+/// so the listener stays readable and the next `accept` fails at once: with
+/// no wait the loop spins on a core, and the spin delays the work that would
+/// release the descriptors.
+struct AcceptBackoff {
+    next: Duration,
+    errors: u64,
+    last_warned: Option<Instant>,
+    /// A `WARN` has been printed and its recovery not yet said.
+    warned_since_recovery: bool,
+}
+
+impl AcceptBackoff {
+    fn new() -> Self {
+        Self {
+            next: ACCEPT_BACKOFF_MIN,
+            errors: 0,
+            last_warned: None,
+            warned_since_recovery: false,
+        }
+    }
+
+    /// The wait to take after this error, doubling up to the cap.
+    fn failed(&mut self) -> Duration {
+        let wait = self.next;
+        self.next = (self.next * 2).min(ACCEPT_BACKOFF_MAX);
+        self.errors += 1;
+        wait
+    }
+
+    /// Whether this error is due a `WARN`, given the time it happened.
+    fn should_warn(&mut self, now: Instant) -> bool {
+        let due = self.last_warned.is_none_or(|at| now.duration_since(at) >= ACCEPT_WARN_EVERY);
+        if due {
+            self.last_warned = Some(now);
+            self.warned_since_recovery = true;
+        }
+        due
+    }
+
+    /// Whether a recovery is due its line: one is, once, after a `WARN`. That
+    /// is bounded by the `WARN`'s own timer, so a listener that flaps at its
+    /// limit says "accepting again" as often as it says it cannot, and a short
+    /// episode that did warn is not left without its ending.
+    fn recovery_is_due(&mut self) -> bool {
+        std::mem::take(&mut self.warned_since_recovery)
+    }
+
+    /// An accept succeeded: the errors so far, and the wait starts over.
+    ///
+    /// `last_warned` is kept: a node at its descriptor limit alternates one
+    /// accepted connection with a run of errors, and forgetting the last line
+    /// here would log again for every one of them.
+    fn recovered(&mut self) -> u64 {
+        let errors = std::mem::take(&mut self.errors);
+        self.next = ACCEPT_BACKOFF_MIN;
+        errors
+    }
+}
+
+/// Accept until one connection arrives, waiting out the listener's own
+/// errors with a bounded, doubling back-off and counting each.
+///
+/// An error that is one client's connection going away before it was
+/// accepted is neither waited on nor counted (see
+/// [`accept_error_is_the_listeners`]); it is the next connection's turn.
+/// `accept` is a closure so a test can put errors in front of a real
+/// listener.
+async fn accept_with_backoff<T, F, Fut>(
+    mut accept: F,
+    backoff: &mut AcceptBackoff,
+    on_error: Option<&AcceptErrorHook>,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    loop {
+        let error = match accept().await {
+            Ok(accepted) => {
+                let errors = backoff.recovered();
+                if errors > 0 && backoff.recovery_is_due() {
+                    info!(errors, "cluster listener is accepting again");
+                }
+                return accepted;
+            }
+            Err(error) => error,
+        };
+        if !accept_error_is_the_listeners(&error) {
+            debug!(%error, "a peer connection failed before it was accepted");
+            continue;
+        }
+        if let Some(hook) = on_error {
+            hook(AcceptListener::Cluster);
+        }
+        let wait = backoff.failed();
+        if backoff.should_warn(Instant::now()) {
+            warn!(
+                %error,
+                errno = error.raw_os_error(),
+                errors = backoff.errors,
+                retry_in_ms = wait.as_millis() as u64,
+                "cluster listener failed to accept; peers cannot connect until this clears, \
+                 and the listener keeps trying"
+            );
+        }
+        tokio::time::sleep(wait).await;
+    }
+}
+
 /// Why this node failed to serve a peer's replication connection: a fixed
 /// set, so the series is always all of them.
 ///
@@ -233,7 +435,7 @@ impl ServeBudgets {
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
     let tls =
         Arc::new(crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"));
-    serve_with(engine, listener, secret, None, None, tls).await
+    serve_with(engine, listener, secret, None, None, None, tls).await
 }
 
 /// [`serve`], reporting each pushed batch's outcome to `on_pushed`.
@@ -258,19 +460,16 @@ pub async fn serve_with(
     secret: String,
     on_pushed: Option<PushHook>,
     on_failed: Option<ServeFailHook>,
+    on_accept_error: Option<AcceptErrorHook>,
     tls: Arc<crate::tls::ClusterTls>,
 ) {
     let local = listener.local_addr().ok();
     info!(bind = ?local, "serving cluster replication over TLS");
 
+    let mut backoff = AcceptBackoff::new();
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                warn!(error = %e, "cluster listener failed to accept");
-                continue;
-            }
-        };
+        let (stream, peer) =
+            accept_with_backoff(|| listener.accept(), &mut backoff, on_accept_error.as_ref()).await;
 
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
@@ -3046,6 +3245,292 @@ pub(crate) mod test_serving {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn emfile() -> io::Error {
+        io::Error::from_raw_os_error(24)
+    }
+
+    fn counting_hook() -> (AcceptErrorHook, Arc<std::sync::atomic::AtomicU64>) {
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let hook: AcceptErrorHook = Arc::new({
+            let seen = Arc::clone(&seen);
+            move |listener| {
+                assert_eq!(listener, AcceptListener::Cluster);
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        (hook, seen)
+    }
+
+    /// A listener out of descriptors fails every accept at once, so a loop
+    /// that does not wait spins. The clock is paused, so a wait costs no real
+    /// time and the elapsed virtual time is exactly what the loop slept: a
+    /// loop with no back-off reads zero here, however many errors it takes.
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_are_waited_out_and_counted_then_accepting_resumes() {
+        let (hook, counted) = counting_hook();
+        let mut backoff = AcceptBackoff::new();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let started = Instant::now();
+        let got = accept_with_backoff(
+            || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move { if n < 8 { Err(emfile()) } else { Ok(n) } }
+            },
+            &mut backoff,
+            Some(&hook),
+        )
+        .await;
+        assert_eq!(got, 8, "the accept after the errors is the one returned");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 9);
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 8);
+        // 50 + 100 + 200 + 400 + 800, then the cap for the other three.
+        assert_eq!(started.elapsed(), Duration::from_millis(1550 + 3 * 1000));
+        // Recovered: the next episode starts again from the shortest wait.
+        assert_eq!(backoff.errors, 0);
+        assert_eq!(backoff.failed(), ACCEPT_BACKOFF_MIN);
+    }
+
+    /// A client whose connection went away before it was accepted is not the
+    /// listener failing: no wait, and not counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_lost_before_accept_is_neither_waited_on_nor_counted() {
+        let (hook, counted) = counting_hook();
+        let mut backoff = AcceptBackoff::new();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let started = Instant::now();
+        let got = accept_with_backoff(
+            || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    match n {
+                        0 => Err(io::ErrorKind::ConnectionAborted.into()),
+                        1 => Err(io::ErrorKind::ConnectionReset.into()),
+                        _ => Ok(n),
+                    }
+                }
+            },
+            &mut backoff,
+            Some(&hook),
+        )
+        .await;
+        assert_eq!(got, 2);
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The `WARN` is thinned to one per [`ACCEPT_WARN_EVERY`] while the
+    /// errors go on, and starts over after a recovery.
+    #[tokio::test(start_paused = true)]
+    async fn the_accept_warning_is_rate_limited() {
+        let mut backoff = AcceptBackoff::new();
+        assert!(backoff.should_warn(Instant::now()));
+        tokio::time::advance(ACCEPT_WARN_EVERY - Duration::from_millis(1)).await;
+        assert!(!backoff.should_warn(Instant::now()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(backoff.should_warn(Instant::now()));
+        // A recovery does not forget it: an episode that follows a run of
+        // successes is still inside the interval, and stays quiet.
+        backoff.recovered();
+        assert!(!backoff.should_warn(Instant::now()));
+        tokio::time::advance(ACCEPT_WARN_EVERY).await;
+        assert!(backoff.should_warn(Instant::now()));
+    }
+
+    /// Every event a test's subscriber saw at `WARN` or `INFO`: its level, its
+    /// message, and the `errno` it carried, if any.
+    type Line = (tracing::Level, String, Option<i64>);
+
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<Line>>>);
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct Fields {
+                message: String,
+                errno: Option<i64>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                    if field.name() == "errno" {
+                        self.errno = Some(value);
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+            }
+            let level = *event.metadata().level();
+            if level > tracing::Level::INFO {
+                return;
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push((level, fields.message, fields.errno));
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    /// Run `errors` accept errors and then one success that takes `hold_last`
+    /// to arrive, and return what was logged.
+    async fn logged_for(errors: u32, hold_last: Duration) -> Vec<Line> {
+        let lines = Lines::default();
+        let seen = Arc::clone(&lines.0);
+        let _recording = tracing::subscriber::set_default(lines);
+        let mut backoff = AcceptBackoff::new();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        accept_with_backoff(
+            || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    if n < errors {
+                        Err(emfile())
+                    } else {
+                        tokio::time::sleep(hold_last).await;
+                        Ok(n)
+                    }
+                }
+            },
+            &mut backoff,
+            None,
+        )
+        .await;
+        seen.lock().unwrap().clone()
+    }
+
+    /// The `WARN` exists, names the OS error number as an integer, and is one
+    /// line for a run of errors inside the interval, not one per error.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_of_accept_errors_logs_one_warn_carrying_the_errno() {
+        let lines = logged_for(8, Duration::ZERO).await;
+        let warns: Vec<_> = lines.iter().filter(|l| l.0 == tracing::Level::WARN).collect();
+        assert_eq!(warns.len(), 1, "one WARN for eight errors in 4.55 s: {lines:?}");
+        assert_eq!(warns[0].2, Some(24), "the errno, as an integer: {lines:?}");
+        assert!(warns[0].1.contains("failed to accept"), "{lines:?}");
+        // The episode warned, so its ending is said, once, even though it was short.
+        let infos = lines.iter().filter(|l| l.0 == tracing::Level::INFO).count();
+        assert_eq!(infos, 1, "{lines:?}");
+    }
+
+    /// A listener at its limit alternates an accepted connection with an
+    /// error, over and over. Each ending is not a line: the `WARN` is one per
+    /// interval, and a recovery follows only a `WARN`.
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_flapping_at_its_limit_logs_one_warn_and_one_recovery() {
+        let lines = Lines::default();
+        let seen = Arc::clone(&lines.0);
+        let _recording = tracing::subscriber::set_default(lines);
+        let mut backoff = AcceptBackoff::new();
+        for _ in 0..25 {
+            let failed = std::sync::atomic::AtomicBool::new(false);
+            accept_with_backoff(
+                || {
+                    let first = !failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+                    async move { if first { Err(emfile()) } else { Ok(()) } }
+                },
+                &mut backoff,
+                None,
+            )
+            .await;
+        }
+        let lines = seen.lock().unwrap().clone();
+        let count = |level| lines.iter().filter(|l| l.0 == level).count();
+        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (1, 1), "{lines:?}");
+    }
+
+    /// Past the interval the `WARN` says so again, and a recovery after that
+    /// long an episode says so once.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_episode_warns_again_and_its_recovery_is_logged_once() {
+        // The interval and a little more spent in one accept that never
+        // returns an error, then a recovery: one WARN, then one INFO.
+        let lines = logged_for(1, ACCEPT_WARN_EVERY + Duration::from_secs(1)).await;
+        let count = |level| lines.iter().filter(|l| l.0 == level).count();
+        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (1, 1), "{lines:?}");
+        // Sixteen errors last past an interval: a second WARN, and one
+        // recovery after it, not one per WARN's worth of errors.
+        let lines = logged_for(16, Duration::ZERO).await;
+        let count = |level| lines.iter().filter(|l| l.0 == level).count();
+        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (2, 1), "{lines:?}");
+    }
+
+    /// The connections `accept(2)` reports a pending network error for, and
+    /// the ones the kernel aborted, belong to one client. Anything else,
+    /// including an errno this build has never heard of, is the listener's.
+    #[test]
+    fn a_connection_the_kernel_had_already_failed_is_not_the_listeners_error() {
+        use io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+        for kind in [ConnectionAborted, ConnectionReset, ConnectionRefused] {
+            assert!(!accept_error_is_the_listeners(&io::Error::from(kind)), "{kind:?}");
+        }
+        #[cfg(target_os = "linux")]
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+        ] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(!accept_error_is_the_listeners(&error), "errno {errno}: {error}");
+        }
+        // The listener's own, `EPERM` (a denied `accept` stays queued and fails
+        // again at once) and an errno nothing here has heard of included.
+        for errno in [24, 23, 12, 105, 1, 9999] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(accept_error_is_the_listeners(&error), "errno {errno}: {error}");
+        }
+    }
+
+    /// Recovery against a real listener: errors in front of it, then a peer
+    /// that connects is accepted and its address is the peer's.
+    #[tokio::test]
+    async fn the_listener_serves_a_peer_after_the_errors_clear() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hook, counted) = counting_hook();
+        let mut backoff = AcceptBackoff::new();
+        let failing = std::sync::atomic::AtomicU32::new(3);
+        let dial = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_stream, peer) = accept_with_backoff(
+            || {
+                let fail = failing
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok();
+                let listener = &listener;
+                async move { if fail { Err(emfile()) } else { listener.accept().await } }
+            },
+            &mut backoff,
+            Some(&hook),
+        )
+        .await;
+        let dialled = dial.await.unwrap();
+        assert_eq!(peer, dialled.local_addr().unwrap());
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
 
     /// The truth table `is_unreachable_from_a_correct_sender` decides. Only
     /// one of the four cells is the error; the other three are all ordinary

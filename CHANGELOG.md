@@ -10,6 +10,23 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+**The replication listener no longer spins on an accept error.** When the
+process ran out of file descriptors (`EMFILE`, `ENFILE`) or memory, the
+replication listener's `accept` failed again at once, because the pending
+connection stayed queued, so the loop ran a core at 100% and delayed the work
+that would have freed the descriptors. It now waits after each such error,
+50 ms at first and doubling to at most one second, and starts over once an
+accept succeeds. It logs a `WARN` that names the OS error number, at most once
+every ten seconds while the errors continue. A peer whose connection went away
+before it was accepted is not the listener's error, so it is neither waited on
+nor counted. The new `kimmy_accept_errors_total{listener}` counts the
+listener's own accept errors on both the `cluster` and the `http` listener;
+both rising together is descriptor exhaustion for the whole process
+([docs/operations.md](docs/operations.md)). The HTTP listener already waited
+50 ms and logged at `ERROR`, and does both as before.
+
 ## 0.42.0 - 2026-09-29
 
 **Roll the members one at a time. This release is not a rollback boundary:

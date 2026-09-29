@@ -780,6 +780,22 @@ impl TelemetryGuard {
             "Sync contacts ended by a pull that failed.",
             |s| s.sync_pulls.contacts[ContactEnd::Failed.slot()]
         );
+        // Accept errors that were a listener's own, one instrument per
+        // listener as the responses are per class.
+        observe!(
+            u64_observable_counter,
+            "kimmy.accept.errors.cluster",
+            "{error}",
+            "Accept errors on the replication listener that were its own: out of file descriptors, buffers or memory.",
+            |s| s.accept_errors[kimmy_cluster::AcceptListener::Cluster.slot()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.accept.errors.http",
+            "{error}",
+            "Accept errors on the client-facing HTTP listener that were its own: out of file descriptors, buffers or memory.",
+            |s| s.accept_errors[kimmy_cluster::AcceptListener::Http.slot()]
+        );
         // What serving peers' windows cost this node (ADR-176). The walk
         // histogram's buckets stay on `/metrics` (see `NOT_BRIDGED`); its sum
         // is here and its count is the windows served.

@@ -39,6 +39,7 @@ pub use peers::{
     RoundHook, RoundReport, replicate,
 };
 pub use transport::{
-    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
-    Repair, ServeFailHook, ServeFailure, serve, serve_with, sync_once, sync_once_with,
+    AcceptErrorHook, AcceptListener, FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook,
+    REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair, ServeFailHook, ServeFailure,
+    accept_error_is_the_listeners, serve, serve_with, sync_once, sync_once_with,
 };

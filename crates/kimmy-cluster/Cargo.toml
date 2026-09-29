@@ -37,6 +37,11 @@ hickory-resolver.workspace = true
 # foca requires rand 0.10; the workspace default is 0.9, which kimmy-auth uses.
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 
+# The errno names `accept(2)` reports for a connection that failed before it
+# was accepted (`transport::accept_error_is_the_listeners`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 kimmy-storage = { workspace = true, features = ["test-hooks"] }
 proptest.workspace = true

@@ -329,6 +329,9 @@ pub struct MetricsSnapshot {
     /// Peer connections this node failed to serve, by reason, in
     /// `ServeFailure::ALL` order.
     pub sync_serve_failures: [u64; kimmy_cluster::ServeFailure::COUNT],
+    /// Accept errors that were a listener's own, by listener, in
+    /// `AcceptListener::ALL` order.
+    pub accept_errors: [u64; kimmy_cluster::AcceptListener::COUNT],
     /// Schema changes a snapshot restore re-logged so that this node can
     /// serve them onward (ADR-180). One of the engine's readings.
     pub sync_ddl_relogged: u64,
@@ -449,6 +452,7 @@ pub struct Metrics {
     ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
     ddl_confirm_pushes: AtomicU64,
     sync_serve_failures: [AtomicU64; kimmy_cluster::ServeFailure::COUNT],
+    accept_errors: [AtomicU64; kimmy_cluster::AcceptListener::COUNT],
     sync_divergent_collections: AtomicU64,
     /// The gauge above says how many collections disagree; these two say
     /// whether anything looked (ADR-135). Counters, unlike the gauge beside
@@ -566,6 +570,7 @@ impl Default for Metrics {
             ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
             ddl_confirm_pushes: AtomicU64::new(0),
             sync_serve_failures: std::array::from_fn(|_| AtomicU64::new(0)),
+            accept_errors: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_divergent_collections: AtomicU64::new(0),
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
@@ -870,6 +875,12 @@ impl Metrics {
         self.sync_serve_failures[reason.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One accept error that was `listener`'s own: out of descriptors or
+    /// memory, not one client's connection going away first.
+    pub fn record_accept_error(&self, listener: kimmy_cluster::AcceptListener) {
+        self.accept_errors[listener.slot()].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One window pushed to confirm schema changes (ADR-191).
     pub fn record_ddl_confirm_push(&self) {
         self.ddl_confirm_pushes.fetch_add(1, Ordering::Relaxed);
@@ -1139,6 +1150,7 @@ impl Metrics {
             sync_ddl_held_push: self.get(&self.sync_ddl_held_push),
             ddl_confirmations: std::array::from_fn(|slot| self.get(&self.ddl_confirmations[slot])),
             ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
+            accept_errors: std::array::from_fn(|slot| self.get(&self.accept_errors[slot])),
             sync_serve_failures: std::array::from_fn(|slot| {
                 self.get(&self.sync_serve_failures[slot])
             }),
@@ -1257,6 +1269,16 @@ impl Metrics {
                     "kimmy_sync_serve_failures_total{{reason=\"{}\"}} {}\n",
                     reason.label(),
                     self.get(&self.sync_serve_failures[reason.slot()])
+                )
+            })
+            .collect::<String>();
+        let accept_errors = kimmy_cluster::AcceptListener::ALL
+            .iter()
+            .map(|listener| {
+                format!(
+                    "kimmy_accept_errors_total{{listener=\"{}\"}} {}\n",
+                    listener.label(),
+                    self.get(&self.accept_errors[listener.slot()])
                 )
             })
             .collect::<String>();
@@ -1465,6 +1487,9 @@ impl Metrics {
              # HELP kimmy_sync_serve_failures_total Replication connections a peer opened to this node that ended in an error on this side, by reason. io: reading or writing the connection failed mid-exchange. It is a lower bound for peers that gave up waiting: a peer that closes cleanly after this node answered is seen as an ordinary close, so the pushing side's kimmy_ddl_confirmations_total{{outcome=\"failed\"}} and {{outcome=\"timeout\"}} are the reliable signal for abandoned pushes. timeout: the handshake ran out of time. malformed: a frame this node could not read or would not accept. local: this node's own storage failed answering the peer, a read to serve it or a write applying a window it pushed; a pushed entry this node cannot decode is malformed. unauthenticated: the peer failed the shared-secret proof, or hung up on reading this node's - a member with a different cluster_secret, or one shutting down or giving up mid-handshake, so a burst during a rolling restart is expected. fault: the peer reported a fault of its own; binding: the TLS session gave no channel binding. A kimmyd member produces neither once its handshake completes. A clean close between requests is not counted, and neither is a TLS handshake that never completes, which anything that can reach the port can cause. Each is also logged at WARN, naming the peer.\n\
              # TYPE kimmy_sync_serve_failures_total counter\n\
              {sync_serve_failures}\
+             # HELP kimmy_accept_errors_total Accept errors that were a listener's own, by listener: the process or host is out of file descriptors, buffers or memory, so new connections are refused until it clears. A client whose connection went away before it was accepted is not counted. cluster: the replication listener; http: the client-facing listener. Both back off after an error, and both are logged, so a steady rise on both at once is descriptor exhaustion for the whole process.\n\
+             # TYPE kimmy_accept_errors_total counter\n\
+             {accept_errors}\
              # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.\n\
              # TYPE kimmy_ddl_confirmations_total counter\n\
              {ddl_confirmations}\
@@ -2101,6 +2126,12 @@ mod tests {
                 m.record_sync_serve_failure(reason);
             }
         }
+        // Likewise per listener: 150 for the first, 151 for the second.
+        for listener in kimmy_cluster::AcceptListener::ALL {
+            for _ in 0..(150 + listener.slot()) {
+                m.record_accept_error(listener);
+            }
+        }
         // A distinct count per outcome, so a line under the wrong label
         // cannot match: 120 for the first, one more for each after it.
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
@@ -2721,6 +2752,10 @@ kimmy_sync_serve_failures_total{reason=\"local\"} 143
 kimmy_sync_serve_failures_total{reason=\"unauthenticated\"} 144
 kimmy_sync_serve_failures_total{reason=\"fault\"} 145
 kimmy_sync_serve_failures_total{reason=\"binding\"} 146
+# HELP kimmy_accept_errors_total Accept errors that were a listener's own, by listener: the process or host is out of file descriptors, buffers or memory, so new connections are refused until it clears. A client whose connection went away before it was accepted is not counted. cluster: the replication listener; http: the client-facing listener. Both back off after an error, and both are logged, so a steady rise on both at once is descriptor exhaustion for the whole process.
+# TYPE kimmy_accept_errors_total counter
+kimmy_accept_errors_total{listener=\"cluster\"} 150
+kimmy_accept_errors_total{listener=\"http\"} 151
 # HELP kimmy_ddl_confirmations_total Schema-change confirmations on a member, one per member per index create or drop this node made (ADR-140), by how each ended (ADR-191). confirmed: the member took the change and did not refuse it. refused: it could not apply it, or declined a drop older than the index it holds. The rest are pending, and anti-entropy carries the change: timeout, the request's deadline passed first; failed, the push errored or timed out; unreached, the member is more than a batch behind or below the retention horizon; purging, it is still purging a drop of the name; stopped_unknown, its batch stopped earlier at a collection it lacks; other_member, a different node answered at the address; task_ended, the push task panicked or was aborted; backoff, the member did not answer the last push and is not pushed to for a while; unattributable, the member runs a version whose answer does not name changes; cancelled, the request went away before an answer, with its client.
 # TYPE kimmy_ddl_confirmations_total counter
 kimmy_ddl_confirmations_total{outcome=\"confirmed\"} 120
@@ -3120,6 +3155,13 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 s.sync_serve_failures[reason.slot()]
             ));
         }
+        for listener in kimmy_cluster::AcceptListener::ALL {
+            expect(&format!(
+                "kimmy_accept_errors_total{{listener=\"{}\"}} {}\n",
+                listener.label(),
+                s.accept_errors[listener.slot()]
+            ));
+        }
         for outcome in kimmy_cluster::ConfirmOutcome::ALL {
             expect(&format!(
                 "kimmy_ddl_confirmations_total{{outcome=\"{}\"}} {}\n",
@@ -3460,6 +3502,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 2
                 // Peer connections this node failed to serve, by reason.
                 + kimmy_cluster::ServeFailure::COUNT
+                // Accept errors a listener had, by listener.
+                + kimmy_cluster::AcceptListener::COUNT
                 // The oplog now, and the walk that last verified the version
                 // vector: entries, logical bytes and seconds (ADR-173's
                 // addendum of 2026-09-26).
