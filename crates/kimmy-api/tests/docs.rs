@@ -681,9 +681,16 @@ fn the_divergence_age_alert_is_written_drain_aware() {
         .take(40)
         .collect::<Vec<_>>()
         .join("\n");
-    for (place, text) in [("the metrics row", *row), ("the alerts section", alerts.as_str())] {
+    // The row's prose names the failure leg as a rise; the alerts section
+    // writes both legs as the PromQL `increase`. Prose that only mentions the
+    // series in passing ("look at `kimmy_sync_failures_total`") is not the leg.
+    let legs = [
+        ("the metrics row", *row, "kimmy_sync_failures_total` has"),
+        ("the alerts section", alerts.as_str(), "increase(kimmy_sync_failures_total"),
+    ];
+    for (place, text, failures) in legs {
         assert!(text.contains("kimmy_sync_contacts_total{ended=\"budget\"}"), "{place}: the drain");
-        assert!(text.contains("kimmy_sync_failures_total"), "{place}: the failure leg");
+        assert!(text.contains(failures), "{place}: the failure leg");
     }
     assert!(alerts.contains("increase(kimmy_sync_contacts_total{ended=\"budget\"}"), "the example");
 }
