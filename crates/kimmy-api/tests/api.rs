@@ -8494,6 +8494,12 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_serve_walk_path_total",
         kimmy_storage::ServeWalk::COUNT * kimmy_storage::WalkPath::COUNT,
     ))
+    .chain([
+        "kimmy_violations_table_ready",
+        "kimmy_violations_backfill_rows_total",
+        "kimmy_violations_walk_path_total",
+        "kimmy_violations_walk_path_total",
+    ])
     .collect();
 
     assert_eq!(series, expected, "the /metrics series set or its order changed:\n{body}");

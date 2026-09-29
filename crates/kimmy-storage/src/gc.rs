@@ -32,7 +32,7 @@
 //! streams already handle that (`ResumeTokenExpired`, surfaced as HTTP 410), so
 //! it is a contract, not a surprise.
 
-use kimmy_core::{CollectionId, Hlc};
+use kimmy_core::{CollectionId, Hlc, OpKind};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
 
@@ -116,8 +116,16 @@ impl Engine {
         // it as rows left behind (ADR-189). The pass asks the purger to look,
         // and keeps any tombstone with rows still under it, below.
         self.ask_for_owed_check();
+        let oplog_removed = self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?;
+        // The one place the violations table's `through` moves forward, when
+        // the table is ready, and only in a pass that removed entries: the
+        // rescan after a crash is bounded by what retention keeps, and a pass
+        // with nothing to collect commits nothing (ADR-200).
+        if oplog_removed > 0 {
+            self.advance_violations_through()?;
+        }
         let outcome = GcOutcome {
-            oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
+            oplog_removed,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
@@ -207,6 +215,7 @@ impl Engine {
             // the same transaction as the arrival index: a mark on an entry
             // that is gone is a row nothing will ever remove. ADR-160.
             let mut held = txn.open_table(tables::OPLOG_HELD)?;
+            let mut violations = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
             // Removing entries appends nothing, so the live counts' mark is
             // carried across the removal here (ADR-174). An emptied oplog or
             // index would otherwise leave it behind, and force a rebuild.
@@ -222,8 +231,21 @@ impl Engine {
                 // so the arrival index can never point at something that is
                 // gone. A stream reading it mid-collection sees either state,
                 // never a mixture.
-                if oplog.remove(key.as_slice())?.is_none() {
+                let Some(old) = oplog.remove(key.as_slice())? else {
                     continue;
+                };
+                // A violation entry's row goes with it, in this transaction:
+                // its header, from the value just removed, says whether it was
+                // one and whose (ADR-200).
+                if let Ok((OpKind::UniqueViolation, collection)) =
+                    codec::decode_oplog_kind_and_collection(old.value())
+                {
+                    drop(old);
+                    violations.remove(
+                        crate::violations_table::row_key(collection, key.as_slice()).as_slice(),
+                    )?;
+                } else {
+                    drop(old);
                 }
                 removed += 1;
                 if let Ok(stamp) = codec::decode_oplog_key(key) {
@@ -234,6 +256,26 @@ impl Engine {
                     arrival.remove(seq.value())?;
                 }
                 held.remove(key.as_slice())?;
+            }
+            // Self-healing: a violations row below the oldest entry the oplog
+            // still holds names nothing, whoever collected the entry (a build
+            // that does not know the table does not remove its rows), so it goes
+            // too. The table is one row per violation, so this reads a handful
+            // of keys and not the oplog (ADR-200).
+            if let Some((oldest, _)) = oplog.first()? {
+                let oldest = oldest.value().to_vec();
+                let mut stale: Vec<Vec<u8>> = Vec::new();
+                for row in violations.iter()? {
+                    let (row_key, _) = row?;
+                    if crate::violations_table::stamp_of(row_key.value())
+                        .is_some_and(|stamp| stamp < oldest.as_slice())
+                    {
+                        stale.push(row_key.value().to_vec());
+                    }
+                }
+                for row_key in stale {
+                    violations.remove(row_key.as_slice())?;
+                }
             }
             crate::live_count::carry_mark(
                 &txn,
@@ -877,7 +919,8 @@ mod tests {
         assert_eq!(oplog_len(&engine), 1);
         let commits = (engine.commits() - before) as usize;
         let chunks = (entries - 1).div_ceil(OPLOG_COLLECT_CHUNK);
-        assert_eq!(commits, chunks, "one commit per chunk of {OPLOG_COLLECT_CHUNK}");
+        // One more: the violations table's `through` follows the collection.
+        assert_eq!(commits, chunks + 1, "one commit per chunk of {OPLOG_COLLECT_CHUNK}");
     }
 
     /// A pass that collects nothing opens no write transaction at all: the

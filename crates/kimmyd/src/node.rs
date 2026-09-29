@@ -2556,6 +2556,34 @@ fn spawn_collector(
         // pass is the only schedule under which the writer is guaranteed a
         // full interval free between passes. It also means nothing collects
         // during start-up, while the node is still opening for business.
+        // Before the first pass: complete the unique-violations table if the
+        // open found it behind (ADR-200). Each step reads a bounded stretch of
+        // the oplog outside the writer and takes the writer only to record
+        // what it found, so it is not a retention pass and does not hold the
+        // writer for one. A stop ends it; an error is logged and leaves
+        // `/violations` on the oplog walk until the next start.
+        while !engine.violations_table_ready() {
+            let step = kimmy_storage::blocking(|| {
+                engine.violations_backfill_step(kimmy_storage::ExamineBudget::serve())
+            });
+            match step {
+                Ok(step) if step.done => {
+                    info!(
+                        rows = engine.violations_snapshot().backfilled_rows,
+                        "the unique-violations table is complete"
+                    );
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                    debug!(%reason, "the violations backfill ended: this node is shutting down");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "completing the unique-violations table failed; /violations walks the oplog until the next start");
+                    break;
+                }
+            }
+        }
         loop {
             tokio::time::sleep(interval).await;
             let started = std::time::Instant::now();

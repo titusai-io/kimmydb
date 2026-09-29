@@ -196,6 +196,8 @@ pub struct Engine {
     hold_counters: crate::hold_meter::HoldCounters,
     /// What serving peers' windows cost this node (ADR-176).
     serve_counters: crate::hold_meter::ServeCounters,
+    /// The unique-violations table's state in process (ADR-200).
+    violations: crate::violations_table::ViolationsState,
     /// Where the retention pass's tombstone scan resumes next pass
     /// (ADR-151): the last document key it visited, or `None` to start from
     /// the top. The scan visits a bounded number of documents per pass.
@@ -1194,6 +1196,9 @@ impl Engine {
             // Created with the others, so reading the record never meets a
             // missing table (`crate::verified`).
             let _ = txn.open_table(tables::VECTOR_VERIFIED)?;
+            // The violations table, with the others so a read never meets it
+            // missing (ADR-200).
+            let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
         }
         txn.commit()?;
 
@@ -1334,6 +1339,7 @@ impl Engine {
             writer_hold_sum_us: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             hold_counters: Default::default(),
             serve_counters: Default::default(),
+            violations: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),
             purges: Default::default(),
@@ -1357,6 +1363,12 @@ impl Engine {
         // them, so deleting them any earlier would defeat that.
         if !unreported.is_empty() {
             crate::migrate::forget_reported_violations(engine.db())?;
+        }
+
+        // Whether the violations table is complete: after the reports above, so
+        // the tail it is compared with includes them (ADR-200).
+        if Self::decide_violations_ready(engine.db())? {
+            engine.violations.set_ready();
         }
 
         Ok(engine)
@@ -1411,6 +1423,10 @@ impl Engine {
 
     pub(crate) fn serve_counters(&self) -> &crate::hold_meter::ServeCounters {
         &self.serve_counters
+    }
+
+    pub(crate) fn violations(&self) -> &crate::violations_table::ViolationsState {
+        &self.violations
     }
 
     /// How long each holder has held the writer, since start (ADR-159).
@@ -4549,6 +4565,38 @@ pub(crate) fn raise_version(
 }
 
 impl Engine {
+    /// Decide at open whether the table is complete: it is when `through` is at
+    /// the oplog's tail (or the oplog is empty). A `through` **above** the tail
+    /// can only be a rewind by a build that does not know the table, and the
+    /// table is untrusted: `through` is cleared, so the backfill starts from
+    /// zero. O(1) in the oplog: two edge reads.
+    pub(crate) fn decide_violations_ready(db: &redb::Database) -> Result<bool> {
+        let txn = db.begin_write()?;
+        let ready = {
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let mut table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            let tail = oplog.last()?.map(|(k, _)| k.value().to_vec());
+            match (tail, crate::violations_table::through_of(&table)?) {
+                (None, _) => true,
+                (Some(tail), Some(through)) if through.as_slice() == tail.as_slice() => true,
+                (Some(tail), Some(through)) if through.as_slice() > tail.as_slice() => {
+                    warn!(
+                        "the unique-violations table claims to be complete past the oplog's \
+                         tail, which only a rewind by a build that does not maintain it leaves; \
+                         it is rebuilt from the oplog in the background"
+                    );
+                    table.remove(crate::violations_table::SENTINEL)?;
+                    false
+                }
+                _ => false,
+            }
+        };
+        txn.commit()?;
+        Ok(ready)
+    }
+}
+
+impl Engine {
     /// The entry this node holds under `stamp`, if any.
     ///
     /// A point lookup, for a caller that minted an entry a moment ago and
@@ -4612,6 +4660,15 @@ pub(crate) fn append_oplog_at(
     let mut oplog = txn.open_table(tables::OPLOG)?;
     let existed =
         oplog.insert(key.as_slice(), codec::encode_oplog_entry(entry).as_slice())?.is_some();
+    // The one way a violation entry enters the oplog, and so the one place its
+    // row is written: in the entry's own transaction, idempotent for a
+    // re-appended one (ADR-200).
+    if entry.kind == OpKind::UniqueViolation {
+        txn.open_table(tables::UNIQUE_VIOLATIONS)?.insert(
+            crate::violations_table::row_key(entry.collection, key.as_slice()).as_slice(),
+            [].as_slice(),
+        )?;
+    }
 
     // Re-appending an entry we already hold must not give it a second arrival
     // position. Peers resend overlapping ranges routinely, and a duplicate

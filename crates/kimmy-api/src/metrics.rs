@@ -118,6 +118,8 @@ pub struct StorageReadings {
     pub writer_hold_decomposition: kimmy_storage::HoldDecomposition,
     /// What serving peers' windows has cost this node (ADR-176).
     pub serve: kimmy_storage::ServeSnapshot,
+    /// The unique-violations table's state (ADR-200).
+    pub violations: kimmy_storage::ViolationsSnapshot,
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
@@ -284,6 +286,8 @@ pub struct MetricsSnapshot {
     /// Counters only, so the whole of both is on the bridge.
     pub write_lock_hold: kimmy_storage::HoldDecomposition,
     pub sync_serve: kimmy_storage::ServeSnapshot,
+    /// The unique-violations table's state (ADR-200).
+    pub violations: kimmy_storage::ViolationsSnapshot,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -1114,6 +1118,7 @@ impl Metrics {
             write_lock_held_us: readings.writer_hold.sum_us,
             write_lock_hold: readings.writer_hold_decomposition,
             sync_serve: readings.serve,
+            violations: readings.violations,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -1672,6 +1677,7 @@ impl Metrics {
         self.render_backup_duration(&mut out);
         render_sync_pulls(&mut out, &pulls);
         render_sync_serve(&mut out, &readings.serve);
+        render_violations(&mut out, &readings.violations);
         out
     }
 
@@ -1926,6 +1932,31 @@ fn render_hold_decomposition(d: &kimmy_storage::HoldDecomposition) -> String {
         d.cpu_unmeasured
     );
     out
+}
+
+/// The unique-violations table (ADR-200): whether `/violations` reads it, what
+/// the background pass that completes it has read, and which way each call was
+/// answered.
+fn render_violations(out: &mut String, violations: &kimmy_storage::ViolationsSnapshot) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        out,
+        "# HELP kimmy_violations_table_ready 1 when the unique-violations table is complete through the oplog's tail and /violations reads it; 0 while it is being completed after an open that found it behind (an older build wrote in between, or it is new), when /violations walks the oplog instead.\n\
+         # TYPE kimmy_violations_table_ready gauge\n\
+         kimmy_violations_table_ready {}\n\
+         # HELP kimmy_violations_backfill_rows_total Oplog rows the background pass that completes the unique-violations table has read, since start.\n\
+         # TYPE kimmy_violations_backfill_rows_total counter\n\
+         kimmy_violations_backfill_rows_total {}\n\
+         # HELP kimmy_violations_walk_path_total /violations calls, by how they were answered: table, from the unique-violations table; oplog, by walking the retained oplog, which is what a call takes until the table is ready.\n\
+         # TYPE kimmy_violations_walk_path_total counter\n\
+         kimmy_violations_walk_path_total{{path=\"table\"}} {}\n\
+         kimmy_violations_walk_path_total{{path=\"oplog\"}} {}\n",
+        u8::from(violations.ready),
+        violations.backfilled_rows,
+        violations.calls_from_table,
+        violations.calls_from_oplog,
+    );
 }
 
 /// What serving peers' windows has cost this node (ADR-176).
@@ -2268,6 +2299,12 @@ mod tests {
                 walk_sum_us: 2_500_000,
                 read_ns: 3_300_000_000,
                 read_bytes: 1_204,
+            },
+            violations: kimmy_storage::ViolationsSnapshot {
+                ready: true,
+                backfilled_rows: 1_401,
+                calls_from_table: 1_402,
+                calls_from_oplog: 1_403,
             },
         }
     }
@@ -3027,6 +3064,16 @@ kimmy_sync_serve_walk_path_total{path=\"linear\",walk=\"push\"} 311
 kimmy_sync_serve_walk_path_total{path=\"fallback_length\",walk=\"push\"} 312
 kimmy_sync_serve_walk_path_total{path=\"fallback_missing_body\",walk=\"push\"} 313
 kimmy_sync_serve_walk_path_total{path=\"fallback_error\",walk=\"push\"} 314
+# HELP kimmy_violations_table_ready 1 when the unique-violations table is complete through the oplog's tail and /violations reads it; 0 while it is being completed after an open that found it behind (an older build wrote in between, or it is new), when /violations walks the oplog instead.
+# TYPE kimmy_violations_table_ready gauge
+kimmy_violations_table_ready 1
+# HELP kimmy_violations_backfill_rows_total Oplog rows the background pass that completes the unique-violations table has read, since start.
+# TYPE kimmy_violations_backfill_rows_total counter
+kimmy_violations_backfill_rows_total 1401
+# HELP kimmy_violations_walk_path_total /violations calls, by how they were answered: table, from the unique-violations table; oplog, by walking the retained oplog, which is what a call takes until the table is ready.
+# TYPE kimmy_violations_walk_path_total counter
+kimmy_violations_walk_path_total{path=\"table\"} 1402
+kimmy_violations_walk_path_total{path=\"oplog\"} 1403
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -3352,6 +3399,16 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 ));
             }
         }
+        expect(&format!("kimmy_violations_table_ready {}\n", u8::from(s.violations.ready)));
+        expect(&format!("kimmy_violations_backfill_rows_total {}\n", s.violations.backfilled_rows));
+        expect(&format!(
+            "kimmy_violations_walk_path_total{{path=\"table\"}} {}\n",
+            s.violations.calls_from_table
+        ));
+        expect(&format!(
+            "kimmy_violations_walk_path_total{{path=\"oplog\"}} {}\n",
+            s.violations.calls_from_oplog
+        ));
 
         expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
         expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
@@ -3558,6 +3615,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // Windows served, by kind of request and by the path that
                 // read them (ADR-197).
                 + kimmy_storage::ServeWalk::COUNT * kimmy_storage::WalkPath::COUNT
+                // The unique-violations table: ready, backfill rows, and the
+                // two ways a call is answered (ADR-200).
+                + 4
                 + 1,
             "expected one sample per series: {out}"
         );

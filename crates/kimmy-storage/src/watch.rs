@@ -968,6 +968,12 @@ impl ExamineBudget {
     fn spent(&self, examined: u64, elapsed: std::time::Duration) -> bool {
         examined >= self.rows || elapsed >= self.time
     }
+
+    /// [`Self::spent`], for another walk that budgets the way a served one does
+    /// (the violations table's backfill, ADR-200).
+    pub(crate) fn spent_after(&self, examined: u64, elapsed: std::time::Duration) -> bool {
+        self.spent(examined, elapsed)
+    }
 }
 
 /// `KIMMY_TEST_SERVE_WALK_ROWS`: [`ExamineBudget::serve`]'s rows, 0 for the

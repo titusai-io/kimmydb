@@ -27,6 +27,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   [docs/operations.md](docs/operations.md)). A nonzero fallback is a bug or
   damage, and is logged. `KIMMY_TEST_SERVE_WALK_PATH=linear`
   is a test switch that reads every window the old way.
+- **`kimmy_violations_table_ready`, `kimmy_violations_backfill_rows_total` and
+  `kimmy_violations_walk_path_total{path}`** say whether `GET …/violations`
+  reads its own table and which way each call was answered
+  ([docs/operations.md](docs/operations.md)).
 
 ### Changed
 
@@ -89,6 +93,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   whose open, or schema 4 migration, took longer, and a migration whose longest index
   outlasted the allowance never finished. The port is now bound first
   ([ADR-198](docs/decisions.md)).
+- **`GET …/violations` reads a table of its own records and not the retained
+  oplog.** It found a collection's violations by reading the header of every
+  retained oplog entry, which reads every page of the oplog through the page
+  cache on every call. A table keyed by collection and stamp now holds one empty
+  row per violation entry, kept with the entry (written with it, removed with
+  it by retention and a rewind), and the route reads only those. A store that
+  lacks it, or that a build that does not know it wrote to, completes it in the
+  background from the oplog, a bounded stretch at a time outside the writer;
+  until then calls walk the oplog as before. An older build reads the same
+  store, so a rollback is safe ([ADR-200](docs/decisions.md)).
 - **The replication listener no longer spins on an accept error.** When the
   process ran out of file descriptors (`EMFILE`, `ENFILE`) or memory, the
   replication listener's `accept` failed again at once, because the pending

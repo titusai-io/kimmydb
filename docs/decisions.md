@@ -21522,3 +21522,92 @@ one-worker runtime over 200 expired documents, with each walked row slowed to
 5 ms. A spawned task measures how late a 10 ms timer fires while the pass runs.
 With the wrap, the worst was about 2.5 ms over a pass of about 2.5 s. With the
 wrap removed, the test failed at 1.23 s late.
+
+## ADR-200 — `GET …/violations` reads a table of its own records, not the retained oplog
+
+**Status:** accepted, 0.43.0.
+
+**The defect.** A unique violation is recorded as an oplog entry
+(`UniqueViolation`), written by the member that merged the collision and never
+shipped, and `GET …/violations` found them by walking the retained oplog and
+reading each header. A value lives in the leaf page of its key, so reading a
+header reads the page: the route paid for the whole oplog, through redb's page
+cache, on every call, to find the handful of records in it. On a member with a
+large retained oplog that is seconds of reads and a page cache emptied of what
+the workload wanted, for an answer that is usually empty.
+
+**Decision.**
+
+- **A table, `UNIQUE_VIOLATIONS`, keyed by `collection id (8 bytes) || stamp
+  key (26)` with an empty value**: one row per retained violation entry, no
+  body, so it cannot disagree with the entry about what the violation says. The
+  route reads the collection's rows in key order, point-reads each entry,
+  checks the header (kind and collection) **before** decoding anything, and
+  skips a row whose entry is gone or is not this collection's violation. What
+  it reports is then judged as before: `live_unique_violations` re-evaluates
+  each record against the documents as they are now (ADR-087), unchanged.
+- **One way in.** `append_oplog_at` inserts the row when the entry is a
+  `UniqueViolation`, in the entry's own transaction, so a re-appended entry is
+  idempotent. Retention removes the row with the entry (the header of the
+  removed value says whose it was) and also trims rows below the oldest entry
+  the oplog still holds, so a row left by a build that does not remove it goes
+  at the next pass. A rewind removes the rows of the entries it discards.
+- **A sentinel row, key `[0x00]`, holds `through`, a stamp key: every violation
+  entry at or below it is in the table.** It lives in the table it describes,
+  so a backup, which copies only the tables `verified.rs` lists, cannot carry
+  one without the other (the table is in that list).
+- **Completeness is recovered from the store, so there is no version marker and
+  no rollback boundary.** At open the table is *ready* when `through` is at the
+  oplog's tail (or the oplog is empty). Otherwise (a store from before the
+  table, or one a build that does not know it wrote to) a background pass scans
+  the oplog from `through`, and `/violations` walks the oplog until it is done.
+  A `through` **above** the tail can only be a rewind by a build that does not
+  know the table, and is cleared, so the pass starts from zero.
+- **The backfill is bounded and never holds the writer for its scan.** Each
+  step reads a stretch of the oplog in a read transaction, header only, under
+  the serve budget (ADR-194: 2 s, 65,536 rows), with the stop honoured per row
+  (`Background` scope). It then takes the writer, as a retention hold, only to
+  point-read the violation keys it found (one collected meanwhile is skipped),
+  insert their rows, and advance `through` to the last stamp scanned or the
+  tail if that is lower. It runs in the retention collector's task before its
+  first pass, so no task and no writer label is added.
+- **`through` advances in retention only**, and only when the table is ready
+  and the pass removed entries: not at a clean close, where a rescan after a
+  crash is bounded by what retention keeps and a close gains no write.
+- **Three series:** `kimmy_violations_table_ready`,
+  `kimmy_violations_backfill_rows_total` and
+  `kimmy_violations_walk_path_total{path="table"|"oplog"}`.
+
+**Measured.** A counting allocator over an oplog of 64 and 256 documents of
+32 KiB with no violations: the route allocates under one document's worth at
+both sizes and does not grow with the oplog; with 50 violations spread across
+an oplog of 200 and of 800 documents it allocates the same at both, and a
+body read per record, not per entry.
+
+**Rejected.**
+
+- *An index by collection inside the oplog's own key:* changes the oplog's
+  key, which every walk and every peer's stamp order depends on.
+- *A version marker with a full rebuild on upgrade:* a rollback boundary and a
+  long open. The store already says what it holds; the tail is the marker.
+- *Advancing `through` at close:* a write on the stop path for a saving
+  measured in seconds after a crash only.
+- *A supervised task of its own:* a new label on every per-task series for a
+  pass that runs once.
+
+### Test
+
+Structural drift, after every step: the table's rows are exactly the
+`(collection, stamp)` pairs of violation entries the oplog holds, none is
+missing at or below `through`, and `through` is not past the tail; through
+writes, a rewind across violations, a dropped collection, retention removing
+violations from the middle of the range, a backfill in steps of a few rows
+(ready only after the last), a backfill that stopped and resumed after a
+restart, writes and retention between steps, a rewind between a step's read
+and its write, and a `through` past the tail. The table's answer equals the
+oplog walk's in each. A row whose entry is gone, and one whose entry is
+another kind, report nothing. Each guard was broken and its test failed: the
+insert, the rewind's removal and its lowering of `through`, the clearing of a
+`through` past the tail, the header check, retention's removal (row and trim
+together), `through` advanced while not ready, and `through` past the tail in
+a step's write.
