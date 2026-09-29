@@ -2442,6 +2442,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-storage",
  "kimmy-task",
+ "libc",
  "parking_lot",
  "postcard",
  "proptest",

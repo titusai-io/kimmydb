@@ -1792,7 +1792,7 @@ impl Accepting {
         // that client's, not the listener's: at debug, as `axum::serve`
         // skipped it, so a port scan or a health check's churn raises no
         // alarm.
-        if !accept_error_is_the_listeners(error.kind()) {
+        if !accept_error_is_the_listeners(error) {
             debug!(%error, "a connection failed before it was accepted");
             return;
         }
@@ -3013,11 +3013,11 @@ mod tests {
         for kind in
             [ErrorKind::ConnectionAborted, ErrorKind::ConnectionReset, ErrorKind::ConnectionRefused]
         {
-            assert!(!accept_error_is_the_listeners(kind), "{kind:?}");
+            assert!(!accept_error_is_the_listeners(&std::io::Error::from(kind)), "{kind:?}");
         }
         let out_of_descriptors = std::io::Error::from_raw_os_error(24).kind();
         for kind in [out_of_descriptors, ErrorKind::OutOfMemory, ErrorKind::Other] {
-            assert!(accept_error_is_the_listeners(kind), "{kind:?}");
+            assert!(accept_error_is_the_listeners(&std::io::Error::from(kind)), "{kind:?}");
         }
     }
 
