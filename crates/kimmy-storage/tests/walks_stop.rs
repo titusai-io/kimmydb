@@ -234,6 +234,10 @@ const WRITES: &[&str] = &[
     "drop_index_stamped",
     "configure_vectors",
     "disable_vectors",
+    // A filter's match, run inside the write transaction that commits it:
+    // with no usable index, the whole collection (`modify::scan_until`).
+    "modify_where",
+    "find_and_modify",
 ];
 
 /// Public walks that iterate no table themselves, and the function each
@@ -245,6 +249,25 @@ const DELEGATES: &[(&str, &str)] = &[
     ("docs::Engine::count", "Engine::for_each_doc"),
     ("index::Engine::visit_index_candidates", "Walk::in_index_order"),
     ("index::Engine::create_index_with", "Engine::create_index_inner"),
+    // An index's unkeyed and undecidable runs.
+    ("index::Engine::unkeyed_count", "holders_of"),
+    ("index::Engine::undecidable_count", "holders_of"),
+    // A shadow collection's vectors, decoded from its documents.
+    ("vectors::Engine::for_each_vector", "Engine::for_each_doc"),
+    // The oplog window a peer is served, in each of its forms. The last one
+    // reads by the arrival index's keys or linearly, both stop-aware; the
+    // linear walk is named because every window can end up in it.
+    ("sync::Engine::entries_for_peer", "Engine::entries_for_peer_holding"),
+    ("sync::Engine::entries_for_peer_holding", "Engine::entries_for_peer_marked"),
+    ("sync::Engine::entries_for_peer_marked", "Engine::entries_for_peer_counting"),
+    ("sync::Engine::entries_for_peer_within", "Engine::entries_for_peer_counting"),
+    ("sync::Engine::entries_for_peer_refit", "Engine::entries_for_peer_counting"),
+    ("sync::Engine::entries_for_peer_counting", "Engine::read_oplog_linear_in"),
+    // The oplog read from a position, in each of its forms.
+    ("watch::Engine::read_oplog_from", "Engine::read_oplog_from_where"),
+    ("watch::Engine::read_oplog_from_where", "Engine::read_oplog_from_skipping"),
+    ("watch::Engine::read_oplog_from_skipping", "Engine::read_oplog_budgeted"),
+    ("watch::Engine::read_oplog_budgeted", "Engine::read_oplog_linear_in"),
 ];
 
 /// Functions that open a table with `WalkStop::in_write()`, whose walks do
@@ -857,12 +880,33 @@ fn the_walks_the_api_counts_are_stop_aware_or_writes() {
     let body = std::fs::read_to_string(guard).unwrap();
     let start = body.find("const WALKS").expect("the API guard's WALKS");
     let end = start + body[start..].find("];").unwrap();
-    let names: Vec<&str> = body[start..end]
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("\".")?.split('(').next())
-        .collect();
-    assert!(names.len() > 10, "read the API guard's walks: {names:?}");
     let all = storage_functions();
+    // An entry is `".name(`, one function, or `".name"` with no bracket, a
+    // prefix naming every storage function that begins with it: a family
+    // such as `entries_for_peer_*` is counted as one, and each member of it
+    // is held to the rule here.
+    let mut names: Vec<String> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for entry in body[start..end].lines().filter_map(|l| l.trim().strip_prefix("\".")) {
+        let entry = entry.split('"').next().unwrap();
+        match entry.split_once('(') {
+            Some((name, _)) => names.push(name.to_string()),
+            None => {
+                let mut family: Vec<String> = all
+                    .iter()
+                    .map(|(_, f)| f.name.rsplit("::").next().unwrap().to_string())
+                    .filter(|n| n.starts_with(entry))
+                    .collect();
+                family.sort();
+                family.dedup();
+                if family.is_empty() {
+                    problems.push(format!("{entry}: the prefix names no storage function"));
+                }
+                names.extend(family);
+            }
+        }
+    }
+    assert!(names.len() > 10, "read the API guard's walks: {names:?}");
     let body_of = |key: &str| {
         all.iter()
             .find(|(file, f)| format!("{file}::{}", f.name) == key)
@@ -900,8 +944,9 @@ fn the_walks_the_api_counts_are_stop_aware_or_writes() {
     };
     let missing: Vec<String> = names
         .iter()
-        .filter(|n| !WRITES.contains(n))
+        .filter(|n| !WRITES.contains(&n.as_str()))
         .filter_map(|n| stop_aware_by(n).err())
+        .chain(problems)
         .collect();
     assert!(
         missing.is_empty(),
