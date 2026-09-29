@@ -1980,40 +1980,58 @@ impl Engine {
     /// relayed from a peer arrives after higher-stamped local ones, so a
     /// renumbering in stamp order would move it below a token that had already
     /// passed it and the stream would skip it. A position whose stamp is gone
-    /// from the oplog, or a second position naming a stamp, is dropped. A stamp
-    /// with no position takes the next one, past the highest ever issued (a
-    /// dropped position is never reused), in stamp order: on a store that
-    /// predates the index that is every entry, from 0, which is correct
-    /// because everything written before the index existed was local, where
-    /// arrival order is stamp order. The stamp half is then rebuilt from the
-    /// positions. One transaction: a failure leaves the index as it was.
+    /// from the oplog, or a second position naming a stamp, is dropped.
+    ///
+    /// **A stamp with no position row takes the position the stamp half still
+    /// names for it**, when that position is free: either half alone can be
+    /// the one that lost the row, and the other still knows where the entry
+    /// arrived. Only a stamp neither half knows takes the next position, past
+    /// the highest ever issued (a dropped position is never reused), in stamp
+    /// order: on a store that predates the index that is every entry, from 0,
+    /// which is correct because everything written before the index existed
+    /// was local, where arrival order is stamp order. The stamp half is then
+    /// rebuilt from the positions. One transaction: a failure leaves the index
+    /// as it was.
     ///
     /// Memory: the surviving stamps, 26 bytes a row, held sorted for the merge
     /// with the oplog. A repair path, run when damage is found, never in
     /// normal operation.
     fn repair_arrival_index_from_oplog(db: &Database) -> Result<()> {
+        let stamp_key = |bytes: &[u8]| -> Result<[u8; codec::STAMP_LEN]> {
+            <[u8; codec::STAMP_LEN]>::try_from(bytes)
+                .map_err(|_| StorageError::Corrupt("an arrival index key is not a stamp".into()))
+        };
         let txn = db.begin_write()?;
-        let (kept, dropped, appended) = {
+        let (kept, dropped, recovered, appended) = {
             let oplog = txn.open_table(tables::OPLOG)?;
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
 
+            // Past the highest position either half has ever named.
             let mut next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
-            let mut surviving: Vec<(Vec<u8>, u64)> = Vec::new();
+            for row in by_stamp.iter()? {
+                let (key, seq) = row?;
+                // A stray key for an entry the oplog no longer holds names no
+                // position anything can resume at.
+                if oplog.get(key.value())?.is_some() {
+                    next = next.max(seq.value() + 1);
+                }
+            }
+            let mut surviving: Vec<([u8; codec::STAMP_LEN], u64)> = Vec::new();
             let mut strays: Vec<u64> = Vec::new();
             for row in arrival.iter()? {
                 let (seq, stamp) = row?;
                 if oplog.get(stamp.value())?.is_some() {
-                    surviving.push((stamp.value().to_vec(), seq.value()));
+                    surviving.push((stamp_key(stamp.value())?, seq.value()));
                 } else {
                     strays.push(seq.value());
                 }
             }
             // Positions ascend, so the sort is stable on them: of two positions
             // naming one stamp, the first is kept.
-            surviving.sort_by(|a, b| a.0.cmp(&b.0));
+            surviving.sort_by_key(|row| row.0);
             let mut kept = 0u64;
-            let mut stamps: Vec<Vec<u8>> = Vec::with_capacity(surviving.len());
+            let mut stamps: Vec<[u8; codec::STAMP_LEN]> = Vec::with_capacity(surviving.len());
             for (stamp, seq) in surviving {
                 if stamps.last() == Some(&stamp) {
                     strays.push(seq);
@@ -2022,19 +2040,31 @@ impl Engine {
                     kept += 1;
                 }
             }
-
-            let mut appended = 0u64;
-            for row in oplog.iter()? {
-                let (key, _) = row?;
-                if stamps.binary_search_by(|have| have.as_slice().cmp(key.value())).is_err() {
-                    arrival.insert(next, key.value())?;
-                    next += 1;
-                    appended += 1;
-                }
-            }
             let dropped = strays.len() as u64;
+            // Removed first, so a position a stray held is free for the stamp
+            // half to hand back.
             for seq in strays {
                 arrival.remove(seq)?;
+            }
+
+            let (mut recovered, mut appended) = (0u64, 0u64);
+            for row in oplog.iter()? {
+                let (key, _) = row?;
+                if stamps.binary_search_by(|have| have.as_slice().cmp(key.value())).is_ok() {
+                    continue;
+                }
+                let named = by_stamp.get(key.value())?.map(|seq| seq.value());
+                match named {
+                    Some(seq) if seq < next && arrival.get(seq)?.is_none() => {
+                        arrival.insert(seq, key.value())?;
+                        recovered += 1;
+                    }
+                    _ => {
+                        arrival.insert(next, key.value())?;
+                        next += 1;
+                        appended += 1;
+                    }
+                }
             }
 
             Self::clear_stamp_half(&mut by_stamp)?;
@@ -2042,11 +2072,17 @@ impl Engine {
                 let (seq, key) = row?;
                 by_stamp.insert(key.value(), seq.value())?;
             }
-            (kept, dropped, appended)
+            (kept, dropped, recovered, appended)
         };
         txn.commit()?;
 
-        info!(kept, dropped, appended, "repaired the oplog arrival index, keeping every position");
+        info!(
+            kept,
+            dropped,
+            recovered,
+            appended,
+            "repaired the oplog arrival index, keeping every position"
+        );
         Ok(())
     }
 

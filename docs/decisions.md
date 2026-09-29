@@ -21176,9 +21176,10 @@ worth of news.
 - **The open's verification walk reads the two key sets in step** when it walks
   the oplog, and a difference the counts cannot see is **repaired in that open**:
   the arrival index is repaired from the oplog **keeping every position whose
-  stamp is still in the oplog**, dropping the rest, appending the stamps it
-  lacks past the highest position ever issued, and rebuilding the stamp half
-  from the positions, all in one transaction; only then is the record written (a
+  stamp is still in the oplog**, dropping the rest, giving a stamp that lost its
+  position row the one the stamp half still names when it is free, appending
+  the stamps neither half knows past the highest position ever issued, and
+  rebuilding the stamp half from the positions, all in one transaction; only then is the record written (a
   crash before it leaves the record unwritten, so the next open walks again).
   Not renumbered in stamp order: a position is what a change stream's token
   names, and a relayed entry arrives after higher-stamped local ones, so a

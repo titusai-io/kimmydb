@@ -930,3 +930,60 @@ fn a_serve_that_fails_does_not_use_the_fallback_lines_slot() {
     assert!(served.is_err(), "the linear walk meets the same body: no window is served");
     assert!(engine.serve_counters().fallback_is_due_a_line(), "and the line's slot is still free");
 }
+
+/// A lost positions row whose stamp the stamp half still names keeps the
+/// position, on a plain open (the counts differ, so the stale-count path
+/// repairs): stamp 20 first, the relayed 15 after it, ten more; a token for 20
+/// resumes at the entry after it and so still delivers 15 and the rest.
+#[test]
+fn a_lost_position_the_stamp_half_still_names_is_given_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let mut rows = vec![Row { origin: 0, at: 20, violation: false }];
+    rows.push(Row { origin: 1, at: 15, violation: false });
+    rows.extend((0..10).map(|i| Row { origin: 0, at: 21 + i, violation: false }));
+    let before = {
+        let engine = Engine::open(&path).unwrap();
+        write(&engine, &rows);
+        let before = arrival_positions(&engine);
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        {
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            assert!(arrival.remove(0u64).unwrap().is_some());
+        }
+        txn.commit().unwrap();
+        engine.close().unwrap();
+        before
+    };
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(arrival_positions(&engine), before, "the position came back, not the top");
+    let after_20 = engine.read_arrival_from(1, 100).unwrap();
+    assert_eq!(after_20.len(), 11, "a token for 20 still reaches 15 and the ten after it");
+    assert_eq!(after_20[0].stamp, stamp_of(&rows[1]));
+}
+
+/// The same with every positions row lost and the stamp half whole: each
+/// entry gets its position back.
+#[test]
+fn a_store_that_lost_its_positions_but_not_its_stamp_half_gets_them_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let rows = relayed_late();
+    let before = {
+        let engine = Engine::open(&path).unwrap();
+        write(&engine, &rows);
+        let before = arrival_positions(&engine);
+        let txn = engine.begin_write(WriterHolder::Write).unwrap();
+        {
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+            for (seq, _) in &before {
+                arrival.remove(*seq).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        engine.close().unwrap();
+        before
+    };
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(arrival_positions(&engine), before);
+}

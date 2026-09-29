@@ -20,7 +20,7 @@ use crate::error::{Result, StorageError};
 /// Bumped only for incompatible layout changes.
 pub const FORMAT_VERSION: u8 = 1;
 
-const STAMP_LEN: usize = HLC_ENCODED_LEN + 16;
+pub(crate) const STAMP_LEN: usize = HLC_ENCODED_LEN + 16;
 /// Sentinel length meaning "this optional field is absent".
 const NONE_LEN: u32 = u32::MAX;
 
