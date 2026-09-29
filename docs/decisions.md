@@ -6964,6 +6964,8 @@ above is the only place that shows.
 
 ## ADR-121 — A request body with a field the route does not define is refused
 
+> **Extended by [ADR-196](#adr-196--a-filters-vocabulary-is-closed-an-unknown-type-alias-or-regex-flag-is-refused-and-number-is-an-alias).** The same rule now covers a filter's `$type` alias and `$regex` flag.
+
 **Decision.** Every request shape the API deserializes carries
 `#[serde(deny_unknown_fields)]`: the bodies of `find`, `count`, `aggregate`,
 `update`, `delete`, `find_and_modify`, index creation, collection creation,
@@ -7379,6 +7381,8 @@ pinned by the golden tests. `SyncOutcome` and `RoundReport` gain a field
 each. A local drop of an index that is not there still records nothing — it
 mints no entry, so a tombstone would be a decision no peer hears of.
 ## ADR-124 — A route that reads no query string refuses every query string
+
+> **Extended by [ADR-196](#adr-196--a-filters-vocabulary-is-closed-an-unknown-type-alias-or-regex-flag-is-refused-and-number-is-an-alias).** The same rule now covers a filter's `$type` alias and `$regex` flag.
 
 **Decision.** One layer over the REST route table,
 `routes::refuse_unread_query_string`, answers `400 bad_request` in the
@@ -21022,3 +21026,97 @@ Firing the reset unconditionally, without the `interval / 2` floor a
 recording as the mechanism a naive read of "reset when there's more to do"
 would reach for, and why the two round-counted timer corrections above are
 required rather than optional the moment resets can be back-to-back.
+
+---
+
+## ADR-196 — A filter's vocabulary is closed: an unknown `$type` alias or `$regex` flag is refused, and `number` is an alias
+
+Extends [ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+and [ADR-124](#adr-124--a-route-that-reads-no-query-string-refuses-every-query-string)
+into the filter language.
+
+**The defect.** A request the server cannot honour must be refused, so that an
+empty result never stands in for "I did not understand you". ADR-121 applied
+that to a body's fields and ADR-124 to a query string, but two words a filter
+takes were still read without being checked. `{"$type": "boolean"}` matched
+nothing, because the argument was taken as a type *name* and no stored value
+reports that name, while `{"$type": 999}` was a `400`: the same mistake, loud
+through one spelling of the argument and silent through the other.
+`{"$regex": "s", "$options": "I"}` dropped the flag it did not know and
+compiled the pattern case-sensitively, so the caller received a short result
+and nothing to say why. In both, the answer is indistinguishable from a true
+empty or short one. And one word a caller would reasonably write, `number`,
+was in the same silent position because no value reports it.
+
+**Decision.**
+
+- **`$type` aliases are a closed set, checked when the filter is parsed.** The
+  set is every name `type_name_of` can return: the eighteen with a numeric
+  code, `symbol` and `dbPointer` (which have none), and `number`. It is not
+  the code table's set, which lacks `symbol` and `dbPointer` and would refuse
+  types `$type` matches today. An alias outside it is a `400`
+  (`InvalidQuery`) naming the alias and listing the ones there are. Names stay
+  case-sensitive. An empty array is a `400`, because it names no type.
+- **`$regex` flags are `i`, `m`, `s` and `x`, and nothing else.** A flag
+  outside them is a `400` naming it, before any document is read, wherever it
+  is written: a sibling `$options`, the flags of a regex literal (in `$regex`
+  and in `$not`), or a `$options` with no `$regex` beside it. The matcher's
+  arm for an unknown flag is now unreachable and says so.
+- **A `$regex` pattern must be usable, and `$options` must be a string.** A
+  pattern that does not compile under its flags, which includes the
+  backreferences and lookarounds the engine does not support, is a `400`
+  naming the pattern and the fault, in a string `$regex`, a regex literal and a
+  literal under `$not`. A non-string `$options`, beside a `$regex` or alone, is
+  a `400`. Both were silent: the pattern matched nothing, the `$options` was
+  ignored. The matcher's own compile is kept as a no-match for a condition not
+  built by the parser, and is unreachable through it.
+- **`number` is an alias for `double`, `int`, `long` and `decimal`.** It is
+  expanded when the filter is parsed, in a bare argument and inside an array,
+  so the parsed condition holds only concrete names and the evaluator, the
+  planner (`$type` is never index-eligible) and the descent into array
+  elements are unchanged. It has no numeric code, `type_name_for_code` is
+  unchanged, and no value reports it. `$convert` has its own target table and
+  does not accept it.
+- **Every path that parses a filter inherits both**: the REST routes, an
+  aggregation `$match`, and the MCP tools, which call the same parser.
+
+**Why.** It is ADR-121's argument, applied to the last place a caller's
+misspelling could still vanish. A closed vocabulary is checkable at parse
+without reading a document, and a `400` that names the offending word is
+cheaper for the caller than a result that looks correct. `number` moves in the
+same change because the two rules meet in one function: once an unknown alias
+is refused, the word a caller most naturally writes for "any numeric type"
+would otherwise become a refusal, and the documented workaround (list `int`,
+`long` and `double`) omitted `decimal`, which the docs' own example showed.
+
+**Caller-visible.** Filters that returned `200` now return `400`: an alias
+outside the set, an empty `$type` list, a flag outside `imsx`, a pattern that
+does not compile, a non-string `$options`. A filter that
+used `number` returned nothing and now returns the numeric values. It is
+listed under **Changed**, marked **Breaking**, in the CHANGELOG.
+
+**Rejected.**
+
+- *Folding the case of an alias* so `"Int"` works: it accepts more spellings
+  than the vocabulary has, and hides the misspelling this refuses.
+- *Validating against the code table*: refuses `symbol` and `dbPointer`, which
+  match today.
+- *Carrying `number` as a variant the evaluator matches:* buys nothing here,
+  since the condition is opaque to the planner, and would put a second place
+  that must agree on what the four types are.
+
+### Test
+
+`kimmy-query` unit tests: each refusal names its word, `boolean`, `Int`,
+`""`, a bad member of a list, and an empty list; every name a value reports is
+an alias and parses and matches itself (and the alias table equals that set,
+so it cannot drift); `number` matches the four numeric types, a numeric array
+element and nothing deeper, is identical to listing the four, and mixes with
+other aliases and codes; a flag outside `imsx` is refused in each of the four
+places it can be written, and the four flags and none are accepted; an
+unclosed group, a backreference and a lookahead are refused in a string
+`$regex`, a literal and a literal under `$not`, with and without flags, and the
+reason is one line; a non-string `$options` is refused beside a `$regex`, beside
+a literal, and alone; `$convert` still refuses `number`. `kimmy-api` and `kimmy-mcp` tests drive the
+same cases through the REST routes, an aggregation `$match` and a tool call.
+

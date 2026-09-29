@@ -3308,6 +3308,8 @@ mod tests {
             doc! {"$convert": {"input": 1}},
             doc! {"$convert": {"input": 1, "to": "int", "onerror": 0}},
             doc! {"$convert": {"input": 1, "to": "widget"}},
+            // `number` is a `$type` alias for four types, not one conversion target.
+            doc! {"$convert": {"input": 1, "to": "number"}},
             doc! {"$convert": {"input": 1, "to": 3}},
             doc! {"$convert": {"input": 1, "to": "$field"}},
         ] {

@@ -79,45 +79,36 @@ both change with it. Nobody has asked.
 
 ---
 
-## 🟡 A filter accepts a `$type` alias and a `$regex` flag it has never heard of, and matches nothing with either
+## 🟢 A filter accepted a `$type` alias and a `$regex` flag it had never heard of, and matched nothing with either
 
-**Raised 2026-09-04 — the `$type` half by the 2026-09 test round, the
-`$options` half while closing it.** `{"$type": 999}` is a
-`400` naming the unknown code. `{"$type": "nosuchtype"}` — and `{"$type":
-"Int"}`, and `{"$type": "boolean"}` — is a `200` with no matches, because
-the argument is taken as a type *name* and no stored value ever reports that
-name. MongoDB refuses an unknown alias, and the two halves here disagree with
-each other as well as with it: the same mistake is loud through one spelling
-of the argument and silent through the other. An empty array, `{"$type":
-[]}`, is accepted the same way — it lists no type, so it matches nothing.
+**Was** (raised 2026-09-04). `{"$type": 999}` was a `400` naming the unknown
+code, but `{"$type": "boolean"}`, `{"$type": "Int"}` and `{"$type": []}` were
+each a `200` with no matches: the argument was taken as a type *name*, and no
+stored value reports a name it does not have. `$options` dropped every flag but
+`i`, `m`, `s` and `x`, so `"I"` compiled the pattern case-sensitively and
+answered an empty or a short result with nothing said. It was the failure
+[ADR-121](decisions.md) closed for request fields and [ADR-124](decisions.md)
+for query parameters, still standing inside the filter, where an empty result
+cannot be told from a real one.
 
-It is the failure [ADR-121](decisions.md) closed for request fields and
-[ADR-124](decisions.md) for query parameters, still standing inside the
-filter: an empty result that is indistinguishable from a real one. It is
-narrower than either, because a filter's keys are the caller's own field
-names and only an *operator's argument* can be checked — but `$type`'s
-argument is exactly that, a closed vocabulary this database defines, and
-`$mod`'s pair, `$size`'s integer and a sort direction are all refused when
-they are wrong already.
+**Now** (closed 2026-09-29, [ADR-196](decisions.md)). An unknown alias, and an
+empty list, are a `400` at parse, naming the alias; the aliases are the names a
+stored value can report (which include `symbol` and `dbPointer`, and have no
+code) and `number`. A `$regex` flag other than `i`, `m`, `s` and `x` is a
+`400` naming it, wherever it is written: a sibling `$options`, the flags of a
+regex literal, or a lone `$options`. `number`, which matched nothing (it was
+never refused), is now the alias for `double`, `int`, `long` and `decimal`, expanded
+when the filter is parsed.
 
-**The same shape is in `$options`.** `compile_regex` reads the flag string
-character by character, sets `i`, `m`, `s` and `x`, and drops everything else
-— so `"I"` is not `"i"`, the pattern compiles case-sensitively, and the
-caller gets an empty result with nothing said. Two words in this language's
-vocabulary that a filter accepts without checking, and they fail the same
-way.
+**Also closed in the same change.** A `$regex` pattern the engine cannot
+use (an unclosed group, and the backreferences and lookarounds it does not
+support) is a `400` naming the pattern and the fault, in a string `$regex`, a
+regex literal and a literal under `$not`; it used to match nothing. A
+`$options` that is not a string is a `400`; it used to be ignored.
 
-**To close:** validate the alias at parse and refuse an unknown one, as the
-numeric arm already does — the same error, reached by the other spelling.
-The table to validate against is `type_name_of`'s, the set of names a stored
-value can actually report, **not** `type_name_for_code`'s: the latter omits
-`symbol` and `dbPointer`, which have no numeric code but are real types that
-`$type` matches today. Refusing them would be a regression dressed as a fix.
-`$options` closes the same way, against its own four flags. Both are
-behaviour changes and tightenings, so they belong to a `0.MINOR` with a
-changelog line, not to a documentation pass; `docs/query-language.md` states
-the current behaviour, the alias list and the flag list in the meantime, so a
-reader can at least check a spelling against something.
+**Kept, and documented.** A regex literal written directly as a field's value
+(`{"name": /^s/}`) is an equality match against a regex value, not a pattern
+match; that has not changed.
 
 ---
 
@@ -314,8 +305,8 @@ collection where one document's `name` is a string: MongoDB fails the whole
 query on reaching that document; here the document is skipped and the rest of
 the result is returned. `filter::matches` answers a `bool` for every caller —
 the scan, `$elemMatch`, the executor's residual re-check after an index probe
-— and the regex arm already resolves the same tension the same way: an
-unusable pattern matches nothing rather than taking down the request. Parse-
+— and a failure that depends on the data shows up mid-scan, so it cannot be
+found at parse. Parse-
 time errors (an unknown operator, a wrong arity, a `$$name` nothing binds) are
 still a `400`, so the leniency is confined to failures that depend on the data.
 `$$ROOT` and `$$CURRENT` were parse-time errors here too until the expression

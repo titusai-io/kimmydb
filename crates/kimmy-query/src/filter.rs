@@ -166,7 +166,8 @@ fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
     // own, so it has to be read before the operators are parsed independently.
     let sibling_options = match doc.get("$options") {
         Some(Bson::String(s)) => s.clone(),
-        _ => String::new(),
+        Some(_) => return Err(Error::InvalidQuery("$options requires a string of flags".into())),
+        None => String::new(),
     };
 
     doc.iter().map(|(key, arg)| parse_condition(&key[1..], arg, &sibling_options)).collect()
@@ -235,23 +236,25 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
         "mod" => parse_mod(arg)?,
         "type" => Condition::Type(parse_type_arg(arg)?),
         "regex" => match arg {
-            Bson::String(pattern) => {
-                Condition::Regex { pattern: pattern.clone(), options: sibling_options.to_string() }
-            }
-            Bson::RegularExpression(re) => Condition::Regex {
-                pattern: re.pattern.as_str().to_string(),
+            Bson::String(pattern) => regex_condition(pattern, sibling_options)?,
+            Bson::RegularExpression(re) => {
                 // Flags written on the literal win over a sibling `$options`.
-                options: if re.options.as_str().is_empty() {
-                    sibling_options.to_string()
+                let options = if re.options.as_str().is_empty() {
+                    sibling_options
                 } else {
-                    re.options.as_str().to_string()
-                },
-            },
+                    re.options.as_str()
+                };
+                regex_condition(re.pattern.as_str(), options)?
+            }
             _ => return Err(Error::InvalidQuery("$regex requires a string or regex".into())),
         },
         // Already folded into the sibling `$regex` above. On its own it
-        // constrains nothing, matching Mongo's leniency.
-        "options" => Condition::AlwaysTrue,
+        // constrains nothing, but its flags are still checked: a flag this
+        // database does not implement is refused wherever it is written.
+        "options" => {
+            check_regex_options(sibling_options)?;
+            Condition::AlwaysTrue
+        }
         "elemMatch" => match arg {
             Bson::Document(d) => Condition::ElemMatch(Box::new(parse_elem_match(d)?)),
             _ => return Err(Error::InvalidQuery("$elemMatch requires a document".into())),
@@ -268,10 +271,9 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
                     })?;
                 Condition::Not(Box::new(combined))
             }
-            Bson::RegularExpression(re) => Condition::Not(Box::new(Condition::Regex {
-                pattern: re.pattern.as_str().to_string(),
-                options: re.options.as_str().to_string(),
-            })),
+            Bson::RegularExpression(re) => {
+                Condition::Not(Box::new(regex_condition(re.pattern.as_str(), re.options.as_str())?))
+            }
             _ => return Err(Error::InvalidQuery("$not requires a document or regex".into())),
         },
         other => {
@@ -361,18 +363,95 @@ fn truncate_to_i64(d: f64) -> Option<i64> {
         .then_some(t as i64)
 }
 
+/// Every name a value can report: what [`type_name_of`] returns, and so every
+/// alias `$type` accepts. Not [`type_name_for_code`]'s table, which has no
+/// code for `symbol` or `dbPointer` and would refuse types `$type` finds.
+const TYPE_NAMES: [&str; 20] = [
+    "double",
+    "string",
+    "object",
+    "array",
+    "binData",
+    "undefined",
+    "objectId",
+    "bool",
+    "date",
+    "null",
+    "regex",
+    "javascript",
+    "int",
+    "timestamp",
+    "long",
+    "decimal",
+    "minKey",
+    "maxKey",
+    "symbol",
+    "dbPointer",
+];
+
+/// What the alias `number` stands for: the four numeric types. It has no
+/// numeric code, and no value reports it, so it is expanded when the filter is
+/// parsed and the evaluator only ever sees concrete names.
+const NUMBER_TYPES: [&str; 4] = ["double", "int", "long", "decimal"];
+
 fn parse_type_arg(arg: &Bson) -> Result<Vec<String>> {
-    let one = |value: &Bson| -> Result<String> {
+    let one = |value: &Bson| -> Result<Vec<String>> {
         match value {
-            Bson::String(s) => Ok(s.clone()),
-            Bson::Int32(n) => type_name_for_code(i64::from(*n)),
-            Bson::Int64(n) => type_name_for_code(*n),
+            Bson::String(s) if s == "number" => {
+                Ok(NUMBER_TYPES.iter().map(|n| (*n).to_string()).collect())
+            }
+            Bson::String(s) if TYPE_NAMES.contains(&s.as_str()) => Ok(vec![s.clone()]),
+            Bson::String(s) => Err(Error::InvalidQuery(format!(
+                "unknown $type alias {s:?}; the aliases are number and {}",
+                TYPE_NAMES.join(", ")
+            ))),
+            Bson::Int32(n) => type_name_for_code(i64::from(*n)).map(|name| vec![name]),
+            Bson::Int64(n) => type_name_for_code(*n).map(|name| vec![name]),
             _ => Err(Error::InvalidQuery("$type requires a string alias or type code".into())),
         }
     };
     match arg {
-        Bson::Array(items) => items.iter().map(one).collect(),
-        other => Ok(vec![one(other)?]),
+        Bson::Array(items) if items.is_empty() => {
+            Err(Error::InvalidQuery("$type requires at least one alias or type code".into()))
+        }
+        Bson::Array(items) => {
+            Ok(items.iter().map(one).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect())
+        }
+        other => one(other),
+    }
+}
+
+/// A `$regex` condition, once its flags are known and its pattern compiles.
+///
+/// Both are decided here, when the filter is parsed, so a pattern the matcher
+/// cannot use is a `400` naming what is wrong with it. It used to match
+/// nothing, which reads as an empty result: a backreference or a lookaround,
+/// which the engine does not support, and a plain typo look the same as "no
+/// document matches".
+fn regex_condition(pattern: &str, options: &str) -> Result<Condition> {
+    check_regex_options(options)?;
+    if let Err(e) = build_regex(pattern, options) {
+        // The crate's message is a multi-line rendering of the pattern with a
+        // caret under the fault. The reason is its last line.
+        let reason = e.to_string();
+        let reason = reason.lines().last().unwrap_or_default().trim_start_matches("error: ");
+        return Err(Error::InvalidQuery(format!(
+            "$regex pattern {pattern:?} cannot be used: {reason}"
+        )));
+    }
+    Ok(Condition::Regex { pattern: pattern.to_string(), options: options.to_string() })
+}
+
+/// Refuse a `$regex` flag this database does not implement. The four it does
+/// (`i`, `m`, `s`, `x`) are all there are: an unknown letter used to be
+/// dropped, so `"I"` compiled the pattern case-sensitively and answered an
+/// empty result with nothing said.
+fn check_regex_options(options: &str) -> Result<()> {
+    match options.chars().find(|flag| !matches!(flag, 'i' | 'm' | 's' | 'x')) {
+        Some(flag) => Err(Error::InvalidQuery(format!(
+            "unknown $regex flag {flag:?}; the flags are i, m, s and x"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -457,9 +536,9 @@ pub fn matches(filter: &Filter, doc: &Document) -> bool {
 /// document-dependent failure that only shows up mid-scan, and this function
 /// answers a `bool` for every caller — the scan, `$elemMatch`, the executor's
 /// residual check. Failing the whole request from here would have to thread a
-/// `Result` through all of them for a case the regex arm already resolves the
-/// other way: an unusable pattern matches nothing. Recorded in
-/// `docs/deviations.md`, because MongoDB does fail the query.
+/// `Result` through all of them, for a failure that depends on the data and so
+/// cannot be found at parse. Recorded in `docs/deviations.md`, because
+/// MongoDB does fail the query.
 fn expr_matches(e: &Expr, doc: &Document) -> bool {
     e.eval(doc).is_ok_and(|v| expr::truthy(&v))
 }
@@ -613,7 +692,8 @@ fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> bool {
     }
 }
 
-fn compile_regex(pattern: &str, options: &str) -> Option<regex::Regex> {
+/// The pattern under its flags, which [`check_regex_options`] has vetted.
+fn build_regex(pattern: &str, options: &str) -> std::result::Result<regex::Regex, regex::Error> {
     let mut builder = regex::RegexBuilder::new(pattern);
     for flag in options.chars() {
         match flag {
@@ -629,11 +709,20 @@ fn compile_regex(pattern: &str, options: &str) -> Option<regex::Regex> {
             'x' => {
                 builder.ignore_whitespace(true);
             }
-            // Unknown flags are ignored rather than failing the whole query.
-            _ => {}
+            // Refused when the filter is parsed (`check_regex_options`), so
+            // none reaches here from the parser. A condition built any other
+            // way gets an error, which `compile_regex` turns into a no-match.
+            _ => return Err(regex::Error::Syntax(format!("unknown flag {flag:?}"))),
         }
     }
-    builder.build().ok()
+    builder.build()
+}
+
+/// The compiled pattern of a parsed condition. `None` is unreachable through
+/// [`parse`], which refuses a pattern that does not compile, and is kept as a
+/// no-match rather than a panic for a condition built any other way.
+fn compile_regex(pattern: &str, options: &str) -> Option<regex::Regex> {
+    build_regex(pattern, options).ok()
 }
 
 #[cfg(test)]
@@ -857,6 +946,172 @@ mod tests {
         assert!(!hits(doc! { "a": { "$type": "int" } }, doc! { "a": 1i64 }));
     }
 
+    fn literal(pattern: &str, options: &str) -> Bson {
+        Bson::RegularExpression(bson::Regex {
+            pattern: pattern.to_string().try_into().expect("valid pattern"),
+            options: options.to_string().try_into().expect("valid options"),
+        })
+    }
+
+    fn refused(query: Document) -> String {
+        match parse(&query) {
+            Err(Error::InvalidQuery(message)) => message,
+            other => panic!("{query:?} must be refused as an invalid query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_type_alias_is_refused_naming_it() {
+        for alias in ["boolean", "Int", "nosuchtype", "number ", ""] {
+            let message = refused(doc! { "a": { "$type": alias } });
+            assert!(message.contains(&format!("{alias:?}")), "{message}");
+        }
+        // Inside an array the bad one is named, whatever its neighbours are.
+        let message = refused(doc! { "a": { "$type": ["string", "nosuch"] } });
+        assert!(message.contains("nosuch"), "{message}");
+        // The numeric spelling was already refused, and stays refused.
+        assert!(refused(doc! { "a": { "$type": 999 } }).contains("999"));
+    }
+
+    #[test]
+    fn an_empty_type_list_is_refused() {
+        refused(doc! { "a": { "$type": [] } });
+    }
+
+    #[test]
+    fn every_name_a_value_reports_is_a_type_alias() {
+        // The table validated against is `type_name_of`'s, not the code
+        // table's: `symbol` and `dbPointer` have no code and still match.
+        let samples: Vec<Bson> = vec![
+            Bson::Double(1.0),
+            Bson::String("s".into()),
+            Bson::Document(doc! {}),
+            Bson::Array(vec![]),
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: vec![],
+            }),
+            Bson::Undefined,
+            Bson::ObjectId(bson::oid::ObjectId::new()),
+            Bson::Boolean(true),
+            Bson::DateTime(bson::DateTime::now()),
+            Bson::Null,
+            literal("a", "i"),
+            Bson::JavaScriptCode("1".into()),
+            Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
+                code: "1".into(),
+                scope: doc! {},
+            }),
+            Bson::Int32(1),
+            Bson::Timestamp(bson::Timestamp { time: 1, increment: 1 }),
+            Bson::Int64(1),
+            Bson::Decimal128("1".parse().unwrap()),
+            Bson::MinKey,
+            Bson::MaxKey,
+            Bson::Symbol("s".into()),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for value in &samples {
+            let name = type_name_of(value);
+            seen.insert(name);
+            let filter = parse(&doc! { "a": { "$type": name } })
+                .unwrap_or_else(|e| panic!("{name} must parse: {e}"));
+            assert!(matches(&filter, &doc! { "a": value.clone() }), "{name} must match itself");
+        }
+        // `dbPointer` cannot be built through the public API; it is in the
+        // table all the same, and parses.
+        seen.insert("dbPointer");
+        assert!(parse(&doc! { "a": { "$type": "dbPointer" } }).is_ok());
+        let table: std::collections::BTreeSet<&str> = TYPE_NAMES.iter().copied().collect();
+        assert_eq!(seen, table, "the alias table and the names values report must be one set");
+        // And every name a code spells is in it.
+        for code in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, -1, 127] {
+            let name = type_name_for_code(code).unwrap();
+            assert!(table.contains(name.as_str()), "{name}");
+        }
+    }
+
+    #[test]
+    fn number_matches_the_four_numeric_types_and_nothing_else() {
+        let q = doc! { "a": { "$type": "number" } };
+        for numeric in [
+            Bson::Int32(4),
+            Bson::Int64(9_007_199_254_740_993),
+            Bson::Double(2.5),
+            Bson::Decimal128("1.25".parse().unwrap()),
+        ] {
+            assert!(hits(q.clone(), doc! { "a": numeric.clone() }), "{numeric:?}");
+        }
+        for other in [
+            Bson::String("many".into()),
+            Bson::Boolean(true),
+            Bson::Null,
+            Bson::Document(doc! { "n": 1 }),
+        ] {
+            assert!(!hits(q.clone(), doc! { "a": other.clone() }), "{other:?}");
+        }
+        // One level into an array, like every other `$type`: an element.
+        assert!(hits(q.clone(), doc! { "a": [3, "boxed"] }));
+        assert!(!hits(q.clone(), doc! { "a": [["deeper", 3]] }));
+        assert!(!hits(q, doc! { "a": ["x", "y"] }));
+    }
+
+    #[test]
+    fn number_is_the_same_filter_as_listing_the_four() {
+        let by_alias = parse(&doc! { "a": { "$type": "number" } }).unwrap();
+        let listed =
+            parse(&doc! { "a": { "$type": ["int", "long", "double", "decimal"] } }).unwrap();
+        for value in [
+            Bson::Int32(1),
+            Bson::Int64(1),
+            Bson::Double(1.0),
+            Bson::Decimal128("1".parse().unwrap()),
+            Bson::String("1".into()),
+            Bson::Boolean(false),
+        ] {
+            let d = doc! { "a": value };
+            assert_eq!(matches(&by_alias, &d), matches(&listed, &d), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn number_mixes_with_other_aliases_and_codes() {
+        let q = doc! { "a": { "$type": ["number", "string"] } };
+        assert!(hits(q.clone(), doc! { "a": 1 }));
+        assert!(hits(q.clone(), doc! { "a": "x" }));
+        assert!(!hits(q, doc! { "a": true }));
+        // A code and the alias in one list.
+        let q = doc! { "a": { "$type": [8, "number"] } };
+        assert!(hits(q.clone(), doc! { "a": true }));
+        assert!(hits(q, doc! { "a": 2.5 }));
+        // Naming one of the four still means that one.
+        assert!(!hits(doc! { "a": { "$type": "int" } }, doc! { "a": 1i64 }));
+        assert!(!hits(doc! { "a": { "$type": "bool" } }, doc! { "a": 1 }));
+    }
+
+    #[test]
+    fn an_unknown_regex_flag_is_refused_naming_it() {
+        for flags in ["I", "g", "ix ", "u", "l"] {
+            let message = refused(doc! { "s": { "$regex": "s", "$options": flags } });
+            assert!(message.contains("flag"), "{message}");
+        }
+        assert!(refused(doc! { "s": { "$regex": "s", "$options": "iI" } }).contains("'I'"));
+        // The literal's own flags, and a lone `$options`, are checked too.
+        refused(doc! { "s": { "$regex": literal("s", "g") } });
+        refused(doc! { "s": { "$options": "I" } });
+        refused(doc! { "s": { "$not": literal("s", "g") } });
+    }
+
+    #[test]
+    fn the_four_regex_flags_and_none_are_accepted() {
+        assert!(hits(doc! { "s": { "$regex": "^AB", "$options": "i" } }, doc! { "s": "abc" }));
+        assert!(hits(doc! { "s": { "$regex": "a b", "$options": "x" } }, doc! { "s": "ab" }));
+        assert!(hits(doc! { "s": { "$regex": "^b", "$options": "m" } }, doc! { "s": "a\nb" }));
+        assert!(hits(doc! { "s": { "$regex": "a.b", "$options": "s" } }, doc! { "s": "a\nb" }));
+        assert!(hits(doc! { "s": { "$regex": "^AB", "$options": "imsx" } }, doc! { "s": "abc" }));
+        assert!(hits(doc! { "s": { "$regex": "^ab", "$options": "" } }, doc! { "s": "abc" }));
+    }
+
     #[test]
     fn regex_matches_strings() {
         assert!(hits(doc! { "s": { "$regex": "^ab" } }, doc! { "s": "abc" }));
@@ -874,8 +1129,45 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_regex_matches_nothing_rather_than_erroring() {
-        assert!(!hits(doc! { "s": { "$regex": "(unclosed" } }, doc! { "s": "x" }));
+    fn an_invalid_regex_is_refused_naming_the_fault_in_every_place_one_is_written() {
+        // A string pattern, a literal, a literal under `$not`, and each with
+        // the kind of pattern the engine cannot use: an unclosed group, and a
+        // backreference and a lookahead, which it does not support.
+        for pattern in ["(unclosed", r"(a)\1", "a(?=b)"] {
+            let message = refused(doc! { "s": { "$regex": pattern } });
+            assert!(message.contains(&format!("{pattern:?}")), "{message}");
+            refused(doc! { "s": { "$regex": pattern, "$options": "i" } });
+            refused(doc! { "s": { "$regex": literal(pattern, "") } });
+            refused(doc! { "s": { "$regex": literal(pattern, "i") } });
+            refused(doc! { "s": { "$not": literal(pattern, "") } });
+        }
+        // The reason is in the message, and only its last line.
+        let message = refused(doc! { "s": { "$regex": "(unclosed" } });
+        assert!(message.contains("unclosed group") && !message.contains('\n'), "{message}");
+        // A pattern that compiles is untouched.
+        assert!(hits(doc! { "s": { "$regex": "^a(b|c)+$" } }, doc! { "s": "abcb" }));
+    }
+
+    #[test]
+    fn a_condition_built_outside_the_parser_with_an_unchecked_flag_matches_nothing() {
+        // The parser refuses a flag it does not implement, but `Condition` is a
+        // public type: one built by hand with such a flag must not panic.
+        let filter = Filter::Field {
+            path: "s".into(),
+            conditions: vec![Condition::Regex { pattern: "a".into(), options: "z".into() }],
+        };
+        assert!(!matches(&filter, &doc! { "s": "a" }));
+    }
+
+    #[test]
+    fn options_must_be_a_string() {
+        for options in [Bson::Int32(1), Bson::Boolean(true), Bson::Null, Bson::Array(vec![])] {
+            let message = refused(doc! { "s": { "$regex": "a", "$options": options.clone() } });
+            assert!(message.contains("$options requires a string"), "{message}");
+            // Alone, and beside a literal, it is refused the same way.
+            refused(doc! { "s": { "$options": options.clone() } });
+            refused(doc! { "s": { "$regex": literal("a", ""), "$options": options } });
+        }
     }
 
     // -----------------------------------------------------------------------

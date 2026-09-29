@@ -114,8 +114,8 @@ and the expression is applied to each candidate. `explain` shows which.
 
 **An evaluation error is "no match".** A type violation inside the expression
 — `{$add: ["$name", 1]}` where `name` is a string — makes that document fail
-the filter rather than failing the request, the same way an unusable `$regex`
-matches nothing. MongoDB fails the query; the difference is recorded in
+the filter rather than failing the request, because the failure depends on the
+data and shows up mid-scan. MongoDB fails the query; the difference is recorded in
 [Deviations](deviations.md).
 
 ### `$mod`
@@ -150,45 +150,44 @@ range beside it still uses the index.
 { "mixed": { "$type": "int" } }
 { "mixed": { "$type": 16 } }                  // the same, by code
 { "mixed": { "$type": ["int", "string"] } }   // either — the array unions
+{ "mixed": { "$type": "number" } }            // int, long, double or decimal
 ```
 
 The argument is an **alias, a numeric BSON code, or an array of them**. An
 array is a union: the document matches when the value is any one of the listed
-types, and aliases and codes may be mixed in it. An empty array lists no type
-and so matches nothing. Anything else — a double, a bool, a nested array — is
+types, and aliases and codes may be mixed in it. An empty array is a `400`,
+because it lists no type. Anything else — a double, a bool, a nested array — is
 a `400` at parse.
 
 | Kind | Alias and code |
 |---|---|
-| Numbers | `int` 16, `long` 18, `double` 1, `decimal` 19 |
+| Numbers | `int` 16, `long` 18, `double` 1, `decimal` 19; and `number`, which is all four and has no code |
 | Text and bytes | `string` 2, `binData` 5 |
 | Structure | `object` 3, `array` 4 |
 | Identity and time | `objectId` 7, `date` 9, `timestamp` 17 |
 | Other | `bool` 8, `null` 10, `regex` 11, `javascript` 13, `undefined` 6, `minKey` −1, `maxKey` 127 |
 
 `javascript` covers both code forms; `symbol` and `dbPointer` are accepted as
-names for the two legacy types that have no code here. There is no `number`
-meta-alias covering the numeric types — list them: `["int", "long",
-"double"]`. And **`int` and `long` are different types**, so a value written
+names for the two legacy types that have no code here. **`number` is an alias
+for the four numeric types at once**: it is expanded when the filter is
+parsed, so `{"$type": "number"}` and `{"$type": ["int", "long", "double",
+"decimal"]}` are the same filter, and it mixes with other aliases and codes in
+an array. It is a `$type` alias only: `$convert` takes a single target type
+and does not accept it. And **`int` and `long` are different types**, so a value written
 as `{"$numberLong": "42"}` is not matched by `{"$type": "int"}`; see [The JSON
 boundary](http-api.md#the-json-boundary) for which one a plain JSON number
 becomes.
 
-**An unknown *code* is refused and an unknown *alias* is not.** `{"$type":
-999}` is a `400` — `unknown $type code 999`; `{"$type": "nosuchtype"}` is
-`200` with no matches, because any string is taken as a type name and no
-stored value ever reports that name. Names are **case-sensitive and exactly
-as spelled above**, so `"Int"`, `"bindata"` and `"boolean"` are each a `200`
-and an empty result rather than a refusal, indistinguishable from a genuine
-"nothing is that type".
-
-An alias is not the only word a filter takes without checking:
-[`$regex`'s `$options`](#regex-compatibility) drops a flag it does not know
-by the same rule and with the same consequence. Both are worth singling out
-because the general rule is refusal — a misspelt operator is `unsupported
-operator "$typo"`, a bad sort direction and a bad `$size` are each a `400` —
-so a `200` here reads as an answer rather than as a mistake. Send the code
-rather than the alias wherever the spelling is not being read by a person.
+**An unknown alias is refused, as an unknown code is.** `{"$type": "boolean"}`
+is a `400` — `unknown $type alias "boolean"`, followed by the aliases there
+are — as `{"$type": 999}` is a `400` naming the code. Names are
+**case-sensitive and exactly as spelled above**, so `"Int"` and `"bindata"`
+are each refused too. An empty result therefore means that nothing is that
+type, and never that the spelling was wrong. The aliases are the names a
+stored value can report, which include `symbol` and `dbPointer`, plus
+`number`. [`$options`](#regex-compatibility) is checked the same way: a flag
+other than `i`, `m`, `s` and `x` is a `400`. Earlier releases accepted both,
+and matched nothing, or compiled without the flag.
 
 **The quoted slot in `unsupported operator "…"` holds the operator and nothing
 else**, as the request spelled it, so a client can match or log it. Where there
@@ -695,17 +694,21 @@ Patterns are compiled with the Rust [`regex`](https://docs.rs/regex) crate,
 The tradeoff is deliberate: `regex` guarantees linear-time matching, so a
 pathological pattern cannot become a denial of service against the database.
 
-An invalid pattern **matches nothing** rather than failing the query — a single
-bad pattern in an `$or` should not take down the whole request.
+A pattern the engine cannot use is a **`400`**, naming the pattern and what is
+wrong with it, before any document is read: an unclosed group, and also a
+backreference or a lookahead, which are not supported. `$options` must be a
+string. Earlier releases let an invalid pattern match nothing, and ignored an
+`$options` that was not a string, so a bad pattern inside an `$or` returned a
+plausible result with one branch silently gone.
 
-**`$options` is read flag by flag, and a flag it does not know is dropped
-silently.** The four above are the whole set; anything else in the string is
-passed over and the pattern compiles without it. That is the same shape as a
-misspelt [`$type` alias](#type), and it bites the same way: `$options` is
-case-sensitive, so `"I"` is not `"i"` — `{"$regex": "S", "$options": "I"}`
-answers `200` having compiled a *case-sensitive* pattern, and finds none of
-the `"s"` a caller expected it to. `"iz"` sets `i` and swallows the `z`.
-There is no refusal to notice, so check the flags rather than the result.
+**A flag other than `i`, `m`, `s` and `x` is refused.** The four above are the
+whole set, and any other character in `$options` — or in the flags of a regex
+literal, or in a lone `$options` — is a `400` naming it, before any document is
+read: `{"$regex": "S", "$options": "I"}` fails on the `I`, because `$options`
+is case-sensitive. Earlier releases dropped an unknown flag and the pattern
+compiled without it, so `"I"` returned a case-sensitive result and `"iz"`
+swallowed the `z`. This is the same rule as for an unknown
+[`$type` alias](#type).
 
 ---
 
