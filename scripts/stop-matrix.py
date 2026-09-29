@@ -57,6 +57,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -468,9 +469,22 @@ def pair_and_compare(baseline_results, head_results):
     return worst_delta
 
 
+def build_label(role, binary):
+    """`role`, the version and the commit the binary reports, so the tables say
+    what actually ran: `baseline 0.42.0 2968407d04c2`. `kimmyd --version`
+    prints `kimmyd 0.42.0 (2968407d04c2 2026-09-29)`; a binary that does not
+    answer that way is labelled by its role alone."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return role
+    match = re.match(r"kimmyd (\S+) \((\S+) ", out)
+    return f"{role} {match.group(1)} {match.group(2)}" if match else role
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--baseline-bin", required=True, help="release kimmyd built from v0.41.0")
+    p.add_argument("--baseline-bin", required=True, help="release kimmyd built from the version to compare against")
     p.add_argument("--head-bin", required=True, help="release kimmyd built from this branch's head")
     p.add_argument("--trials", type=int, default=24, help="total trials per build, split across targets")
     p.add_argument("--walk-row-ms", type=int, default=25)
@@ -485,8 +499,12 @@ def main():
         args.seed = random.SystemRandom().randrange(2**32)
     print(f"seed: {args.seed}", file=sys.stderr)
 
+    baseline_label = build_label("baseline", args.baseline_bin)
+    head_label = build_label("head", args.head_bin)
+    print(f"baseline: {baseline_label}\nhead: {head_label}", file=sys.stderr)
+
     all_results = {}
-    for label, binary in [("v0.41.0", args.baseline_bin), ("this change", args.head_bin)]:
+    for label, binary in [(baseline_label, args.baseline_bin), (head_label, args.head_bin)]:
         print(f"\n### {label}: {args.trials} trials ###", file=sys.stderr)
         results = run_matrix(
             binary, label, args.trials, args.walk_row_ms, args.serve_walk_ms, args.seed_batches, args.seed
@@ -501,10 +519,10 @@ def main():
         if bad_exits or aborted or dirty_restarts:
             failed = True
 
-    baseline_worst = worsts.get("v0.41.0", 0.0)
-    head_worst = worsts.get("this change", 0.0)
+    baseline_worst = worsts.get(baseline_label, 0.0)
+    head_worst = worsts.get(head_label, 0.0)
     print(
-        f"\n== worst stop time: baseline {baseline_worst:.3f}s, head {head_worst:.3f}s "
+        f"\n== worst stop time: {baseline_label} {baseline_worst:.3f}s, {head_label} {head_worst:.3f}s "
         f"(epsilon {STOP_TIME_EPSILON_S}s) =="
     )
 
@@ -513,7 +531,7 @@ def main():
     # and not the other's can move a group's worst or its average without
     # either build actually being slower to stop, and a shared seed makes
     # comparing like-for-like free.
-    worst_pair_delta = pair_and_compare(all_results.get("v0.41.0", []), all_results.get("this change", []))
+    worst_pair_delta = pair_and_compare(all_results.get(baseline_label, []), all_results.get(head_label, []))
     if worst_pair_delta > STOP_TIME_EPSILON_S:
         print(f"FAIL: the worst same-offset pair regressed by {worst_pair_delta:.3f}s, past epsilon")
         failed = True
