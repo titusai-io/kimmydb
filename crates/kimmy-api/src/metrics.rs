@@ -1968,7 +1968,7 @@ fn render_sync_serve(out: &mut String, serve: &kimmy_storage::ServeSnapshot) {
     let _ = writeln!(out, "kimmy_sync_serve_walk_seconds_count {}", serve.windows);
     let _ = writeln!(
         out,
-        "# HELP kimmy_sync_serve_walk_path_total Windows this node served, by the kind of request that asked (serve: a peer's pull; push: the push a schema change's confirmation makes) and the path that read them. keys: from the keys of the arrival index, reading a body only for an entry served or withheld, which is what a request that names what the peer holds takes. linear: the whole oplog, which a request that names nothing held always takes. fallback_length and fallback_missing_body: the key walk found the oplog and its arrival index disagreeing, and the linear walk answered instead; fallback_verified: the open's verification found their key sets different, so every window is read linearly until a restart. A nonzero fallback is a bug or damage and is logged.\n\
+        "# HELP kimmy_sync_serve_walk_path_total Windows this node served, by the kind of request that asked (serve: a peer's pull; push: the push a schema change's confirmation makes) and the path that read them. keys: from the keys of the arrival index, reading a body only for an entry served or withheld, which is what a request that names what the peer holds takes. linear: the whole oplog, which a request that names nothing held always takes. fallback_length and fallback_missing_body: the key walk found the oplog and its arrival index disagreeing (a different number of rows, or a key with no body or one that could not be read), and the linear walk answered instead. A nonzero fallback is a bug or damage and is logged.\n\
          # TYPE kimmy_sync_serve_walk_path_total counter"
     );
     for walk in kimmy_storage::ServeWalk::ALL {
@@ -2260,7 +2260,7 @@ mod tests {
             serve: kimmy_storage::ServeSnapshot {
                 // Distinct per walk and path, so a count rendered under
                 // another label cannot match.
-                paths: [[300, 301, 302, 303, 304], [310, 311, 312, 313, 314]],
+                paths: [[300, 301, 302, 303], [310, 311, 312, 313]],
                 windows: 1_201,
                 entries: 1_202,
                 passed: 1_203,
@@ -3015,18 +3015,16 @@ kimmy_sync_serve_walk_seconds_bucket{le=\"30\"} 1200
 kimmy_sync_serve_walk_seconds_bucket{le=\"+Inf\"} 1201
 kimmy_sync_serve_walk_seconds_sum 2.5
 kimmy_sync_serve_walk_seconds_count 1201
-# HELP kimmy_sync_serve_walk_path_total Windows this node served, by the kind of request that asked (serve: a peer's pull; push: the push a schema change's confirmation makes) and the path that read them. keys: from the keys of the arrival index, reading a body only for an entry served or withheld, which is what a request that names what the peer holds takes. linear: the whole oplog, which a request that names nothing held always takes. fallback_length and fallback_missing_body: the key walk found the oplog and its arrival index disagreeing, and the linear walk answered instead; fallback_verified: the open's verification found their key sets different, so every window is read linearly until a restart. A nonzero fallback is a bug or damage and is logged.
+# HELP kimmy_sync_serve_walk_path_total Windows this node served, by the kind of request that asked (serve: a peer's pull; push: the push a schema change's confirmation makes) and the path that read them. keys: from the keys of the arrival index, reading a body only for an entry served or withheld, which is what a request that names what the peer holds takes. linear: the whole oplog, which a request that names nothing held always takes. fallback_length and fallback_missing_body: the key walk found the oplog and its arrival index disagreeing (a different number of rows, or a key with no body or one that could not be read), and the linear walk answered instead. A nonzero fallback is a bug or damage and is logged.
 # TYPE kimmy_sync_serve_walk_path_total counter
 kimmy_sync_serve_walk_path_total{path=\"keys\",walk=\"serve\"} 300
 kimmy_sync_serve_walk_path_total{path=\"linear\",walk=\"serve\"} 301
 kimmy_sync_serve_walk_path_total{path=\"fallback_length\",walk=\"serve\"} 302
 kimmy_sync_serve_walk_path_total{path=\"fallback_missing_body\",walk=\"serve\"} 303
-kimmy_sync_serve_walk_path_total{path=\"fallback_verified\",walk=\"serve\"} 304
 kimmy_sync_serve_walk_path_total{path=\"keys\",walk=\"push\"} 310
 kimmy_sync_serve_walk_path_total{path=\"linear\",walk=\"push\"} 311
 kimmy_sync_serve_walk_path_total{path=\"fallback_length\",walk=\"push\"} 312
 kimmy_sync_serve_walk_path_total{path=\"fallback_missing_body\",walk=\"push\"} 313
-kimmy_sync_serve_walk_path_total{path=\"fallback_verified\",walk=\"push\"} 314
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the

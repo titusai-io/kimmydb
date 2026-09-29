@@ -483,10 +483,11 @@ fn the_oplog_and_its_arrival_index_hold_the_same_keys() {
 
 /// The open's verification walk reads the arrival index's keys in step with
 /// the oplog's, so a pair the two counts cannot see (a row missing from the
-/// index, a stray key in its place) turns the key walk off for the process, and
-/// every window is then read linearly and counted `fallback_verified`.
+/// index, a stray key in its place) is found, and **repaired in that open**:
+/// both arrival tables are rebuilt from the oplog before the record is written,
+/// and the key walk then reads the right window.
 #[test]
-fn the_verification_walk_finds_a_pair_the_counts_cannot_see_and_turns_the_key_walk_off() {
+fn the_verification_walk_repairs_a_pair_the_counts_cannot_see_before_it_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kimmy.redb");
     let rows: Vec<Row> =
@@ -494,7 +495,6 @@ fn the_verification_walk_finds_a_pair_the_counts_cannot_see_and_turns_the_key_wa
     {
         let engine = Engine::open(&path).unwrap();
         write(&engine, &rows);
-        assert!(!engine.arrival_suspect(), "a sound store is not suspect");
         // A row missing from the index and a stray key in the index: the two
         // counts still agree.
         let txn = engine.begin_write(WriterHolder::Write).unwrap();
@@ -510,24 +510,139 @@ fn the_verification_walk_finds_a_pair_the_counts_cannot_see_and_turns_the_key_wa
     }
 
     // A start that skips the walk (the record says the vector is verified)
-    // cannot see it: this is the limit the property test and the walk cover.
-    let quiet = Engine::open(&path).unwrap();
-    assert!(!quiet.arrival_suspect(), "the walk is skipped when the vector is verified");
-    quiet.close().unwrap();
-
-    // A start that walks does, and serves linearly from then on.
+    // cannot see it: the property test and the walk cover that, and the walk
+    // runs after a schema change, a restore, or with the variable set.
+    // A start that walks finds it and repairs it.
     let engine = crate::verified::test_support::forcing(|| Engine::open(&path).unwrap());
-    assert!(engine.arrival_suspect(), "the walk found the two key sets different");
-    let held = held_of(&[Some(10), Some(10), Some(10), None]);
-    let before = engine.serve_cost();
-    let served = engine.serve_entries_to_peer(Hlc::ZERO, 1000, Some(&held), &[], None).unwrap();
-    let after = engine.serve_cost();
-    let slot = |s: &crate::ServeSnapshot, p: WalkPath| s.paths[ServeWalk::Serve.slot()][p.slot()];
-    assert_eq!(
-        slot(&after, WalkPath::FallbackVerified) - slot(&before, WalkPath::FallbackVerified),
-        1
+    let txn = engine.db().begin_read().unwrap();
+    let oplog_keys: Vec<Vec<u8>> =
+        redb::ReadableTable::iter(&txn.open_table(tables::OPLOG).unwrap())
+            .unwrap()
+            .map(|r| r.unwrap().0.value().to_vec())
+            .collect();
+    let index_keys: Vec<Vec<u8>> =
+        redb::ReadableTable::iter(&txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap())
+            .unwrap()
+            .map(|r| r.unwrap().0.value().to_vec())
+            .collect();
+    assert_eq!(index_keys, oplog_keys, "the index is the oplog's");
+    drop(txn);
+    assert!(engine.version_vector_verified().unwrap().is_some(), "and the record is written");
+
+    // The key walk now reads what the linear one does, and the row the index
+    // lost is served.
+    let ask = Ask {
+        from: Hlc::ZERO,
+        limit: 1000,
+        held: held_of(&[Some(10), Some(10), Some(10), None]),
+        marked: vec![],
+        rows: None,
+    };
+    let (linear, keys) = both(&engine, &ask);
+    let keys = keys.expect("the repaired index is read by the key walk");
+    assert_eq!(keys.window, linear.window);
+    assert!(keys.window.entries.iter().any(|e| e.stamp == stamp_of(&rows[20])));
+}
+
+/// A walk whose index cannot be read is not a failed serve: the oplog can, so
+/// the linear walk answers and the fallback is counted. Here a key of the index
+/// that does not decode, with the counts made equal by a row missing elsewhere.
+#[test]
+fn an_index_key_that_cannot_be_read_falls_back_and_serves() {
+    let (engine, _dir) = engine();
+    let rows: Vec<Row> =
+        (0..30u64).map(|i| Row { origin: (i % 3) as usize, at: i, violation: false }).collect();
+    write(&engine, &rows);
+    let txn = engine.begin_write(WriterHolder::Write).unwrap();
+    {
+        let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+        let key = codec::oplog_key(&stamp_of(&rows[25]));
+        assert!(by_stamp.remove(key.as_slice()).unwrap().is_some());
+        // Too short to be a stamp, and sorting inside the walk's range.
+        by_stamp.insert([0x00u8, 0x01, 0x02].as_slice(), 7u64).unwrap();
+    }
+    txn.commit().unwrap();
+    let ask = Ask {
+        from: Hlc::ZERO,
+        limit: 1000,
+        held: held_of(&[Some(10), Some(10), Some(10), None]),
+        marked: vec![],
+        rows: None,
+    };
+    // The key walk itself fails on the key that does not decode; the serve
+    // answers from the oplog.
+    let txn = engine.db().begin_read().unwrap();
+    let failed = engine.read_oplog_by_arrival_keys_in(
+        &txn,
+        Hlc::ZERO,
+        1000,
+        WalkScope::Request,
+        |s: &Stamp| s.hlc <= ask.held.get(s.node),
+        |_: &OplogEntry| true,
+        None,
     );
-    assert_eq!(slot(&after, WalkPath::Keys), slot(&before, WalkPath::Keys));
-    // It serves the row the index lost, as the linear walk does.
-    assert!(served.entries.iter().any(|e| e.stamp == stamp_of(&rows[20])));
+    assert!(failed.is_err(), "an undecodable index key is the walk's error");
+    drop(txn);
+    let before = engine.serve_cost();
+    let served =
+        engine.serve_entries_to_peer(ask.from, ask.limit, Some(&ask.held), &[], None).unwrap();
+    let after = engine.serve_cost();
+    let expected = {
+        let txn = engine.db().begin_read().unwrap();
+        let passed = Cell::new(0u64);
+        engine
+            .read_oplog_linear_in(
+                &txn,
+                Hlc::ZERO,
+                1000,
+                WalkScope::Background,
+                |s: &Stamp| {
+                    let skip = s.hlc <= ask.held.get(s.node);
+                    passed.set(passed.get() + u64::from(skip));
+                    skip
+                },
+                |e: &OplogEntry| e.kind != OpKind::UniqueViolation,
+                None,
+            )
+            .unwrap()
+    };
+    assert_eq!(served, expected, "the serve is the linear window");
+    let slot = |s: &crate::ServeSnapshot| {
+        s.paths[ServeWalk::Serve.slot()][WalkPath::FallbackMissingBody.slot()]
+    };
+    assert_eq!(slot(&after) - slot(&before), 1);
+}
+
+/// A window re-read to fit its frame is one confirmation push, not two: the
+/// re-walk is not counted. A pull's re-walk is (`served_windows` says so).
+#[test]
+fn a_pushs_frame_refit_is_not_a_second_push_window() {
+    let (engine, _dir) = engine();
+    let rows: Vec<Row> =
+        (0..20u64).map(|i| Row { origin: (i % 2) as usize, at: i, violation: false }).collect();
+    write(&engine, &rows);
+    let held = held_of(&[Some(5), None, None, None]);
+    let pushes = |e: &Engine| e.serve_cost().paths[ServeWalk::Push.slot()];
+    let budget = ExamineBudget::serve();
+    engine
+        .entries_for_peer_within(Hlc::ZERO, 100, Some(&held), WalkScope::Request, budget)
+        .unwrap();
+    assert_eq!(pushes(&engine)[WalkPath::Keys.slot()], 1);
+    engine.entries_for_peer_refit(Hlc::ZERO, 10, Some(&held), WalkScope::Request, budget).unwrap();
+    assert_eq!(pushes(&engine)[WalkPath::Keys.slot()], 1, "the refit is the same push");
+}
+
+/// What a key walk that gave up leaves the linear walk: the time it did not
+/// spend, the rows and the floor as they were.
+#[test]
+fn the_linear_walk_after_a_fallback_has_only_the_time_that_was_left() {
+    let floor = at(5);
+    let budget = Some((ExamineBudget { time: Duration::from_millis(1_500), rows: 77 }, floor));
+    let (left, kept_floor) =
+        crate::sync::after_attempt(budget, Duration::from_millis(600)).unwrap();
+    assert_eq!((left.time, left.rows, kept_floor), (Duration::from_millis(900), 77, floor));
+    // A spent budget stays spent, never negative, and the floor still applies.
+    let (left, _) = crate::sync::after_attempt(budget, Duration::from_secs(9)).unwrap();
+    assert_eq!(left.time, Duration::ZERO);
+    assert!(crate::sync::after_attempt(None, Duration::from_secs(1)).is_none());
 }

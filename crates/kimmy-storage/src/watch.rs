@@ -894,6 +894,12 @@ pub(crate) enum KeyWalkFallback {
     Length,
     /// A key of a row that was not skipped had no body in `OPLOG`.
     MissingBody,
+    /// The walk failed for a reason other than the stop, an error reading the
+    /// index or a key of it that does not decode among them. That is not the
+    /// serve's failure while the oplog can be read directly, so the caller
+    /// answers from the oplog, and if the oplog fails the same way, that is the
+    /// error.
+    Index,
 }
 
 /// One window of the oplog, read from a starting stamp: what the caller keeps,

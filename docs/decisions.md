@@ -21143,9 +21143,10 @@ bounds the rows a window may examine, but the walk still reads every row of the
 oplog to reach each key, and redb stores a value in the leaf page that holds its
 key. So passing over an entry the requester holds costs the page of its body.
 A member that restarted and was quiet is served by every peer from far back in
-stamp order, across everything the cluster wrote since, and round 0430's cold
-restart measured 47 s and about 1.0 GB of reads per peer for 650k rows it held,
-for one document's worth of news.
+stamp order, across everything the cluster wrote since. The 0.42.0 cold probe
+(a cold cache, a live member's store) measured the linear walk at 47 s and about
+1.0 GB of reads per peer over 650k rows the requester held, for one document's
+worth of news.
 
 **Decision.**
 
@@ -21173,20 +21174,45 @@ for one document's worth of news.
   transaction**, with the entries-passed count put back so the abandoned attempt
   is not counted twice. A fallback is logged once per ten minutes and counted.
 - **The open's verification walk reads the two key sets in step** when it walks
-  the oplog, and a difference the counts cannot see turns the key walk off for
-  the process (`fallback_verified`) and is logged at the open. It runs when the
-  vector is not yet verified (ADR-173), which is once per upgrade or unclean
-  stop.
+  the oplog, and a difference the counts cannot see is **repaired in that open**:
+  both arrival tables are rebuilt from the oplog, and only then is the record
+  written (a crash before it leaves the record unwritten, so the next open walks
+  again). It is logged. The walk runs only when the version vector is not
+  already recorded as verified (ADR-173): after a schema change, after a restore
+  (a backup omits the record), or with `KIMMY_VERIFY_OPLOG_AT_OPEN=1`; **not**
+  after an unclean stop. So on a live member the repair rarely runs, and the
+  fallback below is what protects a window served in the meantime. The extra
+  cost is one more key walk of the whole oplog on those opens only: measured
+  cold on a live layout, 89 s and 55,000 reads on top of the `OPLOG` walk.
+- **A key walk that cannot use the index is not a failed serve.** An error
+  reading the index (a storage error, or a key that does not decode) falls back
+  to the linear walk and is counted as a `fallback_missing_body`; an error
+  reading or decoding a *body* is the same error the linear walk would raise,
+  and stays one. The linear walk that follows has **only the time the key walk
+  did not spend**, so a window served on a damaged path stays inside the budget
+  the caller set (the rows and the floor are unchanged).
 - **A metric says which path each window took:**
   `kimmy_sync_serve_walk_path_total{path,walk}`, with `walk` `serve` (a pull) or
-  `push` (a confirmation's push) and `path` `keys`, `linear`, `fallback_length`,
-  `fallback_missing_body` or `fallback_verified`. A push is not in
+  `push` (a confirmation's push) and `path` `keys`, `linear`, `fallback_length`
+  or `fallback_missing_body`. A push is read once and counted once: the re-read
+  that fits it to its frame is not a second window, as a pull's is, because
+  `kimmy_sync_served_windows_total` counts a pull's. A push is not in
   `kimmy_sync_served_windows_total`, so the two kinds are told apart. On the
   OTLP bridge, in the docs, and in the testkit's golden list with the round.
 - **`KIMMY_TEST_SERVE_WALK_PATH=linear|keys`** ships in the binary like the other
   serve-walk switches and logs a `WARN` when set, so a round can time one binary
   on both paths. **The confirmation push takes the key walk too**, because it
   goes through the same function with the same guard and budget.
+
+**What it measured.** On a live member's store, cold, over the newest 650k rows of
+a requester that held everything: the key walk **16.3–16.6 s, 16,712 reads,
+66 MiB**, against the linear walk's **23.5–25.3 s, 79,500 reads, 968 MiB**: about
+15 times fewer bytes and 5 times fewer reads, and **1.4 times the wall time** on
+that rotational disk, where a fragmented store makes each read cost about a
+millisecond. On SSD-class storage the same 16.7k reads take a second or two. A
+compact copy of the same store (restored from a backup, its pages sequential)
+walked in 0.49 s, so what remains is the disk and the store's page layout, not
+the walk.
 
 **Why not the per-origin index of the design note.** It needs a new table, a
 background rebuild, a completeness scheme that survives an older build, and a

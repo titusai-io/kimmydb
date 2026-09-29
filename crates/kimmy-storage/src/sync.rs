@@ -605,6 +605,16 @@ impl MarkedRange {
     }
 }
 
+/// What is left of a window's budget once the key walk that gave up has spent
+/// `spent` of its time. The rows are the linear walk's own count, and the floor
+/// is unchanged, so the window still ends past where it began.
+pub(crate) fn after_attempt(
+    budget: Option<(ExamineBudget, Hlc)>,
+    spent: std::time::Duration,
+) -> Option<(ExamineBudget, Hlc)> {
+    budget.map(|(b, floor)| (ExamineBudget { time: b.time.saturating_sub(spent), ..b }, floor))
+}
+
 impl Engine {
     /// Merge a batch a peer served in answer to `AskEntries`, and record what
     /// the batch proved about coverage.
@@ -848,6 +858,22 @@ impl Engine {
         )
     }
 
+    /// [`Self::entries_for_peer_within`] again, for the same request: the walk a
+    /// window that did not fit its frame is read once more with. Not counted,
+    /// so one confirmation push is one push window (a pull's re-walk is counted,
+    /// as `kimmy_sync_served_windows_total` says it is).
+    pub fn entries_for_peer_refit(
+        &self,
+        from: Hlc,
+        limit: usize,
+        held: Option<&VersionVector>,
+        scope: WalkScope,
+        budget: ExamineBudget,
+    ) -> Result<OplogWindow> {
+        let passed = std::cell::Cell::new(0);
+        self.entries_for_peer_counting(from, limit, held, &[], scope, &passed, Some(budget), None)
+    }
+
     /// [`Self::entries_for_peer_marked`], for a window this node is serving a
     /// peer over the wire, counted as such (ADR-176): the walk's time and the
     /// reads it made, the entries served, and the entries it examined without
@@ -941,15 +967,23 @@ impl Engine {
 
         let txn = self.db().begin_read()?;
         let mut path = WalkPath::Linear;
-        if held.is_some() && self.arrival_suspect() {
-            // The open's verification found the two key sets different, which
-            // the counts inside a walk cannot see: read linearly, and say so.
-            path = WalkPath::FallbackVerified;
-        } else if held.is_some() && !crate::watch::serve_walk_forced_linear() {
+        let mut budget = budget;
+        if held.is_some() && !crate::watch::serve_walk_forced_linear() {
+            let attempted = std::time::Instant::now();
             let before = passed.get();
-            match self
-                .read_oplog_by_arrival_keys_in(&txn, start, limit, scope, skip, keep, budget)?
-            {
+            let tried: Result<std::result::Result<OplogWindow, crate::watch::KeyWalkFallback>> =
+                match self
+                    .read_oplog_by_arrival_keys_in(&txn, start, limit, scope, skip, keep, budget)
+                {
+                    // The stop ends the serve, as it ends the linear walk.
+                    Err(e @ crate::error::StorageError::Stopping(_)) => return Err(e),
+                    // Anything else went wrong reading the derived index (or a body
+                    // the linear walk will meet as well): the oplog answers, and
+                    // says the same thing if it fails the same way.
+                    Err(_) => Ok(Err(crate::watch::KeyWalkFallback::Index)),
+                    Ok(tried) => Ok(tried),
+                };
+            match tried? {
                 Ok(window) => {
                     record(WalkPath::Keys);
                     return Ok(window);
@@ -958,8 +992,13 @@ impl Engine {
                     passed.set(before);
                     path = match why {
                         crate::watch::KeyWalkFallback::Length => WalkPath::FallbackLength,
-                        crate::watch::KeyWalkFallback::MissingBody => WalkPath::FallbackMissingBody,
+                        crate::watch::KeyWalkFallback::MissingBody
+                        | crate::watch::KeyWalkFallback::Index => WalkPath::FallbackMissingBody,
                     };
+                    // The attempt spent part of the window's time; the linear walk
+                    // has what is left, so a window served on the damaged path
+                    // stays inside the budget the caller set.
+                    budget = after_attempt(budget, attempted.elapsed());
                     if served.is_some() && self.serve_counters().fallback_is_due_a_line() {
                         tracing::warn!(
                             reason = path.label(),
