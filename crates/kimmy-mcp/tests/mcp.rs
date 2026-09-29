@@ -946,6 +946,43 @@ async fn find_accepts_the_query_language() {
 }
 
 #[tokio::test]
+async fn a_filter_the_server_cannot_honour_is_refused_here_as_it_is_over_rest() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    let bad_type = server
+        .call(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"total":{"$type":"boolean"}}}),
+        )
+        .await;
+    let message = bad_type["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("boolean"), "the error names the alias: {bad_type}");
+
+    let bad_flag = server
+        .call(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders",
+                   "filter":{"status":{"$regex":"OPEN","$options":"I"}}}),
+        )
+        .await;
+    let message = bad_flag["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("'I'"), "the error names the flag: {bad_flag}");
+
+    let number = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"total":{"$type":"number"}}}),
+        )
+        .await;
+    assert_eq!(number["count"], 3);
+}
+
+#[tokio::test]
 async fn describe_collection_reports_paths_and_types() {
     let server = Server::start().await;
     seed(&server);

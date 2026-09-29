@@ -10215,6 +10215,84 @@ async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
 }
 
 #[tokio::test]
+async fn type_number_finds_every_numeric_type_and_an_unknown_alias_or_flag_is_a_400() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "products" })).await;
+    let docs = "/v1/db/shop/coll/products/docs";
+    for doc in [
+        json!({ "_id": 1, "name": "Gasket", "qty": 4 }),
+        json!({ "_id": 2, "name": "Bolt", "qty": { "$numberLong": "9007199254740993" } }),
+        json!({ "_id": 3, "name": "Washer", "qty": 2.5 }),
+        json!({ "_id": 4, "name": "Spring", "qty": { "$numberDecimal": "1.25" } }),
+        json!({ "_id": 5, "name": "Clip", "qty": "many" }),
+        json!({ "_id": 6, "name": "Pin", "qty": true }),
+        json!({ "_id": 7, "name": "Rivet", "qty": [3, "boxed"] }),
+    ] {
+        let stored = server.post(docs, Some(&token), doc).await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let ids = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/products/find", Some(&token), json!({ "filter": filter }))
+    };
+
+    // `number`: the four numeric types, the array through its element, and
+    // the same through an aggregation `$match`.
+    let number = find(json!({ "qty": { "$type": "number" } })).await;
+    assert_eq!(number.status, 200, "{:?}", number.body);
+    assert_eq!(ids(&number.body), [1, 2, 3, 4, 7]);
+    let listed = find(json!({ "qty": { "$type": ["int", "long", "double", "decimal"] } })).await;
+    assert_eq!(ids(&listed.body), [1, 2, 3, 4, 7]);
+    let matched = server
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$match": { "qty": { "$type": "number" } } }] }),
+        )
+        .await;
+    assert_eq!(matched.status, 200, "{:?}", matched.body);
+    assert_eq!(matched.body["documents"].as_array().unwrap().len(), 5, "{}", matched.body);
+
+    // A type name it has never heard of is refused, naming it; the right
+    // spelling still works.
+    let boolean = find(json!({ "qty": { "$type": "boolean" } })).await;
+    assert_eq!(boolean.status, 400, "{:?}", boolean.body);
+    assert!(boolean.body["message"].as_str().unwrap().contains("boolean"), "{:?}", boolean.body);
+    let bool_alias = find(json!({ "qty": { "$type": "bool" } })).await;
+    assert_eq!(ids(&bool_alias.body), [6]);
+
+    // A regex flag it does not implement is refused, naming it.
+    let flag = find(json!({ "name": { "$regex": "s", "$options": "I" } })).await;
+    assert_eq!(flag.status, 400, "{:?}", flag.body);
+    assert!(flag.body["message"].as_str().unwrap().contains("'I'"), "{:?}", flag.body);
+    let folded = find(json!({ "name": { "$regex": "s", "$options": "i" } })).await;
+    assert_eq!(ids(&folded.body), [1, 3, 4], "{:?}", folded.body);
+    let exact = find(json!({ "name": { "$regex": "s" } })).await;
+    assert_eq!(ids(&exact.body), [1, 3], "{:?}", exact.body);
+
+    // A pattern the engine cannot use, and an `$options` that is not a string,
+    // are refused too, where they used to match nothing or be ignored.
+    let unclosed = find(json!({ "name": { "$regex": "(unclosed" } })).await;
+    assert_eq!(unclosed.status, 400, "{:?}", unclosed.body);
+    assert!(unclosed.body["message"].as_str().unwrap().contains("unclosed"), "{:?}", unclosed.body);
+    let lookahead = find(json!({ "name": { "$regex": "a(?=b)" } })).await;
+    assert_eq!(lookahead.status, 400, "{:?}", lookahead.body);
+    let typed = find(json!({ "name": { "$regex": "s", "$options": 1 } })).await;
+    assert_eq!(typed.status, 400, "{:?}", typed.body);
+    assert!(typed.body["message"].as_str().unwrap().contains("$options"), "{:?}", typed.body);
+}
+
+#[tokio::test]
 async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
     // The value round-trips: `$numberDecimal` in, `$numberDecimal` out, the
     // digits untouched, and `$type` can still find it.

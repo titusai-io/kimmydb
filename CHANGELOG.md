@@ -12,20 +12,52 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-**The replication listener no longer spins on an accept error.** When the
-process ran out of file descriptors (`EMFILE`, `ENFILE`) or memory, the
-replication listener's `accept` failed again at once, because the pending
-connection stayed queued, so the loop ran a core at 100% and delayed the work
-that would have freed the descriptors. It now waits after each such error,
-50 ms at first and doubling to at most one second, and starts over once an
-accept succeeds. It logs a `WARN` that names the OS error number, at most once
-every ten seconds while the errors continue. A peer whose connection went away
-before it was accepted is not the listener's error, so it is neither waited on
-nor counted. The new `kimmy_accept_errors_total{listener}` counts the
-listener's own accept errors on both the `cluster` and the `http` listener;
-both rising together is descriptor exhaustion for the whole process
-([docs/operations.md](docs/operations.md)). The HTTP listener already waited
-50 ms and logged at `ERROR`, and does both as before.
+### Added
+
+- **`kimmy_accept_errors_total{listener}`** counts the accept errors that were
+  a listener's own, on both the `cluster` and the `http` listener; both rising
+  together is descriptor exhaustion for the whole process
+  ([docs/operations.md](docs/operations.md)). A peer whose connection went away
+  before it was accepted is not the listener's error, so it is not counted.
+
+### Changed
+
+- **Breaking: a filter's `$type` alias and `$regex` flag are checked, and an
+  unknown one is a `400`.** `{"$type": "boolean"}`, `{"$type": "Int"}` and
+  `{"$type": []}` returned `200` with no matches, and `{"$regex": "s",
+  "$options": "I"}` compiled the pattern without the flag it did not know;
+  each is now refused at parse, naming the offending alias or flag, as an
+  unknown numeric code already was. The aliases are the names a stored value
+  can report (which include `symbol` and `dbPointer`) and `number`; the flags
+  are `i`, `m`, `s` and `x`, wherever they are written, including in a regex
+  literal and in a `$options` with no `$regex`. Check a stored filter for
+  either before upgrading: one that relied on an unknown alias matching
+  nothing now fails. Names are still case-sensitive.
+- **Breaking: a `$regex` pattern the engine cannot use, and a non-string
+  `$options`, are a `400`.** A pattern with an unclosed group, a backreference
+  or a lookahead (which the engine does not support) used to match nothing,
+  and an `$options` that was not a string was ignored; each is now refused at
+  parse, naming the pattern and the fault. A stored filter that relied on a
+  pattern matching nothing now fails.
+- **`{"$type": "number"}` matches every numeric type.** It is an alias for
+  `double`, `int`, `long` and `decimal`, alone or in an array with other
+  aliases and codes, and one level into arrays like any other `$type`.
+  Until now it matched nothing. `$convert` does not accept it. The documented
+  workaround of listing `int`, `long` and `double` left out `decimal`.
+
+### Fixed
+
+- **The replication listener no longer spins on an accept error.** When the
+  process ran out of file descriptors (`EMFILE`, `ENFILE`) or memory, the
+  replication listener's `accept` failed again at once, because the pending
+  connection stayed queued, so the loop ran a core at 100% and delayed the work
+  that would have freed the descriptors. It now waits after each such error,
+  50 ms at first and doubling to at most one second, and starts over once an
+  accept succeeds. It logs a `WARN` that names the OS error number, at most once
+  every ten seconds while the errors continue. A peer whose connection went away
+  before it was accepted is neither waited on nor counted. The HTTP listener
+  already waited 50 ms and logged at `ERROR`, and does both as before.
+
 
 ## 0.42.0 - 2026-09-29
 
