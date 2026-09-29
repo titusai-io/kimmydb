@@ -39,8 +39,12 @@ pub mod sync;
 pub mod tables;
 pub mod vectors;
 pub mod verified;
+pub mod violations_table;
+#[cfg(test)]
+mod violations_table_tests;
 pub mod walk;
 pub use verified::VerifiedWalk;
+pub use violations_table::{BackfillStep, ViolationsSnapshot};
 pub use walk::WalkScope;
 pub mod watch;
 

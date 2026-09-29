@@ -118,6 +118,8 @@ pub struct StorageReadings {
     pub writer_hold_decomposition: kimmy_storage::HoldDecomposition,
     /// What serving peers' windows has cost this node (ADR-176).
     pub serve: kimmy_storage::ServeSnapshot,
+    /// The unique-violations table's state (ADR-200).
+    pub violations: kimmy_storage::ViolationsSnapshot,
     /// Entries held as state that a sync window released, since start
     /// (`Engine::held_marks_released`, ADR-169's addendum).
     pub held_marks_released: u64,
@@ -284,6 +286,8 @@ pub struct MetricsSnapshot {
     /// Counters only, so the whole of both is on the bridge.
     pub write_lock_hold: kimmy_storage::HoldDecomposition,
     pub sync_serve: kimmy_storage::ServeSnapshot,
+    /// The unique-violations table's state (ADR-200).
+    pub violations: kimmy_storage::ViolationsSnapshot,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -1114,6 +1118,7 @@ impl Metrics {
             write_lock_held_us: readings.writer_hold.sum_us,
             write_lock_hold: readings.writer_hold_decomposition,
             sync_serve: readings.serve,
+            violations: readings.violations,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -1672,6 +1677,7 @@ impl Metrics {
         self.render_backup_duration(&mut out);
         render_sync_pulls(&mut out, &pulls);
         render_sync_serve(&mut out, &readings.serve);
+        render_violations(&mut out, &readings.violations);
         out
     }
 
@@ -1926,6 +1932,31 @@ fn render_hold_decomposition(d: &kimmy_storage::HoldDecomposition) -> String {
         d.cpu_unmeasured
     );
     out
+}
+
+/// The unique-violations table (ADR-200): whether `/violations` reads it, what
+/// the background pass that completes it has read, and which way each call was
+/// answered.
+fn render_violations(out: &mut String, violations: &kimmy_storage::ViolationsSnapshot) {
+    use std::fmt::Write;
+
+    let _ = write!(
+        out,
+        "# HELP kimmy_violations_table_ready 1 when the unique-violations table is complete through the oplog's tail and /violations reads it; 0 while it is being completed after an open that found it behind (an older build wrote in between, or it is new), when /violations walks the oplog instead.\n\
+         # TYPE kimmy_violations_table_ready gauge\n\
+         kimmy_violations_table_ready {}\n\
+         # HELP kimmy_violations_backfill_rows_total Oplog rows the background pass that completes the unique-violations table has read, since start.\n\
+         # TYPE kimmy_violations_backfill_rows_total counter\n\
+         kimmy_violations_backfill_rows_total {}\n\
+         # HELP kimmy_violations_walk_path_total /violations calls, by how they were answered: table, from the unique-violations table; oplog, by walking the retained oplog, which is what a call takes until the table is ready.\n\
+         # TYPE kimmy_violations_walk_path_total counter\n\
+         kimmy_violations_walk_path_total{{path=\"table\"}} {}\n\
+         kimmy_violations_walk_path_total{{path=\"oplog\"}} {}\n",
+        u8::from(violations.ready),
+        violations.backfilled_rows,
+        violations.calls_from_table,
+        violations.calls_from_oplog,
+    );
 }
 
 /// What serving peers' windows has cost this node (ADR-176).
@@ -2269,6 +2300,12 @@ mod tests {
                 read_ns: 3_300_000_000,
                 read_bytes: 1_204,
             },
+            violations: kimmy_storage::ViolationsSnapshot {
+                ready: true,
+                backfilled_rows: 1_401,
+                calls_from_table: 1_402,
+                calls_from_oplog: 1_403,
+            },
         }
     }
 
@@ -2468,6 +2505,16 @@ kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 13
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 14
 kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 18
 kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"30\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"300\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"+Inf\"} 15
+kimmy_write_lock_held_seconds_sum{holder=\"violations\"} 19.5
+kimmy_write_lock_held_seconds_count{holder=\"violations\"} 15
 # HELP kimmy_write_lock_held_component_seconds_total Seconds holds of the storage writer spent, by holder and by what the holding thread was doing. read, write, sync: inside the storage file's page reads, page writes and fsyncs. cpu: on the CPU outside those - B-tree work over cached pages, encoding, index keys, bookkeeping. off_cpu: the rest - off the CPU outside any file call, which is scheduler delay or a wait on a lock inside the storage engine. The five add up to kimmy_write_lock_held_seconds_sum. off_cpu is a residual, so anything the other four fail to capture lands there too; read it beside kimmy_write_lock_held_write_estimated_seconds_total. cpu and off_cpu leave out holds counted in kimmy_write_lock_held_cpu_unmeasured_total.
 # TYPE kimmy_write_lock_held_component_seconds_total counter
 kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"read\"} 0.101
@@ -2530,6 +2577,11 @@ kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"writ
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"sync\"} 1.203
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"cpu\"} 1.204
 kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"off_cpu\"} 1.205
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"read\"} 1.301
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"write\"} 1.302
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"sync\"} 1.303
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"cpu\"} 1.304
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"off_cpu\"} 1.305
 # HELP kimmy_write_lock_held_phase_seconds_total Seconds holds of the storage writer spent, by holder and by where in the transaction. work: from taking the writer to asking to commit, the whole hold of one that aborted. counts: writing the collections' live document counts, once per transaction. commit: the storage engine's commit, its page writes and fsync, to letting go. The three add up to kimmy_write_lock_held_seconds_sum.
 # TYPE kimmy_write_lock_held_phase_seconds_total counter
 kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"work\"} 0.111
@@ -2568,6 +2620,9 @@ kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"commit\"
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"work\"} 1.211
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"counts\"} 1.212
 kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"commit\"} 1.213
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"work\"} 1.311
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"counts\"} 1.312
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"commit\"} 1.313
 # HELP kimmy_write_lock_held_io_bytes_total Bytes holds of the storage writer read from and wrote to the storage file, by holder. Beside the read and write components: more bytes is more pages, and the same bytes in more seconds is slower pages.
 # TYPE kimmy_write_lock_held_io_bytes_total counter
 kimmy_write_lock_held_io_bytes_total{holder=\"write\",io=\"read\"} 1001
@@ -2594,6 +2649,8 @@ kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"read\"} 11001
 kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"write\"} 11002
 kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"read\"} 12001
 kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"write\"} 12002
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"read\"} 13001
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"write\"} 13002
 # HELP kimmy_write_lock_held_write_estimated_seconds_total Seconds of page writes, inside holds of the storage writer, whose CPU time was estimated from a sample rather than read. The most by which cpu and off_cpu in kimmy_write_lock_held_component_seconds_total can be misattributed between each other, in either direction; 0 for a hold of 32 page writes or fewer, which is measured exactly.
 # TYPE kimmy_write_lock_held_write_estimated_seconds_total counter
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"write\"} 0.121
@@ -2608,6 +2665,7 @@ kimmy_write_lock_held_write_estimated_seconds_total{holder=\"expiry\"} 0.921
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"embedding\"} 1.021
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"durability\"} 1.121
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"rewind\"} 1.221
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"violations\"} 1.321
 # HELP kimmy_write_lock_held_overcounted_total Holds of the storage writer whose measured components came to more than the hold, past the clocks' tolerance: something was counted twice. Should read 0; it cannot see a component that was missed, which lands in off_cpu instead.
 # TYPE kimmy_write_lock_held_overcounted_total counter
 kimmy_write_lock_held_overcounted_total{holder=\"write\"} 61
@@ -2622,6 +2680,7 @@ kimmy_write_lock_held_overcounted_total{holder=\"expiry\"} 69
 kimmy_write_lock_held_overcounted_total{holder=\"embedding\"} 70
 kimmy_write_lock_held_overcounted_total{holder=\"durability\"} 71
 kimmy_write_lock_held_overcounted_total{holder=\"rewind\"} 72
+kimmy_write_lock_held_overcounted_total{holder=\"violations\"} 73
 # HELP kimmy_write_lock_held_cpu_unmeasured_total Holds of the storage writer, of any holder, whose thread CPU time could not be read, so they are not in the cpu and off_cpu components. Rises on every hold on a platform without a per-thread CPU clock; 0 on Linux and macOS.
 # TYPE kimmy_write_lock_held_cpu_unmeasured_total counter
 kimmy_write_lock_held_cpu_unmeasured_total 99
@@ -3027,6 +3086,16 @@ kimmy_sync_serve_walk_path_total{path=\"linear\",walk=\"push\"} 311
 kimmy_sync_serve_walk_path_total{path=\"fallback_length\",walk=\"push\"} 312
 kimmy_sync_serve_walk_path_total{path=\"fallback_missing_body\",walk=\"push\"} 313
 kimmy_sync_serve_walk_path_total{path=\"fallback_error\",walk=\"push\"} 314
+# HELP kimmy_violations_table_ready 1 when the unique-violations table is complete through the oplog's tail and /violations reads it; 0 while it is being completed after an open that found it behind (an older build wrote in between, or it is new), when /violations walks the oplog instead.
+# TYPE kimmy_violations_table_ready gauge
+kimmy_violations_table_ready 1
+# HELP kimmy_violations_backfill_rows_total Oplog rows the background pass that completes the unique-violations table has read, since start.
+# TYPE kimmy_violations_backfill_rows_total counter
+kimmy_violations_backfill_rows_total 1401
+# HELP kimmy_violations_walk_path_total /violations calls, by how they were answered: table, from the unique-violations table; oplog, by walking the retained oplog, which is what a call takes until the table is ready.
+# TYPE kimmy_violations_walk_path_total counter
+kimmy_violations_walk_path_total{path=\"table\"} 1402
+kimmy_violations_walk_path_total{path=\"oplog\"} 1403
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -3352,6 +3421,16 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 ));
             }
         }
+        expect(&format!("kimmy_violations_table_ready {}\n", u8::from(s.violations.ready)));
+        expect(&format!("kimmy_violations_backfill_rows_total {}\n", s.violations.backfilled_rows));
+        expect(&format!(
+            "kimmy_violations_walk_path_total{{path=\"table\"}} {}\n",
+            s.violations.calls_from_table
+        ));
+        expect(&format!(
+            "kimmy_violations_walk_path_total{{path=\"oplog\"}} {}\n",
+            s.violations.calls_from_oplog
+        ));
 
         expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
         expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
@@ -3558,6 +3637,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // Windows served, by kind of request and by the path that
                 // read them (ADR-197).
                 + kimmy_storage::ServeWalk::COUNT * kimmy_storage::WalkPath::COUNT
+                // The unique-violations table: ready, backfill rows, and the
+                // two ways a call is answered (ADR-200).
+                + 4
                 + 1,
             "expected one sample per series: {out}"
         );

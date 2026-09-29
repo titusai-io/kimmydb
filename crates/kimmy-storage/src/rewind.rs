@@ -319,16 +319,40 @@ impl Engine {
             // resumed from the wrong place (ADR-173).
             let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            // A violation entry's table row goes with it, and `through` comes
+            // down to the new tail: it may not stand above what the oplog holds
+            // (ADR-200).
+            let mut violations = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
             let mark_before = crate::live_count::mark_of(&arrival, &oplog)?;
             let mut discarded = VersionVector::new();
             for key in doomed {
-                oplog.remove(key.as_slice())?;
+                if let Some(old) = oplog.remove(key.as_slice())? {
+                    let header = codec::decode_oplog_kind_and_collection(old.value());
+                    drop(old);
+                    if let Ok((kimmy_core::OpKind::UniqueViolation, collection)) = header {
+                        violations.remove(
+                            crate::violations_table::row_key(collection, key.as_slice()).as_slice(),
+                        )?;
+                    }
+                }
                 held.remove(key.as_slice())?;
                 if let Some(seq) = by_stamp.remove(key.as_slice())? {
                     arrival.remove(seq.value())?;
                 }
                 discarded.observe(codec::decode_oplog_key(&key)?);
                 outcome.oplog_discarded += 1;
+            }
+            if let Some(through) = crate::violations_table::through_of(&violations)? {
+                let tail = oplog.last()?.map(|(k, _)| k.value().to_vec());
+                match tail {
+                    Some(tail) if tail.as_slice() < through.as_slice() => {
+                        violations.insert(crate::violations_table::SENTINEL, tail.as_slice())?;
+                    }
+                    None => {
+                        violations.remove(crate::violations_table::SENTINEL)?;
+                    }
+                    _ => {}
+                }
             }
             // In the same transaction as the removal: a change stream may have
             // delivered what was just discarded, and a token naming it has to

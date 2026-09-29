@@ -228,6 +228,18 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// carries [`VECTOR_VERIFIED`] either.
 pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
 
+/// `collection id (8) || stamp key (26) -> ()`: one row per retained
+/// `UniqueViolation` oplog entry, so `/violations` reads its own records and not
+/// the whole oplog (ADR-200, `crate::violations_table`). The one-byte key
+/// `[0x00]` is the sentinel and holds `through`, a stamp key: every violation
+/// entry at or below it is in the table.
+///
+/// Node-local and derived from the oplog, absent from a backup: a restored store
+/// has no table and no sentinel, and backfills. **Its redb key and value types
+/// must never change**, for the reason [`VECTOR_VERIFIED`] gives.
+pub const UNIQUE_VIOLATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("unique_violations");
+
 /// `"verified" -> I_EPOCH ‖ schema ‖ rows ‖ logical bytes ‖ elapsed ms`: the
 /// record that the version vector covers the oplog (invariant I), so
 /// `Engine::open` need not walk the oplog to raise it (`crate::verified`).

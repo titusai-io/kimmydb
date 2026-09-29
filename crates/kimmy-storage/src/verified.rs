@@ -940,29 +940,41 @@ mod tests {
     // --- (e) the guard ---
 
     /// Tables whose writers invariant I depends on.
-    const WATCHED: [&str; 4] = [
+    const WATCHED: [&str; 5] = [
         "tables::OPLOG",
         "tables::OPLOG_VERSIONS",
         "tables::OPLOG_HELD",
         "tables::OPLOG_WITNESSED",
+        // The violations table (ADR-200) is written wherever an oplog row that
+        // it describes is: the same functions are audited for it. Two waivers:
+        // `migrate.rs`'s `rewrite_oplog` rewrites values only and keeps every
+        // key, so no row of the table changes; and a backup restore writes a
+        // fresh file, which has no table and no sentinel, so it backfills.
+        "tables::UNIQUE_VIOLATIONS",
     ];
 
     /// What may be called on a watched table without changing it.
     const READERS: [&str; 7] = ["get", "iter", "range", "len", "is_empty", "first", "last"];
 
     /// The writers audited for I, as (file, function). `faults.rs` is test
-    /// and `test-hooks` code as a whole, and `key_walk_tests.rs` is test code
-    /// that damages the store on purpose to show what the key walk does about
-    /// it, so both are exempt as files.
-    const AUDITED_FILES: [&str; 2] = ["faults.rs", "key_walk_tests.rs"];
-    const AUDITED_FNS: [(&str, &str); 10] = [
+    /// and `test-hooks` code as a whole. `key_walk_tests.rs` is test code that
+    /// damages the store on purpose to show what the key walk does about it, and
+    /// `violations_table_tests.rs` writes the violations table to build the stores
+    /// its tests read, so all three are exempt as files.
+    const AUDITED_FILES: [&str; 3] =
+        ["faults.rs", "key_walk_tests.rs", "violations_table_tests.rs"];
+    const AUDITED_FNS: [(&str, &str); 14] = [
         ("engine.rs", "append_oplog_at"),
+        ("engine.rs", "decide_violations_ready"),
+        ("violations_table.rs", "record_violations_backfill"),
+        ("violations_table.rs", "advance_violations_through"),
         ("engine.rs", "raise_version"),
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
         ("engine.rs", "reset_version_vector_to_oplog"),
         ("gc.rs", "remove_oplog_entries"),
+        ("gc.rs", "trim_violation_rows"),
         ("rewind.rs", "rewind_to"),
         ("backup.rs", "restore_with"),
         ("migrate.rs", "rewrite_oplog"),

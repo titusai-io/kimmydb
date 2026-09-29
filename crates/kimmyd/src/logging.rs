@@ -320,6 +320,12 @@ impl TelemetryGuard {
             WriterHolder::Rewind,
             "a rewind to a point in time, which runs only in a process that never serves"
         );
+        held_by!(
+            "kimmy.write_lock.held_seconds.violations",
+            "kimmy.write_lock.holds.violations",
+            WriterHolder::Violations,
+            "the short write that records what a scan of the oplog found for the unique-violations table"
+        );
         // What each holder's holds were made of (ADR-176): every column of
         // `kimmy_write_lock_held_{component,phase}_seconds_total`,
         // `_io_bytes_total`, `_write_estimated_seconds_total` and
@@ -840,6 +846,34 @@ impl TelemetryGuard {
             "By",
             "Bytes the walks behind served windows read from the storage file.",
             |s| s.sync_serve.read_bytes
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.violations.table_ready",
+            "{state}",
+            "1 when the unique-violations table is complete and /violations reads it; 0 while it is being completed and calls walk the oplog.",
+            |s| u64::from(s.violations.ready)
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.violations.backfill_rows",
+            "{row}",
+            "Oplog rows the background pass that completes the unique-violations table has read.",
+            |s| s.violations.backfilled_rows
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.violations.walk_path.table",
+            "{call}",
+            "/violations calls answered from the unique-violations table.",
+            |s| s.violations.calls_from_table
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.violations.walk_path.oplog",
+            "{call}",
+            "/violations calls answered by walking the retained oplog.",
+            |s| s.violations.calls_from_oplog
         );
         observe!(
             u64_observable_counter,

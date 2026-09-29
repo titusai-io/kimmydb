@@ -2556,8 +2556,55 @@ fn spawn_collector(
         // pass is the only schedule under which the writer is guaranteed a
         // full interval free between passes. It also means nothing collects
         // during start-up, while the node is still opening for business.
+        // The unique-violations table is completed here when the open found it
+        // behind (ADR-200), **interleaved with the passes and never before
+        // them**: a step reads a bounded stretch of the oplog outside the writer
+        // and takes the writer only to record what it found, and a pass that is
+        // due runs between two steps, so a long backfill cannot hold retention
+        // off. A stop ends the backfill; an error is logged and leaves
+        // `/violations` on the oplog walk until the next start.
+        let mut backfilling = !engine.violations_table_ready();
+        let mut next_pass = tokio::time::Instant::now() + interval;
         loop {
-            tokio::time::sleep(interval).await;
+            if backfilling {
+                let step = kimmy_storage::blocking(|| {
+                    engine.violations_backfill_step(kimmy_storage::ExamineBudget::serve())
+                });
+                match step {
+                    Ok(step) if step.done => {
+                        backfilling = false;
+                        info!(
+                            rows = engine.violations_snapshot().backfilled_rows,
+                            "the unique-violations table is complete"
+                        );
+                    }
+                    Ok(_) => {
+                        // A pause between steps, ended early by a pass coming
+                        // due, so the pass is not delayed by it.
+                        tokio::time::sleep_until(
+                            next_pass.min(tokio::time::Instant::now() + Duration::from_millis(50)),
+                        )
+                        .await;
+                    }
+                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                        debug!(%reason, "the violations backfill ended: this node is shutting down");
+                        backfilling = false;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "completing the unique-violations table failed; /violations walks the \
+                             oplog until the next start"
+                        );
+                        backfilling = false;
+                    }
+                }
+                if tokio::time::Instant::now() < next_pass {
+                    continue;
+                }
+            } else {
+                tokio::time::sleep_until(next_pass).await;
+            }
             let started = std::time::Instant::now();
             // A pass reads whole tables; on a cold cache that is minutes of
             // disk, and a worker thread must not be held for it.
@@ -2589,6 +2636,7 @@ fn spawn_collector(
                      runs a full interval after this one finished"
                 );
             }
+            next_pass = tokio::time::Instant::now() + interval;
         }
     }))
 }

@@ -1325,6 +1325,134 @@ impl Engine {
         if !coll.indexes.iter().any(|i| i.unique && asked(&i.name)) {
             return Ok(Vec::new());
         }
+        // Ready, the answer comes from the table (ADR-200): this collection's
+        // own violation records, and not one pass over the whole oplog through
+        // redb's page cache. Not ready (a backfill still running, or the table
+        // never built), the oplog walk below, which is also what the table's
+        // tests compare it against.
+        if self.violations_table_ready() && !crate::violations_table::test_forces_oplog() {
+            self.violations().note_call(true);
+            return self.live_unique_violations_from_table(coll, index, scope);
+        }
+        self.violations().note_call(false);
+        self.live_unique_violations_from_oplog(coll, index, scope)
+    }
+
+    /// Re-evaluate each recorded collision against the documents as they are
+    /// now, keeping the ones still standing: the part of the route that does not
+    /// depend on where the records were found.
+    fn standing_from(
+        &self,
+        coll: &CollectionMeta,
+        index: Option<&str>,
+        details: Vec<kimmy_core::UniqueViolationDetail>,
+        seen: &mut std::collections::BTreeSet<(String, Vec<String>)>,
+        reported: &mut std::collections::BTreeSet<(String, Vec<String>)>,
+        out: &mut Vec<kimmy_core::UniqueViolationDetail>,
+    ) -> Result<()> {
+        let asked = |name: &str| index.is_none_or(|wanted| wanted == name);
+        // Outside any read transaction: re-evaluating a record reads the
+        // documents it names, each in a transaction of its own.
+        for detail in details {
+            if detail.ids.is_empty() || !asked(&detail.index) {
+                continue;
+            }
+            if !seen.insert((detail.index.clone(), id_set(&detail.ids))) {
+                continue;
+            }
+            if let Some(standing) = self.standing_members(coll, &detail)?
+                && reported.insert((standing.index.clone(), id_set(&standing.ids)))
+            {
+                out.push(standing);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::live_unique_violations`] from the violations table: one range
+    /// over `(collection, stamp)` keys, a point read of each entry's value, its
+    /// header checked (kind and collection) before anything is decoded, and a
+    /// row whose entry is gone or is not this collection's violation skipped.
+    fn live_unique_violations_from_table(
+        &self,
+        coll: &CollectionMeta,
+        index: Option<&str>,
+        scope: WalkScope,
+    ) -> Result<Vec<kimmy_core::UniqueViolationDetail>> {
+        use std::ops::Bound;
+        // Violation records per read transaction: they are rare, so a page is
+        // short, and the transaction never sits on a long range.
+        const PAGE: usize = 1_024;
+        let mut out = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
+        let mut reported: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
+        let first = crate::violations_table::row_key(coll.id, &[0u8; codec::STAMP_LEN]);
+        let last_possible = crate::violations_table::row_key(coll.id, &[0xFFu8; codec::STAMP_LEN]);
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let mut details = Vec::new();
+            let mut rows = 0usize;
+            let mut last = None;
+            {
+                let txn = self.db().begin_read()?;
+                let oplog = open_walk_table(&txn, tables::OPLOG, self.walk(scope))?;
+                let table = open_walk_table(&txn, tables::UNIQUE_VIOLATIONS, self.walk(scope))?;
+                let lower = match &after {
+                    Some(after) => Bound::Excluded(after.as_slice()),
+                    None => Bound::Included(first.as_slice()),
+                };
+                let range = (lower, Bound::Included(last_possible.as_slice()));
+                for row in table.range::<&[u8]>(range)? {
+                    let (row_key, _) = row?;
+                    rows += 1;
+                    last = Some(row_key.value().to_vec());
+                    let Some(stamp) = crate::violations_table::stamp_of(row_key.value()) else {
+                        continue;
+                    };
+                    // Collected since, by a build that does not remove the
+                    // row: the entry is gone and there is nothing to report.
+                    let Some(value) = oplog.get(stamp)? else {
+                        if rows >= PAGE {
+                            break;
+                        }
+                        continue;
+                    };
+                    // The header first: a row whose entry is not this
+                    // collection's violation is skipped, never decoded.
+                    let named = matches!(
+                        codec::decode_oplog_kind_and_collection(value.value()),
+                        Ok((OpKind::UniqueViolation, id)) if id == coll.id
+                    );
+                    if named {
+                        let entry = codec::decode_oplog_entry(value.value())?;
+                        if let Some(body) = &entry.body {
+                            details.push(bson::deserialize_from_slice(body)?);
+                        }
+                    }
+                    if rows >= PAGE {
+                        break;
+                    }
+                }
+            }
+            self.standing_from(coll, index, details, &mut seen, &mut reported, &mut out)?;
+            match last {
+                Some(last) if rows >= PAGE => after = Some(last),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Self::live_unique_violations`] by the oplog walk: every retained
+    /// `UniqueViolation` entry for this collection, found by reading the whole
+    /// oplog's headers a page at a time. The fallback while the table is not
+    /// ready, and the reference the table is tested against.
+    pub(crate) fn live_unique_violations_from_oplog(
+        &self,
+        coll: &CollectionMeta,
+        index: Option<&str>,
+        scope: WalkScope,
+    ) -> Result<Vec<kimmy_core::UniqueViolationDetail>> {
         // Rows examined per read transaction. Only the entries this pass wants
         // are decoded, so a page costs its matches, not its rows.
         const PAGE: usize = 16_384;
@@ -1352,7 +1480,7 @@ impl Engine {
                         // The kind and collection sit in the entry's fixed
                         // header: every other collection's writes, and every
                         // document write of this one, are judged on it without
-                        // decoding the body — which is what the pass reads
+                        // decoding the body, which is what the pass reads
                         // almost all of the time.
                         let (kind, collection) =
                             codec::decode_oplog_kind_and_collection(value.value())?;
@@ -1370,21 +1498,7 @@ impl Engine {
                     }
                 }
             }
-            // Outside the read transaction: re-evaluating a record reads the
-            // documents it names, each in a transaction of its own.
-            for detail in details {
-                if detail.ids.is_empty() || !asked(&detail.index) {
-                    continue;
-                }
-                if !seen.insert((detail.index.clone(), id_set(&detail.ids))) {
-                    continue;
-                }
-                if let Some(standing) = self.standing_members(coll, &detail)?
-                    && reported.insert((standing.index.clone(), id_set(&standing.ids)))
-                {
-                    out.push(standing);
-                }
-            }
+            self.standing_from(coll, index, details, &mut seen, &mut reported, &mut out)?;
             let Some(last) = last else { break };
             if examined < PAGE {
                 break;
@@ -2766,6 +2880,9 @@ mod tests {
     #[test]
     fn a_question_no_unique_index_can_answer_is_answered_without_reading_the_oplog() {
         let (engine, plain, _dir) = engine();
+        // The walk of the oplog is what reads the row; the table is asked
+        // separately below.
+        engine.violations().clear_ready_for_test();
         engine.create_collection("app", "unique").unwrap();
         engine.create_index("app", "unique", vec![field("email")], true, None).unwrap();
         let unique = engine.get_collection("app", "unique").unwrap();

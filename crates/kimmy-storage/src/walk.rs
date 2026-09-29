@@ -554,6 +554,33 @@ mod tests {
             for n in [1, 4, 7] {
                 assert!(engine.delete(&orders, &kimmy_core::DocId::Int64(n)).unwrap());
             }
+            // A standing unique violation, for the violations walks.
+            let field = |path: &str| crate::IndexField { path: path.into(), descending: false };
+            engine
+                .create_index_with(
+                    "shop",
+                    "orders",
+                    vec![field("u")],
+                    true,
+                    Default::default(),
+                    Some("by_u".into()),
+                    None,
+                    Some(doc! { "u": { "$gt": 0 } }),
+                )
+                .unwrap();
+            let orders = engine.get_collection("shop", "orders").unwrap();
+            engine.insert(&orders, doc! { "_id": 100, "u": 1 }).unwrap();
+            let clash = kimmy_core::OplogEntry {
+                stamp: kimmy_core::Stamp::new(
+                    Hlc::new(u64::MAX >> 20, 0),
+                    kimmy_core::NodeId::from_bytes([9; 16]),
+                ),
+                kind: kimmy_core::OpKind::Insert,
+                collection: orders.id,
+                doc_id: Some(kimmy_core::DocId::Int64(101)),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": 101, "u": 1 }).unwrap()),
+            };
+            assert!(engine.apply_remote(&orders, &clash).unwrap());
             let field = |path: &str| crate::IndexField { path: path.into(), descending: false };
             engine
                 .create_index("shop", "orders", vec![field("_id")], true, Some("by_n".into()))
@@ -612,6 +639,15 @@ mod tests {
                 .map(drop)
         }
         let background: &[(&str, Walk)] = &[
+            // covers: violations_table::Engine::violations_backfill_scan
+            ("violations_backfill_step", |e, _| {
+                e.violations().clear_ready_for_test();
+                let budget = crate::watch::ExamineBudget {
+                    time: std::time::Duration::from_secs(3_600),
+                    rows: u64::MAX,
+                };
+                e.violations_backfill_step(budget).map(drop)
+            }),
             // covers: watch::Engine::read_oplog_linear_in
             ("serve_entries_to_peer", |e, _| {
                 e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[], None).map(drop)
@@ -661,8 +697,14 @@ mod tests {
             }),
             // covers: docs::Engine::for_each_record_after
             ("count", |e, c| e.count(c, WalkScope::Request).map(drop)),
-            // covers: docs::Engine::live_unique_violations
+            // covers: docs::Engine::live_unique_violations_from_table
             ("live_unique_violations", |e, c| {
+                assert!(e.violations_table_ready());
+                e.live_unique_violations(c, None, WalkScope::Request).map(drop)
+            }),
+            // covers: docs::Engine::live_unique_violations_from_oplog
+            ("live_unique_violations (oplog)", |e, c| {
+                e.violations().clear_ready_for_test();
                 e.live_unique_violations(c, None, WalkScope::Request).map(drop)
             }),
             // covers: watch::Engine::read_oplog_linear_in
@@ -709,7 +751,7 @@ mod tests {
         ];
         // The walks that write when they finish, so each stop needs a store
         // the last run did not change.
-        let writes = ["collect_garbage", "a client's index build"];
+        let writes = ["collect_garbage", "a client's index build", "violations_backfill_step"];
         for (scope, walks) in [(WalkScope::Background, background), (WalkScope::Request, request)] {
             for (name, walk) in walks {
                 let rows = every_row::assert_stops_at_every_row(

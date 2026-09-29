@@ -41,10 +41,13 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Request scans of documents and of the oplog.
     "docs::Engine::for_each_doc_or_undecodable",
     "docs::Engine::for_each_record_after",
-    "docs::Engine::live_unique_violations",
+    "docs::Engine::live_unique_violations_from_oplog",
+    "docs::Engine::live_unique_violations_from_table",
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
+    // The pass that completes the violations table, which serves no client.
+    "violations_table::Engine::violations_backfill_scan",
     // An index build's fill, and every read of an index's entries.
     "index::Engine::create_index_inner",
     "index::Engine::index_keyed_entries_after",
@@ -119,6 +122,11 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "engine::Engine::create_collection_in_txn",
         "the registry, and one row of each table: whether an id is free",
     ),
+    (
+        "engine::Engine::decide_violations_ready",
+        "at open, before the node serves or has a stop to answer: the violations table's rows, \
+         cleared when its marker is above the oplog's tail",
+    ),
     ("engine::Engine::drop_database", "one row: whether a database has a collection left"),
     (
         "engine::Engine::list_collections",
@@ -172,6 +180,23 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the dropped-collection registry: one row per drop",
     ),
     ("gc::Engine::collect_dropped_indexes", "the dropped-index registry: one row per drop"),
+    (
+        "gc::Engine::trim_violation_rows",
+        "the violations table: one row per retained violation entry, read in a retention pass \
+         that serves no client (ADR-200)",
+    ),
+    (
+        "violations_table_tests::in_oplog",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    (
+        "violations_table_tests::in_table",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    (
+        "violations_table_tests::wipe_table",
+        "test code emptying the table of a store it wrote itself",
+    ),
     (
         "index::clear_index_entries",
         "walks the walk table its caller opened, so its caller's WalkStop decides: in_write \
@@ -245,6 +270,7 @@ const WRITES: &[&str] = &[
 /// until a [`STOP_AWARE_WALKS`] entry.
 const DELEGATES: &[(&str, &str)] = &[
     ("docs::Engine::for_each_doc", "Engine::for_each_doc_after"),
+    ("docs::Engine::live_unique_violations", "Engine::live_unique_violations_from_table"),
     ("docs::Engine::for_each_doc_after", "Engine::for_each_record_after"),
     ("docs::Engine::count", "Engine::for_each_doc"),
     ("index::Engine::visit_index_candidates", "Walk::in_index_order"),
