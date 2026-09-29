@@ -246,7 +246,7 @@ fn document(id: i64) -> Value {
 async fn wait_ready(client: &reqwest::Client, node: &Node) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(res) = client.get(node.url("/healthz")).send().await
+        if let Ok(res) = client.get(node.url("/readyz")).send().await
             && res.status().is_success()
         {
             return;

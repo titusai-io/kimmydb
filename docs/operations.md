@@ -323,6 +323,16 @@ metadata:
   name: kimmy
 spec:
   serviceName: kimmy-headless
+  # Not the default `OrderedReady`, which would not create pod N+1 until pod N
+  # is Ready: a pod that is catching up is not ready by design (`/readyz` says
+  # so), so a wiped pod-0 would hold every other pod down, with nobody to catch
+  # up from. `Parallel` starts them together. It is immutable on an existing
+  # StatefulSet: move a deployment to it with
+  #   kubectl delete statefulset kimmy --cascade=orphan
+  # (the pods keep running) and then apply this manifest again. It changes only
+  # how pods are created and deleted at scale-up and scale-down; a rolling
+  # update still replaces them one at a time, which is `updateStrategy`.
+  podManagementPolicy: Parallel
   replicas: 3
   selector: { matchLabels: { app: kimmy } }
   template:
@@ -355,32 +365,27 @@ spec:
               valueFrom: { secretKeyRef: { name: kimmy, key: root-password } }
             - name: KIMMY_CLUSTER_SECRET
               valueFrom: { secretKeyRef: { name: kimmy, key: cluster-secret } }
-          # Nothing listens until the database is open, and liveness does not
-          # run until this succeeds. A start walks the retained oplog when no
-          # record says it need not: the first start of this release or of a
-          # later one that raises the schema or I_EPOCH, the first after a
-          # restore, and every start of a release before this one (a rollback
-          # to 0.39 or earlier walks every time). About 46 s per 10 million
-          # entries (the writes of
-          # storage.oplog_retention_secs, 24 h by default) with the store in
-          # the page cache, and much longer cold -- about 30 s per GB of oplog
-          # read on the lab host's disks. Budget the cold walk, from your own
-          # first start's "checked the version vector" line; the first start
-          # after an upgrade that rebuilds partial indexes adds 8 us per
-          # document per partial index, the figure the node's own estimate
-          # uses. Allow at least twice your expected open as
-          # periodSeconds x failureThreshold, and leave margin: the cost per
-          # document grows with the store, so the estimate is a bound, not a
-          # rate -- measured up to 10 million documents per index and
-          # extrapolated above that, which is where you most need the margin.
-          # A start after an unclean stop also repairs the file first, about
-          # 0.4 s per GiB of kimmy.redb (measured, ADR-188), before any of
-          # that. These values are for 10 million retained entries and one
-          # partial index over 10 million documents: 46 s + 80 s = 126 s, so
-          # twice is 252 s and 300 s is set here. Compute yours.
+          # The node binds its port before it opens the database (ADR-198), so
+          # `/healthz` answers from the first moment and stays green through an
+          # open of any length, and `/readyz` answers 503 with what the node is
+          # doing (`phase`, how long it has lasted, how far through it is) until
+          # the store is open and the node is serving. Every other route answers
+          # 503 `starting` until then, so a load balancer and `/v1/version` see
+          # a node that is not up.
+          #
+          # The startupProbe is on `/healthz`, not `/readyz`, on purpose: while
+          # a startupProbe is configured Kubernetes runs neither the liveness
+          # nor the readiness probe until it has succeeded, and one on `/readyz`
+          # would hold both off for the whole of a long open or a long catch-up
+          # and kill a node that is doing exactly what it should, over and over.
+          # `/healthz` passes within seconds of the bind. Nothing in the product
+          # ends an open that is slow, however long it takes: a node whose open
+          # never finishes is visible on `/readyz` (`phase_age_seconds`) and in
+          # its log, which writes a progress line for each phase, and an
+          # operator who wants a ceiling watches for it.
           startupProbe:
             httpGet: { path: /healthz, port: 7878 }
-            periodSeconds: 10
+            periodSeconds: 2
             failureThreshold: 30
           livenessProbe:
             httpGet: { path: /healthz, port: 7878 }
@@ -406,11 +411,18 @@ pod, not only the ready ones, because of `publishNotReadyAddresses: true`: a
 Service that published only ready pods would make readiness a precondition of
 being found, and a cluster starting from cold would have no pod ready to find.
 
-**Without the `startupProbe`, a node whose open outlasts the liveness probe
-never starts.** Kubernetes' defaults restart a container after about 30
-seconds of failed liveness checks, and nothing listens until the open
-completes, so an open longer than that is killed and begun again for ever.
-The comment beside the probe gives the arithmetic for your own numbers.
+**A node that is opening is not a node that is down.** It binds its port first
+(ADR-198), so a liveness probe on `/healthz` passes through an open of any
+length, and a start that used to be killed and begun again for ever, because
+nothing listened until the open finished and Kubernetes' defaults restart a
+container after about 30 seconds of failed liveness checks, now finishes. What
+the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
+`migrating` (`done` of `total` indexes), `verifying` (`done` of `total` oplog
+rows), `counting` and `starting`, with `phase_age_seconds`. The open's cost is
+unchanged: the walk of the retained oplog is about 46 s per 10 million entries
+with the store in the page cache and far more cold, and the schema migration
+adds 8 us per document per partial index; a node logs a line for each phase
+as it goes.
 **A start after an unclean stop repairs the database file first**, before the
 open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
 4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
@@ -482,6 +494,7 @@ a provider this member cannot build is one only an operator can.
 | `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
 | `outcome_unknown` | `ERROR` | A write reached the storage engine's durability step and then failed, so it may or may not have been applied. The same storage fault as `internal`, answered honestly: its client is told to read back before resending. Usually followed at once by the storage-failure stop (ADR-188). **Page** |
 | `partially_applied` | `ERROR` | A request that commits in more than one transaction — a `multi` update or delete, a database drop — failed after its first commit, and part of it landed ([ADR-192](decisions.md)). The cause is on the line: a storage failure (`internal`, `outcome_unknown`, or `storage_failed`, the storage failure that stops the node). **Page**. **One exception, which logs `WARN`**: a cause that is not this node's fault — the shutdown deadline (`stopping`), or the caller's, such as an operator a later document cannot take |
+| `starting` | `WARN` | This node has bound its port and is still starting: its store is opening, or its tasks are, and it answers only the two probes until then ([ADR-198](decisions.md)). Nothing was read or written, and the client is told to go to another member. The node's own answer while it opens is not logged (a probe every few seconds would be a line each); `/readyz` says what it is doing and for how long |
 | `node_stopping` | `WARN` | This node was shutting down and refused a write it had not begun; nothing was written, and the client is told to go to another member ([ADR-192](decisions.md)). Expected during every shutdown that meets a write after its drain. **Do not page**; a count that rises outside shutdowns is worth a look |
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
@@ -547,9 +560,10 @@ It is a walk of every page that holds documents. On a store larger than the
 page cache, or with a cold cache after a host restart, it runs at the disk's
 speed and takes minutes, the same dependence as the retention pass and a backup
 ([Capacity](#capacity)). Plan the first start after upgrading, and the start
-after a restore, for that; a readiness probe that gives up sooner restarts the
-node into the same walk. A start that does not need the rebuild does not read
-the documents.
+after a restore, for that. A readiness probe that gives up sooner takes the
+node out of rotation until it is done, and restarts nothing: only a liveness or
+a startup probe restarts a container, and both are on `/healthz`. A start that
+does not need the rebuild does not read the documents.
 
 #### What a shutdown logs, and what a start says about the last one
 
@@ -760,11 +774,25 @@ start after that is the first one the line means what it says.
 
 | Endpoint | Meaning | Probe |
 |---|---|---|
-| `/healthz` | The process is alive | liveness |
-| `/readyz` | The **storage engine responds**, and has not hit an I/O error | readiness |
+| `/healthz` | The process is alive, **from the moment it binds its port**, before its store is open | liveness, and the startup probe |
+| `/readyz` | The **storage engine responds**, and has not hit an I/O error; **503 while the store is opening**, with what the node is doing | readiness |
 
 `/readyz` performing a real storage read is the point: a node with a wedged
 database is taken out of rotation rather than served traffic it cannot handle.
+
+**While the store opens** ([ADR-198](decisions.md)) the node answers only these
+two. `/readyz` is `503` in the error envelope (`error: starting`, `retry:
+elsewhere`) with `status: opening`, `phase`, `phase_age_seconds`, and `done` and
+`total` when the phase counts. **Every other route answers `503 starting`,
+`/v1/version` and `/metrics` included**: a rolling deploy polls `/v1/version`
+to decide a member is up, and a member that answered it while it was still
+opening would send the roll on to the next one. A stop asked for during the
+open is heard, and stops the node at its next safe point (between the
+migration's per-index steps, or by abandoning the verification walk); otherwise
+the open finishes and the node stops without serving, with a clean exit marker.
+A port that cannot be bound, or a certificate that cannot be read, fails the
+start **before the store is opened**: the store is not touched,
+and the last run's verdict is inherited by the failed start as by any other.
 
 ### Metrics
 

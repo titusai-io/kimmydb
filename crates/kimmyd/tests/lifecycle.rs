@@ -148,7 +148,8 @@ jwt_secret = "{JWT_SECRET}"
         Run { child: std::sync::Mutex::new(child), pid, http: bound, stdout }
     }
 
-    /// Wait until the node answers `/healthz`, failing at once, with its
+    /// Wait until the node answers `/readyz`, which it does only once its store
+    /// is open (it answers `/healthz` from the bind, ADR-198), failing at once, with its
     /// log, if it exits first rather than waiting out `PATIENCE`.
     async fn wait_ready(&self, client: &reqwest::Client) {
         if let Err(why) = self.try_ready(client, ports::BOUND_HTTP_LINE).await {
@@ -174,7 +175,7 @@ jwt_secret = "{JWT_SECRET}"
                 }
             }
             if let Some(port) = self.http.get()
-                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/healthz")).send().await
+                && let Ok(res) = client.get(format!("http://127.0.0.1:{port}/readyz")).send().await
                 && res.status().is_success()
             {
                 return Ok(());
@@ -387,8 +388,8 @@ async fn a_start_that_serves_settles_what_it_inherited() {
     assert!(!marker.contains("previous") && !marker.contains("failed_start"), "{marker}");
 }
 
-/// Hold a port, so a start opens its database, cannot bind, and fails
-/// before it serves; return the start's log.
+/// Hold a port, so a start cannot bind and fails before it opens its
+/// database (the bind comes first, ADR-198); return the start's log.
 fn a_start_that_fails_to_bind(dir: &Path, name: &str) -> String {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
@@ -1453,20 +1454,6 @@ async fn a_start_with_a_serve_walk_switch_says_so() {
     assert!(status.success(), "{status:?}");
 }
 
-/// Pinned as it is, and out of the stop's scope: a SIGTERM before the node
-/// serves finds no handler yet, and ends the process with the signal and no
-/// marker.
-#[tokio::test]
-async fn a_signal_during_start_up_ends_the_process_with_no_marker() {
-    use std::os::unix::process::ExitStatusExt;
-    let dir = tempfile::tempdir().unwrap();
-    let mut run = Run::spawn(dir.path(), "early");
-    run.signal("TERM");
-    let status = run.wait_exit();
-    assert_eq!(status.signal(), Some(15), "{status:?}: {}", run.log());
-    assert!(marker_absent(dir.path()));
-}
-
 /// The TLS listener's stop closes the store too: its drain and its
 /// certificate reloader hold nothing past the runtime's shutdown.
 #[tokio::test]
@@ -1486,8 +1473,8 @@ async fn a_stop_over_tls_closes_the_store() {
     let deadline = Instant::now() + PATIENCE;
     loop {
         if let ports::Bound::Port(port) =
-            ports::bound_http_port(&run.stdout, "serving HTTPS", run.pid, &[])
-            && let Ok(res) = client.get(format!("https://localhost:{port}/healthz")).send().await
+            ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[])
+            && let Ok(res) = client.get(format!("https://localhost:{port}/readyz")).send().await
             && res.status().is_success()
         {
             break;
@@ -1670,4 +1657,317 @@ async fn a_vector_graph_building_at_the_stop_ends_at_the_drain_deadline() {
         },
     )
     .await;
+}
+
+/// The port a node bound, read from its log at the bind: before its store is
+/// open, when a probe already has something to ask (ADR-198).
+async fn wait_bound(run: &Run) -> u16 {
+    let deadline = Instant::now() + PATIENCE;
+    let mut line_wait = ports::LineWait::default();
+    loop {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        match line_wait.judge(bound, ports::BOUND_HTTP_LINE) {
+            Ok(Some(port)) => return port,
+            Ok(None) => {}
+            Err(why) => panic!("{why}; log: {}", run.log()),
+        }
+        assert!(Instant::now() < deadline, "never bound; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// A node whose store takes seconds to open answers `/healthz` from the bind,
+/// says on `/readyz` what it is doing, refuses everything else (`/v1/version`
+/// included, which a roll polls), and then serves, with no connection lost at
+/// the swap.
+#[tokio::test]
+async fn a_node_answers_its_probes_while_its_store_opens_and_serves_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_with(dir.path(), "opening", &[("KIMMY_TEST_OPEN_DELAY_SECS", "5")]);
+    let port = wait_bound(&run).await;
+    let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+    let opened_by = Instant::now() + Duration::from_secs(5);
+
+    // Liveness is up from the bind; readiness says what it is doing.
+    let health = client.get(url("/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "{}", run.log());
+    let ready = client.get(url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 503);
+    let body: serde_json::Value = ready.json().await.unwrap();
+    assert_eq!(body["error"], "starting", "{body}");
+    assert_eq!(body["retry"], "elsewhere", "{body}");
+    assert_eq!(body["status"], "opening", "{body}");
+    assert_eq!(body["phase"], "opening", "{body}");
+    assert!(body["phase_age_seconds"].is_number(), "{body}");
+
+    // Everything else is refused, the two a roll and a scrape use included,
+    // with no Retry-After (another member is the answer).
+    for path in ["/v1/version", "/metrics", "/v1/db/shop/collections"] {
+        let refused = client.get(url(path)).send().await.unwrap();
+        assert_eq!(refused.status(), 503, "{path}");
+        assert!(refused.headers().get("retry-after").is_none(), "{path}");
+        let body: serde_json::Value = refused.json().await.unwrap();
+        assert_eq!(body["error"], "starting", "{path}: {body}");
+    }
+    // The probes are not logged, however many the open receives.
+    assert!(!run.log().contains("request failed"), "{}", run.log());
+
+    // It becomes ready, and a request is answered by the router.
+    run.wait_ready(&client).await;
+    assert!(Instant::now() >= opened_by - Duration::from_secs(1), "the open was not delayed");
+    let version = client.get(url("/v1/version")).send().await.unwrap();
+    assert_eq!(version.status(), 200, "{}", run.log());
+    let log = run.log();
+    let bound = log.find("HTTP listener bound").expect("the bind is logged");
+    let serving = log.find("serving HTTP and WebSocket").expect("serving is logged");
+    let started = log.find("starting kimmyd").expect("the banner is logged");
+    assert!(bound < started && started < serving, "bind, then open, then serving: {log}");
+
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// A stop asked for while the store opens is heard (the handler is installed
+/// at the bind), ends the wait, and stops the node without serving, with a
+/// clean marker.
+#[tokio::test]
+async fn a_stop_during_the_open_stops_the_node_without_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::spawn_with(dir.path(), "stopped", &[("KIMMY_TEST_OPEN_DELAY_SECS", "40")]);
+    let port = wait_bound(&run).await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client.get(format!("http://127.0.0.1:{port}/healthz")).send().await.unwrap().status(),
+        200
+    );
+
+    let before = Instant::now();
+    run.signal("TERM");
+    let status = run.wait_exit();
+    let took = before.elapsed();
+    assert!(status.success(), "{status:?}: {}", run.log());
+    assert!(took < Duration::from_secs(10), "the stop waited for the whole open: {took:?}");
+    let log = run.log();
+    assert!(log.contains("stopping without serving"), "{log}");
+    assert!(!log.contains("serving HTTP and WebSocket"), "it must never serve: {log}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
+/// A bind that fails is a start that never opened the store: no store file was
+/// created, and the last run's verdict is inherited by the failed start.
+#[tokio::test]
+async fn a_bind_that_fails_never_opens_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = a_start_that_fails_to_bind(dir.path(), "unbindable");
+    assert!(log.contains("Address already in use"), "{log}");
+    assert!(!log.contains("starting kimmyd"), "the banner follows the open: {log}");
+    assert!(
+        !dir.path().join("data").join("kimmy.redb").exists(),
+        "an address that cannot be bound must not create the store"
+    );
+}
+
+/// A stop asked for while a migration runs ends the open between two of its
+/// steps and concludes as a clean shutdown, with no engine: exit 0, a
+/// `shutdown` marker, no serving. The next start resumes from the migration's
+/// markers and finds nothing to repair.
+#[tokio::test]
+async fn a_stop_between_two_migration_steps_is_a_clean_shutdown_and_the_next_start_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let path = data.join("kimmy.redb");
+    {
+        let engine = kimmy_storage::Engine::open(&path).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine
+            .insert_many(&coll, (0..20i64).map(|i| bson::doc! { "_id": i, "n": i + 1 }).collect())
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            engine
+                .create_index_with(
+                    "shop",
+                    "orders",
+                    vec![kimmy_storage::IndexField { path: "n".into(), descending: false }],
+                    false,
+                    Default::default(),
+                    Some(name.into()),
+                    None,
+                    Some(bson::doc! { "n": { "$gt": 0 } }),
+                )
+                .unwrap();
+        }
+        engine.close().unwrap();
+    }
+    kimmy_storage::make_schema_3_for_test(&path).unwrap();
+
+    let mut run = Run::spawn_with(dir.path(), "migrating", &[("KIMMY_TEST_OPEN_STEP_MS", "20000")]);
+    let deadline = Instant::now() + PATIENCE;
+    while !run.log().contains("rebuilt a partial index") {
+        assert!(Instant::now() < deadline, "no step finished: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    let before = Instant::now();
+    run.signal("TERM");
+    let status = run.wait_exit();
+    assert!(status.success(), "{status:?}: {}", run.log());
+    assert!(before.elapsed() < Duration::from_secs(10), "the stop waited for the open");
+    let log = run.log();
+    assert!(log.contains("stopping without serving"), "{log}");
+    assert!(log.contains("shutdown complete"), "{log}");
+    assert!(!log.contains("serving HTTP and WebSocket"), "{log}");
+    assert!(!log.contains("exiting on an error"), "not a failed start: {log}");
+    let marker = marker(dir.path()).expect("a stop leaves its marker");
+    assert!(marker.contains("exit = \"shutdown\""), "{marker}");
+    assert!(!marker.contains("failed_start"), "{marker}");
+
+    let client = reqwest::Client::new();
+    let mut next = Run::spawn(dir.path(), "resumed");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    assert!(log.contains("previous run ended cleanly"), "{log}");
+    assert!(!log.contains("repair"), "{log}");
+    assert!(log.contains("rebuilt a partial index"), "the migration resumed: {log}");
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}
+
+/// A stop asked for while the node starts, after the store is open, stops it
+/// and never says it serves (what an operator greps for is a node that did).
+#[tokio::test]
+async fn a_stop_while_the_node_starts_never_logs_that_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::spawn_with(dir.path(), "starting", &[("KIMMY_TEST_START_DELAY_SECS", "4")]);
+    let port = wait_bound(&run).await;
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let body: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if body["phase"] == "starting" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never starting: {body}: {}", run.log());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    run.signal("TERM");
+    let status = run.wait_exit();
+    assert!(status.success(), "{status:?}: {}", run.log());
+    let log = run.log();
+    assert!(!log.contains("serving HTTP and WebSocket"), "{log}");
+    assert!(log.contains("a stop was asked for while the node was starting"), "{log}");
+    assert!(log.contains("shutdown complete"), "{log}");
+}
+
+/// The certificate the listener presents, as DER, from a handshake that
+/// accepts anything: what a client of the node would be handed.
+async fn served_certificate(port: u16) -> Vec<u8> {
+    use std::sync::Arc;
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    #[derive(Debug)]
+    struct Anything;
+    impl ServerCertVerifier for Anything {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(Anything))
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
+    let (_, connection) = tls.get_ref();
+    connection.peer_certificates().unwrap()[0].as_ref().to_vec()
+}
+
+/// A rotated certificate reaches the listener: SIGHUP reloads it into the
+/// configuration the listener serves, and the next handshake presents it.
+#[tokio::test]
+async fn a_reloaded_certificate_is_the_one_the_listener_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert, key) = (dir.path().join("server.crt"), dir.path().join("server.key"));
+    std::fs::write(&cert, first.cert.pem()).unwrap();
+    std::fs::write(&key, first.signing_key.serialize_pem()).unwrap();
+    let (cert_arg, key_arg) = (cert.display().to_string(), key.display().to_string());
+    let mut run = Run::spawn_with(
+        dir.path(),
+        "rotating",
+        &[("KIMMY_TLS_CERT", cert_arg.as_str()), ("KIMMY_TLS_KEY", key_arg.as_str())],
+    );
+    let port = wait_bound(&run).await;
+    let deadline = Instant::now() + PATIENCE;
+    let before = loop {
+        if run.log().contains("serving HTTPS") {
+            break served_certificate(port).await;
+        }
+        assert!(Instant::now() < deadline, "never served: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    };
+    assert_eq!(before, first.cert.der().as_ref(), "the first certificate is served");
+
+    let second = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    std::fs::write(&cert, second.cert.pem()).unwrap();
+    std::fs::write(&key, second.signing_key.serialize_pem()).unwrap();
+    run.signal("HUP");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = served_certificate(port).await;
+        if now == second.cert.der().as_ref() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rotated certificate is never served: {}",
+            run.log()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    run.signal("TERM");
+    assert!(run.wait_exit().success(), "{}", run.log());
 }

@@ -58,11 +58,21 @@ tracing-opentelemetry.workspace = true
 # binary runs on musl's malloc, which serialises concurrent allocation -- the
 # workspace manifest has the numbers.
 mimalloc.workspace = true
+# The one trait the listener's front implements (`front::Front`): axum's own
+# service type is this crate's, already in the tree.
+tower = { version = "0.5", default-features = false }
 
 [dev-dependencies]
+# The front's tests call it as a service and read a response body.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 rcgen.workspace = true
 tempfile.workspace = true
 tokio-rustls.workspace = true
+# A test builds the store a schema 3 node leaves, to stop a real node in the
+# middle of migrating it.
+kimmy-storage = { workspace = true, features = ["test-hooks"] }
+bson.workspace = true
 # For the cluster harness: an HTTP client and JSON for driving real spawned
 # nodes. Both already in the workspace tree; no new dependencies.
 reqwest.workspace = true

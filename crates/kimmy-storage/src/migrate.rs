@@ -414,7 +414,20 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
              growth step, so allow the two added together"
         );
     }
+    if total > 0 {
+        crate::open_progress::set_open_phase_of(
+            crate::open_progress::OpenPhase::Migrating,
+            total as u64,
+        );
+    }
     for (n, (meta, index, documents)) in plan.indexes.iter().enumerate() {
+        // The safe point of a stop asked for during the open: between indexes,
+        // each of which is one commit with its marker, so an interrupted
+        // migration resumes from the markers on the next start.
+        if crate::open_progress::open_stop_requested() {
+            return Err(crate::StorageError::Stopping(crate::StopReason::Shutdown));
+        }
+        crate::open_progress::set_open_done(n as u64);
         let started = std::time::Instant::now();
         info!(
             n = n + 1,
@@ -554,6 +567,7 @@ fn rebuild_partial_indexes(db: &Database) -> Result<()> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "rebuilt a partial index"
         );
+        crate::open_progress::test_step_pause();
     }
     // The end of the bookkeeping. The version is already 4 if any index was
     // rebuilt in this run or an earlier one; it is written here too, for the
@@ -628,6 +642,21 @@ pub(crate) mod hooks {
             }
         })
     }
+}
+
+/// Put a closed store back where a schema 3 node leaves it, so the next open
+/// runs the 3 -> 4 migration, which rebuilds every partial index. For a test of
+/// another crate that stops a real node in the middle of it.
+#[cfg(feature = "test-hooks")]
+// A closed store rewritten by a test, on purpose, outside the check `Engine::open`
+// makes: the point is to hand the next open a store a schema 3 node left.
+#[allow(clippy::disallowed_methods)]
+pub fn make_schema_3_for_test(path: &std::path::Path) -> Result<()> {
+    let db = Database::create(path)?;
+    let txn = db.begin_write()?;
+    txn.open_table(tables::META)?.insert(tables::META_FORMAT_VERSION, [3u8].as_slice())?;
+    txn.commit()?;
+    Ok(())
 }
 
 pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {

@@ -88,7 +88,11 @@ pub fn in_use(stderr: &str) -> bool {
 }
 
 /// The line a node logs once its HTTP listener is bound, carrying the port.
-pub const BOUND_HTTP_LINE: &str = "serving HTTP and WebSocket";
+/// The bind comes before the store opens (ADR-198), so this line, and not the
+/// one a node logs when it starts serving, is what a harness reads the port
+/// from: an open of several seconds would otherwise read as a listener that
+/// never says so.
+pub const BOUND_HTTP_LINE: &str = "HTTP listener bound";
 
 /// What reading a node's HTTP port from its log found.
 pub enum Bound {

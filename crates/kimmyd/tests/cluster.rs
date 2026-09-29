@@ -249,7 +249,7 @@ allowed_hosts = ["127.0.0.1"]
         let budget = patience();
         let deadline = std::time::Instant::now() + budget;
         loop {
-            if let Ok(res) = client.get(self.url("/healthz")).send().await
+            if let Ok(res) = client.get(self.url("/readyz")).send().await
                 && res.status().is_success()
             {
                 return Ok(());

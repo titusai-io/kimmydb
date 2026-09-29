@@ -1060,6 +1060,7 @@ impl Engine {
         // Through a backend that meters what it is asked for, so a hold can
         // say how much of it was the disk (ADR-176). Opened exactly as
         // `Builder::create` opens it.
+        crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Opening);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1114,6 +1115,9 @@ impl Engine {
             let path = path.display().to_string();
             builder.set_repair_callback(move |session| {
                 if existing && !repairing.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::open_progress::set_open_phase(
+                        crate::open_progress::OpenPhase::Repairing,
+                    );
                     warn!(
                         path = %path,
                         "repairing the database after an unclean stop, before serving; this \
@@ -1158,6 +1162,7 @@ impl Engine {
                 elapsed_ms = opened.elapsed().as_millis() as u64,
                 "database repaired after an unclean stop"
             );
+            crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Opening);
         }
 
         // A newer schema or redb is refused before the ensure-tables commit,
@@ -1230,6 +1235,7 @@ impl Engine {
         // rebuilt with it (ADR-174).
         {
             let started = std::time::Instant::now();
+            crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Counting);
             let txn = db.begin_write()?;
             match crate::live_count::rebuild_if_stale(&txn)? {
                 Some(rebuilt) => {
@@ -2180,6 +2186,10 @@ impl Engine {
             let any_held = !held.is_empty()?;
             let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             let mut arrival = by_stamp.iter()?;
+            crate::open_progress::set_open_phase_of(
+                crate::open_progress::OpenPhase::Verifying,
+                oplog.len()?,
+            );
             for row in oplog.iter()? {
                 let (key, value) = row?;
                 match arrival.next().transpose()? {
@@ -2187,6 +2197,16 @@ impl Engine {
                     _ => arrival_differs = true,
                 }
                 walk.rows += 1;
+                if walk.rows % 8192 == 0 {
+                    crate::open_progress::set_open_done(walk.rows);
+                    // A stop asked for during the open abandons this walk, which
+                    // only leaves the version vector unverified, so the next
+                    // start walks again. Nothing is recorded, and the vector is
+                    // not raised.
+                    if crate::open_progress::open_stop_requested() {
+                        return Ok((false, walk, false));
+                    }
+                }
                 walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
                 if any_held && held.get(key.value())?.is_some() {
                     continue;
@@ -2305,6 +2325,13 @@ impl Engine {
             return Ok(());
         }
         let (raised, walk, arrival_differs) = Self::rebuild_version_vector_if_stale(db)?;
+        // A stop asked for during the open ended the walk, which leaves the vector
+        // unverified and the next start walking again: nothing was checked, and
+        // nothing is said to have been.
+        if crate::open_progress::open_stop_requested() {
+            info!("the verification walk was ended by a stop; the next start walks again");
+            return Ok(());
+        }
         info!(
             elapsed_ms = walk.elapsed_ms,
             rows = walk.rows,
