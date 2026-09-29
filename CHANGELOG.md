@@ -19,9 +19,26 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   together is descriptor exhaustion for the whole process
   ([docs/operations.md](docs/operations.md)). A peer whose connection went away
   before it was accepted is not the listener's error, so it is not counted.
+- **`kimmy_sync_serve_walk_path_total{path,walk}`** counts the windows a member
+  served by the kind of request (`walk`: `serve`, a peer's pull, or `push`, the
+  push a schema change's confirmation makes) and by the path that read them
+  (`keys`, `linear`, `fallback_length`, `fallback_missing_body`,
+  `fallback_verified`; [docs/operations.md](docs/operations.md)). A nonzero
+  fallback is a bug or damage, and is logged. `KIMMY_TEST_SERVE_WALK_PATH=linear`
+  is a test switch that reads every window the old way.
 
 ### Changed
 
+- **A member that restarted is served by its peers far faster when it holds
+  almost everything.** A window for a requester that names what it holds is now
+  read from the keys of the arrival index, and a body is read only for an entry
+  that is served or withheld, where every body of the range used to be read to
+  reach its key. On the round that measured it, a restarted quiet member's
+  first write took 31 s to reach its peers cold, and 47 s and 1.0 GB of reads
+  went to 650k rows it already held. Nothing about which entries are served,
+  their order, the window's end or the budget changes, no format changes, and
+  the change needs no rollback boundary
+  ([ADR-197](docs/decisions.md)).
 - **Breaking: a filter's `$type` alias and `$regex` flag are checked, and an
   unknown one is a `400`.** `{"$type": "boolean"}`, `{"$type": "Int"}` and
   `{"$type": []}` returned `200` with no matches, and `{"$regex": "s",
@@ -57,7 +74,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   every ten seconds while the errors continue. A peer whose connection went away
   before it was accepted is neither waited on nor counted. The HTTP listener
   already waited 50 ms and logged at `ERROR`, and does both as before.
-
 
 ## 0.42.0 - 2026-09-29
 

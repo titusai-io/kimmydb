@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use crate::docs::RemoteApplied;
 use crate::engine::{Engine, WriteTxn, WriterHolder};
 use crate::error::Result;
+use crate::hold_meter::{ServeWalk, WalkPath};
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
 use crate::walk::{WalkScope, open_walk_table};
@@ -820,7 +821,7 @@ impl Engine {
         scope: WalkScope,
     ) -> Result<OplogWindow> {
         let passed = std::cell::Cell::new(0);
-        self.entries_for_peer_counting(from, limit, held, marked, scope, &passed, None)
+        self.entries_for_peer_counting(from, limit, held, marked, scope, &passed, None, None)
     }
 
     /// [`Self::entries_for_peer_holding`], ended by `budget` (ADR-194): a
@@ -835,7 +836,16 @@ impl Engine {
         budget: ExamineBudget,
     ) -> Result<OplogWindow> {
         let passed = std::cell::Cell::new(0);
-        self.entries_for_peer_counting(from, limit, held, &[], scope, &passed, Some(budget))
+        self.entries_for_peer_counting(
+            from,
+            limit,
+            held,
+            &[],
+            scope,
+            &passed,
+            Some(budget),
+            Some(ServeWalk::Push),
+        )
     }
 
     /// [`Self::entries_for_peer_marked`], for a window this node is serving a
@@ -867,6 +877,7 @@ impl Engine {
             WalkScope::Background,
             &passed,
             budget,
+            Some(ServeWalk::Serve),
         );
         let walked = walked_from.elapsed();
         let (read, _) = walk.finish();
@@ -883,6 +894,19 @@ impl Engine {
     /// when that is below `from` (ADR-194): a budgeted walk ends only past
     /// `start`'s successor, so whatever the budget, the next request's scan
     /// starts further on.
+    ///
+    /// **Which walk reads it (ADR-197).** A request that names what the
+    /// requester holds skips most of what it walks, and the skip needs only a
+    /// key, so it is read from the keys of `OPLOG_ARRIVAL_SEQ`, which hold the
+    /// same stamps in the same order in pages about twenty times denser, with a
+    /// body read from `OPLOG` only for a row that is served or withheld. A
+    /// request that names nothing skips nothing, and a body point read per row
+    /// would only cost more, so it walks `OPLOG` as it always did. If the two
+    /// tables disagree the key walk gives up (see
+    /// [`Engine::read_oplog_by_arrival_keys_in`]) and the linear walk answers,
+    /// **in the same read transaction**, with `passed` put back as it was so
+    /// the abandoned attempt is not counted twice. `served` names the kind of
+    /// request for the path counter, and is `None` for a local read.
     #[allow(clippy::too_many_arguments)]
     fn entries_for_peer_counting(
         &self,
@@ -893,26 +917,63 @@ impl Engine {
         scope: WalkScope,
         passed: &std::cell::Cell<u64>,
         budget: Option<ExamineBudget>,
+        served: Option<ServeWalk>,
     ) -> Result<OplogWindow> {
         let marked = if held.is_some() { marked } else { &[] };
         let start = marked.iter().map(|span| span.from).fold(from, Hlc::min);
-        self.read_oplog_budgeted(
-            start,
-            limit,
-            scope,
-            |stamp| {
-                let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
-                    && !marked.iter().any(|span| span.contains(stamp));
-                passed.set(passed.get() + u64::from(skip));
-                skip
-            },
-            |entry| {
-                let keep = entry.kind != OpKind::UniqueViolation;
-                passed.set(passed.get() + u64::from(!keep));
-                keep
-            },
-            budget.map(|budget| (budget, start.successor())),
-        )
+        let skip = |stamp: &Stamp| {
+            let skip = held.is_some_and(|held| stamp.hlc <= held.get(stamp.node))
+                && !marked.iter().any(|span| span.contains(stamp));
+            passed.set(passed.get() + u64::from(skip));
+            skip
+        };
+        let keep = |entry: &OplogEntry| {
+            let keep = entry.kind != OpKind::UniqueViolation;
+            passed.set(passed.get() + u64::from(!keep));
+            keep
+        };
+        let budget = budget.map(|budget| (budget, start.successor()));
+        let record = |path: WalkPath| {
+            if let Some(walk) = served {
+                self.serve_counters().record_path(walk, path);
+            }
+        };
+
+        let txn = self.db().begin_read()?;
+        let mut path = WalkPath::Linear;
+        if held.is_some() && self.arrival_suspect() {
+            // The open's verification found the two key sets different, which
+            // the counts inside a walk cannot see: read linearly, and say so.
+            path = WalkPath::FallbackVerified;
+        } else if held.is_some() && !crate::watch::serve_walk_forced_linear() {
+            let before = passed.get();
+            match self
+                .read_oplog_by_arrival_keys_in(&txn, start, limit, scope, skip, keep, budget)?
+            {
+                Ok(window) => {
+                    record(WalkPath::Keys);
+                    return Ok(window);
+                }
+                Err(why) => {
+                    passed.set(before);
+                    path = match why {
+                        crate::watch::KeyWalkFallback::Length => WalkPath::FallbackLength,
+                        crate::watch::KeyWalkFallback::MissingBody => WalkPath::FallbackMissingBody,
+                    };
+                    if served.is_some() && self.serve_counters().fallback_is_due_a_line() {
+                        tracing::warn!(
+                            reason = path.label(),
+                            "the oplog and its arrival index disagree, so a served window was \
+                             read by the linear walk; this is a bug or damage, and is counted in \
+                             kimmy_sync_serve_walk_path_total"
+                        );
+                    }
+                }
+            }
+        }
+        let window = self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
+        record(path);
+        Ok(window)
     }
 
     /// The spans of each origin's history this node holds as state at or below

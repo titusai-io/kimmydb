@@ -8490,6 +8490,10 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         kimmy_storage::SERVE_WALK_BUCKETS_US.len() + 1,
     ))
     .chain(["kimmy_sync_serve_walk_seconds_sum", "kimmy_sync_serve_walk_seconds_count"])
+    .chain(std::iter::repeat_n(
+        "kimmy_sync_serve_walk_path_total",
+        kimmy_storage::ServeWalk::COUNT * kimmy_storage::WalkPath::COUNT,
+    ))
     .collect();
 
     assert_eq!(series, expected, "the /metrics series set or its order changed:\n{body}");

@@ -15832,6 +15832,12 @@ elsewhere would be set without evidence.
 
 ## ADR-171 — A served window passes over what the puller has already processed
 
+> **Amended by [ADR-197](#adr-197--a-served-window-that-skips-most-of-what-it-walks-reads-the-keys-of-the-arrival-index-not-the-oplogs-bodies).**
+> The skip decides on a key, but the walk read every row's body to reach it: the
+> cost the **Cost** paragraph below records. A window for a requester that names
+> what it holds is now read from the keys of the arrival index, and a body is
+> read only for an entry that is served or withheld.
+
 > **Amended by [ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress).**
 > The skip had no bound on the rows it examined, so after a large load a pull
 > from a quiet member walked the whole load on every round and timed out. A
@@ -20584,6 +20590,11 @@ archives.
 
 ## ADR-194 — A serve walk is bounded by what it examines, and a partial window keeps the requester's progress
 
+> **Amended by [ADR-197](#adr-197--a-served-window-that-skips-most-of-what-it-walks-reads-the-keys-of-the-arrival-index-not-the-oplogs-bodies).**
+> The walk the budget bounds reads the arrival index's keys where the request
+> names what the requester holds, guarded in its own read transaction, with the
+> budget, the floor and `scanned_to` unchanged.
+
 Amends ADR-126 and ADR-127 (U1 becomes U1'), ADR-171 (the cap it left out)
 and ADR-157 (what the ceiling's warning counts).
 
@@ -21119,4 +21130,104 @@ unclosed group, a backreference and a lookahead are refused in a string
 reason is one line; a non-string `$options` is refused beside a `$regex`, beside
 a literal, and alone; `$convert` still refuses `number`. `kimmy-api` and `kimmy-mcp` tests drive the
 same cases through the REST routes, an aggregation `$match` and a tool call.
+
+## ADR-197 — A served window that skips most of what it walks reads the keys of the arrival index, not the oplog's bodies
+
+Amends [ADR-171](#adr-171--a-served-window-passes-over-what-the-puller-has-already-processed)
+(what the skip costs) and
+[ADR-194](#adr-194--a-serve-walk-is-bounded-by-what-it-examines-and-a-partial-window-keeps-the-requesters-progress)
+(the walk the budget bounds).
+
+**The defect.** ADR-171's skip decides on a row's key, its stamp, and ADR-194
+bounds the rows a window may examine, but the walk still reads every row of the
+oplog to reach each key, and redb stores a value in the leaf page that holds its
+key. So passing over an entry the requester holds costs the page of its body.
+A member that restarted and was quiet is served by every peer from far back in
+stamp order, across everything the cluster wrote since, and round 0430's cold
+restart measured 47 s and about 1.0 GB of reads per peer for 650k rows it held,
+for one document's worth of news.
+
+**Decision.**
+
+- **A window for a requester that names what it holds is read from the keys of
+  `OPLOG_ARRIVAL_SEQ`**, which is keyed by the same 26-byte stamp as `OPLOG`
+  and so holds the same stamps in the same order, in pages about twenty times
+  denser (39 bytes a row against about 420). The skip is judged on the key as
+  before, and the `OPLOG` body is **point-read only for a row the skip does not
+  name**, decoded, and offered to the same `keep`. A request that names nothing
+  held skips nothing, and a body point read per row would only cost more, so it
+  walks `OPLOG` as it always did.
+- **Everything a requester's coverage rule rests on is unchanged**, because the
+  loop body is the linear one with the row source swapped: the same order; the
+  same kept rule (`>= start`, and `> held[origin]` or inside a marked span);
+  `keep` applied to the decoded entry **before** a row counts towards `limit`
+  (ADR-126); `scanned_to` moved by every examined row; the same row count, so a
+  row-budget window ends at the same row in both walks; the budget check after
+  the row with the caller's floor, measured from where the scan starts
+  (ADR-194); and `passed_through` the full stamp. A body point read is inside
+  the timed loop, so it counts towards the time budget, and the stop is checked
+  by the key iterator before every row, so it is honoured between point reads.
+- **The guard, in the same read transaction.** The two tables must hold the same
+  number of rows, and every key of a row that is not skipped must have a body. If
+  either fails the key walk gives up, and **the linear walk answers in that
+  transaction**, with the entries-passed count put back so the abandoned attempt
+  is not counted twice. A fallback is logged once per ten minutes and counted.
+- **The open's verification walk reads the two key sets in step** when it walks
+  the oplog, and a difference the counts cannot see turns the key walk off for
+  the process (`fallback_verified`) and is logged at the open. It runs when the
+  vector is not yet verified (ADR-173), which is once per upgrade or unclean
+  stop.
+- **A metric says which path each window took:**
+  `kimmy_sync_serve_walk_path_total{path,walk}`, with `walk` `serve` (a pull) or
+  `push` (a confirmation's push) and `path` `keys`, `linear`, `fallback_length`,
+  `fallback_missing_body` or `fallback_verified`. A push is not in
+  `kimmy_sync_served_windows_total`, so the two kinds are told apart. On the
+  OTLP bridge, in the docs, and in the testkit's golden list with the round.
+- **`KIMMY_TEST_SERVE_WALK_PATH=linear|keys`** ships in the binary like the other
+  serve-walk switches and logs a `WARN` when set, so a round can time one binary
+  on both paths. **The confirmation push takes the key walk too**, because it
+  goes through the same function with the same guard and budget.
+
+**Why not the per-origin index of the design note.** It needs a new table, a
+background rebuild, a completeness scheme that survives an older build, and a
+rollback-boundary decision. The key walk needs none of them: every live build
+maintains `OPLOG_ARRIVAL_SEQ` in the same transaction as `OPLOG`, nothing is
+written, and no format changes. The per-origin index remains the fallback if a
+cold measurement shows the keys are not enough.
+
+**The residual, stated.** The length guard and the missing-body check do not
+see a row missing from the index made up for, in the count, by a stray key that
+is skipped or lies beyond the window. No live build writes one: every writer
+maintains both tables in one transaction (`append_oplog_at`, retention's
+removal, rewind, restore, the migration's `rewrite_oplog`, which rewrites
+values only and leaves the keys as they were), the open repairs a short stamp
+half (`rebuild_arrival_index_if_stale`), and a property test runs the store
+generator of `verified.rs` through appends, retention, rewind, restore and
+reopen and asserts the two key sets equal after every step. **One thing to
+know:** `rebuild_stamp_half_from_positions`, the repair of a short stamp half,
+derives it from the positions, so a stray key held in both is carried into the
+rebuilt half; the verification walk is what would then find it.
+
+**No rollback boundary.** Nothing is written and no format changes; a 0.42.0
+build reads the same store.
+
+**A rule for any later switch to the linear walk part-way through a window.** It
+would resume from **the full 26-byte key of the last row examined, exclusive**,
+never from the lower bound of that row's time plus one tick, which is the
+tie-losing bound ADR-148 records. The first version does not switch.
+
+### Test
+
+Both walks are run in one read transaction over generated fixtures (four
+origins with stamp ties, one of them the all-zero id so a stamp can sit on a
+lower bound; late relayed entries, so arrival order is not stamp order; held
+vectors with absent and unknown origins; marked spans; unique violations
+anywhere; a `from` on a tie; any row budget) and every field of the window and
+the passed count are compared. Others: a drain followed window by window; ties
+at `from` at a row-budget boundary; a corrupt body met in the same place, or not
+at all when skipped; a short index and a key with no body, each falling back to
+the linear window with the path and the passed count counted once; the path
+counted by kind of request; the verification walk finding a compensating pair;
+and the key-set invariant over the `verified.rs` generator. Each guard was
+broken and its test failed.
 

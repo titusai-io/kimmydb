@@ -195,6 +195,12 @@ where
         Ok(self.table.get(key)?)
     }
 
+    /// How many rows the table holds, from the count in its header: no page
+    /// of the table is read.
+    pub(crate) fn len(&self) -> Result<u64> {
+        Ok(self.table.len()?)
+    }
+
     pub(crate) fn first(&self) -> Result<Option<EndRow<'_, T>>> {
         Ok(self.table.first()?)
     }
@@ -606,11 +612,18 @@ mod tests {
                 .map(drop)
         }
         let background: &[(&str, Walk)] = &[
-            // covers: watch::Engine::read_oplog_budgeted
+            // covers: watch::Engine::read_oplog_linear_in
             ("serve_entries_to_peer", |e, _| {
                 e.serve_entries_to_peer(Hlc::ZERO, 100, None, &[], None).map(drop)
             }),
-            // covers: watch::Engine::read_oplog_budgeted
+            // covers: watch::Engine::read_oplog_by_arrival_keys_in
+            ("serve_entries_to_peer_holding", |e, _| {
+                // A requester that holds everything the oplog has, so the walk
+                // takes the keys of the arrival index and skips every one.
+                let held = [(HELD_ORIGIN, Hlc::new(u64::MAX, 0))].into_iter().collect();
+                e.serve_entries_to_peer(Hlc::ZERO, 100, Some(&held), &[], None).map(drop)
+            }),
+            // covers: watch::Engine::read_oplog_linear_in
             ("entries_for_peer", |e, _| {
                 e.entries_for_peer(Hlc::ZERO, 100, WalkScope::Background).map(drop)
             }),
@@ -652,7 +665,7 @@ mod tests {
             ("live_unique_violations", |e, c| {
                 e.live_unique_violations(c, None, WalkScope::Request).map(drop)
             }),
-            // covers: watch::Engine::read_oplog_budgeted
+            // covers: watch::Engine::read_oplog_linear_in
             ("read_oplog_from", |e, _| {
                 e.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).map(drop)
             }),

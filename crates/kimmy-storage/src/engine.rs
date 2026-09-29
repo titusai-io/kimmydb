@@ -155,6 +155,11 @@ pub struct Engine {
     /// Set at the node's stop signal, for reads that walk: see
     /// [`Engine::stop_walks`].
     walks_stopping: std::sync::atomic::AtomicBool,
+    /// The open's verification walk found the oplog's keys and the arrival
+    /// index's keys different sets (ADR-197), which their two counts cannot
+    /// tell. The key walk for served windows is then off for this process, and
+    /// each window is read linearly and counted `fallback_verified`.
+    arrival_suspect: std::sync::atomic::AtomicBool,
     /// Run once, the next time a request that has committed begins another
     /// transaction; see [`Engine::before_next_continuing_write`].
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1209,7 +1214,7 @@ impl Engine {
         // version bump: there is no state here that the oplog does not already
         // determine.
         Self::rebuild_arrival_index_if_stale(&db)?;
-        Self::verify_version_vector_at_open(&db)?;
+        let arrival_suspect = Self::verify_version_vector_at_open(&db)?;
         Self::seed_collected_if_untracked(&db)?;
         // A filter created with a generic `Binary` before ADR-182 was stored
         // as an array, and nothing records which arrays those were, so every
@@ -1308,6 +1313,7 @@ impl Engine {
             stopping: std::sync::atomic::AtomicBool::new(false),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
             walks_stopping: std::sync::atomic::AtomicBool::new(false),
+            arrival_suspect: std::sync::atomic::AtomicBool::new(arrival_suspect),
             #[cfg(any(test, feature = "test-hooks"))]
             continuing_hook: parking_lot::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -2074,9 +2080,13 @@ impl Engine {
     /// written before the vector existed, or one an older build appended to.
     pub(crate) fn rebuild_version_vector_if_stale(
         db: &Database,
-    ) -> Result<(bool, crate::verified::VerifiedWalk)> {
+    ) -> Result<(bool, crate::verified::VerifiedWalk, bool)> {
         let started = std::time::Instant::now();
         let mut walk = crate::verified::VerifiedWalk::default();
+        // Whether the arrival index's keys are the oplog's, read in step with
+        // it: the two counts agree when a row is missing from one and a stray
+        // stands in the other, and only reading both says so (ADR-197).
+        let mut arrival_differs = false;
         let mut actual = kimmy_core::VersionVector::new();
         {
             let txn = db.begin_read()?;
@@ -2102,14 +2112,23 @@ impl Engine {
             // walk ADR-153 measured as the dominant cost of opening a large
             // database. Empty is the overwhelmingly common case.
             let any_held = !held.is_empty()?;
+            let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let mut arrival = by_stamp.iter()?;
             for row in oplog.iter()? {
                 let (key, value) = row?;
+                match arrival.next().transpose()? {
+                    Some((other, _)) if other.value() == key.value() => {}
+                    _ => arrival_differs = true,
+                }
                 walk.rows += 1;
                 walk.logical_bytes += (key.value().len() + value.value().len()) as u64;
                 if any_held && held.get(key.value())?.is_some() {
                     continue;
                 }
                 actual.observe(codec::decode_oplog_key(key.value())?);
+            }
+            if arrival.next().is_some() {
+                arrival_differs = true;
             }
         }
         walk.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -2158,7 +2177,7 @@ impl Engine {
                 "raised the version vector to cover the oplog entries appended in position"
             );
         }
-        Ok((raised, walk))
+        Ok((raised, walk, arrival_differs))
     }
 
     /// Check the version vector against the oplog at open, unless the record
@@ -2173,7 +2192,10 @@ impl Engine {
     /// What a skip gives up: the walk decoded every oplog key, so an
     /// undecodable one failed the open. Skipped, it surfaces at the first read
     /// that reaches it.
-    fn verify_version_vector_at_open(db: &Database) -> Result<()> {
+    /// Whether the walk found the arrival index's keys and the oplog's
+    /// different sets, which only a walk that ran can say: `false` for one
+    /// skipped because the vector was verified.
+    fn verify_version_vector_at_open(db: &Database) -> Result<bool> {
         let schema = Self::current_schema(db)?;
         if !crate::verified::forced()
             && let Some(walk) = crate::verified::read_db(db, schema)?
@@ -2207,9 +2229,9 @@ impl Engine {
                     );
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
-        let (raised, walk) = Self::rebuild_version_vector_if_stale(db)?;
+        let (raised, walk, arrival_differs) = Self::rebuild_version_vector_if_stale(db)?;
         info!(
             elapsed_ms = walk.elapsed_ms,
             rows = walk.rows,
@@ -2217,7 +2239,21 @@ impl Engine {
             raised,
             "checked the version vector against the oplog"
         );
-        Ok(())
+        if arrival_differs {
+            warn!(
+                "the oplog and its arrival index hold different sets of keys although their \
+                 counts agree; windows served to peers are read from the oplog itself until \
+                 this node restarts, and it is counted in kimmy_sync_serve_walk_path_total. \
+                 This is a bug or damage"
+            );
+        }
+        Ok(arrival_differs)
+    }
+
+    /// Whether the open's verification found the arrival index's keys and the
+    /// oplog's different sets.
+    pub(crate) fn arrival_suspect(&self) -> bool {
+        self.arrival_suspect.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The store's schema version, as the record is keyed by it.

@@ -594,6 +594,11 @@ pub const SERVE_WALK_BUCKETS_US: [u64; 12] = [
 /// What serving peers' windows has cost this node, since start (ADR-176).
 #[derive(Default)]
 pub(crate) struct ServeCounters {
+    /// Windows served, by the kind of walk that asked and the path that read
+    /// them ([`ServeWalk`], [`WalkPath`]).
+    paths: [[AtomicU64; WalkPath::COUNT]; ServeWalk::COUNT],
+    /// When a fallback last said so in the log, as unix milliseconds.
+    fallback_logged_ms: AtomicU64,
     windows: AtomicU64,
     entries: AtomicU64,
     passed: AtomicU64,
@@ -617,8 +622,29 @@ impl ServeCounters {
         self.read_bytes.fetch_add(meter.read_bytes, Relaxed);
     }
 
+    /// One window served by `walk` was read by `path`.
+    pub(crate) fn record_path(&self, walk: ServeWalk, path: WalkPath) {
+        self.paths[walk.slot()][path.slot()].fetch_add(1, Relaxed);
+    }
+
+    /// Whether a fallback is due a log line: the first, and then one per ten
+    /// minutes. A fallback is a bug or damage, and a node that falls back on
+    /// every window must not say so on every window.
+    pub(crate) fn fallback_is_due_a_line(&self) -> bool {
+        const EVERY_MS: u64 = 10 * 60 * 1000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let last = self.fallback_logged_ms.load(Relaxed);
+        (last == 0 || now.saturating_sub(last) >= EVERY_MS)
+            && self.fallback_logged_ms.compare_exchange(last, now.max(1), Relaxed, Relaxed).is_ok()
+    }
+
     pub(crate) fn snapshot(&self) -> ServeSnapshot {
         ServeSnapshot {
+            paths: std::array::from_fn(|walk| {
+                std::array::from_fn(|path| self.paths[walk][path].load(Relaxed))
+            }),
             windows: self.windows.load(Relaxed),
             entries: self.entries.load(Relaxed),
             passed: self.passed.load(Relaxed),
@@ -630,10 +656,79 @@ impl ServeCounters {
     }
 }
 
+/// Which kind of request a served window answers: a peer's pull, or the push
+/// a schema change's confirmation makes. A push is not in `served_windows`, so
+/// the two must be told apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ServeWalk {
+    Serve,
+    Push,
+}
+
+impl ServeWalk {
+    pub const COUNT: usize = 2;
+    pub const ALL: [Self; Self::COUNT] = [Self::Serve, Self::Push];
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Push => "push",
+        }
+    }
+}
+
+/// How a served window was read (ADR-197): from the keys of the arrival index
+/// (`keys`), by the linear walk of the oplog that reads every body (`linear`,
+/// which a request that names nothing held always takes), or by the linear
+/// walk after the keys gave up because the two tables disagreed
+/// (`fallback_length`, `fallback_missing_body`), or because the open's
+/// verification walk had found their key sets different (`fallback_verified`).
+/// A fixed set, so the series is always all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WalkPath {
+    Keys,
+    Linear,
+    FallbackLength,
+    FallbackMissingBody,
+    FallbackVerified,
+}
+
+impl WalkPath {
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Keys,
+        Self::Linear,
+        Self::FallbackLength,
+        Self::FallbackMissingBody,
+        Self::FallbackVerified,
+    ];
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Keys => "keys",
+            Self::Linear => "linear",
+            Self::FallbackLength => "fallback_length",
+            Self::FallbackMissingBody => "fallback_missing_body",
+            Self::FallbackVerified => "fallback_verified",
+        }
+    }
+}
+
 /// What serving peers' windows has cost this node, as a scrape reads it
 /// (ADR-176).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServeSnapshot {
+    /// Windows served, by walk kind then by path, in [`ServeWalk::ALL`] and
+    /// [`WalkPath::ALL`] order.
+    pub paths: [[u64; WalkPath::COUNT]; ServeWalk::COUNT],
     /// Windows walked for a peer; also the walk histogram's count.
     pub windows: u64,
     /// Entries those windows carried.
