@@ -175,7 +175,13 @@ pub fn accept_error_is_the_listeners(error: &io::Error) -> bool {
 
 /// The errors Linux's `accept(2)` may return for the connection it is
 /// accepting rather than for the listener: the "pending" network errors of the
-/// man page, plus `EPERM`, which a firewall rule returns for one connection.
+/// man page.
+///
+/// **`EPERM` is not one of them**, though a firewall rule can return it for
+/// one connection: a security module or a seccomp policy that denies `accept`
+/// itself answers `EPERM` before the connection is dequeued, so it stays
+/// queued and every retry fails the same way. Treated as one client's error
+/// it would bring back the loop that spins on a core.
 #[cfg(target_os = "linux")]
 fn pending_connection_error(error: &io::Error) -> bool {
     matches!(
@@ -189,7 +195,6 @@ fn pending_connection_error(error: &io::Error) -> bool {
                 | libc::EHOSTUNREACH
                 | libc::EOPNOTSUPP
                 | libc::ENETUNREACH
-                | libc::EPERM
         )
     )
 }
@@ -222,11 +227,18 @@ struct AcceptBackoff {
     next: Duration,
     errors: u64,
     last_warned: Option<Instant>,
+    /// A `WARN` has been printed and its recovery not yet said.
+    warned_since_recovery: bool,
 }
 
 impl AcceptBackoff {
     fn new() -> Self {
-        Self { next: ACCEPT_BACKOFF_MIN, errors: 0, last_warned: None }
+        Self {
+            next: ACCEPT_BACKOFF_MIN,
+            errors: 0,
+            last_warned: None,
+            warned_since_recovery: false,
+        }
     }
 
     /// The wait to take after this error, doubling up to the cap.
@@ -242,8 +254,17 @@ impl AcceptBackoff {
         let due = self.last_warned.is_none_or(|at| now.duration_since(at) >= ACCEPT_WARN_EVERY);
         if due {
             self.last_warned = Some(now);
+            self.warned_since_recovery = true;
         }
         due
+    }
+
+    /// Whether a recovery is due its line: one is, once, after a `WARN`. That
+    /// is bounded by the `WARN`'s own timer, so a listener that flaps at its
+    /// limit says "accepting again" as often as it says it cannot, and a short
+    /// episode that did warn is not left without its ending.
+    fn recovery_is_due(&mut self) -> bool {
+        std::mem::take(&mut self.warned_since_recovery)
     }
 
     /// An accept succeeded: the errors so far, and the wait starts over.
@@ -279,10 +300,7 @@ where
         let error = match accept().await {
             Ok(accepted) => {
                 let errors = backoff.recovered();
-                // On the same timer as the `WARN`, so a listener that
-                // flaps at its limit says so once every few seconds and
-                // not once per accepted connection.
-                if errors > 0 && backoff.should_warn(Instant::now()) {
+                if errors > 0 && backoff.recovery_is_due() {
                     info!(errors, "cluster listener is accepting again");
                 }
                 return accepted;
@@ -3369,12 +3387,9 @@ mod tests {
         fn exit(&self, _: &tracing::Id) {}
     }
 
-    /// Run `errors` accept errors and then one success, `after` apart from
-    /// the last error, and return what was logged.
-    async fn logged_for(
-        errors: u32,
-        hold_last: Duration,
-    ) -> Vec<(tracing::Level, String, Option<i64>)> {
+    /// Run `errors` accept errors and then one success that takes `hold_last`
+    /// to arrive, and return what was logged.
+    async fn logged_for(errors: u32, hold_last: Duration) -> Vec<Line> {
         let lines = Lines::default();
         let seen = Arc::clone(&lines.0);
         let _recording = tracing::subscriber::set_default(lines);
@@ -3408,8 +3423,35 @@ mod tests {
         assert_eq!(warns.len(), 1, "one WARN for eight errors in 4.55 s: {lines:?}");
         assert_eq!(warns[0].2, Some(24), "the errno, as an integer: {lines:?}");
         assert!(warns[0].1.contains("failed to accept"), "{lines:?}");
-        // The recovery came inside the interval of that line, so it is quiet.
-        assert!(lines.iter().all(|l| l.0 != tracing::Level::INFO), "{lines:?}");
+        // The episode warned, so its ending is said, once, even though it was short.
+        let infos = lines.iter().filter(|l| l.0 == tracing::Level::INFO).count();
+        assert_eq!(infos, 1, "{lines:?}");
+    }
+
+    /// A listener at its limit alternates an accepted connection with an
+    /// error, over and over. Each ending is not a line: the `WARN` is one per
+    /// interval, and a recovery follows only a `WARN`.
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_flapping_at_its_limit_logs_one_warn_and_one_recovery() {
+        let lines = Lines::default();
+        let seen = Arc::clone(&lines.0);
+        let _recording = tracing::subscriber::set_default(lines);
+        let mut backoff = AcceptBackoff::new();
+        for _ in 0..25 {
+            let failed = std::sync::atomic::AtomicBool::new(false);
+            accept_with_backoff(
+                || {
+                    let first = !failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+                    async move { if first { Err(emfile()) } else { Ok(()) } }
+                },
+                &mut backoff,
+                None,
+            )
+            .await;
+        }
+        let lines = seen.lock().unwrap().clone();
+        let count = |level| lines.iter().filter(|l| l.0 == level).count();
+        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (1, 1), "{lines:?}");
     }
 
     /// Past the interval the `WARN` says so again, and a recovery after that
@@ -3421,11 +3463,11 @@ mod tests {
         let lines = logged_for(1, ACCEPT_WARN_EVERY + Duration::from_secs(1)).await;
         let count = |level| lines.iter().filter(|l| l.0 == level).count();
         assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (1, 1), "{lines:?}");
-        // Sixteen errors last past two intervals: a second WARN, and the
-        // recovery two seconds after it stays quiet.
+        // Sixteen errors last past an interval: a second WARN, and one
+        // recovery after it, not one per WARN's worth of errors.
         let lines = logged_for(16, Duration::ZERO).await;
         let count = |level| lines.iter().filter(|l| l.0 == level).count();
-        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (2, 0), "{lines:?}");
+        assert_eq!((count(tracing::Level::WARN), count(tracing::Level::INFO)), (2, 1), "{lines:?}");
     }
 
     /// The connections `accept(2)` reports a pending network error for, and
@@ -3447,12 +3489,13 @@ mod tests {
             libc::EHOSTUNREACH,
             libc::EOPNOTSUPP,
             libc::ENETUNREACH,
-            libc::EPERM,
         ] {
             let error = io::Error::from_raw_os_error(errno);
             assert!(!accept_error_is_the_listeners(&error), "errno {errno}: {error}");
         }
-        for errno in [24, 23, 12, 105, 9999] {
+        // The listener's own, `EPERM` (a denied `accept` stays queued and fails
+        // again at once) and an errno nothing here has heard of included.
+        for errno in [24, 23, 12, 105, 1, 9999] {
             let error = io::Error::from_raw_os_error(errno);
             assert!(accept_error_is_the_listeners(&error), "errno {errno}: {error}");
         }
