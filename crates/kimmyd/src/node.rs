@@ -1073,7 +1073,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
                 worker.set_policy(providers);
-                worker.set_owner_check(embedding_owner_check(worker_me, worker_members));
+                if let Some(check) = embedding_owner_check(worker_me, worker_members) {
+                    worker.set_owner_check(check);
+                }
                 worker.set_counters(worker_counters);
                 // Every error `run` returns is a storage error, which is
                 // transient: it used to return here, and node.rs logged
@@ -2497,10 +2499,6 @@ fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
     }
 }
 
-/// Start the drop purger (ADR-189): what a collection drop held is removed
-/// here, after the drop has answered, a chunk per commit. Always, whatever
-/// `storage.gc_interval_secs` says: it looks for owed rows on its own, and a
-/// drop's rows must not wait for a retention pass that may never run.
 /// TTL expiry, supervised as `ttl_expiry`.
 ///
 /// Ownership is rendezvous-hashed per collection among the members known to
@@ -2536,15 +2534,24 @@ fn spawn_expiry(
 /// Which embedded collections this member owns: the rendezvous function over
 /// the live members that may own embeddings by what they say about themselves
 /// (ADR-201), not one that is catching up and not one whose worker is switched
-/// off. With no clustering it is this node, which owns everything.
+/// off.
+///
+/// **`None` with no clustering**: the worker then installs no check and owns
+/// everything, as it always did. A check that answered yes to everything would
+/// make every collection a first sight to rescan at each start, for a gap a lone
+/// member cannot have, since it never defers.
 fn embedding_owner_check(
     me: kimmy_core::NodeId,
     members: Option<kimmy_cluster::Members>,
-) -> kimmy_vector::OwnerCheck {
-    let owners = kimmy_api::ownership::Owners::over(me, members);
-    Box::new(move |key| owners.owns_embedding(key))
+) -> Option<kimmy_vector::OwnerCheck> {
+    let owners = kimmy_api::ownership::Owners::over(me, Some(members?));
+    Some(Box::new(move |key| owners.owns_embedding(key)))
 }
 
+/// Start the drop purger (ADR-189): what a collection drop held is removed
+/// here, after the drop has answered, a chunk per commit. Always, whatever
+/// `storage.gc_interval_secs` says: it looks for owed rows on its own, and a
+/// drop's rows must not wait for a retention pass that may never run.
 fn spawn_drop_purger(
     engine: Arc<Engine>,
     shutdown: kimmy_task::Shutdown,
@@ -4151,11 +4158,19 @@ mod tests {
             catching_up: true,
             ..Default::default()
         }));
-        let check = embedding_owner_check(me, Some(members));
+        let check = embedding_owner_check(me, Some(members)).expect("clustered: a check");
         for key in (0..20).map(|i| format!("app/c{i}")) {
             assert!(!check(&key), "{key}: a catching-up member embeds nothing");
         }
-        let alone = embedding_owner_check(me, None);
-        assert!(alone("app/c0"), "with no clustering this node owns everything");
+    }
+
+    /// Without clustering the worker gets no owner check, so it owns everything
+    /// and never re-evaluates ownership (the worker's own tests pin that a worker
+    /// with no check rescans nothing): a lone member's start rescans nothing,
+    /// since it never defers and so has no gap to close.
+    #[test]
+    fn a_lone_members_worker_gets_no_owner_check_and_rescans_nothing_at_start() {
+        let me = kimmy_core::NodeId::from_bytes([0x11; 16]);
+        assert!(embedding_owner_check(me, None).is_none(), "no check without clustering");
     }
 }
