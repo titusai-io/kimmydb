@@ -148,12 +148,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   provider twice (two members that each believe they own it across a partition
   still both scan it), and a member that owns it again at its next check after
   losing it for a moment rescans it and finishes the reindex. A document the new
-  configuration's provider refuses as input (`400`, `413`, `422`), while
-  another document of the same batch is embedded at that moment, loses the
-  vectors it held from the old configuration, which could never be replaced,
-  with a `WARN` naming it; no other failure removes anything. A provider's
-  `408` and `425` are now retried like a `429`. The fingerprint covers the
-  whole configuration, the provider's `endpoint` and `api_key_env` included, so
+  configuration's provider refuses as input (`400`, `413`, `422`), when its
+  batch, taken apart, stored successes on both sides of it, loses the vectors
+  it held from the old configuration, which could never be replaced, with a
+  `WARN` naming it; no other failure removes anything. A provider's `408` and
+  `425` are now retried like a `429`. The fingerprint covers the whole
+  configuration, the provider's `endpoint` and `api_key_env` included, so
   changing either re-embeds the collection. The field is additive: an older
   build reads such a record and ignores it, so a rollback is safe.
 - **A node whose open outlasts the liveness probe is no longer killed and begun

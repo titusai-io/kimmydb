@@ -426,14 +426,19 @@ struct Checkpoint {
     /// The node's stop ended the work: nothing more is done, and nothing is
     /// recorded as done. The documents are embedded after the restart.
     stopped: Option<kimmy_storage::StopReason>,
-    /// A document of the batch in hand was embedded and stored: the
-    /// provider took input from this batch at this moment, so a document of
-    /// the same batch it refused as input was refused for itself.
-    proven: bool,
-    /// Documents of the batch in hand the provider refused as input
-    /// ([`VectorError::refuses_the_input`]); see
-    /// [`EmbeddingWorker::settle_refusals`].
-    refused: Vec<Job>,
+}
+
+/// How one document sent alone ended.
+enum Alone {
+    /// The provider's answer was stored; how many documents that wrote (none
+    /// when the document moved meanwhile).
+    Stored(usize),
+    /// The provider refused the document as input
+    /// ([`VectorError::refuses_the_input`]); the job comes back to be judged
+    /// against its split ([`EmbeddingWorker::settle_refusals`]).
+    RefusedAsInput(Job),
+    /// Anything else: skipped, left stale, or ended by the stop.
+    Failed,
 }
 
 /// The error the worker returns once the node's stop has ended its work.
@@ -971,10 +976,7 @@ impl EmbeddingWorker {
             if i + 1 == count && !checkpoint.failed {
                 checkpoint.token = pending.token.take();
             }
-            let (collection, shadow, config) =
-                (batch.collection.clone(), batch.shadow.clone(), batch.config.clone());
             self.embed_batch(batch, &mut checkpoint).await;
-            self.settle_refusals(&collection, &shadow, &config, &mut checkpoint);
             if checkpoint.stopped.is_some() {
                 break;
             }
@@ -2061,44 +2063,15 @@ impl EmbeddingWorker {
     /// whole scan. A store that fails is not progress, or a shadow collection
     /// that cannot be written would read fresh for the whole scan.
     async fn embed_scanned(&mut self, batch: Batch) -> Result<usize> {
-        let (collection, shadow, config) =
-            (batch.collection.clone(), batch.shadow.clone(), batch.config.clone());
         let mut checkpoint = Checkpoint::default();
         let embedded = self.embed_batch(batch, &mut checkpoint).await;
         if let Some(reason) = checkpoint.stopped {
             return Err(stopped(reason));
         }
-        self.settle_refusals(&collection, &shadow, &config, &mut checkpoint);
         if !checkpoint.failed {
             self.counters.progressed();
         }
         Ok(embedded)
-    }
-
-    /// Remove the old vectors of the documents one batch's split refused as
-    /// input, but only when the same split embedded and stored another
-    /// document ([`Checkpoint::proven`]): the provider was taking this
-    /// configuration's input at that moment, so the refusal is the
-    /// document's, not the provider's. Nothing carries from one batch to the
-    /// next, in a scan or a flush: a provider that goes bad, or comes good,
-    /// part-way through a scan would otherwise lend one batch's success to
-    /// another batch's refusals, which a key that expired mid-scan turns into
-    /// the loss of every later document's vectors. A batch of one proves
-    /// nothing. Empties the checkpoint's share either way.
-    fn settle_refusals(
-        &self,
-        collection: &CollectionMeta,
-        shadow: &CollectionMeta,
-        config: &VectorConfig,
-        checkpoint: &mut Checkpoint,
-    ) {
-        let proven = std::mem::take(&mut checkpoint.proven);
-        let refused = std::mem::take(&mut checkpoint.refused);
-        if proven {
-            for job in &refused {
-                self.forget_refused(collection, shadow, config, job);
-            }
-        }
     }
 
     /// Embed one batch and return how many documents were written.
@@ -2129,7 +2102,11 @@ impl EmbeddingWorker {
         }
         if jobs.len() == 1 {
             let job = jobs.into_iter().next().expect("one job");
-            return self.embed_alone(&collection, &shadow, &config, job, checkpoint).await;
+            // A batch of one proves nothing about a refusal: see below.
+            return match self.embed_alone(&collection, &shadow, &config, job, checkpoint).await {
+                Alone::Stored(written) => written,
+                Alone::RefusedAsInput(_) | Alone::Failed => 0,
+            };
         }
         let vectors = loop {
             match self.call_provider(&collection, &config, &jobs).await {
@@ -2167,26 +2144,31 @@ impl EmbeddingWorker {
                     );
                     let mut written = 0;
                     let mut alone = Checkpoint::default();
-                    for job in jobs {
-                        written +=
-                            self.embed_alone(&collection, &shadow, &config, job, &mut alone).await;
+                    let mut stored_at = Vec::new();
+                    let mut refused = Vec::new();
+                    for (at, job) in jobs.into_iter().enumerate() {
+                        match self.embed_alone(&collection, &shadow, &config, job, &mut alone).await
+                        {
+                            Alone::Stored(stored) => {
+                                written += stored;
+                                stored_at.push(at);
+                            }
+                            Alone::RefusedAsInput(job) => refused.push((at, job)),
+                            Alone::Failed => {}
+                        }
                         if alone.stopped.is_some() {
                             break;
                         }
                     }
                     checkpoint.failed |= alone.failed;
                     checkpoint.stopped = checkpoint.stopped.or(alone.stopped);
-                    checkpoint.proven |= alone.proven;
-                    checkpoint.refused.append(&mut alone.refused);
+                    self.settle_refusals(&collection, &shadow, &config, &stored_at, refused);
                     return written;
                 }
             }
         };
         match self.store(&collection, &shadow, &config, jobs, vectors, checkpoint) {
-            Ok(written) => {
-                checkpoint.proven = true;
-                written
-            }
+            Ok(written) => written,
             Err(e) => {
                 warn!(
                     error = %e,
@@ -2209,14 +2191,14 @@ impl EmbeddingWorker {
         config: &VectorConfig,
         job: Job,
         checkpoint: &mut Checkpoint,
-    ) -> usize {
+    ) -> Alone {
         let vectors = loop {
             match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
                 Ok(vectors) => break vectors,
                 Err(e) if e.is_stopping() => {
                     checkpoint.failed = true;
                     checkpoint.stopped = e.stop_reason();
-                    return 0;
+                    return Alone::Failed;
                 }
                 Err(e) if e.is_retryable() => {
                     warn!(error = %e, "embedding failed; retrying");
@@ -2244,21 +2226,18 @@ impl EmbeddingWorker {
                             "embedding permanently failed; skipping this document"
                         );
                         if e.refuses_the_input() {
-                            checkpoint.refused.push(job);
+                            return Alone::RefusedAsInput(job);
                         }
                     }
-                    return 0;
+                    return Alone::Failed;
                 }
             }
         };
-        // Proof only once the answer is stored: `store` is what checks the
-        // provider answered with a vector for every input, and an answer
-        // with the wrong count shows nothing about the refused document.
+        // Stored only once `store` has accepted the answer: it is what checks
+        // the provider answered with a vector for every input, and an answer
+        // with the wrong count shows nothing about a refused neighbour.
         match self.store(collection, shadow, config, vec![job], vectors, checkpoint) {
-            Ok(written) => {
-                checkpoint.proven = true;
-                written
-            }
+            Ok(written) => Alone::Stored(written),
             Err(e) => {
                 warn!(
                     error = %e,
@@ -2267,15 +2246,46 @@ impl EmbeddingWorker {
                     "storing a document's vectors failed; it stays stale"
                 );
                 checkpoint.failed = true;
-                0
+                Alone::Failed
+            }
+        }
+    }
+
+    /// Remove the old vectors of the documents a batch's split refused as
+    /// input, but only those with a stored success on **both sides** of them
+    /// in the same split (`stored_at` holds the split positions of the
+    /// documents stored, in order): the provider was taking this
+    /// configuration's input just before the document was refused and again
+    /// just after, so the refusal is the document's, not the provider's. A
+    /// success on one side is not enough, because nearly every call a failing
+    /// provider receives is inside a split, so a provider that comes good (or
+    /// goes bad) almost always does so part-way through one, and the
+    /// documents it refused before recovering (or after failing) would lose
+    /// their vectors. A refused document first or last in its split therefore
+    /// keeps them, and is sent again later, which fails safe. Nothing carries
+    /// from one split to another, and a batch of one proves nothing.
+    fn settle_refusals(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        stored_at: &[usize],
+        refused: Vec<(usize, Job)>,
+    ) {
+        let (Some(&first), Some(&last)) = (stored_at.first(), stored_at.last()) else {
+            return;
+        };
+        for (at, job) in &refused {
+            if first < *at && *at < last {
+                self.forget_refused(collection, shadow, config, job);
             }
         }
     }
 
     /// Remove what a document the provider refused as input holds from
     /// another configuration, judged as the document was when it was judged
-    /// stale (ADR-203). Called only once the same scan, or the same batch's
-    /// split, has seen the provider answer for this configuration, so the
+    /// stale (ADR-203). Called only for a refusal with stored successes on
+    /// both sides of it in its split ([`Self::settle_refusals`]), so the
     /// refusal is the document's: those vectors can no longer be replaced,
     /// and they may be another model's, in another vector space, ranked
     /// against queries embedded by this one. Vectors already under this
@@ -2450,7 +2460,7 @@ impl VectorError {
     /// a rejection per input inside a successful answer). Even these can be the
     /// configuration's fault — a field the model does not accept fails every
     /// document alike — which is why a refusal removes a document's vectors
-    /// only when another document of the same batch was embedded then
+    /// only with stored successes on both sides of it in the same split
     /// ([`EmbeddingWorker::settle_refusals`]).
     pub fn refuses_the_input(&self) -> bool {
         matches!(self, VectorError::ProviderRejected { status: 400 | 413 | 422, .. })
@@ -5624,15 +5634,15 @@ mod tests {
         assert!(made_under(&engine, &ids[0]).is_some(), "kept");
     }
 
-    /// A document the new provider refuses as input (`422`) in a batch whose
-    /// other documents land loses the vectors it held from the old
+    /// A document the new provider refuses as input (`422`) between two
+    /// documents of its batch that land loses the vectors it held from the old
     /// configuration, which can no longer be replaced; the others are embedded
     /// under the new one.
     #[tokio::test]
-    async fn a_document_refused_as_input_while_its_batch_lands_loses_its_old_vectors() {
+    async fn a_document_refused_as_input_between_two_that_land_loses_its_old_vectors() {
         let (engine, coll, _worker, _dir) = setup().await;
         let (ids, b, entry) =
-            embedded_then_reconfigured(&engine, &coll, &["poison", "world", "earth"], |a| {
+            embedded_then_reconfigured(&engine, &coll, &["world", "poison", "earth"], |a| {
                 VectorConfig { document_prefix: Some("passage: ".into()), ..a }
             })
             .await;
@@ -5644,8 +5654,8 @@ mod tests {
         owner.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
         switchable_owner(&mut owner, true);
         assert_eq!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 2 });
-        assert!(engine.get_vectors(&shadow, &ids[0]).unwrap().is_empty(), "A's vectors are gone");
-        assert_eq!(made_under(&engine, &ids[1]), Some(b.fingerprint()));
+        assert!(engine.get_vectors(&shadow, &ids[1]).unwrap().is_empty(), "A's vectors are gone");
+        assert_eq!(made_under(&engine, &ids[0]), Some(b.fingerprint()));
         assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()));
     }
 
@@ -5654,7 +5664,7 @@ mod tests {
     struct Phases {
         inner: Arc<FakeProvider>,
         calls: std::sync::atomic::AtomicUsize,
-        good: fn(usize) -> bool,
+        good: Box<dyn Fn(usize) -> bool + Send + Sync>,
     }
 
     #[async_trait]
@@ -5683,7 +5693,9 @@ mod tests {
     /// Forty documents under A, B moving only the endpoint, and a backfill of
     /// B in batches of four through a provider that serves the calls `good`
     /// says. Answers how many documents have no vectors afterwards.
-    async fn documents_without_vectors_after(good: fn(usize) -> bool) -> usize {
+    async fn documents_without_vectors_after(
+        good: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> usize {
         let (engine, coll, _worker, _dir) = setup().await;
         let bodies: Vec<String> = (0..40).map(|i| format!("doc{i}")).collect();
         let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
@@ -5698,7 +5710,7 @@ mod tests {
             .await;
         let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
         owner.set_batching(BatchSettings { max_chunks: 4, ..Default::default() });
-        let phases = Phases { inner: FakeProvider::new(4), calls: 0.into(), good };
+        let phases = Phases { inner: FakeProvider::new(4), calls: 0.into(), good: Box::new(good) };
         owner.set_provider(coll.id.0, Arc::new(phases));
         switchable_owner(&mut owner, true);
         assert!(matches!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { .. }));
@@ -5716,12 +5728,74 @@ mod tests {
         assert_eq!(documents_without_vectors_after(|call| call < 2).await, 0);
     }
 
-    /// Scenario B: six calls fail, then the provider serves. The first batch's
-    /// split is refused whole, so its four documents keep their vectors; a
-    /// success later in the scan used to count for them too.
+    /// Scenario B: the provider fails a number of calls, then serves. Six
+    /// lands on a split's boundary; seven, eight and nine land inside the
+    /// second batch's split, after one, two or three of its documents were
+    /// refused, and ten after the whole of it. None of the refused documents
+    /// has a stored success before it in its split, so none loses its
+    /// vectors. A success anywhere in the scan used to count; then one
+    /// anywhere in the split did, and d04, d04–d05 and d04–d06 lost theirs.
     #[tokio::test]
     async fn a_provider_that_comes_good_part_way_through_a_scan_removes_nothing() {
-        assert_eq!(documents_without_vectors_after(|call| call >= 6).await, 0);
+        for bad in 6..=10 {
+            let lost = documents_without_vectors_after(move |call| call >= bad).await;
+            assert_eq!(lost, 0, "after {bad} bad calls");
+        }
+    }
+
+    /// Going bad inside a split: the first document lands, the second is
+    /// refused for itself (`422`), and then the key expires and every later
+    /// call is refused (`400`). No refused document has a success after it in
+    /// the split, so none loses its vectors, the one refused for itself
+    /// included: that fails safe, and it is sent again.
+    #[tokio::test]
+    async fn a_provider_that_goes_bad_inside_a_split_removes_nothing() {
+        struct Expires {
+            inner: Arc<FakeProvider>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl EmbeddingProvider for Expires {
+            async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let status = if texts.iter().any(|t| t.contains("poison")) {
+                    422
+                } else if call >= 2 {
+                    400
+                } else {
+                    return self.inner.embed(texts).await;
+                };
+                Err(VectorError::ProviderRejected { provider: "fake", status, detail: "no".into() })
+            }
+
+            fn dim(&self) -> usize {
+                4
+            }
+
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+        }
+
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, _, entry) = embedded_then_reconfigured(
+            &engine,
+            &coll,
+            &["world", "poison", "earth", "moon"],
+            |a| VectorConfig { document_prefix: Some("passage: ".into()), ..a },
+        )
+        .await;
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        owner.set_provider(
+            coll.id.0,
+            Arc::new(Expires { inner: FakeProvider::new(4), calls: 0.into() }),
+        );
+        switchable_owner(&mut owner, true);
+        assert_eq!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 1 });
+        for id in &ids {
+            assert!(made_under(&engine, id).is_some(), "{id} keeps its vectors");
+        }
     }
 
     /// A provider whose answer for the other document of the split has the
@@ -5795,52 +5869,82 @@ mod tests {
         engine.clear_vector_fingerprint(coll.id).unwrap();
         assert_eq!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 0 });
         assert!(made_under(&engine, &ids[1]).is_some(), "nothing else was sent: kept");
-        engine
-            .replace(
-                &coll,
-                &ids[0],
-                bson::doc! { "_id": "d00", "title": "hi", "body": "changed" },
-                false,
-            )
-            .unwrap();
+        let change = |changes: &[(usize, &str)]| {
+            for (i, body) in changes {
+                let replacement =
+                    bson::doc! { "_id": ids[*i].to_string(), "title": "hi", "body": *body };
+                engine.replace(&coll, &ids[*i], replacement, false).unwrap();
+            }
+        };
+        // Its neighbours on both sides land in the same split.
+        change(&[(0, "changed"), (2, "moved")]);
         owner.rescan_owned().await.unwrap();
         assert!(engine.get_vectors(&shadow, &ids[1]).unwrap().is_empty(), "A's vectors are gone");
         assert_eq!(made_under(&engine, &ids[0]), Some(b.fingerprint()));
+        assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()));
 
-        // Under B already, then changed to text B's provider refuses, in a
-        // batch with a document that lands: its vectors are behind it, not
-        // another configuration's, and stay.
-        for (id, body) in [(&ids[0], "again"), (&ids[2], "poison")] {
-            let replacement = bson::doc! { "_id": id.to_string(), "title": "hi", "body": body };
-            engine.replace(&coll, id, replacement, false).unwrap();
-        }
+        // Under B, then changed to text B's provider refuses, between two
+        // documents that land: its vectors are behind it, not another
+        // configuration's, and stay.
+        change(&[(1, "fine")]);
+        owner.rescan_owned().await.unwrap();
+        assert_eq!(made_under(&engine, &ids[1]), Some(b.fingerprint()));
+        change(&[(0, "again"), (1, "poison"), (2, "again")]);
         let sent = fake.calls();
         owner.rescan_owned().await.unwrap();
-        assert!(fake.calls() > sent, "both were sent, and one refused");
-        assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()), "kept");
+        assert!(fake.calls() > sent, "all three were sent, and one refused");
+        assert_eq!(made_under(&engine, &ids[1]), Some(b.fingerprint()), "kept");
     }
 
     /// The stream's flush judges a refusal within its own batch's split: a
     /// batch every document of which is refused as input removes nothing, and
-    /// one where the others land removes the refused document's old vectors.
+    /// one where the documents either side of the refused one land removes
+    /// its old vectors.
     #[tokio::test]
     async fn a_flush_removes_only_what_its_own_split_shows_is_the_documents() {
         let (engine, coll, _worker, _dir) = setup().await;
         let (ids, b, _) = embedded_then_reconfigured(
             &engine,
             &coll,
-            &["poison one", "poison two", "world"],
+            &["poison one", "world", "poison two", "earth"],
             |a| VectorConfig { document_prefix: Some("passage: ".into()), ..a },
         )
         .await;
+        let (mut owner, fake, pending_of) = a_flushing_owner(&engine, &b);
+        *fake.poison.lock().unwrap() = Some("poison".into());
+
+        let mut both_refused = pending_of(&owner, &[&ids[0..1], &ids[2..3]].concat());
+        owner.flush(&mut both_refused).await.unwrap();
+        assert!(made_under(&engine, &ids[0]).is_some() && made_under(&engine, &ids[2]).is_some());
+
+        let mut between = pending_of(&owner, &ids[1..]);
+        owner.flush(&mut between).await.unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &ids[2]).unwrap().is_empty(), "A's vectors are gone");
+        assert!(made_under(&engine, &ids[0]).is_some(), "not in this batch: kept");
+        assert_eq!(made_under(&engine, &ids[1]), Some(b.fingerprint()));
+        assert_eq!(made_under(&engine, &ids[3]), Some(b.fingerprint()));
+    }
+
+    /// An owner that embeds under `b` with `fake`, and a way to hold a
+    /// pending batch of documents for its flush.
+    #[allow(clippy::type_complexity)]
+    fn a_flushing_owner(
+        engine: &Arc<Engine>,
+        b: &VectorConfig,
+    ) -> (
+        EmbeddingWorker,
+        Arc<FakeProvider>,
+        impl Fn(&EmbeddingWorker, &[kimmy_core::DocId]) -> Pending,
+    ) {
         let coll = engine.get_collection("app", "docs").unwrap();
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
-        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        let mut owner = EmbeddingWorker::new(Arc::clone(engine));
         let fake = FakeProvider::new(4);
-        *fake.poison.lock().unwrap() = Some("poison".into());
         owner.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
         switchable_owner(&mut owner, true);
-        let pending_of = |owner: &EmbeddingWorker, ids: &[kimmy_core::DocId]| {
+        let b = b.clone();
+        let pending_of = move |owner: &EmbeddingWorker, ids: &[kimmy_core::DocId]| {
             let mut pending = Pending::default();
             let judgement = Judgement {
                 fingerprint: b.fingerprint(),
@@ -5859,16 +5963,34 @@ mod tests {
             }
             pending
         };
+        (owner, fake, pending_of)
+    }
 
-        let mut both_refused = pending_of(&owner, &ids[..2]);
-        owner.flush(&mut both_refused).await.unwrap();
-        assert!(made_under(&engine, &ids[0]).is_some() && made_under(&engine, &ids[1]).is_some());
-
-        let mut one_lands = pending_of(&owner, &ids[1..]);
-        owner.flush(&mut one_lands).await.unwrap();
-        assert!(engine.get_vectors(&shadow, &ids[1]).unwrap().is_empty(), "A's vectors are gone");
-        assert!(made_under(&engine, &ids[0]).is_some(), "not in this batch: kept");
-        assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()));
+    /// Batches of one flush are judged apart: the first batch's split proves
+    /// its own refused document's case, and lends nothing to the next batch,
+    /// whose split refuses both its documents. (A flush holds one batch per
+    /// collection; two batches of one collection here stand for two.)
+    #[tokio::test]
+    async fn a_flush_lends_no_batchs_proof_to_the_next() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, b, _) = embedded_then_reconfigured(
+            &engine,
+            &coll,
+            &["world", "poison one", "earth", "poison two", "poison three"],
+            |a| VectorConfig { document_prefix: Some("passage: ".into()), ..a },
+        )
+        .await;
+        let (mut owner, fake, pending_of) = a_flushing_owner(&engine, &b);
+        *fake.poison.lock().unwrap() = Some("poison".into());
+        let mut first = pending_of(&owner, &ids[..3]);
+        let second = pending_of(&owner, &ids[3..]);
+        first.batches.extend(second.batches);
+        owner.flush(&mut first).await.unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &ids[1]).unwrap().is_empty(), "proved in its split");
+        for id in &ids[3..] {
+            assert!(made_under(&engine, id).is_some(), "{id}: nothing landed in its split: kept");
+        }
     }
 
     /// A document a deferred re-check sends alone and the provider refuses
