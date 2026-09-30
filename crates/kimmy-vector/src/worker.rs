@@ -1017,10 +1017,11 @@ impl EmbeddingWorker {
     /// documents the previous owner had deferred, silently. A rescan finds what
     /// is stale or missing and embeds only that ([`Unscanned::Check`]): it
     /// forces every document only when this member recorded a completed scan
-    /// under a configuration that has since changed. So a collection the
-    /// previous owner had kept up costs reads, not provider calls, on a member
-    /// that has never scanned it, which is every member but the one that owned
-    /// it when its configuration was set. The price is the one gap
+    /// under a configuration that has since changed and its own stream has not
+    /// yet passed the change (a member that skips a change's backfill forgets
+    /// what it recorded). So a collection the previous owner had kept up costs
+    /// reads, not provider calls, on every member but the one that owned it
+    /// when its current configuration was set. The price is the one gap
     /// [`Unscanned::Check`] names: a reindex the previous owner left unfinished
     /// is not seen.
     ///
@@ -1521,6 +1522,14 @@ impl EmbeddingWorker {
         // completed scan by whoever ran it, and only the owner completes
         // scans. If ownership moves later, vectors already replicate; a new
         // owner re-scans only when someone changes the configuration again.
+        //
+        // **And one recorded earlier is forgotten.** It attests a scan under
+        // the configuration this entry replaces, and the owner's re-embed under
+        // the new one replicates here, so keeping it would make this member
+        // look behind when it gains the collection back, and send every
+        // document to the provider again (ADR-201). Without it the collection
+        // reads as never scanned here, and an ownership rescan trusts each
+        // document's staleness.
         if !self.is_owner_of(&set.db, &set.collection) {
             debug!(
                 db = %set.db,
@@ -1528,6 +1537,7 @@ impl EmbeddingWorker {
                 "backfill owned elsewhere; relying on replication"
             );
             self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
+            kimmy_storage::blocking(|| self.engine.clear_vector_fingerprint(collection.id))?;
             return Ok(Outcome::Skipped);
         }
 
@@ -1642,7 +1652,8 @@ impl EmbeddingWorker {
         // configuration, attests it: a scan that trusted per-document
         // staleness with nothing recorded proved nothing about the
         // configuration, and recording it would stop a later forced scan
-        // when this member really is behind.
+        // when this member is behind a configuration its stream has not yet
+        // reached.
         if force || recorded == Some(fingerprint) {
             self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
         }
@@ -4610,7 +4621,7 @@ mod tests {
     }
 
     /// A member that has never scanned the collection: it did not own it when
-    /// its vectors were configured, so it skipped that backfill and recorded no
+    /// its vectors were configured, so it skipped that backfill and holds no
     /// fingerprint. Ten documents then get current vectors (as the owner's would
     /// replicate), by a worker that owns the collection for each one. Answers the
     /// documents' ids.
@@ -4637,7 +4648,6 @@ mod tests {
             assert!(matches!(owner.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
             ids.push(id);
         }
-        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), None, "the fixture's premise");
         ids
     }
 
@@ -4666,6 +4676,7 @@ mod tests {
     async fn an_ownership_rescan_sends_no_current_document_on_a_member_that_never_scanned() {
         let (engine, coll, _worker, _dir) = setup().await;
         current_without_a_fingerprint(&engine, &coll).await;
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), None, "the fixture's premise");
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert_eq!(fake.calls(), 0, "every document was current");
         assert_eq!(
@@ -4700,8 +4711,9 @@ mod tests {
     }
 
     /// A member that recorded a completed scan under a configuration that has
-    /// since changed knows it is behind: its ownership rescan re-embeds every
-    /// document, and then records the configuration it scanned under.
+    /// since changed, and whose stream has not passed the change (so it has not
+    /// forgotten what it recorded), is behind: its ownership rescan re-embeds
+    /// every document, and then records the configuration it scanned under.
     #[tokio::test]
     async fn an_ownership_rescan_forces_on_a_member_whose_recorded_configuration_changed() {
         let (engine, coll, _worker, _dir) = setup().await;
@@ -4735,5 +4747,23 @@ mod tests {
             worker.rescan_gained(t0 + Duration::from_secs(secs)).await.unwrap();
         }
         assert_eq!(fake.calls(), after, "not scanned twice");
+    }
+
+    /// A member that owned the collection when its vectors were configured
+    /// recorded that configuration; the configuration then changed while another
+    /// member owned it, and that member's re-embed replicated here. When this
+    /// member gains the collection back its vectors are current, so its rescan
+    /// sends nothing: skipping the new configuration's backfill forgot the old
+    /// fingerprint, which would otherwise read as this member being behind.
+    #[tokio::test]
+    async fn a_fingerprint_from_before_a_configuration_backfilled_elsewhere_forces_nothing() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        // Recorded under an earlier configuration.
+        engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
+        // The new configuration's entry reaches this member as a non-owner, and
+        // the owner's vectors under it replicate here.
+        current_without_a_fingerprint(&engine, &coll).await;
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls(), 0, "every document was current");
     }
 }

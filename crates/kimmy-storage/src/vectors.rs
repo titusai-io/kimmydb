@@ -567,6 +567,24 @@ impl crate::Engine {
         Ok(())
     }
 
+    /// Forget the fingerprint [`Self::put_vector_fingerprint`] recorded, so the
+    /// collection reads as never fully scanned here. The embedding worker calls
+    /// it when a configuration change is backfilled by another member: what was
+    /// recorded attests a configuration this member no longer knows its vectors
+    /// to be under, nor to be behind. Commits only when there was one.
+    pub fn clear_vector_fingerprint(&self, collection: CollectionId) -> Result<()> {
+        if self.vector_fingerprint(collection)?.is_none() {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Embedding)?;
+        {
+            let mut meta = txn.open_table(crate::tables::META)?;
+            meta.remove(fingerprint_key(collection).as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// The configuration fingerprint the last completed backfill recorded.
     pub fn vector_fingerprint(&self, collection: CollectionId) -> Result<Option<u64>> {
         let txn = self.db().begin_read()?;
