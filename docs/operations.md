@@ -2219,6 +2219,28 @@ Keep a copy of the damaged file if you want to know what happened to it. A
 store whose other commit slot alone is damaged opens normally, because redb
 reads only the primary slot of a store that was shut down cleanly.
 
+### Vector records from before 0.43.0, and mixed versions
+
+From 0.43.0 each stored vector record carries a fingerprint of the collection
+configuration it was embedded under, so a reindex whose owner stopped
+part-way is finished by whichever member takes the collection over
+([ADR-203](decisions.md)). The record format is additive, so **0.43.0 is not a
+rollback boundary** for it: an older build reads a record carrying the
+fingerprint and ignores it.
+
+- **Records written before the upgrade carry no fingerprint** and are judged
+  as before, by the document's version alone. Nothing rewrites them in the
+  background. The next configuration change's backfill re-embeds every such
+  record, as it always has, and stamps it; from then on the collection is
+  covered. A reindex of such records that its owner leaves unfinished is still
+  not finished by another member.
+- **In a mixed cluster**, a member on an older release writes records without
+  the fingerprint, so the same holds for what it embeds while it owns a
+  collection. Nothing else changes, and nothing is re-embedded because of the
+  upgrade itself.
+- **A member rolled back to 0.42.0** keeps the fingerprints on the records it
+  holds, ignores them, and writes its own records without one.
+
 ### Rebuild vector indexes after upgrading past 2026-08-15
 
 **Builds before this date could produce an HNSW index that silently lost part

@@ -1323,6 +1323,7 @@ mod tests {
                         source_hlc: Hlc::new(1, 0),
                         vector: vec![i as f32, 1.0, 0.0, 0.0],
                         text: "t".into(),
+                        config: None,
                     }],
                 )
                 .unwrap();
@@ -1513,6 +1514,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "new".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -1553,6 +1555,7 @@ mod tests {
             source_hlc: Hlc::new(2, 0),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             text: "replicated".into(),
+            config: None,
         };
         let mut body = bson::serialize_to_document(&record).unwrap();
         body.insert("_id", chunk_id.to_bson());
@@ -1609,6 +1612,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "new".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -1725,6 +1729,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "written while down".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -1852,6 +1857,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![0.0, 0.0, 0.0, 1.0],
                     text: "moved".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -2302,6 +2308,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "new".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -2735,6 +2742,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "new".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -2786,6 +2794,7 @@ mod tests {
                     source_hlc: Hlc::new(2, 0),
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "new".into(),
+                    config: None,
                 }],
             )
             .unwrap();

@@ -380,6 +380,7 @@ fn vector_writes(c: &mut Criterion) {
                         source_hlc: Hlc::new(1, 0),
                         vector: vector.clone(),
                         text: "a chunk of document text".into(),
+                        config: None,
                     })
                     .collect();
                 // `put_vectors` returns nothing, so the records are what gets

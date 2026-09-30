@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use kimmy_core::{
-    CollectionId, DocId, Error as CoreError, Hlc, ResumeToken, VectorConfig, VectorRecord,
-    vector_meta,
+    CollectionId, DocId, Error as CoreError, Hlc, ResumeToken, Unstamped, VectorConfig,
+    VectorRecord, vector_meta,
 };
 use tracing::info;
 
@@ -741,6 +741,20 @@ impl crate::Engine {
         self.write_batch(WriterHolder::Embedding, |scope| scope.delete_vectors(shadow, source))
     }
 
+    /// [`WriteScope::delete_vectors_made_under_another`], in a scope of its
+    /// own. A document whose chunks are all under `config` costs no commit.
+    pub fn delete_vectors_made_under_another(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        config: u64,
+        unstamped: Unstamped,
+    ) -> Result<usize> {
+        self.write_batch(WriterHolder::Embedding, |scope| {
+            scope.delete_vectors_made_under_another(shadow, source, config, unstamped)
+        })
+    }
+
     /// Visit every stored vector. Used by search and by index rebuilds.
     ///
     /// A document that does not decode as a vector record is **skipped, not
@@ -775,21 +789,28 @@ impl crate::Engine {
         })
     }
 
-    /// Whether a document's vectors are older than the document itself.
+    /// Whether a document's vectors need making again: any of them is older
+    /// than the document itself, or was made under a configuration other than
+    /// the one fingerprinted `config` (ADR-203). A record with no fingerprint
+    /// is judged as `unstamped` says ([`VectorRecord::is_stale`]).
     ///
     /// Returns `true` when there are no vectors at all, since a document that
-    /// has never been embedded also needs work.
+    /// has never been embedded also needs work. The fingerprint rides on the
+    /// records this reads anyway, so the configuration costs no read of its
+    /// own.
     pub fn vectors_are_stale(
         &self,
         shadow: &CollectionMeta,
         source: &DocId,
         current: Hlc,
+        config: u64,
+        unstamped: Unstamped,
     ) -> Result<bool> {
         let records = self.get_vectors(shadow, source)?;
         if records.is_empty() {
             return Ok(true);
         }
-        Ok(records.iter().any(|r| r.is_stale(current)))
+        Ok(records.iter().any(|r| r.is_stale(current, config, unstamped)))
     }
 
     fn vector_chunk_numbers(&self, shadow: &CollectionMeta, source: &DocId) -> Result<Vec<u32>> {
@@ -846,6 +867,30 @@ impl WriteScope<'_> {
             self.touch_vector_generation(shadow.id);
         }
         Ok(())
+    }
+
+    /// Remove every chunk of one source document when any was made under a
+    /// configuration other than the one fingerprinted `config`
+    /// ([`VectorRecord::made_under_another`]; a chunk with no fingerprint is
+    /// judged as `unstamped` says). The embedding worker calls it when the
+    /// current configuration's provider permanently refuses the document:
+    /// what it holds is another model's vectors, in another vector space, and
+    /// a search would rank them against queries embedded by this one
+    /// (ADR-203). Chunks already under `config` are kept. Read under the
+    /// writer, like [`Self::delete_vectors`], so no write can land between
+    /// the judgement and the delete. Returns how many were removed.
+    pub fn delete_vectors_made_under_another(
+        &mut self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        config: u64,
+        unstamped: Unstamped,
+    ) -> Result<usize> {
+        let records = self.engine.get_vectors(shadow, source)?;
+        if !records.iter().any(|r| r.made_under_another(config, unstamped)) {
+            return Ok(0);
+        }
+        self.delete_vectors(shadow, source)
     }
 
     /// [`crate::Engine::delete_vectors`], into this scope's transaction.
@@ -1237,6 +1282,7 @@ mod tests {
             source_hlc: Hlc::new(hlc_ms, 0),
             vector: vec![chunk as f32, 1.0],
             text: text.into(),
+            config: None,
         }
     }
 
@@ -1555,13 +1601,47 @@ mod tests {
     fn staleness_is_derived_from_the_document_version() {
         let (engine, shadow, _dir) = with_vectors();
         let source = DocId::Int64(1);
+        let stale = |ms| {
+            engine.vectors_are_stale(&shadow, &source, Hlc::new(ms, 0), 7, Unstamped::ByVersion)
+        };
 
         // Never embedded: work is needed.
-        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(10, 0)).unwrap());
+        assert!(stale(10).unwrap());
 
         engine.put_vectors(&shadow, &source, &[record(0, 10, "text")]).unwrap();
-        assert!(!engine.vectors_are_stale(&shadow, &source, Hlc::new(10, 0)).unwrap());
-        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(11, 0)).unwrap());
+        assert!(!stale(10).unwrap());
+        assert!(stale(11).unwrap());
+    }
+
+    /// A record's configuration fingerprint is stored with it and read back,
+    /// and a chunk made under another configuration marks the document stale
+    /// at the same version, where one with no fingerprint is left to the
+    /// version (ADR-203).
+    #[test]
+    fn staleness_reads_the_configuration_each_chunk_carries() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        let at = Hlc::new(10, 0);
+        let stamped = |chunk, config| VectorRecord { config, ..record(chunk, 10, "t") };
+
+        engine.put_vectors(&shadow, &source, &[stamped(0, Some(u64::MAX))]).unwrap();
+        assert_eq!(engine.get_vectors(&shadow, &source).unwrap()[0].config, Some(u64::MAX));
+        assert!(
+            !engine.vectors_are_stale(&shadow, &source, at, u64::MAX, Unstamped::Stale).unwrap()
+        );
+
+        engine
+            .put_vectors(&shadow, &source, &[stamped(0, Some(u64::MAX)), stamped(1, Some(7))])
+            .unwrap();
+        assert!(
+            engine.vectors_are_stale(&shadow, &source, at, u64::MAX, Unstamped::ByVersion).unwrap(),
+            "one chunk made under another configuration"
+        );
+
+        engine.put_vectors(&shadow, &source, &[stamped(0, None)]).unwrap();
+        assert_eq!(engine.get_vectors(&shadow, &source).unwrap()[0].config, None);
+        assert!(!engine.vectors_are_stale(&shadow, &source, at, 7, Unstamped::ByVersion).unwrap());
+        assert!(engine.vectors_are_stale(&shadow, &source, at, 7, Unstamped::Stale).unwrap());
     }
 
     #[test]
@@ -1572,7 +1652,8 @@ mod tests {
         engine
             .put_vectors(&shadow, &source, &[record(0, 20, "fresh"), record(1, 10, "stale")])
             .unwrap();
-        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(20, 0)).unwrap());
+        let at = Hlc::new(20, 0);
+        assert!(engine.vectors_are_stale(&shadow, &source, at, 7, Unstamped::ByVersion).unwrap());
     }
 
     #[test]
@@ -1760,6 +1841,7 @@ mod tests {
                     source_hlc: Hlc::ZERO,
                     vector: vec![0.5; 8],
                     text: "text that is about to be dropped".into(),
+                    config: None,
                 }],
             )
             .unwrap();

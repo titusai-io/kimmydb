@@ -92,6 +92,32 @@ impl VectorConfig {
         }
         self.provider.validate()
     }
+
+    /// A stable fingerprint of this configuration.
+    ///
+    /// FNV-1a over the JSON serialization. Two things hold it: the embedding
+    /// worker's record of the configuration its last completed scan ran under,
+    /// which is local, and every vector record the worker writes, which
+    /// replicates (ADR-203). The second makes stability a cross-member and
+    /// cross-release matter: members compare the fingerprint a record carries
+    /// with their own of the collection's configuration, so a build that
+    /// serializes an unchanged configuration differently reads every record as
+    /// made under another one and re-embeds the collection once when it next
+    /// scans it. A new optional field therefore skips serializing when unset,
+    /// as `document_prefix` does, and `the_fingerprint_of_a_configuration_is_pinned`
+    /// fails when the encoding moves.
+    pub fn fingerprint(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x100_0000_01b3;
+
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        let mut hash = OFFSET;
+        for byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
 }
 
 /// Where embeddings come from.
@@ -901,6 +927,30 @@ mod tests {
         .unwrap();
         assert!(serde_json::to_value(&plain).unwrap()["provider"].get("dimensions").is_none());
     }
+
+    /// Every vector record carries its configuration's fingerprint and every
+    /// member compares it with its own (ADR-203), so a build that fingerprints an
+    /// unchanged configuration differently re-embeds every collection it scans.
+    /// These are the values 0.43.0 wrote; a change here is that cost, and must be
+    /// deliberate.
+    #[test]
+    fn the_fingerprint_of_a_configuration_is_pinned() {
+        assert_eq!(config().fingerprint(), PINNED_BYO);
+        let served = VectorConfig {
+            provider: ProviderConfig::Ollama {
+                model: "nomic-embed-text".into(),
+                endpoint: "http://localhost:11434".into(),
+            },
+            dim: 768,
+            document_prefix: Some("search_document: ".into()),
+            ..config()
+        };
+        assert_eq!(served.fingerprint(), PINNED_SERVED);
+        assert_ne!(PINNED_BYO, PINNED_SERVED);
+    }
+
+    const PINNED_BYO: u64 = 0x55e6_85e3_0fd4_2c17;
+    const PINNED_SERVED: u64 = 0x1360_41fe_f8f0_89d3;
 
     #[test]
     fn base_name_inverts_shadow_name_and_ignores_ordinary_collections() {

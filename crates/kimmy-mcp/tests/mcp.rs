@@ -282,6 +282,7 @@ fn seed_vectors(server: &Server) {
             source_hlc: stamp.hlc,
             vector: vector.to_vec(),
             text: text.to_string(),
+            config: None,
         };
         server.engine.put_vectors(&shadow, &source, &[record]).unwrap();
     }

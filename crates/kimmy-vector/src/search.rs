@@ -423,6 +423,7 @@ mod tests {
                 source_hlc: kimmy_core::Hlc::new(1, 0),
                 vector: vector.to_vec(),
                 text: (*text).to_string(),
+                config: None,
             });
         }
         for (source, records) in by_source {
