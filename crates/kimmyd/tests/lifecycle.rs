@@ -2200,6 +2200,81 @@ async fn a_marker_that_cannot_be_written_fails_the_start_before_the_open() {
     assert_eq!(unbound.wait_exit().code(), status.code());
 }
 
+/// A replay floor that can never be written refuses the start before the open,
+/// as a marker that cannot be written does: the floor's contents are written
+/// right after the open, but a directory at its path is known before it. On a
+/// fresh directory nothing is created; on an existing store `kimmy.redb` is
+/// byte for byte what the last run left, and the refusal is recorded as a failed
+/// start that keeps the clean stop before it.
+#[tokio::test]
+async fn a_replay_floor_path_that_cannot_be_written_refuses_the_start_before_the_open() {
+    let data = |dir: &Path| dir.join("data");
+    let floor_dir = |dir: &Path| data(dir).join("kimmy.replay-floor");
+    let entries = |dir: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(data(dir))
+            .map(|found| {
+                found.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+
+    // A fresh directory.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(floor_dir(fresh.path())).unwrap();
+    let mut failed = Run::spawn_clustered(fresh.path(), "fresh", dead_port(), 3);
+    let status = failed.wait_exit();
+    assert!(!status.success(), "{status:?}");
+    let log = failed.log();
+    assert!(log.contains("exiting on an error"), "{log}");
+    assert!(log.contains("the replay floor cannot be written"), "{log}");
+    assert!(!log.contains("storage engine open"), "the store was opened: {log}");
+    assert!(!log.contains("starting kimmyd"), "the banner follows the open: {log}");
+    assert!(!data(fresh.path()).join("kimmy.redb").exists(), "the store was created");
+    assert!(!data(fresh.path()).join(CATCHING_UP_FILE).exists(), "a marker was written");
+    let recorded = marker(fresh.path()).expect("a failed start records itself");
+    assert!(
+        recorded.contains("exit = \"error\"") && recorded.contains("failed_start = true"),
+        "{recorded}"
+    );
+    assert_eq!(entries(fresh.path()), ["kimmy.last-exit", "kimmy.replay-floor"]);
+
+    // An existing store, stopped cleanly, with a directory where its floor goes.
+    let client = reqwest::Client::new();
+    let kept = tempfile::tempdir().unwrap();
+    let mut first = Run::spawn_clustered(kept.path(), "first", dead_port(), 3);
+    first.wait_ready(&client).await;
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+    let _ = std::fs::remove_file(data(kept.path()).join("kimmy.replay-floor"));
+    std::fs::create_dir_all(floor_dir(kept.path())).unwrap();
+    let store = data(kept.path()).join("kimmy.redb");
+    let before = std::fs::read(&store).unwrap();
+    let names_before = entries(kept.path());
+
+    let mut refused = Run::spawn_clustered(kept.path(), "refused", dead_port(), 3);
+    assert!(!refused.wait_exit().success());
+    let log = refused.log();
+    assert!(log.contains("the replay floor cannot be written"), "{log}");
+    assert!(!log.contains("storage engine open"), "the store was opened: {log}");
+    assert!(log.contains("previous run ended cleanly"), "tagged as before the open: {log}");
+    assert!(std::fs::read(&store).unwrap() == before, "the refused start wrote to kimmy.redb");
+    let recorded = marker(kept.path()).expect("a failed start records itself");
+    assert!(recorded.contains("failed_start = true"), "{recorded}");
+    assert!(
+        recorded.contains("[previous]") && recorded.contains("exit = \"shutdown\""),
+        "{recorded}"
+    );
+    assert_eq!(entries(kept.path()), names_before, "the refused start left files behind");
+
+    // The same directory started standalone does not look at the floor at all.
+    let mut standalone = Run::spawn(kept.path(), "standalone");
+    standalone.wait_ready(&client).await;
+    standalone.signal("TERM");
+    assert!(standalone.wait_exit().success());
+}
+
 /// Seeds that name only this member name nobody to catch up from: a fresh member
 /// whose static seed list is its own cluster address is ready at once and not
 /// marked, where a replicas=1 first start would otherwise wait out the bound. With
