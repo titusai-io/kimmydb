@@ -146,13 +146,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   each batch whether this member still owns the collection and stops when it
   does not, so a reindex under way when ownership moves is not sent to the
   provider twice (two members that each believe they own it across a partition
-  still both scan it). A document the new configuration's provider refuses for
-  good loses the vectors it held from the old one, with a `WARN` naming it,
-  instead of leaving another model's vectors in the collection's search. The
-  fingerprint covers the whole configuration, the provider's `endpoint` and
-  `api_key_env` included, so changing either re-embeds the collection. The
-  field is additive: an older build reads such a record and ignores it, so a
-  rollback is safe.
+  still both scan it), and a member that owns it again at its next check after
+  losing it for a moment rescans it and finishes the reindex. A document the new
+  configuration's provider refuses as input (`400`, `413`, `422`), while the
+  same scan shows the provider embedding other documents, loses the vectors it
+  held from the old configuration, which could never be replaced, with a
+  `WARN` naming it; no other failure removes anything. A provider's `408` and
+  `425` are now retried like a `429`. The fingerprint covers the whole
+  configuration, the provider's `endpoint` and `api_key_env` included, so
+  changing either re-embeds the collection. The field is additive: an older
+  build reads such a record and ignores it, so a rollback is safe.
 - **A node whose open outlasts the liveness probe is no longer killed and begun
   again for ever.** Nothing listened until the open finished, so the documented
   manifest's liveness probe (Kubernetes' defaults, about 30 s) restarted any node

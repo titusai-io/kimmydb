@@ -374,16 +374,25 @@ restart re-processes up to a second of the stream, which the idempotence
 above makes a handful of reads.
 
 A provider failure that could plausibly succeed on retry — a transport error, a
-rate limit — retries the same entry after a delay rather than advancing past it.
+rate limit, a `5xx`, a `408` or a `425` — retries the same entry after a delay rather than advancing past it.
 A failure that will fail identically forever — a wrong dimension, a missing API
 key — does not, because retrying it would stall every document queued behind it.
-A document the provider refuses for good this way also **loses the vectors it
-held from another configuration**: they are another model's, and a search would
-rank them against queries embedded by this one. Vectors it holds from the
-current configuration, only behind the document, stay. A `WARN` names the
-document and the chunks removed. The refused document then has no vectors, so
-every later scan sends it again, as it does any document that has never been
-embedded.
+A document the provider refuses **as input** (`400`, `413` or `422`) also loses
+the vectors it held from another configuration, but only once the same scan,
+or the same batch taken apart, has seen the provider embed another document
+under the current configuration: that shows the provider works, so the refusal
+is the document's, and its old vectors can never be replaced. They may be
+another model's, in another vector space; they may also be perfectly good (the
+fingerprint also moves with the endpoint, the key's variable, the metric or
+the query prefix), which is why nothing less than a refusal of the document
+itself removes them. Every other failure removes nothing: a missing key, an
+authentication or `404` answer, a wrong width, an unusable answer, a refusal
+every document meets, and a document refused on its own (a deferred re-check,
+a collection of one), where nothing shows the provider works. Vectors from the
+current configuration, only behind the document, always stay. A `WARN` names
+the document and the chunks removed. The refused document then has no vectors,
+so every later scan sends it again, as it does any document that has never
+been embedded.
 
 ---
 
@@ -409,8 +418,10 @@ again, before each batch, whether this member still owns the collection, and one
 that no longer does stops there without recording anything, so a reindex under
 way when ownership moves is not sent twice, beyond the batch in flight; a forced
 one goes on only for records with no fingerprint, which the new owner's rescan
-trusts. Two members that each believe they own the collection, across a
-partition, both scan it. Records written
+trusts. A member that owns the collection again at its next ownership check,
+after losing it for a moment, counts that as a gain and rescans it once the
+gain has held, which finishes what its scan left. Two members that each believe
+they own the collection, across a partition, both scan it. Records written
 before 0.43.0 cannot say, and a rescan re-embeds them only on a member that
 completed a scan under an earlier configuration and has not yet processed the
 change itself (a member that sees a change backfilled by another member forgets
