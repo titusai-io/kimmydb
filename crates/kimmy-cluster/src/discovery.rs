@@ -78,6 +78,22 @@ impl SeedSource {
     }
 }
 
+/// Whether `seeds` name a member other than the one at `own`, judged without
+/// resolving anything (ADR-202).
+///
+/// A member that creates its store with nobody else to hear from has nothing to
+/// catch up from, so it is not marked. A static address is compared with this
+/// member's own cluster address, which is how discovery already takes it out of
+/// what a seed resolves to (`resolve`). A name (`dns:`, `dns-srv:`, `k8s:`) is
+/// resolved by the discovery loop and not at the start, so it is taken to name
+/// others: the member is marked, and waits the bound if nobody answers.
+pub fn names_another_member(seeds: &[SeedSource], own: SocketAddr) -> bool {
+    seeds.iter().any(|seed| match seed {
+        SeedSource::Static(addrs) => addrs.iter().any(|addr| *addr != own),
+        SeedSource::Dns { .. } | SeedSource::DnsSrv { .. } | SeedSource::Kubernetes { .. } => true,
+    })
+}
+
 /// The process-wide resolver, built from `/etc/resolv.conf` on first use.
 ///
 /// One resolver rather than one per lookup: it holds the system configuration
@@ -295,6 +311,34 @@ mod tests {
 
     fn parse(s: &str) -> SeedSource {
         s.parse().unwrap_or_else(|e| panic!("{s:?} should parse: {e}"))
+    }
+
+    /// Seeds that name only this member name nobody to hear from; anything that
+    /// names another address, or a name discovery resolves later, does.
+    #[test]
+    fn seeds_naming_only_this_member_name_no_other() {
+        let own: SocketAddr = "127.0.0.1:7900".parse().unwrap();
+        let other: SocketAddr = "127.0.0.2:7900".parse().unwrap();
+        let same_ip_other_port: SocketAddr = "127.0.0.1:7901".parse().unwrap();
+        assert!(!names_another_member(&[], own));
+        assert!(!names_another_member(&[SeedSource::Static(vec![])], own));
+        assert!(!names_another_member(&[SeedSource::Static(vec![own])], own));
+        assert!(!names_another_member(
+            &[SeedSource::Static(vec![own]), SeedSource::Static(vec![own])],
+            own
+        ));
+        assert!(names_another_member(&[SeedSource::Static(vec![own, other])], own));
+        assert!(names_another_member(&[SeedSource::Static(vec![other])], own));
+        assert!(names_another_member(&[SeedSource::Static(vec![same_ip_other_port])], own));
+        for name in
+            ["dns:seeds.example.com", "dns-srv:_kimmy._tcp.example.com", "k8s:kimmy.default.svc"]
+        {
+            assert!(names_another_member(&[parse(name)], own), "{name}");
+        }
+        assert!(names_another_member(
+            &[SeedSource::Static(vec![own]), parse("dns:x.example.com")],
+            own
+        ));
     }
 
     #[test]

@@ -404,6 +404,9 @@ impl ServeFailure {
             // Handled before this is asked: a node shutting down refuses
             // pushes, which is not a failure to count.
             ProtocolError::Stopping(_) => None,
+            // This node dialled itself; the dialler ends it, and it is not a
+            // failure of a peer.
+            ProtocolError::SelfContact => None,
             ProtocolError::Unauthenticated => Some(Self::Unauthenticated),
             ProtocolError::Fault(_) => Some(Self::Fault),
         }
@@ -641,6 +644,11 @@ where
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
     debug!(?peer, "peer authenticated");
+    // The same connection, seen from the listener: this node dialled itself.
+    if peer == engine.node_id() {
+        note_self_contact(peer);
+        return Ok(());
+    }
 
     loop {
         let (frame, undecodable) = crate::protocol::read_frame_noting_facts(&mut stream).await?;
@@ -1076,7 +1084,34 @@ pub(crate) async fn dial(
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
+    // A node that dials an address of its own gets its own id back. Nothing it
+    // reads there is a statement about the cluster, and the catching-up marker
+    // must never count it as a member reached (ADR-202).
+    if their_node == engine.node_id() {
+        note_self_contact(peer);
+        return Err(ProtocolError::SelfContact);
+    }
     Ok((stream, their_node))
+}
+
+/// Say, once per process, that a contact was with a node that has this node's id.
+///
+/// Two things look the same from here: a seed that names **this** node by an
+/// address it does not bind (a wildcard bind reached by a loopback or service
+/// address), and **another host** started from a copy of this node's data
+/// directory, which holds the same node id. Neither is a peer, and both are ended
+/// at the handshake; the line names the address, so the operator can tell which.
+fn note_self_contact(peer: impl std::fmt::Display) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        info!(
+            %peer,
+            "a connection reached a node with this node's own id, and is ended; it is not a \
+             peer. If that address is one of this node's own, a seed names it by an address it \
+             does not bind; if it is another host, that host was started from a copy of this \
+             node's data directory and must be given its own"
+        );
+    }
 }
 
 /// The body of [`sync_once`], over a connection [`dial`] opened: one round,
@@ -1152,6 +1187,7 @@ where
     let ours = stalls.local_facts.clone();
     write_frame(stream, &Message::AskVersions { witnessed: true, facts: ours }).await?;
     let (frame, undecodable) = crate::protocol::read_frame_noting_facts(stream).await?;
+    let mut their_facts = None;
     let (theirs, their_witnessed) = match frame {
         Message::Vectors { servable, witnessed, facts } => {
             if undecodable {
@@ -1159,6 +1195,7 @@ where
             }
             // What the peer says about itself, kept for the loop to hand to
             // `Members` once the tick is done (ADR-201).
+            their_facts = facts.clone();
             if let Some(facts) = facts {
                 stalls.facts_read.push((their_node, facts));
             }
@@ -1173,6 +1210,14 @@ where
     let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
     // For the lag gauge, whatever becomes of the round from here.
     stalls.vectors_read.push((peer, theirs.clone()));
+    // What this contact read, for the catching-up marker's judgement (ADR-202):
+    // kept by the loop only if the round then succeeds.
+    stalls.reached_candidates.push(crate::catchup::Reached {
+        node: their_node,
+        servable: theirs.clone(),
+        witnessed: their_witnessed.clone(),
+        facts: their_facts,
+    });
 
     // What we have *seen*, not what we could serve. Asking against the
     // servable vector re-requests everything a node processed without
@@ -1916,6 +1961,9 @@ pub struct PeerStalls {
     facts_read: Vec<(NodeId, Arc<crate::facts::Facts>)>,
     /// Peers whose block this tick did not decode, until the loop takes them.
     facts_undecodable: Vec<NodeId>,
+    /// What each contact's vector read showed, until the loop takes it: kept
+    /// only for a round that then succeeded (ADR-202).
+    reached_candidates: Vec<crate::catchup::Reached>,
     /// Where this node stood behind each peer when its probe count was read,
     /// on the origins it then trailed that peer on (ADR-168) — the mirror of
     /// `by_peer`, so a member that is itself draining a backlog is not read
@@ -2202,7 +2250,37 @@ impl PeerStalls {
         self.local_facts = facts;
     }
 
-    /// The blocks peers sent since the last call.
+    /// What the contacts since the last call read, for the catching-up marker.
+    ///
+    /// **Kept only if the round succeeded**: the marker is judged on successful
+    /// contacts, and a round that read a peer's vectors and then failed read
+    /// nothing it can rely on. The round is passed in, and not a flag, so the
+    /// answer cannot be got wrong at the call.
+    pub fn take_reached_after<T, E>(
+        &mut self,
+        round: &Result<T, E>,
+    ) -> Vec<crate::catchup::Reached> {
+        let candidates = std::mem::take(&mut self.reached_candidates);
+        if round.is_ok() { candidates } else { Vec::new() }
+    }
+
+    /// Whether a whole-database snapshot pull from a current member is still
+    /// under way, which the catching-up marker waits out (ADR-202): the filter
+    /// `resume_snapshots` applies. One that is complete is not (applying the last
+    /// page sets it complete before steps that can still fail, and the entry stays
+    /// until the round ends), nor one that has applied no page; a repair's scoped
+    /// pull is the ordinary anti-entropy machinery on a member that is otherwise
+    /// current, and does not hold it; and a departed peer's cursor cannot hold
+    /// this member.
+    pub fn snapshot_pending(&self, live: Option<&std::collections::BTreeSet<NodeId>>) -> bool {
+        self.snapshots.iter().any(|(peer, progress)| {
+            progress.scope().is_none()
+                && !progress.is_complete()
+                && progress.pages() > 0
+                && live.is_none_or(|live| live.contains(peer))
+        })
+    }
+
     /// The peers whose block did not decode since the last call.
     pub fn take_facts_undecodable(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.facts_undecodable)
@@ -4998,6 +5076,17 @@ mod tests {
         assert!(!outcome.exhausted, "left to resume is not the tail: {outcome:?}");
         assert!(stalls.snapshot_resumes(their_node, None), "the cursor is kept");
         assert_eq!(stalls.snapshots[&their_node].after(), Some(&cursor(2_000)));
+        // The catching-up marker waits it out (ADR-202): a whole-database cursor
+        // that is not complete, for a peer that is still a member, and for no
+        // other.
+        assert!(stalls.snapshot_pending(None), "a whole-database snapshot is under way");
+        let members: std::collections::BTreeSet<NodeId> = [their_node].into();
+        assert!(stalls.snapshot_pending(Some(&members)));
+        let departed: std::collections::BTreeSet<NodeId> = [node(4)].into();
+        assert!(
+            !stalls.snapshot_pending(Some(&departed)),
+            "a departed peer's cursor cannot hold this member"
+        );
         let meta = engine.collection_by_id(orders).unwrap().expect("the definition arrived");
         assert_eq!(engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(), 2);
         assert_eq!(
@@ -5037,6 +5126,7 @@ mod tests {
         assert!(outcome.exhausted, "a completed snapshot is the tail: {outcome:?}");
         assert!(outcome.divergent.is_some(), "so the check ran: {outcome:?}");
         assert!(!stalls.snapshot_resumes(their_node, None), "nothing left to resume");
+        assert!(!stalls.snapshot_pending(None), "a completed snapshot holds nothing");
         assert_eq!(
             engine.count(&meta, kimmy_storage::WalkScope::Request).unwrap(),
             4,
@@ -5247,6 +5337,10 @@ mod tests {
             assert!(outcome.repairing && !outcome.exhausted, "round {round}: {outcome:?}");
             assert!(stalls.repairing(their_node), "round {round}: a moving repair is kept");
             assert!(stalls.snapshot_resumes(their_node, Some(orders)), "round {round}");
+            assert!(
+                !stalls.snapshot_pending(None),
+                "round {round}: a repair's scoped snapshot never holds the catching-up marker"
+            );
         }
 
         // The final page, with the budget intact: done, and the check runs.
@@ -6703,6 +6797,79 @@ mod tests {
         let failures = served.failures.lock().clone();
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(failures.iter().all(|f| matches!(f, ServeFailure::Io)), "{failures:?}");
+    }
+
+    /// A round that failed contributes nothing to the catching-up marker, whatever
+    /// it read before it failed; one that succeeded contributes what it read.
+    #[test]
+    fn only_a_round_that_succeeded_contributes_its_contact() {
+        let candidate = || crate::catchup::Reached {
+            node: NodeId::from_bytes([7; 16]),
+            servable: VersionVector::new(),
+            witnessed: None,
+            facts: None,
+        };
+        let mut stalls = PeerStalls::new();
+        stalls.reached_candidates.push(candidate());
+        let failed: Result<(), ProtocolError> = Err(ProtocolError::Closed);
+        assert!(stalls.take_reached_after(&failed).is_empty(), "a failed round is no contact");
+        assert!(stalls.reached_candidates.is_empty(), "and it does not linger for the next");
+
+        stalls.reached_candidates.push(candidate());
+        let succeeded: Result<(), ProtocolError> = Ok(());
+        assert_eq!(stalls.take_reached_after(&succeeded).len(), 1);
+    }
+
+    /// A connection from this node to itself is ended by the listener that
+    /// receives it, having read the handshake: nothing it would serve is a
+    /// statement about the cluster, and the dialler must not count it a peer.
+    #[tokio::test]
+    async fn a_connection_from_this_node_to_itself_is_ended_by_the_listener() {
+        const SECRET: &str = "a-self-contact-secret";
+        const BINDING: &[u8] = b"a-self-contact-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let serving =
+            serve_peer(&engine, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+        let asking = async {
+            let them = open_handshake(&engine, &mut ours, SECRET, BINDING).await.unwrap();
+            assert_eq!(them, engine.node_id(), "premise: the peer named is this node");
+            read_frame(&mut ours).await
+        };
+        // Bounded: a listener that did not end the contact would leave both sides
+        // waiting on each other.
+        let (served, answer) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(serving, asking) })
+                .await
+                .expect("the listener ended the contact");
+        assert!(served.is_ok(), "{served:?}");
+        assert!(matches!(answer, Err(ProtocolError::Closed)), "{answer:?}");
+    }
+
+    /// A snapshot that has applied no page holds nothing, and neither does one
+    /// that is complete but has not yet been dropped from the map (applying the
+    /// last page marks it complete before steps that can still fail): only an
+    /// unfinished pull that has landed a page is pending.
+    #[test]
+    fn a_snapshot_with_no_page_applied_or_a_complete_one_holds_nothing() {
+        let peer = NodeId::from_bytes([5; 16]);
+        let mut stalls = PeerStalls::new();
+        stalls.snapshot_progress(peer, None);
+        assert!(!stalls.snapshot_pending(None), "begun, no page yet");
+
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        a.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(progress.is_complete(), "premise: the one page was the last");
+        stalls.snapshots.insert(peer, progress);
+        assert!(!stalls.snapshot_pending(None), "complete");
     }
 }
 

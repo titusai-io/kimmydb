@@ -42,6 +42,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   show how a member sees its peers ([docs/operations.md](docs/operations.md)). This change
   only carries and keeps the block; who owns what changes with the next change.
 
+- **A member that knows it is behind says so, refuses requests, and does no owner work
+  until it has caught up** ([ADR-202](docs/decisions.md)). A member that creates its store
+  in a cluster it has seeds for (a new pod, a wiped volume) writes a marker file,
+  `kimmy.catching-up`, in its data directory before the store exists. While it is set the
+  member answers **`503 catching_up`** (`retry: elsewhere`, a new stable error code) on
+  every route but `/healthz`, `/readyz`, `/metrics` and `/v1/topology` (`/v1/version`, a
+  login, `/mcp` and a WebSocket upgrade included, so a rolling deploy does not read it as
+  up); `/readyz` is `503 catching_up`; every response carries `x-kimmy-catching-up`;
+  `/v1/topology` marks it (`catchingUp`); and it does no TTL expiry, embedding or webhook
+  delivery, while its peers leave it out of the owners. It clears against a peer that holds
+  everything it holds, against its neighbours when every member of a new cluster started
+  from nothing, or when the operator deletes the file (read live, no restart). With no peer
+  reached that could say whether it is behind for `cluster.catch_up_wait_secs` (120) it
+  serves as `unknown`, with owner work still off and a `WARN` every ten minutes.
+  `cluster.expected_members` (unset by default; `KIMMY_CLUSTER_EXPECTED_MEMBERS`) holds a new
+  cluster's clear back until that many members are reached. An open change stream is closed
+  (1001, `catching_up`) when the member starts refusing. A member never counts as a peer to
+  itself: a seed that names it by an address it does not bind ends at the handshake, and is
+  no failed round. A clustered member with no membership (`cluster.membership = false`) now
+  has an embedding owner check, so it rescans its embedded collections once after each
+  start, sending the provider only the documents that are stale. A member whose static seeds name only itself is not marked:
+  nobody else can hold its data. `kimmy_catching_up{reason}` is one-hot over `none`,
+  `seeded_empty`, `restored`, `snapshot` and `unknown`
+  ([docs/operations.md](docs/operations.md#a-member-that-is-catching-up)). The marker is a
+  file an older build ignores, so a rollback is safe; a member restored from a backup is not
+  marked by this change, which is the behaviour before it.
+
 ### Changed
 
 - **A member that restarted reads far less to be served when it holds almost
@@ -107,12 +134,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `owed_elsewhere`; aggregate with `max`) and a `WARN` naming it, at most once per
   thirty minutes per collection. Only a member that is not itself a candidate can see
   a collection with none, so the unowned states come from a member with expiry off
-  (which keeps a check running for this, once a minute) or, once the catching-up
-  marker is set by a later release, from one catching up; a lone member with expiry
-  off reports every TTL collection it holds as `unowned_no_holder`. A member that says
-  it is catching up delivers no webhooks and owns no expiry or embedding (the bit is
-  carried and honoured now, and reserved for the catching-up marker, which nothing
-  sets yet), and one whose embedding worker is off no longer owns embeddings. In a
+  (which keeps a check running for this, once a minute) or from one that is catching
+  up (its catching-up marker is set, below); a lone member with expiry
+  off reports every TTL collection it holds as `unowned_no_holder`. A member that is
+  catching up delivers no webhooks and owns no expiry or embedding, its peers
+  leave it out of the owners by the bit it sends, and one whose embedding worker is
+  off no longer owns embeddings. In a
   cluster, a collection whose embedding ownership moves to a member, or that a member
   owns when it starts, is rescanned there once that has held for thirty seconds, so
   what was deferred before, by the previous owner or by this member before a restart,

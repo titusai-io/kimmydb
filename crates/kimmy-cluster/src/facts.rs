@@ -35,6 +35,55 @@ use serde::{Deserialize, Serialize};
 /// candidate to anyone else.
 pub const MAX_TTL_COLLECTIONS: usize = 256;
 
+/// Why a member's catching-up marker is set (ADR-202).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchUpReason {
+    /// This start created the store, with clustering enabled and seeds configured.
+    SeededEmpty,
+    /// A restore from a backup put the store there, or the own-origin check found
+    /// this member has lost writes it made.
+    Restored,
+    /// A peer's retained oplog no longer covers this member's position: it is
+    /// stale, and is catching up by a whole-database snapshot.
+    Snapshot,
+}
+
+impl CatchUpReason {
+    pub const ALL: [Self; 3] = [Self::SeededEmpty, Self::Restored, Self::Snapshot];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SeededEmpty => "seeded_empty",
+            Self::Restored => "restored",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.label() == text)
+    }
+
+    /// 1-based, so 0 can mean none in an atomic.
+    pub(crate) const fn code(self) -> u8 {
+        self as u8 + 1
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.code() == code)
+    }
+
+    /// How few clear rules apply: `restored` clears only by dominance or the
+    /// operator, `snapshot` by dominance, `seeded_empty` also by the mutual clear.
+    pub(crate) const fn strength(self) -> u8 {
+        match self {
+            Self::SeededEmpty => 0,
+            Self::Snapshot => 1,
+            Self::Restored => 2,
+        }
+    }
+}
+
 /// A class of work whose owner is chosen by the rendezvous function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OwnerClass {
@@ -107,6 +156,10 @@ pub struct Facts {
     /// store). Never overridden for any class.
     #[serde(default)]
     pub catching_up: bool,
+    /// Why, when `catching_up`: the mutual clear needs every reached peer to be
+    /// `seeded_empty`. Absent from a build that predates the field.
+    #[serde(default)]
+    pub catching_up_reason: Option<CatchUpReason>,
     #[serde(default)]
     pub yielding: Yielding,
     /// Operator choices, which are not faults and so are not yielding: expiry is

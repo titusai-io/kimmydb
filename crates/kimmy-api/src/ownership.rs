@@ -186,18 +186,23 @@ pub struct Owners {
     /// member expires nothing. With clustering its own block says so too; this
     /// is what says it without clustering, where there is no block.
     expiry_off: bool,
+    /// The catching-up marker, when this node has one: **while it is set no owner
+    /// work of any class runs here**, whatever the view says (ADR-202). The view's
+    /// own `catching_up` bit does the same through the local block, but a node
+    /// with clustering on and no membership has no block to carry it.
+    gate: Option<std::sync::Arc<kimmy_cluster::catchup::CatchUp>>,
 }
 
 impl Owners {
     /// With clustering (`Some`) or without (`None`, which owns everything).
     pub fn over(me: NodeId, members: Option<kimmy_cluster::Members>) -> Self {
-        Self { me, view: members.map_or(View::Alone, View::Members), expiry_off: false }
+        Self { me, view: members.map_or(View::Alone, View::Members), expiry_off: false, gate: None }
     }
 
     /// Over a fixed live set and nothing said by anyone, as ownership was before
     /// members said anything.
     pub fn over_set(me: NodeId, live: BTreeSet<NodeId>) -> Self {
-        Self { me, view: View::Set(live), expiry_off: false }
+        Self { me, view: View::Set(live), expiry_off: false, gate: None }
     }
 
     /// The same view, for a member whose expiry is switched off: it is never a
@@ -211,6 +216,19 @@ impl Owners {
         self
     }
 
+    /// Also refuse every question while `catch_up`'s marker is set.
+    pub fn gated_by(
+        mut self,
+        catch_up: Option<std::sync::Arc<kimmy_cluster::catchup::CatchUp>>,
+    ) -> Self {
+        self.gate = catch_up;
+        self
+    }
+
+    fn gated(&self) -> bool {
+        self.gate.as_ref().is_some_and(|catch_up| catch_up.is_set())
+    }
+
     fn mine(&self, members: &kimmy_cluster::Members) -> std::sync::Arc<kimmy_cluster::Facts> {
         members.local_facts().map(|(facts, _)| facts).unwrap_or_default()
     }
@@ -222,6 +240,9 @@ impl Owners {
         collection: Option<kimmy_core::CollectionId>,
         holds_ttl: bool,
     ) -> bool {
+        if self.gated() {
+            return false;
+        }
         // A member with expiry off is never a candidate for it: in its own
         // view, as in its block's.
         let holds_ttl = holds_ttl && !self.expiry_off;
@@ -273,6 +294,16 @@ impl Owners {
                 // Alone, with expiry off, nobody can expire it: there is no
                 // other member to.
                 View::Alone if self.expiry_off => TtlState::UnownedNoHolder,
+                // Waiting on the marker, unless expiry is off here too: a member
+                // that could not expire once caught up is no holder waiting. Only
+                // where there is no block to carry the bit: with members, the
+                // member's own block already leaves it out of the candidates, and
+                // the arm below answers `owed_elsewhere` when a peer holds the
+                // index and `unowned_catching_up` only when every holder is
+                // catching up, as ADR-201 defines it.
+                View::Alone | View::Set(_) if self.gated() && !self.expiry_off => {
+                    TtlState::UnownedCatchingUp
+                }
                 View::Alone | View::Set(_) => {
                     if self.owns_ttl(coll) {
                         TtlState::Owned

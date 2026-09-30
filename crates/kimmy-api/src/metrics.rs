@@ -159,6 +159,9 @@ pub struct OwnershipReading {
     /// TTL collections this member holds an index on, by
     /// [`crate::ownership::TtlState`], in `TtlState::ALL` order.
     pub ttl_collections: [u64; crate::ownership::TtlState::ALL.len()],
+    /// This member's catching-up state (ADR-202): an index into
+    /// [`kimmy_cluster::catchup::STATES`]; 0 is `none`.
+    pub catching_up: usize,
 }
 
 /// The background writers behind the page's measured gauges, each with a
@@ -2019,6 +2022,18 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
     );
     let _ = writeln!(
         out,
+        "# HELP kimmy_catching_up Whether this member knows it is behind (ADR-202), one-hot over the reason, so exactly one series is 1: none; seeded_empty (it created its store in a cluster it has seeds for); restored and snapshot (reserved: nothing sets them yet); unknown (the marker is set and no peer that could say has been reached for cluster.catch_up_wait_secs, so it serves, with owner work still off). While any reason but none holds, no expiry, embedding or webhook work runs here, and requests are refused except when unknown.\n\
+         # TYPE kimmy_catching_up gauge"
+    );
+    for (slot, reason) in kimmy_cluster::catchup::STATES.into_iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "kimmy_catching_up{{reason=\"{reason}\"}} {}",
+            u8::from(ownership.catching_up == slot)
+        );
+    }
+    let _ = writeln!(
+        out,
         "# HELP kimmy_ttl_collections Collections this member holds a TTL index on, by how their expiry stands from this member's view: owned (this member expires it), owed_elsewhere (another member does), unowned_no_holder (no member is known to hold the index and be able to expire it: an operator or index-definition problem), unowned_catching_up (every member known to hold it is catching up: a transient, and the expiry waits). Each member reports its own view, so aggregate with max across members.\n\
          # TYPE kimmy_ttl_collections gauge"
     );
@@ -2361,6 +2376,8 @@ mod tests {
                 unconfirmed: [1_511, 1_512, 1_513],
                 undecodable: 1_531,
                 ttl_collections: [1_521, 1_522, 1_523, 1_524],
+                // `restored`, so the golden shows one 1 among the zeros.
+                catching_up: 2,
             },
             // One holder per row, none of them equal, so a row rendered
             // under another holder's label cannot match the golden. The
@@ -3190,6 +3207,13 @@ kimmy_yield_unconfirmed_peers{class=\"embeddings\"} 1513
 # HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.
 # TYPE kimmy_ownership_facts_undecodable_total counter
 kimmy_ownership_facts_undecodable_total 1531
+# HELP kimmy_catching_up Whether this member knows it is behind (ADR-202), one-hot over the reason, so exactly one series is 1: none; seeded_empty (it created its store in a cluster it has seeds for); restored and snapshot (reserved: nothing sets them yet); unknown (the marker is set and no peer that could say has been reached for cluster.catch_up_wait_secs, so it serves, with owner work still off). While any reason but none holds, no expiry, embedding or webhook work runs here, and requests are refused except when unknown.
+# TYPE kimmy_catching_up gauge
+kimmy_catching_up{reason=\"none\"} 0
+kimmy_catching_up{reason=\"seeded_empty\"} 0
+kimmy_catching_up{reason=\"restored\"} 1
+kimmy_catching_up{reason=\"snapshot\"} 0
+kimmy_catching_up{reason=\"unknown\"} 0
 # HELP kimmy_ttl_collections Collections this member holds a TTL index on, by how their expiry stands from this member's view: owned (this member expires it), owed_elsewhere (another member does), unowned_no_holder (no member is known to hold the index and be able to expire it: an operator or index-definition problem), unowned_catching_up (every member known to hold it is catching up: a transient, and the expiry waits). Each member reports its own view, so aggregate with max across members.
 # TYPE kimmy_ttl_collections gauge
 kimmy_ttl_collections{state=\"owned\"} 1521
@@ -3526,6 +3550,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             ));
         }
         expect(&format!("kimmy_ownership_facts_undecodable_total {}\n", s.ownership.undecodable));
+        for (slot, reason) in kimmy_cluster::catchup::STATES.into_iter().enumerate() {
+            expect(&format!(
+                "kimmy_catching_up{{reason=\"{reason}\"}} {}\n",
+                u8::from(s.ownership.catching_up == slot)
+            ));
+        }
         for state in crate::ownership::TtlState::ALL {
             expect(&format!(
                 "kimmy_ttl_collections{{state=\"{}\"}} {}\n",
@@ -3768,7 +3798,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::OwnerClass::ALL.len()
                 + 1
                 + crate::ownership::TtlState::ALL.len()
-                + 1,
+                + 1
+                // One-hot over the catching-up marker's states (ADR-202).
+                + kimmy_cluster::catchup::STATES.len(),
             "expected one sample per series: {out}"
         );
     }

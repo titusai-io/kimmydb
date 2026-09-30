@@ -202,6 +202,13 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_SEEDS", value_delimiter = ',')]
     pub seeds: Vec<SeedSource>,
 
+    /// The number of members the cluster is meant to have (the StatefulSet's
+    /// `replicas`). Members that start from nothing together clear their
+    /// catching-up markers against each other only once this many have been
+    /// reached; unset trusts discovery.
+    #[arg(long, env = "KIMMY_CLUSTER_EXPECTED_MEMBERS")]
+    pub expected_members: Option<usize>,
+
     /// Log filter directive, e.g. `info` or `info,kimmy_storage=debug`.
     #[arg(long, env = "KIMMY_LOG_LEVEL")]
     pub log_level: Option<String>,
@@ -363,6 +370,9 @@ impl Overrides {
         }
         if let Some(secret) = &self.cluster_secret {
             cfg.cluster.cluster_secret = Some(secret.clone());
+        }
+        if let Some(expected) = self.expected_members {
+            cfg.cluster.expected_members = Some(expected);
         }
         if !self.seeds.is_empty() {
             cfg.cluster.seeds = self.seeds.clone();
@@ -654,6 +664,17 @@ mod tests {
         cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.cluster.enabled, "naming seeds should enable clustering");
         assert_eq!(cfg.cluster.seeds.len(), 1);
+    }
+
+    #[test]
+    fn expected_members_comes_from_the_flag_and_defaults_to_unset() {
+        let cli = parse(&["--expected-members", "3"]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.cluster.expected_members, Some(3));
+        let mut cfg = Config::default();
+        parse(&[]).overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.cluster.expected_members, None, "unset unless told");
     }
 
     #[test]

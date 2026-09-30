@@ -113,6 +113,19 @@ impl Node {
         storage: &str,
         sync_interval_secs: u64,
     ) -> Node {
+        Self::spawn_configured(name, cluster, seeds, storage, sync_interval_secs, "")
+    }
+
+    /// [`Self::spawn_with_interval`], with `cluster_extra` added to the node's
+    /// `[cluster]` section: `catch_up_wait_secs`, `expected_members`.
+    fn spawn_configured(
+        name: &'static str,
+        cluster: u16,
+        seeds: &[u16],
+        storage: &str,
+        sync_interval_secs: u64,
+        cluster_extra: &str,
+    ) -> Node {
         let dir = tempfile::tempdir().unwrap();
         let http = ports::choose();
         let seed_list =
@@ -140,6 +153,7 @@ seeds = [{seed_list}]
 cluster_secret = "{CLUSTER_SECRET}"
 sync_interval_secs = {sync_interval_secs}
 discovery_interval_secs = 2
+{cluster_extra}
 
 [webhooks]
 allowed_hosts = ["127.0.0.1"]
@@ -2324,7 +2338,17 @@ async fn the_divergence_check_reads_a_kept_count_not_the_collection() {
 async fn a_replication_connection_the_node_cannot_serve_is_counted_by_reason() {
     use tokio::io::AsyncWriteExt;
     let client = reqwest::Client::new();
-    let node = Node::spawn_with("node-served", ports::choose(), &[ports::choose()], "");
+    // Its one seed is nobody, so this fresh member has no peer to hear from and
+    // serves as `unknown` once the wait runs out (ADR-202): a short one, so the
+    // test waits on that and not on the default of two minutes.
+    let node = Node::spawn_configured(
+        "node-served",
+        ports::choose(),
+        &[ports::choose()],
+        "",
+        1,
+        "catch_up_wait_secs = 2",
+    );
     node.wait_ready(&client).await;
     let malformed = "kimmy_sync_serve_failures_total{reason=\"malformed\"}";
     assert_eq!(node.gauge(&client, malformed).await, Some(0), "premise: a row, at 0");
@@ -2361,7 +2385,16 @@ async fn a_member_that_never_completes_a_round_reads_lag_0_beside_an_age_that_cl
     // would fall back to. The `[vector]` table rides in after `[storage]`'s
     // lines, where `spawn_with` puts what it is handed.
     let no_worker = "\n[vector]\nworker_enabled = false";
-    let node = Node::spawn_with("node-alone", ports::choose(), &[ports::choose()], no_worker);
+    // Fresh with a seed nobody answers, so it serves as `unknown` (ADR-202) once
+    // the wait runs out, which is made short here.
+    let node = Node::spawn_configured(
+        "node-alone",
+        ports::choose(),
+        &[ports::choose()],
+        no_worker,
+        1,
+        "catch_up_wait_secs = 2",
+    );
     node.wait_ready(&client).await;
 
     let replication = "kimmy_task_progress_age_seconds{task=\"replication\"}";
@@ -3468,6 +3501,223 @@ async fn a_draining_advancing_contact_resumes_at_once_not_after_the_interval() {
         "the drain must cross at least two advancing contacts to prove anything about the \
          reset: only {checked} pairs followed an advancing contact"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The catching-up marker (ADR-202)
+// ---------------------------------------------------------------------------
+
+impl Node {
+    fn catching_up_file(&self) -> std::path::PathBuf {
+        self.dir.path().join("data").join("kimmy.catching-up")
+    }
+
+    /// `/readyz`: its status, the `x-kimmy-catching-up` header and the body.
+    async fn readyz(
+        &self,
+        client: &reqwest::Client,
+    ) -> Option<(u16, Option<String>, serde_json::Value)> {
+        let res = client.get(self.url("/readyz")).send().await.ok()?;
+        let status = res.status().as_u16();
+        let header =
+            res.headers().get("x-kimmy-catching-up").map(|v| v.to_str().unwrap().to_string());
+        Some((status, header, res.json().await.unwrap_or(serde_json::Value::Null)))
+    }
+
+    /// Ready, with no marker: cleared, not merely serving as `unknown`.
+    async fn cleared(&self, client: &reqwest::Client) -> bool {
+        matches!(self.readyz(client).await, Some((200, None, body)) if body.get("catching_up").is_none())
+            && !self.catching_up_file().exists()
+    }
+
+    /// Serving as `unknown`: the wait ran out with the marker still set.
+    async fn unknown(&self, client: &reqwest::Client) -> bool {
+        matches!(self.readyz(client).await, Some((200, Some(h), _)) if h == "unknown")
+            && self.catching_up_file().exists()
+    }
+}
+
+/// A whole cluster starting from nothing: every member is fresh, every member
+/// has a root user and registers itself in the topology (both stamp the
+/// member's own origin before its first contact), and every member clears, by the
+/// mutual clear, within a few ticks. Nobody waits out the bound, nobody stays
+/// `unknown`, and expiry runs once the marker is gone.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn an_all_fresh_cluster_clears_and_then_expires() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    for node in [&a, &b, &c] {
+        eventually("the member to clear its marker", || node.cleared(&client)).await;
+        assert_eq!(
+            node.gauge(&client, "kimmy_catching_up{reason=\"none\"}").await,
+            Some(1),
+            "{}: {}",
+            node.name,
+            node.log()
+        );
+        assert!(
+            node.log().contains("the catching-up marker was cleared"),
+            "{}: {}",
+            node.name,
+            node.log()
+        );
+        assert!(!node.log().contains("catching up for longer than"), "no member waited the bound");
+    }
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+    let created = client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ttl_seen",
+            "fields": [{ "path": "seen" }],
+            "expireAfterSeconds": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    client
+        .post(a.url("/v1/db/shop/coll/sessions/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 1, "seen": { "$date": 0 } }))
+        .send()
+        .await
+        .unwrap();
+    eventually("the expired document to disappear", || {
+        let (client, url, token) =
+            (client.clone(), a.url("/v1/db/shop/coll/sessions/docs/1"), token.clone());
+        async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 404 }
+    })
+    .await;
+}
+
+/// Two fresh members whose seed list names a third that never starts, with
+/// `cluster.expected_members = 3`: neither can clear against the other, because
+/// the number of members they have reached plus themselves is 2. Past the wait
+/// each serves as `unknown` with the marker set and expiry off; the WARN says so;
+/// deleting the file on both brings expiry back with no restart.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn two_fresh_members_expecting_three_hold_and_the_operator_clears_them() {
+    let client = reqwest::Client::new();
+    let (pa, pb, gone) = (ports::choose(), ports::choose(), ports::choose());
+    let extra = "catch_up_wait_secs = 3\nexpected_members = 3";
+    let a = Node::spawn_configured("node-a", pa, &[pb, gone], "", 1, extra);
+    let b = Node::spawn_configured("node-b", pb, &[pa, gone], "", 1, extra);
+    eventually("both to serve as unknown", || async {
+        a.unknown(&client).await && b.unknown(&client).await
+    })
+    .await;
+    for node in [&a, &b] {
+        assert_eq!(node.gauge(&client, "kimmy_catching_up{reason=\"unknown\"}").await, Some(1));
+        // Said by the tick after the bound runs out, not by the request that sees it.
+        eventually("the WARN that the marker is still set", || async {
+            node.log().contains("catching up for longer than")
+        })
+        .await;
+        assert!(node.catching_up_file().exists());
+    }
+
+    // Serving, but expiry is off: the collection is unowned for want of a member
+    // not catching up, and the due document stays.
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ttl_seen",
+            "fields": [{ "path": "seen" }],
+            "expireAfterSeconds": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(a.url("/v1/db/shop/coll/sessions/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 1, "seen": { "$date": 0 } }))
+        .send()
+        .await
+        .unwrap();
+    eventually("the collection to read as waiting on a member that is not catching up", || {
+        let (client, a) = (client.clone(), &a);
+        async move {
+            a.gauge(&client, "kimmy_ttl_collections{state=\"unowned_catching_up\"}").await
+                == Some(1)
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let doc = client
+        .get(a.url("/v1/db/shop/coll/sessions/docs/1"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doc.status(), 200, "expiry is off while the marker is set");
+
+    // The operator's clear, live, on both.
+    std::fs::remove_file(a.catching_up_file()).unwrap();
+    std::fs::remove_file(b.catching_up_file()).unwrap();
+    eventually("both to clear", || async { a.cleared(&client).await && b.cleared(&client).await })
+        .await;
+    eventually("the expired document to go once expiry is back", || {
+        let (client, url, token) =
+            (client.clone(), a.url("/v1/db/shop/coll/sessions/docs/1"), token.clone());
+        async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 404 }
+    })
+    .await;
+}
+
+/// The same two members, with the third arriving: it is fresh too, the three
+/// have now all been reached, and all three clear.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn the_third_member_arriving_clears_the_two_that_expected_it() {
+    let client = reqwest::Client::new();
+    let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+    let extra = "catch_up_wait_secs = 3\nexpected_members = 3";
+    let a = Node::spawn_configured("node-a", pa, &[pb, pc], "", 1, extra);
+    let b = Node::spawn_configured("node-b", pb, &[pa, pc], "", 1, extra);
+    eventually("both to serve as unknown", || async {
+        a.unknown(&client).await && b.unknown(&client).await
+    })
+    .await;
+    let c = Node::spawn_configured("node-c", pc, &[pa, pb], "", 1, extra);
+    for node in [&a, &b, &c] {
+        eventually("the member to clear", || node.cleared(&client)).await;
+    }
+}
+
+/// The twin of the test above with `expected_members` unset: nothing tells the
+/// two that a third exists, and it was never seen, so they clear against each
+/// other. This is the documented cost of trusting discovery, made a test so it is
+/// a decision on record.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn without_expected_members_two_fresh_members_clear_against_each_other() {
+    let client = reqwest::Client::new();
+    let (pa, pb, gone) = (ports::choose(), ports::choose(), ports::choose());
+    let a = Node::spawn_configured("node-a", pa, &[pb, gone], "", 1, "");
+    let b = Node::spawn_configured("node-b", pb, &[pa, gone], "", 1, "");
+    for node in [&a, &b] {
+        eventually("the member to clear against its neighbour", || node.cleared(&client)).await;
+    }
 }
 
 /// Pulls the integer value out of a `key=123` field in a log line, such as

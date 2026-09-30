@@ -64,6 +64,12 @@ pub fn router_with_limits(
         // default is exactly what axum applied when nothing set one, so an
         // operator who never touches the setting sees no change (ADR-099).
         .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
+        // A member that is catching up refuses every route but the four an
+        // operator or a client's routing needs (ADR-202), over the whole table
+        // including `/mcp`, which is merged above. Inside the drain below, so a
+        // refusal written while the client is still sending is answered as the
+        // ceiling's is, and inside the count, so it is counted and traced.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), catching_up_gate))
         // Outside the ceiling, so it sees the ceiling's refusal: a 413 is
         // written while the client may still be sending, and closing on the
         // unread rest answers it with a reset that can take the 413 with it.
@@ -78,6 +84,47 @@ pub fn router_with_limits(
         // outermost, so a refusal the deadline or the ceiling makes is counted
         // and traced like any other response.
         .layer(axum::middleware::from_fn_with_state(state, count_request))
+}
+
+/// The routes a member that is catching up still answers: the probes, the scrape
+/// and the topology (which marks the member, so a client that routes by it can
+/// avoid it). Everything else, `/v1/version`, `/mcp` and a WebSocket upgrade
+/// included, is refused: the deploy tooling polls `/v1/version` to decide a
+/// rolled member is up, and a gated member must not read as up.
+fn catching_up_exempt(path: &str) -> bool {
+    matches!(path, "/healthz" | "/readyz" | "/metrics" | "/v1/topology")
+}
+
+/// While the catching-up marker is set and the wait has not run out, answer
+/// `503 catching_up` (retry elsewhere), and on every response while it is set at
+/// all (gated or `unknown`) carry `x-kimmy-catching-up: <state>` (ADR-202).
+async fn catching_up_gate(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(catch_up) = state.catch_up() else { return next.run(request).await };
+    let now = std::time::Instant::now();
+    let mut response = if catch_up.gated(now) && !catching_up_exempt(request.uri().path()) {
+        ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::error::ErrorCode::CatchingUp,
+            format!(
+                "this member is catching up ({}) and serves nothing until it has; another \
+                 member answers",
+                catch_up.state_label(now)
+            ),
+        )
+        .into_response()
+    } else {
+        next.run(request).await
+    };
+    if catch_up.is_set()
+        && let Ok(value) = axum::http::HeaderValue::from_str(catch_up.state_label(now))
+    {
+        response.headers_mut().insert("x-kimmy-catching-up", value);
+    }
+    response
 }
 
 /// The route table, before instrumentation.
@@ -650,7 +697,35 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
         ));
     }
     state.engine.list_databases()?;
-    Ok(Json(json!({ "status": "ready", "node": state.engine.node_id().to_string() })))
+    // A member that knows it is behind is not ready: a readiness probe keeps it
+    // out of the Service while its peers hold what it is still fetching. Past
+    // the bound (`unknown`) it is ready, and says why it still is not trusted
+    // with owner work (ADR-202).
+    let now = std::time::Instant::now();
+    let catching_up = state.catch_up().filter(|c| c.is_set());
+    if let Some(catch_up) = catching_up.filter(|c| c.gated(now)) {
+        let mut refusal = ApiError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            crate::error::ErrorCode::CatchingUp,
+            format!(
+                "this member is catching up ({}) and is not ready until it has; another member \
+                 answers",
+                catch_up.state_label(now)
+            ),
+        );
+        // Beside `error`, `message` and `retry`, as the opening state's fields are:
+        // what a probe or an operator reads without parsing the message.
+        refusal.extra = Some(Box::new(serde_json::Map::from_iter([(
+            "reason".to_string(),
+            json!(catch_up.state_label(now)),
+        )])));
+        return Err(refusal);
+    }
+    let mut body = json!({ "status": "ready", "node": state.engine.node_id().to_string() });
+    if let Some(catch_up) = catching_up {
+        body["catching_up"] = json!(catch_up.state_label(now));
+    }
+    Ok(Json(body))
 }
 
 // ---------------------------------------------------------------------------

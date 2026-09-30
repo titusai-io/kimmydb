@@ -68,8 +68,32 @@ async fn pump(
     mut stream: kimmy_storage::ChangeStream,
     full_document: bool,
 ) {
+    // Woken when this member may have started refusing requests (ADR-202): a
+    // stream that stayed open would go on delivering from a store that is now
+    // known to be behind. No timer: the pump polls none (0.40.2).
+    let mut gate = state.catch_up().map(|catch_up| catch_up.subscribe());
+    // A receiver treats the value it subscribed at as seen, so a member that became
+    // gated between the request's gate check and here would wake nothing: asked
+    // once now, after subscribing, no change can fall between the two.
+    if state.catch_up().is_some_and(|c| c.gated(std::time::Instant::now())) {
+        close_catching_up(&mut socket).await;
+        return;
+    }
     loop {
         tokio::select! {
+            () = async {
+                match gate.as_mut() {
+                    Some(gate) => {
+                        let _ = gate.changed().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                if state.catch_up().is_some_and(|c| c.gated(std::time::Instant::now())) {
+                    close_catching_up(&mut socket).await;
+                    break;
+                }
+            }
             // Watch for the client going away, so a dropped connection does not
             // leave this task holding a stream forever.
             incoming = socket.recv() => {
@@ -95,6 +119,17 @@ async fn pump(
         }
     }
     debug!("change stream socket closed");
+}
+
+/// Going away, and another member serves: the close a client reads as
+/// `retry: elsewhere` (`catching_up`, ADR-202).
+async fn close_catching_up(socket: &mut WebSocket) {
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1001,
+            reason: "catching_up".into(),
+        })))
+        .await;
 }
 
 /// Render an event as the JSON a client sees.

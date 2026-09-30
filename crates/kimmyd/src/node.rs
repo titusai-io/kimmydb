@@ -522,6 +522,29 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             }
         }
     });
+    // The catching-up marker (ADR-202). After the bind, so a start that cannot
+    // bind leaves none, and before the open, which creates the store: whether it
+    // existed is read here. A member that creates its store in a cluster it has
+    // seeds for is fresh, and cannot tell "the first node of a new cluster" from
+    // "a wiped member of an old one"; it is marked until it has caught up. Seeds
+    // that name only itself name nobody to catch up from, and do not count.
+    let store_existed = path.exists();
+    let catch_up = kimmy_storage::blocking(|| {
+        kimmy_cluster::catchup::CatchUp::open(
+            &config.storage.data_dir,
+            Duration::from_secs(config.cluster.catch_up_wait_secs),
+        )
+    });
+    if !config.cluster.enabled {
+        catch_up.discard_when_standalone();
+    } else if !store_existed
+        && kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind)
+    {
+        catch_up
+            .mark(kimmy_cluster::CatchUpReason::SeededEmpty)
+            .context("writing the catching-up marker")
+            .map_err(failed_before_open)?;
+    }
     if let Ok(value) = std::env::var("KIMMY_TEST_OPEN_STEP_MS") {
         let ms = value.parse::<u64>().ok();
         warn!(
@@ -573,7 +596,6 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             );
         }
     };
-    kimmy_storage::set_open_phase(kimmy_storage::OpenPhase::Starting);
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
@@ -626,6 +648,11 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         info!("a stop was asked for while the store was opening; stopping without serving");
         return Ok(ended_before_serving(serving, Some(engine), Arc::clone(&stop.by)).await);
     }
+    // Flipped only now, after the check above, so that the phase an operator reads
+    // and the stage the stop path judges agree: a stop that came before this point
+    // is a stop during the open and is reported as one, and `starting` on `/readyz`
+    // means a stop from here on is a stop while the node starts.
+    kimmy_storage::set_open_phase(kimmy_storage::OpenPhase::Starting);
 
     // A test switch that makes the start after the open last, so a test can
     // stop a node in the phase `starting`. Announced like the others.
@@ -789,6 +816,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         providers.clone(),
     )
     .context("building the API state")?;
+    // Before any task that reads it is spawned: expiry and the dispatcher take the
+    // marker from the state when they start.
+    state.set_catch_up(Arc::clone(&catch_up));
 
     // Where a local token may be minted from (ADR-100). Validation already
     // refused an unknown name and `disabled` without a provider; this is the
@@ -1063,6 +1093,8 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         // a full-corpus provider bill on every member at once.
         let worker_me = engine.node_id();
         let worker_members = cluster.members.clone();
+        let worker_gate = state.catch_up().cloned();
+        let worker_clustered = config.cluster.enabled;
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
         let batching = config.vector.batch.settings();
@@ -1073,7 +1105,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
                 worker.set_policy(providers);
-                if let Some(check) = embedding_owner_check(worker_me, worker_members) {
+                if let Some(check) =
+                    embedding_owner_check(worker_me, worker_members, worker_gate, worker_clustered)
+                {
                     worker.set_owner_check(check);
                 }
                 worker.set_counters(worker_counters);
@@ -2125,6 +2159,7 @@ async fn spawn_cluster(
             uuid::Uuid::new_v4().as_bytes().to_vec(),
             config.storage.ttl_interval_secs == 0,
             !config.vector.worker_enabled,
+            state.catch_up().cloned(),
         ));
     }
     let serving = kimmy_task::supervise(
@@ -2248,6 +2283,9 @@ async fn spawn_cluster(
                 seeds: config.cluster.seeds.clone(),
                 secret,
                 local,
+                catch_up: state.catch_up().cloned(),
+                expected_members: config.cluster.expected_members,
+                self_recheck: kimmy_cluster::SELF_RECHECK,
                 sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
                 discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
                 fanout: config.cluster.fanout,
@@ -2534,7 +2572,10 @@ fn spawn_expiry(
 /// Which embedded collections this member owns: the rendezvous function over
 /// the live members that may own embeddings by what they say about themselves
 /// (ADR-201), not one that is catching up and not one whose worker is switched
-/// off.
+/// off. **Nothing at all while the catching-up marker is set** (ADR-202): a live
+/// embedding write from a stale copy is the same last-writer-wins hazard as an
+/// expiry, so the marker outranks the member set, and covers a clustered member
+/// that has no membership to carry the bit.
 ///
 /// **`None` with no clustering**: the worker then installs no check and owns
 /// everything, as it always did. A check that answered yes to everything would
@@ -2543,8 +2584,13 @@ fn spawn_expiry(
 fn embedding_owner_check(
     me: kimmy_core::NodeId,
     members: Option<kimmy_cluster::Members>,
+    catch_up: Option<Arc<kimmy_cluster::catchup::CatchUp>>,
+    clustered: bool,
 ) -> Option<kimmy_vector::OwnerCheck> {
-    let owners = kimmy_api::ownership::Owners::over(me, Some(members?));
+    if members.is_none() && !clustered {
+        return None;
+    }
+    let owners = kimmy_api::ownership::Owners::over(me, members).gated_by(catch_up);
     Some(Box::new(move |key| owners.owns_embedding(key)))
 }
 
@@ -4158,7 +4204,8 @@ mod tests {
             catching_up: true,
             ..Default::default()
         }));
-        let check = embedding_owner_check(me, Some(members)).expect("clustered: a check");
+        let check =
+            embedding_owner_check(me, Some(members), None, true).expect("clustered: a check");
         for key in (0..20).map(|i| format!("app/c{i}")) {
             assert!(!check(&key), "{key}: a catching-up member embeds nothing");
         }
@@ -4171,6 +4218,22 @@ mod tests {
     #[test]
     fn a_lone_members_worker_gets_no_owner_check_and_rescans_nothing_at_start() {
         let me = kimmy_core::NodeId::from_bytes([0x11; 16]);
-        assert!(embedding_owner_check(me, None).is_none(), "no check without clustering");
+        assert!(
+            embedding_owner_check(me, None, None, false).is_none(),
+            "no check without clustering"
+        );
+
+        // A clustered member with no membership has no block to carry the bit, and
+        // the marker alone keeps its worker from embedding.
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up =
+            kimmy_cluster::catchup::CatchUp::open(dir.path(), std::time::Duration::from_secs(120));
+        let check = embedding_owner_check(me, None, Some(Arc::clone(&catch_up)), true)
+            .expect("clustered: a check");
+        assert!(check("app/docs"), "no marker, no gate");
+        catch_up.mark(kimmy_cluster::CatchUpReason::SeededEmpty).unwrap();
+        assert!(!check("app/docs"), "gated while the marker is set");
+        catch_up.clear("the test");
+        assert!(check("app/docs"));
     }
 }

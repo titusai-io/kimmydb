@@ -766,6 +766,18 @@ elsewhere`) with `status: opening`, `phase`, `phase_age_seconds`, and `done` and
 `total` when the phase counts; every other route, `/v1/version` and `/metrics`
 included, answers `503 starting`.
 
+**A member that knows it is behind is not ready** ([ADR-202](decisions.md)). A member
+that created its store in a cluster it has seeds for keeps a marker until it has caught
+up, and while it is set `/readyz` is `503` in the error envelope (`error: catching_up`,
+`retry: elsewhere`, and `reason`: the state) and every route but `/healthz`, `/readyz`, `/metrics` and
+`/v1/topology` answers `503 catching_up` too, `/v1/version`, a login, `/mcp` and a
+WebSocket upgrade included. Every response of a member whose marker is set carries
+`x-kimmy-catching-up: <state>` (`seeded_empty`, `restored`, `snapshot` or `unknown`).
+Past `cluster.catch_up_wait_secs` with no peer reached that could say whether it is
+behind, the member serves as `unknown`: `/readyz` is `200` and carries
+`"catching_up": "unknown"`. `GET /v1/topology` marks the member (`catchingUp` with the
+state) and a peer that says it is catching up (`catchingUp: true`).
+
 Metrics deliberately expose **counts only** — naming collections there would
 leak your schema to anything that can reach the port.
 
@@ -1168,6 +1180,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
+| 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

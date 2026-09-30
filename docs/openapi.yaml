@@ -251,6 +251,13 @@ paths:
                   node:
                     type: string
                     description: This node's id.
+                  catching_up:
+                    const: unknown
+                    description: |
+                      Present only when the member's catching-up marker is set
+                      and `cluster.catch_up_wait_secs` has run out with no peer
+                      reached that could say whether it is behind: it serves,
+                      and does no expiry, embedding or webhook work.
         "503":
           description: |
             Not ready. While the node's store is opening the body is the error
@@ -258,7 +265,9 @@ paths:
             (`repairing`, `opening`, `migrating`, `verifying`, `counting` or
             `starting`), `phase_age_seconds`, and `done` and `total` when the
             phase counts. It is also the answer of a node whose storage engine
-            has hit an I/O error.
+            has hit an I/O error, and of a member that knows it is behind
+            (`error: catching_up`, `retry: elsewhere`, and `reason`, the state; its
+            catching-up marker is set, see `x-kimmy-catching-up`).
           content:
             application/json:
               schema:
@@ -3034,6 +3043,7 @@ components:
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
+        | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
         - payload_too_large
@@ -3059,6 +3069,7 @@ components:
         - partially_applied
         - node_stopping
         - starting
+        - catching_up
 
     Capability:
       type: string
@@ -3277,6 +3288,19 @@ components:
           description: |
             With `staleSince`: how far the peer trailed at the last round, in
             seconds.
+        catchingUp:
+          description: |
+            Present only while the member is catching up (ADR-202). On the
+            answering node's own entry it is the state, a string:
+            `seeded_empty`, `restored` or `snapshot` while it refuses
+            requests, `unknown` once `cluster.catch_up_wait_secs` has run out
+            with no peer reached that could say. On a peer's entry it is `true`
+            when that peer's last block says it is catching up. A client that
+            routes by topology should prefer a node without it.
+          oneOf:
+            - type: string
+              enum: [seeded_empty, restored, snapshot, unknown]
+            - type: boolean
 
     Token:
       type: object
