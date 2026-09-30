@@ -630,6 +630,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
+    stalls.set_catch_up(config.catch_up.clone());
     // Addresses that answered the handshake with this node's own id (ADR-202),
     // and when: left out of the peers, and never a failed round, until
     // `config.self_recheck` has passed, when they are dialled once more, quietly
@@ -1597,11 +1598,23 @@ fn judge_catch_up(
     reached: &[crate::catchup::Reached],
     expected_members: Option<usize>,
 ) -> crate::catchup::Decision {
+    let live = members.map(Members::node_ids);
+    // The members that can answer the replay of this member's own origin, for it
+    // to settle on: SWIM's live ones and the peers reached this run. An origin a
+    // contact's vector names is not one: a member that has gone for good keeps its
+    // id in every vector, and holds nothing a live peer cannot also serve.
+    if catch_up.replay_armed() {
+        catch_up.replay_note_members(
+            engine.node_id(),
+            live.iter().flatten().copied(),
+            reached.iter().map(|peer| peer.node),
+        );
+        catch_up.replay_settle();
+    }
     catch_up.refresh();
     if !catch_up.is_set() {
         return crate::catchup::Decision::NotSet;
     }
-    let live = members.map(Members::node_ids);
     let now = Instant::now();
     // Whose snapshot cursors can hold this member: a current member's. Without
     // membership there is no live set, and a peer that has not been reached within
@@ -2273,5 +2286,61 @@ mod tests {
             judge_catch_up(&real, &engine, &pulling, None, &both, None),
             crate::catchup::Decision::Kept
         );
+    }
+
+    /// The tick's judgement is what settles the replay: the members SWIM lists live
+    /// and the peers reached are the ones the floor waits on, and the floor goes
+    /// only once every one of them has answered.
+    #[test]
+    fn the_judgement_settles_the_replay_floor_once_every_member_that_can_answer_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        let on_disk = || crate::catchup::replay_floor_on_disk(marker_dir.path());
+        assert_eq!(on_disk(), Some(kimmy_core::Hlc::new(50, 0)));
+
+        // SWIM lists a member no tick has reached; the one reached has answered.
+        let reached = other_peer_this_member_covers(&engine);
+        let listed = NodeId::from_bytes([5; 16]);
+        let members = Members::default();
+        members.insert_for_test("127.0.0.1:7005".parse().unwrap(), listed);
+        catch_up.replay_finished(reached[0].node);
+        judge_catch_up(&catch_up, &engine, &PeerStalls::new(), Some(&members), &reached, None);
+        assert!(
+            catch_up.replay_armed() && on_disk().is_some(),
+            "the listed member has not answered"
+        );
+
+        catch_up.replay_finished(listed);
+        judge_catch_up(&catch_up, &engine, &PeerStalls::new(), Some(&members), &reached, None);
+        assert!(
+            !catch_up.replay_armed() && on_disk().is_none(),
+            "every member that can answer has"
+        );
+    }
+
+    /// A member that has gone for good keeps its id in every vector for ever. It
+    /// holds nothing a live peer cannot also serve, so the floor does not wait on
+    /// it: a floor that did would be kept until it fell below every peer's horizon.
+    #[test]
+    fn an_origin_only_named_in_a_vector_does_not_hold_the_replay_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+
+        let departed = NodeId::from_bytes([7; 16]);
+        let mut servable = engine.version_vector().unwrap();
+        servable.insert(departed, kimmy_core::Hlc::new(10, 0));
+        let peer = NodeId::from_bytes([4; 16]);
+        let reached =
+            [crate::catchup::Reached { node: peer, servable, witnessed: None, facts: None }];
+        catch_up.replay_finished(peer);
+        judge_catch_up(&catch_up, &engine, &PeerStalls::new(), None, &reached, None);
+        assert!(!catch_up.replay_armed(), "the departed origin is not waited on");
+        assert_eq!(crate::catchup::replay_floor_on_disk(marker_dir.path()), None);
     }
 }

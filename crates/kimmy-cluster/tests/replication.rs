@@ -7025,3 +7025,648 @@ async fn an_address_that_answered_as_this_node_is_dialled_again_after_the_rechec
     }
     looping.abort();
 }
+
+// ---------------------------------------------------------------------------
+// A member that lost writes it made, and a member that fell behind the horizon
+// (ADR-202)
+// ---------------------------------------------------------------------------
+
+/// A member whose store is a backup taken before `lost` of its writes, with a
+/// peer that holds all of them: the shape of a volume restored from a backup, or
+/// of a crash that forgot a tail a peer had already pulled.
+struct LostTail {
+    /// The peer, holding every write.
+    peer: Node,
+    /// Another peer, which pulled from the writer only up to the backup: it holds
+    /// nothing of the tail.
+    behind: Node,
+    /// The member with the same identity as the writer, from the backup.
+    restored: Node,
+    /// The collection the writes went to, on the restored member.
+    documents: u64,
+    lost: u64,
+}
+
+/// `kept` writes in the backup, `lost` written after it and pulled by the peer.
+/// `startup_write` makes the restored member write once before its first contact,
+/// as a node does at start (its topology record), at a stamp above the lost ones.
+async fn lost_tail(kept: u64, lost: u64, startup_write: bool) -> LostTail {
+    let writer = node().await;
+    let peer = node().await;
+    let behind = node().await;
+    let meta = writer.engine.create_collection("shop", "orders").unwrap();
+    let batch = |from: u64, to: u64| (from as i64..to as i64).map(|i| doc! { "_id": i }).collect();
+    writer.engine.insert_many(&meta, batch(0, kept)).unwrap();
+    let mut backup = Vec::new();
+    writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    sync_once(&behind.engine, writer.addr, SECRET, None).await.unwrap();
+    writer.engine.insert_many(&meta, batch(kept, kept + lost)).unwrap();
+    // The peer pulls every write, the lost ones included, window by window.
+    while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
+        sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let engine = Arc::new(Engine::open(&path).unwrap());
+    assert_eq!(engine.node_id(), writer.engine.node_id(), "the identity comes back with it");
+    writer.serving.abort();
+    drop(writer);
+    let (addr, serving, pushed) = listen(&engine, SECRET).await;
+    let restored = Node { engine, addr, serving, pushed, path, _dir: dir };
+    if startup_write {
+        let meta = restored.engine.create_collection("shop", "startup").unwrap();
+        restored.engine.insert(&meta, doc! { "_id": "registered" }).unwrap();
+    }
+    LostTail { peer, behind, restored, documents: kept + lost, lost }
+}
+
+fn marker_in(dir: &tempfile::TempDir) -> Arc<kimmy_cluster::catchup::CatchUp> {
+    kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120))
+}
+
+/// One round of the restored member against the peer, with the marker handed to
+/// the round as the replication loop hands it.
+async fn round_with(
+    member: &Node,
+    peer: &Node,
+    catch_up: &Arc<kimmy_cluster::catchup::CatchUp>,
+) -> kimmy_storage::SyncOutcome {
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.set_catch_up(Some(Arc::clone(catch_up)));
+    kimmy_cluster::transport::sync_once_with(&member.engine, peer.addr, SECRET, None, &mut stalls)
+        .await
+        .unwrap()
+}
+
+/// The replay finds writes this member made and no longer holds, though its own
+/// startup write put its vector past them: it marks itself `restored`, reads
+/// them back, and the first round after leaves it holding all of them.
+#[tokio::test]
+async fn writes_this_member_made_and_lost_are_found_marked_restored_and_read_back() {
+    let scenario = lost_tail(2, 3, true).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "premise: the backup lacks the tail"
+    );
+
+    // Without the replay the ordinary round never serves them: the restored
+    // member's own vector is past them.
+    let control_dir = tempfile::tempdir().unwrap();
+    let control = marker_in(&control_dir);
+    round_with(&scenario.restored, &scenario.peer, &control).await;
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "premise: an ordinary pull does not fetch them"
+    );
+    assert!(!control.is_set());
+
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert!(
+        catch_up.replay_answered(scenario.peer.engine.node_id()),
+        "the peer has answered the replay"
+    );
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "the {} lost writes are back",
+        scenario.lost
+    );
+}
+
+/// The control: a member that lost nothing finds nothing, however much of its
+/// own origin the peer holds (its startup write among it). A plain restart never
+/// marks itself.
+#[tokio::test]
+async fn a_member_that_lost_nothing_does_not_mark_itself() {
+    let scenario = lost_tail(3, 0, true).await;
+    // The peer has pulled this member's startup write, so it holds stamps of this
+    // member's origin above the position the store had at open.
+    sync_once(&scenario.peer.engine, scenario.restored.addr, SECRET, None).await.unwrap();
+    assert!(
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id())
+            > scenario.restored.engine.own_position_at_open(),
+        "premise: the peer holds this run's own writes"
+    );
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert!(!catch_up.is_set(), "a plain restart is not a loss: {catch_up:?}");
+    assert!(catch_up.replay_answered(scenario.peer.engine.node_id()), "and the replay is done");
+}
+
+/// After a rollback the wall clock can sit behind the writes that were lost. The
+/// replay moves the local clock past every stamp it reads, so a write made from
+/// then on is stamped above the lost ones, whatever the wall clock says.
+#[tokio::test]
+async fn the_replay_moves_the_clock_past_the_lost_writes() {
+    let writer = node().await;
+    let peer = node().await;
+    let meta = writer.engine.create_collection("shop", "orders").unwrap();
+    writer.engine.insert(&meta, doc! { "_id": 0 }).unwrap();
+    let mut backup = Vec::new();
+    writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
+    // A write this member made an hour ahead of the clock it will restart with.
+    let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    let lost = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.engine.node_id()),
+        kind: kimmy_core::OpKind::Insert,
+        collection: meta.id,
+        doc_id: Some(DocId::String("99".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "99" }).unwrap()),
+    };
+    peer.engine.apply_batch(std::slice::from_ref(&lost)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let engine = Arc::new(Engine::open(&path).unwrap());
+    writer.serving.abort();
+    let (addr, serving, pushed) = listen(&engine, SECRET).await;
+    let restored = Node { engine, addr, serving, pushed, path, _dir: dir };
+    let here = restored.engine.get_collection("shop", "orders").unwrap();
+    restored.engine.insert(&here, doc! { "_id": "startup" }).unwrap();
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(restored.engine.own_position_at_open(), None).unwrap();
+    round_with(&restored, &peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+
+    restored.engine.insert(&here, doc! { "_id": "after" }).unwrap();
+    let mine = restored.engine.version_vector().unwrap().get(restored.engine.node_id());
+    assert!(
+        mine > lost.stamp.hlc,
+        "a write after the replay is stamped above the lost one: {mine:?} against {:?}",
+        lost.stamp.hlc
+    );
+}
+
+/// A peer that cannot serve this member's origin from where the replay asks (it
+/// has collected that history) answers `BeyondHorizon`, which says nothing of what
+/// it holds: the replay is not answered by it, and is asked again next round. It
+/// is never silently finished.
+#[tokio::test]
+async fn a_replay_the_peer_answers_with_a_horizon_is_not_answered() {
+    let scenario = lost_tail(2, 3, true).await;
+    scenario
+        .peer
+        .engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    for _ in 0..2 {
+        round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+        assert!(
+            !catch_up.replay_answered(scenario.peer.engine.node_id()),
+            "a horizon is not an answer to the replay"
+        );
+    }
+    assert_eq!(
+        catch_up.replay_beyond_horizon(scenario.peer.engine.node_id(), std::time::Instant::now()),
+        kimmy_cluster::catchup::Horizon::Again,
+        "and it was reported the first time"
+    );
+}
+
+/// A peer that answers a horizon for ever, because its retention differs from this
+/// member's, is given up on after the wait: the replay stops asking it, it counts
+/// as settled, and the floor goes once nothing else is owed.
+#[tokio::test]
+async fn a_peer_that_answers_a_horizon_for_the_whole_wait_is_given_up_on() {
+    let scenario = lost_tail(2, 3, true).await;
+    scenario
+        .peer
+        .engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up =
+        kimmy_cluster::catchup::CatchUp::open(marker_dir.path(), Duration::from_millis(300));
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let peer = scenario.peer.engine.node_id();
+    let me = scenario.restored.engine.node_id();
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert!(!catch_up.replay_answered(peer), "not yet: one horizon is not the wait");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert!(catch_up.replay_answered(peer), "a horizon for the whole wait is given up on");
+
+    catch_up.replay_note_members(me, [peer], [peer]);
+    catch_up.replay_settle();
+    assert!(!catch_up.replay_armed(), "nothing else is owed");
+    assert_eq!(
+        kimmy_cluster::catchup::replay_floor_on_disk(marker_dir.path()),
+        None,
+        "and the floor goes"
+    );
+}
+
+/// A floor an earlier start left, older than every peer's oplog, is clamped to
+/// what the peers keep, so a newer loss is still read back and marked. Without the
+/// clamp the same floor is answered `BeyondHorizon` and the loss is never seen.
+#[tokio::test]
+async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
+    let retention = Duration::from_secs(3);
+    let writer = node().await;
+    let peer = node().await;
+    let meta = writer.engine.create_collection("shop", "orders").unwrap();
+    writer.engine.insert_many(&meta, (0..2i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    let old_floor = writer.engine.version_vector().unwrap().get(writer.engine.node_id());
+    writer.engine.insert_many(&meta, (2..4i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
+        sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
+    }
+    // Time passes, and the peer's retention collects what it holds so far.
+    tokio::time::sleep(retention + Duration::from_millis(400)).await;
+    peer.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms(),
+            kimmy_storage::RetentionPolicy::new(retention.as_secs(), u64::MAX),
+        )
+        .unwrap();
+    let mut backup = Vec::new();
+    writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    writer.engine.insert_many(&meta, (4..7i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
+        sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
+    }
+    writer.serving.abort();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let engine = Arc::new(Engine::open(&path).unwrap());
+    let position = engine.own_position_at_open();
+    let (addr, serving, pushed) = listen(&engine, SECRET).await;
+    let restored = Node { engine, addr, serving, pushed, path, _dir: dir };
+    let startup = restored.engine.create_collection("shop", "startup").unwrap();
+    restored.engine.insert(&startup, doc! { "_id": "registered" }).unwrap();
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_replay_floor(marker_dir.path(), old_floor).unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(position, Some(retention)).unwrap();
+    assert!(catch_up.replay_floor() > old_floor, "the floor is clamped past the stale one");
+    for _ in 0..3 {
+        round_with(&restored, &peer, &catch_up).await;
+    }
+    let orders = restored.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        7,
+        "the writes made after the backup are read back"
+    );
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+}
+
+/// The behind peer first, then the one that holds the tail: with both live, the
+/// marker never reads clear on the strength of the first. It clears only after
+/// the second has answered and the tail is back.
+#[tokio::test]
+async fn a_live_peer_that_holds_the_tail_holds_the_clear_until_it_has_answered() {
+    use kimmy_cluster::catchup::{Decision, Reached, Tick};
+    let scenario = lost_tail(2, 3, true).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(marker_dir.path(), kimmy_cluster::CatchUpReason::Restored)
+        .unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let me = scenario.restored.engine.node_id();
+    let live: std::collections::BTreeSet<_> =
+        [scenario.behind.engine.node_id(), scenario.peer.engine.node_id(), me].into();
+    let judge = |reached: &[&Node]| {
+        let reached: Vec<Reached> = reached
+            .iter()
+            .map(|peer| Reached {
+                node: peer.engine.node_id(),
+                servable: peer.engine.version_vector().unwrap(),
+                witnessed: None,
+                facts: None,
+            })
+            .collect();
+        let mine = scenario.restored.engine.witnessed_vector().unwrap();
+        let servable = scenario.restored.engine.version_vector().unwrap();
+        catch_up.evaluate(&Tick {
+            me,
+            reached: &reached,
+            mine_witnessed: &mine,
+            mine_servable: &servable,
+            snapshot_pending: false,
+            live: Some(&live),
+            expected_members: None,
+            now: std::time::Instant::now(),
+        })
+    };
+
+    round_with(&scenario.restored, &scenario.behind, &catch_up).await;
+    assert!(catch_up.replay_answered(scenario.behind.engine.node_id()));
+    assert_eq!(judge(&[&scenario.behind]), Decision::Kept, "the live peer ahead has not answered");
+    assert!(catch_up.is_set(), "still gated: it never reads none");
+
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert_eq!(judge(&[&scenario.behind, &scenario.peer]), Decision::Cleared("dominance"));
+}
+
+/// A peer that answers a pull with `BeyondHorizon` and takes this member to a
+/// whole-database snapshot marks it `snapshot` before the snapshot lands; a
+/// repair's snapshot of one collection marks nothing.
+#[tokio::test]
+async fn only_a_whole_database_snapshot_marks_the_member() {
+    // Whole database: a member that joins knowing nothing, below the horizon.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..20i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let b = node().await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    round_with(&b, &a, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Snapshot));
+    assert!(marker_dir.path().join(kimmy_cluster::catchup::FILE).exists());
+}
+
+/// The same handling in the replication loop, end to end: the stale member is
+/// marked while the snapshot is under way, and clears once it holds what the peer
+/// holds. A repair's scoped snapshot, in the same loop, never touches the marker.
+#[tokio::test]
+async fn a_repair_snapshot_does_not_mark_and_a_horizon_snapshot_clears_when_caught_up() {
+    use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+
+    // A repair: B lacks a collection A holds, and asks A for that one snapshot.
+    let a = node().await;
+    let b = node().await;
+    let base = a.engine.create_collection("shop", "base").unwrap();
+    a.engine.insert(&base, doc! { "_id": "0" }).unwrap();
+    sync(&a, &b).await;
+    let late = a.engine.create_collection("shop", "late").unwrap();
+    a.engine.insert(&base, doc! { "_id": "past-the-create" }).unwrap();
+    let past = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&past, &[], Hlc::ZERO, true).unwrap();
+    for i in 0..5 {
+        a.engine.insert(&late, doc! { "_id": i }).unwrap();
+    }
+    let repair_dir = tempfile::tempdir().unwrap();
+    let repairing = marker_in(&repair_dir);
+    let changes = repairing.subscribe();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.catch_up = Some(Arc::clone(&repairing));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if b.engine
+            .get_collection("shop", "late")
+            .ok()
+            .is_some_and(|c| b.engine.count(&c, kimmy_storage::WalkScope::Request).unwrap() == 5)
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the repair never landed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+    assert_eq!(*changes.borrow(), 0, "a repair's snapshot set the catching-up marker");
+    assert!(!repairing.is_set());
+
+    // A horizon: a stale member is marked and then cleared by the loop.
+    let c = node().await;
+    let cc = c.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..20i64 {
+        c.engine.insert(&cc, doc! { "_id": i }).unwrap();
+    }
+    c.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let d = node().await;
+    let stale_dir = tempfile::tempdir().unwrap();
+    let stale = marker_in(&stale_dir);
+    let changes = stale.subscribe();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![c.addr])], SECRET.into(), d.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.catch_up = Some(Arc::clone(&stale));
+    let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while stale.is_set() || *changes.borrow() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "never marked and cleared: {stale:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    looping.abort();
+    assert!(*changes.borrow() >= 1, "it was marked for the snapshot");
+    let held = d.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(d.engine.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 20);
+}
+
+/// A tail longer than one window is read back window by window, and the replay
+/// is finished only at the end of it.
+#[tokio::test]
+async fn a_lost_tail_longer_than_a_window_is_read_back_whole() {
+    let lost = kimmy_cluster::protocol::MAX_BATCH as u64 * 2 + 300;
+    let scenario = lost_tail(2, lost, true).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert!(catch_up.replay_answered(scenario.peer.engine.node_id()));
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents
+    );
+}
+
+/// The whole lifecycle of `restored` through the replication loop: found by the
+/// replay, held while the member is behind, and cleared by dominance once it holds
+/// what its peer holds, the lost tail included. A member cleared before the tail
+/// was back would be serving as complete a store that is not.
+#[tokio::test]
+async fn a_member_marked_restored_by_the_replay_clears_only_once_the_tail_is_back() {
+    use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+
+    let scenario = lost_tail(2, 40, true).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let changes = catch_up.subscribe();
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![scenario.peer.addr])],
+        SECRET.into(),
+        scenario.restored.addr,
+    );
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.catch_up = Some(Arc::clone(&catch_up));
+    let looping = tokio::spawn(replicate(Arc::clone(&scenario.restored.engine), config));
+
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while *changes.borrow() == 0
+        || catch_up.is_set()
+        || !catch_up.replay_answered(scenario.peer.engine.node_id())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "never marked and cleared: {catch_up:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    looping.abort();
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "cleared before the tail was back"
+    );
+}
+
+/// A peer that holds nothing of the member's origin above the position the store
+/// had at open has nothing to replay: the replay is answered without a request.
+/// (No startup write here, so the peer's highest stamp of the member's origin is
+/// exactly where the store stood.)
+#[tokio::test]
+async fn a_peer_that_holds_nothing_more_of_this_members_origin_answers_the_replay_at_once() {
+    let scenario = lost_tail(3, 0, false).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    assert_eq!(
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id()),
+        scenario.restored.engine.own_position_at_open(),
+        "premise: the peer holds exactly what the store held of this origin"
+    );
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert!(
+        catch_up.replay_answered(scenario.peer.engine.node_id()),
+        "nothing to ask for, so it is answered"
+    );
+    assert!(!catch_up.is_set());
+}
+
+/// The clock moves past every stamp the replay reads, applied or not: a lost write
+/// in a collection this member does not have yet cannot be applied (the ordinary
+/// machinery brings the collection), and a write made meanwhile must still be
+/// stamped above it.
+#[tokio::test]
+async fn the_clock_passes_a_lost_write_that_cannot_be_applied_yet() {
+    let scenario = lost_tail(2, 0, true).await;
+    let peer_only = scenario.peer.engine.create_collection("shop", "peer_only").unwrap();
+    let me = scenario.restored.engine.node_id();
+    let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    let lost = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), me),
+        kind: kimmy_core::OpKind::Insert,
+        collection: peer_only.id,
+        doc_id: Some(DocId::String("lost".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "lost" }).unwrap()),
+    };
+    scenario.peer.engine.apply_batch(std::slice::from_ref(&lost)).unwrap();
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    scenario.restored.engine.insert(&orders, doc! { "_id": "after" }).unwrap();
+    let mine = scenario.restored.engine.version_vector().unwrap().get(me);
+    assert!(
+        mine > lost.stamp.hlc,
+        "a write after the replay is stamped above the lost one: {mine:?}"
+    );
+}
+
+/// The first run after a loss writes (a topology record, client writes) and stops
+/// before it reaches a peer. The next start opens with an own-origin position past
+/// the entries it lost, and asks from the floor the first start left on disk, not
+/// from there: the tail is read back. Without the persisted floor it finds nothing.
+#[tokio::test]
+async fn a_start_that_wrote_and_stopped_before_a_peer_leaves_the_replay_its_floor() {
+    let scenario = lost_tail(2, 3, true).await;
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    let me = scenario.restored.engine.node_id();
+    let backup_position = scenario.peer.engine.version_vector().unwrap().get(me);
+    assert!(backup_position > Hlc::ZERO);
+
+    // Without a floor on disk, the later start's position is past the tail and the
+    // replay has nothing to ask for.
+    let later = scenario.restored.engine.version_vector().unwrap().get(me);
+    let forgetful_dir = tempfile::tempdir().unwrap();
+    let forgetful = marker_in(&forgetful_dir);
+    forgetful.arm_replay(later, None).unwrap();
+    round_with(&scenario.restored, &scenario.peer, &forgetful).await;
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        2,
+        "premise: from the later position the tail is never asked for"
+    );
+
+    // With the floor the first start persisted, the second start reads it back.
+    let dir = tempfile::tempdir().unwrap();
+    let first = marker_in(&dir);
+    first.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let second = kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+    second.arm_replay(later, None).unwrap();
+    round_with(&scenario.restored, &scenario.peer, &second).await;
+    assert_eq!(second.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "the tail is back"
+    );
+}
+
+/// A peer that is behind on this member's origin answers the replay with nothing,
+/// and settles nothing for the peer that holds the tail: the replay runs against
+/// each distinct peer, the first time it is reached.
+#[tokio::test]
+async fn a_peer_that_is_behind_does_not_settle_the_replay_for_the_one_that_is_ahead() {
+    let scenario = lost_tail(2, 3, true).await;
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+
+    round_with(&scenario.restored, &scenario.behind, &catch_up).await;
+    assert!(catch_up.replay_answered(scenario.behind.engine.node_id()));
+    assert!(!catch_up.replay_answered(scenario.peer.engine.node_id()), "not the other");
+    assert!(!catch_up.is_set(), "the behind peer proved nothing");
+
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "the tail is back, though the first peer reached was behind"
+    );
+}

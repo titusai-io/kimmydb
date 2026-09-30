@@ -196,7 +196,73 @@ pub struct CatchUp {
     /// counting peer reached that closes a gate the wait had opened. What an open
     /// change stream waits on to end when the member starts refusing.
     changes: tokio::sync::watch::Sender<u64>,
+    /// The replay of this member's own origin (ADR-202): armed at the start of a
+    /// clustered member, answered by each peer once per run.
+    replay: Mutex<Replay>,
     state: Mutex<State>,
+}
+
+/// Where the replay of this member's own origin stands in this run.
+///
+/// Armed at open; each distinct peer is asked once per run, the first time it is
+/// reached, and its answer is remembered. **No clear rule fires until every peer
+/// reached within the wait, and every member SWIM lists live, has answered**, and
+/// the floor the replay asks from is kept on disk until every member that can
+/// answer (the live ones and the peers reached this run) has.
+#[derive(Default)]
+struct Replay {
+    armed: bool,
+    /// Where each ask starts: the lowest own-origin position any start since the
+    /// last complete replay saw at open, so a start that wrote before it reached a
+    /// peer does not lose the entries between.
+    floor: kimmy_core::Hlc,
+    /// The peers that have answered this run.
+    answered: BTreeSet<NodeId>,
+    /// How far each peer's replay has read and applied, across rounds.
+    cursors: BTreeMap<NodeId, kimmy_core::Hlc>,
+    /// The members SWIM lists live now, other than this one: replaced every tick,
+    /// so one that has left stops being waited on.
+    live: BTreeSet<NodeId>,
+    /// The peers reached in this run. An origin named in a contact's vector is
+    /// not here: a member that has gone for good keeps its id in every vector,
+    /// and holds nothing a live peer cannot also serve.
+    reached: BTreeSet<NodeId>,
+    /// How long a peer keeps the oplog: what is older than this can no longer be
+    /// read back, and asking for it is answered `BeyondHorizon`. `None` when
+    /// retention collection is off.
+    retention: Option<Duration>,
+    /// The peers whose `BeyondHorizon` answer has been reported.
+    horizon_reported: BTreeSet<NodeId>,
+    /// When each peer began answering `BeyondHorizon` without an answer between:
+    /// the replay gives up on it after the wait.
+    horizon_since: BTreeMap<NodeId, Instant>,
+    /// When the replay was armed.
+    armed_at: Option<Instant>,
+    /// When each member was first seen live this run: the clear waits on a live
+    /// member's answer for the wait from the later of this and `armed_at`, no
+    /// longer.
+    live_since: BTreeMap<NodeId, Instant>,
+}
+
+/// What a `BeyondHorizon` answer to the replay comes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Horizon {
+    /// The first from this peer: say so.
+    First,
+    /// The replay stays owed and asks again next round.
+    Again,
+    /// The peer has answered `BeyondHorizon` for the whole wait: the replay stops
+    /// asking it, and it counts as settled (it cannot serve those entries).
+    GaveUp,
+}
+
+impl std::fmt::Debug for CatchUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatchUp")
+            .field("reason", &self.reason())
+            .field("replay_armed", &self.replay_armed())
+            .finish_non_exhaustive()
+    }
 }
 
 struct State {
@@ -232,6 +298,7 @@ impl CatchUp {
             reason: AtomicU8::new(0),
             counting_ms: AtomicU64::new(0),
             changes: tokio::sync::watch::channel(0).0,
+            replay: Mutex::new(Replay::default()),
             state: Mutex::new(State { marker: None, reached: BTreeMap::new(), warned: None }),
         });
         if let Some(marker) = marker {
@@ -360,14 +427,189 @@ impl CatchUp {
         }
     }
 
-    /// Remove the marker file and forget the marker, when clustering is off: a
-    /// stale file from a node that left a cluster must not gate a standalone one
-    /// for ever.
+    /// Remove the marker file and forget the marker, when this member has nobody
+    /// else to catch up from (clustering is off, or its seeds name only itself): a
+    /// file left by a restore, or by a node that left a cluster, must not gate a
+    /// standalone one for ever.
     pub fn discard_when_standalone(&self) {
         if self.is_set() {
-            info!("clustering is off, so the catching-up marker is discarded");
-            self.clear("clustering is off");
+            info!("this member has no peers, so the catching-up marker is discarded");
+            self.clear("no peers");
         }
+    }
+
+    /// Arm the replay of this member's own origin for this run (ADR-202): a clustered
+    /// member asks each peer it reaches, once, what that peer holds of this
+    /// member's origin above the floor. Called right after the store is opened,
+    /// before this run writes anything, with the own-origin position the store
+    /// had.
+    ///
+    /// **The floor is persisted** (`kimmy.replay-floor`): the lower of what an
+    /// earlier start left and `at_open`. A start that writes (a topology record,
+    /// client writes) and stops before it reaches a peer would otherwise open the
+    /// next time with a position past the entries it lost, and find nothing to
+    /// read back. The file is removed only when every member that can answer has
+    /// answered ([`Self::replay_settle`]).
+    ///
+    /// The floor is **clamped to what the peers can still serve**: no older than
+    /// `now − retention`, since entries below the oplog horizon cannot be read
+    /// back by any replay (the snapshot brings them). Without the clamp a floor a
+    /// member held for longer than the retention would be older than every peer's
+    /// horizon, be answered `BeyondHorizon`, and never see a newer loss.
+    ///
+    /// A floor file that cannot be read counts as the lowest floor, and a floor
+    /// that cannot be written is an error, as the marker's is.
+    pub fn arm_replay(
+        &self,
+        at_open: kimmy_core::Hlc,
+        retention: Option<Duration>,
+    ) -> std::io::Result<()> {
+        let file = self.replay_floor_path();
+        let existing = kimmy_storage::blocking(|| read_replay_floor(&file));
+        let lowest = existing.map_or(at_open, |held| held.min(at_open));
+        let floor = lowest.max(oldest_readable(retention));
+        if existing != Some(floor) {
+            kimmy_storage::blocking(|| write_replay_floor_file(&file, floor))?;
+        }
+        let mut replay = self.replay.lock();
+        replay.armed = true;
+        replay.floor = floor;
+        replay.retention = retention;
+        replay.armed_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Whether the replay is armed and not yet settled.
+    pub fn replay_armed(&self) -> bool {
+        self.replay.lock().armed
+    }
+
+    /// The persisted floor, as clamped at arm time.
+    pub fn replay_floor(&self) -> kimmy_core::Hlc {
+        self.replay.lock().floor
+    }
+
+    /// Where the replay against `peer` goes on from: the floor, or further if an
+    /// earlier round got further, and never older than the oplog the peers keep
+    /// (which moves on as the run does: a peer that answered `BeyondHorizon` is
+    /// asked from a later position next round).
+    pub fn replay_from(&self, peer: NodeId) -> kimmy_core::Hlc {
+        let replay = self.replay.lock();
+        replay
+            .cursors
+            .get(&peer)
+            .copied()
+            .unwrap_or_default()
+            .max(replay.floor)
+            .max(oldest_readable(replay.retention))
+    }
+
+    /// `peer` answered the replay `BeyondHorizon` at `now`: it cannot tell what it
+    /// holds of this member's origin from where the replay asks, so the replay is
+    /// **not** answered and is asked again next round, **until the peer has
+    /// answered it so for the whole wait**, when the replay gives up on it: it
+    /// counts as answered (it cannot serve those entries, and asking again would
+    /// never end). The clamp uses this member's retention and the answer depends
+    /// on the peer's, so members that keep the oplog for different times reach
+    /// this.
+    pub fn replay_beyond_horizon(&self, peer: NodeId, now: Instant) -> Horizon {
+        let mut replay = self.replay.lock();
+        let since = *replay.horizon_since.entry(peer).or_insert(now);
+        if now.saturating_duration_since(since) >= self.wait {
+            replay.answered.insert(peer);
+            return Horizon::GaveUp;
+        }
+        if replay.horizon_reported.insert(peer) { Horizon::First } else { Horizon::Again }
+    }
+
+    /// The replay against `peer` has read and applied everything through `hlc`.
+    pub fn replay_advanced(&self, peer: NodeId, hlc: kimmy_core::Hlc) {
+        let mut replay = self.replay.lock();
+        replay.horizon_since.remove(&peer);
+        let cursor = replay.cursors.entry(peer).or_default();
+        *cursor = (*cursor).max(hlc);
+    }
+
+    /// Whether `peer` has answered the replay this run.
+    pub fn replay_answered(&self, peer: NodeId) -> bool {
+        self.replay.lock().answered.contains(&peer)
+    }
+
+    /// `peer` has answered the replay: what it held of this member's origin has
+    /// been read (and applied, if it was lost).
+    pub fn replay_finished(&self, peer: NodeId) {
+        self.replay.lock().answered.insert(peer);
+    }
+
+    /// Whether a member SWIM lists live that has not answered the replay still
+    /// holds the clear at `now`. Each holds it for the wait from the later of the
+    /// replay's arming and the member first being seen live this run, and no
+    /// longer: past that it keeps the floor and is still asked when reached, but
+    /// a member that cannot answer (its cluster port unreachable, an accept
+    /// back-off) does not hold the clear for ever while other peers are reached.
+    fn live_member_holds(&self, live: &BTreeSet<NodeId>, me: NodeId, now: Instant) -> bool {
+        let mut replay = self.replay.lock();
+        let armed_at = replay.armed_at;
+        let mut holds = false;
+        for node in live.iter().filter(|node| **node != me) {
+            let since = *replay.live_since.entry(*node).or_insert(now);
+            if replay.answered.contains(node) {
+                continue;
+            }
+            let from = armed_at.map_or(since, |armed| armed.max(since));
+            if now.saturating_duration_since(from) < self.wait {
+                holds = true;
+            }
+        }
+        holds
+    }
+
+    /// The members that can answer: SWIM's live ones now (replacing the last
+    /// tick's) and the peers reached this tick, which stay noted for the run.
+    /// This member is not one of them.
+    pub fn replay_note_members(
+        &self,
+        me: NodeId,
+        live: impl IntoIterator<Item = NodeId>,
+        reached: impl IntoIterator<Item = NodeId>,
+    ) {
+        let mut replay = self.replay.lock();
+        replay.live = live.into_iter().filter(|node| *node != me).collect();
+        replay.reached.extend(reached.into_iter().filter(|node| *node != me));
+    }
+
+    /// Settle the replay when every member that can answer has (and at least one
+    /// has): the persisted floor is removed and the replay disarmed. Until then
+    /// the floor stays, and every newly reached peer is asked once, even after the
+    /// marker has cleared: the lost entries sit below this member's own vector,
+    /// so no ordinary pull fetches them.
+    pub fn replay_settle(&self) {
+        let file = self.replay_floor_path();
+        {
+            let mut replay = self.replay.lock();
+            if !replay.armed
+                || replay.answered.is_empty()
+                || !replay.live.is_subset(&replay.answered)
+                || !replay.reached.is_subset(&replay.answered)
+            {
+                return;
+            }
+            replay.armed = false;
+        }
+        kimmy_storage::blocking(|| remove_replay_floor(&file));
+        info!("every member that can answer has answered the replay of this member's own origin");
+    }
+
+    /// Forget the replay altogether, and its persisted floor: a member with
+    /// clustering off has no peers to read anything back from.
+    pub fn forget_replay(&self) {
+        let file = self.replay_floor_path();
+        self.replay.lock().armed = false;
+        kimmy_storage::blocking(|| remove_replay_floor(&file));
+    }
+
+    fn replay_floor_path(&self) -> PathBuf {
+        self.path.parent().unwrap_or_else(|| Path::new(".")).join(REPLAY_FLOOR_FILE)
     }
 
     /// The peers reached by a successful contact within the wait, as of `now`.
@@ -486,6 +728,18 @@ impl CatchUp {
             .filter(|(at, _)| tick.now.saturating_duration_since(*at) <= self.wait)
             .map(|(_, peer)| peer)
             .collect();
+
+        // The replay of this member's own origin is owed by every peer reached in
+        // the window and by every member SWIM lists live: any of them may yet find
+        // that writes were lost, so nothing clears until each has answered it, and
+        // at least one has. The wait bounds it: the gate opens as `unknown`.
+        if self.replay_armed()
+            && (window.is_empty()
+                || window.iter().any(|peer| !self.replay_answered(peer.node))
+                || tick.live.is_some_and(|live| self.live_member_holds(live, tick.me, tick.now)))
+        {
+            return Decision::Kept;
+        }
 
         // Dominance: a contact this tick, and this member's witnessed vector
         // covers what every counting peer in the window serves, and no
@@ -606,7 +860,8 @@ fn mutual_clear_holds(
 /// fsynced, renamed over the target, and the directory fsynced.
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!("{FILE}.tmp"));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(FILE);
+    let tmp = dir.join(format!("{name}.tmp"));
     {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(text.as_bytes())?;
@@ -614,6 +869,72 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// The replay floor's file name, in the data directory.
+pub const REPLAY_FLOOR_FILE: &str = "kimmy.replay-floor";
+
+/// The floor in `path`: `None` when there is no file, the lowest floor when there
+/// is one that cannot be read or understood (replaying from the start is the
+/// conservative side).
+fn read_replay_floor(path: &Path) -> Option<kimmy_core::Hlc> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(error = %e, "the replay floor file cannot be read; the replay starts from the beginning");
+            return Some(kimmy_core::Hlc::ZERO);
+        }
+    };
+    let (mut ms, mut counter) = (None, 0u16);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key.trim() {
+            "floor_ms" => ms = value.trim().parse::<u64>().ok(),
+            "floor_counter" => counter = value.trim().parse::<u16>().unwrap_or(0),
+            _ => {}
+        }
+    }
+    // A file that cannot be read as a floor is the lowest one: replaying from the
+    // start is the conservative side.
+    Some(kimmy_core::Hlc::new(ms.unwrap_or(0), if ms.is_some() { counter } else { 0 }))
+}
+
+/// The oldest position a peer keeping the oplog for `retention` can still serve.
+fn oldest_readable(retention: Option<Duration>) -> kimmy_core::Hlc {
+    match retention {
+        Some(retention) => kimmy_core::Hlc::new(
+            kimmy_storage::physical_now_ms().saturating_sub(retention.as_millis() as u64),
+            0,
+        ),
+        None => kimmy_core::Hlc::ZERO,
+    }
+}
+
+fn write_replay_floor_file(path: &Path, floor: kimmy_core::Hlc) -> std::io::Result<()> {
+    write_atomic(
+        path,
+        &format!("floor_ms = {}\nfloor_counter = {}\n", floor.wall_ms, floor.counter),
+    )
+}
+
+fn remove_replay_floor(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(error = %e, "could not remove the replay floor file");
+    }
+}
+
+/// The replay floor on disk in `data_dir`, if there is one.
+pub fn replay_floor_on_disk(data_dir: &Path) -> Option<kimmy_core::Hlc> {
+    read_replay_floor(&data_dir.join(REPLAY_FLOOR_FILE))
+}
+
+/// Write the replay floor a restore leaves: the own-origin position of the
+/// backup, so the first start reads back what the member made after it.
+pub fn write_replay_floor(data_dir: &Path, floor: kimmy_core::Hlc) -> std::io::Result<()> {
+    write_replay_floor_file(&data_dir.join(REPLAY_FLOOR_FILE), floor)
 }
 
 /// Write the marker before the store exists (R2.4): the reason, and the time.
@@ -1207,5 +1528,346 @@ mod tests {
             Decision::Kept,
             "peer 1's write is missing from this member"
         );
+    }
+
+    /// While the replay of the member's own origin is owed by a peer reached in the
+    /// window, no rule clears the marker, whatever the tick shows: it may yet find
+    /// writes this member lost. It clears once every peer reached in the window has
+    /// answered, and not on the strength of the first to.
+    #[test]
+    fn nothing_clears_until_every_peer_reached_has_answered_the_replay() {
+        let now = Instant::now();
+        let one = [reached(1, vector(&[(1, 100)]), None, block(None))];
+        let mine = vector(&[(1, 100)]);
+        let f = marked(CatchUpReason::Restored);
+        f.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        assert!(f.catchup.replay_armed());
+        assert_eq!(f.catchup.evaluate(&tick(&one, &mine, None, now)), Decision::Kept);
+        assert!(f.catchup.is_set());
+        f.catchup.replay_finished(node(1));
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
+
+        // A second peer reached in the window that has not answered holds it, though
+        // the first has.
+        let two = [
+            reached(1, vector(&[(1, 100)]), None, block(None)),
+            reached(2, vector(&[(2, 100)]), None, block(None)),
+        ];
+        let mine = vector(&[(1, 100), (2, 100)]);
+        let g = marked(CatchUpReason::Restored);
+        g.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        g.catchup.replay_finished(node(1));
+        assert_eq!(g.catchup.evaluate(&tick(&two, &mine, None, now)), Decision::Kept);
+        g.catchup.replay_finished(node(2));
+        assert_eq!(
+            g.catchup.evaluate(&tick(&two, &mine, None, now)),
+            Decision::Cleared("dominance")
+        );
+
+        // The mutual clear waits for it too.
+        let seeded = block(Some(CatchUpReason::SeededEmpty));
+        let live: BTreeSet<NodeId> = [node(1)].into();
+        let mine = vector(&[(1, 5), (9, 5)]);
+        let both = [reached(1, vector(&[(1, 5)]), Some(mine.clone()), seeded)];
+        let h = marked(CatchUpReason::SeededEmpty);
+        h.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        assert_eq!(h.catchup.evaluate(&tick(&both, &mine, Some(&live), now)), Decision::Kept);
+        h.catchup.replay_finished(node(1));
+        assert_eq!(
+            h.catchup.evaluate(&tick(&both, &mine, Some(&live), now)),
+            Decision::Cleared("mutual")
+        );
+    }
+
+    /// The replay against each peer goes on from where it got, and never from behind
+    /// the floor; one peer's progress says nothing about another's.
+    #[test]
+    fn the_replay_goes_on_from_where_it_got_peer_by_peer() {
+        let f = marked(CatchUpReason::Restored);
+        let floor = kimmy_core::Hlc::new(50, 0);
+        f.catchup.arm_replay(floor, None).unwrap();
+        assert_eq!(f.catchup.replay_from(node(1)), floor);
+        f.catchup.replay_advanced(node(1), kimmy_core::Hlc::new(80, 0));
+        assert_eq!(f.catchup.replay_from(node(1)), kimmy_core::Hlc::new(80, 0));
+        f.catchup.replay_advanced(node(1), kimmy_core::Hlc::new(60, 0));
+        assert_eq!(f.catchup.replay_from(node(1)), kimmy_core::Hlc::new(80, 0), "never back");
+        assert_eq!(f.catchup.replay_from(node(2)), floor, "another peer starts at the floor");
+    }
+
+    /// The floor is the lowest position any start since the last complete replay
+    /// saw at open, and it is on disk: a start that wrote before it reached a peer
+    /// does not lose the entries between.
+    #[test]
+    fn the_replay_floor_is_the_lowest_position_seen_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REPLAY_FLOOR_FILE);
+        let first = CatchUp::open(dir.path(), Duration::from_secs(120));
+        first.arm_replay(kimmy_core::Hlc::new(50, 3), None).unwrap();
+        assert_eq!(first.replay_floor(), kimmy_core::Hlc::new(50, 3));
+        assert!(path.exists(), "persisted");
+        // The next start opens with the position past what the first run wrote.
+        let second = CatchUp::open(dir.path(), Duration::from_secs(120));
+        second.arm_replay(kimmy_core::Hlc::new(80, 0), None).unwrap();
+        assert_eq!(second.replay_floor(), kimmy_core::Hlc::new(50, 3), "the floor does not rise");
+        // A start with a lower position lowers it.
+        let third = CatchUp::open(dir.path(), Duration::from_secs(120));
+        third.arm_replay(kimmy_core::Hlc::new(20, 0), None).unwrap();
+        assert_eq!(third.replay_floor(), kimmy_core::Hlc::new(20, 0));
+        assert_eq!(read_replay_floor(&path), Some(kimmy_core::Hlc::new(20, 0)));
+    }
+
+    /// The floor is removed when every member that can answer has (SWIM's live
+    /// ones and the peers reached this run), and not before: not on the first
+    /// answer, not while a live member has not answered. A member that has left
+    /// SWIM's set stops being waited on.
+    #[test]
+    fn the_replay_floor_is_removed_only_when_every_member_that_can_answer_has_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REPLAY_FLOOR_FILE);
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+
+        catchup.replay_settle();
+        assert!(path.exists() && catchup.replay_armed(), "nobody has answered");
+        catchup.replay_note_members(node(9), [node(1), node(2), node(9)], [node(1)]);
+        catchup.replay_finished(node(1));
+        catchup.replay_settle();
+        assert!(path.exists() && catchup.replay_armed(), "member 2 has not answered");
+
+        // Member 2 leaves the live set: it is no longer waited on.
+        catchup.replay_note_members(node(9), [node(1), node(9)], []);
+        catchup.replay_settle();
+        assert!(!path.exists() && !catchup.replay_armed(), "the members that can answer have");
+    }
+
+    /// A peer reached in the run that has not answered holds the floor even after
+    /// it has left SWIM's set: it may still hold what was lost.
+    #[test]
+    fn a_peer_reached_and_never_answered_holds_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        catchup.replay_note_members(node(9), [node(1), node(2)], [node(1), node(2)]);
+        catchup.replay_finished(node(1));
+        catchup.replay_note_members(node(9), [node(1)], []);
+        catchup.replay_settle();
+        assert!(catchup.replay_armed(), "peer 2 was reached and has not answered");
+    }
+
+    /// The floor is no older than what a peer keeping the oplog for the retention
+    /// can serve, and the clamp is what is persisted; with no retention it is left.
+    #[test]
+    fn the_replay_floor_is_clamped_to_what_the_peers_still_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        write_replay_floor(dir.path(), kimmy_core::Hlc::new(1_000, 0)).unwrap();
+        let hour = Duration::from_secs(3600);
+        let now = kimmy_storage::physical_now_ms();
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        catchup.arm_replay(kimmy_core::Hlc::new(2_000, 0), Some(hour)).unwrap();
+        let floor = catchup.replay_floor();
+        assert!(floor.wall_ms + 3_600_000 >= now, "clamped up to the retention: {floor:?}");
+        assert!(floor.wall_ms + 3_600_000 <= now + 10_000, "and no further: {floor:?}");
+        assert_eq!(read_replay_floor(&dir.path().join(REPLAY_FLOOR_FILE)), Some(floor));
+        assert!(catchup.replay_from(node(1)) >= floor);
+
+        let bare = tempfile::tempdir().unwrap();
+        write_replay_floor(bare.path(), kimmy_core::Hlc::new(1_000, 0)).unwrap();
+        let unclamped = CatchUp::open(bare.path(), Duration::from_secs(120));
+        unclamped.arm_replay(kimmy_core::Hlc::new(2_000, 0), None).unwrap();
+        assert_eq!(unclamped.replay_floor(), kimmy_core::Hlc::new(1_000, 0));
+    }
+
+    /// The position the replay asks from moves on with the retention as the run
+    /// does: a peer that answered `BeyondHorizon` is asked from a later position
+    /// next round, not from the same one.
+    #[test]
+    fn the_replay_asks_from_a_position_that_moves_on_with_the_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        let retention = Duration::from_millis(200);
+        catchup.arm_replay(kimmy_core::Hlc::ZERO, Some(retention)).unwrap();
+        let first = catchup.replay_from(node(1));
+        std::thread::sleep(Duration::from_millis(300));
+        let later = catchup.replay_from(node(1));
+        assert!(later.wall_ms >= first.wall_ms + 250, "{first:?} then {later:?}");
+        assert!(catchup.replay_floor() <= first, "the persisted floor does not move");
+    }
+
+    /// A floor file that cannot be read is the lowest floor, not no floor; a floor
+    /// that cannot be written fails the arm.
+    #[test]
+    fn an_unreadable_floor_is_the_lowest_and_an_unwritable_one_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: reading it fails, but not as a
+        // missing file does.
+        let path = dir.path().join(REPLAY_FLOOR_FILE);
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(read_replay_floor(&path), Some(kimmy_core::Hlc::ZERO));
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        assert_eq!(catchup.replay_floor(), kimmy_core::Hlc::ZERO);
+
+        assert_eq!(read_replay_floor(&dir.path().join("absent")), None);
+        let missing =
+            CatchUp::open(&dir.path().join("no-such-directory"), Duration::from_secs(120));
+        assert!(missing.arm_replay(kimmy_core::Hlc::new(50, 0), None).is_err());
+        assert!(!missing.replay_armed(), "a floor that could not be written arms nothing");
+    }
+
+    /// A member SWIM lists live that has not answered the replay holds the clear,
+    /// though every peer reached has: it may be the one that holds what was lost.
+    #[test]
+    fn a_live_member_that_has_not_answered_holds_the_clear() {
+        let now = Instant::now();
+        let one = [reached(1, vector(&[(1, 100)]), None, block(None))];
+        let mine = vector(&[(1, 100)]);
+        let live: BTreeSet<NodeId> = [node(1), node(2), node(9)].into();
+        let f = marked(CatchUpReason::Restored);
+        f.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        f.catchup.replay_finished(node(1));
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, Some(&live), now)),
+            Decision::Kept,
+            "member 2 is live and has not answered"
+        );
+        f.catchup.replay_finished(node(2));
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, Some(&live), now)),
+            Decision::Cleared("dominance"),
+            "this member is not one it waits on"
+        );
+    }
+
+    /// A `BeyondHorizon` answer is reported once per peer and is not an answer,
+    /// until the peer has answered it so for the whole wait: then the replay gives
+    /// up on it once, and it counts as settled. An answer in between starts the
+    /// count again.
+    #[test]
+    fn a_horizon_answer_is_reported_once_and_ends_after_the_wait() {
+        let f = marked(CatchUpReason::Restored);
+        let t0 = Instant::now();
+        let wait = Duration::from_secs(120);
+        f.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        assert_eq!(f.catchup.replay_beyond_horizon(node(1), t0), Horizon::First);
+        assert_eq!(f.catchup.replay_beyond_horizon(node(1), t0 + wait / 2), Horizon::Again);
+        assert!(!f.catchup.replay_answered(node(1)));
+        assert_eq!(f.catchup.replay_beyond_horizon(node(2), t0), Horizon::First);
+        assert_eq!(f.catchup.replay_beyond_horizon(node(1), t0 + wait), Horizon::GaveUp);
+        assert!(f.catchup.replay_answered(node(1)), "given up on: it counts as settled");
+        assert!(!f.catchup.replay_answered(node(2)));
+
+        // An answer between two horizons starts the count again.
+        f.catchup.replay_advanced(node(2), kimmy_core::Hlc::new(60, 0));
+        assert_eq!(f.catchup.replay_beyond_horizon(node(2), t0 + wait), Horizon::Again);
+        assert_eq!(
+            f.catchup.replay_beyond_horizon(node(2), t0 + wait * 2 - Duration::from_secs(1)),
+            Horizon::Again
+        );
+        assert!(!f.catchup.replay_answered(node(2)));
+    }
+
+    /// A peer reached that answers a horizon for ever holds the clear only for the
+    /// wait: once the replay gives up on it, the clear is judged as it is for any
+    /// other peer.
+    #[test]
+    fn a_peer_the_replay_has_given_up_on_no_longer_holds_the_clear() {
+        let f = marked(CatchUpReason::Restored);
+        let t0 = Instant::now();
+        let wait = Duration::from_secs(120);
+        let one = [reached(1, vector(&[(1, 100)]), None, block(None))];
+        let mine = vector(&[(1, 100)]);
+        f.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        f.catchup.replay_beyond_horizon(node(1), t0);
+        assert_eq!(f.catchup.evaluate(&tick(&one, &mine, None, t0)), Decision::Kept);
+        f.catchup.replay_beyond_horizon(node(1), t0 + wait);
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, None, t0 + wait)),
+            Decision::Cleared("dominance")
+        );
+    }
+
+    /// A member SWIM lists live that never answers the replay holds the clear for
+    /// the wait from the later of the replay's arming and its first being seen
+    /// live, and no longer, though another peer is reached on every tick. It keeps
+    /// the floor, and is still asked when reached.
+    #[test]
+    fn a_live_member_that_never_answers_holds_the_clear_for_the_wait_and_no_longer() {
+        let f = marked(CatchUpReason::Restored);
+        let t0 = Instant::now();
+        let wait = Duration::from_secs(120);
+        let secs = Duration::from_secs;
+        let one = [reached(1, vector(&[(1, 100)]), None, block(None))];
+        let mine = vector(&[(1, 100)]);
+        f.catchup.arm_replay(kimmy_core::Hlc::new(50, 0), None).unwrap();
+        f.catchup.replay_finished(node(1));
+        let live_two: BTreeSet<NodeId> = [node(1), node(2), node(9)].into();
+        for at in [0, 100, 119] {
+            assert_eq!(
+                f.catchup.evaluate(&tick(&one, &mine, Some(&live_two), t0 + secs(at))),
+                Decision::Kept,
+                "{at} s: member 2 is live and has not answered"
+            );
+        }
+        // A member first seen live later holds it for the wait from then.
+        let live_three: BTreeSet<NodeId> = [node(1), node(2), node(3), node(9)].into();
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, Some(&live_three), t0 + secs(130))),
+            Decision::Kept
+        );
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, Some(&live_three), t0 + secs(249))),
+            Decision::Kept,
+            "member 3 holds it from when it was first seen"
+        );
+        assert_eq!(
+            f.catchup.evaluate(&tick(&one, &mine, Some(&live_three), t0 + wait * 2 + secs(11))),
+            Decision::Cleared("dominance")
+        );
+        assert!(f.catchup.replay_armed(), "the floor is kept");
+        assert!(!f.catchup.replay_answered(node(2)), "and it is still asked when reached");
+    }
+
+    /// A member with clustering off forgets the replay and its floor.
+    #[test]
+    fn a_standalone_start_forgets_the_replay_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        write_replay_floor(dir.path(), kimmy_core::Hlc::new(50, 0)).unwrap();
+        catchup.forget_replay();
+        assert!(!dir.path().join(REPLAY_FLOOR_FILE).exists());
+        assert!(!catchup.replay_armed());
+    }
+
+    /// A peer reached earlier that is catching up for another reason (`restored`
+    /// or `snapshot`) holds the mutual clear when only a `seeded_empty` peer is
+    /// reached now: the rule is for a cluster of members that all started from
+    /// nothing, and one that is restored or streaming a snapshot is not one.
+    #[test]
+    fn a_peer_reached_earlier_that_is_restored_or_snapshotting_holds_the_mutual_clear() {
+        for other in [CatchUpReason::Restored, CatchUpReason::Snapshot] {
+            let f = marked(CatchUpReason::SeededEmpty);
+            let start = Instant::now();
+            let seeded = block(Some(CatchUpReason::SeededEmpty));
+            let live: BTreeSet<NodeId> = [node(1), node(2)].into();
+            let mine = vector(&[(9, 5)]);
+            let elsewhere =
+                reached(1, vector(&[(9, 5)]), Some(vector(&[(9, 5)])), block(Some(other)));
+            let fresh = reached(2, vector(&[(9, 5)]), Some(vector(&[(9, 5)])), seeded);
+            let both = [elsewhere, fresh.clone()];
+            // The first tick only records them (a snapshot is under way).
+            let mut first = tick(&both, &mine, Some(&live), start);
+            first.snapshot_pending = true;
+            assert_eq!(f.catchup.evaluate(&first), Decision::Kept);
+            let later = start + Duration::from_secs(1);
+            let only = [fresh];
+            assert_eq!(
+                f.catchup.evaluate(&tick(&only, &mine, Some(&live), later)),
+                Decision::Kept,
+                "peer 1 is catching up for {other:?}, and was reached in the window"
+            );
+        }
     }
 }

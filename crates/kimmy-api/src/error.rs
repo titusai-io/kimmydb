@@ -94,7 +94,8 @@ pub enum ErrorCode {
     /// serves.
     Starting,
     /// This member is serving and knows it is behind: it created its store in a
-    /// cluster it has seeds for and is catching up (ADR-202). Nothing was read or
+    /// cluster it has seeds for, was restored, or fell behind its peers' retention
+    /// horizon, and is catching up (ADR-202). Nothing was read or
     /// written, and another member serves.
     CatchingUp,
 }

@@ -2305,3 +2305,153 @@ async fn a_member_whose_seed_reaches_itself_is_not_cleared_by_itself() {
     run.signal("TERM");
     assert!(run.wait_exit().success());
 }
+
+// ---------------------------------------------------------------------------
+// A restored store (ADR-202)
+// ---------------------------------------------------------------------------
+
+/// A backup of a small store, and the config a `restore` into `dir/data` reads.
+fn backup_and_config(dir: &Path) -> (PathBuf, PathBuf) {
+    let source = kimmy_storage::Engine::open(&dir.join("source.redb")).unwrap();
+    let orders = source.create_collection("shop", "orders").unwrap();
+    source.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+    let backup = dir.join("backup.bin");
+    source
+        .backup_to(&mut std::fs::File::create(&backup).unwrap(), kimmy_storage::WalkScope::Request)
+        .unwrap();
+    let config = dir.join("restore.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:0\"\n\n[storage]\ndata_dir = \"{}\"\n",
+            dir.join("data").display()
+        ),
+    )
+    .unwrap();
+    (backup, config)
+}
+
+/// `kimmyd restore`, run to its end.
+fn restore(config: &Path, backup: &Path) -> std::process::Output {
+    let out = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        .arg("--config")
+        .arg(config)
+        .arg("restore")
+        .arg("--from")
+        .arg(backup)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("running kimmyd restore");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
+/// A restore writes the marker, and a standalone start after it discards it and
+/// is ready and unmarked: the case the restore command has always served, which a
+/// marker that outlived it would turn into a node that answers `503` for two
+/// minutes.
+#[tokio::test]
+async fn a_standalone_start_after_a_restore_is_ready_and_unmarked() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let (backup, config) = backup_and_config(dir.path());
+    let out = restore(&config, &backup);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("catching up"), "the restore says so");
+    let file = catching_up_marker(dir.path()).expect("a restore marks the node");
+    assert!(file.contains("restored"), "{file}");
+    let floor = dir.path().join("data").join("kimmy.replay-floor");
+    assert!(floor.exists(), "and leaves the replay the backup's position to ask from");
+    let source = kimmy_storage::Engine::open(&dir.path().join("source.redb")).unwrap();
+    assert_eq!(
+        kimmy_cluster::catchup::replay_floor_on_disk(&dir.path().join("data")),
+        Some(source.version_vector().unwrap().get(source.node_id())),
+        "the floor is the backup's own-origin position"
+    );
+    drop(source);
+
+    let mut run = Run::spawn(dir.path(), "standalone-after-restore");
+    run.wait_ready(&client).await;
+    assert!(catching_up_marker(dir.path()).is_none(), "nobody to catch up from: discarded");
+    assert!(!floor.exists(), "and with clustering off there is no replay to keep a floor for");
+    let (status, header, _) = readyz(&run, &client).await;
+    assert_eq!((status, header), (200, None));
+    assert_eq!(catching_up_gauge(&run, &client).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// A restored member with peers is marked `restored` (a store exists, so it is not
+/// `seeded_empty`), refuses requests and is not ready, and with nobody reachable
+/// serves as `unknown` once the wait runs out.
+#[tokio::test]
+async fn a_restored_member_with_peers_is_marked_restored_and_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let (backup, config) = backup_and_config(dir.path());
+    restore(&config, &backup);
+
+    let mut run = Run::spawn_clustered(dir.path(), "restored-with-peers", dead_port(), 3);
+    let deadline = Instant::now() + PATIENCE;
+    while run.http.get().is_none() {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
+            let _ = run.http.set(port);
+        }
+        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    until_ready_is(&run, &client, "503 catching_up restored", |status, header, body| {
+        status == 503 && header.as_deref() == Some("restored") && body["error"] == "catching_up"
+    })
+    .await;
+    assert_eq!(
+        catching_up_gauge(&run, &client).await,
+        ["kimmy_catching_up{reason=\"restored\"} 1"]
+    );
+    until_ready_is(&run, &client, "200 unknown", |status, header, _| {
+        status == 200 && header.as_deref() == Some("unknown")
+    })
+    .await;
+    // Nobody has answered the replay, so the floor it asks from is still on disk.
+    assert!(
+        dir.path().join("data").join("kimmy.replay-floor").exists(),
+        "the replay floor is kept until every member that can answer has"
+    );
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// A replay floor that cannot be written fails the start, as the marker does:
+/// a start that went on without it would lose what it could not record. It
+/// fails as every other start does: the exit is logged and recorded as an
+/// error, and the next start reports the failed start with the floor's error.
+/// (A directory where the file belongs is unreadable as a floor, which counts as
+/// the lowest, and the clamped floor then has to be written over it.)
+#[tokio::test]
+async fn a_replay_floor_that_cannot_be_written_fails_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let floor = dir.path().join("data").join("kimmy.replay-floor");
+    std::fs::create_dir_all(&floor).unwrap();
+    let mut run = Run::spawn_clustered(dir.path(), "unwritable-floor", dead_port(), 3);
+    let status = run.wait_exit();
+    assert!(!status.success(), "{status:?}");
+    let log = run.log();
+    assert!(log.contains("exiting on an error"), "{log}");
+    assert!(log.contains("replay floor"), "the failure names the floor: {log}");
+    let recorded = marker(dir.path()).expect("an error exit records itself");
+    assert!(recorded.contains("exit = \"error\""), "{recorded}");
+
+    std::fs::remove_dir(&floor).unwrap();
+    let mut next = Run::spawn(dir.path(), "after-unwritable-floor");
+    next.wait_ready(&client).await;
+    let log = next.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("the previous start failed before it served"))
+        .unwrap_or_else(|| panic!("no failed-start line:\n{log}"));
+    assert!(line.contains("WARN") && line.contains("replay floor"), "{line}");
+    assert!(!log.contains("did not shut down cleanly"), "{log}");
+    next.signal("TERM");
+    assert!(next.wait_exit().success());
+}

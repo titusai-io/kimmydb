@@ -429,6 +429,40 @@ impl OpenWatch {
     }
 }
 
+/// What a start does about the catching-up marker and the replay of its own
+/// origin (ADR-202).
+#[derive(Debug, PartialEq, Eq)]
+struct StartPlan {
+    /// Write `seeded_empty`: the store is new, and the seeds name another member.
+    mark_seeded_empty: bool,
+    /// Drop a marker left behind: there is nobody to catch up from.
+    discard_marker: bool,
+    /// Ask each peer, once, what it holds of this member's own origin. **Whenever
+    /// clustering is on**, whether or not the seeds name another member: a node
+    /// whose static seeds name only itself can still have SWIM peers, and a lost
+    /// write is found by the replay, which marks the member then.
+    arm_replay: bool,
+    /// Drop a replay floor left behind: clustering is off.
+    forget_replay: bool,
+}
+
+fn start_plan(clustered: bool, seeds_name_another: bool, store_existed: bool) -> StartPlan {
+    if !clustered {
+        return StartPlan {
+            mark_seeded_empty: false,
+            discard_marker: true,
+            arm_replay: false,
+            forget_replay: true,
+        };
+    }
+    StartPlan {
+        mark_seeded_empty: seeds_name_another && !store_existed,
+        discard_marker: !seeds_name_another,
+        arm_replay: true,
+        forget_replay: false,
+    }
+}
+
 async fn start_and_serve(config: Config) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -535,11 +569,18 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             Duration::from_secs(config.cluster.catch_up_wait_secs),
         )
     });
-    if !config.cluster.enabled {
+    let plan = start_plan(
+        config.cluster.enabled,
+        kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind),
+        store_existed,
+    );
+    if plan.discard_marker {
         catch_up.discard_when_standalone();
-    } else if !store_existed
-        && kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind)
-    {
+    }
+    if plan.forget_replay {
+        catch_up.forget_replay();
+    }
+    if plan.mark_seeded_empty {
         catch_up
             .mark(kimmy_cluster::CatchUpReason::SeededEmpty)
             .context("writing the catching-up marker")
@@ -596,6 +637,17 @@ async fn start_and_serve(config: Config) -> Result<Served> {
             );
         }
     };
+    // The replay of the member's own origin is armed before this run writes
+    // anything: the position the store has now is the one it can have lost writes
+    // above (ADR-202).
+    if plan.arm_replay {
+        // What a peer keeps of the oplog bounds what a replay can read back.
+        let retention = (config.storage.gc_interval_secs > 0)
+            .then(|| Duration::from_secs(config.storage.oplog_retention_secs));
+        catch_up
+            .arm_replay(engine.own_position_at_open(), retention)
+            .context("writing the replay floor")?;
+    }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
@@ -4235,5 +4287,55 @@ mod tests {
         assert!(!check("app/docs"), "gated while the marker is set");
         catch_up.clear("the test");
         assert!(check("app/docs"));
+    }
+
+    /// What a start does about the marker and the replay, for each shape of node.
+    #[test]
+    fn a_start_arms_the_replay_whenever_clustering_is_on() {
+        // Clustering off: nothing to catch up from or to read back; both dropped.
+        assert_eq!(
+            start_plan(false, false, true),
+            StartPlan {
+                mark_seeded_empty: false,
+                discard_marker: true,
+                arm_replay: false,
+                forget_replay: true
+            }
+        );
+        // A new store with seeds that name another member: marked, replay armed.
+        assert_eq!(
+            start_plan(true, true, false),
+            StartPlan {
+                mark_seeded_empty: true,
+                discard_marker: false,
+                arm_replay: true,
+                forget_replay: false
+            }
+        );
+        // An existing store (a restore, a plain restart): not marked here, and the
+        // marker a restore left is kept.
+        assert_eq!(
+            start_plan(true, true, true),
+            StartPlan {
+                mark_seeded_empty: false,
+                discard_marker: false,
+                arm_replay: true,
+                forget_replay: false
+            }
+        );
+        // The seed-node pattern: seeds that name only itself, but SWIM peers. The
+        // marker is dropped, and the replay stays armed to find a loss and mark
+        // the member then.
+        for store_existed in [false, true] {
+            assert_eq!(
+                start_plan(true, false, store_existed),
+                StartPlan {
+                    mark_seeded_empty: false,
+                    discard_marker: true,
+                    arm_replay: true,
+                    forget_replay: false
+                }
+            );
+        }
     }
 }
