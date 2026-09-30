@@ -8554,6 +8554,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         kimmy_cluster::OwnerClass::ALL.len(),
     ))
     .chain(["kimmy_ownership_facts_undecodable_total"])
+    .chain(std::iter::repeat_n("kimmy_catching_up", kimmy_cluster::catchup::STATES.len()))
     .chain(std::iter::repeat_n("kimmy_ttl_collections", kimmy_api::ownership::TtlState::ALL.len()))
     .collect();
 

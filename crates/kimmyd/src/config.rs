@@ -897,6 +897,29 @@ pub struct ClusterConfig {
     /// receives the change through anti-entropy as before.
     /// `0` turns the confirmation off. Needs `membership`.
     pub ddl_confirm_timeout_secs: u64,
+    /// How long a member that knows it is behind (its catching-up marker is
+    /// set) waits with no *counting* peer reached before it serves, marked
+    /// `unknown` (ADR-202).
+    ///
+    /// A wiped or restored member refuses requests, and expires, embeds and
+    /// delivers nothing, until it has caught up. When no peer that could tell it
+    /// whether it is behind is reachable (two wiped members and a third that is
+    /// gone), it cannot learn, and this bounds how long it refuses on a guess.
+    /// Owner work stays off past the bound; the state reads `unknown`, and a
+    /// `WARN` says so every ten minutes. Must be greater than zero.
+    pub catch_up_wait_secs: u64,
+    /// The number of members the cluster is meant to have, when known (the
+    /// StatefulSet's `replicas`).
+    ///
+    /// Members that were wiped together clear their catching-up marker against
+    /// each other once every member they have *seen* has been reached; without
+    /// this they trust discovery to be complete, so a cluster whose third member
+    /// neither has ever seen can clear without it. With it, the mutual clear also
+    /// needs this many members (reached, plus this one). Unset by default, so an
+    /// existing deployment's behaviour does not change. A value that is too high
+    /// after scaling down holds an all-fresh cold start back until it is corrected
+    /// or the marker is deleted.
+    pub expected_members: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1266,6 +1289,8 @@ impl Default for ClusterConfig {
             discovery_interval_secs: 30,
             membership: true,
             fanout: kimmy_cluster::DEFAULT_FANOUT,
+            catch_up_wait_secs: 120,
+            expected_members: None,
             ddl_confirm_timeout_secs: 10,
         }
     }
@@ -1458,6 +1483,18 @@ impl Config {
             }
         }
 
+        if self.cluster.enabled && self.cluster.catch_up_wait_secs == 0 {
+            anyhow::bail!(
+                "cluster.catch_up_wait_secs must be greater than zero; zero would open the gate \
+                 of a member that is catching up before it had reached anyone"
+            );
+        }
+        if self.cluster.expected_members == Some(0) {
+            anyhow::bail!(
+                "cluster.expected_members must be at least 1 when it is set; leave it unset when \
+                 the number of members is not known"
+            );
+        }
         if self.cluster.enabled && self.cluster.sync_interval_secs == 0 {
             anyhow::bail!(
                 "cluster.sync_interval_secs must be greater than zero; a node that never runs \
@@ -2029,6 +2066,28 @@ mod tests {
         assert!(err.contains("cluster_secret"), "unhelpful error: {err}");
 
         cfg.cluster.cluster_secret = Some("shared".into());
+        cfg.validate().unwrap();
+    }
+
+    /// A wait of zero would open the gate of a member that is catching up before
+    /// it had reached anyone; an expected count of zero names no cluster.
+    #[test]
+    fn the_catching_up_settings_refuse_zero() {
+        let mut cfg = valid();
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.cluster_secret = Some("shared".into());
+        cfg.validate().unwrap();
+
+        cfg.cluster.catch_up_wait_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("catch_up_wait_secs"), "unhelpful error: {err}");
+        cfg.cluster.catch_up_wait_secs = 120;
+
+        cfg.cluster.expected_members = Some(0);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("expected_members"), "unhelpful error: {err}");
+        cfg.cluster.expected_members = Some(3);
         cfg.validate().unwrap();
     }
 

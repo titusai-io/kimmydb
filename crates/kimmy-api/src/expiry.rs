@@ -171,7 +171,7 @@ pub async fn run(
     members: Option<kimmy_cluster::Members>,
     interval: Duration,
 ) {
-    let owners = Owners::over(me, members);
+    let owners = Owners::over(me, members).gated_by(state.catch_up().cloned());
     let mut unowned = Unowned::default();
     let mut ticker = tokio::time::interval(interval);
     // The first tick fires immediately, which would expire during startup

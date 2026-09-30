@@ -138,6 +138,7 @@ pub fn state_with_policies(
         sessions,
         members: std::sync::OnceLock::new(),
         ddl_confirm: std::sync::OnceLock::new(),
+        catch_up: std::sync::OnceLock::new(),
         federation: std::sync::OnceLock::new(),
         stale_peers: Default::default(),
         local_login: std::sync::OnceLock::new(),

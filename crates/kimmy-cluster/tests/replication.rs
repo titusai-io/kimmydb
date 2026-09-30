@@ -6793,3 +6793,235 @@ async fn an_ordinary_tick_against_a_caught_up_peer_always_opens() {
          comparison against it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The catching-up marker through the real loop (ADR-202)
+// ---------------------------------------------------------------------------
+
+/// A wiped member that is marked `restored` facing a populated peer stays marked
+/// until it holds everything the peer serves, and clears by dominance then, from
+/// what the loop's own successful contacts read. A marker cleared before the
+/// documents arrived is a member serving an empty store as complete.
+#[tokio::test]
+async fn a_wiped_member_clears_its_marker_only_once_it_holds_what_the_peer_holds() {
+    use kimmy_cluster::catchup::CatchUp;
+    use kimmy_cluster::{CatchUpReason, ReplicationConfig, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let meta = a.engine.create_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (0..300i64).map(|i| doc! { "_id": i, "n": i }).collect();
+    a.engine.insert_many(&meta, docs).unwrap();
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(600));
+    catch_up.mark(CatchUpReason::Restored).unwrap();
+
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.catch_up = Some(Arc::clone(&catch_up));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while catch_up.is_set() {
+        assert!(tokio::time::Instant::now() < deadline, "the marker never cleared");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let held = b.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        b.engine.count(&held, kimmy_storage::WalkScope::Request).unwrap(),
+        300,
+        "the marker cleared before the member held what the peer holds"
+    );
+    assert!(
+        !marker_dir.path().join(kimmy_cluster::catchup::FILE).exists(),
+        "the file goes with the marker"
+    );
+    looping.abort();
+}
+
+/// With no peer reachable the loop learns nothing and the marker stays: nothing
+/// in a tick with no contact may clear it, and the operator's deletion of the file
+/// is read by the loop itself, with no restart.
+#[tokio::test]
+async fn a_marker_survives_ticks_that_reach_nobody_and_the_operators_clear_is_read() {
+    use kimmy_cluster::catchup::CatchUp;
+    use kimmy_cluster::{CatchUpReason, ReplicationConfig, SeedSource, replicate};
+
+    let b = node().await;
+    let dead = {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        taken.local_addr().unwrap()
+    };
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(600));
+    catch_up.mark(CatchUpReason::SeededEmpty).unwrap();
+
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![dead])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.catch_up = Some(Arc::clone(&catch_up));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(catch_up.is_set(), "a tick that reached nobody cleared the marker");
+
+    std::fs::remove_file(marker_dir.path().join(kimmy_cluster::catchup::FILE)).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while catch_up.is_set() {
+        assert!(tokio::time::Instant::now() < deadline, "the loop never read the operator's clear");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+}
+
+/// A node that dials an address of its own (a seed naming it by an address it does
+/// not bind) is answered with its own node id, and ends the contact: it is no
+/// round, and no peer (ADR-202).
+#[tokio::test]
+async fn a_node_dialling_itself_ends_the_contact() {
+    let a = node().await;
+    let outcome = sync_once(&a.engine, a.addr, SECRET, None).await;
+    assert!(
+        matches!(outcome, Err(kimmy_cluster::protocol::ProtocolError::SelfContact)),
+        "{outcome:?}"
+    );
+}
+
+/// A seed that names this node by an address it does not bind reaches the node
+/// itself. The loop takes that as "this address is me": no round fails, nothing
+/// backs off, and the address is not dialled again, however many ticks pass
+/// (ADR-202). It is not a peer that went away.
+#[tokio::test]
+async fn a_seed_that_reaches_this_node_itself_is_left_out_and_never_a_failure() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    // The loop's own address is one it does not listen on, as a wildcard bind is:
+    // discovery cannot take the seed out by comparing addresses.
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![a.addr])],
+        SECRET.into(),
+        "127.0.0.1:1".parse().unwrap(),
+    );
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    looping.abort();
+
+    let mut ticks = 0;
+    while let Ok(report) = rx.try_recv() {
+        ticks += 1;
+        assert_eq!(report.failed, 0, "a self-contact was counted as a failed round: {report:?}");
+        assert_eq!(report.backing_off, 0, "and backed off from: {report:?}");
+    }
+    assert!(ticks >= 5, "premise: the loop ran ({ticks} ticks)");
+}
+
+/// Once an address has answered as this node itself it is left out of the peers:
+/// dialled once, not once a tick. A proxy in front of the node counts the
+/// connections its seed receives.
+#[tokio::test]
+async fn an_address_that_answered_as_this_node_is_not_dialled_again() {
+    use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+
+    let a = node().await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&dials);
+    let target = a.addr;
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![proxy_addr])],
+        SECRET.into(),
+        "127.0.0.1:1".parse().unwrap(),
+    );
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    looping.abort();
+    let n = dials.load(Ordering::SeqCst);
+    assert!(n >= 1, "premise: the seed was dialled");
+    assert!(n <= 2, "the address that answered as this node was dialled {n} times in 2 s");
+}
+
+/// An address that answered as this node is dialled again after `self_recheck`: it
+/// can come to name another node (a service or load-balancer address whose
+/// backends changed, a copy of a data directory fixed and restarted with a new
+/// id). Here the proxy in front of the seed first forwards to the node itself, and
+/// later to a different one, whose data must then be pulled.
+#[tokio::test]
+async fn an_address_that_answered_as_this_node_is_dialled_again_after_the_recheck() {
+    use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let meta = b.engine.create_collection("shop", "orders").unwrap();
+    b.engine.insert(&meta, doc! { "_id": "from-b" }).unwrap();
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let target = Arc::new(std::sync::Mutex::new(a.addr));
+    let pointed = Arc::clone(&target);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy.accept().await {
+            let to = *pointed.lock().unwrap();
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![proxy_addr])],
+        SECRET.into(),
+        "127.0.0.1:1".parse().unwrap(),
+    );
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.self_recheck = Duration::from_millis(400);
+    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+
+    // It reaches itself first, and nothing is pulled.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(a.engine.get_collection("shop", "orders").is_err(), "premise: nothing from b yet");
+
+    // The address now names a different node.
+    *target.lock().unwrap() = b.addr;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(held) = a.engine.get_collection("shop", "orders")
+            && a.engine.get(&held, &DocId::String("from-b".into())).unwrap().is_some()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the address that had answered as this node was never dialled again"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+}

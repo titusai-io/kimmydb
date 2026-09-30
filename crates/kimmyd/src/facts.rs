@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Weak};
 
+use kimmy_cluster::catchup::CatchUp;
 use kimmy_cluster::{Facts, FactsSource, TtlHeld};
 use kimmy_storage::{CollectionMeta, Engine, ttl_indexes};
 
@@ -15,10 +16,19 @@ pub fn source(
     boot: Vec<u8>,
     ttl_disabled: bool,
     embeddings_disabled: bool,
+    catch_up: Option<Arc<CatchUp>>,
 ) -> FactsSource {
     Arc::new(move || {
-        let base =
-            Facts { boot: boot.clone(), ttl_disabled, embeddings_disabled, ..Facts::default() };
+        let (catching_up, catching_up_reason) =
+            catch_up.as_ref().map_or((false, None), |c| (c.is_set(), c.marker().map(|m| m.reason)));
+        let base = Facts {
+            boot: boot.clone(),
+            ttl_disabled,
+            embeddings_disabled,
+            catching_up,
+            catching_up_reason,
+            ..Facts::default()
+        };
         let Some(engine) = engine.upgrade() else { return base };
         // A schema that cannot be read is sent as holding nothing: the peers
         // then do not count this member a holder, which fails toward another
@@ -96,7 +106,7 @@ mod tests {
         let (engine, _dir) = engine();
         ttl(&engine, "app", "sessions", 60);
         engine.create_collection("app", "plain").unwrap();
-        let source = source(Arc::downgrade(&engine), vec![1; 16], false, true);
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, true, None);
         let block = source();
         assert_eq!(block.boot, vec![1; 16]);
         assert!(block.embeddings_disabled && !block.ttl_disabled);
@@ -109,7 +119,7 @@ mod tests {
 
         let (other, _dir2) = engine_pair();
         ttl(&other, "app", "sessions", 120);
-        let other_block = super::source(Arc::downgrade(&other), vec![2; 16], false, false)();
+        let other_block = super::source(Arc::downgrade(&other), vec![2; 16], false, false, None)();
         assert_ne!(block.ttl[0].digest, other_block.ttl[0].digest, "a different definition");
     }
 
@@ -123,8 +133,30 @@ mod tests {
         let (engine, _dir) = engine();
         let weak = Arc::downgrade(&engine);
         drop(engine);
-        let block = source(weak, vec![3; 16], true, false)();
+        let block = source(weak, vec![3; 16], true, false, None)();
         assert_eq!(block.boot, vec![3; 16]);
         assert!(block.ttl.is_empty() && block.ttl_disabled);
+    }
+
+    /// The block carries the marker's state live: the bit and the reason while it
+    /// is set (which is what makes peers leave this member out of the candidates),
+    /// none once it clears, and none for a member with no marker at all.
+    #[test]
+    fn the_block_says_when_the_catching_up_marker_is_set() {
+        let (engine, _dir) = engine();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = CatchUp::open(marker_dir.path(), std::time::Duration::from_secs(120));
+        let with =
+            source(Arc::downgrade(&engine), vec![1; 16], false, false, Some(Arc::clone(&catch_up)));
+        let without = source(Arc::downgrade(&engine), vec![1; 16], false, false, None);
+
+        assert!(!with().catching_up && with().catching_up_reason.is_none());
+        catch_up.mark(kimmy_cluster::CatchUpReason::Restored).unwrap();
+        let block = with();
+        assert!(block.catching_up, "{block:?}");
+        assert_eq!(block.catching_up_reason, Some(kimmy_cluster::CatchUpReason::Restored));
+        assert!(!without().catching_up, "a member with no marker is never catching up");
+        catch_up.clear("the test");
+        assert!(!with().catching_up && with().catching_up_reason.is_none());
     }
 }

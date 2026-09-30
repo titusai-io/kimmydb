@@ -98,6 +98,11 @@ pub struct AppState {
     /// before its request answers (ADR-140). Set late, like `members`, and
     /// for the same reason; `None` on a node that is not clustered.
     pub(crate) ddl_confirm: std::sync::OnceLock<DdlConfirmer>,
+    /// The catching-up marker (ADR-202), when clustering is on: read by the gate
+    /// over every route but four, by the response header, `/v1/topology` and
+    /// `kimmy_catching_up`, and by the owner work that must not run while it is
+    /// set. Set late, like `members`, and for the same reason.
+    pub(crate) catch_up: std::sync::OnceLock<std::sync::Arc<kimmy_cluster::catchup::CatchUp>>,
     /// The external identity provider, when one is configured.
     ///
     /// Set late for the same reason `members` is: the router is built before
@@ -154,6 +159,17 @@ impl AppState {
     /// The stale-rejoiner record for a peer, if it has one.
     pub fn stale_peer(&self, node: kimmy_core::NodeId) -> Option<StalePeer> {
         self.stale_peers.lock().get(&node).copied()
+    }
+
+    /// Hand the state the catching-up marker. Called once; a second call is
+    /// ignored.
+    pub fn set_catch_up(&self, catch_up: std::sync::Arc<kimmy_cluster::catchup::CatchUp>) {
+        let _ = self.catch_up.set(catch_up);
+    }
+
+    /// The catching-up marker, if this node has one.
+    pub fn catch_up(&self) -> Option<&std::sync::Arc<kimmy_cluster::catchup::CatchUp>> {
+        self.catch_up.get()
     }
 
     /// Hand the state the live member set. Called once, after the cluster
@@ -275,6 +291,9 @@ impl AppState {
                     self.ttl_owners().ttl_view(&self.engine.all_collections()?).counts;
                 // Counted as blocks arrive, whether or not membership is up.
                 reading.undecodable = kimmy_cluster::facts_undecodable_total();
+                // One-hot over the marker's state; `none` on a node with none.
+                reading.catching_up =
+                    self.catch_up().map_or(0, |c| c.state_slot(std::time::Instant::now()));
                 reading
             },
         })
@@ -323,6 +342,7 @@ impl AppState {
     pub fn ttl_owners(&self) -> crate::ownership::Owners {
         crate::ownership::Owners::over(self.engine.node_id(), self.members().cloned())
             .with_expiry_off(self.expiry_off.get().copied().unwrap_or(false))
+            .gated_by(self.catch_up().cloned())
     }
 
     /// Say where a local token may be minted from. Called once, at startup; a

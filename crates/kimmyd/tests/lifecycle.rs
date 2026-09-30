@@ -60,24 +60,70 @@ impl Run {
     }
 
     fn spawn_on_with(dir: &Path, name: &str, http: u16, extra_env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, http, extra_env, "", None, false)
+        Run::spawn_full(dir, name, http, extra_env, "", None, false, "")
     }
 
     /// [`Run::spawn_with`], with the node's stderr a pipe whose reader is
     /// already closed, so every write the node makes to it fails with EPIPE:
     /// the stderr a process has when whatever was reading it has gone.
     fn spawn_with_stderr_closed(dir: &Path, name: &str, env: &[(&str, &str)]) -> Run {
-        Run::spawn_full(dir, name, 0, env, "", None, true)
+        Run::spawn_full(dir, name, 0, env, "", None, true, "")
     }
 
     /// [`Run::spawn`], with `storage` added to the config's `[storage]`.
     fn spawn_with_storage(dir: &Path, name: &str, storage: &str) -> Run {
-        Run::spawn_full(dir, name, 0, &[], storage, None, false)
+        Run::spawn_full(dir, name, 0, &[], storage, None, false, "")
     }
 
     /// [`Run::spawn`], with the process allowed `nofile` file descriptors.
     fn spawn_with_fd_limit(dir: &Path, name: &str, nofile: u32) -> Run {
-        Run::spawn_full(dir, name, 0, &[], "", Some(nofile), false)
+        Run::spawn_full(dir, name, 0, &[], "", Some(nofile), false, "")
+    }
+
+    /// [`Run::spawn`] as a member of a cluster whose only seed is `seed`: a port
+    /// nothing listens on, so no peer is ever reached. `wait_secs` is
+    /// `cluster.catch_up_wait_secs`.
+    fn spawn_clustered(dir: &Path, name: &str, seed: u16, wait_secs: u64) -> Run {
+        Run::spawn_clustered_on(dir, name, ports::choose(), &[seed], wait_secs)
+    }
+
+    /// [`Run::spawn_clustered`] on the cluster port `cluster`, seeded with `seeds`
+    /// (one of which may be its own).
+    fn spawn_clustered_on(
+        dir: &Path,
+        name: &str,
+        cluster: u16,
+        seeds: &[u16],
+        wait_secs: u64,
+    ) -> Run {
+        Run::spawn_clustered_at(dir, name, "127.0.0.1", cluster, seeds, wait_secs)
+    }
+
+    /// [`Run::spawn_clustered_on`], binding the cluster port on `host`: a
+    /// wildcard bind is reached by a seed that names it by any address of its own.
+    fn spawn_clustered_at(
+        dir: &Path,
+        name: &str,
+        host: &str,
+        cluster: u16,
+        seeds: &[u16],
+        wait_secs: u64,
+    ) -> Run {
+        let seeds =
+            seeds.iter().map(|p| format!("\"127.0.0.1:{p}\"")).collect::<Vec<_>>().join(", ");
+        let tail = format!(
+            r#"
+[cluster]
+enabled = true
+bind = "{host}:{cluster}"
+seeds = [{seeds}]
+cluster_secret = "a-lifecycle-harness-cluster-secret"
+sync_interval_secs = 1
+discovery_interval_secs = 2
+catch_up_wait_secs = {wait_secs}
+"#
+        );
+        Run::spawn_full(dir, name, 0, &[], "", None, false, &tail)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -89,6 +135,7 @@ impl Run {
         storage: &str,
         nofile: Option<u32>,
         stderr_closed: bool,
+        tail: &str,
     ) -> Run {
         let config = format!(
             r#"
@@ -101,7 +148,7 @@ data_dir = "{data}"
 
 [auth]
 jwt_secret = "{JWT_SECRET}"
-"#,
+{tail}"#,
             data = dir.join("data").display(),
         );
         let config_path = dir.join(format!("{name}.toml"));
@@ -1970,4 +2017,291 @@ async fn a_reloaded_certificate_is_the_one_the_listener_serves() {
     }
     run.signal("TERM");
     assert!(run.wait_exit().success(), "{}", run.log());
+}
+
+// ---------------------------------------------------------------------------
+// The catching-up marker (ADR-202)
+// ---------------------------------------------------------------------------
+
+/// The marker file the member keeps in its data directory.
+const CATCHING_UP_FILE: &str = "kimmy.catching-up";
+
+fn catching_up_marker(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("data").join(CATCHING_UP_FILE)).ok()
+}
+
+/// A port nothing listens on: a cluster seed no peer is ever reached at.
+fn dead_port() -> u16 {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    taken.local_addr().unwrap().port()
+}
+
+/// `/readyz` of a run: its status, its `x-kimmy-catching-up` header and its body.
+async fn readyz(run: &Run, client: &reqwest::Client) -> (u16, Option<String>, serde_json::Value) {
+    let port = *run.http.get().expect("the port was read from the log");
+    let res = client.get(format!("http://127.0.0.1:{port}/readyz")).send().await.unwrap();
+    let status = res.status().as_u16();
+    let header = res.headers().get("x-kimmy-catching-up").map(|v| v.to_str().unwrap().to_string());
+    (status, header, res.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+async fn catching_up_gauge(run: &Run, client: &reqwest::Client) -> Vec<String> {
+    let port = *run.http.get().expect("the port was read from the log");
+    let body = client
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    body.lines()
+        .filter(|l| l.starts_with("kimmy_catching_up{") && l.ends_with(" 1"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Wait until `what` holds of `/readyz`, or fail with the run's log.
+async fn until_ready_is(
+    run: &Run,
+    client: &reqwest::Client,
+    what: &str,
+    mut holds: impl FnMut(u16, &Option<String>, &serde_json::Value) -> bool,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let (status, header, body) = readyz(run, client).await;
+        if holds(status, &header, &body) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw: {what}; last {status} {header:?} {body}; log: {}",
+            run.log()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// A member that creates its store in a cluster it has seeds for is marked
+/// before the store exists, is not ready (it says why), and refuses data routes.
+/// With no peer reachable it cannot learn, so past the wait it serves as
+/// `unknown`, with the marker still set; the operator deleting the file clears
+/// it live; and the next start, which finds a store, is not marked.
+#[tokio::test]
+async fn a_fresh_member_with_seeds_is_marked_and_the_marker_goes_by_the_wait_and_the_operator() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = Run::spawn_clustered(dir.path(), "fresh", dead_port(), 3);
+
+    // Not ready at first: wait for the port, not for a 200.
+    let deadline = Instant::now() + PATIENCE;
+    while run.http.get().is_none() {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
+            let _ = run.http.set(port);
+        }
+        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, body| {
+        status == 503 && header.as_deref() == Some("seeded_empty") && body["error"] == "catching_up"
+    })
+    .await;
+    let file = catching_up_marker(dir.path()).expect("the marker is written for a fresh member");
+    assert!(file.contains("seeded_empty"), "{file}");
+    assert_eq!(
+        catching_up_gauge(&run, &client).await,
+        ["kimmy_catching_up{reason=\"seeded_empty\"} 1"]
+    );
+
+    // The wait runs out with no peer reached: ready, and honest about it.
+    until_ready_is(&run, &client, "200 unknown", |status, header, body| {
+        status == 200 && header.as_deref() == Some("unknown") && body["catching_up"] == "unknown"
+    })
+    .await;
+    assert!(catching_up_marker(dir.path()).is_some(), "unknown keeps the marker");
+    assert_eq!(catching_up_gauge(&run, &client).await, ["kimmy_catching_up{reason=\"unknown\"} 1"]);
+
+    // The operator's clear takes effect live, with no restart.
+    std::fs::remove_file(dir.path().join("data").join(CATCHING_UP_FILE)).unwrap();
+    until_ready_is(&run, &client, "ready and unmarked", |status, header, body| {
+        status == 200 && header.is_none() && body.get("catching_up").is_none()
+    })
+    .await;
+    assert_eq!(catching_up_gauge(&run, &client).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
+    assert!(run.log().contains("the catching-up marker was cleared"), "{}", run.log());
+
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+
+    // The store exists now: an ordinary restart is not fresh, and is not marked.
+    let mut again = Run::spawn_clustered(dir.path(), "again", dead_port(), 3);
+    again.wait_ready(&client).await;
+    assert!(catching_up_marker(dir.path()).is_none(), "an ordinary restart is never marked");
+    assert_eq!(catching_up_gauge(&again, &client).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
+    again.signal("TERM");
+    assert!(again.wait_exit().success());
+}
+
+/// A marker left by a node that was in a cluster does not gate a standalone one:
+/// it is discarded at the start, and the node is ready at once.
+#[tokio::test]
+async fn a_standalone_start_discards_a_stale_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    std::fs::write(
+        dir.path().join("data").join(CATCHING_UP_FILE),
+        "reason = \"restored\"\nsince = 1\n",
+    )
+    .unwrap();
+    let mut run = Run::spawn(dir.path(), "standalone");
+    run.wait_ready(&client).await;
+    assert!(catching_up_marker(dir.path()).is_none(), "the stale file is removed");
+    let (status, header, _) = readyz(&run, &client).await;
+    assert_eq!((status, header), (200, None));
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// A member that cannot write its marker does not start: it fails before the
+/// open like a bind that fails does, with the same exit and the same verdict for
+/// the next start. The HTTP port was already bound, so this is the check that
+/// the answer is "failed to start" and never "catching up": the store is not
+/// created, the banner never follows, and no marker exists.
+#[tokio::test]
+async fn a_marker_that_cannot_be_written_fails_the_start_before_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    // The marker is written by way of a temporary file of this name; a directory
+    // there makes the write fail, on any platform and as any user.
+    std::fs::create_dir_all(dir.path().join("data").join(format!("{CATCHING_UP_FILE}.tmp")))
+        .unwrap();
+    let mut failed = Run::spawn_clustered(dir.path(), "unwritable", dead_port(), 3);
+    let status = failed.wait_exit();
+    assert!(!status.success(), "{status:?}");
+    let log = failed.log();
+    assert!(log.contains("exiting on an error"), "{log}");
+    assert!(log.contains("catching-up marker"), "the line carries the error's text: {log}");
+    assert!(!log.contains("starting kimmyd"), "the banner follows the open: {log}");
+    assert!(!log.contains("catching up") || !log.contains("serving HTTP"), "{log}");
+    assert!(
+        !dir.path().join("data").join("kimmy.redb").exists(),
+        "a marker that cannot be written must not let the store be created"
+    );
+    assert!(!dir.path().join("data").join(CATCHING_UP_FILE).exists());
+    let recorded = marker(dir.path()).expect("an error exit records itself");
+    assert!(recorded.contains("exit = \"error\""), "{recorded}");
+
+    // The same exit as a bind that fails: one before-open class.
+    let other = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut unbound = Run::spawn_on(other.path(), "unbindable", taken.local_addr().unwrap().port());
+    assert_eq!(unbound.wait_exit().code(), status.code());
+}
+
+/// Seeds that name only this member name nobody to catch up from: a fresh member
+/// whose static seed list is its own cluster address is ready at once and not
+/// marked, where a replicas=1 first start would otherwise wait out the bound. With
+/// a second seed that is a real (dead) peer it is marked, and refuses.
+#[tokio::test]
+async fn a_fresh_member_seeded_only_with_itself_is_not_marked_and_one_with_another_seed_is() {
+    let client = reqwest::Client::new();
+
+    let alone = tempfile::tempdir().unwrap();
+    let cluster = ports::choose();
+    let mut run = Run::spawn_clustered_on(alone.path(), "alone", cluster, &[cluster], 120);
+    run.wait_ready(&client).await;
+    assert!(catching_up_marker(alone.path()).is_none(), "nobody else can hold its data");
+    assert_eq!(catching_up_gauge(&run, &client).await, ["kimmy_catching_up{reason=\"none\"} 1"]);
+    let (status, header, _) = readyz(&run, &client).await;
+    assert_eq!((status, header), (200, None));
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+
+    let with_peer = tempfile::tempdir().unwrap();
+    let cluster = ports::choose();
+    let run = Run::spawn_clustered_on(
+        with_peer.path(),
+        "with-peer",
+        cluster,
+        &[cluster, dead_port()],
+        120,
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while run.http.get().is_none() {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
+            let _ = run.http.set(port);
+        }
+        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, body| {
+        status == 503 && header.as_deref() == Some("seeded_empty") && body["error"] == "catching_up"
+    })
+    .await;
+    assert!(catching_up_marker(with_peer.path()).is_some());
+}
+
+/// A member on a wildcard bind whose only seed names it by a loopback address dials
+/// itself. It is not a peer: the contact is ended, the member is marked as any
+/// fresh member with a seed is, and with nobody else reached it serves as `unknown`
+/// once the wait runs out. It must never clear by the mutual clear against itself,
+/// which it did before the transport refused a contact with its own node id, before
+/// HTTP served.
+#[tokio::test]
+async fn a_member_whose_seed_reaches_itself_is_not_cleared_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let cluster = ports::choose();
+    let mut run =
+        Run::spawn_clustered_at(dir.path(), "self-seeded", "0.0.0.0", cluster, &[cluster], 3);
+    let deadline = Instant::now() + PATIENCE;
+    while run.http.get().is_none() {
+        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
+        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
+            let _ = run.http.set(port);
+        }
+        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, _| {
+        status == 503 && header.as_deref() == Some("seeded_empty")
+    })
+    .await;
+    // Longer than the discovery interval, so it has dialled itself more than once.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    until_ready_is(&run, &client, "200 unknown", |status, header, _| {
+        status == 200 && header.as_deref() == Some("unknown")
+    })
+    .await;
+    let log = run.log();
+    assert!(
+        log.contains("a connection reached a node with this node's own id"),
+        "the self-contact is said once: {log}"
+    );
+    assert!(
+        !log.contains("the catching-up marker was cleared"),
+        "a member cleared its own marker against itself: {log}"
+    );
+    assert!(catching_up_marker(dir.path()).is_some(), "still set");
+    // It is not a peer that failed: no failed round counted, no back-off, and no
+    // warning per tick.
+    let port = *run.http.get().unwrap();
+    let page = client
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.lines().any(|l| l == "kimmy_sync_failures_total 0"),
+        "a self-contact was counted as a failed round:\n{page}"
+    );
+    assert!(!log.contains("sync round failed"), "and warned about: {log}");
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
 }

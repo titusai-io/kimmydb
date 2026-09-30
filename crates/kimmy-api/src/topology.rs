@@ -97,6 +97,16 @@ pub async fn topology(
     // webhook (ADR-051).
     let live = state.members().map(|m| m.node_ids()).unwrap_or_default();
 
+    let peers_catching_up: Vec<kimmy_core::NodeId> = state
+        .members()
+        .map(|m| {
+            m.peer_states()
+                .into_iter()
+                .filter(|(_, s)| *s == kimmy_cluster::PeerState::IneligibleCatchingUp)
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .unwrap_or_default();
     let meta = registry(&state)?;
     let mut nodes = Vec::new();
     let mut me_seen = false;
@@ -108,7 +118,18 @@ pub async fn topology(
         // What replication last learned about this peer's distance behind
         // us, when that distance exceeds tombstone retention (ADR-085).
         let stale = node.parse::<kimmy_core::NodeId>().ok().and_then(|n| state.stale_peer(n));
-        nodes.push(entry(&document, &node, is_me, is_me || contains(&live, &node), stale));
+        let mut listed = entry(&document, &node, is_me, is_me || contains(&live, &node), stale);
+        // A member that is catching up says so, and how this member sees a peer
+        // that is (ADR-202): present only while it holds, so a client that never
+        // looks sees the shape it always saw.
+        if is_me {
+            if let Some(catch_up) = state.catch_up().filter(|c| c.is_set()) {
+                listed["catchingUp"] = json!(catch_up.state_label(std::time::Instant::now()));
+            }
+        } else if peers_catching_up.iter().any(|n| n.to_string() == node) {
+            listed["catchingUp"] = json!(true);
+        }
+        nodes.push(listed);
         Ok(true)
     })?;
 
@@ -123,6 +144,10 @@ pub async fn topology(
             "status": "live",
             "self": true,
         }));
+        if let Some(catch_up) = state.catch_up().filter(|c| c.is_set()) {
+            let last = nodes.len() - 1;
+            nodes[last]["catchingUp"] = json!(catch_up.state_label(std::time::Instant::now()));
+        }
     }
 
     // Stable order, with this node first: a client reading the list top-down

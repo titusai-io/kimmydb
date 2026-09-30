@@ -235,6 +235,52 @@ async fn the_dispatcher_loop_delivers_without_being_driven() {
     assert!(delivered, "the dispatcher loop must deliver on its own");
 }
 
+/// The dispatcher loop as the daemon runs it takes the catching-up marker from the
+/// state (ADR-202): with it set the loop calls no endpoint, however many passes
+/// run, and when it clears the loop delivers what it held. The test above asks
+/// `Owners` directly; this is the wiring.
+#[tokio::test]
+async fn the_dispatcher_loop_delivers_nothing_while_the_catching_up_marker_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = kimmy_cluster::catchup::CatchUp::open(
+        marker_dir.path(),
+        std::time::Duration::from_secs(120),
+    );
+    catch_up.mark(kimmy_cluster::CatchUpReason::SeededEmpty).unwrap();
+    state.set_catch_up(std::sync::Arc::clone(&catch_up));
+    let (addr, _seen, hits) = receiver(200).await;
+    register(&state, &format!("http://{addr}/hook"), vec![]);
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1, "item": "widget" }).unwrap();
+
+    let handle = tokio::spawn(dispatch::run(
+        state.clone(),
+        EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
+        me(),
+        None,
+        dispatch::Limits::default(),
+        dispatch::client(&EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]))
+            .expect("a delivery client for the test"),
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the loop delivered while the marker was set");
+
+    catch_up.clear("the test");
+    let mut delivered = false;
+    for _ in 0..300 {
+        if hits.load(Ordering::SeqCst) > 0 {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    handle.abort();
+    assert!(delivered, "the loop must deliver once the marker clears");
+}
+
 #[tokio::test]
 async fn a_write_is_delivered_and_the_signature_verifies() {
     let dir = tempfile::tempdir().unwrap();

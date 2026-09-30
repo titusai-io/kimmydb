@@ -552,6 +552,31 @@ membership = true
 # not count against this.
 fanout = 3
 
+# How long a member that knows it is behind waits with no reachable peer that
+# could tell it so before it serves.
+#
+# A member that creates its store in a cluster it has seeds for (a new pod, a
+# wiped volume) writes a `kimmy.catching-up` marker in its data directory. While
+# it is set the member refuses requests (`503 catching_up`), is not ready, and
+# expires, embeds and delivers nothing, until it has caught up or the operator
+# deletes the file. When no peer that could say whether it is behind can be
+# reached for this long (two wiped members and a third that is gone) it cannot
+# learn, so it serves with `x-kimmy-catching-up: unknown`; owner work stays off
+# and a WARN says so every ten minutes. Must be greater than zero.
+catch_up_wait_secs = 120
+
+# The number of members the cluster is meant to have, when it is known (the
+# StatefulSet's `replicas`). Unset by default.
+#
+# Members that start from nothing together clear their markers against each other
+# once every member they have seen has been reached. Without this they trust
+# discovery to be complete, so a cluster whose third member neither of the others
+# has ever seen can clear without it. With it, the clear also needs this many
+# members (reached, plus this one). A value too high after scaling down holds an
+# all-fresh cold start back until it is corrected or the marker file is deleted.
+# Also `KIMMY_CLUSTER_EXPECTED_MEMBERS`.
+# expected_members = 3
+
 [webhooks]
 # Hosts a webhook may target beyond the public internet.
 #

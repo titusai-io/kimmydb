@@ -735,8 +735,8 @@ subscriptions use (ADR-045, ADR-051). Its deletes then replicate as ordinary
 deletes. A collection no member can expire is reported: `kimmy_ttl_collections`
 and a `WARN` naming it, at most once per thirty minutes. Only a member that is
 not itself a candidate can see that, so the report comes from a member with
-expiry switched off (or, once a later release sets the marker, one that is
-catching up): a member with expiry on that holds the index always sees an
+expiry switched off (or one that is catching up, with its marker set: see
+[ADR-202](decisions.md)): a member with expiry on that holds the index always sees an
 owner. Compare members with `max`.
 
 The alternative, every node expiring independently, is *convergent* — N deletes

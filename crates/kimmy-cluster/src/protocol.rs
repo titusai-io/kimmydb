@@ -400,6 +400,13 @@ pub enum ProtocolError {
     /// once it runs again.
     #[error("this node is shutting down: {0}")]
     Stopping(String),
+    /// The peer at the far end of the connection is this node itself (the
+    /// handshake named this node's own id): a seed that names it by an address
+    /// it does not bind, a wildcard bind reached by a loopback address. No round
+    /// is run with it (ADR-202): what it reads is this node's own state, which
+    /// says nothing about the cluster.
+    #[error("the peer is this node itself")]
+    SelfContact,
 }
 
 /// Write one length-prefixed frame.

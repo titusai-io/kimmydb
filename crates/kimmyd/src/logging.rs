@@ -1047,6 +1047,43 @@ impl TelemetryGuard {
             |s| s.ownership.undecodable
         );
         observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.none",
+            "{state}",
+            "This member is not catching up. One of five, exactly one is 1.",
+            |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("none"))
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.seeded_empty",
+            "{state}",
+            "This member created its store in a cluster it has seeds for, and has not yet caught up. One of five, exactly one is 1.",
+            |s| u64::from(
+                s.ownership.catching_up == kimmy_cluster::catchup::slot_of("seeded_empty")
+            )
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.restored",
+            "{state}",
+            "This member was restored, or writes it made are missing, and has not yet caught up. One of five, exactly one is 1.",
+            |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("restored"))
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.snapshot",
+            "{state}",
+            "A peer's oplog no longer covers this member, and a whole-database snapshot is under way. One of five, exactly one is 1.",
+            |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("snapshot"))
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.catching_up.unknown",
+            "{state}",
+            "The catching-up marker is set and no peer that could say has been reached within the wait: serving, with owner work off. One of five, exactly one is 1.",
+            |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("unknown"))
+        );
+        observe!(
             u64_observable_counter,
             "kimmy.sync.failures",
             "{round}",
@@ -2157,6 +2194,24 @@ mod tests {
              published as something it is not:\n  {}",
             shared.join("\n  ")
         );
+    }
+
+    #[test]
+    fn each_catching_up_instrument_reads_the_slot_of_its_own_state() {
+        // The five instruments of `kimmy_catching_up{reason}` each read one slot
+        // of the one-hot reading. Which slot is written beside the name, so a
+        // swap or a copy would publish one state under another's name and pass
+        // the coverage test, which reads names only.
+        let source = include_str!("logging.rs");
+        for state in kimmy_cluster::catchup::STATES {
+            let name = format!("\"kimmy.catching_up.{state}\"");
+            let at = source.find(&name).unwrap_or_else(|| panic!("no instrument {name}"));
+            let call = &source[at..at + source[at..].find(");").expect("the call ends")];
+            assert!(
+                call.contains(&format!("slot_of(\"{state}\")")),
+                "{name} does not read the slot of `{state}`: {call}"
+            );
+        }
     }
 
     #[test]

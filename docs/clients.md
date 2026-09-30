@@ -57,6 +57,17 @@ dropped after the request was sent is in the same state: see
 [retrying after an unknown outcome](#retrying-after-an-unknown-outcome). Reads
 move freely; writes are the caller's decision.
 
+**A member that is catching up answers `503 catching_up`, `retry: elsewhere`.**
+A member that created its store in a cluster it has seeds for refuses every route
+but `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up
+([ADR-202](decisions.md)), so a client that reads `/v1/version` for its
+capabilities (`has_capability`) from such a member sees the `503`, not a version:
+treat it as any `retry: elsewhere`, and read the capabilities from another member.
+Nothing was read or written. A member past its wait serves and says
+`x-kimmy-catching-up: unknown` on every response, and `/v1/topology` marks a member
+that is catching up (`catchingUp`), so a client that fails over by topology can
+prefer one that is not.
+
 **Resume change streams from the last token seen.** A token resumes on any node:
 exactly on the node that issued it, and on any other with every event the stream
 had not sent but possibly some it had (up to 1,024 once the stream had caught

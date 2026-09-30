@@ -1,6 +1,6 @@
 //! The replication loop: find peers, sync with them, repeat.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -504,6 +504,19 @@ pub struct ReplicationConfig {
     /// Where each peer's last advertised vector is kept, for the replication
     /// lag gauge to be computed from when it is read (ADR-175's addendum).
     pub lag_vectors: Option<std::sync::Arc<LagVectors>>,
+    /// The catching-up marker (ADR-202): judged every tick from what the tick's
+    /// successful contacts read, and re-read from its file so an operator's
+    /// clear is live.
+    pub catch_up: Option<Arc<crate::catchup::CatchUp>>,
+    /// `cluster.expected_members`: the mutual clear also requires this many
+    /// members (reached, plus this one).
+    pub expected_members: Option<usize>,
+    /// How long an address that answered as this node itself stays out of the
+    /// peers before it is dialled once more (ADR-202). The address can come to
+    /// name another node (a copy of a data directory fixed and restarted with a
+    /// new id, a service or load-balancer address whose backends changed), so
+    /// the answer is not kept for the life of the process.
+    pub self_recheck: Duration,
 }
 
 /// Each peer's last advertised vector, kept for the replication lag gauge,
@@ -569,6 +582,10 @@ impl LagVectors {
 /// entries at most.
 pub const MAX_PULLS_PER_CONTACT: usize = 128;
 
+/// How long an address that answered as this node itself stays out of the peers
+/// before it is dialled once more (ADR-202).
+pub const SELF_RECHECK: Duration = Duration::from_secs(300);
+
 impl ReplicationConfig {
     pub fn new(seeds: Vec<SeedSource>, secret: String, local: SocketAddr) -> Self {
         Self {
@@ -587,6 +604,9 @@ impl ReplicationConfig {
             on_peer_staleness: None,
             on_round: None,
             lag_vectors: None,
+            catch_up: None,
+            expected_members: None,
+            self_recheck: SELF_RECHECK,
         }
     }
 }
@@ -610,6 +630,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // tracker, and read and written inside the round, which is where the
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
+    // Addresses that answered the handshake with this node's own id (ADR-202),
+    // and when: left out of the peers, and never a failed round, until
+    // `config.self_recheck` has passed, when they are dialled once more, quietly
+    // (the address may name another node by then). Bounded by the addresses
+    // discovery and membership offer.
+    let mut self_addresses: BTreeMap<SocketAddr, Instant> = BTreeMap::new();
     // The peers a yielding class is waiting on, said once per interval each.
     let mut unconfirmed_warned = crate::facts::UnconfirmedWarn::default();
     // What the lease on a peer's block is derived from (ADR-201).
@@ -725,7 +751,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // Membership when it knows anyone, discovery otherwise. A node
                 // that has just started has resolved seeds but not yet gossiped
                 // with them, so discovery is what gets the first round out.
-                let peers = match &config.members {
+                let mut peers = match &config.members {
                     Some(members) if !members.is_empty() => {
                         let mut live = members.snapshot();
                         live.remove(&config.local);
@@ -733,6 +759,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     }
                     _ => discovered.clone(),
                 };
+                // An address that answered as this node itself is not a peer
+                // (ADR-202): not dialled again, and never a failed round.
+                self_addresses.retain(|_, at| at.elapsed() < config.self_recheck);
+                peers.retain(|peer| !self_addresses.contains_key(peer));
                 // A peer membership no longer lists as live, one SWIM marked
                 // down included, counts no more towards the lag gauge.
                 if let Some(lag) = &config.lag_vectors {
@@ -848,6 +878,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // whole budget.
                 let mut draining: VecDeque<Contact> =
                     chosen.into_iter().map(Contact::new).collect();
+                // The peers this tick reached by a *successful* round, with what
+                // their vectors and blocks showed: what the catching-up marker is
+                // judged on (ADR-202).
+                let mut tick_reached: Vec<crate::catchup::Reached> = Vec::new();
                 // The contact whose pulls this tick summed to the most wall
                 // time, named in the tick-overrun warning below: the peer
                 // the tick's own length is most attributable to.
@@ -931,6 +965,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     report.entries_skipped_unknown_collection += applied.unknown_collection;
                     report.entries_skipped_beyond_advertised += applied.deferred;
                     report.entries_skipped_purge_pending += applied.purge_pending;
+                    tick_reached.extend(stalls.take_reached_after(&pulled));
                     match pulled {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
@@ -1149,6 +1184,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         // through the health backoff, and retrying it inside
                         // the tick would spend the budget on a peer that has
                         // just said it cannot answer (ADR-157).
+                        // The address is this node itself: a seed that names it by an
+                        // address it does not bind, or a copy of its data directory
+                        // on another host. Not a peer that failed, so no back-off,
+                        // no failure counted and no warning per tick: the address is
+                        // remembered and left out (the transport said why, once).
+                        Err(crate::protocol::ProtocolError::SelfContact) => {
+                            self_addresses.insert(peer, Instant::now());
+                            debug!(%peer, "left out: the peer at this address is this node");
+                            slowest_contact =
+                                slower(slowest_contact, contact.peer, contact.total_took + took);
+                            contact.finish();
+                        }
                         Err(e) => {
                             let now = Instant::now();
                             // Reported on the first failure and then at a
@@ -1181,6 +1228,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             contact.finish();
                         }
                     }
+                }
+                // The catching-up marker (ADR-202): the operator's clear is read
+                // live, and a set marker is judged on what this tick reached.
+                if let Some(catch_up) = &config.catch_up {
+                    judge_catch_up(
+                        catch_up,
+                        &engine,
+                        &stalls,
+                        config.members.as_ref(),
+                        &tick_reached,
+                        config.expected_members,
+                    );
                 }
                 // A draining peer left with time still worth having: rather
                 // than wait out the rest of this interval, the next tick
@@ -1523,6 +1582,54 @@ async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr
     // syncing with itself would do work to learn nothing.
     out.remove(&local);
     out
+}
+
+/// Judge the catching-up marker once, at the end of a tick, from what the tick's
+/// successful contacts read (ADR-202): the operator's clear is read live, and a
+/// set marker is evaluated against this member's own vectors, the members SWIM
+/// holds, and whether a whole-database snapshot pull from a current member is
+/// still under way, **whichever peers this tick happened to reach**.
+fn judge_catch_up(
+    catch_up: &crate::catchup::CatchUp,
+    engine: &Engine,
+    stalls: &PeerStalls,
+    members: Option<&Members>,
+    reached: &[crate::catchup::Reached],
+    expected_members: Option<usize>,
+) -> crate::catchup::Decision {
+    catch_up.refresh();
+    if !catch_up.is_set() {
+        return crate::catchup::Decision::NotSet;
+    }
+    let live = members.map(Members::node_ids);
+    let now = Instant::now();
+    // Whose snapshot cursors can hold this member: a current member's. Without
+    // membership there is no live set, and a peer that has not been reached within
+    // the wait (gone, replaced) must not hold it for ever.
+    let snapshot_from = live.clone().or_else(|| {
+        let mut reached_lately = catch_up.reached_within(now);
+        reached_lately.extend(reached.iter().map(|peer| peer.node));
+        Some(reached_lately)
+    });
+    let vectors = kimmy_storage::blocking(|| {
+        Ok::<_, kimmy_storage::StorageError>((engine.witnessed_vector()?, engine.version_vector()?))
+    });
+    match vectors {
+        Ok((mine_witnessed, mine_servable)) => catch_up.evaluate(&crate::catchup::Tick {
+            me: engine.node_id(),
+            reached,
+            mine_witnessed: &mine_witnessed,
+            mine_servable: &mine_servable,
+            snapshot_pending: stalls.snapshot_pending(snapshot_from.as_ref()),
+            live: live.as_ref(),
+            expected_members,
+            now,
+        }),
+        Err(e) => {
+            warn!(error = %e, "could not read this member's vectors to judge the catching-up marker");
+            crate::catchup::Decision::Kept
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2068,5 +2175,103 @@ mod tests {
 
         assert_eq!(applied, 2, "the collection and the index, once each");
         assert!(b.get_collection("shop", "orders").is_ok(), "and B holds them");
+    }
+
+    /// A whole-database snapshot from one peer, one page applied and the rest to
+    /// come, on a fresh engine; and the peer's id.
+    fn part_way_through_a_snapshot()
+    -> ((Engine, tempfile::TempDir), NodeId, kimmy_storage::SnapshotProgress) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Engine::open(&source_dir.path().join("kimmy.redb")).unwrap();
+        let orders = source.create_collection("shop", "orders").unwrap();
+        let docs: Vec<_> = (0..(kimmy_storage::SNAPSHOT_PAGE as i64 + 20))
+            .map(|i| bson::doc! { "_id": i })
+            .collect();
+        source.insert_many(&orders, docs).unwrap();
+        let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+        let page = source.snapshot_page(None, None).unwrap();
+        engine.apply_snapshot_page(source.node_id(), &mut progress, &page).unwrap();
+        assert!(!progress.is_complete() && progress.pages() == 1, "premise: part-way");
+        ((engine, dir), source.node_id(), progress)
+    }
+
+    fn other_peer_this_member_covers(engine: &Engine) -> [crate::catchup::Reached; 1] {
+        [crate::catchup::Reached {
+            node: NodeId::from_bytes([4; 16]),
+            servable: engine.version_vector().unwrap(),
+            witnessed: None,
+            facts: None,
+        }]
+    }
+
+    /// A snapshot pull from one peer is still under way, and the tick reached only
+    /// another, which this member covers, with membership listing the first as
+    /// live: it is not cleared, because the snapshot is still to land. Without the
+    /// pull, the same tick clears it.
+    #[test]
+    fn a_pending_snapshot_holds_the_marker_whichever_peer_the_tick_reached() {
+        let ((engine, _dir), snapshot_peer, progress) = part_way_through_a_snapshot();
+        let reached = other_peer_this_member_covers(&engine);
+        let members = Members::default();
+        members.insert_for_test("127.0.0.1:7001".parse().unwrap(), snapshot_peer);
+        let mut pulling = PeerStalls::new();
+        pulling.resume_snapshots(vec![(snapshot_peer, progress)]);
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        let held = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        held.mark(crate::CatchUpReason::Snapshot).unwrap();
+        assert_eq!(
+            judge_catch_up(&held, &engine, &pulling, Some(&members), &reached, None),
+            crate::catchup::Decision::Kept
+        );
+        assert!(held.is_set(), "the snapshot is still to land");
+
+        let free_dir = tempfile::tempdir().unwrap();
+        let free = crate::catchup::CatchUp::open(free_dir.path(), Duration::from_secs(120));
+        free.mark(crate::CatchUpReason::Snapshot).unwrap();
+        assert_eq!(
+            judge_catch_up(&free, &engine, &PeerStalls::new(), Some(&members), &reached, None),
+            crate::catchup::Decision::Cleared("dominance")
+        );
+    }
+
+    /// Without membership there is no live set, and a cursor for a peer that has
+    /// not been reached within the wait (gone, replaced) does not hold the member
+    /// for ever; one for a peer reached lately does.
+    #[test]
+    fn without_membership_a_cursor_for_a_peer_not_reached_lately_does_not_hold_the_marker() {
+        let ((engine, _dir), snapshot_peer, progress) = part_way_through_a_snapshot();
+        let reached = other_peer_this_member_covers(&engine);
+        let mut pulling = PeerStalls::new();
+        pulling.resume_snapshots(vec![(snapshot_peer, progress)]);
+
+        // The snapshot's peer has never been reached: its cursor is a ghost.
+        let ghost_dir = tempfile::tempdir().unwrap();
+        let ghost = crate::catchup::CatchUp::open(ghost_dir.path(), Duration::from_secs(120));
+        ghost.mark(crate::CatchUpReason::Snapshot).unwrap();
+        assert_eq!(
+            judge_catch_up(&ghost, &engine, &pulling, None, &reached, None),
+            crate::catchup::Decision::Cleared("dominance")
+        );
+
+        // The same tick also reached the snapshot's peer: its pull is real.
+        let real_dir = tempfile::tempdir().unwrap();
+        let real = crate::catchup::CatchUp::open(real_dir.path(), Duration::from_secs(120));
+        real.mark(crate::CatchUpReason::Snapshot).unwrap();
+        let both = [
+            reached[0].clone(),
+            crate::catchup::Reached {
+                node: snapshot_peer,
+                servable: kimmy_core::VersionVector::new(),
+                witnessed: None,
+                facts: None,
+            },
+        ];
+        assert_eq!(
+            judge_catch_up(&real, &engine, &pulling, None, &both, None),
+            crate::catchup::Decision::Kept
+        );
     }
 }

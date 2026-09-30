@@ -18,6 +18,7 @@
 
 #![allow(dead_code)]
 
+pub mod catchup;
 pub mod confirm;
 pub mod discovery;
 pub mod facts;
@@ -31,17 +32,17 @@ pub mod transport;
 pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };
-pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
+pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_another_member};
 pub use facts::{
-    Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState, TtlHeld, Yielding,
-    facts_undecodable_total,
+    CatchUpReason, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState, TtlHeld,
+    Yielding, facts_undecodable_total,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
 pub use peers::{
     ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,
     Histogram, LagVectors, MAX_PULLS_PER_CONTACT, PULL_BUCKETS_US, PullReport, ReplicationConfig,
-    RoundHook, RoundReport, replicate,
+    RoundHook, RoundReport, SELF_RECHECK, replicate,
 };
 pub use transport::{
     AcceptErrorHook, AcceptListener, FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook,

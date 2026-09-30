@@ -1063,7 +1063,7 @@ pub async fn run(
     client: reqwest::Client,
 ) {
     info!("webhook dispatcher started");
-    let owners = crate::ownership::Owners::over(me, members);
+    let owners = crate::ownership::Owners::over(me, members).gated_by(state.catch_up().cloned());
     let mut backoff = Backoff::default();
     loop {
         // Asked every tick rather than once: the whole point is that ownership
