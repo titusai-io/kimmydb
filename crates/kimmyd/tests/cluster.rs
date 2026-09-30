@@ -1339,6 +1339,13 @@ async fn one_expired_document_produces_one_delete_cluster_wide() {
     })
     .await;
 
+    // Tokens for all three first: the window below is only a few seconds, and
+    // a login is not what it should be spent on.
+    let mut tokens = Vec::new();
+    for node in [&a, &b, &c] {
+        tokens.push(node.login(&client).await);
+    }
+
     // Due about four seconds from now (`seen` plus the index's one second), so
     // it can replicate to every member first and each has the chance to
     // expire it.
@@ -1356,10 +1363,6 @@ async fn one_expired_document_produces_one_delete_cluster_wide() {
     assert!(inserted.status().is_success(), "inserting the document: {}", inserted.status());
 
     // Readable on every member while it is still live.
-    let mut tokens = Vec::new();
-    for node in [&a, &b, &c] {
-        tokens.push(node.login(&client).await);
-    }
     for (node, token) in [&a, &b, &c].into_iter().zip(&tokens) {
         loop {
             let res = client
@@ -1385,8 +1388,7 @@ async fn one_expired_document_produces_one_delete_cluster_wide() {
     );
 
     // Gone everywhere: the owner deletes, and the delete replicates.
-    for node in [&a, &b, &c] {
-        let token = node.login(&client).await;
+    for (node, token) in [&a, &b, &c].into_iter().zip(&tokens) {
         eventually("the expired document to disappear from every node", || {
             let client = client.clone();
             let url = node.url("/v1/db/shop/coll/sessions/docs/1");
