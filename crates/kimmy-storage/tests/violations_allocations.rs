@@ -10,6 +10,19 @@
 //! control**, forced by a test switch on the same store: it must grow with the
 //! oplog, or the measurement could not tell the two routes apart.
 //!
+//! **Stamped from a pinned clock**, because what a cold call reads depends on
+//! where the store's pages are, and with stamps from the wall clock that
+//! depended on the time. redb shortens each branch key to the bytes that tell
+//! its two children apart, so a branch page's fill, and with it where the page
+//! splits and which pages the store has and where, moved with when the fixture
+//! was built; the reopen then leaves in the small cache whatever its own reads
+//! left there. The table's first call read a different handful of pages from
+//! run to run, and under host load up to 100 KiB more than usual, which failed
+//! the flat bound though nothing in the route had changed. A witnessed stamp
+//! far past the wall clock makes each local stamp the successor of the one
+//! before, and the remote entries come from fixed origins, so every run builds
+//! the same store and measures the same bytes.
+//!
 //! Its own binary, with a counting `#[global_allocator]`, for the reason
 //! `count_allocations.rs` gives.
 
@@ -54,10 +67,16 @@ fn allocated_by<T>(f: impl FnOnce() -> T) -> (usize, T) {
     (ALLOCATED.load(Ordering::Relaxed) - before, out)
 }
 
+/// Where the fixture's clock is pinned before its first write: far past any
+/// wall clock it runs under, so each local stamp is the successor of the one
+/// before, whenever and however slowly the store is built.
+const PINNED: Hlc = Hlc::new(1 << 44, 0);
+
 /// A store at `path` whose oplog holds `documents` large entries, with
 /// `violations` unique violations spread evenly among them, closed.
 fn build(path: &std::path::Path, documents: usize, violations: usize) {
     let engine = Engine::open(path).unwrap();
+    engine.witness_processed(&Stamp::new(PINNED, NodeId::from_bytes([0xFF; 16]))).unwrap();
     engine.create_collection("app", "docs").unwrap();
     let field = IndexField { path: "email".into(), descending: false };
     engine.create_index("app", "docs", vec![field], true, None).unwrap();
@@ -78,7 +97,10 @@ fn build(path: &std::path::Path, documents: usize, violations: usize) {
                 .insert(&coll, doc! { "_id": format!("c{made}"), "email": format!("c{made}@x") })
                 .unwrap();
             let entry = OplogEntry {
-                stamp: Stamp::new(Hlc::new(9_000 + made as u64, 0), NodeId::generate()),
+                stamp: Stamp::new(
+                    Hlc::new(9_000 + made as u64, 0),
+                    NodeId::from_bytes([made as u8 + 1; 16]),
+                ),
                 kind: OpKind::Insert,
                 collection: coll.id,
                 doc_id: Some(DocId::String(format!("r{made}"))),
