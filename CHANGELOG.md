@@ -66,8 +66,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   nobody else can hold its data. `kimmy_catching_up{reason}` is one-hot over `none`,
   `seeded_empty`, `restored`, `snapshot` and `unknown`
   ([docs/operations.md](docs/operations.md#a-member-that-is-catching-up)). The marker is a
-  file an older build ignores, so a rollback is safe; a member restored from a backup is not
-  marked by this change, which is the behaviour before it.
+  file an older build ignores, so a rollback is safe. `kimmyd restore` marks the restored node
+  (`restored`), a peer that can only serve a member with a whole-database snapshot marks it
+  (`snapshot`), and every clustered start replays the member's own origin against each peer it
+  reaches: writes it made and no longer holds (a volume restored from a backup, a crash under
+  `coalesced` durability after a peer had pulled an unflushed commit) are found, the member is
+  marked `restored`, reads them back, and moves its clock past them. The floor the replay asks
+  from is kept in `kimmy.replay-floor` (never older than the oplog retention) until every live member and every peer reached has answered, so a start that
+  wrote before it reached a peer does not lose the tail. A node with no peers discards the mark at
+  its start.
 
 ### Changed
 

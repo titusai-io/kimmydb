@@ -1161,6 +1161,153 @@ where
     .ok_or_else(|| ProtocolError::TimedOut("sync round".into()))?
 }
 
+/// Ask `peer` what it holds of this member's own origin above the replay floor
+/// (the lowest position any start since the last complete replay saw at open), and
+/// read it (ADR-202).
+///
+/// **Why it is needed.** A member that lost writes it made (a volume restored
+/// from a backup, a crash under `coalesced` durability that a peer had already
+/// pulled from) writes again at start (the root user, its topology record), at
+/// a stamp above the lost ones. A version vector keeps only the highest stamp per
+/// origin, so this member's vector then says it holds everything of its own
+/// origin the peer has, and no ordinary pull serves the lost entries again.
+///
+/// **What it proves.** An entry of this member's origin above the position at
+/// open that its own oplog does not hold is a write this member made and no
+/// longer holds. That is exact: this run's own writes are in the oplog before
+/// any peer can be served them, so a plain restart finds nothing. Any such
+/// entry marks the member `restored` before it is applied. Every stamp read,
+/// whether or not it is lost, moves the local clock past itself, so a write made
+/// from here on is stamped above it even if the wall clock is behind.
+///
+/// **Bounded and resumable.** It goes on page by page until the peer's answer is
+/// exhausted or the round's page budget is spent, remembering how far it got.
+/// A peer's `BeyondHorizon` answer is **not** an answer: the peer cannot tell
+/// what it holds of this origin from where the replay asks, and no snapshot
+/// follows for that reason. The replay stays owed by that peer, is reported once,
+/// and asks again next round from a position that has moved on with the peers'
+/// retention.
+async fn replay_own_origin<S>(
+    engine: &Engine,
+    stream: &mut S,
+    peer: SocketAddr,
+    their_node: kimmy_core::NodeId,
+    theirs: &VersionVector,
+    catch_up: &crate::catchup::CatchUp,
+    deadline: Instant,
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let me = engine.node_id();
+    let mut from = catch_up.replay_from(their_node);
+    // The peer's highest stamp of this origin is at or below where the replay
+    // starts: it holds nothing of ours that this store lacks.
+    if theirs.get(me) <= from {
+        catch_up.replay_finished(their_node);
+        return Ok(());
+    }
+    let mut limit = MAX_BATCH;
+    loop {
+        // Everything of every other origin is "held", so the peer's walk passes
+        // over it and serves only this origin's entries above `from`.
+        let mut held = theirs.clone();
+        held.insert(me, from);
+        write_frame(
+            stream,
+            &Message::AskEntries {
+                from,
+                limit,
+                held: Some(held),
+                marked: Vec::new(),
+                partial: false,
+            },
+        )
+        .await?;
+        let entries = match read_frame(stream).await? {
+            Message::Entries { entries, exhausted, .. } => (entries, exhausted),
+            Message::BatchTooLarge { fits } if fits > 0 && fits < limit => {
+                limit = fits;
+                continue;
+            }
+            Message::BeyondHorizon {} => {
+                match catch_up.replay_beyond_horizon(their_node, std::time::Instant::now()) {
+                    crate::catchup::Horizon::First => warn!(
+                        %peer,
+                        "the peer has collected the oplog this member's replay asks from, so it \
+                         cannot say what it holds of this member's own origin; the replay stays \
+                         owed and asks again next round"
+                    ),
+                    crate::catchup::Horizon::Again => {}
+                    crate::catchup::Horizon::GaveUp => warn!(
+                        %peer,
+                        "the peer has answered this member's replay with a horizon for the whole \
+                         catch-up wait; the replay stops asking it (the members may keep the oplog \
+                         for different times: storage.oplog_retention_secs should be the same on \
+                         every member)"
+                    ),
+                }
+                return Ok(());
+            }
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!(
+                    "expected Entries for a replay of this member's origin, got {other:?}"
+                )));
+            }
+        };
+        let (entries, exhausted) = entries;
+        let own: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
+            .collect();
+        for entry in &own {
+            engine.advance_clock_past(&entry.stamp);
+        }
+        let lost: Vec<_> = kimmy_storage::blocking(|| {
+            own.iter()
+                .map(|entry| engine.has_oplog_entry(&entry.stamp).map(|held| (entry, held)))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| ProtocolError::Local(e.to_string()))?
+        .into_iter()
+        .filter(|(_, held)| !held)
+        .map(|(entry, _)| entry.clone())
+        .collect();
+        if !lost.is_empty() {
+            warn!(
+                %peer,
+                entries = lost.len(),
+                "the peer holds writes this member made and no longer holds; it is marked \
+                 restored until it has caught up, and reads them back"
+            );
+            catch_up.mark(crate::facts::CatchUpReason::Restored).map_err(|e| {
+                ProtocolError::Local(format!("writing the catching-up marker: {e}"))
+            })?;
+            let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
+                .map_err(|e| ProtocolError::Local(e.to_string()))?;
+            if outcome.unknown.is_some() || outcome.purge_pending > 0 {
+                // A collection these entries name is not here yet: the ordinary
+                // machinery brings it, and the replay goes on from where it was.
+                return Ok(());
+            }
+        }
+        let Some(last) = own.last().map(|entry| entry.stamp.hlc) else {
+            catch_up.replay_finished(their_node);
+            return Ok(());
+        };
+        catch_up.replay_advanced(their_node, last);
+        if exhausted {
+            catch_up.replay_finished(their_node);
+            return Ok(());
+        }
+        from = last;
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+    }
+}
+
 /// One round with `their_node` over `stream`, unbounded: [`sync_over`] puts
 /// the peer's deadline around it (ADR-177), hands it `snapshot_deadline`, the
 /// wall-time instant past which a snapshot pull asks for no more pages this
@@ -1218,6 +1365,20 @@ where
         witnessed: their_witnessed.clone(),
         facts: their_facts,
     });
+
+    // This run's replay of its own origin (ADR-202), once against each distinct
+    // peer, the first time it is reached: what that peer holds of this member's
+    // origin above the persisted floor, which no ordinary pull would serve,
+    // because the vector this member holds has moved past it (this run's own
+    // writes, or the start before it). A peer that is behind on this origin
+    // settles nothing for the peer that is not.
+    if let Some(catch_up) = stalls.catch_up.clone()
+        && catch_up.replay_armed()
+        && !catch_up.replay_answered(their_node)
+    {
+        replay_own_origin(engine, stream, peer, their_node, &theirs, &catch_up, snapshot_deadline)
+            .await?;
+    }
 
     // What we have *seen*, not what we could serve. Asking against the
     // servable vector re-requests everything a node processed without
@@ -1666,6 +1827,16 @@ where
             if repair.is_none() && !stalls.snapshot_resumes(their_node, None) {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
             }
+            // A whole-database snapshot is about to replace what this member
+            // holds, and until it has arrived the member is stale: it says so
+            // (ADR-202). Only a scope of `None` marks: a repair's snapshot of one
+            // collection is the ordinary machinery on a member that is current.
+            if scope.is_none()
+                && let Some(catch_up) = &stalls.catch_up
+                && let Err(e) = catch_up.mark(crate::facts::CatchUpReason::Snapshot)
+            {
+                warn!(error = %e, "could not write the catching-up marker for a snapshot");
+            }
             let pulled = pull_snapshot(
                 engine,
                 stream,
@@ -1964,6 +2135,10 @@ pub struct PeerStalls {
     /// What each contact's vector read showed, until the loop takes it: kept
     /// only for a round that then succeeded (ADR-202).
     reached_candidates: Vec<crate::catchup::Reached>,
+    /// The catching-up marker (ADR-202): set when a peer answers a pull with
+    /// `BeyondHorizon` and this node takes a whole-database snapshot, and the
+    /// owner of the replay of this node's own origin.
+    catch_up: Option<Arc<crate::catchup::CatchUp>>,
     /// Where this node stood behind each peer when its probe count was read,
     /// on the origins it then trailed that peer on (ADR-168) — the mirror of
     /// `by_peer`, so a member that is itself draining a backlog is not read
@@ -2248,6 +2423,11 @@ impl PeerStalls {
     /// Send `facts` with every request from now on.
     pub fn set_local_facts(&mut self, facts: Option<Arc<crate::facts::Facts>>) {
         self.local_facts = facts;
+    }
+
+    /// Hand the rounds the catching-up marker.
+    pub fn set_catch_up(&mut self, catch_up: Option<Arc<crate::catchup::CatchUp>>) {
+        self.catch_up = catch_up;
     }
 
     /// What the contacts since the last call read, for the catching-up marker.
@@ -6871,6 +7051,167 @@ mod tests {
         stalls.snapshots.insert(peer, progress);
         assert!(!stalls.snapshot_pending(None), "complete");
     }
+
+    /// A replay the round cannot finish (its budget is spent after one window)
+    /// goes on from where it got, and is finished by the next: the cursor is what
+    /// keeps a tail longer than a round from being fetched from its start again.
+    #[tokio::test]
+    async fn a_replay_the_round_cannot_finish_goes_on_from_where_it_got() {
+        const SECRET: &str = "a-replay-test-secret";
+        const BINDING: &[u8] = b"a-replay-test-binding";
+        let lost = MAX_BATCH as i64 * 2 + 50;
+
+        // The writer, whose backup lacks the tail; a peer that holds all of it.
+        let writer_dir = tempfile::tempdir().unwrap();
+        let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
+        let orders = writer.create_collection("shop", "orders").unwrap();
+        writer.insert_many(&orders, (0..2).map(|i| bson::doc! { "_id": i }).collect()).unwrap();
+        let mut backup = Vec::new();
+        writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+        writer
+            .insert_many(&orders, (2..2 + lost).map(|i| bson::doc! { "_id": i }).collect())
+            .unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = Engine::open(&peer_dir.path().join("kimmy.redb")).unwrap();
+        let mut from = Hlc::ZERO;
+        loop {
+            let window = writer
+                .entries_for_peer(from, MAX_BATCH, kimmy_storage::WalkScope::Background)
+                .unwrap();
+            peer.apply_batch(&window.entries).unwrap();
+            if window.exhausted {
+                break;
+            }
+            from = window.entries.last().unwrap().stamp.hlc;
+        }
+
+        // The member: the backup restored, with a write of its own at start.
+        let member_dir = tempfile::tempdir().unwrap();
+        let path = member_dir.path().join("kimmy.redb");
+        kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+        let member = Engine::open(&path).unwrap();
+        assert_eq!(member.node_id(), writer.node_id());
+        member.create_collection("shop", "startup").unwrap();
+        let held = member.get_collection("shop", "orders").unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(member.own_position_at_open(), None).unwrap();
+        let theirs = peer.version_vector().unwrap();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let round = |deadline: Instant| {
+            let (member, peer, catch_up, theirs) = (&member, &peer, &catch_up, &theirs);
+            async move {
+                let (mut ours, served) = tokio::io::duplex(MAX_FRAME);
+                let serving =
+                    serve_peer(peer, served, SECRET, BINDING, None, ServeBudgets::serving(), None);
+                let asking = async {
+                    open_handshake(member, &mut ours, SECRET, BINDING).await.unwrap();
+                    let done = replay_own_origin(
+                        member,
+                        &mut ours,
+                        addr,
+                        peer.node_id(),
+                        theirs,
+                        catch_up,
+                        deadline,
+                    )
+                    .await;
+                    drop(ours);
+                    done
+                };
+                let (_, done) = tokio::join!(serving, asking);
+                done.unwrap();
+            }
+        };
+
+        // One window, then the budget is spent: the cursor has moved, and the
+        // replay is still owed.
+        round(spent()).await;
+        assert!(!catch_up.replay_answered(peer.node_id()), "one window is not the tail");
+        let at_open = member.own_position_at_open();
+        assert!(catch_up.replay_from(peer.node_id()) > at_open, "the cursor moved");
+        let first = member.count(&held, kimmy_storage::WalkScope::Request).unwrap();
+        assert!(first > 2 && first < 2 + lost as u64, "part of the tail is back: {first}");
+
+        // The next round finishes it.
+        round(ample()).await;
+        assert!(catch_up.replay_answered(peer.node_id()));
+        assert_eq!(
+            member.count(&held, kimmy_storage::WalkScope::Request).unwrap(),
+            2 + lost as u64
+        );
+        assert_eq!(catch_up.reason(), Some(crate::CatchUpReason::Restored));
+    }
+
+    /// The replay moves the clock past every stamp it reads, whether or not the
+    /// entry can be applied yet: a lost write in a collection this member does not
+    /// have stops the apply, and the write this member makes before the ordinary
+    /// pull brings the collection must still be stamped above it.
+    #[tokio::test]
+    async fn the_replay_moves_the_clock_past_an_entry_it_could_not_apply() {
+        const SECRET: &str = "a-replay-clock-secret";
+        const BINDING: &[u8] = b"a-replay-clock-binding";
+        let writer_dir = tempfile::tempdir().unwrap();
+        let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
+        writer.create_collection("shop", "orders").unwrap();
+        let mut backup = Vec::new();
+        writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+
+        // The peer holds a write stamped an hour ahead with this member's origin, in
+        // a collection this member has never heard of.
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = Engine::open(&peer_dir.path().join("kimmy.redb")).unwrap();
+        let elsewhere = peer.create_collection("shop", "peer_only").unwrap();
+        let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+        let lost = kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(ahead, 0), writer.node_id()),
+            kind: kimmy_core::OpKind::Insert,
+            collection: elsewhere.id,
+            doc_id: Some(kimmy_core::DocId::String("lost".into())),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": "lost" }).unwrap()),
+        };
+        peer.apply_batch(std::slice::from_ref(&lost)).unwrap();
+
+        let member_dir = tempfile::tempdir().unwrap();
+        let path = member_dir.path().join("kimmy.redb");
+        kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+        let member = Engine::open(&path).unwrap();
+        let orders = member.get_collection("shop", "orders").unwrap();
+        member.create_collection("shop", "startup").unwrap();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(member.own_position_at_open(), None).unwrap();
+        let theirs = peer.version_vector().unwrap();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let (mut ours, served) = tokio::io::duplex(MAX_FRAME);
+        let serving =
+            serve_peer(&peer, served, SECRET, BINDING, None, ServeBudgets::serving(), None);
+        let asking = async {
+            open_handshake(&member, &mut ours, SECRET, BINDING).await.unwrap();
+            let done = replay_own_origin(
+                &member,
+                &mut ours,
+                addr,
+                peer.node_id(),
+                &theirs,
+                &catch_up,
+                ample(),
+            )
+            .await;
+            drop(ours);
+            done
+        };
+        let (_, done) = tokio::join!(serving, asking);
+        done.unwrap();
+        assert_eq!(catch_up.reason(), Some(crate::CatchUpReason::Restored));
+        assert!(member.get_collection("shop", "peer_only").is_err(), "premise: not applied");
+
+        member.insert(&orders, bson::doc! { "_id": "after" }).unwrap();
+        let mine = member.version_vector().unwrap().get(member.node_id());
+        assert!(mine > lost.stamp.hlc, "stamped above the lost write: {mine:?}");
+    }
 }
 
 /// **A partial window never skips an entry** (ADR-194; the design note's
@@ -7143,6 +7484,55 @@ mod partial_windows_never_skip {
         };
         let (_, (), outcome) = tokio::join!(serving, relaying, pulling);
         (outcome, asked.get())
+    }
+
+    /// The replay of this member's own origin is asked of a peer once per run: a
+    /// later round against a peer that has answered it asks nothing, though the
+    /// peer has since learned more of this member's origin (its later writes), and
+    /// a peer that has not answered it is asked again.
+    #[tokio::test]
+    async fn a_peer_is_asked_the_replay_once_per_run() {
+        let member_dir = tempfile::tempdir().unwrap();
+        let member = Engine::open(&member_dir.path().join("kimmy.redb")).unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer = Engine::open(&peer_dir.path().join("kimmy.redb")).unwrap();
+        let orders = member.create_collection("shop", "orders").unwrap();
+        let docs = |from: i64, to: i64| (from..to).map(|i| bson::doc! { "_id": i }).collect();
+        member.insert_many(&orders, docs(0, 3)).unwrap();
+        let (caught, _) = pull(&peer, &member, &mut PeerStalls::new(), UNBUDGETED, || {}).await;
+        caught.unwrap();
+        assert_eq!(peer.version_vector().unwrap(), member.version_vector().unwrap());
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        catch_up.arm_replay(Hlc::ZERO, None).unwrap();
+        let mut stalls = PeerStalls::new();
+        stalls.set_catch_up(Some(Arc::clone(&catch_up)));
+
+        let (first, asked) = pull(&member, &peer, &mut stalls, UNBUDGETED, || {}).await;
+        first.unwrap();
+        assert!(asked.is_some(), "the first round asks the peer for the replay");
+        assert!(catch_up.replay_answered(peer.node_id()));
+
+        // The member writes on and the peer learns of it: its vector for this
+        // origin is past where the replay read to, and a round still asks nothing.
+        member.insert_many(&orders, docs(3, 5)).unwrap();
+        pull(&peer, &member, &mut PeerStalls::new(), UNBUDGETED, || {}).await.0.unwrap();
+        for round in 0..2 {
+            let (later, asked) = pull(&member, &peer, &mut stalls, UNBUDGETED, || {}).await;
+            later.unwrap();
+            assert_eq!(asked, None, "round {round}: a peer that has answered is not asked again");
+        }
+
+        // A peer that has not answered is asked: a fresh run, the same peer.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let fresh = crate::catchup::CatchUp::open(fresh_dir.path(), Duration::from_secs(120));
+        fresh.arm_replay(Hlc::ZERO, None).unwrap();
+        let mut again = PeerStalls::new();
+        again.set_catch_up(Some(fresh));
+        let (round, asked) = pull(&member, &peer, &mut again, UNBUDGETED, || {}).await;
+        round.unwrap();
+        assert!(asked.is_some(), "a peer that has not answered this run is asked");
     }
 
     /// Where the next request would ask the scan to start, against `theirs`:

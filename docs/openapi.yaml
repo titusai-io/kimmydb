@@ -3043,7 +3043,7 @@ components:
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
-        | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
+        | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
         - payload_too_large

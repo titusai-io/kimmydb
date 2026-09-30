@@ -46,6 +46,10 @@ pub struct Engine {
     /// records it (ADR-188).
     health: std::sync::Arc<crate::health::StorageHealth>,
     node_id: NodeId,
+    /// The highest stamp of this node's own origin in the oplog when the store
+    /// was opened, before this run wrote anything (ADR-202): the position a
+    /// replay of this node's own origin asks a peer from.
+    own_position_at_open: Hlc,
     /// Guards the HLC. Every write takes this briefly to mint a stamp, so it
     /// must never be held across a redb commit.
     clock: Mutex<HlcClock>,
@@ -1291,10 +1295,13 @@ impl Engine {
 
         info!(node = %node_id, path = %path.display(), "storage engine open");
 
+        // Read before anything of this run can write under this origin.
+        let own_position_at_open = Self::read_versions(&db, tables::OPLOG_VERSIONS)?.get(node_id);
         let engine = Self {
             db,
             health,
             node_id,
+            own_position_at_open,
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
             vector_generations: Mutex::new(Default::default()),
@@ -3206,6 +3213,32 @@ impl Engine {
             Some((key, _)) => Ok(codec::decode_oplog_key(key.value())?.hlc),
             None => Ok(Hlc::ZERO),
         }
+    }
+
+    /// The highest stamp of this node's own origin the oplog held when the store
+    /// was opened, before this run's first write: `Hlc::ZERO` for a store that
+    /// had none. What a replay of this node's own origin asks a peer from
+    /// (ADR-202).
+    pub fn own_position_at_open(&self) -> Hlc {
+        self.own_position_at_open
+    }
+
+    /// Whether the oplog holds the entry with this stamp, whatever it says.
+    pub fn has_oplog_entry(&self, stamp: &Stamp) -> Result<bool> {
+        let key = crate::codec::oplog_key(stamp);
+        let txn = self.db().begin_read()?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        Ok(oplog.get(key.as_slice())?.is_some())
+    }
+
+    /// Move the local clock past `stamp`, so that a write made from here on is
+    /// stamped above it whatever the wall clock says. What a replay of this
+    /// node's own origin does with every stamp it reads (ADR-202): after a
+    /// rollback the wall clock can sit behind the writes that were lost, and a
+    /// new write stamped below one of them would lose to it under
+    /// last-writer-wins.
+    pub fn advance_clock_past(&self, stamp: &Stamp) {
+        self.witness(stamp);
     }
 
     /// Mint the next stamp for a local write.

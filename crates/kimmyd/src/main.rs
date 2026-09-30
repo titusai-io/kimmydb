@@ -148,6 +148,32 @@ fn main() -> Result<()> {
                 );
             }
 
+            // A restored store is behind whatever its cluster has written since
+            // the backup, and writes this node made after it are gone: it is
+            // marked until it has caught up (ADR-202). A start with no peers to
+            // catch up from discards the file.
+            kimmy_cluster::catchup::write_marker(
+                &config.storage.data_dir,
+                kimmy_cluster::CatchUpReason::Restored,
+            )
+            .context("writing the catching-up marker")?;
+            // Where the first start's replay of the node's own origin begins: the
+            // position the backup holds, so what the node made after it is read back
+            // from its peers even if a start before it reaches one writes first.
+            let position = {
+                let engine = kimmy_storage::Engine::open(&target).with_context(|| {
+                    format!("opening {} to read its position", target.display())
+                })?;
+                engine.own_position_at_open()
+            };
+            kimmy_cluster::catchup::write_replay_floor(&config.storage.data_dir, position)
+                .context("writing the replay floor")?;
+            eprintln!(
+                "note: this node is marked as catching up (kimmy.catching-up in the data \
+                 directory): with peers it refuses requests until it holds what they hold, and \
+                 a node with none discards the mark at its start."
+            );
+
             // A restored directory has a database and no run behind it. The
             // marker says so, or the first start would warn about a run that
             // did not shut down cleanly when there was no run at all.

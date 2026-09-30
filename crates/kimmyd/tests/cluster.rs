@@ -3720,6 +3720,101 @@ async fn without_expected_members_two_fresh_members_clear_against_each_other() {
     }
 }
 
+/// A member restored from a backup that lacks writes it made afterwards: it is
+/// marked `restored` by the restore, its first contact with a peer reads back the
+/// writes it made and no longer holds (the peers hold them and no ordinary pull
+/// would serve them), and it clears once it holds what its peers hold. The whole
+/// path through real processes: the backup, the stop, the restore command, the
+/// start, and the replay.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it() {
+    let client = reqwest::Client::new();
+    let (mut a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    let insert = |id: i64| {
+        let (client, url, token) =
+            (client.clone(), a.url("/v1/db/shop/coll/orders/docs"), token.clone());
+        async move {
+            let res = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "_id": id }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+    };
+    for id in 1..=3 {
+        insert(id).await;
+    }
+
+    // The backup, then writes it will not have.
+    let backup = client.get(a.url("/v1/admin/backup")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(backup.status(), 200);
+    let backup_path = a.dir.path().join("backup.bin");
+    std::fs::write(&backup_path, backup.bytes().await.unwrap()).unwrap();
+    for id in 4..=8 {
+        insert(id).await;
+    }
+    // Held by a peer before the member is lost.
+    for node in [&b, &c] {
+        let token = node.login(&client).await;
+        eventually("a peer to hold the later writes", || {
+            let (client, url, token) =
+                (client.clone(), node.url("/v1/db/shop/coll/orders/docs/8"), token.clone());
+            async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 200 }
+        })
+        .await;
+    }
+
+    // The member is stopped, its data replaced by the restore, and started again.
+    a.signal("TERM");
+    a.wait_exit(Duration::from_secs(60));
+    std::fs::remove_dir_all(a.dir.path().join("data")).unwrap();
+    let restored = Command::new(env!("CARGO_BIN_EXE_kimmyd"))
+        .arg("--config")
+        .arg(a.dir.path().join("kimmy.toml"))
+        .arg("restore")
+        .arg("--from")
+        .arg(&backup_path)
+        .env("KIMMY_ROOT_PASSWORD", ROOT_PASSWORD)
+        .output()
+        .expect("running kimmyd restore");
+    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+    a.restart_with(&[]);
+    a.wait_ready(&client).await;
+
+    // It reads back what it made and lost, and says so.
+    let token = a.login(&client).await;
+    for id in 1..=8 {
+        eventually("the restored member to hold every write", || {
+            let (client, url, token) = (
+                client.clone(),
+                a.url(&format!("/v1/db/shop/coll/orders/docs/{id}")),
+                token.clone(),
+            );
+            async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 200 }
+        })
+        .await;
+    }
+    eventually("the marker to clear", || a.cleared(&client)).await;
+    assert!(
+        a.log().contains("the peer holds writes this member made and no longer holds"),
+        "the replay says what it found: {}",
+        a.log()
+    );
+}
+
 /// Pulls the integer value out of a `key=123` field in a log line, such as
 /// `pulls=12` in a "merged from peer" line.
 fn parse_field(line: &str, key: &str) -> Option<usize> {
