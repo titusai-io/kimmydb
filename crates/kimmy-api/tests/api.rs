@@ -5429,6 +5429,54 @@ async fn client_supplied_vectors_become_searchable() {
     assert_eq!(found.body["matches"][0]["text"], "alpha");
 }
 
+/// ADR-203: vectors a client stores into a `byo` collection carry the
+/// configuration's fingerprint, so after a switch to a server-side provider any
+/// member reads them as made under another configuration; into a collection the
+/// server embeds they carry none, and are judged by their version as before.
+#[tokio::test]
+async fn client_supplied_vectors_carry_the_byo_configuration_and_no_other() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server
+        .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a", "text": "alpha" }))
+        .await;
+    let put = || async {
+        let res = server
+            .put(
+                "/v1/db/shop/coll/docs/docs/a/vectors",
+                Some(&token),
+                json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "alpha" }]),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    };
+    let engine = &server.state.engine;
+    let stored = || {
+        let shadow = engine.vector_collection("shop", "docs").unwrap().unwrap();
+        let records = engine.get_vectors(&shadow, &kimmy_core::DocId::String("a".into())).unwrap();
+        let config = engine.get_collection("shop", "docs").unwrap().vector.unwrap();
+        (records[0].config, config.fingerprint())
+    };
+
+    put().await;
+    let (made_under, byo) = stored();
+    assert_eq!(made_under, Some(byo), "the byo configuration's fingerprint");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 3, "provider": { "kind": "open_ai", "model": "m" } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let (made_under, served) = stored();
+    assert_ne!(served, byo);
+    assert_eq!(made_under, Some(byo), "stale under the new configuration");
+    put().await;
+    assert_eq!(stored().0, None, "none into a collection the server embeds");
+}
+
 #[tokio::test]
 async fn storing_vectors_replaces_the_whole_set() {
     // Replace-all, so a document that shrinks to fewer chunks cannot leave
@@ -10931,6 +10979,7 @@ fn fill_and_build(
             source_hlc: kimmy_core::Hlc::new(1, 0),
             vector: vec![chunk as f32, 1.0, 0.0],
             text: "t".into(),
+            config: None,
         })
         .collect();
     engine.put_vectors(shadow, &source, &records).unwrap();
@@ -11006,6 +11055,7 @@ async fn dropping_a_database_takes_an_orphan_shadow_and_its_vector_index_with_it
             source_hlc: kimmy_core::Hlc::new(1, 0),
             vector: vec![chunk as f32, 0.0, 1.0],
             text: "t".into(),
+            config: None,
         })
         .collect();
     engine.put_vectors(&orphan, &source, &records).unwrap();

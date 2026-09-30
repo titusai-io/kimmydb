@@ -286,7 +286,12 @@ The server fills in the rest of each record: which document it belongs to, and
 the document's current HLC. That second part is why staleness detection keeps
 working for `byo` exactly as it does for a server-side provider — the version a
 chunk was derived from is the document's own, not something a client could get
-wrong.
+wrong. It also stamps each record with the `byo` configuration's fingerprint, so
+if the collection later switches to a server-side provider, every member reads
+the client's vectors as made under another configuration and the new provider
+replaces them ([ADR-203](decisions.md)). Vectors stored this way into a
+collection the server embeds carry no fingerprint, and stay until the document
+changes or its configuration does.
 
 | | |
 |---|---|
@@ -303,15 +308,17 @@ match the configured `dim` or the request is `400`.
 
 ## Staleness, and why re-embedding is idempotent
 
-Each `VectorRecord` carries the **HLC of the source document** it was made from:
+Each `VectorRecord` carries the **HLC of the source document** it was made from,
+and the **fingerprint of the configuration** it was made under:
 
 ```rust
 struct VectorRecord {
-    source: DocId,     // the source document
-    chunk: u32,        // which chunk
-    source_hlc: Hlc,   // the version this was embedded from
+    source: DocId,       // the source document
+    chunk: u32,          // which chunk
+    source_hlc: Hlc,     // the version this was embedded from
     vector: Vec<f32>,
     text: String,
+    config: Option<u64>, // the configuration this was embedded under (0.43.0)
 }
 ```
 
@@ -323,6 +330,17 @@ That one field does the work of a queue:
 - **Re-processing is free.** Replay the same oplog entry twice and the second
   pass sees vectors already at that HLC and does nothing. That is what makes the
   worker safe to restart, and safe to run behind an at-least-once log.
+- **A configuration change is visible on every member.** The document's HLC
+  cannot see one, since configurations do not touch documents, so a record
+  also says which configuration made it: a fingerprint of the whole
+  configuration (provider and model, `dim`, `fields`, chunking, prefixes,
+  metric). A record whose fingerprint is not the collection's current one is
+  stale wherever it is read, so a reindex that stopped part-way is finished by
+  whichever member next scans the collection, and what it had already
+  re-embedded is not sent again ([ADR-203](decisions.md)). A record with no
+  fingerprint, written before 0.43.0 or by an older member, is judged by its
+  HLC alone, except in a configuration change's own backfill, which re-embeds
+  it.
 
 The worker records its oplog position **after** doing the work, never before.
 Crashing mid-embed replays the entry; crashing after writing vectors but before
@@ -361,14 +379,17 @@ owns when its worker starts, since what was deferred before a restart went with
 the process and the recorded position has passed it (in a cluster only: a
 single node never defers). A rescan embeds what each document's own check says
 is stale or missing, so a collection the previous owner kept up costs reads, not
-provider calls. It re-embeds everything only on a member that completed a scan
-under an earlier configuration and has not yet processed the change itself; a
-member that sees a change backfilled by another member forgets which
-configuration it last scanned under. **A known gap:** that check sees a
-document change but not a configuration change, so a reindex the previous owner
-left unfinished, because it stopped or left part-way through, is not finished by
-the member that takes the collection over; the old model's vectors stay until
-each document changes or the configuration is set again. Every
+provider calls. That check sees a configuration change as well as a document
+change, since each record says which configuration made it, so a reindex the
+previous owner left unfinished, because it stopped or left part-way through, is
+finished by the member that takes the collection over, and the documents the
+owner had reached are not sent again ([ADR-203](decisions.md)). Records written
+before 0.43.0 cannot say, and a rescan re-embeds them only on a member that
+completed a scan under an earlier configuration and has not yet processed the
+change itself (a member that sees a change backfilled by another member forgets
+which configuration it last scanned under); otherwise, an unfinished reindex of
+such records is not finished until each document changes or the configuration
+is set again. Every
 member sees every write, but only the owner calls the provider for it; the
 others hold the write against the owner leaving and otherwise let replication
 bring them the vectors. That is what keeps a three-member cluster's provider
@@ -778,6 +799,7 @@ The exact path is the oracle for everything approximate:
 | Dropping the data drops the graph | A collection drop, a database drop and a drop arriving by replication each leave the cache without the graph and the snapshot directory gone; a drop re-delivered after the name was created again leaves the live graph alone |
 | A snapshot cannot outlive the collection it describes | A collection dropped and recreated under the same name derives the same id and the same snapshot path; the graph records the incarnation it was built for and is refused when that does not match, and a sweep — at startup, and whenever the change-feed consumer falls behind — removes snapshots for collections the node no longer holds and any a previous collection of the same name left behind; the startup sweep also removes the staging directories of builds a previous process did not finish |
 | Re-embedding is idempotent | Replaying an oplog entry after vectors exist at that HLC is a no-op |
+| A reindex that stopped part-way is finished elsewhere | An owner stopped after four of ten documents under a new configuration; the member taking over sends exactly the other six, and a restarted owner replaying the change sends the same six; records with no fingerprint are trusted by their HLC |
 | A crash does not lose embeddings | The recorded position always trails completed work |
 | Retry does not stall the queue | Retryable and terminal provider failures are distinguished and tested apart |
 | Batching changes the calls, not the writes | 100 one-chunk documents backfill in at most four provider calls and write 100 documents; a poisoned document in a batch of five is skipped alone while four land; at every observation of a streamed backlog, the recorded position has never passed an entry whose vectors are not on disk |

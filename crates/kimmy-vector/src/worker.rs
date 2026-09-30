@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kimmy_core::{ChunkConfig, Hlc, OpKind, VectorConfig, VectorRecord, path};
+use kimmy_core::{ChunkConfig, Hlc, OpKind, Unstamped, VectorConfig, VectorRecord, path};
 use kimmy_storage::{
     ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope, WriterHolder,
 };
@@ -97,16 +97,23 @@ const OWNERSHIP_TICK: Duration = Duration::from_secs(5);
 /// fingerprint for: it has never completed a scan of it, which is every member
 /// but the one that owned the collection when its configuration was set, since
 /// a non-owner skips that backfill and records nothing.
+///
+/// Since 0.43.0 a record says which configuration made it (ADR-203), and a
+/// record made under another is stale on every scan, forced or not; so what
+/// this decides is only how a record **with no fingerprint** is read: one an
+/// older release or an older member wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unscanned {
-    /// Re-embed every document: a configuration change's own backfill, and the
-    /// recovery for a lost position, which must not trust what is there.
+    /// Read such a record as stale: a configuration change's own backfill, and
+    /// the recovery for a lost position, which must not trust what is there.
     Force,
-    /// Trust each document's staleness: an ownership rescan (ADR-201). The
-    /// previous owner's vectors replicated here and are current, and forcing
-    /// would send the whole collection to the provider on every member that
-    /// gains it. What this cannot see is a reindex the previous owner left
-    /// unfinished, since a record does not say which configuration made it.
+    /// Trust such a record's version: an ownership rescan (ADR-201). The
+    /// previous owner's vectors replicated here and are almost always current,
+    /// and forcing would send every document older releases embedded to the
+    /// provider on every member that gains the collection. A reindex the
+    /// previous owner left unfinished is still completed, since what it had
+    /// not reached carries the old configuration's fingerprint, unless those
+    /// records were written before 0.43.0.
     Check,
 }
 
@@ -1015,15 +1022,17 @@ impl EmbeddingWorker {
     /// collection whose ownership moved between members (a peer left, one began
     /// catching up, one's worker was switched off) would otherwise lose the
     /// documents the previous owner had deferred, silently. A rescan finds what
-    /// is stale or missing and embeds only that ([`Unscanned::Check`]): it
-    /// forces every document only when this member recorded a completed scan
-    /// under a configuration that has since changed and its own stream has not
-    /// yet passed the change (a member that skips a change's backfill forgets
-    /// what it recorded). So a collection the previous owner had kept up costs
-    /// reads, not provider calls, on every member but the one that owned it
-    /// when its current configuration was set. The price is the one gap
-    /// [`Unscanned::Check`] names: a reindex the previous owner left unfinished
-    /// is not seen.
+    /// is stale or missing and embeds only that ([`Unscanned::Check`]): a
+    /// record behind its document, or made under another configuration than
+    /// the collection's (ADR-203), so a reindex the previous owner left
+    /// unfinished is finished here. It forces every record with no
+    /// fingerprint (one written before 0.43.0) only when this member recorded
+    /// a completed scan under a configuration that has since changed and its
+    /// own stream has not yet passed the change (a member that skips a
+    /// change's backfill forgets what it recorded). So a collection the
+    /// previous owner had kept up costs reads, not provider calls. What
+    /// remains of the gap [`Unscanned::Check`] names is an unfinished reindex
+    /// of records written before 0.43.0.
     ///
     /// **A first sight after a start is a gain.** The position a worker resumes
     /// from has passed every document it deferred, and the deferrals went with
@@ -1286,14 +1295,13 @@ impl EmbeddingWorker {
         let Some(shadow) = self.shadow_of(&collection.db, &collection.name, false)? else {
             return Ok(Recheck::Gone);
         };
-        // `force: false` is the whole point: this re-reads the document's
-        // current stamp and does nothing if the previous owner's vectors
-        // arrived before it left.
-        Ok(if self.embed_one(&collection, &shadow, &config, &item.source, false).await? {
-            Recheck::Embedded
-        } else {
-            Recheck::Current
-        })
+        // Trusting a record's version is the whole point: this re-reads the
+        // document's current stamp and does nothing if the previous owner's
+        // vectors arrived before it left.
+        let embedded = self
+            .embed_one(&collection, &shadow, &config, &item.source, Unstamped::ByVersion)
+            .await?;
+        Ok(if embedded { Recheck::Embedded } else { Recheck::Current })
     }
 
     /// Prepare one entry, retrying what is worth retrying and skipping, by
@@ -1445,8 +1453,15 @@ impl EmbeddingWorker {
         };
 
         // The entry carries the version this work is for. Anything newer has
-        // its own entry coming, so redoing older work would be wasted.
-        if !self.engine.vectors_are_stale(&shadow, &source, entry.stamp.hlc)? {
+        // its own entry coming, so redoing older work would be wasted. Vectors
+        // at that version made under another configuration are redone.
+        if !self.engine.vectors_are_stale(
+            &shadow,
+            &source,
+            entry.stamp.hlc,
+            config.fingerprint(),
+            Unstamped::ByVersion,
+        )? {
             return Ok(Prepared::Done(Outcome::Skipped));
         }
 
@@ -1478,10 +1493,13 @@ impl EmbeddingWorker {
     /// The scan walks the **collection**, not the oplog — the oplog may have
     /// collected the entries that created these documents, and the documents
     /// themselves are the durable source. Per document the staleness check
-    /// decides: already-current vectors are skipped, so replaying this entry
-    /// after a crash re-does only what had not landed, and a configuration
-    /// change that alters nothing a document produced (a metric change, say)
-    /// costs a scan and no embedding.
+    /// decides: vectors already made under this configuration, at the
+    /// document's version, are skipped, so replaying this entry after a crash
+    /// re-does only what had not landed (ADR-203). The fingerprint covers the
+    /// whole configuration, so any change, a metric change included, re-embeds
+    /// every document once. A record with no fingerprint cannot say it was
+    /// made under this one, and is re-embedded too, unless this member has
+    /// already completed a scan under it.
     async fn backfill_from_entry(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
         let Some(body) = &entry.body else {
             return Ok(Outcome::Skipped);
@@ -1520,8 +1538,9 @@ impl EmbeddingWorker {
         //
         // The fingerprint is deliberately *not* written here: it attests a
         // completed scan by whoever ran it, and only the owner completes
-        // scans. If ownership moves later, vectors already replicate; a new
-        // owner re-scans only when someone changes the configuration again.
+        // scans. If ownership moves later, vectors already replicate, and
+        // each carries the configuration it was made under, so a new owner's
+        // rescan finishes a re-embed the owner left part-way (ADR-203).
         //
         // **And one recorded earlier is forgotten.** It attests a scan under
         // the configuration this entry replaces, and the owner's re-embed under
@@ -1564,22 +1583,26 @@ impl EmbeddingWorker {
         reason: &'static str,
         unscanned: Unscanned,
     ) -> Result<usize> {
-        // Whether this scan must re-embed regardless of per-document
-        // staleness. The HLC check cannot see a configuration change —
-        // configurations do not touch documents — so the decision comes from
-        // a fingerprint of the configuration the last *completed* scan ran
-        // under. Written only after the scan, so a crash mid-backfill leaves
-        // it stale and the replayed entry redoes the whole scan: some
-        // documents embed twice, which idempotent output makes harmless,
-        // where the alternative — recording first — would leave the rest
-        // embedded under the old model with nothing to notice. With no
-        // fingerprint here, `unscanned` decides: see [`Unscanned`].
-        let fingerprint = config_fingerprint(config);
+        // Whether this scan reads a record with no configuration fingerprint
+        // as stale. A record that carries one is judged by it on every scan
+        // (ADR-203); one written before 0.43.0, or by an older member, cannot
+        // say which configuration made it, and the HLC check cannot see a
+        // configuration change — configurations do not touch documents — so
+        // for such records the decision comes from a fingerprint of the
+        // configuration the last *completed* scan ran under. Written only
+        // after the scan, so a crash mid-backfill leaves it stale and the
+        // replayed entry forces again; what the crashed scan had already
+        // re-embedded carries this configuration's fingerprint and is not
+        // sent twice, where the alternative — recording first — would leave
+        // the rest embedded under the old model with nothing to notice. With
+        // no fingerprint here, `unscanned` decides: see [`Unscanned`].
+        let fingerprint = config.fingerprint();
         let recorded = kimmy_storage::blocking(|| self.engine.vector_fingerprint(collection.id))?;
         let force = match recorded {
             Some(recorded) => recorded != fingerprint,
             None => unscanned == Unscanned::Force,
         };
+        let unstamped = if force { Unstamped::Stale } else { Unstamped::ByVersion };
 
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
@@ -1606,7 +1629,7 @@ impl EmbeddingWorker {
         for source in ids {
             // Three reads per document, off the async worker like the walk.
             let prepared = kimmy_storage::blocking(|| {
-                self.prepare_one(collection, shadow, config, &source, force)
+                self.prepare_one(collection, shadow, config, &source, fingerprint, unstamped)
             });
             let job = match prepared {
                 Ok(Some(job)) => job,
@@ -1648,12 +1671,12 @@ impl EmbeddingWorker {
         if let Some(reason) = self.engine.walk_stop(kimmy_storage::WalkScope::Background) {
             return Err(stopped(reason));
         }
-        // Only a scan that re-embedded everything, or one under the recorded
-        // configuration, attests it: a scan that trusted per-document
-        // staleness with nothing recorded proved nothing about the
-        // configuration, and recording it would stop a later forced scan
-        // when this member is behind a configuration its stream has not yet
-        // reached.
+        // Only a forced scan, which left every record made under this
+        // configuration, or one under the recorded configuration, attests it:
+        // a scan that trusted the version of records with no fingerprint,
+        // with nothing recorded, proved nothing about them, and recording it
+        // would stop a later forced scan when this member is behind a
+        // configuration its stream has not yet reached.
         if force || recorded == Some(fingerprint) {
             self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
         }
@@ -1676,9 +1699,12 @@ impl EmbeddingWorker {
         shadow: &CollectionMeta,
         config: &VectorConfig,
         source: &kimmy_core::DocId,
-        force: bool,
+        unstamped: Unstamped,
     ) -> Result<bool> {
-        let Some(job) = self.prepare_one(collection, shadow, config, source, force)? else {
+        let fingerprint = config.fingerprint();
+        let Some(job) =
+            self.prepare_one(collection, shadow, config, source, fingerprint, unstamped)?
+        else {
             return Ok(false);
         };
         let vectors = self.call_provider(collection, config, std::slice::from_ref(&job)).await?;
@@ -1688,17 +1714,21 @@ impl EmbeddingWorker {
     }
 
     /// Read one document afresh and prepare it, or nothing if its vectors are
-    /// already current.
+    /// already current: at the document's version and made under `config`,
+    /// whose fingerprint the caller computed once for its whole run.
     ///
-    /// `force` re-embeds even current-looking vectors — the configuration
-    /// changed, so "current" was measured against the wrong ruler.
+    /// `unstamped` is how a record with no fingerprint is read.
+    /// [`Unstamped::Stale`] re-embeds such current-looking vectors — the
+    /// configuration changed, and a record from before 0.43.0 cannot say it
+    /// was made under the new one.
     fn prepare_one(
         &self,
         collection: &CollectionMeta,
         shadow: &CollectionMeta,
         config: &VectorConfig,
         source: &kimmy_core::DocId,
-        force: bool,
+        fingerprint: u64,
+        unstamped: Unstamped,
     ) -> Result<Option<Job>> {
         // The stamp is the document's *current* version, read fresh — a
         // document replaced mid-scan is embedded at whichever version the
@@ -1707,7 +1737,7 @@ impl EmbeddingWorker {
         let Some(stamp) = self.engine.document_stamp(collection, source)? else {
             return Ok(None);
         };
-        if !force && !self.engine.vectors_are_stale(shadow, source, stamp.hlc)? {
+        if !self.engine.vectors_are_stale(shadow, source, stamp.hlc, fingerprint, unstamped)? {
             return Ok(None);
         }
         let Some(document) = self.engine.get(collection, source)? else {
@@ -1816,7 +1846,11 @@ impl EmbeddingWorker {
             });
         }
         // Encoded before the scope opens: the scope holds the engine's one
-        // writer, and every other writer on the node waits behind it.
+        // writer, and every other writer on the node waits behind it. Each
+        // record carries the fingerprint of the configuration its inputs were
+        // prepared and embedded under, which is this batch's, so any member
+        // can tell it from a later configuration's (ADR-203).
+        let fingerprint = config.fingerprint();
         let mut vectors = vectors.into_iter();
         let mut writes = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -1833,6 +1867,7 @@ impl EmbeddingWorker {
                     source_hlc: job.hlc,
                     vector,
                     text,
+                    config: Some(fingerprint),
                 })
                 .collect();
             let write = VectorWrite::encode(&job.source, &records)?;
@@ -2126,12 +2161,6 @@ impl EmbeddingWorker {
     }
 }
 
-/// A stable fingerprint of a vector configuration.
-///
-/// FNV-1a over the JSON serialization. Stable across restarts, which is what
-/// the backfill decision needs; a build that changes the config's *shape*
-/// changes the fingerprint and costs one spurious full re-embed after
-/// upgrade, which is the safe direction to be wrong in.
 /// How a stream stopped yielding.
 enum StreamEnd {
     /// The stream closed; there is nothing further to watch.
@@ -2145,19 +2174,6 @@ enum StreamEnd {
 /// from rather than reports.
 fn is_lost_position(e: &kimmy_storage::StorageError) -> bool {
     matches!(e, kimmy_storage::StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
-}
-
-fn config_fingerprint(config: &VectorConfig) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x100_0000_01b3;
-
-    let bytes = serde_json::to_vec(config).unwrap_or_default();
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 /// Gather the configured fields into one block of text.
@@ -2704,6 +2720,7 @@ mod tests {
                     source_hlc: stamp.hlc,
                     vector: vec![1.0, 0.0, 0.0, 0.0],
                     text: "text".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -3327,7 +3344,14 @@ mod tests {
         for (i, title) in titles.iter().enumerate() {
             let id = engine.insert(coll, doc! { "_id": i as i64, "title": *title }).unwrap();
             let job = worker
-                .prepare_one(coll, &shadow, &config, &id, false)
+                .prepare_one(
+                    coll,
+                    &shadow,
+                    &config,
+                    &id,
+                    config.fingerprint(),
+                    Unstamped::ByVersion,
+                )
                 .unwrap()
                 .expect("a fresh document has a job");
             let item = Item {
@@ -3518,13 +3542,12 @@ mod tests {
         other_metric.metric = Metric::Dot;
 
         let all = [&base, &wider, &other_field, &both_fields, &other_metric];
-        let prints: std::collections::BTreeSet<u64> =
-            all.iter().map(|c| config_fingerprint(c)).collect();
+        let prints: std::collections::BTreeSet<u64> = all.iter().map(|c| c.fingerprint()).collect();
         assert_eq!(prints.len(), all.len(), "each configuration must fingerprint differently");
 
         // ...and the same configuration must fingerprint the same, or every
         // replay would look like a change and re-embed the collection.
-        assert_eq!(config_fingerprint(&base), config_fingerprint(&base.clone()));
+        assert_eq!(base.fingerprint(), base.clone().fingerprint());
     }
 
     #[tokio::test]
@@ -4425,6 +4448,7 @@ mod tests {
                     source_hlc: stamp.hlc,
                     vector: vec![0.1; 4],
                     text: "hello".into(),
+                    config: None,
                 }],
             )
             .unwrap();
@@ -4693,6 +4717,7 @@ mod tests {
         let (engine, coll, _worker, _dir) = setup().await;
         let ids = current_without_a_fingerprint(&engine, &coll).await;
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
         // Changed and never embedded since: its vectors are behind it.
         engine
             .replace(
@@ -4703,27 +4728,34 @@ mod tests {
             )
             .unwrap();
         let stamp = engine.document_stamp(&coll, &ids[3]).unwrap().unwrap();
-        assert!(engine.vectors_are_stale(&shadow, &ids[3], stamp.hlc).unwrap());
+        let stale = || {
+            let fingerprint = config.fingerprint();
+            engine.vectors_are_stale(&shadow, &ids[3], stamp.hlc, fingerprint, Unstamped::ByVersion)
+        };
+        assert!(stale().unwrap());
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert_eq!(fake.calls(), 1, "one provider call, for the stale document");
-        assert!(!engine.vectors_are_stale(&shadow, &ids[3], stamp.hlc).unwrap(), "re-embedded");
+        assert!(!stale().unwrap(), "re-embedded");
         assert_eq!(fake.inputs.lock().unwrap().iter().filter(|t| t.contains("hello")).count(), 0);
     }
 
     /// A member that recorded a completed scan under a configuration that has
     /// since changed, and whose stream has not passed the change (so it has not
     /// forgotten what it recorded), is behind: its ownership rescan re-embeds
-    /// every document, and then records the configuration it scanned under.
+    /// every document whose records cannot say which configuration made them
+    /// (written before 0.43.0), and then records the configuration it scanned
+    /// under.
     #[tokio::test]
     async fn an_ownership_rescan_forces_on_a_member_whose_recorded_configuration_changed() {
         let (engine, coll, _worker, _dir) = setup().await;
-        current_without_a_fingerprint(&engine, &coll).await;
+        let ids = current_without_a_fingerprint(&engine, &coll).await;
+        written_before_043(&engine, &ids);
         engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert!(fake.calls() >= 1, "every document is sent again");
         assert_eq!(fake.inputs.lock().unwrap().iter().filter(|t| t.contains("hello")).count(), 10);
         let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
-        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), Some(config_fingerprint(&config)));
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), Some(config.fingerprint()));
     }
 
     /// A lost position's recovery scans every owned collection; the first
@@ -4765,5 +4797,339 @@ mod tests {
         current_without_a_fingerprint(&engine, &coll).await;
         let fake = rescan_at_first_sight(&engine, &coll).await;
         assert_eq!(fake.calls(), 0, "every document was current");
+    }
+
+    // -----------------------------------------------------------------------
+    // The configuration a record carries (ADR-203)
+    // -----------------------------------------------------------------------
+
+    /// Rewrite each document's records without a configuration fingerprint, as
+    /// a release before 0.43.0, or an older member, wrote them.
+    fn written_before_043(engine: &Engine, ids: &[kimmy_core::DocId]) {
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for id in ids {
+            let records: Vec<VectorRecord> = engine
+                .get_vectors(&shadow, id)
+                .unwrap()
+                .into_iter()
+                .map(|r| VectorRecord { config: None, ..r })
+                .collect();
+            assert!(!records.is_empty(), "{id} has vectors to rewrite");
+            engine.put_vectors(&shadow, id, &records).unwrap();
+        }
+    }
+
+    /// The configuration fingerprint a document's records carry: one, since a
+    /// chunk set is written whole.
+    fn made_under(engine: &Engine, id: &kimmy_core::DocId) -> Option<u64> {
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let records = engine.get_vectors(&shadow, id).unwrap();
+        assert!(!records.is_empty(), "{id} has vectors");
+        let configs: std::collections::BTreeSet<Option<u64>> =
+            records.iter().map(|r| r.config).collect();
+        assert_eq!(configs.len(), 1, "{id}'s chunks disagree: {configs:?}");
+        records[0].config
+    }
+
+    /// A provider whose first `good` calls succeed and whose every later call
+    /// fails the way a provider that went away does, retryably, so the worker
+    /// waits and tries again for as long as it runs: an owner that is stopped
+    /// part-way through a scan once the test aborts it.
+    struct GoesAway {
+        inner: Arc<FakeProvider>,
+        good: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for GoesAway {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            use std::sync::atomic::Ordering;
+            if self
+                .good
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err()
+            {
+                return Err(VectorError::Transport {
+                    provider: "fake",
+                    kind: TransportKind::Reset,
+                    detail: "gone".into(),
+                });
+            }
+            self.inner.embed(texts).await
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// What an owner that stopped part-way through a reindex leaves: ten
+    /// documents embedded under configuration A by its owner, which recorded a
+    /// completed scan under A; the configuration changes to B (a document
+    /// prefix, so what is sent under B is told apart by its input); the owner's
+    /// backfill of B re-embeds one batch of four and is stopped, the provider
+    /// gone. Answers the documents' ids, the two fingerprints and B's entry.
+    async fn an_interrupted_reindex(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+    ) -> (Vec<kimmy_core::DocId>, u64, u64, kimmy_core::OplogEntry) {
+        let a = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        let mut owner = EmbeddingWorker::new(Arc::clone(engine));
+        owner.set_provider(coll.id.0, FakeProvider::new(4));
+        switchable_owner(&mut owner, true);
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = engine
+                .insert(
+                    coll,
+                    bson::doc! { "_id": format!("d{i}"), "title": "hello", "body": format!("doc{i}") },
+                )
+                .unwrap();
+            assert!(matches!(
+                owner.process(&last_entry(engine)).await.unwrap(),
+                Outcome::Embedded { .. }
+            ));
+            ids.push(id);
+        }
+        engine.put_vector_fingerprint(coll.id, a.fingerprint()).unwrap();
+
+        let b = VectorConfig { document_prefix: Some("passage: ".into()), ..a.clone() };
+        engine.configure_vectors("app", "docs", b.clone()).unwrap();
+        let entry = configured_entry(engine);
+        let mut stopping = EmbeddingWorker::new(Arc::clone(engine));
+        stopping.set_batching(BatchSettings { max_chunks: 4, ..Default::default() });
+        let goes_away = GoesAway { inner: FakeProvider::new(4), good: 1.into() };
+        stopping.set_provider(coll.id.0, Arc::new(goes_away));
+        switchable_owner(&mut stopping, true);
+        let replayed = entry.clone();
+        let running = tokio::spawn(async move { stopping.process(&replayed).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ids.iter().filter(|id| made_under(engine, id) == Some(b.fingerprint())).count() < 4 {
+            assert!(Instant::now() < deadline, "the owner's first batch never landed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled(), "stopped part-way, not finished");
+        let under_b = ids.iter().filter(|id| made_under(engine, id) == Some(b.fingerprint()));
+        assert_eq!(under_b.count(), 4, "one batch re-embedded under B");
+        let under_a = ids.iter().filter(|id| made_under(engine, id) == Some(a.fingerprint()));
+        assert_eq!(under_a.count(), 6, "and six left under A");
+        assert_eq!(
+            engine.vector_fingerprint(coll.id).unwrap(),
+            Some(a.fingerprint()),
+            "an unfinished scan attests nothing"
+        );
+        (ids, a.fingerprint(), b.fingerprint(), entry)
+    }
+
+    /// The finding ADR-203 closes. The owner of a collection stops part-way
+    /// through re-embedding it under a new configuration, after the other
+    /// members' streams passed the configuration's entry, which made each of
+    /// them forget any scan it had recorded. The member that takes over has no
+    /// fingerprint, so its rescan trusts per-document staleness: before
+    /// records said which configuration made them, the six documents still
+    /// under the old one looked current and kept the old model's vectors, with
+    /// nothing said. Now it re-embeds exactly those six under the new
+    /// configuration, and sends nothing for the four the owner had reached.
+    #[tokio::test]
+    async fn a_reindex_its_owner_left_part_way_is_finished_by_the_member_that_takes_over() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, a, b, _) = an_interrupted_reindex(&engine, &coll).await;
+        let reached: Vec<String> = ids
+            .iter()
+            .filter(|id| made_under(&engine, id) == Some(b))
+            .map(|id| id.to_string())
+            .collect();
+        // What the member taking over holds: no fingerprint, forgotten when its
+        // stream skipped the owner's backfill.
+        engine.clear_vector_fingerprint(coll.id).unwrap();
+
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        let inputs = fake.inputs.lock().unwrap().clone();
+        assert_eq!(inputs.len(), 6, "the six documents still under A, one chunk each: {inputs:?}");
+        assert!(inputs.iter().all(|t| t.starts_with("passage: hello")), "under B: {inputs:?}");
+        for id in &reached {
+            let body = id.trim_start_matches('d');
+            assert!(
+                !inputs.iter().any(|t| t.ends_with(&format!("doc{body}"))),
+                "{id} was already under B, and was sent again: {inputs:?}"
+            );
+        }
+        for id in &ids {
+            assert_eq!(made_under(&engine, id), Some(b), "{id} is under B now");
+            assert_ne!(made_under(&engine, id), Some(a));
+        }
+        assert_eq!(
+            engine.vector_fingerprint(coll.id).unwrap(),
+            None,
+            "a trusting rescan attests nothing"
+        );
+    }
+
+    /// The owner restarts and its stream replays the configuration's entry,
+    /// since the scan never completed: the forced scan sends only the documents
+    /// it had not reached, since what it re-embedded before it stopped says it
+    /// was made under the new configuration. It sent them all again before.
+    #[tokio::test]
+    async fn an_owner_replaying_its_interrupted_reindex_sends_only_what_it_had_not_reached() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, _, b, entry) = an_interrupted_reindex(&engine, &coll).await;
+        let mut restarted = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        restarted.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut restarted, true);
+        assert_eq!(restarted.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 6 });
+        assert_eq!(fake.inputs.lock().unwrap().len(), 6, "only what the stop left under A");
+        assert!(ids.iter().all(|id| made_under(&engine, id) == Some(b)));
+        assert_eq!(
+            engine.vector_fingerprint(coll.id).unwrap(),
+            Some(b),
+            "the completed scan attests B"
+        );
+    }
+
+    /// Every record the worker writes carries the fingerprint of the
+    /// configuration it was embedded under, on the stream and in a scan, and
+    /// not whatever this member last recorded.
+    #[tokio::test]
+    async fn every_embed_stamps_its_records_with_the_configuration_it_ran_under() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        owner.set_provider(coll.id.0, FakeProvider::new(4));
+        switchable_owner(&mut owner, true);
+        let streamed = engine
+            .insert(
+                &coll,
+                bson::doc! { "_id": "s", "title": "a title long enough", "body": "to cut in two" },
+            )
+            .unwrap();
+        assert!(matches!(
+            owner.process(&last_entry(&engine)).await.unwrap(),
+            Outcome::Embedded { .. }
+        ));
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &streamed).unwrap().len() > 1, "several chunks");
+        assert_eq!(made_under(&engine, &streamed), Some(config.fingerprint()));
+
+        let scanned = engine
+            .insert(&coll, bson::doc! { "_id": "b", "title": "hello", "body": "world" })
+            .unwrap();
+        owner.rescan_owned().await.unwrap();
+        assert_eq!(made_under(&engine, &scanned), Some(config.fingerprint()));
+        assert_eq!(made_under(&engine, &streamed), Some(config.fingerprint()));
+    }
+
+    /// Records written before 0.43.0 carry no fingerprint and are judged by
+    /// their version where nothing says the configuration changed: an ownership
+    /// rescan and a replayed entry send nothing for current ones, and a changed
+    /// document is still re-embedded. Reading them as stale would re-embed
+    /// everything older releases wrote, on every member that gains the
+    /// collection.
+    #[tokio::test]
+    async fn records_without_a_fingerprint_are_judged_by_their_version() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let ids = current_without_a_fingerprint(&engine, &coll).await;
+        written_before_043(&engine, &ids);
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls(), 0, "every document was current by its version");
+        assert!(ids.iter().all(|id| made_under(&engine, id).is_none()), "and nothing rewritten");
+
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        let replay = FakeProvider::new(4);
+        owner.set_provider(coll.id.0, Arc::clone(&replay) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut owner, true);
+        let entry = engine
+            .read_oplog_from(Hlc::ZERO, 10_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.doc_id.as_ref() == Some(&ids[0]))
+            .expect("d0's insert");
+        assert_eq!(owner.process(&entry).await.unwrap(), Outcome::Skipped, "a replay is a no-op");
+        assert_eq!(replay.calls(), 0);
+
+        engine
+            .replace(
+                &coll,
+                &ids[3],
+                bson::doc! { "_id": "d3", "title": "changed", "body": "since" },
+                false,
+            )
+            .unwrap();
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.inputs.lock().unwrap().clone(), vec!["changed\n\nsince".to_string()]);
+        let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        assert_eq!(made_under(&engine, &ids[3]), Some(config.fingerprint()));
+    }
+
+    /// A member behind a configuration change (it recorded a scan under an
+    /// earlier one) forces only records that cannot say which configuration
+    /// made them: the ones the owner already re-embedded under the current
+    /// configuration are not sent again.
+    #[tokio::test]
+    async fn a_forced_rescan_sends_no_record_made_under_the_current_configuration() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        current_without_a_fingerprint(&engine, &coll).await;
+        engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls(), 0, "every record was made under the current configuration");
+        let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), Some(config.fingerprint()));
+    }
+
+    /// A `byo` collection is the client's: no scan touches its records, stamped
+    /// or not. What its stamp is for is a later switch to a server-side
+    /// provider, after which any member's rescan reads the client's records as
+    /// made under another configuration and re-embeds them.
+    #[tokio::test]
+    async fn a_byo_collection_is_left_alone_until_the_server_embeds_it() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let served = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        let byo = VectorConfig { provider: ProviderConfig::Byo {}, ..served.clone() };
+        engine.configure_vectors("app", "docs", byo.clone()).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let mut ids = Vec::new();
+        for (i, config) in [Some(byo.fingerprint()), None].into_iter().enumerate() {
+            let id = engine
+                .insert(
+                    &coll,
+                    bson::doc! { "_id": format!("c{i}"), "title": "client", "body": "text" },
+                )
+                .unwrap();
+            let stamp = engine.document_stamp(&coll, &id).unwrap().unwrap();
+            let record = VectorRecord {
+                source: id.clone(),
+                chunk: 0,
+                source_hlc: stamp.hlc,
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                text: "client".into(),
+                config,
+            };
+            engine.put_vectors(&shadow, &id, &[record]).unwrap();
+            ids.push(id);
+        }
+        let before: Vec<_> =
+            ids.iter().map(|id| engine.get_vectors(&shadow, id).unwrap()).collect();
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, true);
+        worker.rescan_owned().await.unwrap();
+        assert_eq!(worker.process(&configured_entry(&engine)).await.unwrap(), Outcome::Skipped);
+        let fake_rescan = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls() + fake_rescan.calls(), 0, "nothing sent for a byo collection");
+        let after: Vec<_> = ids.iter().map(|id| engine.get_vectors(&shadow, id).unwrap()).collect();
+        assert_eq!(after, before, "and nothing rewritten");
+
+        engine.configure_vectors("app", "docs", served.clone()).unwrap();
+        engine.clear_vector_fingerprint(coll.id).unwrap();
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.inputs.lock().unwrap().len(), 1, "the stamped client record, alone");
+        assert_eq!(made_under(&engine, &ids[0]), Some(served.fingerprint()));
+        assert_eq!(made_under(&engine, &ids[1]), None, "an unstamped one is trusted by version");
     }
 }

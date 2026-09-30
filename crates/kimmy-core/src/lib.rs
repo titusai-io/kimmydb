@@ -36,5 +36,5 @@ pub use oplog::{Issued, MAX_TOKEN_ORIGINS, OpKind, OplogEntry, ResumeToken};
 pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
-pub use vector_record::{VectorRecord, similarity};
+pub use vector_record::{Unstamped, VectorRecord, similarity};
 pub use version::VersionVector;

@@ -89,6 +89,7 @@ fn fixture(count: usize) -> (Engine, CollectionMeta, tempfile::TempDir) {
             source_hlc: Hlc::new(1, 0),
             vector: pseudo_random(i as u64 + 1, DIM),
             text: format!("document {i}"),
+            config: None,
         };
         engine.put_vectors(&shadow, &source, &[record]).unwrap();
     }

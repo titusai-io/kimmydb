@@ -6321,6 +6321,7 @@ mod tests {
                 source_hlc: Hlc::new(1, 0),
                 vector: vec![1.0, 0.0, 0.0, 0.0],
                 text: "t".into(),
+                config: None,
             }],
         )
         .unwrap();

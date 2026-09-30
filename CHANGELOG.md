@@ -116,8 +116,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   cluster, a collection whose embedding ownership moves to a member, or that a member
   owns when it starts, is rescanned there once that has held for thirty seconds, so
   what was deferred before, by the previous owner or by this member before a restart,
-  is not lost; the rescan embeds only what is stale or missing, and a reindex the
-  previous owner left unfinished is not completed by it. One member still expires a
+  is not lost; the rescan embeds only what is stale or missing, which includes a
+  reindex the previous owner left unfinished (below). One member still expires a
   given collection once the blocks have settled; for about one sync interval after a
   TTL index is created, while a member's sync contacts fail and SWIM keeps it up, and
   for every collection past the 256 a block lists, more than one holder may delete the
@@ -126,6 +126,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   not a candidate, since it is not known to hold the index, so a mixed cluster's newer
   members expire the collection. No stored format changes.
 
+- **A vector reindex that its owner left part-way is finished by the member that
+  takes the collection over.** A vector record said which version of its
+  document it was made from and nothing about the configuration, so when the
+  owner of a collection stopped or left while re-embedding it under a new model,
+  width, field list, chunking or prefix, the member that took over read the
+  documents it had not reached as current, and they kept the old model's
+  vectors, with nothing said. Each record now carries a fingerprint of the
+  configuration it was made under, and one made under another configuration is
+  stale on every member, so the member taking over re-embeds exactly those
+  documents and sends nothing for the ones already done; an owner that restarts
+  and replays the change sends only what it had not reached, where it sent the
+  whole collection again ([ADR-203](docs/decisions.md)). Records written before
+  this release, or by an older member of a mixed cluster, carry no fingerprint
+  and are judged as before; the next configuration change's backfill stamps
+  them ([docs/operations.md](docs/operations.md)). Vectors a client stores into
+  a `byo` collection carry that configuration's fingerprint, so a later switch
+  to a server-side provider is finished the same way. The field is additive: an
+  older build reads such a record and ignores it, so a rollback is safe.
 - **A node whose open outlasts the liveness probe is no longer killed and begun
   again for ever.** Nothing listened until the open finished, so the documented
   manifest's liveness probe (Kubernetes' defaults, about 30 s) restarted any node

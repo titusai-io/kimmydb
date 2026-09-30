@@ -575,7 +575,8 @@ pub struct ChunkInput {
 /// The server supplies `source` and `source_hlc` from the document it already
 /// holds, so a client never has to know the internal record shape — and
 /// staleness detection keeps working, because the HLC is the document's own
-/// rather than something a client could get wrong.
+/// rather than something a client could get wrong. It supplies the
+/// configuration fingerprint too, for a `byo` collection (below).
 pub async fn put_document_vectors(
     State(state): State<SharedState>,
     auth: Auth,
@@ -626,6 +627,15 @@ pub async fn put_document_vectors(
         .vector_collection(&db, &coll)?
         .ok_or_else(|| ApiError::not_found("vector collection is missing"))?;
 
+    // Into a `byo` collection the records carry the configuration's
+    // fingerprint, as the worker's do (ADR-203). Nothing judges a `byo`
+    // collection's records, but a later switch to a server-side provider does,
+    // and then these read as made under another configuration on every member,
+    // so an owner that stops part-way through re-embedding them leaves the rest
+    // for whoever takes over. Into a collection the server embeds they carry
+    // none, and are judged by their version as before: kept until the document
+    // changes or a configuration change's backfill forces them.
+    let made_under = (!config.provider.embeds_server_side()).then(|| config.fingerprint());
     let records: Vec<kimmy_core::VectorRecord> = body
         .into_iter()
         .map(|c| kimmy_core::VectorRecord {
@@ -634,6 +644,7 @@ pub async fn put_document_vectors(
             source_hlc: stamp.hlc,
             vector: c.vector,
             text: c.text,
+            config: made_under,
         })
         .collect();
 
@@ -1449,6 +1460,7 @@ mod tests {
                         source_hlc: kimmy_core::Hlc::new(1, 0),
                         vector: vec![angle.cos(), angle.sin()],
                         text: format!("d{i}c{chunk}"),
+                        config: None,
                     }
                 })
                 .collect();
