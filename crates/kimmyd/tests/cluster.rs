@@ -1311,6 +1311,27 @@ async fn one_expired_document_produces_one_delete_cluster_wide() {
         .unwrap();
     assert_eq!(created.status(), 200, "creating the TTL index");
 
+    // Until the members have told each other they hold the index, each counts
+    // only itself a holder and so owns the collection: a window of duplicates,
+    // which the design accepts over a gap (ADR-201) and which the block's next
+    // contact closes. The counting below is of the settled state, so wait for
+    // exactly one member to own it.
+    eventually("exactly one member to own the collection", || {
+        let client = client.clone();
+        let nodes = [&a, &b, &c];
+        async move {
+            let mut owned = 0;
+            for node in nodes {
+                match node.gauge(&client, "kimmy_ttl_collections{state=\"owned\"}").await {
+                    Some(n) => owned += n,
+                    None => return false,
+                }
+            }
+            owned == 1
+        }
+    })
+    .await;
+
     // Dated in the past, so it is already due the moment it lands.
     client
         .post(a.url("/v1/db/shop/coll/sessions/docs"))

@@ -398,6 +398,51 @@ async fn a_node_that_does_not_own_a_subscription_delivers_nothing() {
     assert_eq!(hits.load(Ordering::Relaxed), 0, "a non-owner must not call the endpoint");
 }
 
+/// A member that is catching up delivers nothing, however the hash ranks it: the
+/// dispatcher asks `Owners`, which leaves it out of the candidates by what it says
+/// about itself (ADR-201), and its peers pick its share up.
+#[tokio::test]
+async fn a_catching_up_member_delivers_no_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, hits) = receiver(200).await;
+    // A subscription this member would own with nobody else about.
+    register_as(&state, "wh_gated_here", &format!("http://{addr}/hook"), vec![]);
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+
+    let members = kimmy_cluster::Members::default();
+    let peer = kimmy_core::NodeId::from_bytes([0x11; 16]);
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), peer);
+    members.record_peer_facts_for_test(
+        peer,
+        kimmy_cluster::Facts { boot: vec![1; 16], ..Default::default() },
+        std::time::Duration::ZERO,
+    );
+    members.set_facts_source(std::sync::Arc::new(|| kimmy_cluster::Facts {
+        boot: vec![2; 16],
+        catching_up: true,
+        ..Default::default()
+    }));
+    let owners = kimmy_api::ownership::Owners::over(me(), Some(members));
+
+    let client = reqwest::Client::new();
+    let policy = EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]);
+    let mut backoff = dispatch::Backoff::default();
+    let outcome = dispatch::dispatch_once_owned(
+        &state,
+        &client,
+        &policy,
+        &owners,
+        &mut backoff,
+        dispatch::Limits::default(),
+    )
+    .await;
+    assert_eq!(outcome.skipped_not_owner, 1, "{outcome:?}");
+    assert_eq!(outcome.delivered, 0);
+    assert_eq!(hits.load(Ordering::Relaxed), 0, "a catching-up member must not call the endpoint");
+}
+
 #[tokio::test]
 async fn the_egress_policy_is_enforced_at_delivery_not_only_at_registration() {
     // A hostname is not a destination. This registers while the policy permits

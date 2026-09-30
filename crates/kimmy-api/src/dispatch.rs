@@ -692,6 +692,21 @@ pub async fn dispatch_once(
     backoff: &mut Backoff,
     limits: Limits,
 ) -> DispatchOutcome {
+    let owners = crate::ownership::Owners::over_set(me, members.clone());
+    dispatch_once_owned(state, client, policy, &owners, backoff, limits).await
+}
+
+/// [`dispatch_once`], asking `owners` which subscriptions this member delivers:
+/// the live members that may own webhooks by what they say about themselves,
+/// which leaves out one that is catching up (ADR-201).
+pub async fn dispatch_once_owned(
+    state: &SharedState,
+    client: &reqwest::Client,
+    policy: &EgressPolicy,
+    owners: &crate::ownership::Owners,
+    backoff: &mut Backoff,
+    limits: Limits,
+) -> DispatchOutcome {
     let mut outcome = DispatchOutcome::default();
     let mut planned: Vec<Planned> = Vec::new();
 
@@ -728,7 +743,7 @@ pub async fn dispatch_once(
         };
         backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
         for job in jobs {
-            if !crate::ownership::owns(&job.id, me, members) {
+            if !owners.owns_subscription(&job.id) {
                 outcome.skipped_not_owner += 1;
                 continue;
             }
@@ -1048,17 +1063,17 @@ pub async fn run(
     client: reqwest::Client,
 ) {
     info!("webhook dispatcher started");
+    let owners = crate::ownership::Owners::over(me, members);
     let mut backoff = Backoff::default();
     loop {
-        // Re-read every tick rather than once: the whole point is that
-        // ownership follows the live set as it changes.
+        // Asked every tick rather than once: the whole point is that ownership
+        // follows the live set, and what its members say, as they change.
         // Node ids, not addresses: ownership must follow the node, not where
         // it happens to be listening (ADR-051).
-        let live = members.as_ref().map(|m| m.node_ids()).unwrap_or_default();
         // The pass itself always runs on the tick. Backoff is held per
         // subscription inside it, so a failing endpoint delays only its own
         // deliveries and every other subscription keeps its cadence.
-        dispatch_once(&state, &client, &policy, me, &live, &mut backoff, limits).await;
+        dispatch_once_owned(&state, &client, &policy, &owners, &mut backoff, limits).await;
         tokio::time::sleep(TICK).await;
     }
 }

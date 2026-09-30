@@ -103,6 +103,184 @@ pub fn owns(subscription: &str, me: NodeId, members: &BTreeSet<NodeId>) -> bool 
     owner(subscription, &candidates) == Some(me)
 }
 
+/// Whether `me` is the owner of `key` among `candidates`, a set that is already
+/// filtered by what the members say about themselves (ADR-201) and so already
+/// holds `me` when `me` may own the class. **An empty set has no owner**: unlike
+/// [`owns`] it does not add `me`, because a member that may not own the class
+/// (it is catching up, or does not hold the index) must not be put back.
+pub fn owns_among(key: &str, me: NodeId, candidates: &BTreeSet<NodeId>) -> bool {
+    owner(key, candidates) == Some(me)
+}
+
+/// How a collection's expiry stands, from this member's view (ADR-201).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtlState {
+    /// This member owns it.
+    Owned,
+    /// Another member owns it.
+    OwedElsewhere,
+    /// No member can expire it: none is known to hold the index and be able to
+    /// (every holder has expiry switched off, or none is known to hold it).
+    UnownedNoHolder,
+    /// Every member known to hold the index is catching up. A delay, never a
+    /// loss: a stale expiry beats a refreshed copy under last-writer-wins, so
+    /// the work waits.
+    UnownedCatchingUp,
+}
+
+impl TtlState {
+    pub const ALL: [Self; 4] =
+        [Self::Owned, Self::OwedElsewhere, Self::UnownedNoHolder, Self::UnownedCatchingUp];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::OwedElsewhere => "owed_elsewhere",
+            Self::UnownedNoHolder => "unowned_no_holder",
+            Self::UnownedCatchingUp => "unowned_catching_up",
+        }
+    }
+
+    pub const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// This member's view of every TTL collection it holds an index on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TtlView {
+    /// Collections per [`TtlState`], in [`TtlState::ALL`] order.
+    pub counts: [u64; TtlState::ALL.len()],
+    /// The collections nobody can expire, `db.collection`, with why.
+    pub unowned: Vec<(String, TtlState)>,
+}
+
+#[derive(Clone)]
+enum View {
+    /// No clustering: this node owns everything.
+    Alone,
+    /// The live member set and what its members say about themselves.
+    Members(kimmy_cluster::Members),
+    /// A bare member set, as before facts: for tests that fix who is live.
+    Set(BTreeSet<NodeId>),
+}
+
+/// Who may own what (ADR-201): the rendezvous function over the candidates each
+/// class allows, from the live members and what they last said.
+///
+/// Three consumers ask, each for its own class: expiry per collection, webhooks
+/// per subscription, embeddings per collection. Cheap to clone and to ask; the
+/// candidate set is computed per question from the member table, never cached.
+#[derive(Clone)]
+pub struct Owners {
+    me: NodeId,
+    view: View,
+}
+
+impl Owners {
+    /// With clustering (`Some`) or without (`None`, which owns everything).
+    pub fn over(me: NodeId, members: Option<kimmy_cluster::Members>) -> Self {
+        Self { me, view: members.map_or(View::Alone, View::Members) }
+    }
+
+    /// Over a fixed live set and nothing said by anyone, as ownership was before
+    /// members said anything.
+    pub fn over_set(me: NodeId, live: BTreeSet<NodeId>) -> Self {
+        Self { me, view: View::Set(live) }
+    }
+
+    fn mine(&self, members: &kimmy_cluster::Members) -> std::sync::Arc<kimmy_cluster::Facts> {
+        members.local_facts().map(|(facts, _)| facts).unwrap_or_default()
+    }
+
+    fn owns(
+        &self,
+        class: kimmy_cluster::OwnerClass,
+        key: &str,
+        collection: Option<kimmy_core::CollectionId>,
+        holds_ttl: bool,
+    ) -> bool {
+        match &self.view {
+            View::Alone => true,
+            View::Set(live) => owns(key, self.me, live),
+            View::Members(members) => {
+                let mine = self.mine(members);
+                let candidates = members.candidates(class, collection, self.me, &mine, holds_ttl);
+                owns_among(key, self.me, &candidates)
+            }
+        }
+    }
+
+    /// Whether this member delivers the subscription.
+    pub fn owns_subscription(&self, id: &str) -> bool {
+        self.owns(kimmy_cluster::OwnerClass::Webhooks, id, None, false)
+    }
+
+    /// Whether this member embeds the collection (`db/collection`, the worker's
+    /// key).
+    pub fn owns_embedding(&self, key: &str) -> bool {
+        self.owns(kimmy_cluster::OwnerClass::Embeddings, key, None, false)
+    }
+
+    /// Whether this member expires the collection: it holds a TTL index on it,
+    /// and is the top-ranked of the members known to.
+    pub fn owns_ttl(&self, coll: &kimmy_storage::CollectionMeta) -> bool {
+        let holds = kimmy_storage::ttl_indexes(coll).next().is_some();
+        self.owns(
+            kimmy_cluster::OwnerClass::Ttl,
+            &crate::expiry::key(&coll.db, &coll.name),
+            Some(coll.id),
+            holds,
+        )
+    }
+
+    /// How each TTL collection among `collections` stands from here.
+    pub fn ttl_view(&self, collections: &[kimmy_storage::CollectionMeta]) -> TtlView {
+        let mut view = TtlView::default();
+        for coll in collections {
+            if kimmy_storage::ttl_indexes(coll).next().is_none() {
+                continue;
+            }
+            let state = match &self.view {
+                View::Alone | View::Set(_) => {
+                    if self.owns_ttl(coll) {
+                        TtlState::Owned
+                    } else {
+                        TtlState::OwedElsewhere
+                    }
+                }
+                View::Members(members) => {
+                    let mine = self.mine(members);
+                    let candidates = members.candidates(
+                        kimmy_cluster::OwnerClass::Ttl,
+                        Some(coll.id),
+                        self.me,
+                        &mine,
+                        true,
+                    );
+                    let key = crate::expiry::key(&coll.db, &coll.name);
+                    if candidates.is_empty() {
+                        if mine.catching_up || members.holder_catching_up(coll.id) {
+                            TtlState::UnownedCatchingUp
+                        } else {
+                            TtlState::UnownedNoHolder
+                        }
+                    } else if owns_among(&key, self.me, &candidates) {
+                        TtlState::Owned
+                    } else {
+                        TtlState::OwedElsewhere
+                    }
+                }
+            };
+            view.counts[state.slot()] += 1;
+            if matches!(state, TtlState::UnownedNoHolder | TtlState::UnownedCatchingUp) {
+                view.unowned.push((format!("{}.{}", coll.db, coll.name), state));
+            }
+        }
+        view
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +445,91 @@ mod tests {
         // *representation* of a `NodeId`, which is the hyphenated string form
         // fixed in `kimmy_core::ids` rather than whatever a format would pick.
         assert_eq!(hash("wh_a", &node(1)), 0xd7f5_9b66_b282_926a);
+    }
+
+    // -- What members say about themselves (ADR-201) ----------------------------
+
+    use kimmy_cluster::{Facts, Members, TtlHeld};
+
+    fn addr(n: u8) -> std::net::SocketAddr {
+        format!("127.0.0.1:{}", 7000 + u16::from(n)).parse().unwrap()
+    }
+
+    /// A member's view: the others live, each having said `said`, and itself
+    /// described by `mine`.
+    fn view(me: u8, others: &[(u8, Facts)], mine: Facts) -> Owners {
+        let members = Members::default();
+        for (n, said) in others {
+            members.insert_for_test(addr(*n), node(*n));
+            members.record_peer_facts_for_test(node(*n), said.clone(), std::time::Duration::ZERO);
+        }
+        members.set_facts_source(std::sync::Arc::new(move || mine.clone()));
+        Owners::over(node(me), Some(members))
+    }
+
+    fn block() -> Facts {
+        Facts { boot: vec![1; 16], ..Facts::default() }
+    }
+
+    #[test]
+    fn an_empty_candidate_set_has_no_owner_and_does_not_put_me_back() {
+        assert!(!owns_among("wh_a", node(1), &BTreeSet::new()));
+        assert!(owns_among("wh_a", node(1), &members(&[1])));
+    }
+
+    /// A member that is catching up delivers nothing, and its peers between them
+    /// deliver everything, each subscription once.
+    #[test]
+    fn a_catching_up_member_owns_no_subscription_and_the_others_own_each_once() {
+        let gated = Facts { catching_up: true, ..block() };
+        // Member 1 is the gated one; 2 and 3 have read its block.
+        let one = view(1, &[(2, block()), (3, block())], gated.clone());
+        let two = view(2, &[(1, gated.clone()), (3, block())], block());
+        let three = view(3, &[(1, gated), (2, block())], block());
+        for id in (0..40).map(|i| format!("wh_{i}")) {
+            assert!(!one.owns_subscription(&id), "{id}: the catching-up member delivers nothing");
+            let owners = [&two, &three].iter().filter(|o| o.owns_subscription(&id)).count();
+            assert_eq!(owners, 1, "{id}");
+        }
+    }
+
+    /// A member whose embedding worker is off never owns an embedding, and one
+    /// whose peers are all off owns none.
+    #[test]
+    fn a_member_with_its_embedding_worker_off_owns_no_embedding() {
+        let off = Facts { embeddings_disabled: true, ..block() };
+        let one = view(1, &[(2, block())], off.clone());
+        let two = view(2, &[(1, off)], block());
+        for key in (0..30).map(|i| format!("db/c{i}")) {
+            assert!(!one.owns_embedding(&key));
+            assert!(two.owns_embedding(&key), "{key}: the only member that can");
+        }
+    }
+
+    /// Without clustering, or with a member set nobody has spoken in, ownership
+    /// is what it was.
+    #[test]
+    fn with_no_clustering_this_node_owns_everything_and_unheard_peers_count_as_before() {
+        let alone = Owners::over(node(1), None);
+        assert!(alone.owns_subscription("wh_a") && alone.owns_embedding("db/c"));
+        // Peers that have said nothing (older builds): as the bare set did.
+        let members_set = members(&[2, 3]);
+        let unheard = Members::default();
+        for n in [2u8, 3] {
+            unheard.insert_for_test(addr(n), node(n));
+        }
+        let with_facts = Owners::over(node(1), Some(unheard));
+        let bare = Owners::over_set(node(1), members_set);
+        for i in 0..40 {
+            let id = format!("wh_{i}");
+            assert_eq!(with_facts.owns_subscription(&id), bare.owns_subscription(&id), "{id}");
+        }
+    }
+
+    fn ttl_block(collection: u64) -> Facts {
+        block().with_ttl(vec![TtlHeld {
+            collection: kimmy_core::CollectionId(collection),
+            digest: vec![1; 8],
+        }])
     }
 }

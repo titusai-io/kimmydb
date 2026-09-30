@@ -1012,6 +1012,34 @@ impl TelemetryGuard {
             |s| s.ownership.unconfirmed[2]
         );
         observe!(
+            u64_observable_gauge,
+            "kimmy.ttl.collections.owned",
+            "{collection}",
+            "TTL collections this member expires.",
+            |s| s.ownership.ttl_collections[0]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ttl.collections.owed_elsewhere",
+            "{collection}",
+            "TTL collections another member expires.",
+            |s| s.ownership.ttl_collections[1]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ttl.collections.unowned_no_holder",
+            "{collection}",
+            "TTL collections no member is known to hold the index and be able to expire.",
+            |s| s.ownership.ttl_collections[2]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ttl.collections.unowned_catching_up",
+            "{collection}",
+            "TTL collections whose every known holder is catching up, so expiry waits.",
+            |s| s.ownership.ttl_collections[3]
+        );
+        observe!(
             u64_observable_counter,
             "kimmy.ownership.facts_undecodable",
             "{block}",

@@ -352,7 +352,11 @@ key — does not, because retrying it would stall every document queued behind i
 
 A collection is embedded by exactly one node at a time: the member its
 `"{db}/{collection}"` key assigns by rendezvous hash, the same function that
-assigns webhook delivery and TTL expiry ([ADR-077](decisions.md)). Every
+assigns webhook delivery and TTL expiry ([ADR-077](decisions.md)), among the
+members that may own it: not one that is catching up, and not one whose worker
+is switched off ([ADR-201](decisions.md)). A collection whose ownership moves to
+a member is rescanned there once the move has held for thirty seconds, so what
+the previous owner had deferred is not lost. Every
 member sees every write, but only the owner calls the provider for it; the
 others hold the write against the owner leaving and otherwise let replication
 bring them the vectors. That is what keeps a three-member cluster's provider

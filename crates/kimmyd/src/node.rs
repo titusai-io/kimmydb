@@ -1090,14 +1090,12 @@ async fn start_and_serve(config: Config) -> Result<Served> {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
                 worker.set_policy(providers);
-                worker.set_owner_check(Box::new(move |key| match &worker_members {
-                    // No clustering: the candidate set is just this node,
-                    // which owns everything.
-                    Some(members) => {
-                        kimmy_api::ownership::owns(key, worker_me, &members.node_ids())
-                    }
-                    None => true,
-                }));
+                // The candidates are the live members that may own embeddings by
+                // what they say about themselves (ADR-201): not one that is
+                // catching up, and not one whose worker is switched off. With
+                // no clustering it is this node, which owns everything.
+                let owners = kimmy_api::ownership::Owners::over(worker_me, worker_members);
+                worker.set_owner_check(Box::new(move |key| owners.owns_embedding(key)));
                 worker.set_counters(worker_counters);
                 // Every error `run` returns is a storage error, which is
                 // transient: it used to return here, and node.rs logged

@@ -421,6 +421,29 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Read one length-prefixed frame.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, ProtocolError> {
+    decode(&read_body(reader).await?)
+}
+
+/// [`read_frame`], and whether this frame carried a `facts` block that did not
+/// decode (ADR-201). The flag is cleared and taken with **no await between**, right
+/// around the decode, so another task decoding on the same thread while this one
+/// waited for its bytes cannot set it: it names this frame's peer or none.
+pub(crate) async fn read_frame_noting_facts<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(Message, bool), ProtocolError> {
+    let body = read_body(reader).await?;
+    crate::facts::take_undecodable();
+    let message = decode(&body)?;
+    Ok((message, crate::facts::take_undecodable()))
+}
+
+fn decode(body: &[u8]) -> Result<Message, ProtocolError> {
+    bson::deserialize_from_slice(body)
+        .map_err(|e| ProtocolError::Malformed(format!("decoding: {e}")))
+}
+
+/// The bytes of one length-prefixed frame.
+async fn read_body<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
     // Closed only at a frame boundary, before the first byte of a prefix. A
     // connection that ends inside the prefix ended mid-frame, which is an
     // I/O failure like one that ends inside the body.
@@ -459,8 +482,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
 
     let mut body = vec![0u8; size];
     reader.read_exact(&mut body).await?;
-    bson::deserialize_from_slice(&body)
-        .map_err(|e| ProtocolError::Malformed(format!("decoding: {e}")))
+    Ok(body)
 }
 
 /// `HMAC-SHA256(secret, nonce || binding)`.
@@ -1178,6 +1200,46 @@ mod tests {
             .unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
         assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
+    }
+
+    /// Another task decoding an undecodable block on the same thread while this
+    /// one waits for its bytes must not make this frame look undecodable: the
+    /// flag belongs to the frame that was decoded, with no await between clearing
+    /// and taking it.
+    #[tokio::test]
+    async fn a_frame_is_not_blamed_for_a_block_another_task_could_not_decode() {
+        use tokio::io::AsyncWriteExt;
+        let frame = |body: bson::Document| {
+            let mut buffer = Vec::new();
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let good = frame(bson::doc! {
+            "Vectors": { "servable": {}, "witnessed": {}, "facts": { "catching_up": true } }
+        });
+        let bad = frame(bson::doc! {
+            "Vectors": { "servable": {}, "witnessed": {}, "facts": { "ttl": "not a list" } }
+        });
+
+        let (mut waiting_end, mut waiting_writer) = tokio::io::duplex(4096);
+        // The first task reads and has nothing yet: it is parked on its bytes.
+        let waiting = tokio::spawn(async move {
+            read_frame_noting_facts(&mut waiting_end).await.map(|(_, flagged)| flagged)
+        });
+        tokio::task::yield_now().await;
+
+        // Meanwhile a second connection, on this thread, decodes a bad block.
+        let (mut other_end, mut other_writer) = tokio::io::duplex(4096);
+        other_writer.write_all(&bad).await.unwrap();
+        // A read site that does not look at the flag, as most do.
+        let other = read_frame(&mut other_end).await.unwrap();
+        assert!(matches!(other, Message::Vectors { facts: None, .. }), "the block was dropped");
+
+        // Now the first one's bytes arrive, and they are good.
+        waiting_writer.write_all(&good).await.unwrap();
+        assert!(!waiting.await.unwrap().unwrap(), "and not on the frame that was waiting");
     }
 
     /// The boundary for `facts` (ADR-201), in both directions and on both

@@ -24,7 +24,10 @@
 //!   an interval with no stronger promise, and the alternative — every node
 //!   expiring — trades a bounded delay for permanent write amplification.
 //! - **A brief double-delete is possible** while membership is settling, since
-//!   a node SWIM has declared dead still counts itself a candidate. Two deletes
+//!   a node SWIM has declared dead still counts itself a candidate, and **for
+//!   about one sync interval after a TTL index is created**: until the members
+//!   have told each other they hold it, each holder counts only itself, so more
+//!   than one holder may delete the same expired document (ADR-201). Two deletes
 //!   of one document converge to the same tombstone under last-writer-wins, so
 //!   this costs an extra oplog entry and nothing else.
 //!
@@ -42,7 +45,7 @@ use kimmy_core::NodeId;
 use kimmy_storage::{Engine, ExpiryOutcome, physical_now_ms, ttl_indexes};
 use tracing::{debug, info, warn};
 
-use crate::ownership;
+use crate::ownership::{Owners, TtlState};
 use crate::state::SharedState;
 
 /// How often a node looks for expired documents.
@@ -58,7 +61,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// this string ([ADR-031](../../../docs/decisions.md)), so the two agree, and a
 /// string is what [`ownership::owns`] hashes. Prefixed so an expiry key can
 /// never collide with a webhook subscription id in the same hash space.
-fn key(db: &str, collection: &str) -> String {
+pub fn key(db: &str, collection: &str) -> String {
     format!("ttl\0{db}.{collection}")
 }
 
@@ -68,6 +71,13 @@ fn key(db: &str, collection: &str) -> String {
 /// logged and the pass continues: a collection that cannot be scanned must not
 /// stop every other collection from expiring.
 pub fn pass(engine: &Engine, me: NodeId, members: &BTreeSet<NodeId>, now_ms: u64) -> ExpiryOutcome {
+    pass_with(engine, &Owners::over_set(me, members.clone()), now_ms)
+}
+
+/// [`pass`], asking `owners` which collections this member may expire: the
+/// members known to hold a collection's TTL index, not every live one
+/// (ADR-201).
+pub fn pass_with(engine: &Engine, owners: &Owners, now_ms: u64) -> ExpiryOutcome {
     let mut total = ExpiryOutcome::default();
 
     let databases = match engine.list_databases() {
@@ -88,9 +98,14 @@ pub fn pass(engine: &Engine, me: NodeId, members: &BTreeSet<NodeId>, now_ms: u64
         };
 
         for coll in collections {
+            // A collection with no TTL index has nothing to expire, whoever
+            // owns it.
+            if ttl_indexes(&coll).next().is_none() {
+                continue;
+            }
             // Checked before the scan, not after: a node that does not own a
             // collection should do no storage work for it at all.
-            if !ownership::owns(&key(&coll.db, &coll.name), me, members) {
+            if !owners.owns_ttl(&coll) {
                 continue;
             }
 
@@ -146,6 +161,10 @@ pub async fn run(
     members: Option<kimmy_cluster::Members>,
     interval: Duration,
 ) {
+    let owners = Owners::over(me, members);
+    // A collection nobody can expire is said once per this many passes.
+    let mut warned: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut passes = 0u64;
     let mut ticker = tokio::time::interval(interval);
     // The first tick fires immediately, which would expire during startup
     // before membership has formed — so a node that will not own a collection
@@ -156,17 +175,19 @@ pub async fn run(
     loop {
         ticker.tick().await;
 
-        // Read per pass rather than once: membership changes under us, and an
-        // ownership answer computed from a stale set is how a collection ends
-        // up with no owner at all.
-        let live: BTreeSet<NodeId> = members.as_ref().map(|m| m.node_ids()).unwrap_or_default();
+        // Asked per pass rather than once: membership and what members say
+        // change under us, and an ownership answer computed from a stale set is
+        // how a collection ends up with no owner at all.
 
         // Off the async worker (ADR-199). The pass walks each owned TTL
         // index's expired range and deletes what it finds; inline, the worker
         // it held could not poll the runtime's I/O and timer driver, and the
         // stop signal reached the member owning the collections up to 0.74 s
         // late.
-        let outcome = kimmy_storage::blocking(|| pass(&state.engine, me, &live, physical_now_ms()));
+        let outcome =
+            kimmy_storage::blocking(|| pass_with(&state.engine, &owners, physical_now_ms()));
+        passes += 1;
+        warn_unowned(&state, &owners, &mut warned, passes);
         // Recorded even though zero-valued calls are common, because summing
         // this across a cluster is how "one document, one delete" stays a
         // measured property rather than a claim in a comment.
@@ -180,9 +201,52 @@ pub async fn run(
     }
 }
 
+/// How many passes go between two warnings about the same collection.
+const UNOWNED_WARN_EVERY: u64 = 30;
+
+/// Say, rate-limited per collection, that no member can expire a collection this
+/// member holds a TTL index on, and why (ADR-201). Silent expiry is the failure
+/// this whole design exists to make audible.
+fn warn_unowned(
+    state: &SharedState,
+    owners: &Owners,
+    warned: &mut std::collections::HashMap<String, u64>,
+    pass: u64,
+) {
+    let collections = match kimmy_storage::blocking(|| state.engine.all_collections()) {
+        Ok(collections) => collections,
+        Err(e) => {
+            debug!(error = %e, "could not list collections to check who owns their expiry");
+            return;
+        }
+    };
+    let view = owners.ttl_view(&collections);
+    warned.retain(|name, _| view.unowned.iter().any(|(unowned, _)| unowned == name));
+    for (name, why) in &view.unowned {
+        let due = warned.get(name).is_none_or(|last| pass - last >= UNOWNED_WARN_EVERY);
+        if !due {
+            continue;
+        }
+        warned.insert(name.clone(), pass);
+        match why {
+            TtlState::UnownedCatchingUp => warn!(
+                collection = %name,
+                "no member can expire this collection: every member known to hold its TTL index \
+                 is catching up, so expiry waits until one has caught up"
+            ),
+            _ => warn!(
+                collection = %name,
+                "no member can expire this collection: none is known to hold its TTL index and \
+                 be able to expire (every holder has expiry switched off, or none is known)"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ownership;
 
     fn node(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 16])

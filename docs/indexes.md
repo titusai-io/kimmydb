@@ -726,8 +726,14 @@ and the mechanism, and it still answers ordinary queries.
 ### In a cluster
 
 **One node expires a given collection**, chosen by rendezvous hashing over the
-live member set — the same mechanism webhook subscriptions use (ADR-045,
-ADR-051). Its deletes then replicate as ordinary deletes.
+live members **that are known to hold its TTL index and are able to expire**
+([ADR-201](decisions.md)): a member that does not hold the index, has expiry
+switched off (`storage.ttl_interval_secs = 0`) or is catching up is not a
+candidate, so a top-ranked member that cannot do the work no longer keeps the
+collection and leaves it unexpired. It is the same rendezvous mechanism webhook
+subscriptions use (ADR-045, ADR-051). Its deletes then replicate as ordinary
+deletes. A collection no member can expire is reported: `kimmy_ttl_collections`
+and a `WARN` naming it.
 
 The alternative, every node expiring independently, is *convergent* — N deletes
 of one document settle to the same tombstone — but N-1 of those entries are
@@ -738,9 +744,13 @@ background job.
 Two consequences, both deliberate:
 
 - If the owning node is stopped or partitioned, that collection **stops
-  expiring** until membership changes and ownership moves.
-- While membership settles, a brief double-delete is possible. Both converge to
-  the same tombstone, so it costs one extra oplog entry.
+  expiring** until membership changes and ownership moves. A member that drops
+  the TTL index while its contacts fail is still counted a holder only until its
+  last block is older than the lease (a few sync intervals).
+- While membership settles, and for about one sync interval after a TTL index
+  is created, a brief double-delete is possible: more than one holder may delete
+  the same expired document. Both converge to the same tombstone, so it costs one
+  extra oplog entry.
 
 **An expiry is an ordinary delete.** It is indistinguishable from a user delete
 in a change stream or a webhook, which is also MongoDB's behaviour. A dedicated
@@ -756,7 +766,11 @@ an unknown tag as *corruption* — and that was not worth the audit trail.
 
 Summed across a cluster, `kimmy_ttl_expired_total` is what makes "one document,
 one delete" a *measured* property — the cluster harness asserts exactly that,
-because correctness alone cannot tell the two designs apart.
+because correctness alone cannot tell the two designs apart. It holds once
+membership and the members' blocks have settled: **for about one sync interval
+after a TTL index is created, more than one holder may delete the same expired
+document**, because each counts only itself until the others' blocks arrive; the
+deletes converge, and the sum reads high by the duplicates for that window.
 
 A steadily rising `kimmy_ttl_skipped_total` means documents are being refreshed
 about as fast as the pass finds them, which is worth knowing before it looks

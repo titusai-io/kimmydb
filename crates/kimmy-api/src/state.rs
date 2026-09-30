@@ -258,6 +258,15 @@ impl AppState {
                         peers: m.peer_state_counts(),
                         unconfirmed: kimmy_cluster::OwnerClass::ALL
                             .map(|class| m.unconfirmed_peers(class).len() as u64),
+                        // The TTL collections this member holds an index on, by
+                        // how their expiry stands from here (ADR-201): read from
+                        // the registry, one row per collection.
+                        ttl_collections: crate::ownership::Owners::over(
+                            self.engine.node_id(),
+                            Some(m.clone()),
+                        )
+                        .ttl_view(&self.engine.all_collections().unwrap_or_default())
+                        .counts,
                         ..Default::default()
                     }
                 });

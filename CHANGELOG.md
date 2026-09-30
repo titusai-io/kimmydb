@@ -97,6 +97,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A collection's expiry is owned by a member that can expire it.** The owner was the
+  rendezvous winner over every live member, so a top-ranked member that did not hold
+  the collection's TTL index, had expiry switched off or was catching up owned the
+  collection and expired nothing, and no member expired it, with nothing said. The
+  candidates are now the members known to hold the index and able to expire, from the
+  block each sends on the replication contact ([ADR-201](docs/decisions.md)). A
+  collection no member can expire is reported by `kimmy_ttl_collections{state}` (also
+  `owned` and `owed_elsewhere`; aggregate with `max`) and a `WARN` naming it. A
+  member that is catching up no longer delivers webhooks, and one whose embedding
+  worker is off no longer owns embeddings; a collection whose embedding ownership moves
+  to a member is rescanned there, so what the previous owner had deferred is not lost.
+  For about one sync interval after a TTL index is created, more than one holder may
+  delete the same expired document (each counts only itself until the others' blocks
+  arrive); the deletes converge. Members that say nothing (an older version) are
+  counted as they were, and no stored format changes.
+
 - **A node whose open outlasts the liveness probe is no longer killed and begun
   again for ever.** Nothing listened until the open finished, so the documented
   manifest's liveness probe (Kubernetes' defaults, about 30 s) restarted any node
