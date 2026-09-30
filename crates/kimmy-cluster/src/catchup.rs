@@ -858,17 +858,67 @@ fn mutual_clear_holds(
 
 /// Write `text` to `path` atomically: a temporary file in the same directory,
 /// fsynced, renamed over the target, and the directory fsynced.
+///
+/// A write that fails after the temporary file was created removes it, so a
+/// refused rename leaves no `.tmp` beside the target.
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(FILE);
-    let tmp = dir.join(format!("{name}.tmp"));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+    let tmp = tmp_beside(path);
+    let mut file = create_fresh(&tmp)?;
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// Create `tmp` as a new file, removing whatever stands there first. A stale
+/// temporary file left by a write that never finished goes; a link planted at
+/// its name goes too, removed and not followed, so the write can neither be
+/// redirected to the link's target nor truncate it.
+fn create_fresh(tmp: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
+}
+
+/// The temporary file [`write_atomic`] writes `path` through.
+fn tmp_beside(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(FILE);
+    dir.join(format!("{name}.tmp"))
+}
+
+/// Whether the replay floor can be written in `data_dir`, asked before the store
+/// is opened: its path is absent or a regular file (judged on what a link points
+/// at, which is followed), and the directory takes the temporary file the write
+/// goes through. The floor's contents need the open's
+/// position and are written right after it; this is what lets a path that can
+/// never take them refuse the start before the open rather than after it.
+pub fn check_replay_floor_writable(data_dir: &Path) -> std::io::Result<()> {
+    let file = data_dir.join(REPLAY_FLOOR_FILE);
+    match std::fs::metadata(&file) {
+        Ok(found) if !found.is_file() => {
+            return Err(std::io::Error::other(format!(
+                "{} exists and is not a regular file",
+                file.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let tmp = tmp_beside(&file);
+    drop(create_fresh(&tmp)?);
+    std::fs::remove_file(&tmp)
 }
 
 /// The replay floor's file name, in the data directory.
@@ -1828,6 +1878,66 @@ mod tests {
         );
         assert!(f.catchup.replay_armed(), "the floor is kept");
         assert!(!f.catchup.replay_answered(node(2)), "and it is still asked when reached");
+    }
+
+    #[test]
+    fn a_replay_floor_path_that_cannot_take_a_file_is_refused_before_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        check_replay_floor_writable(dir.path()).expect("an absent floor can be written");
+        assert!(!dir.path().join("kimmy.replay-floor.tmp").exists(), "the probe cleans up");
+        write_replay_floor(dir.path(), kimmy_core::Hlc::new(1, 0)).unwrap();
+        check_replay_floor_writable(dir.path()).expect("a regular file is replaced");
+
+        let floor_is_a_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(floor_is_a_directory.path().join(REPLAY_FLOOR_FILE)).unwrap();
+        let refused = check_replay_floor_writable(floor_is_a_directory.path()).unwrap_err();
+        assert!(refused.to_string().contains("not a regular file"), "{refused}");
+
+        let tmp_is_a_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp_is_a_directory.path().join("kimmy.replay-floor.tmp")).unwrap();
+        assert!(check_replay_floor_writable(tmp_is_a_directory.path()).is_err());
+
+        assert!(check_replay_floor_writable(&dir.path().join("absent")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_the_temporary_name_is_replaced_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, "not the floor").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("kimmy.replay-floor.tmp");
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+
+        check_replay_floor_writable(dir.path()).expect("the probe replaces the link");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "not the floor");
+        assert!(!tmp.exists() && tmp.symlink_metadata().is_err(), "the probe removes what it made");
+
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        write_replay_floor(dir.path(), kimmy_core::Hlc::new(7, 0)).expect("the write succeeds");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "not the floor");
+        assert_eq!(
+            read_replay_floor(&dir.path().join(REPLAY_FLOOR_FILE)),
+            Some(kimmy_core::Hlc::new(7, 0))
+        );
+        assert!(tmp.symlink_metadata().is_err(), "no temporary file is left");
+    }
+
+    #[test]
+    fn a_write_whose_rename_fails_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the target: the temporary file is written, then the
+        // rename over it is refused.
+        let floor = dir.path().join(REPLAY_FLOOR_FILE);
+        std::fs::create_dir(&floor).unwrap();
+        assert!(write_replay_floor_file(&floor, kimmy_core::Hlc::new(1, 0)).is_err());
+        assert!(!dir.path().join("kimmy.replay-floor.tmp").exists(), "the floor's temporary file");
+
+        let marker = dir.path().join(FILE);
+        std::fs::create_dir(&marker).unwrap();
+        assert!(write_atomic(&marker, "reason = \"restored\"\n").is_err());
+        assert!(!dir.path().join(format!("{FILE}.tmp")).exists(), "the marker's temporary file");
     }
 
     /// A member with clustering off forgets the replay and its floor.

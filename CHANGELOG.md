@@ -10,6 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A clustered start that can never write its replay floor is refused before
+  the store is opened, and leaves no temporary file.** The floor
+  (`kimmy.replay-floor`) is written right after the open, from the position
+  the store has then. When its path held something that is not a regular
+  file, a directory for one, the start failed only after the open:
+  `kimmy.redb` had already been opened and committed to, and the failed write
+  left a `kimmy.replay-floor.tmp` beside it. A FIFO there was worse: the start
+  hung after the open, ignored `SIGTERM` and needed `SIGKILL`. A start now
+  checks, before the open and before it writes the catching-up marker, that
+  the path is absent or a regular file (judged on what a symlink points at)
+  and that the data directory takes the temporary file the write goes through.
+  It exits with the same error class as a marker that cannot be written
+  (`the replay floor cannot be written`), with the store neither created nor
+  touched; the failed start is recorded in `kimmy.last-exit` where the start
+  holds the directory lock. A read-only data directory is refused the same
+  way; it used to fail after the open, or start only when a floor file already
+  on disk needed no rewrite.
+  A write that fails after its temporary file was created, the floor's or the
+  marker's, now removes it, and a stale temporary file, or a link planted at
+  its name, is removed before the new one is created, so the write can no
+  longer be redirected to, or truncate, the link's target.
+
 ## 0.43.0 - 2026-09-30
 
 **Roll the members one at a time. This release is not a rollback boundary for

@@ -574,6 +574,17 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         kimmy_cluster::names_another_member(&config.cluster.seeds, config.cluster.bind),
         store_existed,
     );
+    // The replay floor is written right after the open, from the position the
+    // store has then. A path that can never take it is refused here, with
+    // nothing written and the store not opened, like a marker that cannot be
+    // written.
+    if plan.arm_replay {
+        kimmy_storage::blocking(|| {
+            kimmy_cluster::catchup::check_replay_floor_writable(&config.storage.data_dir)
+        })
+        .context("the replay floor cannot be written")
+        .map_err(failed_before_open)?;
+    }
     if plan.discard_marker {
         catch_up.discard_when_standalone();
     }
