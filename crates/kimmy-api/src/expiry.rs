@@ -274,15 +274,13 @@ impl Unowned {
     /// many were said.
     fn say(&mut self, view: &crate::ownership::TtlView, now: tokio::time::Instant) -> usize {
         let mut said = 0;
-        // A collection that has an owner again is forgotten, so it is said at once
-        // if it loses it again.
-        self.warned.retain(|name, _| view.unowned.iter().any(|(unowned, _)| unowned == name));
+        // Kept across a spell with an owner, so a collection whose ownership
+        // flaps is still said once per gap and not at every check; pruned once
+        // the gap has passed, when it would be due anyway, so the map holds only
+        // the collections said within the last gap.
+        self.warned.retain(|_, last| now.saturating_duration_since(*last) < UNOWNED_WARN_EVERY);
         for (name, why) in &view.unowned {
-            let due = self
-                .warned
-                .get(name)
-                .is_none_or(|last| now.saturating_duration_since(*last) >= UNOWNED_WARN_EVERY);
-            if !due {
+            if self.warned.contains_key(name) {
                 continue;
             }
             self.warned.insert(name.clone(), now);
@@ -354,8 +352,9 @@ mod tests {
     }
 
     /// A collection nobody can expire is said at once, then not again for
-    /// thirty minutes however often it is checked; one that finds an owner and
-    /// loses it again is said at once.
+    /// thirty minutes however often it is checked, and however often it finds an
+    /// owner and loses it again in between. What was said is forgotten once the
+    /// gap has passed.
     #[test]
     fn an_unowned_collection_is_said_once_per_thirty_minutes() {
         let t0 = tokio::time::Instant::now();
@@ -371,8 +370,14 @@ mod tests {
             assert_eq!(said.say(&unowned, at(minute * 60)), 0, "minute {minute}");
         }
         assert_eq!(said.say(&unowned, at(30 * 60)), 1, "due again after thirty minutes");
-        assert_eq!(said.say(&owned, at(31 * 60)), 0);
-        assert_eq!(said.say(&unowned, at(32 * 60)), 1, "owned in between, so said at once");
+        // Flapping, owned one minute and not the next: still once per gap.
+        for minute in 31..60 {
+            let view = if minute % 2 == 1 { &owned } else { &unowned };
+            assert_eq!(said.say(view, at(minute * 60)), 0, "minute {minute}");
+        }
+        assert_eq!(said.say(&unowned, at(60 * 60)), 1, "thirty minutes after the last");
+        assert_eq!(said.say(&owned, at(90 * 60)), 0);
+        assert!(said.warned.is_empty(), "forgotten once the gap has passed");
     }
 
     #[test]

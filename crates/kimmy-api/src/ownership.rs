@@ -611,6 +611,12 @@ mod tests {
 
         let able = seen(ttl_block(id));
         assert_eq!(able.counts, [0, 1, 0, 0], "the able holder owns it: {able:?}");
+
+        // This member is catching up too, with expiry off, and no peer holds
+        // the index: once caught up it still would not expire it, so nobody can.
+        let mine = Facts { ttl_disabled: true, catching_up: true, ..ttl_block(id) };
+        let alone_off = view(1, &[(2, block())], mine).ttl_view(&registry);
+        assert_eq!(alone_off.counts, [0, 0, 1, 0], "{alone_off:?}");
     }
 
     /// Without clustering, a member with expiry off can expire nothing and nobody
