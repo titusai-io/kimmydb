@@ -106,9 +106,13 @@ impl VectorRecord {
     /// one fingerprinted `config`. A record with no fingerprint is judged as
     /// `unstamped` says.
     pub fn is_stale(&self, current: Hlc, config: u64, unstamped: Unstamped) -> bool {
-        if self.source_hlc < current {
-            return true;
-        }
+        self.source_hlc < current || self.made_under_another(config, unstamped)
+    }
+
+    /// Whether this record was made under a configuration other than the one
+    /// fingerprinted `config`, whatever its version. A record with no
+    /// fingerprint is judged as `unstamped` says.
+    pub fn made_under_another(&self, config: u64, unstamped: Unstamped) -> bool {
         match self.config {
             Some(made_under) => made_under != config,
             None => unstamped == Unstamped::Stale,

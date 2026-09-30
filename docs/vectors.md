@@ -322,6 +322,11 @@ struct VectorRecord {
 }
 ```
 
+`config` is internal: no API response carries it. A client that reads the
+shadow collection directly sees it as an `int64`, which may be negative: it
+holds the fingerprint's 64 bits in a signed integer, since BSON has no unsigned
+64-bit type.
+
 That one field does the work of a queue:
 
 - **Staleness is a comparison, not a state machine.** If a document's current
@@ -334,13 +339,22 @@ That one field does the work of a queue:
   cannot see one, since configurations do not touch documents, so a record
   also says which configuration made it: a fingerprint of the whole
   configuration (provider and model, `dim`, `fields`, chunking, prefixes,
-  metric). A record whose fingerprint is not the collection's current one is
-  stale wherever it is read, so a reindex that stopped part-way is finished by
-  whichever member next scans the collection, and what it had already
-  re-embedded is not sent again ([ADR-203](decisions.md)). A record with no
-  fingerprint, written before 0.43.0 or by an older member, is judged by its
-  HLC alone, except in a configuration change's own backfill, which re-embeds
-  it.
+  metric, and the provider's `endpoint` and `api_key_env` too, so moving an
+  Ollama server to another host or renaming the key's variable re-embeds the
+  whole collection). A record whose fingerprint is not the collection's
+  current one is stale wherever it is read, so a reindex that stopped part-way
+  is finished by whichever member next scans the collection, and what it had
+  already re-embedded is not sent again ([ADR-203](decisions.md)).
+- **A record with no fingerprint** (written before 0.43.0, by an older member,
+  or by a client into a collection the server embeds) is judged by its HLC
+  alone, except in a *forced* scan, which re-embeds it: a configuration
+  change's own backfill on the member that owns the collection, and the
+  recovery of a lost stream position, each unless this member has already
+  completed a scan under the current configuration (a replayed entry, say);
+  and an ownership rescan on a member that completed a scan under an earlier
+  configuration and has not yet processed the change. Nowhere else: not on the
+  stream, not in a deferred re-check, and not in an ownership rescan on a
+  member with nothing recorded.
 
 The worker records its oplog position **after** doing the work, never before.
 Crashing mid-embed replays the entry; crashing after writing vectors but before
@@ -363,6 +377,13 @@ A provider failure that could plausibly succeed on retry — a transport error, 
 rate limit — retries the same entry after a delay rather than advancing past it.
 A failure that will fail identically forever — a wrong dimension, a missing API
 key — does not, because retrying it would stall every document queued behind it.
+A document the provider refuses for good this way also **loses the vectors it
+held from another configuration**: they are another model's, and a search would
+rank them against queries embedded by this one. Vectors it holds from the
+current configuration, only behind the document, stay. A `WARN` names the
+document and the chunks removed. The refused document then has no vectors, so
+every later scan sends it again, as it does any document that has never been
+embedded.
 
 ---
 
@@ -383,7 +404,13 @@ provider calls. That check sees a configuration change as well as a document
 change, since each record says which configuration made it, so a reindex the
 previous owner left unfinished, because it stopped or left part-way through, is
 finished by the member that takes the collection over, and the documents the
-owner had reached are not sent again ([ADR-203](decisions.md)). Records written
+owner had reached are not sent again ([ADR-203](decisions.md)). A scan asks
+again, before each batch, whether this member still owns the collection, and one
+that no longer does stops there without recording anything, so a reindex under
+way when ownership moves is not sent twice, beyond the batch in flight; a forced
+one goes on only for records with no fingerprint, which the new owner's rescan
+trusts. Two members that each believe they own the collection, across a
+partition, both scan it. Records written
 before 0.43.0 cannot say, and a rescan re-embeds them only on a member that
 completed a scan under an earlier configuration and has not yet processed the
 change itself (a member that sees a change backfilled by another member forgets

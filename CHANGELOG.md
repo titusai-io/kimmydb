@@ -142,8 +142,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and are judged as before; the next configuration change's backfill stamps
   them ([docs/operations.md](docs/operations.md)). Vectors a client stores into
   a `byo` collection carry that configuration's fingerprint, so a later switch
-  to a server-side provider is finished the same way. The field is additive: an
-  older build reads such a record and ignores it, so a rollback is safe.
+  to a server-side provider is finished the same way. A scan now asks before
+  each batch whether this member still owns the collection and stops when it
+  does not, so a reindex under way when ownership moves is not sent to the
+  provider twice (two members that each believe they own it across a partition
+  still both scan it). A document the new configuration's provider refuses for
+  good loses the vectors it held from the old one, with a `WARN` naming it,
+  instead of leaving another model's vectors in the collection's search. The
+  fingerprint covers the whole configuration, the provider's `endpoint` and
+  `api_key_env` included, so changing either re-embeds the collection. The
+  field is additive: an older build reads such a record and ignores it, so a
+  rollback is safe.
 - **A node whose open outlasts the liveness probe is no longer killed and begun
   again for ever.** Nothing listened until the open finished, so the documented
   manifest's liveness probe (Kubernetes' defaults, about 30 s) restarted any node

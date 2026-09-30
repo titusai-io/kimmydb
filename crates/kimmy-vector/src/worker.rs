@@ -239,6 +239,24 @@ struct Job {
     inputs: Vec<String>,
     /// Estimated tokens across `inputs`, for the batch's token bound.
     tokens: usize,
+    /// How the document's records with no fingerprint were read when it was
+    /// judged stale, so that a permanent refusal removes what that judgement
+    /// called another configuration's vectors, and nothing else.
+    unstamped: Unstamped,
+}
+
+/// What a scan re-embeds, fixed at its start except for `handed_over`.
+#[derive(Clone, Copy, Debug)]
+struct Judgement {
+    /// The fingerprint of the configuration the scan runs under.
+    fingerprint: u64,
+    /// How a record with no fingerprint is read.
+    unstamped: Unstamped,
+    /// This member stopped owning the collection part-way through a forced
+    /// scan, so only what the new owner will not re-embed is left to it: a
+    /// document whose records have no fingerprint and are current by version,
+    /// which the new owner's rescan trusts (ADR-203).
+    handed_over: bool,
 }
 
 /// Documents of one collection gathered for one provider call.
@@ -1481,7 +1499,15 @@ impl EmbeddingWorker {
         // Embedding from the entry's own image is what makes this path cheap:
         // no re-read of the document. The version is the entry's, and the
         // stamp check after the provider call is what keeps that honest.
-        let Some(job) = self.prepare(&shadow, &config, source, entry.stamp.hlc, &document)? else {
+        let Some(job) = self.prepare(
+            &shadow,
+            &config,
+            source,
+            entry.stamp.hlc,
+            &document,
+            Unstamped::ByVersion,
+        )?
+        else {
             return Ok(Prepared::Done(Outcome::Skipped));
         };
         Ok(Prepared::Embed(Box::new(Item { collection, shadow, config, job })))
@@ -1603,6 +1629,7 @@ impl EmbeddingWorker {
             None => unscanned == Unscanned::Force,
         };
         let unstamped = if force { Unstamped::Stale } else { Unstamped::ByVersion };
+        let mut judgement = Judgement { fingerprint, unstamped, handed_over: false };
 
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
@@ -1627,25 +1654,46 @@ impl EmbeddingWorker {
         // document, inside `embed_batch`, exactly as the streaming path.
         let mut batch = Batch::new(collection.clone(), shadow.clone(), config.clone());
         for source in ids {
-            // Three reads per document, off the async worker like the walk.
-            let prepared = kimmy_storage::blocking(|| {
-                self.prepare_one(collection, shadow, config, &source, fingerprint, unstamped)
-            });
-            let job = match prepared {
-                Ok(Some(job)) => job,
-                Ok(None) => continue,
-                Err(e) if e.is_stopping() => return Err(e),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        db = %collection.db,
-                        collection = %collection.name,
-                        doc = %source,
-                        "backfill could not read a document; skipping it"
-                    );
-                    continue;
-                }
+            let Some(mut job) = self.scanned_job(collection, shadow, config, &source, judgement)?
+            else {
+                continue;
             };
+            // **Ownership is asked again before each batch starts.** A scan can
+            // run for as long as the collection is large, and ownership can
+            // move meanwhile; the new owner's rescan then sees every document
+            // this scan has not reached as stale, by its version or by the
+            // configuration its records carry, and embeds it, so a scan that
+            // ran on would send the rest of the collection twice. At most the
+            // batch in flight and the one being gathered overlap. A scan that
+            // trusts records with no fingerprint stops here. A forced one goes
+            // on for exactly the documents the new owner will not re-embed —
+            // records with no fingerprint, current by version, which its
+            // rescan trusts — and neither records a fingerprint. Two members
+            // that each believe they own the collection (a partition) both
+            // scan it: the one duplicate this accepts (ADR-203).
+            if batch.jobs.is_empty()
+                && !judgement.handed_over
+                && !kimmy_storage::blocking(|| self.is_owner_of(&collection.db, &collection.name))
+            {
+                judgement.handed_over = true;
+                info!(
+                    db = %collection.db,
+                    collection = %collection.name,
+                    embedded,
+                    reason,
+                    "this member no longer owns the collection; its new owner finishes the scan"
+                );
+                if !force {
+                    break;
+                }
+                // Judged again by what is left to this member.
+                let Some(left) =
+                    self.scanned_job(collection, shadow, config, &source, judgement)?
+                else {
+                    continue;
+                };
+                job = left;
+            }
             if !batch.accepts(&job, &self.batching) {
                 let ready = std::mem::replace(
                     &mut batch,
@@ -1677,7 +1725,8 @@ impl EmbeddingWorker {
         // with nothing recorded, proved nothing about them, and recording it
         // would stop a later forced scan when this member is behind a
         // configuration its stream has not yet reached.
-        if force || recorded == Some(fingerprint) {
+        // A scan that handed the collection over completed nothing.
+        if !judgement.handed_over && (force || recorded == Some(fingerprint)) {
             self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
         }
         info!(
@@ -1688,6 +1737,36 @@ impl EmbeddingWorker {
             "scanned a collection's vectors"
         );
         Ok(embedded)
+    }
+
+    /// One document of a scan, read and prepared off the async worker (three
+    /// reads, like the walk). A read that fails is logged and the document
+    /// skipped; the stop is not.
+    fn scanned_job(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        source: &kimmy_core::DocId,
+        judgement: Judgement,
+    ) -> Result<Option<Job>> {
+        let prepared = kimmy_storage::blocking(|| {
+            self.prepare_one(collection, shadow, config, source, judgement)
+        });
+        match prepared {
+            Ok(job) => Ok(job),
+            Err(e) if e.is_stopping() => Err(e),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    db = %collection.db,
+                    collection = %collection.name,
+                    doc = %source,
+                    "backfill could not read a document; skipping it"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Bring one document's vectors up to date, alone. `Ok(true)` if work was
@@ -1701,13 +1780,21 @@ impl EmbeddingWorker {
         source: &kimmy_core::DocId,
         unstamped: Unstamped,
     ) -> Result<bool> {
-        let fingerprint = config.fingerprint();
-        let Some(job) =
-            self.prepare_one(collection, shadow, config, source, fingerprint, unstamped)?
-        else {
+        let judgement =
+            Judgement { fingerprint: config.fingerprint(), unstamped, handed_over: false };
+        let Some(job) = self.prepare_one(collection, shadow, config, source, judgement)? else {
             return Ok(false);
         };
-        let vectors = self.call_provider(collection, config, std::slice::from_ref(&job)).await?;
+        let vectors = match self.call_provider(collection, config, std::slice::from_ref(&job)).await
+        {
+            Ok(vectors) => vectors,
+            Err(e) => {
+                if !e.is_stopping() && !e.is_retryable() && !e.is_refused_by_policy() {
+                    self.forget_refused(collection, shadow, config, &job);
+                }
+                return Err(e);
+            }
+        };
         let stored =
             self.store(collection, shadow, config, vec![job], vectors, &mut Checkpoint::default())?;
         Ok(stored == 1)
@@ -1717,18 +1804,18 @@ impl EmbeddingWorker {
     /// already current: at the document's version and made under `config`,
     /// whose fingerprint the caller computed once for its whole run.
     ///
-    /// `unstamped` is how a record with no fingerprint is read.
+    /// `judgement.unstamped` is how a record with no fingerprint is read.
     /// [`Unstamped::Stale`] re-embeds such current-looking vectors — the
     /// configuration changed, and a record from before 0.43.0 cannot say it
-    /// was made under the new one.
+    /// was made under the new one. Once `judgement.handed_over`, only such a
+    /// document is prepared: every other stale one is the new owner's.
     fn prepare_one(
         &self,
         collection: &CollectionMeta,
         shadow: &CollectionMeta,
         config: &VectorConfig,
         source: &kimmy_core::DocId,
-        fingerprint: u64,
-        unstamped: Unstamped,
+        judgement: Judgement,
     ) -> Result<Option<Job>> {
         // The stamp is the document's *current* version, read fresh — a
         // document replaced mid-scan is embedded at whichever version the
@@ -1737,13 +1824,22 @@ impl EmbeddingWorker {
         let Some(stamp) = self.engine.document_stamp(collection, source)? else {
             return Ok(None);
         };
-        if !self.engine.vectors_are_stale(shadow, source, stamp.hlc, fingerprint, unstamped)? {
+        let Judgement { fingerprint, unstamped, handed_over } = judgement;
+        let stale = |unstamped| {
+            self.engine.vectors_are_stale(shadow, source, stamp.hlc, fingerprint, unstamped)
+        };
+        let wanted = if handed_over {
+            !stale(Unstamped::ByVersion)? && stale(Unstamped::Stale)?
+        } else {
+            stale(unstamped)?
+        };
+        if !wanted {
             return Ok(None);
         }
         let Some(document) = self.engine.get(collection, source)? else {
             return Ok(None);
         };
-        self.prepare(shadow, config, source.clone(), stamp.hlc, &document)
+        self.prepare(shadow, config, source.clone(), stamp.hlc, &document, unstamped)
     }
 
     /// Text to chunks to provider inputs, for one version of one document.
@@ -1757,6 +1853,7 @@ impl EmbeddingWorker {
         source: kimmy_core::DocId,
         hlc: Hlc,
         document: &bson::Document,
+        unstamped: Unstamped,
     ) -> Result<Option<Job>> {
         let text = extract_text(document, config);
         let chunks = config.chunk.split(&text);
@@ -1766,7 +1863,7 @@ impl EmbeddingWorker {
         }
         let inputs = prefixed(config, &chunks);
         let tokens = inputs.iter().map(|input| ChunkConfig::estimate_tokens(input)).sum();
-        Ok(Some(Job { source, hlc, chunks, inputs, tokens }))
+        Ok(Some(Job { source, hlc, chunks, inputs, tokens, unstamped }))
     }
 
     /// One provider call for every chunk of every job, in job order.
@@ -2084,6 +2181,7 @@ impl EmbeddingWorker {
                             doc = %job.source,
                             "embedding permanently failed; skipping this document"
                         );
+                        self.forget_refused(collection, shadow, config, &job);
                     }
                     return 0;
                 }
@@ -2101,6 +2199,47 @@ impl EmbeddingWorker {
                 checkpoint.failed = true;
                 0
             }
+        }
+    }
+
+    /// Remove what a document the provider permanently refused holds from
+    /// another configuration, judged as the document was when it was judged
+    /// stale (ADR-203). It is another model's vectors in this collection's
+    /// shadow, and a search would rank them against queries embedded under
+    /// this one. Vectors already under this configuration, only behind the
+    /// document, stay. Named in a `WARN` when anything went; a failure to
+    /// remove them leaves them, and says so.
+    fn forget_refused(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        job: &Job,
+    ) {
+        let removed = kimmy_storage::blocking(|| {
+            self.engine.delete_vectors_made_under_another(
+                shadow,
+                &job.source,
+                config.fingerprint(),
+                job.unstamped,
+            )
+        });
+        match removed {
+            Ok(0) => {}
+            Ok(chunks) => warn!(
+                db = %collection.db,
+                collection = %collection.name,
+                doc = %job.source,
+                chunks,
+                "removed the vectors a refused document held from another configuration"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                db = %collection.db,
+                collection = %collection.name,
+                doc = %job.source,
+                "could not remove the vectors a refused document holds from another configuration"
+            ),
         }
     }
 
@@ -3349,8 +3488,11 @@ mod tests {
                     &shadow,
                     &config,
                     &id,
-                    config.fingerprint(),
-                    Unstamped::ByVersion,
+                    Judgement {
+                        fingerprint: config.fingerprint(),
+                        unstamped: Unstamped::ByVersion,
+                        handed_over: false,
+                    },
                 )
                 .unwrap()
                 .expect("a fresh document has a job");
@@ -5131,5 +5273,205 @@ mod tests {
         assert_eq!(fake.inputs.lock().unwrap().len(), 1, "the stamped client record, alone");
         assert_eq!(made_under(&engine, &ids[0]), Some(served.fingerprint()));
         assert_eq!(made_under(&engine, &ids[1]), None, "an unstamped one is trusted by version");
+    }
+
+    /// A provider that takes its time over every call, so that two members'
+    /// scans overlap in time as they do on a real cluster.
+    struct Slow {
+        inner: Arc<FakeProvider>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for Slow {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.embed(texts).await
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// A worker for the collection, batching four documents to a call through
+    /// a provider that takes 100 ms, and `fake` counting what it sends.
+    fn a_slow_worker(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+        owner: bool,
+    ) -> (EmbeddingWorker, Arc<FakeProvider>, Arc<std::sync::atomic::AtomicBool>) {
+        let mut worker = EmbeddingWorker::new(Arc::clone(engine));
+        worker.set_batching(BatchSettings { max_chunks: 4, ..Default::default() });
+        let fake = FakeProvider::new(4);
+        let slow = Slow { inner: Arc::clone(&fake), delay: Duration::from_millis(100) };
+        worker.set_provider(coll.id.0, Arc::new(slow));
+        let flag = switchable_owner(&mut worker, owner);
+        (worker, fake, flag)
+    }
+
+    /// Forty documents embedded under configuration A, then reconfigured to B
+    /// (a document prefix). The owner O starts B's backfill; 250 ms in, the
+    /// collection's ownership moves to N, whose rescan of it (after the
+    /// settle) runs while O's scan does. Answers what each sent, once both are
+    /// done.
+    async fn ownership_moves_during_a_reindex(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+        before_043: bool,
+    ) -> (Vec<kimmy_core::DocId>, u64, Arc<FakeProvider>, Arc<FakeProvider>) {
+        let a = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        let mut first = EmbeddingWorker::new(Arc::clone(engine));
+        first.set_provider(coll.id.0, FakeProvider::new(4));
+        switchable_owner(&mut first, true);
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let id = engine
+                .insert(
+                    coll,
+                    bson::doc! { "_id": format!("d{i:02}"), "title": "hello", "body": format!("doc{i}") },
+                )
+                .unwrap();
+            assert!(matches!(
+                first.process(&last_entry(engine)).await.unwrap(),
+                Outcome::Embedded { .. }
+            ));
+            ids.push(id);
+        }
+        if before_043 {
+            written_before_043(engine, &ids);
+        }
+        let b = VectorConfig { document_prefix: Some("passage: ".into()), ..a };
+        engine.configure_vectors("app", "docs", b.clone()).unwrap();
+        let entry = configured_entry(engine);
+
+        let (mut old_owner, sent_by_old, owns) = a_slow_worker(engine, coll, true);
+        let backfill = tokio::spawn(async move { old_owner.process(&entry).await });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        owns.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (mut new_owner, sent_by_new, _) = a_slow_worker(engine, coll, true);
+        let t0 = Instant::now();
+        new_owner.rescan_gained(t0).await.unwrap();
+        new_owner.rescan_gained(t0 + Duration::from_secs(31)).await.unwrap();
+        backfill.await.unwrap().unwrap();
+        (ids, b.fingerprint(), sent_by_old, sent_by_new)
+    }
+
+    /// The owner of a reindex that loses the collection part-way stops at the
+    /// next batch and records nothing; the new owner finishes the rest. When the
+    /// old owner scanned on, both walked the same documents in the same order,
+    /// each sending what the other had not yet stored: about 72 provider inputs
+    /// for 40 documents, where one batch of overlap is the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_stops_when_its_collection_moves_to_another_member() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, b, old, new) = ownership_moves_during_a_reindex(&engine, &coll, false).await;
+        let (by_old, by_new) = (old.inputs.lock().unwrap().len(), new.inputs.lock().unwrap().len());
+        assert!(by_old > 0 && by_new > 0, "each sent some: {by_old} and {by_new}");
+        assert!(by_old + by_new <= 40 + 4, "{by_old} + {by_new} inputs for 40 documents");
+        for id in &ids {
+            assert_eq!(made_under(&engine, id), Some(b), "{id} is under B");
+        }
+        assert_eq!(
+            engine.vector_fingerprint(coll.id).unwrap(),
+            None,
+            "a scan that handed the collection over attests nothing"
+        );
+    }
+
+    /// Records written before 0.43.0 are the exception: the new owner's rescan
+    /// trusts them by version, so the old owner's forced scan goes on for them
+    /// after it loses the collection, and they still end up under B, each
+    /// sent once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forced_scan_that_loses_its_collection_still_embeds_what_the_new_owner_trusts() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, b, old, new) = ownership_moves_during_a_reindex(&engine, &coll, true).await;
+        let (by_old, by_new) = (old.inputs.lock().unwrap().len(), new.inputs.lock().unwrap().len());
+        assert_eq!((by_old, by_new), (40, 0), "the old owner, alone, once each");
+        for id in &ids {
+            assert_eq!(made_under(&engine, id), Some(b), "{id} is under B");
+        }
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), None);
+    }
+
+    /// A document the new configuration's provider permanently refuses loses
+    /// the vectors another configuration made: another model's vectors in the
+    /// same shadow would be ranked against queries embedded by this one. A
+    /// refused document whose vectors are already under this configuration
+    /// keeps them.
+    #[tokio::test]
+    async fn a_refused_document_loses_the_vectors_another_configuration_made() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let a = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        owner.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut owner, true);
+        let mut ids = Vec::new();
+        for (id, body) in [("fine", "world"), ("refused", "poison"), ("later", "world")] {
+            ids.push(
+                engine
+                    .insert(&coll, bson::doc! { "_id": id, "title": "hi", "body": body })
+                    .unwrap(),
+            );
+            assert!(matches!(
+                owner.process(&last_entry(&engine)).await.unwrap(),
+                Outcome::Embedded { .. }
+            ));
+        }
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+
+        let b = VectorConfig { document_prefix: Some("passage: ".into()), ..a };
+        engine.configure_vectors("app", "docs", b.clone()).unwrap();
+        *fake.poison.lock().unwrap() = Some("poison".into());
+        let outcome = owner.process(&configured_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 2 });
+        assert!(engine.get_vectors(&shadow, &ids[1]).unwrap().is_empty(), "A's vectors are gone");
+        assert_eq!(made_under(&engine, &ids[0]), Some(b.fingerprint()));
+
+        // Under B already, then changed to text B's provider refuses: its
+        // vectors are behind the document, not another model's, and stay.
+        engine
+            .replace(
+                &coll,
+                &ids[2],
+                bson::doc! { "_id": "later", "title": "hi", "body": "poison" },
+                false,
+            )
+            .unwrap();
+        let sent = fake.calls();
+        owner.rescan_owned().await.unwrap();
+        assert!(fake.calls() > sent, "the changed document was sent, and refused");
+        assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()), "kept");
+    }
+
+    /// The same for a document a deferred re-check sends alone.
+    #[tokio::test]
+    async fn a_document_refused_alone_loses_the_vectors_another_configuration_made() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let a = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        owner.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut owner, true);
+        let id = engine
+            .insert(&coll, bson::doc! { "_id": "r", "title": "hi", "body": "poison" })
+            .unwrap();
+        assert!(matches!(
+            owner.process(&last_entry(&engine)).await.unwrap(),
+            Outcome::Embedded { .. }
+        ));
+        let b = VectorConfig { document_prefix: Some("passage: ".into()), ..a };
+        engine.configure_vectors("app", "docs", b.clone()).unwrap();
+        *fake.poison.lock().unwrap() = Some("poison".into());
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let refused = owner.embed_one(&coll, &shadow, &b, &id, Unstamped::ByVersion).await;
+        assert!(refused.is_err_and(|e| !e.is_retryable()), "refused for good");
+        assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty(), "A's vectors are gone");
     }
 }

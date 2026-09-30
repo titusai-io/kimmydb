@@ -741,6 +741,20 @@ impl crate::Engine {
         self.write_batch(WriterHolder::Embedding, |scope| scope.delete_vectors(shadow, source))
     }
 
+    /// [`WriteScope::delete_vectors_made_under_another`], in a scope of its
+    /// own. A document whose chunks are all under `config` costs no commit.
+    pub fn delete_vectors_made_under_another(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        config: u64,
+        unstamped: Unstamped,
+    ) -> Result<usize> {
+        self.write_batch(WriterHolder::Embedding, |scope| {
+            scope.delete_vectors_made_under_another(shadow, source, config, unstamped)
+        })
+    }
+
     /// Visit every stored vector. Used by search and by index rebuilds.
     ///
     /// A document that does not decode as a vector record is **skipped, not
@@ -853,6 +867,30 @@ impl WriteScope<'_> {
             self.touch_vector_generation(shadow.id);
         }
         Ok(())
+    }
+
+    /// Remove every chunk of one source document when any was made under a
+    /// configuration other than the one fingerprinted `config`
+    /// ([`VectorRecord::made_under_another`]; a chunk with no fingerprint is
+    /// judged as `unstamped` says). The embedding worker calls it when the
+    /// current configuration's provider permanently refuses the document:
+    /// what it holds is another model's vectors, in another vector space, and
+    /// a search would rank them against queries embedded by this one
+    /// (ADR-203). Chunks already under `config` are kept. Read under the
+    /// writer, like [`Self::delete_vectors`], so no write can land between
+    /// the judgement and the delete. Returns how many were removed.
+    pub fn delete_vectors_made_under_another(
+        &mut self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        config: u64,
+        unstamped: Unstamped,
+    ) -> Result<usize> {
+        let records = self.engine.get_vectors(shadow, source)?;
+        if !records.iter().any(|r| r.made_under_another(config, unstamped)) {
+            return Ok(0);
+        }
+        self.delete_vectors(shadow, source)
     }
 
     /// [`crate::Engine::delete_vectors`], into this scope's transaction.
