@@ -14,8 +14,10 @@
 //! # What is deliberately not here
 //!
 //! **Any notion of which node should run this.** Expiry is owned by one node
-//! per collection so that one document produces one delete rather than N, but
-//! that decision is rendezvous hashing over cluster membership, and this crate
+//! per collection so that one document produces one delete rather than N once
+//! the members' views have settled (ADR-201 states the windows in which more
+//! than one member deletes it), but that decision is rendezvous hashing over
+//! cluster membership, and this crate
 //! does not know a cluster exists — the same boundary that keeps `$lookup` out
 //! of `kimmy-query`. The caller decides *whether* to run a pass; this decides
 //! *what* a pass removes.

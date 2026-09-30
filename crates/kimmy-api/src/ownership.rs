@@ -1,13 +1,20 @@
-//! Which node delivers a given subscription.
+//! Which node delivers a given subscription, expires a given collection, or
+//! embeds one.
 //!
 //! # Not a leader
 //!
-//! `owner(subscription, members)` is a **pure function** of the subscription id
-//! and the live member set. Every node computes it independently and gets the
-//! same answer; there is no vote, no term, no consensus and no cluster-wide
-//! coordinator. Different subscriptions land on different nodes, so the work
-//! spreads, and a transient disagreement about membership produces a *duplicate
-//! delivery* rather than a split brain.
+//! `owner(key, candidates)` is a **pure function** of the key (a subscription
+//! id, or a collection's expiry or embedding key) and a candidate set. The
+//! candidates are the live members that may own the class by what each last
+//! said about itself on the replication contact, plus this node by its own
+//! block ([`Owners`], ADR-201): a member that is catching up, or has the work
+//! switched off, or (for expiry) is not known to hold the collection's TTL
+//! index, is not one. Every node computes it independently and gets the same
+//! answer once their views of the members agree; there is no vote, no term,
+//! no consensus and no cluster-wide coordinator. Different keys land on
+//! different nodes, so the work spreads, and a transient disagreement about
+//! membership or about what a member said produces a *duplicate delivery*
+//! rather than a split brain.
 //!
 //! # Rendezvous hashing, not modulo
 //!
@@ -175,18 +182,33 @@ enum View {
 pub struct Owners {
     me: NodeId,
     view: View,
+    /// Expiry is switched off here (`storage.ttl_interval_secs = 0`), so this
+    /// member expires nothing. With clustering its own block says so too; this
+    /// is what says it without clustering, where there is no block.
+    expiry_off: bool,
 }
 
 impl Owners {
     /// With clustering (`Some`) or without (`None`, which owns everything).
     pub fn over(me: NodeId, members: Option<kimmy_cluster::Members>) -> Self {
-        Self { me, view: members.map_or(View::Alone, View::Members) }
+        Self { me, view: members.map_or(View::Alone, View::Members), expiry_off: false }
     }
 
     /// Over a fixed live set and nothing said by anyone, as ownership was before
     /// members said anything.
     pub fn over_set(me: NodeId, live: BTreeSet<NodeId>) -> Self {
-        Self { me, view: View::Set(live) }
+        Self { me, view: View::Set(live), expiry_off: false }
+    }
+
+    /// The same view, for a member whose expiry is switched off: it is never a
+    /// candidate for a collection's expiry, clustered or not, so a collection
+    /// no other member can expire is `unowned_no_holder` from here. Without
+    /// clustering that is every TTL collection, since nobody else exists to
+    /// expire them (ADR-201).
+    #[must_use]
+    pub fn with_expiry_off(mut self, off: bool) -> Self {
+        self.expiry_off = off;
+        self
     }
 
     fn mine(&self, members: &kimmy_cluster::Members) -> std::sync::Arc<kimmy_cluster::Facts> {
@@ -200,6 +222,12 @@ impl Owners {
         collection: Option<kimmy_core::CollectionId>,
         holds_ttl: bool,
     ) -> bool {
+        // A member with expiry off is never a candidate for it: in its own
+        // view, as in its block's.
+        let holds_ttl = holds_ttl && !self.expiry_off;
+        if class == kimmy_cluster::OwnerClass::Ttl && !holds_ttl {
+            return false;
+        }
         match &self.view {
             View::Alone => true,
             View::Set(live) => owns(key, self.me, live),
@@ -242,6 +270,9 @@ impl Owners {
                 continue;
             }
             let state = match &self.view {
+                // Alone, with expiry off, nobody can expire it: there is no
+                // other member to.
+                View::Alone if self.expiry_off => TtlState::UnownedNoHolder,
                 View::Alone | View::Set(_) => {
                     if self.owns_ttl(coll) {
                         TtlState::Owned
@@ -256,11 +287,14 @@ impl Owners {
                         Some(coll.id),
                         self.me,
                         &mine,
-                        true,
+                        !self.expiry_off,
                     );
                     let key = crate::expiry::key(&coll.db, &coll.name);
                     if candidates.is_empty() {
-                        if mine.catching_up || members.holder_catching_up(coll.id) {
+                        // This member counts among the holders that are
+                        // catching up only if it could expire once caught up.
+                        let me_waiting = mine.catching_up && !mine.ttl_disabled && !self.expiry_off;
+                        if me_waiting || members.holder_catching_up(coll.id) {
                             TtlState::UnownedCatchingUp
                         } else {
                             TtlState::UnownedNoHolder
@@ -531,5 +565,67 @@ mod tests {
             collection: kimmy_core::CollectionId(collection),
             digest: vec![1; 8],
         }])
+    }
+
+    /// A store holding `app.sessions` with a TTL index, and its registry.
+    fn ttl_registry() -> (Vec<kimmy_storage::CollectionMeta>, u64, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "sessions").unwrap();
+        engine
+            .create_index_with(
+                "app",
+                "sessions",
+                vec![kimmy_storage::IndexField::ascending("seen")],
+                false,
+                Default::default(),
+                Some("ttl_seen".into()),
+                Some(60),
+                None,
+            )
+            .unwrap();
+        let id = engine.get_collection("app", "sessions").unwrap().id.0;
+        (engine.all_collections().unwrap(), id, dir)
+    }
+
+    /// A member with expiry off, whose one peer holds the index: the collection
+    /// waits when that holder says it is catching up, and nobody can expire it
+    /// when the holder has expiry off too, catching up or not, since it would not
+    /// expire it once caught up. The two states are what tell an operator "wait"
+    /// from "fix the configuration".
+    #[test]
+    fn a_holder_catching_up_is_a_wait_and_one_with_expiry_off_is_no_holder() {
+        let (registry, id, _dir) = ttl_registry();
+        let mine = Facts { ttl_disabled: true, ..ttl_block(id) };
+        let seen = |said: Facts| view(1, &[(2, said)], mine.clone()).ttl_view(&registry);
+
+        let waiting = seen(Facts { catching_up: true, ..ttl_block(id) });
+        assert_eq!(waiting.counts, [0, 0, 0, 1], "{waiting:?}");
+        assert_eq!(waiting.unowned, vec![("app.sessions".into(), TtlState::UnownedCatchingUp)]);
+
+        let off = seen(Facts { ttl_disabled: true, ..ttl_block(id) });
+        assert_eq!(off.counts, [0, 0, 1, 0], "{off:?}");
+        let off_and_waiting =
+            seen(Facts { ttl_disabled: true, catching_up: true, ..ttl_block(id) });
+        assert_eq!(off_and_waiting.counts, [0, 0, 1, 0], "{off_and_waiting:?}");
+
+        let able = seen(ttl_block(id));
+        assert_eq!(able.counts, [0, 1, 0, 0], "the able holder owns it: {able:?}");
+    }
+
+    /// Without clustering, a member with expiry off can expire nothing and nobody
+    /// else exists to: every TTL collection it holds is `unowned_no_holder`, and
+    /// it owns none of them. `Owners::over(me, None)` alone reads them owned.
+    #[test]
+    fn a_lone_member_with_expiry_off_owns_no_ttl_collection() {
+        let (registry, _, _dir) = ttl_registry();
+        let alone = Owners::over(node(1), None);
+        assert_eq!(alone.ttl_view(&registry).counts, [1, 0, 0, 0]);
+        let off = Owners::over(node(1), None).with_expiry_off(true);
+        let seen = off.ttl_view(&registry);
+        assert_eq!(seen.counts, [0, 0, 1, 0], "{seen:?}");
+        assert_eq!(seen.unowned, vec![("app.sessions".into(), TtlState::UnownedNoHolder)]);
+        assert!(!off.owns_ttl(&registry[0]));
+        assert!(off.owns_subscription("wh_a") && off.owns_embedding("app/c"), "TTL only");
     }
 }

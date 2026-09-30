@@ -116,6 +116,10 @@ pub struct AppState {
     /// while serving would be one more thing a request could race. Unset reads
     /// as [`LocalLogin::Always`], which is exactly the behaviour that shipped.
     pub(crate) local_login: std::sync::OnceLock<crate::local_login::LocalLogin>,
+    /// Whether expiry is switched off here (`storage.ttl_interval_secs = 0`),
+    /// for `kimmy_ttl_collections`: without clustering there is no block to say
+    /// it (ADR-201). Unset reads as on.
+    pub(crate) expiry_off: std::sync::OnceLock<bool>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -258,18 +262,17 @@ impl AppState {
                         peers: m.peer_state_counts(),
                         unconfirmed: kimmy_cluster::OwnerClass::ALL
                             .map(|class| m.unconfirmed_peers(class).len() as u64),
-                        // The TTL collections this member holds an index on, by
-                        // how their expiry stands from here (ADR-201): read from
-                        // the registry, one row per collection.
-                        ttl_collections: crate::ownership::Owners::over(
-                            self.engine.node_id(),
-                            Some(m.clone()),
-                        )
-                        .ttl_view(&self.engine.all_collections().unwrap_or_default())
-                        .counts,
                         ..Default::default()
                     }
                 });
+                // The TTL collections this member holds an index on, by how
+                // their expiry stands from here (ADR-201), read from the
+                // registry, one row per collection; with or without clustering,
+                // since a lone member with expiry off expires none of them. A
+                // registry that cannot be read fails the scrape, as the webhook
+                // gauges' does: a zero here would say nothing is unowned.
+                reading.ttl_collections =
+                    self.ttl_owners().ttl_view(&self.engine.all_collections()?).counts;
                 // Counted as blocks arrive, whether or not membership is up.
                 reading.undecodable = kimmy_cluster::facts_undecodable_total();
                 reading
@@ -307,6 +310,19 @@ impl AppState {
     /// The external identity provider, if this node federates with one.
     pub fn federation(&self) -> Option<&Arc<crate::federation::Federation>> {
         self.federation.get()
+    }
+
+    /// Say whether expiry is switched off here. Called once, at startup; a
+    /// second call is ignored.
+    pub fn set_expiry_off(&self, off: bool) {
+        let _ = self.expiry_off.set(off);
+    }
+
+    /// Who may expire what, from here: the live members and what they said,
+    /// and whether expiry is off on this member (ADR-201).
+    pub fn ttl_owners(&self) -> crate::ownership::Owners {
+        crate::ownership::Owners::over(self.engine.node_id(), self.members().cloned())
+            .with_expiry_off(self.expiry_off.get().copied().unwrap_or(false))
     }
 
     /// Say where a local token may be minted from. Called once, at startup; a
@@ -648,5 +664,51 @@ pub(crate) mod tests {
         members.remove_for_test(&"127.0.0.1:7001".parse().unwrap());
         let out = state.metrics.render_with(&state.storage_readings().unwrap());
         assert!(out.contains("\nkimmy_cluster_members 1\n"), "{out}");
+    }
+
+    /// `kimmy_ttl_collections` is read from the registry at the scrape, with or
+    /// without clustering (ADR-201): a lone member owns its TTL collections, and
+    /// with expiry off nobody can expire them; clustered with no peers, it owns
+    /// them. A zeroed reading would say nothing is owned or unowned anywhere.
+    #[test]
+    fn the_ttl_collections_gauge_reads_each_members_own_view() {
+        fn ttl_collection(state: &SharedState) {
+            state.engine.create_collection("app", "sessions").unwrap();
+            state
+                .engine
+                .create_index_with(
+                    "app",
+                    "sessions",
+                    vec![kimmy_storage::IndexField::ascending("seen")],
+                    false,
+                    Default::default(),
+                    Some("ttl_seen".into()),
+                    Some(60),
+                    None,
+                )
+                .unwrap();
+            state.engine.create_collection("app", "plain").unwrap();
+        }
+        let read =
+            |state: &SharedState| state.storage_readings().unwrap().ownership.ttl_collections;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alone = a_state(&dir);
+        ttl_collection(&alone);
+        assert_eq!(read(&alone), [1, 0, 0, 0], "a lone member owns its TTL collection");
+        let out = alone.metrics.render_with(&alone.storage_readings().unwrap());
+        assert!(out.contains("\nkimmy_ttl_collections{state=\"owned\"} 1\n"), "{out}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let off = a_state(&dir);
+        ttl_collection(&off);
+        off.set_expiry_off(true);
+        assert_eq!(read(&off), [0, 0, 1, 0], "with expiry off nobody can expire it");
+
+        let dir = tempfile::tempdir().unwrap();
+        let clustered = a_state(&dir);
+        ttl_collection(&clustered);
+        clustered.set_members(kimmy_cluster::Members::default());
+        assert_eq!(read(&clustered), [1, 0, 0, 0], "the only holder owns it");
     }
 }

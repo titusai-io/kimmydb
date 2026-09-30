@@ -388,15 +388,18 @@ impl Members {
         BTreeSet::new()
     }
 
-    /// Whether a live peer that lists `collection` among its TTL indexes says it
-    /// is catching up: what tells "every holder is catching up, so expiry waits"
-    /// from "nobody holds the index" (ADR-201).
+    /// Whether a live peer that lists `collection` among its TTL indexes, and has
+    /// expiry on, says it is catching up: what tells "every holder is catching
+    /// up, so expiry waits" from "nobody holds the index" (ADR-201). One with
+    /// expiry off would not expire it once caught up, so it does not count.
     pub fn holder_catching_up(&self, collection: CollectionId) -> bool {
         let table = self.0.peer_facts.read();
         self.node_ids().iter().any(|peer| {
-            table
-                .get(peer)
-                .is_some_and(|held| held.facts.catching_up && held.facts.holds_ttl(collection))
+            table.get(peer).is_some_and(|held| {
+                held.facts.catching_up
+                    && !held.facts.ttl_disabled
+                    && held.facts.holds_ttl(collection)
+            })
         })
     }
 

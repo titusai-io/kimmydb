@@ -65,6 +65,8 @@ tower = { version = "0.5", default-features = false }
 [dev-dependencies]
 # The front's tests call it as a service and read a response body.
 tower = { version = "0.5", features = ["util"] }
+# A paused clock, for the expiry task's checks, which are minutes apart.
+tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1"
 rcgen.workspace = true
 tempfile.workspace = true

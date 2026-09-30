@@ -443,6 +443,71 @@ async fn a_catching_up_member_delivers_no_subscription() {
     assert_eq!(hits.load(Ordering::Relaxed), 0, "a catching-up member must not call the endpoint");
 }
 
+/// The dispatcher's own loop asks the same gated owners, not every live member:
+/// `dispatch::run`, as the daemon spawns it, delivers nothing from a member that
+/// says it is catching up, and delivers from one that does not. A pass alone
+/// (above) cannot show that the loop builds its owners from what members say.
+#[tokio::test]
+async fn the_dispatcher_loop_asks_the_members_that_may_own_webhooks() {
+    // What this member says about itself, and one eligible peer.
+    fn members(catching_up: bool) -> kimmy_cluster::Members {
+        let members = kimmy_cluster::Members::default();
+        let peer = kimmy_core::NodeId::from_bytes([0x11; 16]);
+        members.insert_for_test("127.0.0.1:7001".parse().unwrap(), peer);
+        members.record_peer_facts_for_test(
+            peer,
+            kimmy_cluster::Facts { boot: vec![1; 16], ..Default::default() },
+            std::time::Duration::ZERO,
+        );
+        members.set_facts_source(Arc::new(move || kimmy_cluster::Facts {
+            boot: vec![2; 16],
+            catching_up,
+            ..Default::default()
+        }));
+        members
+    }
+    /// A subscription this member owns against that peer, and one event for it;
+    /// then the loop, for `wait`. Answers the endpoint's hits.
+    async fn deliveries(catching_up: bool, wait: std::time::Duration) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_for(&dir);
+        let (addr, _seen, hits) = receiver(200).await;
+        let peer = kimmy_core::NodeId::from_bytes([0x11; 16]);
+        let id = (0..)
+            .map(|i| format!("wh_loop_{i}"))
+            .find(|id| {
+                let both: BTreeSet<_> = [me(), peer].into();
+                kimmy_api::ownership::owner(id, &both) == Some(me())
+            })
+            .unwrap();
+        register_as(&state, &id, &format!("http://{addr}/hook"), vec![]);
+        let coll = state.engine.create_collection("shop", "orders").unwrap();
+        state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        let task = tokio::spawn(dispatch::run(
+            Arc::clone(&state),
+            EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
+            me(),
+            Some(members(catching_up)),
+            dispatch::Limits::default(),
+            reqwest::Client::new(),
+        ));
+        let until = tokio::time::Instant::now() + wait;
+        while hits.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        task.abort();
+        hits.load(Ordering::Relaxed)
+    }
+
+    assert!(deliveries(false, std::time::Duration::from_secs(10)).await > 0, "the owner delivers");
+    // Two ticks: the loop's first pass runs at once, and a second follows.
+    assert_eq!(
+        deliveries(true, std::time::Duration::from_millis(2_500)).await,
+        0,
+        "a member that says it is catching up delivers nothing from the loop"
+    );
+}
+
 #[tokio::test]
 async fn the_egress_policy_is_enforced_at_delivery_not_only_at_registration() {
     // A hostname is not a destination. This registers while the policy permits
