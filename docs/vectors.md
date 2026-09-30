@@ -378,10 +378,13 @@ rate limit, a `5xx`, a `408` or a `425` — retries the same entry after a delay
 A failure that will fail identically forever — a wrong dimension, a missing API
 key — does not, because retrying it would stall every document queued behind it.
 A document the provider refuses **as input** (`400`, `413` or `422`) also loses
-the vectors it held from another configuration, but only once the same scan,
-or the same batch taken apart, has seen the provider embed another document
-under the current configuration: that shows the provider works, so the refusal
-is the document's, and its old vectors can never be replaced. They may be
+the vectors it held from another configuration, but only when another document
+of the same batch, sent alone once the batch was refused and taken apart, was
+embedded and stored at that moment: the provider was taking this
+configuration's input then, so the refusal is the document's, and its old
+vectors can never be replaced. A success in an earlier or later batch does not
+count, since a provider can go bad or come good part-way through a scan (a key
+that expires answers `400` to everything from then on). They may be
 another model's, in another vector space; they may also be perfectly good (the
 fingerprint also moves with the endpoint, the key's variable, the metric or
 the query prefix), which is why nothing less than a refusal of the document

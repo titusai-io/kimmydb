@@ -426,31 +426,14 @@ struct Checkpoint {
     /// The node's stop ended the work: nothing more is done, and nothing is
     /// recorded as done. The documents are embedded after the restart.
     stopped: Option<kimmy_storage::StopReason>,
-    /// The provider answered for this batch's configuration at least once:
-    /// it works, so a document it refused as input was refused for itself.
+    /// A document of the batch in hand was embedded and stored: the
+    /// provider took input from this batch at this moment, so a document of
+    /// the same batch it refused as input was refused for itself.
     proven: bool,
-    /// Documents the provider refused as input ([`VectorError::refuses_the_input`]),
-    /// whose vectors from another configuration go once the provider is
-    /// [`Checkpoint::proven`] for the same configuration ([`Refusals`]).
+    /// Documents of the batch in hand the provider refused as input
+    /// ([`VectorError::refuses_the_input`]); see
+    /// [`EmbeddingWorker::settle_refusals`].
     refused: Vec<Job>,
-}
-
-/// Documents the provider refused as input, held until something shows the
-/// provider works for the same configuration. A refusal that every document
-/// meets (a model that does not take a field the configuration sends, say)
-/// is the configuration's, not any document's, and removes nothing.
-#[derive(Default)]
-struct Refusals {
-    proven: bool,
-    jobs: Vec<Job>,
-}
-
-impl Refusals {
-    /// Take what one batch learnt, emptying its checkpoint's share.
-    fn gather(&mut self, checkpoint: &mut Checkpoint) {
-        self.proven |= std::mem::take(&mut checkpoint.proven);
-        self.jobs.append(&mut checkpoint.refused);
-    }
 }
 
 /// The error the worker returns once the node's stop has ended its work.
@@ -991,15 +974,7 @@ impl EmbeddingWorker {
             let (collection, shadow, config) =
                 (batch.collection.clone(), batch.shadow.clone(), batch.config.clone());
             self.embed_batch(batch, &mut checkpoint).await;
-            // Batches of a flush can be of different collections, so a
-            // refusal is judged within its own batch's split.
-            let mut refusals = Refusals::default();
-            refusals.gather(&mut checkpoint);
-            if refusals.proven {
-                for job in refusals.jobs {
-                    self.forget_refused(&collection, &shadow, &config, &job);
-                }
-            }
+            self.settle_refusals(&collection, &shadow, &config, &mut checkpoint);
             if checkpoint.stopped.is_some() {
                 break;
             }
@@ -1690,7 +1665,6 @@ impl EmbeddingWorker {
         };
         let unstamped = if force { Unstamped::Stale } else { Unstamped::ByVersion };
         let mut judgement = Judgement { fingerprint, unstamped, handed_over: false };
-        let mut refusals = Refusals::default();
 
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
@@ -1760,7 +1734,7 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready, &mut refusals).await?;
+                embedded += self.embed_scanned(ready).await?;
             }
             batch.push(job);
             if batch.full(&self.batching) {
@@ -1768,10 +1742,10 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready, &mut refusals).await?;
+                embedded += self.embed_scanned(ready).await?;
             }
         }
-        embedded += self.embed_scanned(batch, &mut refusals).await?;
+        embedded += self.embed_scanned(batch).await?;
 
         // The completed scan is what the fingerprint attests. Failing to
         // write it costs a redundant re-scan next time, never a gap. A scan
@@ -2086,7 +2060,7 @@ impl EmbeddingWorker {
     /// between them, and it is working: without this its age climbed for the
     /// whole scan. A store that fails is not progress, or a shadow collection
     /// that cannot be written would read fresh for the whole scan.
-    async fn embed_scanned(&mut self, batch: Batch, refusals: &mut Refusals) -> Result<usize> {
+    async fn embed_scanned(&mut self, batch: Batch) -> Result<usize> {
         let (collection, shadow, config) =
             (batch.collection.clone(), batch.shadow.clone(), batch.config.clone());
         let mut checkpoint = Checkpoint::default();
@@ -2094,18 +2068,37 @@ impl EmbeddingWorker {
         if let Some(reason) = checkpoint.stopped {
             return Err(stopped(reason));
         }
-        // A scan runs under one configuration, so a success anywhere in it
-        // proves the provider for every refusal in it, earlier or later.
-        refusals.gather(&mut checkpoint);
-        if refusals.proven {
-            for job in std::mem::take(&mut refusals.jobs) {
-                self.forget_refused(&collection, &shadow, &config, &job);
-            }
-        }
+        self.settle_refusals(&collection, &shadow, &config, &mut checkpoint);
         if !checkpoint.failed {
             self.counters.progressed();
         }
         Ok(embedded)
+    }
+
+    /// Remove the old vectors of the documents one batch's split refused as
+    /// input, but only when the same split embedded and stored another
+    /// document ([`Checkpoint::proven`]): the provider was taking this
+    /// configuration's input at that moment, so the refusal is the
+    /// document's, not the provider's. Nothing carries from one batch to the
+    /// next, in a scan or a flush: a provider that goes bad, or comes good,
+    /// part-way through a scan would otherwise lend one batch's success to
+    /// another batch's refusals, which a key that expired mid-scan turns into
+    /// the loss of every later document's vectors. A batch of one proves
+    /// nothing. Empties the checkpoint's share either way.
+    fn settle_refusals(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        checkpoint: &mut Checkpoint,
+    ) {
+        let proven = std::mem::take(&mut checkpoint.proven);
+        let refused = std::mem::take(&mut checkpoint.refused);
+        if proven {
+            for job in &refused {
+                self.forget_refused(collection, shadow, config, job);
+            }
+        }
     }
 
     /// Embed one batch and return how many documents were written.
@@ -2140,10 +2133,7 @@ impl EmbeddingWorker {
         }
         let vectors = loop {
             match self.call_provider(&collection, &config, &jobs).await {
-                Ok(vectors) => {
-                    checkpoint.proven = true;
-                    break vectors;
-                }
+                Ok(vectors) => break vectors,
                 // The node is stopping: none of the batch is embedded, and
                 // nothing is recorded as done.
                 Err(e) if e.is_stopping() => {
@@ -2193,7 +2183,10 @@ impl EmbeddingWorker {
             }
         };
         match self.store(&collection, &shadow, &config, jobs, vectors, checkpoint) {
-            Ok(written) => written,
+            Ok(written) => {
+                checkpoint.proven = true;
+                written
+            }
             Err(e) => {
                 warn!(
                     error = %e,
@@ -2219,10 +2212,7 @@ impl EmbeddingWorker {
     ) -> usize {
         let vectors = loop {
             match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
-                Ok(vectors) => {
-                    checkpoint.proven = true;
-                    break vectors;
-                }
+                Ok(vectors) => break vectors,
                 Err(e) if e.is_stopping() => {
                     checkpoint.failed = true;
                     checkpoint.stopped = e.stop_reason();
@@ -2261,8 +2251,14 @@ impl EmbeddingWorker {
                 }
             }
         };
+        // Proof only once the answer is stored: `store` is what checks the
+        // provider answered with a vector for every input, and an answer
+        // with the wrong count shows nothing about the refused document.
         match self.store(collection, shadow, config, vec![job], vectors, checkpoint) {
-            Ok(written) => written,
+            Ok(written) => {
+                checkpoint.proven = true;
+                written
+            }
             Err(e) => {
                 warn!(
                     error = %e,
@@ -2454,7 +2450,8 @@ impl VectorError {
     /// a rejection per input inside a successful answer). Even these can be the
     /// configuration's fault — a field the model does not accept fails every
     /// document alike — which is why a refusal removes a document's vectors
-    /// only once the provider has answered for another ([`Refusals`]).
+    /// only when another document of the same batch was embedded then
+    /// ([`EmbeddingWorker::settle_refusals`]).
     pub fn refuses_the_input(&self) -> bool {
         matches!(self, VectorError::ProviderRejected { status: 400 | 413 | 422, .. })
     }
@@ -5627,14 +5624,12 @@ mod tests {
         assert!(made_under(&engine, &ids[0]).is_some(), "kept");
     }
 
-    /// A document the new provider refuses as input (`422`), while it answers
-    /// for the others in the same scan, loses the vectors it held from the old
+    /// A document the new provider refuses as input (`422`) in a batch whose
+    /// other documents land loses the vectors it held from the old
     /// configuration, which can no longer be replaced; the others are embedded
-    /// under the new one. The refused document is the first scanned and each
-    /// batch holds one, so the success that shows the refusal is the
-    /// document's comes in a later batch of the same scan.
+    /// under the new one.
     #[tokio::test]
-    async fn a_document_refused_as_input_while_others_succeed_loses_its_old_vectors() {
+    async fn a_document_refused_as_input_while_its_batch_lands_loses_its_old_vectors() {
         let (engine, coll, _worker, _dir) = setup().await;
         let (ids, b, entry) =
             embedded_then_reconfigured(&engine, &coll, &["poison", "world", "earth"], |a| {
@@ -5643,7 +5638,6 @@ mod tests {
             .await;
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
-        owner.set_batching(BatchSettings { max_chunks: 1, ..Default::default() });
         let fake = FakeProvider::new(4);
         *fake.poison.lock().unwrap() = Some("poison".into());
         fake.poison_status.store(422, std::sync::atomic::Ordering::SeqCst);
@@ -5653,6 +5647,125 @@ mod tests {
         assert!(engine.get_vectors(&shadow, &ids[0]).unwrap().is_empty(), "A's vectors are gone");
         assert_eq!(made_under(&engine, &ids[1]), Some(b.fingerprint()));
         assert_eq!(made_under(&engine, &ids[2]), Some(b.fingerprint()));
+    }
+
+    /// A provider that answers `400` to every call it is not told to serve,
+    /// counting calls from zero: one that goes bad, or comes good, part-way.
+    struct Phases {
+        inner: Arc<FakeProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+        good: fn(usize) -> bool,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for Phases {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !(self.good)(call) {
+                return Err(VectorError::ProviderRejected {
+                    provider: "fake",
+                    status: 400,
+                    detail: "INVALID_ARGUMENT".into(),
+                });
+            }
+            self.inner.embed(texts).await
+        }
+
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// Forty documents under A, B moving only the endpoint, and a backfill of
+    /// B in batches of four through a provider that serves the calls `good`
+    /// says. Answers how many documents have no vectors afterwards.
+    async fn documents_without_vectors_after(good: fn(usize) -> bool) -> usize {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let bodies: Vec<String> = (0..40).map(|i| format!("doc{i}")).collect();
+        let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let (ids, _, entry) =
+            embedded_then_reconfigured(&engine, &coll, &bodies, |a| VectorConfig {
+                provider: ProviderConfig::Ollama {
+                    model: "m".into(),
+                    endpoint: "http://localhost:2".into(),
+                },
+                ..a
+            })
+            .await;
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        owner.set_batching(BatchSettings { max_chunks: 4, ..Default::default() });
+        let phases = Phases { inner: FakeProvider::new(4), calls: 0.into(), good };
+        owner.set_provider(coll.id.0, Arc::new(phases));
+        switchable_owner(&mut owner, true);
+        assert!(matches!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { .. }));
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        ids.iter().filter(|id| engine.get_vectors(&shadow, id).unwrap().is_empty()).count()
+    }
+
+    /// The reviewer's scenario A: the provider serves two batches and then
+    /// answers `400` to everything (a key that expired mid-scan, which Gemini
+    /// reports as `400 INVALID_ARGUMENT`). Every later document is refused
+    /// alone in a split where nothing landed, so none loses its vectors. A
+    /// success earlier in the scan used to count, and 32 of 40 lost theirs.
+    #[tokio::test]
+    async fn a_provider_that_goes_bad_part_way_through_a_scan_removes_nothing() {
+        assert_eq!(documents_without_vectors_after(|call| call < 2).await, 0);
+    }
+
+    /// Scenario B: six calls fail, then the provider serves. The first batch's
+    /// split is refused whole, so its four documents keep their vectors; a
+    /// success later in the scan used to count for them too.
+    #[tokio::test]
+    async fn a_provider_that_comes_good_part_way_through_a_scan_removes_nothing() {
+        assert_eq!(documents_without_vectors_after(|call| call >= 6).await, 0);
+    }
+
+    /// A provider whose answer for the other document of the split has the
+    /// wrong number of vectors: `store` refuses it, so it shows nothing about
+    /// the refused document, which keeps its vectors.
+    #[tokio::test]
+    async fn an_answer_store_refuses_is_no_proof() {
+        struct Miscounts;
+
+        #[async_trait]
+        impl EmbeddingProvider for Miscounts {
+            async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                if texts.iter().any(|t| t.contains("poison")) {
+                    return Err(VectorError::ProviderRejected {
+                        provider: "fake",
+                        status: 422,
+                        detail: "no".into(),
+                    });
+                }
+                Ok(vec![vec![1.0, 0.0, 0.0, 0.0]; texts.len() + 1])
+            }
+
+            fn dim(&self) -> usize {
+                4
+            }
+
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+        }
+
+        let (engine, coll, _worker, _dir) = setup().await;
+        let (ids, _, entry) =
+            embedded_then_reconfigured(&engine, &coll, &["poison", "world"], |a| VectorConfig {
+                document_prefix: Some("passage: ".into()),
+                ..a
+            })
+            .await;
+        let mut owner = EmbeddingWorker::new(Arc::clone(&engine));
+        owner.set_provider(coll.id.0, Arc::new(Miscounts));
+        switchable_owner(&mut owner, true);
+        assert_eq!(owner.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 0 });
+        assert!(made_under(&engine, &ids[0]).is_some(), "kept");
+        assert!(made_under(&engine, &ids[1]).is_some(), "kept");
     }
 
     /// Within one batch's split too: a batch the provider refuses is taken
