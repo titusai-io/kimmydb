@@ -99,19 +99,31 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 - **A collection's expiry is owned by a member that can expire it.** The owner was the
   rendezvous winner over every live member, so a top-ranked member that did not hold
-  the collection's TTL index, had expiry switched off or was catching up owned the
-  collection and expired nothing, and no member expired it, with nothing said. The
-  candidates are now the members known to hold the index and able to expire, from the
-  block each sends on the replication contact ([ADR-201](docs/decisions.md)). A
-  collection no member can expire is reported by `kimmy_ttl_collections{state}` (also
-  `owned` and `owed_elsewhere`; aggregate with `max`) and a `WARN` naming it. A
-  member that is catching up no longer delivers webhooks, and one whose embedding
-  worker is off no longer owns embeddings; a collection whose embedding ownership moves
-  to a member is rescanned there, so what the previous owner had deferred is not lost.
-  For about one sync interval after a TTL index is created, more than one holder may
-  delete the same expired document (each counts only itself until the others' blocks
-  arrive); the deletes converge. Members that say nothing (an older version) are
-  counted as they were, and no stored format changes.
+  the collection's TTL index, or had expiry switched off, owned the collection and
+  expired nothing, and no member expired it, with nothing said. The candidates are
+  now the members known to hold the index and able to expire, from the block each
+  sends on the replication contact ([ADR-201](docs/decisions.md)). A collection no
+  member can expire is reported by `kimmy_ttl_collections{state}` (also `owned` and
+  `owed_elsewhere`; aggregate with `max`) and a `WARN` naming it, at most once per
+  thirty minutes per collection. Only a member that is not itself a candidate can see
+  a collection with none, so the unowned states come from a member with expiry off
+  (which keeps a check running for this, once a minute) or, once the catching-up
+  marker is set by a later release, from one catching up; a lone member with expiry
+  off reports every TTL collection it holds as `unowned_no_holder`. A member that
+  says it is catching up delivers no webhooks and owns no expiry or embedding (the
+  bit is carried and honoured now, and reserved for the catching-up marker, which
+  nothing sets yet), and one whose embedding worker is off no longer owns embeddings.
+  A collection whose embedding ownership moves to a member, or that a member owns
+  when it starts, is rescanned there once that has held for thirty seconds, so what
+  was deferred before, by the previous owner or by this member before a restart, is
+  not lost. One member still expires a given collection once the blocks have
+  settled; for about one sync interval after a TTL index is created, while a
+  member's sync contacts fail and SWIM keeps it up, and for every collection past
+  the 256 a block lists, more than one holder may delete the same expired document,
+  and the deletes converge. For webhooks and embeddings a member that has said
+  nothing (an older version) counts as it did; for expiry it is not a candidate,
+  since it is not known to hold the index, so a mixed cluster's newer members
+  expire the collection. No stored format changes.
 
 - **A node whose open outlasts the liveness probe is no longer killed and begun
   again for ever.** Nothing listened until the open finished, so the documented

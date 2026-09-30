@@ -1333,6 +1333,11 @@ independently is convergent but produces N deletes per document, of which N-1
 are superseded entries that still cost oplog, replication and change-stream
 bandwidth. The cost is that expiry stalls for a collection whose owner is
 partitioned; TTL is best-effort by nature and that was judged the better trade.
+Since ADR-201 the candidates are the members known to hold the collection's TTL
+index and able to expire, and one owner holds only once their blocks have
+settled: for about one sync interval after a TTL index is created, while a
+member's sync contacts fail and SWIM keeps it up, and for every collection past
+the 256 a block lists, more than one holder deletes the same document.
 
 **An expiry is an ordinary `OpKind::Delete`.** A dedicated op kind would be a
 **stop-the-cluster upgrade**: `op_kind_from_tag` (`codec.rs`) rejects an unknown
@@ -1358,8 +1363,10 @@ share `insert_in_txn`.
 
 **`kimmy_ttl_expired_total` was added** so "one document, one delete" is
 measured rather than asserted: the cluster harness sums it across three nodes
-and requires exactly 1. Correctness alone cannot distinguish the two designs,
-because N deletes converge.
+and requires exactly 1, once the members' blocks have settled and the document
+has reached all three before it falls due. Correctness alone cannot distinguish
+the two designs, because N deletes converge. It is the settled state's
+property; the windows above read high by their duplicates (ADR-201).
 
 ---
 

@@ -356,7 +356,11 @@ assigns webhook delivery and TTL expiry ([ADR-077](decisions.md)), among the
 members that may own it: not one that is catching up, and not one whose worker
 is switched off ([ADR-201](decisions.md)). A collection whose ownership moves to
 a member is rescanned there once the move has held for thirty seconds, so what
-the previous owner had deferred is not lost. Every
+the previous owner had deferred is not lost; so is every collection a member
+owns when its worker starts, since what was deferred before a restart went with
+the process and the recorded position has passed it. A rescan embeds only what
+is stale or missing, so it costs reads, not provider calls, when nothing was
+missed. Every
 member sees every write, but only the owner calls the provider for it; the
 others hold the write against the owner leaving and otherwise let replication
 bring them the vectors. That is what keeps a three-member cluster's provider
