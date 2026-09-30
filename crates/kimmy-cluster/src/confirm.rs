@@ -1644,18 +1644,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_push_that_times_out_backs_off_and_the_driver_does_not_wedge() {
         let b = member().await;
-        *b.served.hold.lock() = Duration::from_millis(1500);
-        let config = ConfirmConfig { request_timeout: Duration::from_millis(500), ..wide() };
+        // `after` below is an ordinary exchange run under this same timeout,
+        // so it is a second, not the few hundred milliseconds one pause on a
+        // loaded host can use up.
+        let hold = Duration::from_millis(2000);
+        *b.served.hold.lock() = hold;
+        let config = ConfirmConfig { request_timeout: Duration::from_millis(1000), ..wide() };
         let a = pusher_for(&b, config);
         let node = b.engine.node_id();
+        let pushed_at = Instant::now();
         let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
         assert_eq!(one.outcome(), ConfirmOutcome::Failed, "{one:?}");
+        // Failed at the timeout, not when the member finally answered: a driver
+        // that waited out the held answer before settling would pass the rest.
+        assert!(
+            pushed_at.elapsed() < hold,
+            "the push outlasted the held answer: {:?}",
+            pushed_at.elapsed()
+        );
         assert!(a.confirmer.backing_off(b.addr), "the window was sent");
         let during = a.confirmer.confirm(b.addr, node, create(&a.engine, "e2"), DEADLINE).await;
         assert_eq!(during.outcome(), ConfirmOutcome::Backoff);
         *b.served.hold.lock() = Duration::ZERO;
-        // Past the back-off, and past the member's held answer (1.5 s from
-        // when the window arrived, 0.5 s before the timeout): lower bounds.
+        // Past the back-off, and past the member's held answer (2 s from
+        // when the window arrived, 1 s after the timeout): lower bounds.
         tokio::time::sleep(WIDE_BACKOFF + Duration::from_millis(50)).await;
         let after = a.confirmer.confirm(b.addr, node, create(&a.engine, "e3"), DEADLINE).await;
         assert_eq!(after, Resolution::Confirmed);
