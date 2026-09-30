@@ -5252,16 +5252,15 @@ const FLOOR: Duration = Duration::from_millis(350);
 /// [`SLOW`] and [`FLOOR`], widened for the three phase tests below
 /// (`a_pull_that_waits_for_the_writer_says_so_apart_from_applying`,
 /// `a_pull_whose_commit_is_slow_says_so_in_apply`,
-/// `a_pull_from_a_slow_peer_says_so_in_serve`). Those three assert that an
-/// *unrelated* phase reads under `FLOOR` — in particular `apply`, whose
-/// commits fsync (the puller here is `Durable`, the default, per
-/// ADR-088) — and `SLOW`/`FLOOR`'s 50 ms margin left no room for an
-/// occasional slow fsync on a loaded, shared disk (a CI runner) to cross
-/// it: one CI run measured `apply` at 371.80 ms against `FLOOR = 350 ms`,
-/// on a batch whose apply commits twice (the collection's own DDL commit,
-/// then the fifty inserts'). 1 s of margin between an injected delay and
-/// the floor an unrelated phase must stay under comfortably absorbs that,
-/// at the cost of a few more seconds of wall time per phase test.
+/// `a_pull_from_a_slow_peer_says_so_in_serve`). Each injects one delay,
+/// `PHASE_SLOW`, and asserts that the phase it lands in reads at least
+/// `PHASE_FLOOR`: a lower bound the delay itself guarantees. The phases it
+/// does not land in are not held to a fixed floor, which a slow fsync on a
+/// loaded, shared disk (one CI run measured `apply` at 371.80 ms against a
+/// 350 ms floor, on a batch whose apply commits twice) or a stalled host
+/// crosses on its own. Each is read against the phase that was slowed
+/// instead, and all three against the wall time of the pull that measured
+/// them: the phases are disjoint, so they cannot add up to more than that.
 const PHASE_SLOW: Duration = Duration::from_millis(1_500);
 const PHASE_FLOOR: Duration = Duration::from_secs(1);
 
@@ -5313,10 +5312,34 @@ async fn pull_timed(
     into: &Engine,
     peer: std::net::SocketAddr,
 ) -> (kimmy_storage::SyncOutcome, kimmy_storage::PullTiming) {
-    let mut stalls = PeerStalls::new();
-    let outcome = sync_once_with(into, peer, SECRET, None, &mut stalls).await.expect("pull");
-    let pull = stalls.take_pull().expect("a window was pulled");
+    let (outcome, pull, _) = pull_measured(into, peer).await;
     (outcome, pull)
+}
+
+/// [`pull_timed`], and the wall time of the whole pull as the caller saw it.
+async fn pull_measured(
+    into: &Engine,
+    peer: std::net::SocketAddr,
+) -> (kimmy_storage::SyncOutcome, kimmy_storage::PullTiming, Duration) {
+    let mut stalls = PeerStalls::new();
+    let started = std::time::Instant::now();
+    let outcome = sync_once_with(into, peer, SECRET, None, &mut stalls).await.expect("pull");
+    let took = started.elapsed();
+    let pull = stalls.take_pull().expect("a window was pulled");
+    (outcome, pull, took)
+}
+
+/// A pull's phases are disjoint and measured inside the pull, so together
+/// they fit in its wall time, however long a stalled host made any of them.
+/// A check on double counting, not a tight one: where the slowed thing sits
+/// outside the phases (the slow relay of the serve test delays the handshake
+/// and the version exchange, which no phase counts), the sum has seconds of
+/// slack, and the per-phase bounds beside it carry the test.
+fn assert_phases_fit_in(pull: &kimmy_storage::PullTiming, took: Duration) {
+    assert!(
+        pull.serve + pull.wait + pull.apply <= took,
+        "serve, wait and apply are disjoint phases of one pull: {pull:?} in {took:?}"
+    );
 }
 
 #[tokio::test]
@@ -5335,12 +5358,19 @@ async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
     });
     held_rx.recv().unwrap();
 
-    let (_, pull) = pull_timed(&b.engine, a.addr).await;
+    let (_, pull, took) = pull_measured(&b.engine, a.addr).await;
     holder.join().unwrap();
 
     assert!(pull.wait >= PHASE_FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
-    assert!(pull.apply < PHASE_FLOOR, "and is not also counted as applying: {pull:?}");
-    assert!(pull.serve < PHASE_FLOOR, "nor as serving: {pull:?}");
+    // Against the wait itself, not a fixed floor: a wait counted as applying
+    // or serving would make that phase a large share of the wait, and a stall
+    // in either phase on a loaded host can cross a fixed floor on its own.
+    // The same reading holds for the unslowed phases of the two tests below.
+    assert!(pull.apply < pull.wait / 4, "and is not also counted as applying: {pull:?}");
+    assert!(pull.serve < pull.wait / 4, "nor as serving: {pull:?}");
+    // Nor counted twice, or in part: the wait is a slice of this pull's own
+    // time, and the other phases are the rest.
+    assert_phases_fit_in(&pull, took);
     assert_eq!(pull.entries, 51, "the creation and the fifty documents: {pull:?}");
 }
 
@@ -5351,11 +5381,12 @@ async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
     // work the batch does after taking the writer, not a wait for it.
     b.engine.set_durability(kimmy_storage::DurabilityClass::Coalesced, PHASE_SLOW);
 
-    let (_, pull) = pull_timed(&b.engine, a.addr).await;
+    let (_, pull, took) = pull_measured(&b.engine, a.addr).await;
 
     assert!(pull.apply >= PHASE_FLOOR, "a slow commit is the apply phase: {pull:?}");
-    assert!(pull.wait < PHASE_FLOOR, "not a wait for the writer: {pull:?}");
-    assert!(pull.serve < PHASE_FLOOR, "nor serving: {pull:?}");
+    assert!(pull.wait < pull.apply / 4, "not a wait for the writer: {pull:?}");
+    assert!(pull.serve < pull.apply / 4, "nor serving: {pull:?}");
+    assert_phases_fit_in(&pull, took);
 }
 
 #[tokio::test]
@@ -5363,11 +5394,12 @@ async fn a_pull_from_a_slow_peer_says_so_in_serve() {
     let (a, b) = a_source_holding(50).await;
     let slow = slow_relay(a.addr, PHASE_SLOW).await;
 
-    let (_, pull) = pull_timed(&b.engine, slow).await;
+    let (_, pull, took) = pull_measured(&b.engine, slow).await;
 
     assert!(pull.serve >= PHASE_FLOOR, "a slow answer is the serve phase: {pull:?}");
-    assert!(pull.wait < PHASE_FLOOR, "{pull:?}");
-    assert!(pull.apply < PHASE_FLOOR, "{pull:?}");
+    assert!(pull.wait < pull.serve / 4, "{pull:?}");
+    assert!(pull.apply < pull.serve / 4, "{pull:?}");
+    assert_phases_fit_in(&pull, took);
 }
 
 #[tokio::test]
@@ -6209,8 +6241,12 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
 /// that is merely slow -- never a peer whose pulls apply nothing new --
 /// would spin the loop back-to-back on it forever. A wedged peer answers
 /// slowly enough that every tick ends `Budget`, and if the gate carried it
-/// forward anyway, rounds would land back-to-back instead of one sync
-/// interval apart.
+/// forward anyway, the next tick would be a reset and say so in its report.
+/// A loop that rescheduled without saying so would show only in the timing,
+/// rounds landing back-to-back instead of one sync interval apart, so that
+/// is read too: a tick that overran its interval (a stalled host) makes the
+/// ticker fire the next at once (`MissedTickBehavior::Delay`), so one short
+/// gap is no spin, and two in a row are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wedged_contact_ending_budget_is_never_reset_or_carried_forward() {
     let b = node().await;
@@ -6255,18 +6291,30 @@ async fn a_wedged_contact_ending_budget_is_never_reset_or_carried_forward() {
         "premise: the delay must keep every tick well short of the ceiling"
     );
 
-    // A reset ticks back-to-back, at roughly one pull's own cost; an
-    // ordinary tick waits out the rest of the interval. Comfortably above
-    // the wedged peer's own 280 ms and comfortably below the 500 ms
-    // interval a wrongly-fired reset would skip.
-    let threshold = Duration::from_millis(420);
-    for pair in seen.windows(2) {
-        let gap = pair[1].0.duration_since(pair[0].0);
+    // A contact carried forward schedules the next tick as a reset, and the
+    // report for that tick says so. Not read from the gap between rounds: a
+    // tick that overran its interval on a loaded host makes the ticker fire
+    // the next one at once (`MissedTickBehavior::Delay`, ADR-154), a gap of
+    // one pull's own cost with no reset anywhere in it.
+    for (_, report) in &seen {
         assert!(
-            gap >= threshold,
-            "a gap of {gap:?} between rounds against a peer that never advances -- shorter \
-             than the sync interval, so this contact was reset and carried forward despite \
-             never moving anything"
+            !report.reset,
+            "a round was a reset tick against a peer that never advances, so its contact was \
+             carried forward despite never moving anything: {report:?}"
+        );
+    }
+
+    // Comfortably above the wedged peer's own 280 ms and comfortably below
+    // the 500 ms interval a spinning loop would skip. After an overrun the
+    // next gap is one pull's cost, and the one after it an interval again.
+    let threshold = Duration::from_millis(420);
+    let gaps: Vec<Duration> =
+        seen.windows(2).map(|pair| pair[1].0.duration_since(pair[0].0)).collect();
+    for pair in gaps.windows(2) {
+        assert!(
+            pair[0] >= threshold || pair[1] >= threshold,
+            "two gaps in a row shorter than the sync interval ({gaps:?}) against a peer that \
+             never advances: the loop is spinning on it"
         );
     }
 }
@@ -6724,6 +6772,11 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
         .unwrap_or_else(|_| panic!("no second tick arrived"))
         .expect("the loop must keep reporting");
     let second_at = tokio::time::Instant::now();
+    let third = tokio::time::timeout_at(deadline, rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("no third tick arrived"))
+        .expect("the loop must keep reporting");
+    let third_at = tokio::time::Instant::now();
     looping.abort();
 
     assert!(
@@ -6733,11 +6786,17 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
     );
     assert!(!first_reset, "premise: the first tick is not itself a reset's continuation");
     assert!(!second.reset, "an advancing Ceiling end must not schedule a reset for the next tick");
-    let gap = second_at.duration_since(first_at);
+    assert!(!third.reset, "nor the one after it");
+    // A tick that overran its interval on a stalled host makes the ticker
+    // fire the next at once (`MissedTickBehavior::Delay`), so one short gap
+    // proves nothing; two in a row are a loop rescheduling without the flag.
+    let gaps = [second_at.duration_since(first_at), third_at.duration_since(second_at)];
+    let short = interval - interval / 4;
     assert!(
-        gap >= interval - interval / 4,
-        "the tick after an advancing Ceiling end landed {gap:?} after it, well under the \
-         {interval:?} interval -- it was reset and carried forward despite ending at the ceiling"
+        gaps.iter().any(|gap| *gap >= short),
+        "the ticks after an advancing Ceiling end landed {gaps:?} after one another, both well \
+         under the {interval:?} interval -- it was reset and carried forward despite ending at \
+         the ceiling"
     );
 }
 
