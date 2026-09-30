@@ -10,7 +10,37 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.43.0 - 2026-09-30
+
+**Roll the members one at a time. This release is not a rollback boundary for
+stored data: it changes no stored format that an older build cannot read
+(schema 4, redb 4.3.0, the verified-vector epoch 1, all as in 0.42.0), and a
+member rolls back by starting 0.42.0 on its data directory. A real rollback was
+run: a 0.43.0 member wrote documents, a unique index with a recorded violation,
+a TTL collection and stamped `byo` vectors, and 0.42.0 opened that store clean,
+served it, wrote to it and stopped clean, as it did on a restored store that
+carried the two new marker files. One thing in a configuration does not roll
+back: 0.42.0 refuses a config file that sets `cluster.catch_up_wait_secs` or
+`cluster.expected_members`, which are new here, because it refuses an unknown
+key in `[cluster]` at parse, so remove both before starting an older build (the
+`KIMMY_CLUSTER_EXPECTED_MEMBERS` variable is ignored); a member on the defaults
+rolls back untouched. What a caller can see change: a member that knows it is
+behind (a new or wiped member in a cluster, a store put back by `kimmyd
+restore`, one that lost writes it made, one past its peers' retention horizon)
+answers `503 catching_up` on every route but `/healthz`, `/readyz`, `/metrics`
+and `/v1/topology` (`/v1/version` included, and `/readyz` is `503` too), does no
+expiry, embedding or webhook work, and clears when it holds what its peers hold;
+the HTTP port is bound before the store opens and answers only `/healthz` and
+`/readyz` until the node is up, every other route, `/v1/version` and `/metrics`
+included, answering `503 starting`; a filter's unknown `$type` alias or
+`$regex` flag, an unusable `$regex` pattern and a non-string `$options` are a
+`400` where they matched nothing (breaking), and `{"$type": "number"}` matches
+every numeric type; expiry, webhooks and embeddings are owned by members that
+can do the work; vector records carry the configuration that made them, so a
+reindex its owner left part-way is finished by the member that takes over; and
+`GET …/violations` is faster. New metrics report accept errors, the serve-walk
+path, the violations table, each member's ownership state and TTL collection
+ownership, and the catching-up reason.** The details follow.
 
 ### Added
 

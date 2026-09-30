@@ -23,7 +23,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.42.0"
+version = "0.43.0"
 edition = "2024"
 rust-version = "1.90"
 license = "AGPL-3.0-only"
