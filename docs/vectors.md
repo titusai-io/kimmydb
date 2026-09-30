@@ -358,9 +358,15 @@ is switched off ([ADR-201](decisions.md)). A collection whose ownership moves to
 a member is rescanned there once the move has held for thirty seconds, so what
 the previous owner had deferred is not lost; so is every collection a member
 owns when its worker starts, since what was deferred before a restart went with
-the process and the recorded position has passed it. A rescan embeds only what
-is stale or missing, so it costs reads, not provider calls, when nothing was
-missed. Every
+the process and the recorded position has passed it (in a cluster only: a
+single node never defers). A rescan embeds what each document's own check says
+is stale or missing, so a collection the previous owner kept up costs reads, not
+provider calls. It re-embeds everything only on a member that completed a scan
+under a configuration that has since changed. **A known gap:** that check sees a
+document change but not a configuration change, so a reindex the previous owner
+left unfinished, because it stopped or left part-way through, is not finished by
+the member that takes the collection over; the old model's vectors stay until
+each document changes or the configuration is set again. Every
 member sees every write, but only the owner calls the provider for it; the
 others hold the write against the owner leaving and otherwise let replication
 bring them the vectors. That is what keeps a three-member cluster's provider

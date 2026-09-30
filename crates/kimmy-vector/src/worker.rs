@@ -93,6 +93,23 @@ const DEFERRAL_TICK: Duration = Duration::from_secs(5);
 /// How often the worker asks again which embedded collections it owns.
 const OWNERSHIP_TICK: Duration = Duration::from_secs(5);
 
+/// What a scan does for a collection this member has no configuration
+/// fingerprint for: it has never completed a scan of it, which is every member
+/// but the one that owned the collection when its configuration was set, since
+/// a non-owner skips that backfill and records nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unscanned {
+    /// Re-embed every document: a configuration change's own backfill, and the
+    /// recovery for a lost position, which must not trust what is there.
+    Force,
+    /// Trust each document's staleness: an ownership rescan (ADR-201). The
+    /// previous owner's vectors replicated here and are current, and forcing
+    /// would send the whole collection to the provider on every member that
+    /// gains it. What this cannot see is a reindex the previous owner left
+    /// unfinished, since a record does not say which configuration made it.
+    Check,
+}
+
 /// How long a collection's ownership must have held, once it moved to this
 /// member, before it is rescanned: a membership view that flaps must not start a
 /// rescan each time it swings, so a gain counts only after the answer has held
@@ -963,8 +980,19 @@ impl EmbeddingWorker {
                     continue;
                 };
                 embedded += self
-                    .scan_collection(&collection, &shadow, &config, "a lost stream position")
+                    .scan_collection(
+                        &collection,
+                        &shadow,
+                        &config,
+                        "a lost stream position",
+                        Unscanned::Force,
+                    )
                     .await?;
+                // Just covered: owned and settled, so the first evaluation after
+                // this start does not rescan it again as a first sight.
+                let key = format!("{}/{}", db.name, collection.name);
+                self.ownership_gaining.remove(&key);
+                self.ownership_settled.insert(key, true);
             }
         }
         Ok(embedded)
@@ -987,17 +1015,24 @@ impl EmbeddingWorker {
     /// collection whose ownership moved between members (a peer left, one began
     /// catching up, one's worker was switched off) would otherwise lose the
     /// documents the previous owner had deferred, silently. A rescan finds what
-    /// is stale or missing and embeds only that, so a collection the previous
-    /// owner had kept up costs reads, not provider calls.
+    /// is stale or missing and embeds only that ([`Unscanned::Check`]): it
+    /// forces every document only when this member recorded a completed scan
+    /// under a configuration that has since changed. So a collection the
+    /// previous owner had kept up costs reads, not provider calls, on a member
+    /// that has never scanned it, which is every member but the one that owned
+    /// it when its configuration was set. The price is the one gap
+    /// [`Unscanned::Check`] names: a reindex the previous owner left unfinished
+    /// is not seen.
     ///
     /// **A first sight after a start is a gain.** The position a worker resumes
     /// from has passed every document it deferred, and the deferrals went with
     /// the process that held them, so a member that starts owning a collection
     /// may be its only chance at documents the previous owner, or it itself
     /// before the restart, deferred. Every collection owned at the first
-    /// evaluation is therefore rescanned once, after the same settle, which
-    /// costs reads. A collection first seen later, created while this worker
-    /// runs, is the stream's to cover. **A flap is not a gain**: a gain that
+    /// evaluation is therefore rescanned once, after the same settle, on the
+    /// same terms. A collection a lost position's recovery has just scanned is
+    /// not rescanned again. A collection first seen later, created while this
+    /// worker runs, is the stream's to cover. **A flap is not a gain**: a gain that
     /// reverses before it has held resets. **One collection per evaluation**,
     /// and a scan counts as progress a batch at a time, so a large rescan
     /// neither holds the loop for long nor makes the worker look stalled.
@@ -1073,8 +1108,15 @@ impl EmbeddingWorker {
         let shadow =
             kimmy_storage::blocking(|| self.shadow_of(&collection.db, &collection.name, true))?;
         if let Some(shadow) = shadow {
-            let embedded =
-                self.scan_collection(&collection, &shadow, &config, "ownership gained").await?;
+            let embedded = self
+                .scan_collection(
+                    &collection,
+                    &shadow,
+                    &config,
+                    "ownership gained",
+                    Unscanned::Check,
+                )
+                .await?;
             info!(
                 db = %collection.db,
                 collection = %collection.name,
@@ -1489,8 +1531,15 @@ impl EmbeddingWorker {
             return Ok(Outcome::Skipped);
         }
 
-        let embedded =
-            self.scan_collection(&collection, &shadow, &config, "a configuration change").await?;
+        let embedded = self
+            .scan_collection(
+                &collection,
+                &shadow,
+                &config,
+                "a configuration change",
+                Unscanned::Force,
+            )
+            .await?;
         Ok(Outcome::Backfilled { embedded })
     }
 
@@ -1503,6 +1552,7 @@ impl EmbeddingWorker {
         shadow: &CollectionMeta,
         config: &VectorConfig,
         reason: &'static str,
+        unscanned: Unscanned,
     ) -> Result<usize> {
         // Whether this scan must re-embed regardless of per-document
         // staleness. The HLC check cannot see a configuration change —
@@ -1512,10 +1562,14 @@ impl EmbeddingWorker {
         // it stale and the replayed entry redoes the whole scan: some
         // documents embed twice, which idempotent output makes harmless,
         // where the alternative — recording first — would leave the rest
-        // embedded under the old model with nothing to notice.
+        // embedded under the old model with nothing to notice. With no
+        // fingerprint here, `unscanned` decides: see [`Unscanned`].
         let fingerprint = config_fingerprint(config);
-        let force = kimmy_storage::blocking(|| self.engine.vector_fingerprint(collection.id))?
-            != Some(fingerprint);
+        let recorded = kimmy_storage::blocking(|| self.engine.vector_fingerprint(collection.id))?;
+        let force = match recorded {
+            Some(recorded) => recorded != fingerprint,
+            None => unscanned == Unscanned::Force,
+        };
 
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
@@ -1584,7 +1638,14 @@ impl EmbeddingWorker {
         if let Some(reason) = self.engine.walk_stop(kimmy_storage::WalkScope::Background) {
             return Err(stopped(reason));
         }
-        self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
+        // Only a scan that re-embedded everything, or one under the recorded
+        // configuration, attests it: a scan that trusted per-document
+        // staleness with nothing recorded proved nothing about the
+        // configuration, and recording it would stop a later forced scan
+        // when this member really is behind.
+        if force || recorded == Some(fingerprint) {
+            self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
+        }
         info!(
             collection = %collection.name,
             embedded,
@@ -4546,5 +4607,133 @@ mod tests {
         let embedded = vectors_within(&engine, &d).await;
         running.abort();
         assert_eq!(embedded, 1, "the gained collection is rescanned by the running worker");
+    }
+
+    /// A member that has never scanned the collection: it did not own it when
+    /// its vectors were configured, so it skipped that backfill and recorded no
+    /// fingerprint. Ten documents then get current vectors (as the owner's would
+    /// replicate), by a worker that owns the collection for each one. Answers the
+    /// documents' ids.
+    async fn current_without_a_fingerprint(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+    ) -> Vec<kimmy_core::DocId> {
+        let mut bystander = EmbeddingWorker::new(Arc::clone(engine));
+        bystander.set_provider(coll.id.0, FakeProvider::new(4));
+        switchable_owner(&mut bystander, false);
+        assert_eq!(bystander.process(&configured_entry(engine)).await.unwrap(), Outcome::Skipped);
+        let mut owner = EmbeddingWorker::new(Arc::clone(engine));
+        owner.set_provider(coll.id.0, FakeProvider::new(4));
+        switchable_owner(&mut owner, true);
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = engine
+                .insert(
+                    coll,
+                    bson::doc! { "_id": format!("d{i}"), "title": "hello", "body": "world" },
+                )
+                .unwrap();
+            let entry = as_if_written_elsewhere(last_entry(engine));
+            assert!(matches!(owner.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
+            ids.push(id);
+        }
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), None, "the fixture's premise");
+        ids
+    }
+
+    /// A worker, restarted, that owns the collection from its first sight: its
+    /// rescan runs after the settle, and `fake` counts what it sends.
+    async fn rescan_at_first_sight(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+    ) -> Arc<FakeProvider> {
+        let mut restarted = EmbeddingWorker::new(Arc::clone(engine));
+        let fake = FakeProvider::new(4);
+        restarted.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut restarted, true);
+        let t0 = Instant::now();
+        restarted.rescan_gained(t0).await.unwrap();
+        restarted.rescan_gained(t0 + Duration::from_secs(31)).await.unwrap();
+        fake
+    }
+
+    /// The cost the ownership rescan must not have: on a member with no
+    /// fingerprint, current documents are read and not sent to the provider.
+    /// Forcing them would re-embed the whole collection on every member that
+    /// gains it, and again after any stop mid-scan. Nor does the rescan record a
+    /// fingerprint it did not earn.
+    #[tokio::test]
+    async fn an_ownership_rescan_sends_no_current_document_on_a_member_that_never_scanned() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        current_without_a_fingerprint(&engine, &coll).await;
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls(), 0, "every document was current");
+        assert_eq!(
+            engine.vector_fingerprint(coll.id).unwrap(),
+            None,
+            "a rescan that trusted staleness attests no configuration"
+        );
+    }
+
+    /// And the rescan still does its work there: a document whose vectors are
+    /// stale is re-embedded, and only it.
+    #[tokio::test]
+    async fn an_ownership_rescan_re_embeds_a_stale_document_on_a_member_that_never_scanned() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        let ids = current_without_a_fingerprint(&engine, &coll).await;
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        // Changed and never embedded since: its vectors are behind it.
+        engine
+            .replace(
+                &coll,
+                &ids[3],
+                bson::doc! { "_id": "d3", "title": "changed", "body": "since" },
+                false,
+            )
+            .unwrap();
+        let stamp = engine.document_stamp(&coll, &ids[3]).unwrap().unwrap();
+        assert!(engine.vectors_are_stale(&shadow, &ids[3], stamp.hlc).unwrap());
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert_eq!(fake.calls(), 1, "one provider call, for the stale document");
+        assert!(!engine.vectors_are_stale(&shadow, &ids[3], stamp.hlc).unwrap(), "re-embedded");
+        assert_eq!(fake.inputs.lock().unwrap().iter().filter(|t| t.contains("hello")).count(), 0);
+    }
+
+    /// A member that recorded a completed scan under a configuration that has
+    /// since changed knows it is behind: its ownership rescan re-embeds every
+    /// document, and then records the configuration it scanned under.
+    #[tokio::test]
+    async fn an_ownership_rescan_forces_on_a_member_whose_recorded_configuration_changed() {
+        let (engine, coll, _worker, _dir) = setup().await;
+        current_without_a_fingerprint(&engine, &coll).await;
+        engine.put_vector_fingerprint(coll.id, 0x0bad_c0de).unwrap();
+        let fake = rescan_at_first_sight(&engine, &coll).await;
+        assert!(fake.calls() >= 1, "every document is sent again");
+        assert_eq!(fake.inputs.lock().unwrap().iter().filter(|t| t.contains("hello")).count(), 10);
+        let config = engine.get_collection("app", "docs").unwrap().vector.unwrap();
+        assert_eq!(engine.vector_fingerprint(coll.id).unwrap(), Some(config_fingerprint(&config)));
+    }
+
+    /// A lost position's recovery scans every owned collection; the first
+    /// evaluation after it does not rescan them again as first sights.
+    #[tokio::test]
+    async fn a_collection_the_recovery_just_scanned_is_not_rescanned_as_a_first_sight() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, true);
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        worker.rescan_owned().await.unwrap();
+        let after = fake.calls();
+        assert!(after >= 1, "the recovery embedded the collection");
+        // Left to a stream this test does not run, so a rescan would embed it.
+        engine
+            .insert(&coll, bson::doc! { "_id": "b", "title": "written", "body": "after" })
+            .unwrap();
+        let t0 = Instant::now();
+        for secs in [0u64, 31, 62] {
+            worker.rescan_gained(t0 + Duration::from_secs(secs)).await.unwrap();
+        }
+        assert_eq!(fake.calls(), after, "not scanned twice");
     }
 }

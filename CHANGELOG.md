@@ -113,10 +113,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   says it is catching up delivers no webhooks and owns no expiry or embedding (the
   bit is carried and honoured now, and reserved for the catching-up marker, which
   nothing sets yet), and one whose embedding worker is off no longer owns embeddings.
-  A collection whose embedding ownership moves to a member, or that a member owns
-  when it starts, is rescanned there once that has held for thirty seconds, so what
-  was deferred before, by the previous owner or by this member before a restart, is
-  not lost. One member still expires a given collection once the blocks have
+  In a cluster, a collection whose embedding ownership moves to a member, or that a
+  member owns when it starts, is rescanned there once that has held for thirty
+  seconds, so what was deferred before, by the previous owner or by this member
+  before a restart, is not lost; the rescan embeds only what is stale or missing,
+  and a reindex the previous owner left unfinished is not completed by it. One member still expires a given collection once the blocks have
   settled; for about one sync interval after a TTL index is created, while a
   member's sync contacts fail and SWIM keeps it up, and for every collection past
   the 256 a block lists, more than one holder may delete the same expired document,
