@@ -2097,7 +2097,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.42.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.43.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2117,7 +2117,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.42.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.43.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2202,6 +2202,27 @@ cluster member wipe the data directory and let it catch up from its peers.
 data directory is refused as in use with nothing written, before the start
 reads anything it might act on. The lock also refuses, and is refused by, a
 0.36.x node on the same store.
+
+**Rolling back from 0.43.0 to 0.42.0 needs no store work, and one edit to the
+configuration.** 0.43.0 changes no stored format: the storage schema (4), redb
+(4.3.0) and the verified-vector epoch (1) are as in 0.42.0, and a real
+rollback was run ([ADR-197](decisions.md) to [ADR-203](decisions.md) each state
+their own). The violations table ([ADR-200](decisions.md)) is a table 0.42.0
+does not know and leaves alone, reading a collection's violations from the
+oplog as before; when 0.43.0 starts again it completes the table from the oplog
+in the background. A vector record's configuration fingerprint
+([ADR-203](decisions.md)) is an extra key 0.42.0 ignores. The files
+`kimmy.catching-up` and `kimmy.replay-floor` ([ADR-202](decisions.md)) are files
+0.42.0 ignores, **and 0.42.0 has no gate**: a member whose marker is set serves
+what it holds the moment it starts on 0.42.0, so keep clients off a member that
+was catching up until it has caught up, as before this release, and delete the
+two files if the member is to be started on 0.43.0 again with no history of
+being behind. **The configuration does not roll back by itself.** 0.42.0
+refuses an unknown key in `[cluster]` when it parses the file, and exits: remove
+`cluster.catch_up_wait_secs` and `cluster.expected_members` first. The
+variable `KIMMY_CLUSTER_EXPECTED_MEMBERS` (`catch_up_wait_secs` has none) is
+ignored by 0.42.0, so a manifest that sets it needs no edit. A member on the
+defaults rolls back untouched.
 
 **Rolling back from 0.40.1 to 0.40.0 or earlier** after a stop that could not
 close its store: the older build does not know the marker `storage_not_closed`.
