@@ -8500,6 +8500,12 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_violations_walk_path_total",
         "kimmy_violations_walk_path_total",
     ])
+    .chain(std::iter::repeat_n("kimmy_ownership_peers", kimmy_cluster::PeerState::ALL.len()))
+    .chain(std::iter::repeat_n(
+        "kimmy_yield_unconfirmed_peers",
+        kimmy_cluster::OwnerClass::ALL.len(),
+    ))
+    .chain(["kimmy_ownership_facts_undecodable_total"])
     .collect();
 
     assert_eq!(series, expected, "the /metrics series set or its order changed:\n{body}");

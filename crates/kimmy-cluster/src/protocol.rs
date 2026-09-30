@@ -89,6 +89,16 @@ pub enum Message {
     AskVersions {
         #[serde(default)]
         witnessed: bool,
+        /// The requester's own block (ADR-201), so a member that is only ever
+        /// contacted and never contacts still hands it over. Optional on the
+        /// wire: a receiver that predates it ignores the key, and a requester
+        /// that predates it sends none, which reads as unknown.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::facts::lenient"
+        )]
+        facts: Option<std::sync::Arc<crate::facts::Facts>>,
     },
     /// The answer: what the receiver can serve.
     Versions(VersionVector),
@@ -98,7 +108,19 @@ pub enum Message {
     /// [`Message::Witnessed`] carries. One frame rather than two requests,
     /// because every sync round asks the first question and a checked
     /// contact needs the second.
-    Vectors { servable: VersionVector, witnessed: VersionVector },
+    Vectors {
+        servable: VersionVector,
+        witnessed: VersionVector,
+        /// The answerer's own block (ADR-201), with the same compatibility as
+        /// `AskVersions::facts`: an older requester drops the key, and an older
+        /// answerer sends none.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::facts::lenient"
+        )]
+        facts: Option<std::sync::Arc<crate::facts::Facts>>,
+    },
     /// "Send me everything at or after this point."
     ///
     /// `held` is the requester's witnessed vector — the one `from` was derived
@@ -650,8 +672,8 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let messages = [
-            Message::AskVersions { witnessed: false },
-            Message::AskVersions { witnessed: true },
+            Message::AskVersions { witnessed: false, facts: None },
+            Message::AskVersions { witnessed: true, facts: None },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
                 limit: 10,
@@ -678,7 +700,11 @@ mod tests {
                 partial: false,
             },
             Message::Versions(populated_vector()),
-            Message::Vectors { servable: populated_vector(), witnessed: populated_vector() },
+            Message::Vectors {
+                servable: populated_vector(),
+                witnessed: populated_vector(),
+                facts: None,
+            },
             Message::Entries {
                 entries: Vec::new(),
                 scanned_to: Hlc::new(11, 2),
@@ -761,7 +787,9 @@ mod tests {
         // The length prefix is what separates them; without it the second read
         // would consume the tail of the first message.
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Message::AskVersions { witnessed: false }).await.unwrap();
+        write_frame(&mut buffer, &Message::AskVersions { witnessed: false, facts: None })
+            .await
+            .unwrap();
         write_frame(
             &mut buffer,
             &Message::AskEntries {
@@ -778,7 +806,7 @@ mod tests {
         let mut stream = buffer.as_slice();
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskVersions { witnessed: false }
+            Message::AskVersions { witnessed: false, facts: None }
         );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
@@ -1131,23 +1159,164 @@ mod tests {
         let old_request = frame(bson::doc! { "AskVersions": {} });
         assert_eq!(
             read_frame(&mut old_request.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false },
+            Message::AskVersions { witnessed: false, facts: None },
             "a request without the field must read as one that did not ask"
         );
 
         let future = frame(bson::doc! { "AskVersions": { "somethingNewer": true } });
         assert_eq!(
             read_frame(&mut future.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false },
+            Message::AskVersions { witnessed: false, facts: None },
             "a field this build does not know must not fail the frame"
         );
 
         // And the frame this build writes when it asks is exactly the shape
         // an old receiver is handed above: an unknown field on `AskVersions`.
         let mut asked = Vec::new();
-        write_frame(&mut asked, &Message::AskVersions { witnessed: true }).await.unwrap();
+        write_frame(&mut asked, &Message::AskVersions { witnessed: true, facts: None })
+            .await
+            .unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
         assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
+    }
+
+    /// The boundary for `facts` (ADR-201), in both directions and on both
+    /// messages. An older build reads a message carrying the key and drops it;
+    /// this build reads one without the key as unknown; a block with fewer fields
+    /// than this build's decodes; and a member with no block writes no key at all,
+    /// so its frame is byte for byte the frame an older build wrote.
+    #[tokio::test]
+    async fn facts_cross_a_version_boundary_in_both_directions() {
+        use serde::Deserialize;
+        // What the message was before the field, as an older build reads it.
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum Before {
+            AskVersions {
+                #[serde(default)]
+                witnessed: bool,
+            },
+            Vectors {
+                servable: VersionVector,
+                witnessed: VersionVector,
+            },
+        }
+        let frame = |body: bson::Document| {
+            let mut buffer = Vec::new();
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let facts =
+            crate::facts::Facts { boot: vec![9; 16], catching_up: true, ..Default::default() }
+                .with_ttl(vec![crate::facts::TtlHeld {
+                    collection: kimmy_core::CollectionId(u64::MAX - 1),
+                    digest: vec![0xFF; 8],
+                }]);
+
+        // New writes, old reads.
+        for message in [
+            Message::AskVersions {
+                witnessed: true,
+                facts: Some(std::sync::Arc::new(facts.clone())),
+            },
+            Message::Vectors {
+                servable: populated_vector(),
+                witnessed: populated_vector(),
+                facts: Some(std::sync::Arc::new(facts.clone())),
+            },
+        ] {
+            let mut written = Vec::new();
+            write_frame(&mut written, &message).await.unwrap();
+            let old: Before = bson::deserialize_from_slice(&written[4..]).unwrap();
+            match (message, old) {
+                (Message::AskVersions { .. }, Before::AskVersions { witnessed }) => {
+                    assert!(witnessed);
+                }
+                (Message::Vectors { servable, .. }, Before::Vectors { servable: seen, .. }) => {
+                    assert_eq!(seen, servable);
+                }
+                other => panic!("the same variant either way: {other:?}"),
+            }
+        }
+
+        // Old writes, new reads: no key means no block.
+        let old_vectors = frame(bson::doc! { "Vectors": { "servable": {}, "witnessed": {} } });
+        match read_frame(&mut old_vectors.as_slice()).await.unwrap() {
+            Message::Vectors { facts, .. } => assert_eq!(facts, None),
+            other => panic!("{other:?}"),
+        }
+        let old_ask = frame(bson::doc! { "AskVersions": { "witnessed": true } });
+        assert_eq!(
+            read_frame(&mut old_ask.as_slice()).await.unwrap(),
+            Message::AskVersions { witnessed: true, facts: None }
+        );
+
+        // A block from a build with fewer fields, on the wire in a reply.
+        let fewer = frame(bson::doc! {
+            "Vectors": { "servable": {}, "witnessed": {}, "facts": { "catching_up": true } }
+        });
+        match read_frame(&mut fewer.as_slice()).await.unwrap() {
+            Message::Vectors { facts: Some(facts), .. } => {
+                assert!(facts.catching_up && facts.ttl.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A block that does not decode is no block, never a failed exchange: a
+        // wrong type for a field, and a partial `yielding` (the missing flags
+        // read as false).
+        let wrong = frame(bson::doc! {
+            "Vectors": { "servable": {}, "witnessed": {}, "facts": { "ttl": "not a list" } }
+        });
+        match read_frame(&mut wrong.as_slice()).await.unwrap() {
+            Message::Vectors { facts, servable, .. } => {
+                assert_eq!(facts, None);
+                assert_eq!(servable, VersionVector::new(), "the rest of the message stands");
+            }
+            other => panic!("{other:?}"),
+        }
+        let partial = frame(bson::doc! {
+            "AskVersions": { "witnessed": true, "facts": { "yielding": { "ttl": true } } }
+        });
+        match read_frame(&mut partial.as_slice()).await.unwrap() {
+            Message::AskVersions { facts: Some(facts), .. } => {
+                assert!(
+                    facts.yielding.ttl && !facts.yielding.webhooks && !facts.yielding.embeddings
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // This build's own frames round trip, block included, and a member with
+        // no block writes none.
+        let mut wire = Vec::new();
+        let full = Message::Vectors {
+            servable: populated_vector(),
+            witnessed: populated_vector(),
+            facts: Some(std::sync::Arc::new(facts)),
+        };
+        write_frame(&mut wire, &full).await.unwrap();
+        assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
+        let mut bare = Vec::new();
+        write_frame(
+            &mut bare,
+            &Message::Vectors {
+                servable: populated_vector(),
+                witnessed: populated_vector(),
+                facts: None,
+            },
+        )
+        .await
+        .unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&bare[4..]).unwrap();
+        assert!(!body.get_document("Vectors").unwrap().contains_key("facts"));
+        let mut ask = Vec::new();
+        write_frame(&mut ask, &Message::AskVersions { witnessed: true, facts: None })
+            .await
+            .unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&ask[4..]).unwrap();
+        assert!(!body.get_document("AskVersions").unwrap().contains_key("facts"));
     }
 
     /// The same boundary for `AskSnapshot::collection` (ADR-152). A

@@ -20,6 +20,7 @@
 
 pub mod confirm;
 pub mod discovery;
+pub mod facts;
 pub mod health;
 pub mod membership;
 pub mod peers;
@@ -31,6 +32,10 @@ pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
+pub use facts::{
+    Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState, TtlHeld, Yielding,
+    facts_undecodable_total,
+};
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
 pub use peers::{

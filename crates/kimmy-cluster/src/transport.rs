@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use kimmy_core::oplog::OplogEntry;
 
+use crate::membership::Members;
 use crate::protocol::{
     MAX_BATCH, MAX_FRAME, Message, ProtocolError, nonce, proof_is_valid, prove, read_frame,
     write_frame,
@@ -435,7 +436,7 @@ impl ServeBudgets {
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
     let tls =
         Arc::new(crate::tls::ClusterTls::new().expect("cluster TLS for a locally served listener"));
-    serve_with(engine, listener, secret, None, None, None, tls).await
+    serve_with(engine, listener, secret, None, None, None, tls, None).await
 }
 
 /// [`serve`], reporting each pushed batch's outcome to `on_pushed`.
@@ -454,6 +455,7 @@ pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
 /// nothing on its own (see [`crate::tls`]), so reusing it costs nothing, and
 /// generating a keypair per peer would be a denial-of-service lever anyone who
 /// can open a socket could pull.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with(
     engine: Arc<Engine>,
     listener: TcpListener,
@@ -462,6 +464,7 @@ pub async fn serve_with(
     on_failed: Option<ServeFailHook>,
     on_accept_error: Option<AcceptErrorHook>,
     tls: Arc<crate::tls::ClusterTls>,
+    members: Option<Members>,
 ) {
     let local = listener.local_addr().ok();
     info!(bind = ?local, "serving cluster replication over TLS");
@@ -475,6 +478,7 @@ pub async fn serve_with(
         let secret = secret.clone();
         let on_pushed = on_pushed.clone();
         let on_failed = on_failed.clone();
+        let members = members.clone();
         let acceptor = tls.acceptor();
         // One task per peer: a slow or hostile peer must not stall the others,
         // and a panic in one connection must not take the listener down. The
@@ -515,6 +519,7 @@ pub async fn serve_with(
                 on_failed.as_ref(),
                 peer,
                 ServeBudgets::serving(),
+                members.as_ref(),
             )
             .await;
         });
@@ -576,10 +581,12 @@ async fn serve_connection<S>(
     on_failed: Option<&ServeFailHook>,
     peer: impl std::fmt::Display,
     budgets: ServeBudgets,
+    members: Option<&Members>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed, budgets).await else {
+    let Err(e) = serve_peer(engine, stream, secret, binding, on_pushed, budgets, members).await
+    else {
         return;
     };
     // One line per connection, not a warning per push: the refusal ends the
@@ -622,6 +629,7 @@ async fn serve_peer<S>(
     binding: &[u8],
     on_pushed: Option<&PushHook>,
     budgets: ServeBudgets,
+    members: Option<&Members>,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -635,8 +643,21 @@ where
     debug!(?peer, "peer authenticated");
 
     loop {
+        // A stale flag from an earlier decode is not this frame's.
+        crate::facts::take_undecodable();
         match read_frame(&mut stream).await? {
-            Message::AskVersions { witnessed } => {
+            Message::AskVersions { witnessed, facts } => {
+                if crate::facts::take_undecodable()
+                    && let Some(members) = members
+                {
+                    members.note_undecodable(peer, std::time::Instant::now());
+                }
+                // The requester's own block, which a member that is only ever
+                // contacted hands over this way (ADR-201).
+                let sent_facts = facts.is_some();
+                if let (Some(members), Some(facts)) = (members, facts) {
+                    members.record_peer_facts(peer, facts, std::time::Instant::now());
+                }
                 let servable =
                     engine.version_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
                 if !witnessed {
@@ -653,7 +674,15 @@ where
                 // of what it can serve.
                 let witnessed =
                     engine.witnessed_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
-                write_frame(&mut stream, &Message::Vectors { servable, witnessed }).await?;
+                let ours = members.and_then(Members::local_facts);
+                let facts = ours.as_ref().map(|(block, _)| Arc::clone(block));
+                write_frame(&mut stream, &Message::Vectors { servable, witnessed, facts }).await?;
+                // Read by the peer only when the peer said it could read a block
+                // (its request carried one: a 0.42 requester's did not), and only
+                // once the frame that carries ours has gone (ADR-201).
+                if let (Some(members), Some((_, generation)), true) = (members, ours, sent_facts) {
+                    members.note_read_by(peer, generation);
+                }
             }
             Message::AskWitnessed {} => {
                 let witnessed =
@@ -1123,9 +1152,21 @@ where
     // anyway (ADR-146): what it can serve drives the pull, and what it
     // has processed drives the count half's gate below. A peer that
     // predates the flag answers with the first alone.
-    write_frame(stream, &Message::AskVersions { witnessed: true }).await?;
+    let ours = stalls.local_facts.clone();
+    write_frame(stream, &Message::AskVersions { witnessed: true, facts: ours }).await?;
+    crate::facts::take_undecodable();
     let (theirs, their_witnessed) = match read_frame(stream).await? {
-        Message::Vectors { servable, witnessed } => (servable, Some(witnessed)),
+        Message::Vectors { servable, witnessed, facts } => {
+            if crate::facts::take_undecodable() {
+                stalls.facts_undecodable.push(their_node);
+            }
+            // What the peer says about itself, kept for the loop to hand to
+            // `Members` once the tick is done (ADR-201).
+            if let Some(facts) = facts {
+                stalls.facts_read.push((their_node, facts));
+            }
+            (servable, Some(witnessed))
+        }
         Message::Versions(servable) => (servable, None),
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
@@ -1871,6 +1912,13 @@ pub struct PeerStalls {
     /// The vectors rounds have read since the loop last took them: each
     /// peer's `theirs`, for the lag gauge (ADR-175's addendum).
     vectors_read: Vec<(SocketAddr, VersionVector)>,
+    /// This member's own block, sent with every `AskVersions` this tick
+    /// (ADR-201); set by the loop at the start of a tick.
+    local_facts: Option<Arc<crate::facts::Facts>>,
+    /// The blocks peers sent this tick, with the peer, until the loop takes them.
+    facts_read: Vec<(NodeId, Arc<crate::facts::Facts>)>,
+    /// Peers whose block this tick did not decode, until the loop takes them.
+    facts_undecodable: Vec<NodeId>,
     /// Where this node stood behind each peer when its probe count was read,
     /// on the origins it then trailed that peer on (ADR-168) — the mirror of
     /// `by_peer`, so a member that is itself draining a backlog is not read
@@ -2152,6 +2200,21 @@ impl PeerStalls {
 
     /// The vectors the rounds since this was last taken read from their
     /// peers, whether or not the rounds went on to succeed.
+    /// Send `facts` with every request from now on.
+    pub fn set_local_facts(&mut self, facts: Option<Arc<crate::facts::Facts>>) {
+        self.local_facts = facts;
+    }
+
+    /// The blocks peers sent since the last call.
+    /// The peers whose block did not decode since the last call.
+    pub fn take_facts_undecodable(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.facts_undecodable)
+    }
+
+    pub fn take_facts_read(&mut self) -> Vec<(NodeId, Arc<crate::facts::Facts>)> {
+        std::mem::take(&mut self.facts_read)
+    }
+
     pub fn take_vectors_read(&mut self) -> Vec<(SocketAddr, VersionVector)> {
         std::mem::take(&mut self.vectors_read)
     }
@@ -3177,6 +3240,7 @@ pub(crate) mod test_serving {
             None,
             peer,
             ServeBudgets::serving(),
+            None,
         )
         .await;
         ended.lock().take()
@@ -3231,6 +3295,7 @@ pub(crate) mod test_serving {
                             Some(&hook),
                             peer,
                             ServeBudgets::serving(),
+                            None,
                         )
                         .await;
                     }
@@ -4220,7 +4285,7 @@ mod tests {
 
         async fn fake_peer(mut stream: DuplexStream, answer: Message) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("the round opens by asking for both vectors, got {other:?}"),
             }
             write_frame(&mut stream, &answer).await.unwrap();
@@ -4238,7 +4303,8 @@ mod tests {
 
         // Upgraded: both vectors, gated on what it has processed.
         let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let answer = Message::Vectors { servable: trailing.clone(), witnessed: processed };
+        let answer =
+            Message::Vectors { servable: trailing.clone(), witnessed: processed, facts: None };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
         let outcome =
@@ -4262,6 +4328,193 @@ mod tests {
         assert!(stalls.without_witnessed.contains(&their_node), "and noted as answering without");
         assert_eq!(outcome.divergent, Some(std::collections::BTreeSet::new()), "the check ran");
     }
+    /// The served side records the block a requester sends and answers with its
+    /// own, and notes that the requester has read it (ADR-201). An older
+    /// requester, which sends none, is answered as it always was.
+    #[tokio::test]
+    async fn the_serve_arm_exchanges_blocks() {
+        use crate::facts::Facts;
+        const SECRET: &str = "a-facts-test-secret";
+        const BINDING: &[u8] = b"a-facts-test-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let served = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let asker_dir = tempfile::tempdir().unwrap();
+        let asker = Engine::open(&asker_dir.path().join("kimmy.redb")).unwrap();
+        let members = Members::default();
+        let asker_node = asker.node_id();
+        members.insert_for_test("127.0.0.1:7001".parse().unwrap(), asker_node);
+        let mine = Facts { boot: vec![4; 16], ttl_disabled: true, ..Facts::default() };
+        members.set_facts_source(Arc::new({
+            let mine = mine.clone();
+            move || mine.clone()
+        }));
+        let theirs = Facts { boot: vec![5; 16], catching_up: true, ..Facts::default() };
+
+        let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+        let serving = async {
+            let _ = serve_peer(
+                &served,
+                far,
+                SECRET,
+                BINDING,
+                None,
+                ServeBudgets::serving(),
+                Some(&members),
+            )
+            .await;
+        };
+        let asking = async {
+            open_handshake(&asker, &mut ours, SECRET, BINDING).await.unwrap();
+            write_frame(
+                &mut ours,
+                &Message::AskVersions { witnessed: true, facts: Some(Arc::new(theirs.clone())) },
+            )
+            .await
+            .unwrap();
+            let with = read_frame(&mut ours).await.unwrap();
+            // An older requester: no block sent, none recorded, none required.
+            write_frame(&mut ours, &Message::AskVersions { witnessed: true, facts: None })
+                .await
+                .unwrap();
+            let without = read_frame(&mut ours).await.unwrap();
+            // And one that predates the witnessed vector at all.
+            write_frame(&mut ours, &Message::AskVersions { witnessed: false, facts: None })
+                .await
+                .unwrap();
+            let old = read_frame(&mut ours).await.unwrap();
+            drop(ours);
+            (with, without, old)
+        };
+        let ((), (with, without, old)) = tokio::join!(serving, asking);
+        match with {
+            Message::Vectors { facts, .. } => assert_eq!(facts.as_deref(), Some(&mine)),
+            other => panic!("{other:?}"),
+        }
+        match without {
+            Message::Vectors { facts, .. } => assert_eq!(facts.as_deref(), Some(&mine)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(old, Message::Versions(_)), "{old:?}");
+        assert_eq!(
+            members.peer_states()[&asker_node],
+            crate::facts::PeerState::IneligibleCatchingUp,
+            "the requester's block was recorded"
+        );
+        assert!(members.unconfirmed_peers(crate::facts::OwnerClass::Ttl).is_empty());
+    }
+
+    /// A peer has read this member's block only when its request carried one and
+    /// the frame carrying ours has gone: a 0.42 requester's request carries none,
+    /// and a reply that could not be written was read by nobody (ADR-201).
+    #[tokio::test]
+    async fn the_serve_side_confirms_a_read_only_after_the_frame_went_and_only_to_a_requester_that_sent_a_block()
+     {
+        use crate::facts::{Facts, OwnerClass, Yielding};
+        const SECRET: &str = "a-confirm-test-secret";
+        const BINDING: &[u8] = b"a-confirm-test-binding";
+
+        // One connection: what it asks, and whether it stays to read the answer.
+        async fn confirmed(asks: Message, reads_the_answer: bool) -> bool {
+            let dir = tempfile::tempdir().unwrap();
+            let served = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let asker_dir = tempfile::tempdir().unwrap();
+            let asker = Engine::open(&asker_dir.path().join("kimmy.redb")).unwrap();
+            let members = Members::default();
+            let asker_node = asker.node_id();
+            members.insert_for_test("127.0.0.1:7001".parse().unwrap(), asker_node);
+            // A member that yields ttl, so there is a block to confirm.
+            members.set_facts_source(Arc::new(|| Facts {
+                yielding: Yielding { ttl: true, ..Yielding::default() },
+                ..Facts::default()
+            }));
+            let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+            let serving = async {
+                let _ = serve_peer(
+                    &served,
+                    far,
+                    SECRET,
+                    BINDING,
+                    None,
+                    ServeBudgets::serving(),
+                    Some(&members),
+                )
+                .await;
+            };
+            let asking = async {
+                open_handshake(&asker, &mut ours, SECRET, BINDING).await.unwrap();
+                write_frame(&mut ours, &asks).await.unwrap();
+                if reads_the_answer {
+                    let _ = read_frame(&mut ours).await.unwrap();
+                }
+                drop(ours);
+            };
+            tokio::join!(serving, asking);
+            members.unconfirmed_peers(OwnerClass::Ttl).is_empty()
+        }
+
+        let block = Some(Arc::new(Facts::default()));
+        assert!(
+            confirmed(Message::AskVersions { witnessed: true, facts: block.clone() }, true).await,
+            "a requester that sent a block, and read the answer, has read ours"
+        );
+        assert!(
+            !confirmed(Message::AskVersions { witnessed: true, facts: None }, true).await,
+            "a 0.42 requester sent none, so nothing says it can read one"
+        );
+        assert!(
+            !confirmed(Message::AskVersions { witnessed: true, facts: block }, false).await,
+            "a reply that could not be written was read by nobody"
+        );
+    }
+
+    /// The requester sends its own block with `AskVersions` and keeps the one
+    /// the answer carries, for the loop to hand to `Members`; an answer without
+    /// one leaves nothing.
+    #[tokio::test]
+    async fn the_sync_arm_sends_its_block_and_keeps_the_answer() {
+        use crate::facts::Facts;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let sent = Facts { boot: vec![6; 16], ..Facts::default() };
+        let answered = Facts { boot: vec![7; 16], embeddings_disabled: true, ..Facts::default() };
+        let vector = engine.version_vector().unwrap();
+
+        async fn peer(mut stream: tokio::io::DuplexStream, answer: Message, expect: Option<Facts>) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true, facts } => {
+                    assert_eq!(facts.as_deref(), expect.as_ref());
+                }
+                other => panic!("{other:?}"),
+            }
+            write_frame(&mut stream, &answer).await.unwrap();
+            // The round then asks for nothing it lacks: it ends at the check or
+            // at the close; either way this side is done.
+        }
+
+        let mut stalls = PeerStalls::new();
+        stalls.set_local_facts(Some(Arc::new(sent.clone())));
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let answer = Message::Vectors {
+            servable: vector.clone(),
+            witnessed: vector.clone(),
+            facts: Some(Arc::new(answered.clone())),
+        };
+        let far = tokio::spawn(peer(theirs, answer, Some(sent)));
+        let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
+        far.await.unwrap();
+        assert_eq!(stalls.take_facts_read(), vec![(node(9), Arc::new(answered))]);
+        assert!(stalls.take_facts_read().is_empty(), "taken once");
+
+        stalls.set_local_facts(None);
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let bare = Message::Vectors { servable: vector.clone(), witnessed: vector, facts: None };
+        let far = tokio::spawn(peer(theirs, bare, None));
+        let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
+        far.await.unwrap();
+        assert!(stalls.take_facts_read().is_empty(), "an answer with no block leaves none");
+    }
+
     /// A round that fails after the peer's vectors arrived still leaves them
     /// for the lag gauge (ADR-175's addendum): a peer whose every round
     /// fails, as in round 0430, counts towards the lag rather than vanishing
@@ -4277,10 +4530,11 @@ mod tests {
 
         async fn fake_peer(mut stream: DuplexStream, servable: VersionVector) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("the round opens by asking for both vectors, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: servable.clone(), witnessed: servable };
+            let answer =
+                Message::Vectors { servable: servable.clone(), witnessed: servable, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
             let _ = read_frame(&mut stream).await;
@@ -4328,10 +4582,11 @@ mod tests {
             window: Vec<OplogEntry>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskEntries { .. } => {}
@@ -4437,9 +4692,10 @@ mod tests {
         ) {
             assert!(matches!(
                 read_frame(&mut stream).await.unwrap(),
-                Message::AskVersions { witnessed: true }
+                Message::AskVersions { witnessed: true, .. }
             ));
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskEntries { from, .. } => assert_eq!(from, expect_from),
@@ -4510,10 +4766,11 @@ mod tests {
             exhausted: bool,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskEntries { from, held, .. } => {
@@ -4676,10 +4933,11 @@ mod tests {
             then_check: bool,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskEntries { .. } => {}
@@ -4825,9 +5083,10 @@ mod tests {
         ) {
             assert!(matches!(
                 read_frame(&mut stream).await.unwrap(),
-                Message::AskVersions { witnessed: true }
+                Message::AskVersions { witnessed: true, .. }
             ));
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskSnapshot { after, .. } => {
@@ -4927,10 +5186,11 @@ mod tests {
             page: Option<SnapshotPage>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
             let Some(page) = page else { return };
@@ -5154,10 +5414,11 @@ mod tests {
             incarnations: Vec<(CollectionId, Hlc)>,
         ) {
             match read_frame(&mut stream).await.unwrap() {
-                Message::AskVersions { witnessed: true } => {}
+                Message::AskVersions { witnessed: true, .. } => {}
                 other => panic!("expected AskVersions, got {other:?}"),
             }
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
                 Message::AskDivergence { .. } => {}
@@ -5455,6 +5716,7 @@ mod tests {
             Some(&hook),
             "peer",
             ServeBudgets { whole: Duration::ZERO, ..ServeBudgets::serving() },
+            None,
         );
         let asking = async {
             open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
@@ -5493,8 +5755,9 @@ mod tests {
         const SECRET: &str = "a-push-test-secret";
         const BINDING: &[u8] = b"a-push-test-binding";
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
-        let serving =
-            async { serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving()).await };
+        let serving = async {
+            serve_peer(&b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None).await
+        };
         let pushing = async {
             open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
             let push = Message::Push {
@@ -5542,7 +5805,7 @@ mod tests {
         });
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
         let serving = async {
-            serve_peer(b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving()).await
+            serve_peer(b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving(), None).await
         };
         let pushing = async {
             open_handshake(&pusher, &mut ours, SECRET, BINDING).await.unwrap();
@@ -5591,6 +5854,7 @@ mod tests {
             Some(&hook),
             "peer",
             ServeBudgets::serving(),
+            None,
         );
         tokio::join!(serving, client(ours, peer));
         std::mem::take(&mut *seen.lock().unwrap())
@@ -5605,7 +5869,9 @@ mod tests {
             open_handshake(&peer, &mut ours, "a-serve-failure-secret", b"a-serve-failure-binding")
                 .await
                 .unwrap();
-            write_frame(&mut ours, &Message::AskVersions { witnessed: true }).await.unwrap();
+            write_frame(&mut ours, &Message::AskVersions { witnessed: true, facts: None })
+                .await
+                .unwrap();
             drop(ours);
         })
         .await;
@@ -5666,7 +5932,9 @@ mod tests {
             open_handshake(&peer, &mut ours, "a-serve-failure-secret", b"a-serve-failure-binding")
                 .await
                 .unwrap();
-            write_frame(&mut ours, &Message::AskVersions { witnessed: true }).await.unwrap();
+            write_frame(&mut ours, &Message::AskVersions { witnessed: true, facts: None })
+                .await
+                .unwrap();
             let _ = read_frame(&mut ours).await.unwrap();
             drop(ours);
         })
@@ -5735,7 +6003,8 @@ mod tests {
         });
         let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
         let serving = async {
-            serve_peer(&b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving()).await
+            serve_peer(&b, theirs, SECRET, BINDING, Some(&hook), ServeBudgets::serving(), None)
+                .await
         };
         let pushing = async {
             open_handshake(&a, &mut ours, SECRET, BINDING).await.unwrap();
@@ -5942,10 +6211,10 @@ mod tests {
         answer_divergence: bool,
     ) {
         match read_frame(&mut stream).await.unwrap() {
-            Message::AskVersions { witnessed: true } => {}
+            Message::AskVersions { witnessed: true, .. } => {}
             other => panic!("expected AskVersions, got {other:?}"),
         }
-        let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+        let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
             Message::AskEntries { .. } => {}
@@ -6103,7 +6372,8 @@ mod tests {
         let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(async move {
             let _ = read_frame(&mut peer_end).await;
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
             // Asked for entries, and never answers.
@@ -6136,7 +6406,11 @@ mod tests {
         let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(async move {
             let _ = read_frame(&mut peer_end).await;
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() };
+            let answer = Message::Vectors {
+                servable: theirs.clone(),
+                witnessed: theirs.clone(),
+                facts: None,
+            };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
             write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
@@ -6201,7 +6475,8 @@ mod tests {
         let (mut ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
         let peer = tokio::spawn(async move {
             let _ = read_frame(&mut peer_end).await;
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
             write_frame(&mut peer_end, &Message::BeyondHorizon {}).await.unwrap();
@@ -6296,7 +6571,8 @@ mod tests {
             window: Vec<OplogEntry>,
         ) {
             let _ = read_frame(&mut stream).await;
-            let answer = Message::Vectors { servable: theirs.clone(), witnessed: theirs };
+            let answer =
+                Message::Vectors { servable: theirs.clone(), witnessed: theirs, facts: None };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;
             let scanned_to = window.last().unwrap().stamp.hlc;
@@ -6398,7 +6674,9 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
         let (mut stream, _) = dial(&b, addr, CLOSING_SECRET).await.unwrap();
-        write_frame(&mut stream, &Message::AskVersions { witnessed: true }).await.unwrap();
+        write_frame(&mut stream, &Message::AskVersions { witnessed: true, facts: None })
+            .await
+            .unwrap();
         assert!(read_frame(&mut stream).await.is_ok(), "premise: a whole exchange");
         drop(stream);
         served.ended(1).await;
@@ -6665,7 +6943,7 @@ mod partial_windows_never_skip {
         let (mut ours, near) = tokio::io::duplex(MAX_FRAME);
         let (far, theirs) = tokio::io::duplex(MAX_FRAME);
         let budgets = ServeBudgets { partial, whole: REQUEST_TIMEOUT };
-        let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets);
+        let serving = serve_peer(sender, theirs, SECRET, BINDING, None, budgets, None);
         let asked: std::cell::Cell<Option<Hlc>> = std::cell::Cell::new(None);
         let relaying = async {
             let (mut near_read, mut near_write) = tokio::io::split(near);

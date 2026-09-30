@@ -30,11 +30,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use foca::{Config, Foca, Identity, Notification, PostcardCodec, Timer};
-use kimmy_core::NodeId;
+use kimmy_core::{CollectionId, NodeId};
 
+use crate::facts::{Facts, FactsSource, LocalFacts, OwnerClass, PeerFacts, PeerState, may_own};
 use crate::protocol;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,15 @@ struct MembersInner {
     /// moves forward (ADR-191).
     generations: RwLock<BTreeMap<SocketAddr, u64>>,
     next: std::sync::atomic::AtomicU64,
+    /// This member's own block, once the daemon has given a source for it.
+    local: std::sync::OnceLock<LocalFacts>,
+    /// The last block each peer sent (ADR-201).
+    peer_facts: RwLock<BTreeMap<NodeId, PeerFacts>>,
+    /// The sync interval and the fanout the lease is derived from.
+    lease_shape: RwLock<(Duration, usize)>,
+    /// When each peer's undecodable block was last said, so it is said once per
+    /// [`crate::health::WARN_INTERVAL`] and peer.
+    undecodable_said: parking_lot::Mutex<BTreeMap<NodeId, Instant>>,
 }
 
 impl Members {
@@ -195,10 +205,199 @@ impl Members {
         let generation = self.0.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.0.generations.write().insert(addr, generation);
         self.0.live.write().insert(addr, node);
+        // Nothing is dropped here: a block that arrived before SWIM's insert
+        // (the contact can win the race) is the peer's, and a peer SWIM declared
+        // down had its block dropped then, in `remove`.
     }
 
     fn remove(&self, addr: &SocketAddr) {
-        self.0.live.write().remove(addr);
+        let gone = self.0.live.write().remove(addr);
+        // Declared down: what it last said, and what it last read of ours,
+        // belong to an incarnation that may be gone. A block it sends after it
+        // is back is a new one, and a stale bit stays only until then (ADR-201).
+        if let Some(node) = gone {
+            self.forget_peer(node);
+        }
+    }
+
+    /// A block from `peer` did not decode and was treated as none. Says so, once
+    /// per interval per peer, naming it: otherwise a peer whose blocks never
+    /// decode looks exactly like an older one that sends none. Answers whether it
+    /// said it now.
+    pub(crate) fn note_undecodable(&self, peer: NodeId, now: Instant) -> bool {
+        let mut said = self.0.undecodable_said.lock();
+        let due = said
+            .get(&peer)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= crate::health::WARN_INTERVAL);
+        if due {
+            said.insert(peer, now);
+            warn!(
+                %peer,
+                "a peer sent a facts block that does not decode; it is treated as having sent \
+                 none, as an older version's peer is"
+            );
+        }
+        due
+    }
+
+    /// Drop what `node` last said and what it last read of this member's block:
+    /// it is a new incarnation, or SWIM declared it down (ADR-201).
+    fn forget_peer(&self, node: NodeId) {
+        self.0.peer_facts.write().remove(&node);
+        if let Some(local) = self.0.local.get() {
+            local.forget(node);
+        }
+    }
+
+    /// Give this member's own block a source. Once: a second call is ignored.
+    pub fn set_facts_source(&self, source: FactsSource) {
+        let _ = self.0.local.set(LocalFacts::with_source(source));
+    }
+
+    /// The sync interval and fanout the lease is derived from.
+    pub fn configure_lease(&self, sync_interval: Duration, fanout: usize) {
+        *self.0.lease_shape.write() = (sync_interval, fanout.max(1));
+    }
+
+    /// How long a peer's block is fresh: **at least `ceil((N - 1) / fanout) + 2`
+    /// sync intervals**, derived from the current member count `N` and the
+    /// fanout, not a constant. With a fanout below the peer count one round does
+    /// not reach every peer, and a fixed lease would expire facts that are still
+    /// being refreshed (ADR-201).
+    pub fn lease(&self) -> Duration {
+        let (interval, fanout) = *self.0.lease_shape.read();
+        // Unconfigured (a member set nothing has told its intervals): the
+        // defaults, so a lease is never zero and never divides by zero.
+        let interval =
+            if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval };
+        let fanout = fanout.max(1);
+        let peers = self.0.live.read().len();
+        interval * (peers.div_ceil(fanout) as u32 + 2)
+    }
+
+    /// This member's block to send, with its generation, or `None` with no
+    /// source. Cached (`facts::LocalFacts`).
+    pub(crate) fn local_facts(&self) -> Option<(std::sync::Arc<Facts>, u64)> {
+        self.0.local.get()?.current(Instant::now())
+    }
+
+    /// `peer` was sent this member's block `generation`.
+    pub(crate) fn note_read_by(&self, peer: NodeId, generation: u64) {
+        if let Some(local) = self.0.local.get() {
+            local.note_read(peer, generation);
+        }
+    }
+
+    /// A block `node` sent. A new boot id replaces everything earlier, which is
+    /// what replacing the block does; nothing of the previous process is kept.
+    pub(crate) fn record_peer_facts(&self, node: NodeId, facts: Arc<Facts>, now: Instant) {
+        let mut table = self.0.peer_facts.write();
+        // A new boot id is a new process: what the old one read of our block
+        // says nothing of it.
+        let restarted = table.get(&node).is_some_and(|held| held.facts.boot != facts.boot);
+        table.insert(node, PeerFacts { facts, received: now });
+        if let Some(local) = self.0.local.get() {
+            if restarted {
+                local.forget(node);
+            }
+            local.retain(&self.node_ids());
+        }
+        // A peer that is not live and has been quiet for many leases is
+        // forgotten, so the table follows the cluster and does not grow.
+        let lease = self.lease();
+        let live: BTreeSet<NodeId> = self.node_ids();
+        table.retain(|peer, held| {
+            live.contains(peer) || now.saturating_duration_since(held.received) < lease * 10
+        });
+    }
+
+    /// How this member sees each live peer.
+    pub fn peer_states(&self) -> BTreeMap<NodeId, PeerState> {
+        self.peer_states_at(Instant::now())
+    }
+
+    pub(crate) fn peer_states_at(&self, now: Instant) -> BTreeMap<NodeId, PeerState> {
+        let lease = self.lease();
+        let table = self.0.peer_facts.read();
+        self.node_ids()
+            .into_iter()
+            .map(|node| {
+                let state = match table.get(&node) {
+                    None => PeerState::Unknown,
+                    Some(held) if now.saturating_duration_since(held.received) > lease => {
+                        PeerState::Stale
+                    }
+                    Some(held) if held.facts.catching_up => PeerState::IneligibleCatchingUp,
+                    Some(held) if held.facts.yielding.any() => PeerState::IneligibleYielding,
+                    Some(_) => PeerState::Eligible,
+                };
+                (node, state)
+            })
+            .collect()
+    }
+
+    /// Live peers per [`PeerState`], in [`PeerState::ALL`] order.
+    pub fn peer_state_counts(&self) -> [u64; PeerState::ALL.len()] {
+        let mut counts = [0u64; PeerState::ALL.len()];
+        for state in self.peer_states().into_values() {
+            counts[state.slot()] += 1;
+        }
+        counts
+    }
+
+    /// The candidates for `class` (for TTL, `collection`): the live peers that
+    /// may own it by what they last said, plus this member if it may by its own
+    /// block. **Never `catching_up`**; an empty set with yielding respected is
+    /// tried again ignoring it, since an owner that is slow beats none. Empty
+    /// after that means nobody may own it (ADR-201).
+    ///
+    /// A peer that has never sent a block owns as it always did, except that TTL
+    /// needs positive knowledge that it holds the index, and **a TTL listing is
+    /// positive only while its block is within its lease**. A block past its
+    /// lease keeps saying `catching_up` and what it yields.
+    pub fn candidates(
+        &self,
+        class: OwnerClass,
+        collection: Option<CollectionId>,
+        me: NodeId,
+        mine: &Facts,
+        me_holds_ttl: bool,
+    ) -> BTreeSet<NodeId> {
+        let table = self.0.peer_facts.read();
+        let peers = self.node_ids();
+        let (now, lease) = (Instant::now(), self.lease());
+        for ignore_yielding in [false, true] {
+            let mut set: BTreeSet<NodeId> = peers
+                .iter()
+                .filter(|peer| {
+                    let held = table.get(*peer);
+                    let fresh = held
+                        .is_some_and(|held| now.saturating_duration_since(held.received) <= lease);
+                    let theirs = held.map(|held| &*held.facts);
+                    may_own(theirs, class, collection, None, ignore_yielding, fresh)
+                })
+                .copied()
+                .collect();
+            if may_own(Some(mine), class, collection, Some(me_holds_ttl), ignore_yielding, true) {
+                set.insert(me);
+            }
+            if !set.is_empty() {
+                return set;
+            }
+        }
+        BTreeSet::new()
+    }
+
+    /// The live peers that have not read this member's current block while it
+    /// yields `class`: what a yielding member waits on before it stops owning
+    /// (ADR-201). Empty when the member does not yield the class.
+    pub fn unconfirmed_peers(&self, class: OwnerClass) -> Vec<NodeId> {
+        let Some(local) = self.0.local.get() else { return Vec::new() };
+        let Some((block, _)) = local.current(Instant::now()) else { return Vec::new() };
+        if !block.yielding.of(class) {
+            return Vec::new();
+        }
+        local.unread_by(&self.node_ids())
     }
 
     /// Populate a member set without a running SWIM task.
@@ -252,6 +451,12 @@ impl foca::Runtime<Member> for Collector {
             // unchanged, so the live set already contains it.
             Notification::Rename(old, new) => {
                 debug!(from = ?old, to = ?new, "member renewed its identity");
+                // A new incarnation: what the old one said, and read, is not
+                // this one's (ADR-201). Only `insert` follows, and it drops
+                // nothing, since a block can beat the insert of a peer that is
+                // new to this member.
+                self.members.forget_peer(old.node);
+                self.members.forget_peer(new.node);
                 self.members.insert(new.addr, new.node);
             }
             Notification::Defunct => {
@@ -467,6 +672,41 @@ mod tests {
 
     fn node(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 16])
+    }
+
+    /// SWIM's `Rename` (a node renewing its identity after being wrongly declared
+    /// down) is a new incarnation: the block it sent and what it read of ours are
+    /// dropped, where `insert` alone drops nothing (ADR-201).
+    #[test]
+    fn a_renamed_member_is_a_new_incarnation_and_is_forgotten() {
+        use foca::Runtime;
+        let members = Members::default();
+        members.set_facts_source(std::sync::Arc::new(|| Facts {
+            yielding: crate::facts::Yielding { ttl: true, ..Default::default() },
+            ..Facts::default()
+        }));
+        let old = Member::identified(addr(7900), node(1));
+        let new = old.renew().unwrap();
+        members.insert_for_test(addr(7900), node(1));
+        members.record_peer_facts(
+            node(1),
+            Arc::new(Facts { catching_up: true, boot: vec![1; 16], ..Facts::default() }),
+            Instant::now(),
+        );
+        let (_, generation) = members.local_facts().unwrap();
+        members.note_read_by(node(1), generation);
+        assert_eq!(members.peer_states()[&node(1)], PeerState::IneligibleCatchingUp);
+        assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty());
+
+        let mut collector =
+            Collector { outgoing: Vec::new(), timers: Vec::new(), members: members.clone() };
+        collector.notify(Notification::Rename(&old, &new));
+        assert_eq!(members.peer_states()[&node(1)], PeerState::Unknown, "its block is dropped");
+        assert_eq!(
+            members.unconfirmed_peers(OwnerClass::Ttl),
+            vec![node(1)],
+            "and what it read of ours"
+        );
     }
 
     #[test]

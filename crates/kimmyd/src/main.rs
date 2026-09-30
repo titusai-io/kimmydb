@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod facts;
 mod front;
 mod lifecycle;
 mod logging;

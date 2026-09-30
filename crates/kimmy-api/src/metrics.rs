@@ -142,6 +142,20 @@ pub struct StorageReadings {
     /// construction. It was written by the webhook dispatcher's loop, which
     /// had nothing to do with membership and could stop writing it.
     pub cluster_members: u64,
+    /// Ownership as this member sees it (ADR-201).
+    pub ownership: OwnershipReading,
+}
+
+/// How this member sees the ownership of work, read at the scrape (ADR-201).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnershipReading {
+    /// Live peers by [`kimmy_cluster::PeerState`], in `PeerState::ALL` order.
+    pub peers: [u64; kimmy_cluster::PeerState::ALL.len()],
+    /// Live peers that have not read this member's block, per class, while it
+    /// yields the class, in `OwnerClass::ALL` order.
+    pub unconfirmed: [u64; kimmy_cluster::OwnerClass::ALL.len()],
+    /// Blocks that arrived and did not decode, since start.
+    pub undecodable: u64,
 }
 
 /// The background writers behind the page's measured gauges, each with a
@@ -296,6 +310,7 @@ pub struct MetricsSnapshot {
     pub webhook_unreadable: u64,
     pub webhook_backlog_secs: u64,
     pub cluster_members: u64,
+    pub ownership: OwnershipReading,
     /// Seconds since each of [`PROGRESS_WRITERS`] last made progress, in that
     /// order, or since the process started before its first (ADR-187). `None`
     /// for a writer this node does not run, which has no row.
@@ -1143,6 +1158,7 @@ impl Metrics {
             webhook_unreadable: readings.webhook_unreadable,
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: readings.cluster_members,
+            ownership: readings.ownership,
             task_progress_age_secs: self.task_progress_ages_at(now),
             replication_lag_ms: self.replication_lag_ms_now(),
             sync_failures: self.get(&self.sync_failures),
@@ -1678,6 +1694,7 @@ impl Metrics {
         render_sync_pulls(&mut out, &pulls);
         render_sync_serve(&mut out, &readings.serve);
         render_violations(&mut out, &readings.violations);
+        render_ownership(&mut out, &readings.ownership);
         out
     }
 
@@ -1956,6 +1973,46 @@ fn render_violations(out: &mut String, violations: &kimmy_storage::ViolationsSna
         violations.backfilled_rows,
         violations.calls_from_table,
         violations.calls_from_oplog,
+    );
+}
+
+/// Ownership as this member sees it (ADR-201): its peers by what they last said,
+/// and the peers a yielding class is waiting on.
+fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
+    use std::fmt::Write;
+
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block yet: an older version, or one not yet heard); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.\n\
+         # TYPE kimmy_ownership_peers gauge"
+    );
+    for state in kimmy_cluster::PeerState::ALL {
+        let _ = writeln!(
+            out,
+            "kimmy_ownership_peers{{state=\"{}\"}} {}",
+            state.label(),
+            ownership.peers[state.slot()]
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_unconfirmed_peers Live peers that have not read this member's current block while it yields the class. A member that yields a class keeps owning it until every live peer has read the block that says so; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.\n\
+         # TYPE kimmy_yield_unconfirmed_peers gauge"
+    );
+    for class in kimmy_cluster::OwnerClass::ALL {
+        let _ = writeln!(
+            out,
+            "kimmy_yield_unconfirmed_peers{{class=\"{}\"}} {}",
+            class.label(),
+            ownership.unconfirmed[class as usize]
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.\n\
+         # TYPE kimmy_ownership_facts_undecodable_total counter\n\
+         kimmy_ownership_facts_undecodable_total {}",
+        ownership.undecodable
     );
 }
 
@@ -2283,6 +2340,11 @@ mod tests {
             writer_hold_max_us: 52_500_000,
             held_marks_released: 53,
             held_marks: 54,
+            ownership: OwnershipReading {
+                peers: [1_501, 1_502, 1_503, 1_504, 1_505],
+                unconfirmed: [1_511, 1_512, 1_513],
+                undecodable: 1_531,
+            },
             // One holder per row, none of them equal, so a row rendered
             // under another holder's label cannot match the golden. The
             // counts are the buckets' sum, as a real snapshot's are.
@@ -3096,6 +3158,21 @@ kimmy_violations_backfill_rows_total 1401
 # TYPE kimmy_violations_walk_path_total counter
 kimmy_violations_walk_path_total{path=\"table\"} 1402
 kimmy_violations_walk_path_total{path=\"oplog\"} 1403
+# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block yet: an older version, or one not yet heard); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
+# TYPE kimmy_ownership_peers gauge
+kimmy_ownership_peers{state=\"eligible\"} 1501
+kimmy_ownership_peers{state=\"ineligible_catching_up\"} 1502
+kimmy_ownership_peers{state=\"ineligible_yielding\"} 1503
+kimmy_ownership_peers{state=\"unknown\"} 1504
+kimmy_ownership_peers{state=\"stale\"} 1505
+# HELP kimmy_yield_unconfirmed_peers Live peers that have not read this member's current block while it yields the class. A member that yields a class keeps owning it until every live peer has read the block that says so; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.
+# TYPE kimmy_yield_unconfirmed_peers gauge
+kimmy_yield_unconfirmed_peers{class=\"ttl\"} 1511
+kimmy_yield_unconfirmed_peers{class=\"webhooks\"} 1512
+kimmy_yield_unconfirmed_peers{class=\"embeddings\"} 1513
+# HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.
+# TYPE kimmy_ownership_facts_undecodable_total counter
+kimmy_ownership_facts_undecodable_total 1531
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -3411,6 +3488,21 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.sync_serve.walk_sum_us as f64 / 1e6
         ));
         expect(&format!("kimmy_sync_serve_walk_seconds_count {}\n", s.sync_serve.windows));
+        for state in kimmy_cluster::PeerState::ALL {
+            expect(&format!(
+                "kimmy_ownership_peers{{state=\"{}\"}} {}\n",
+                state.label(),
+                s.ownership.peers[state.slot()]
+            ));
+        }
+        for class in kimmy_cluster::OwnerClass::ALL {
+            expect(&format!(
+                "kimmy_yield_unconfirmed_peers{{class=\"{}\"}} {}\n",
+                class.label(),
+                s.ownership.unconfirmed[class as usize]
+            ));
+        }
+        expect(&format!("kimmy_ownership_facts_undecodable_total {}\n", s.ownership.undecodable));
         for walk in kimmy_storage::ServeWalk::ALL {
             for path in kimmy_storage::WalkPath::ALL {
                 expect(&format!(
@@ -3640,6 +3732,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // The unique-violations table: ready, backfill rows, and the
                 // two ways a call is answered (ADR-200).
                 + 4
+                // Peers by state, and the peers a yielding class waits on
+                // (ADR-201).
+                + kimmy_cluster::PeerState::ALL.len()
+                + kimmy_cluster::OwnerClass::ALL.len()
+                + 1
                 + 1,
             "expected one sample per series: {out}"
         );

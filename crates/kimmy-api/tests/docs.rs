@@ -581,6 +581,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         webhook_invalidated: 19,
         webhook_unreadable: 21,
         cluster_members: 20,
+        ownership: Default::default(),
     };
     assert_eq!(
         exposed_series(&metrics.render()).keys().collect::<Vec<_>>(),

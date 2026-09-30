@@ -71,6 +71,7 @@ async fn listen(
         None,
         None,
         tls,
+        None,
     ));
     (addr, serving, pushed)
 }
@@ -364,7 +365,9 @@ async fn a_peer_that_never_proves_itself_learns_nothing() {
 
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
     // Skip the handshake entirely and ask straight out.
-    write_frame(&mut stream, &Message::AskVersions { witnessed: false }).await.unwrap();
+    write_frame(&mut stream, &Message::AskVersions { witnessed: false, facts: None })
+        .await
+        .unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
     match response {
@@ -3431,6 +3434,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                             Message::AskVersions { .. } => Message::Vectors {
                                 servable: theirs.clone(),
                                 witnessed: theirs.clone(),
+                                facts: None,
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
@@ -4091,6 +4095,7 @@ async fn listen_with(
         None,
         None,
         tls,
+        None,
     ));
     (addr, serving)
 }
@@ -5943,9 +5948,11 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                 let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
                 while let Ok(message) = read_frame(&mut stream).await {
                     let answer = match message {
-                        Message::AskVersions { .. } => {
-                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
-                        }
+                        Message::AskVersions { .. } => Message::Vectors {
+                            servable: theirs.clone(),
+                            witnessed: theirs.clone(),
+                            facts: None,
+                        },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
                             scanned_to: entry.stamp.hlc,
@@ -6056,9 +6063,11 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                 let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
                 while let Ok(message) = read_frame(&mut stream).await {
                     let answer = match message {
-                        Message::AskVersions { .. } => {
-                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
-                        }
+                        Message::AskVersions { .. } => Message::Vectors {
+                            servable: theirs.clone(),
+                            witnessed: theirs.clone(),
+                            facts: None,
+                        },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
                             scanned_to: entry.stamp.hlc,
@@ -6168,9 +6177,11 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                 let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
                 while let Ok(message) = read_frame(&mut stream).await {
                     let answer = match message {
-                        Message::AskVersions { .. } => {
-                            Message::Vectors { servable: theirs.clone(), witnessed: theirs.clone() }
-                        }
+                        Message::AskVersions { .. } => Message::Vectors {
+                            servable: theirs.clone(),
+                            witnessed: theirs.clone(),
+                            facts: None,
+                        },
                         Message::AskEntries { .. } => {
                             tokio::time::sleep(delay).await;
                             Message::Entries {
@@ -6646,6 +6657,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                             Message::AskVersions { .. } => Message::Vectors {
                                 servable: theirs.clone(),
                                 witnessed: theirs.clone(),
+                                facts: None,
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
