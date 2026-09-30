@@ -1272,13 +1272,20 @@ async fn every_subscription_has_a_deliverer_and_a_dead_owners_are_taken_over() {
 // ---------------------------------------------------------------------------
 
 /// The claim the ownership decision was made for: **one expired document
-/// produces one delete cluster-wide, not one per node.**
+/// produces one delete cluster-wide, not one per node**, once the members'
+/// blocks have settled (ADR-201 states the windows in which it does not).
 ///
 /// Every node runs its own expiry timer, so the naive design has all three
 /// notice the same document and issue three deletes. Those converge under
 /// last-writer-wins, so correctness alone cannot tell the two designs apart —
 /// only counting can, which is why `kimmy_ttl_expired_total` exists. Summed
 /// across the cluster it must read exactly 1.
+///
+/// **The document must reach every member before it falls due**, or this
+/// cannot see amplification at all: a document already expired when it lands
+/// is deleted by the member it landed on before it replicates, and the others
+/// receive the delete with the insert and have nothing to expire. So it is
+/// dated a few seconds ahead, and read on all three before it is due.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn one_expired_document_produces_one_delete_cluster_wide() {
@@ -1311,18 +1318,77 @@ async fn one_expired_document_produces_one_delete_cluster_wide() {
         .unwrap();
     assert_eq!(created.status(), 200, "creating the TTL index");
 
-    // Dated in the past, so it is already due the moment it lands.
-    client
+    // Until the members have told each other they hold the index, each counts
+    // only itself a holder and so owns the collection: a window of duplicates,
+    // which the design accepts over a gap (ADR-201) and which the block's next
+    // contact closes. The counting below is of the settled state, so wait for
+    // exactly one member to own it.
+    eventually("exactly one member to own the collection", || {
+        let client = client.clone();
+        let nodes = [&a, &b, &c];
+        async move {
+            let mut owned = 0;
+            for node in nodes {
+                match node.gauge(&client, "kimmy_ttl_collections{state=\"owned\"}").await {
+                    Some(n) => owned += n,
+                    None => return false,
+                }
+            }
+            owned == 1
+        }
+    })
+    .await;
+
+    // Tokens for all three first: the window below is only a few seconds, and
+    // a login is not what it should be spent on.
+    let mut tokens = Vec::new();
+    for node in [&a, &b, &c] {
+        tokens.push(node.login(&client).await);
+    }
+
+    // Due about four seconds from now (`seen` plus the index's one second), so
+    // it can replicate to every member first and each has the chance to
+    // expire it.
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+            as i64;
+    let due = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let inserted = client
         .post(a.url("/v1/db/shop/coll/sessions/docs"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "_id": 1, "seen": { "$date": 0 } }))
+        .json(&serde_json::json!({ "_id": 1, "seen": { "$date": now_ms + 3_000 } }))
         .send()
         .await
         .unwrap();
+    assert!(inserted.status().is_success(), "inserting the document: {}", inserted.status());
+
+    // Readable on every member while it is still live.
+    for (node, token) in [&a, &b, &c].into_iter().zip(&tokens) {
+        loop {
+            let res = client
+                .get(node.url("/v1/db/shop/coll/sessions/docs/1"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            if res.status() == 200 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < due,
+                "the document did not reach every member before it fell due, so this run \
+                 cannot tell one delete from one per member"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    assert!(
+        std::time::Instant::now() < due,
+        "the document reached every member only after it fell due; this run proves nothing"
+    );
 
     // Gone everywhere: the owner deletes, and the delete replicates.
-    for node in [&a, &b, &c] {
-        let token = node.login(&client).await;
+    for (node, token) in [&a, &b, &c].into_iter().zip(&tokens) {
         eventually("the expired document to disappear from every node", || {
             let client = client.clone();
             let url = node.url("/v1/db/shop/coll/sessions/docs/1");

@@ -204,6 +204,11 @@ impl LocalFacts {
     /// cache stale may both build; each takes a ticket first, and a build never
     /// publishes over one that started after it, so an older read of the schema
     /// cannot replace a newer one.
+    ///
+    /// **And off the async worker** (ADR-153, ADR-199): the callers are the serve
+    /// and sync arms and every owner check (the webhook dispatcher's and the
+    /// embedding worker's), all on the runtime, and a rebuild is a read of the
+    /// whole collection registry. A reuse of the cached block reads nothing.
     pub(crate) fn current(&self, now: Instant) -> Option<(Arc<Facts>, u64)> {
         let source = self.source.as_ref()?;
         let ticket = {
@@ -216,7 +221,7 @@ impl LocalFacts {
                 ticket
             })
         };
-        let fresh = ticket.map(|ticket| (ticket, source()));
+        let fresh = ticket.map(|ticket| (ticket, kimmy_storage::blocking(|| source())));
         let mut state = self.state.lock();
         if let Some((ticket, fresh)) = fresh
             && ticket > state.published_ticket
@@ -349,8 +354,8 @@ pub(crate) fn may_own(
 ///
 /// **It is counted and said**, or a peer whose blocks never decode would look
 /// exactly like an older peer that sends none: the count is
-/// [`facts_undecodable_total`], and the connection's own code takes
-/// [`take_undecodable`] right after the read, which is the only place that knows
+/// [`facts_undecodable_total`], and the read that decoded the frame reports it
+/// (`protocol::read_frame_noting_facts`), which is the only place that knows
 /// which peer sent it.
 pub(crate) fn lenient<'de, D>(deserializer: D) -> Result<Option<Arc<Facts>>, D::Error>
 where

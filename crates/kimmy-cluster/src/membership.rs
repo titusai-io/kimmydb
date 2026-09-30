@@ -277,7 +277,7 @@ impl Members {
 
     /// This member's block to send, with its generation, or `None` with no
     /// source. Cached (`facts::LocalFacts`).
-    pub(crate) fn local_facts(&self) -> Option<(std::sync::Arc<Facts>, u64)> {
+    pub fn local_facts(&self) -> Option<(std::sync::Arc<Facts>, u64)> {
         self.0.local.get()?.current(Instant::now())
     }
 
@@ -388,6 +388,21 @@ impl Members {
         BTreeSet::new()
     }
 
+    /// Whether a live peer that lists `collection` among its TTL indexes, and has
+    /// expiry on, says it is catching up: what tells "every holder is catching
+    /// up, so expiry waits" from "nobody holds the index" (ADR-201). One with
+    /// expiry off would not expire it once caught up, so it does not count.
+    pub fn holder_catching_up(&self, collection: CollectionId) -> bool {
+        let table = self.0.peer_facts.read();
+        self.node_ids().iter().any(|peer| {
+            table.get(peer).is_some_and(|held| {
+                held.facts.catching_up
+                    && !held.facts.ttl_disabled
+                    && held.facts.holds_ttl(collection)
+            })
+        })
+    }
+
     /// The live peers that have not read this member's current block while it
     /// yields `class`: what a yielding member waits on before it stops owning
     /// (ADR-201). Empty when the member does not yield the class.
@@ -398,6 +413,15 @@ impl Members {
             return Vec::new();
         }
         local.unread_by(&self.node_ids())
+    }
+
+    /// Record a block a peer sent, as if a contact had carried it now. For
+    /// tests in crates that consume this set, whose point is what ownership does
+    /// with what members say (ADR-201).
+    /// `age` back-dates the block, so a test can make it stale.
+    pub fn record_peer_facts_for_test(&self, node: NodeId, facts: Facts, age: Duration) {
+        let received = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        self.record_peer_facts(node, Arc::new(facts), received);
     }
 
     /// Populate a member set without a running SWIM task.

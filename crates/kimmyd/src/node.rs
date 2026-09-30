@@ -984,32 +984,15 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         })
     };
 
-    // TTL expiry. Ownership is rendezvous-hashed per collection through the
-    // same live member set the dispatcher uses, so one node expires a given
-    // collection and one expired document produces one delete cluster-wide
-    // rather than one per node.
-    let expiry_handle = {
-        let state = Arc::clone(&state);
-        let members = cluster.members.clone();
-        let me = engine.node_id();
-        let interval = match config.storage.ttl_interval_secs {
-            0 => None,
-            secs => Some(Duration::from_secs(secs)),
-        };
-        match interval {
-            None => {
-                warn!(
-                    "TTL expiry is disabled; documents with an expiry policy will not be removed"
-                );
-                None
-            }
-            Some(interval) => {
-                Some(kimmy_task::supervise("ttl_expiry", shutdown.clone(), async move {
-                    kimmy_api::expiry::run(state, me, members, interval).await;
-                }))
-            }
-        }
-    };
+    // TTL expiry, or with it switched off the check that says which
+    // collections nobody can expire.
+    state.set_expiry_off(config.storage.ttl_interval_secs == 0);
+    let expiry_handle = Some(spawn_expiry(
+        Arc::clone(&state),
+        cluster.members.clone(),
+        config.storage.ttl_interval_secs,
+        shutdown.clone(),
+    ));
 
     // Keeps each node's view of "is this token still good" honest. Another
     // ordinary oplog consumer, which is also what makes revoking on one node
@@ -1090,14 +1073,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
                 worker.set_policy(providers);
-                worker.set_owner_check(Box::new(move |key| match &worker_members {
-                    // No clustering: the candidate set is just this node,
-                    // which owns everything.
-                    Some(members) => {
-                        kimmy_api::ownership::owns(key, worker_me, &members.node_ids())
-                    }
-                    None => true,
-                }));
+                if let Some(check) = embedding_owner_check(worker_me, worker_members) {
+                    worker.set_owner_check(check);
+                }
                 worker.set_counters(worker_counters);
                 // Every error `run` returns is a storage error, which is
                 // transient: it used to return here, and node.rs logged
@@ -2519,6 +2497,55 @@ fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
     } else {
         bind
     }
+}
+
+/// TTL expiry, supervised as `ttl_expiry`.
+///
+/// Ownership is rendezvous-hashed per collection among the members known to
+/// hold its TTL index and able to expire (ADR-201), so once the members' blocks
+/// have settled one member expires a given collection and one expired document
+/// produces one delete cluster-wide rather than one per member. Two windows are
+/// wider, and stated in the ADR: a member whose sync contacts fail while SWIM
+/// keeps it up, and a member holding more TTL collections than a block lists.
+///
+/// With expiry switched off (`storage.ttl_interval_secs = 0`) the task is still
+/// spawned, and only checks which collections this member holds a TTL index on
+/// and nobody can expire, and says so: such a member is never a candidate, so it
+/// is the one that can see a collection with none (`expiry::watch_unowned`).
+fn spawn_expiry(
+    state: kimmy_api::SharedState,
+    members: Option<kimmy_cluster::Members>,
+    ttl_interval_secs: u64,
+    shutdown: kimmy_task::Shutdown,
+) -> tokio::task::JoinHandle<()> {
+    let me = state.engine.node_id();
+    if ttl_interval_secs == 0 {
+        warn!("TTL expiry is disabled; documents with an expiry policy will not be removed");
+        return kimmy_task::supervise("ttl_expiry", shutdown, async move {
+            kimmy_api::expiry::watch_unowned(state, me, members).await;
+        });
+    }
+    let interval = Duration::from_secs(ttl_interval_secs);
+    kimmy_task::supervise("ttl_expiry", shutdown, async move {
+        kimmy_api::expiry::run(state, me, members, interval).await;
+    })
+}
+
+/// Which embedded collections this member owns: the rendezvous function over
+/// the live members that may own embeddings by what they say about themselves
+/// (ADR-201), not one that is catching up and not one whose worker is switched
+/// off.
+///
+/// **`None` with no clustering**: the worker then installs no check and owns
+/// everything, as it always did. A check that answered yes to everything would
+/// make every collection a first sight to rescan at each start, for a gap a lone
+/// member cannot have, since it never defers.
+fn embedding_owner_check(
+    me: kimmy_core::NodeId,
+    members: Option<kimmy_cluster::Members>,
+) -> Option<kimmy_vector::OwnerCheck> {
+    let owners = kimmy_api::ownership::Owners::over(me, Some(members?));
+    Some(Box::new(move |key| owners.owns_embedding(key)))
 }
 
 /// Start the drop purger (ADR-189): what a collection drop held is removed
@@ -3974,5 +4001,176 @@ mod tests {
 
         assert!(fetch_jwks(&jwks_client().unwrap(), "http://127.0.0.1:1").await.is_err());
         assert_eq!(federation.key_count(), 1, "a failed fetch must install nothing");
+    }
+
+    // -- Who owns expiry and embeddings, as the daemon wires it (ADR-201) -----
+
+    /// What was logged while the guard lived, on this thread. The tests below
+    /// run on a current-thread runtime, so a spawned task logs here too.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn record(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(self.clone())
+                    .with_max_level(tracing::Level::WARN)
+                    .without_time()
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+
+        /// How many warnings name no member able to expire `collection`.
+        fn unowned(&self, collection: &str) -> usize {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    line.contains("WARN")
+                        && line.contains("no member can expire this collection")
+                        && line.contains(&format!("collection={collection}"))
+                })
+                .count()
+        }
+    }
+
+    /// A state over a store holding `app.sessions` with a TTL index.
+    fn ttl_state(dir: &tempfile::TempDir) -> kimmy_api::SharedState {
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("app", "sessions").unwrap();
+        engine
+            .create_index_with(
+                "app",
+                "sessions",
+                vec![kimmy_storage::IndexField::ascending("seen")],
+                false,
+                Default::default(),
+                Some("ttl_seen".into()),
+                Some(60),
+                None,
+            )
+            .unwrap();
+        let tokens = kimmy_auth::TokenIssuer::new(
+            "a-node-ownership-test-secret-a-node-ownership-test-secret",
+            3600,
+        )
+        .unwrap();
+        kimmy_api::state_with_egress(
+            engine,
+            tokens,
+            false,
+            kimmy_api::RateLimits::disabled(),
+            kimmy_api::egress::EgressPolicy::new(kimmy_api::egress::WEBHOOKS, Vec::new()),
+        )
+        .unwrap()
+    }
+
+    /// Run the expiry task as the daemon spawns it with expiry off, and answer how many warnings it gave about `app.sessions` at each minute
+    /// in `minutes` (counted from the start, cumulatively).
+    async fn unowned_warnings(
+        members: Option<kimmy_cluster::Members>,
+        minutes: &[u64],
+    ) -> Vec<usize> {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ttl_state(&dir);
+        let captured = Captured::default();
+        let _recording = captured.record();
+        let shutdown = kimmy_task::Shutdown::new();
+        let start = tokio::time::Instant::now();
+        let task = spawn_expiry(Arc::clone(&state), members, 0, shutdown.clone());
+        let mut counts = Vec::new();
+        for minute in minutes {
+            tokio::time::sleep_until(start + Duration::from_secs(minute * 60 + 1)).await;
+            counts.push(captured.unowned("app.sessions"));
+        }
+        task.abort();
+        counts
+    }
+
+    /// A lone member with expiry switched off holds a TTL collection nobody can
+    /// expire, and says so, naming it: once within the first check, and not again
+    /// until thirty minutes have passed. The expiry pass is not what says it (it
+    /// does not run), so this is the task that does, and without it the member
+    /// that can see the collection is unowned never says it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_member_with_expiry_off_warns_that_nobody_expires_its_ttl_collections() {
+        let counts = unowned_warnings(None, &[0, 1, 2, 10, 29, 31]).await;
+        assert_eq!(counts, [0, 1, 1, 1, 1, 2], "not before membership forms, then once per 30 min");
+    }
+
+    /// And clustered: this member has expiry off, and its one peer does not hold
+    /// the index, so no member can expire the collection.
+    #[tokio::test(start_paused = true)]
+    async fn a_clustered_member_with_expiry_off_warns_when_no_holder_can_expire() {
+        let members = kimmy_cluster::Members::default();
+        let peer = kimmy_core::NodeId::from_bytes([0x22; 16]);
+        members.insert_for_test("127.0.0.1:7002".parse().unwrap(), peer);
+        members.record_peer_facts_for_test(
+            peer,
+            kimmy_cluster::Facts { boot: vec![2; 16], ..Default::default() },
+            Duration::ZERO,
+        );
+        members.set_facts_source(Arc::new(|| kimmy_cluster::Facts {
+            boot: vec![1; 16],
+            ttl_disabled: true,
+            ..Default::default()
+        }));
+        let counts = unowned_warnings(Some(members), &[1, 2, 31]).await;
+        assert_eq!(counts, [1, 1, 2]);
+    }
+
+    /// The embedding worker's owner check asks among the members that may own
+    /// embeddings: this member, catching up, owns none, and its peer owns every
+    /// collection. Owning everything instead would embed on a store that is not
+    /// yet whole.
+    #[test]
+    fn the_embedding_owner_check_leaves_out_a_member_that_is_catching_up() {
+        let me = kimmy_core::NodeId::from_bytes([0x11; 16]);
+        let members = kimmy_cluster::Members::default();
+        let peer = kimmy_core::NodeId::from_bytes([0x22; 16]);
+        members.insert_for_test("127.0.0.1:7002".parse().unwrap(), peer);
+        members.record_peer_facts_for_test(
+            peer,
+            kimmy_cluster::Facts { boot: vec![2; 16], ..Default::default() },
+            Duration::ZERO,
+        );
+        members.set_facts_source(Arc::new(|| kimmy_cluster::Facts {
+            boot: vec![1; 16],
+            catching_up: true,
+            ..Default::default()
+        }));
+        let check = embedding_owner_check(me, Some(members)).expect("clustered: a check");
+        for key in (0..20).map(|i| format!("app/c{i}")) {
+            assert!(!check(&key), "{key}: a catching-up member embeds nothing");
+        }
+    }
+
+    /// Without clustering the worker gets no owner check, so it owns everything
+    /// and never re-evaluates ownership (the worker's own tests pin that a worker
+    /// with no check rescans nothing): a lone member's start rescans nothing,
+    /// since it never defers and so has no gap to close.
+    #[test]
+    fn a_lone_members_worker_gets_no_owner_check_and_rescans_nothing_at_start() {
+        let me = kimmy_core::NodeId::from_bytes([0x11; 16]);
+        assert!(embedding_owner_check(me, None).is_none(), "no check without clustering");
     }
 }

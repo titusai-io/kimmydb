@@ -643,13 +643,10 @@ where
     debug!(?peer, "peer authenticated");
 
     loop {
-        // A stale flag from an earlier decode is not this frame's.
-        crate::facts::take_undecodable();
-        match read_frame(&mut stream).await? {
+        let (frame, undecodable) = crate::protocol::read_frame_noting_facts(&mut stream).await?;
+        match frame {
             Message::AskVersions { witnessed, facts } => {
-                if crate::facts::take_undecodable()
-                    && let Some(members) = members
-                {
+                if undecodable && let Some(members) = members {
                     members.note_undecodable(peer, std::time::Instant::now());
                 }
                 // The requester's own block, which a member that is only ever
@@ -1154,10 +1151,10 @@ where
     // predates the flag answers with the first alone.
     let ours = stalls.local_facts.clone();
     write_frame(stream, &Message::AskVersions { witnessed: true, facts: ours }).await?;
-    crate::facts::take_undecodable();
-    let (theirs, their_witnessed) = match read_frame(stream).await? {
+    let (frame, undecodable) = crate::protocol::read_frame_noting_facts(stream).await?;
+    let (theirs, their_witnessed) = match frame {
         Message::Vectors { servable, witnessed, facts } => {
-            if crate::facts::take_undecodable() {
+            if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
             // What the peer says about itself, kept for the loop to hand to

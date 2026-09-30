@@ -156,6 +156,9 @@ pub struct OwnershipReading {
     pub unconfirmed: [u64; kimmy_cluster::OwnerClass::ALL.len()],
     /// Blocks that arrived and did not decode, since start.
     pub undecodable: u64,
+    /// TTL collections this member holds an index on, by
+    /// [`crate::ownership::TtlState`], in `TtlState::ALL` order.
+    pub ttl_collections: [u64; crate::ownership::TtlState::ALL.len()],
 }
 
 /// The background writers behind the page's measured gauges, each with a
@@ -2014,6 +2017,19 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
          kimmy_ownership_facts_undecodable_total {}",
         ownership.undecodable
     );
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_ttl_collections Collections this member holds a TTL index on, by how their expiry stands from this member's view: owned (this member expires it), owed_elsewhere (another member does), unowned_no_holder (no member is known to hold the index and be able to expire it: an operator or index-definition problem), unowned_catching_up (every member known to hold it is catching up: a transient, and the expiry waits). Each member reports its own view, so aggregate with max across members.\n\
+         # TYPE kimmy_ttl_collections gauge"
+    );
+    for state in crate::ownership::TtlState::ALL {
+        let _ = writeln!(
+            out,
+            "kimmy_ttl_collections{{state=\"{}\"}} {}",
+            state.label(),
+            ownership.ttl_collections[state.slot()]
+        );
+    }
 }
 
 /// What serving peers' windows has cost this node (ADR-176).
@@ -2344,6 +2360,7 @@ mod tests {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
                 undecodable: 1_531,
+                ttl_collections: [1_521, 1_522, 1_523, 1_524],
             },
             // One holder per row, none of them equal, so a row rendered
             // under another holder's label cannot match the golden. The
@@ -3173,6 +3190,12 @@ kimmy_yield_unconfirmed_peers{class=\"embeddings\"} 1513
 # HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.
 # TYPE kimmy_ownership_facts_undecodable_total counter
 kimmy_ownership_facts_undecodable_total 1531
+# HELP kimmy_ttl_collections Collections this member holds a TTL index on, by how their expiry stands from this member's view: owned (this member expires it), owed_elsewhere (another member does), unowned_no_holder (no member is known to hold the index and be able to expire it: an operator or index-definition problem), unowned_catching_up (every member known to hold it is catching up: a transient, and the expiry waits). Each member reports its own view, so aggregate with max across members.
+# TYPE kimmy_ttl_collections gauge
+kimmy_ttl_collections{state=\"owned\"} 1521
+kimmy_ttl_collections{state=\"owed_elsewhere\"} 1522
+kimmy_ttl_collections{state=\"unowned_no_holder\"} 1523
+kimmy_ttl_collections{state=\"unowned_catching_up\"} 1524
 ";
 
         // The read is taken at a moment placed ahead of the clock, so the
@@ -3503,6 +3526,13 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             ));
         }
         expect(&format!("kimmy_ownership_facts_undecodable_total {}\n", s.ownership.undecodable));
+        for state in crate::ownership::TtlState::ALL {
+            expect(&format!(
+                "kimmy_ttl_collections{{state=\"{}\"}} {}\n",
+                state.label(),
+                s.ownership.ttl_collections[state.slot()]
+            ));
+        }
         for walk in kimmy_storage::ServeWalk::ALL {
             for path in kimmy_storage::WalkPath::ALL {
                 expect(&format!(
@@ -3737,6 +3767,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::PeerState::ALL.len()
                 + kimmy_cluster::OwnerClass::ALL.len()
                 + 1
+                + crate::ownership::TtlState::ALL.len()
                 + 1,
             "expected one sample per series: {out}"
         );

@@ -141,6 +141,7 @@ pub fn state_with_policies(
         federation: std::sync::OnceLock::new(),
         stale_peers: Default::default(),
         local_login: std::sync::OnceLock::new(),
+        expiry_off: std::sync::OnceLock::new(),
     }))
 }
 
