@@ -7702,7 +7702,8 @@ mod partial_windows_never_skip {
         (docs, position, stamps)
     }
 
-    async fn run(case: Case) -> Result<(), String> {
+    /// Run `case` against the oracles; whether any pull asked for a window.
+    async fn run(case: Case) -> Result<bool, String> {
         let (sender, _sdir) = engine();
         sender.create_collection("db", "c").unwrap();
         let unique = vec![IndexField::ascending("u")];
@@ -7723,6 +7724,9 @@ mod partial_windows_never_skip {
         let last_within = case.within.iter().map(|(n, _)| *n).max();
         let mut stalls = PeerStalls::new();
         let mut pulls = 0usize;
+        // Whether any pull asked the sender for a window: a requester level
+        // with the sender, no span to name, asks nothing, and no walk runs.
+        let mut asked_any = false;
         loop {
             let theirs = sender.version_vector().unwrap();
             let rows = budget(case.budgets[pulls % case.budgets.len()]);
@@ -7735,6 +7739,15 @@ mod partial_windows_never_skip {
             })
             .await;
             let outcome = outcome.map_err(|e| format!("pull {pulls} failed: {e}"))?;
+            asked_any |= start.is_some();
+            // A pull that asked nothing had no window for `within` to land
+            // inside, so it never ran: land those writes now, after the pull,
+            // or the case loses them and every later pull asks nothing too.
+            if start.is_none() {
+                for write in &within {
+                    stamper.land(&sender, write);
+                }
+            }
             nothing_skipped(&requester, &sender)
                 .map_err(|e| format!("(a) after pull {pulls}: {e}"))?;
             // A partial window moved the position, however little it carried,
@@ -7773,10 +7786,19 @@ mod partial_windows_never_skip {
 
         // The windows above were read from the arrival index's keys and by no
         // fallback: a silent fall back to the linear walk would pass every
-        // oracle here and exercise nothing of the key walk (ADR-197).
+        // oracle here and exercise nothing of the key walk (ADR-197). A case
+        // whose requester never asked had no window to read: it was level
+        // with the sender throughout, which it must still be.
+        if !asked_any {
+            let (mine, theirs) =
+                (requester.witnessed_vector().unwrap(), sender.version_vector().unwrap());
+            if let Some(behind) = mine.behind(&theirs) {
+                return Err(format!("no pull asked, yet the requester is behind at {behind:?}"));
+            }
+        }
         let paths = sender.serve_cost().paths[kimmy_storage::ServeWalk::Serve.slot()];
         let at = |path: kimmy_storage::WalkPath| paths[path.slot()];
-        if at(kimmy_storage::WalkPath::Keys) == 0
+        if (asked_any && at(kimmy_storage::WalkPath::Keys) == 0)
             || at(kimmy_storage::WalkPath::FallbackLength) != 0
             || at(kimmy_storage::WalkPath::FallbackMissingBody) != 0
             || at(kimmy_storage::WalkPath::FallbackError) != 0
@@ -7808,7 +7830,57 @@ mod partial_windows_never_skip {
                 "(c) the budgeted requester ended with {budgeted:?}, the whole one with {whole:?}"
             ));
         }
-        Ok(())
+        Ok(asked_any)
+    }
+
+    /// The writes of a case whose requester holds all of them as placed:
+    /// three per origin, origin 3 writing as origin 0.
+    fn level_initial() -> Vec<Write> {
+        [1, 3, 1, 0, 0, 1, 2, 2, 0, 2]
+            .into_iter()
+            .map(|origin| Write { origin, wall: 0, counter: 0, collides: false })
+            .collect()
+    }
+
+    /// A requester placed level with the sender, with no write to come, asks
+    /// nothing, so no window is served and the key walk reads none: that is
+    /// not a skip, and the case passes, its requester level at the end. The
+    /// seed that found this failed it as "the windows were not all read by
+    /// the key walk: [0, 0, 0, 0, 0]".
+    #[test]
+    fn a_requester_level_with_the_sender_asks_nothing_and_passes() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let case = Case {
+            origins: 3,
+            initial: level_initial(),
+            held: vec![4, 3, 3, 0],
+            marks: Vec::new(),
+            between: Vec::new(),
+            within: Vec::new(),
+            budgets: vec![0],
+        };
+        assert_eq!(runtime.block_on(run(case)), Ok(false));
+    }
+
+    /// A write meant to land within a pull that asks nothing lands after it
+    /// instead, and the next pull asks for it and is served it by the key
+    /// walk: the case keeps its writes rather than dropping them unseen.
+    #[test]
+    fn a_write_within_a_pull_that_asks_nothing_still_lands_and_is_served() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let case = Case {
+            origins: 3,
+            initial: level_initial(),
+            held: vec![4, 3, 3, 0],
+            marks: vec![30, 4],
+            between: Vec::new(),
+            within: vec![
+                (4, Write { origin: 1, wall: 1, counter: 2, collides: false }),
+                (7, Write { origin: 3, wall: 2, counter: 2, collides: false }),
+            ],
+            budgets: vec![10],
+        };
+        assert_eq!(runtime.block_on(run(case)), Ok(true));
     }
 
     /// A span whose marked entries this sender no longer holds, collected
