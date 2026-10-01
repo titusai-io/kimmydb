@@ -5220,8 +5220,9 @@ const FLOOR: Duration = Duration::from_millis(350);
 /// loaded, shared disk (one CI run measured `apply` at 371.80 ms against a
 /// 350 ms floor, on a batch whose apply commits twice) or a stalled host
 /// crosses on its own. Each is read against the phase that was slowed
-/// instead, and all three against the wall time of the pull that measured
-/// them: the phases are disjoint, so they cannot add up to more than that.
+/// instead ([`assert_not_counted_in`]), and all three against the wall time
+/// of the pull that measured them: the phases are disjoint, so they cannot add
+/// up to more than that.
 const PHASE_SLOW: Duration = Duration::from_millis(1_500);
 const PHASE_FLOOR: Duration = Duration::from_secs(1);
 
@@ -5296,6 +5297,31 @@ async fn pull_measured(
 /// outside the phases (the slow relay of the serve test delays the handshake
 /// and the version exchange, which no phase counts), the sum has seconds of
 /// slack, and the per-phase bounds beside it carry the test.
+/// That the delay in the `slowed` phase is not also counted in `other`.
+///
+/// A delay counted in the wrong phase either moves there, and the slowed
+/// phase then misses its floor, or is counted in both, and `other` then reads
+/// at least as long as `slowed`. So `other` is held to half of `slowed`, and
+/// no tighter: a tighter bound catches nothing more of that, and only shrinks
+/// what a stall may add to an unslowed phase. A quarter failed on a loaded
+/// runner (`apply` 433.76 ms against `serve` 1.503 s) and under a driver that
+/// stops the test process for 200 to 600 ms at a time (`apply` 928.87 ms
+/// against `serve` 3.185 s); half lets a stall in `other` reach half the
+/// slowed phase, 750 ms at the least, and a stall that also lengthens the
+/// slowed phase widens it.
+fn assert_not_counted_in(
+    slowed: (&str, Duration),
+    other: (&str, Duration),
+    pull: &kimmy_storage::PullTiming,
+) {
+    assert!(
+        other.1 < slowed.1 / 2,
+        "the {} delay is not also counted in {}: {pull:?}",
+        slowed.0,
+        other.0
+    );
+}
+
 fn assert_phases_fit_in(pull: &kimmy_storage::PullTiming, took: Duration) {
     assert!(
         pull.serve + pull.wait + pull.apply <= took,
@@ -5324,11 +5350,11 @@ async fn a_pull_that_waits_for_the_writer_says_so_apart_from_applying() {
 
     assert!(pull.wait >= PHASE_FLOOR, "the wait behind the writer is the wait phase: {pull:?}");
     // Against the wait itself, not a fixed floor: a wait counted as applying
-    // or serving would make that phase a large share of the wait, and a stall
-    // in either phase on a loaded host can cross a fixed floor on its own.
-    // The same reading holds for the unslowed phases of the two tests below.
-    assert!(pull.apply < pull.wait / 4, "and is not also counted as applying: {pull:?}");
-    assert!(pull.serve < pull.wait / 4, "nor as serving: {pull:?}");
+    // or serving would make that phase as long as the wait, and a stall in
+    // either phase on a loaded host can cross a fixed floor on its own. The
+    // same reading holds for the unslowed phases of the two tests below.
+    assert_not_counted_in(("wait", pull.wait), ("apply", pull.apply), &pull);
+    assert_not_counted_in(("wait", pull.wait), ("serve", pull.serve), &pull);
     // Nor counted twice, or in part: the wait is a slice of this pull's own
     // time, and the other phases are the rest.
     assert_phases_fit_in(&pull, took);
@@ -5345,8 +5371,8 @@ async fn a_pull_whose_commit_is_slow_says_so_in_apply() {
     let (_, pull, took) = pull_measured(&b.engine, a.addr).await;
 
     assert!(pull.apply >= PHASE_FLOOR, "a slow commit is the apply phase: {pull:?}");
-    assert!(pull.wait < pull.apply / 4, "not a wait for the writer: {pull:?}");
-    assert!(pull.serve < pull.apply / 4, "nor serving: {pull:?}");
+    assert_not_counted_in(("apply", pull.apply), ("wait", pull.wait), &pull);
+    assert_not_counted_in(("apply", pull.apply), ("serve", pull.serve), &pull);
     assert_phases_fit_in(&pull, took);
 }
 
@@ -5358,8 +5384,8 @@ async fn a_pull_from_a_slow_peer_says_so_in_serve() {
     let (_, pull, took) = pull_measured(&b.engine, slow).await;
 
     assert!(pull.serve >= PHASE_FLOOR, "a slow answer is the serve phase: {pull:?}");
-    assert!(pull.wait < pull.serve / 4, "{pull:?}");
-    assert!(pull.apply < pull.serve / 4, "{pull:?}");
+    assert_not_counted_in(("serve", pull.serve), ("wait", pull.wait), &pull);
+    assert_not_counted_in(("serve", pull.serve), ("apply", pull.apply), &pull);
     assert_phases_fit_in(&pull, took);
 }
 
