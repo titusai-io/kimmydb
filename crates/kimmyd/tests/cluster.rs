@@ -2671,52 +2671,33 @@ async fn a_quiet_members_write_reaches_its_peers_after_a_large_load_elsewhere() 
     }
 }
 
-/// A connection has authenticated on `node` more times than one of its kinds
-/// has ended (disconnected, failed, or been cut short at a stop) since its
-/// last restart: a peer's connection is open, which is true for the whole
-/// version exchange and the request that follows it, not only the walk
-/// `AskEntries` starts — the only step of a served connection with no log
-/// line of its own. On its own this goes true right at authentication,
-/// before any of that, so [`wait_for_a_sustained_pull_in_flight`] is what a
-/// test should call.
-fn a_peers_pull_looks_in_flight(node: &Node) -> bool {
+/// A serve walk is in flight on `node`: one has started (`a serve walk started
+/// for a peer's pull`, logged at the transport's debug level) and not ended (`a
+/// serve walk ended`). Both lines come from the walk's own thread, so a walk
+/// that a peer's connection no longer waits for is still one, and the
+/// handshake and the version exchange before it are not. This replaced a guess
+/// from which connections were open, which two overlapping pulls could satisfy
+/// for a moment with no walk running.
+fn a_serve_walk_is_in_flight(node: &Node) -> bool {
     let log = node.log();
-    let started = log.matches("peer authenticated").count();
-    let ended = log.matches("peer disconnected").count()
-        + log.matches("peer connection failed").count()
-        + log.matches("stopped serving a peer's pull").count();
-    started > ended
+    log.matches("a serve walk started for a peer's pull").count()
+        > log.matches("a serve walk ended").count()
 }
 
-/// Wait until [`a_peers_pull_looks_in_flight`] has read true on every poll,
-/// a hundred milliseconds apart, for at least `held` running — long enough
-/// past a fresh connection's authentication, version exchange and the
-/// `AskEntries` request itself that a continuous true reading is the walk,
-/// not the handshake. A single false reading resets the clock. Gives up
-/// after [`patience`].
-///
-/// A connection's authentication alone (`a_peers_pull_looks_in_flight` on
-/// its own) is not enough: a fresh connection reads true from the instant it
-/// authenticates, before it has asked for anything, so signalling on that
-/// alone can land in the gap between one window's connection closing and the
-/// next one's handshake finishing.
-async fn wait_for_a_sustained_pull_in_flight(node: &Node, held: Duration) {
+/// Wait until [`a_serve_walk_is_in_flight`], polling every 25 ms. Gives up
+/// after [`patience`]. The walk is slowed by the test so that it lasts seconds,
+/// and the caller signals the node at once: whether a walk was still in flight
+/// at the signal is then asserted from the node's own log, `stopped serving a
+/// peer's pull`.
+async fn wait_for_a_serve_walk_in_flight(node: &Node) {
     let deadline = std::time::Instant::now() + patience();
-    let mut held_since: Option<std::time::Instant> = None;
-    loop {
-        if a_peers_pull_looks_in_flight(node) {
-            let since = *held_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= held {
-                return;
-            }
-        } else {
-            held_since = None;
-        }
+    while !a_serve_walk_is_in_flight(node) {
         assert!(
             std::time::Instant::now() < deadline,
-            "gave up waiting for a peer's pull to stay in flight for {held:?} running"
+            "gave up waiting for a serve walk to start: {}",
+            node.log()
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -2729,8 +2710,7 @@ async fn wait_for_a_sustained_pull_in_flight(node: &Node, held: Duration) {
 /// hold a serve walk for seconds, as a cold walk of a large oplog does, and
 /// its served window's own budget is raised past that so the row count ends
 /// it, not ADR-194's default two seconds. B is stopped once a pull has held
-/// mid-walk for a moment ([`wait_for_a_sustained_pull_in_flight`]), not on a
-/// bare connection: its serve walks end at the signal, and it exits 0
+/// mid-walk ([`wait_for_a_serve_walk_in_flight`]), not on a bare connection: its serve walks end at the signal, and it exits 0
 /// promptly with the store closed (`engine closed`, the `shutdown` marker),
 /// and its next start repairs nothing.
 ///
@@ -2795,7 +2775,7 @@ async fn a_member_stopped_while_serving_its_peers_pulls_exits_promptly_and_close
             }
         })
     };
-    wait_for_a_sustained_pull_in_flight(&b, Duration::from_millis(1500)).await;
+    wait_for_a_serve_walk_in_flight(&b).await;
 
     let started = std::time::Instant::now();
     b.signal("TERM");
@@ -3112,7 +3092,7 @@ async fn a_peers_pull_ends_at_the_signal_while_a_clients_request_drains() {
         tokio::spawn(async move { reqwest::Client::new().get(url).bearer_auth(token).send().await })
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
-    wait_for_a_sustained_pull_in_flight(&b, Duration::from_millis(1500)).await;
+    wait_for_a_serve_walk_in_flight(&b).await;
     b.signal("TERM");
     let status = b.wait_exit(Duration::from_secs(60));
     writer.abort();

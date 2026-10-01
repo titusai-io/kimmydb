@@ -622,6 +622,28 @@ async fn serve_connection<S>(
     }
 }
 
+/// The two debug lines that bracket a serve walk, a peer's `AskEntries` being
+/// read from the oplog: `a serve walk started for a peer's pull` when it begins
+/// and `a serve walk ended` when the walk is over, whichever way it ended (a
+/// window, the cap, the stop, an error) and whatever became of the connection.
+/// Written by a guard on the thread that walks, so an end is never missed.
+struct ServeWalk {
+    peer: NodeId,
+}
+
+impl ServeWalk {
+    fn begin(peer: NodeId) -> Self {
+        debug!(?peer, "a serve walk started for a peer's pull");
+        Self { peer }
+    }
+}
+
+impl Drop for ServeWalk {
+    fn drop(&mut self) {
+        debug!(peer = ?self.peer, "a serve walk ended");
+    }
+}
+
 /// `budgets` bounds each window's walk (ADR-194): one asked for in part ends
 /// at its budget, and one asked for whole at the cap, which its requester
 /// cannot take in part and has stopped waiting for by then.
@@ -732,6 +754,12 @@ where
                     false => kimmy_storage::ExamineBudget::time(budgets.whole),
                 };
                 let window = match kimmy_storage::blocking(|| {
+                    // Bracketed in the log from inside the blocking call, so the
+                    // end line is written when the walk is over and not when the
+                    // connection's future is dropped: a test that stops a member
+                    // mid-walk waits on the start line instead of guessing from
+                    // which connections are open.
+                    let _walk = ServeWalk::begin(peer);
                     engine.serve_entries_to_peer(from, limit, held.as_ref(), &marked, Some(budget))
                 }) {
                     Ok(window) => window,
@@ -3637,6 +3665,72 @@ mod tests {
         assert_eq!(got, 2);
         assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Every message a test's subscriber saw, at any level.
+    #[derive(Clone, Default)]
+    struct Messages(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Messages {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    /// The two debug lines that bracket a serve walk: the start when the walk
+    /// begins and the end when it is over, whichever way it is over, a panic
+    /// included, since a cluster test that waits for a walk in flight counts
+    /// starts against ends and an end that never came would read as a walk for
+    /// ever.
+    #[test]
+    fn a_serve_walk_is_bracketed_by_its_start_and_end_lines_even_if_it_panics() {
+        let messages = Messages::default();
+        let seen = Arc::clone(&messages.0);
+        let _recording = tracing::subscriber::set_default(messages);
+        let peer = NodeId::generate();
+        {
+            let _walk = ServeWalk::begin(peer);
+            assert_eq!(*seen.lock().unwrap(), ["a serve walk started for a peer's pull"]);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["a serve walk started for a peer's pull", "a serve walk ended"]
+        );
+        seen.lock().unwrap().clear();
+        let panicked = std::panic::catch_unwind(|| {
+            let _walk = ServeWalk::begin(NodeId::generate());
+            panic!("a walk that panics");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["a serve walk started for a peer's pull", "a serve walk ended"],
+            "the end line is written on the way out of a panic too"
+        );
     }
 
     /// The `WARN` is thinned to one per [`ACCEPT_WARN_EVERY`] while the
