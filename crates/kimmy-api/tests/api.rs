@@ -2137,6 +2137,115 @@ async fn an_array_filter_whose_expr_cannot_be_evaluated_fails_the_update() {
     assert_eq!(res.body["lines"], lines, "nothing was written");
 }
 
+/// An `arrayFilters` entry takes `$expr`, reading the element as `$$<identifier>`
+/// (ADR-209): the lines below their own minimum are flagged and the others left
+/// alone, on `update` and on `find_and_modify`. One that names a second
+/// identifier, or reads the document, is a `400` naming what it did wrong, and
+/// an element it cannot be evaluated against fails the update (ADR-206).
+#[tokio::test]
+async fn an_array_filter_takes_expr_over_two_fields_of_the_element() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    let lines = json!([
+        {"sku": "gasket", "qty": 2, "min": 5},
+        {"sku": "bolt", "qty": 10, "min": 5},
+    ]);
+    server
+        .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "lines": lines}))
+        .await;
+    let short = json!({"$expr": {"$lt": ["$$short.qty", "$$short.min"]}});
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"lines.$[short].flag": "below-min"}},
+                "arrayFilters": [short],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!((res.body["matched"].clone(), res.body["modified"].clone()), (json!(1), json!(1)));
+    let doc = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["lines"][0]["flag"], "below-min", "{doc}");
+    assert!(doc["lines"][1].get("flag").is_none(), "{doc}");
+
+    // `find_and_modify` takes the same entry, and a field condition beside it.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$inc": {"lines.$[short].qty": 10}},
+                "arrayFilters": [{"short.sku": "gasket", "$expr": {"$lt": ["$$short.qty", "$$short.min"]}}],
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["lines"][0]["qty"], 12, "{:?}", res.body);
+    assert_eq!(res.body["document"]["lines"][1]["qty"], 10, "{:?}", res.body);
+
+    // The refusals are `400`s, and write nothing.
+    let refused = |filters: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/orders/update",
+                    Some(token),
+                    json!({
+                        "filter": {"_id": 1},
+                        "update": {"$set": {"lines.$[short].flag": 1}},
+                        "arrayFilters": filters,
+                    }),
+                )
+                .await;
+            assert_eq!(res.status, 400, "{:?}", res.body);
+            res.body["message"].as_str().unwrap_or_default().to_string()
+        }
+    };
+    let msg = refused(json!([{"short.qty": 1, "$expr": {"$gt": ["$$other.qty", 0]}}])).await;
+    assert!(msg.contains("short") && msg.contains("other") && msg.contains("both"), "{msg}");
+    let msg = refused(json!([{"$expr": {"$gt": ["$$short.qty", "$min"]}}])).await;
+    assert!(msg.contains("cannot read"), "{msg}");
+    let before = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await.body;
+
+    // An element the expression cannot be evaluated against fails the update.
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({"_id": 2, "lines": [{"qty": 1, "min": 5}, {"qty": "x", "min": 5}]}),
+        )
+        .await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 2},
+                "update": {"$set": {"lines.$[short].flag": 1}},
+                "arrayFilters": [{"$expr": {"$lt": [{"$add": ["$$short.qty", 1]}, "$$short.min"]}}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["message"],
+        "invalid query: $expr cannot be evaluated for an array element of the document with _id \
+         2: $add needs numbers, found a string"
+    );
+    let after = server.get("/v1/db/shop/coll/orders/docs/2", Some(&token)).await.body;
+    assert!(after["lines"][0].get("flag").is_none(), "nothing was written: {after}");
+    assert_eq!(server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await.body, before);
+}
+
 /// A `$lookup` pipeline with no input documents joins nothing, so the
 /// foreign collection is not part of the answer and its `$match` is not run
 /// over it (ADR-206).

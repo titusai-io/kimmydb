@@ -82,12 +82,24 @@ pub enum Condition {
 /// ([`REGEX_CONDITIONS_LIMIT`], [`REGEX_TOTAL_LIMIT_BYTES`]), or to the
 /// budget of the enclosing pipeline when one is being parsed.
 pub fn parse(doc: &Document) -> Result<Filter> {
+    parse_with_vars(doc, &[])
+}
+
+/// [`parse`] for an `arrayFilters` entry (ADR-209): the element is bound to
+/// the one name in `vars`, which a `$expr` in the entry reads as `$$name`.
+///
+/// Only a `$expr` at the entry's own level, or under its `$and`, `$or` and
+/// `$nor`, sees the name; a `$elemMatch` body is a filter over the elements
+/// of another array, parsed with nothing bound. An expression that reads the
+/// document (a field, `$$ROOT`, `$$CURRENT`) is refused there, so that the
+/// element has one spelling.
+pub fn parse_with_vars(doc: &Document, vars: &[String]) -> Result<Filter> {
     let _budget = RegexBudget::open();
     let mut clauses = Vec::new();
 
     for (key, value) in doc {
         if let Some(op) = key.strip_prefix('$') {
-            clauses.push(parse_logical(op, value)?);
+            clauses.push(parse_logical(op, value, vars)?);
         } else {
             clauses.push(Filter::Field {
                 path: key.clone(),
@@ -123,7 +135,7 @@ fn cheap_first<T>(items: Vec<T>, has_expr: fn(&T) -> bool) -> Vec<T> {
     cheap.into_iter().chain(expensive).collect()
 }
 
-fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
+fn parse_logical(op: &str, value: &Bson, vars: &[String]) -> Result<Filter> {
     let branches = |value: &Bson| -> Result<Vec<Filter>> {
         let Bson::Array(items) = value else {
             return Err(Error::InvalidQuery(format!("${op} requires an array")));
@@ -134,7 +146,7 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
         let parsed = items
             .iter()
             .map(|item| match item {
-                Bson::Document(d) => parse(d),
+                Bson::Document(d) => parse_with_vars(d, vars),
                 _ => Err(Error::InvalidQuery(format!("${op} entries must be documents"))),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -149,7 +161,19 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
         // a wrong arity — in the same error type as the rest of this module,
         // so a caller sees one kind of `400` whichever half of the filter was
         // malformed.
-        "expr" => Filter::Expr(Box::new(Expr::parse(value)?)),
+        "expr" => {
+            let expr = Expr::parse_with_vars(value, vars)?;
+            if let Some(element) = vars.first()
+                && expr.reads_document()
+            {
+                return Err(Error::InvalidQuery(format!(
+                    "an $expr in an arrayFilters entry reads the element as $${element}, as in \
+                     $${element}.qty; a field, $$ROOT and $$CURRENT name the document, which \
+                     it cannot read"
+                )));
+            }
+            Filter::Expr(Box::new(expr))
+        }
         // `$not` is only meaningful applied to a field's operators; at the top
         // level Mongo rejects it too, and the clearer error is worth it.
         "not" => {
@@ -1062,21 +1086,34 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
 /// so a dotted condition sees an absent path there, exactly as a document
 /// without the field would: `$exists: false` holds, `$gt` does not.
 ///
-/// `Err` as for [`matches`], when a `$expr` cannot be evaluated against a
-/// document element. An `arrayFilters` entry cannot carry `$expr` at its top
-/// level, but can under an `$elemMatch` on a field of the element, and that
-/// one is evaluated here. `id` is the `_id` of the document the element is
+/// A `$expr` in the entry reads the element as `$$<identifier>` (ADR-209),
+/// whatever its type: `identifier` is the name it was parsed with, and is
+/// bound to `element` while it evaluates. Nothing else is bound, and the
+/// parser refused an expression that reads the document, so the scope's root
+/// is an empty document nothing reads.
+///
+/// `Err` as for [`matches`], when a `$expr` cannot be evaluated against the
+/// element, or, under an `$elemMatch` on a field of the element, against an
+/// element of that field. `id` is the `_id` of the document the element is
 /// in, for the message.
-pub fn matches_element(filter: &Filter, element: &Bson, id: Option<&Bson>) -> Result<bool> {
-    element_matches(filter, element).map_err(|e| unevaluable(e, id, "an array element of "))
+pub fn matches_element(
+    filter: &Filter,
+    identifier: &str,
+    element: &Bson,
+    id: Option<&Bson>,
+) -> Result<bool> {
+    element_matches(filter, identifier, element)
+        .map_err(|e| unevaluable(e, id, "an array element of "))
 }
 
-fn element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
+fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<bool> {
     match filter {
         Filter::AlwaysTrue => Ok(true),
-        Filter::And(branches) => all_of(branches, |f| element_matches(f, element)),
-        Filter::Or(branches) => any_of(branches, |f| element_matches(f, element)),
-        Filter::Nor(branches) => Ok(!any_of(branches, |f| element_matches(f, element))?),
+        Filter::And(branches) => all_of(branches, |f| element_matches(f, identifier, element)),
+        Filter::Or(branches) => any_of(branches, |f| element_matches(f, identifier, element)),
+        Filter::Nor(branches) => {
+            Ok(!any_of(branches, |f| element_matches(f, identifier, element))?)
+        }
         Filter::Field { path, conditions } => {
             if path.is_empty() {
                 return all_of(conditions, |c| condition_matches(c, &[element]));
@@ -1087,19 +1124,13 @@ fn element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
             };
             all_of(conditions, |c| condition_matches(c, &values))
         }
-        // Unreachable through `arrayFilters` today: `update::strip_identifier`
-        // refuses every `$`-operator but `$and`/`$or`/`$nor`, so no `$expr`
-        // survives parsing into a filter that lands here. Answered rather than
-        // left to `unreachable!` because the restriction is one parser's rule,
-        // not a property of this function: against a document element the
-        // expression evaluates over the element — `$$ROOT` there is the
-        // element, as it is under a document-form `$elemMatch` — and a scalar
-        // element offers neither a field to read nor a document to name, so it
-        // does not match, which is what `matches_scalar_against` answers too.
-        Filter::Expr(e) => match element {
-            Bson::Document(doc) => expr_matches(e, doc),
-            _ => Ok(false),
-        },
+        Filter::Expr(e) => {
+            #[cfg(test)]
+            EXPR_EVALUATIONS.with(|n| n.set(n.get() + 1));
+            let root = Document::new();
+            let bindings = [(identifier, element)];
+            e.eval_in(&expr::Scope::with_bindings(&root, &bindings)).map(|v| expr::truthy(&v))
+        }
     }
 }
 
@@ -2329,28 +2360,60 @@ mod tests {
 
     #[test]
     fn an_element_filter_fails_on_an_expression_it_cannot_evaluate() {
-        // An `arrayFilters` entry reaches one under an `$elemMatch` on a field
-        // of the element; answered as an error, not "not selected", naming the
-        // document the element is in.
-        let filter = Filter::Expr(Box::new(
-            Expr::parse(&Bson::Document(doc! { "$gt": [ { "$add": ["$qty", 1] }, 0 ] })).unwrap(),
-        ));
+        // An `arrayFilters` entry's `$expr` reads the element as `$$line`; one it
+        // cannot evaluate is an error, not "not selected", naming the document
+        // the element is in.
+        let filter = parse_with_vars(
+            &doc! { "$expr": { "$gt": [ { "$add": ["$$line.qty", 1] }, 0 ] } },
+            &["line".to_string()],
+        )
+        .unwrap();
         let id = Bson::Int32(7);
-        let err =
-            matches_element(&filter, &Bson::Document(doc! { "qty": "x" }), Some(&id)).unwrap_err();
+        let err = matches_element(&filter, "line", &Bson::Document(doc! { "qty": "x" }), Some(&id))
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "invalid query: $expr cannot be evaluated for an array element of the document with \
              _id 7: $add needs numbers, found a string"
         );
-        let err = matches_element(&filter, &Bson::Document(doc! { "qty": "x" }), None).unwrap_err();
+        let err = matches_element(&filter, "line", &Bson::Document(doc! { "qty": "x" }), None)
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "invalid query: $expr cannot be evaluated for an array element: $add needs numbers, \
              found a string"
         );
-        assert!(matches_element(&filter, &Bson::Document(doc! { "qty": 1 }), None).unwrap());
-        assert!(!matches_element(&filter, &Bson::Int32(1), None).unwrap());
+        assert!(
+            matches_element(&filter, "line", &Bson::Document(doc! { "qty": 1 }), None).unwrap()
+        );
+        // A scalar element is evaluated like any other: it has no `qty`, which
+        // is null, and null does not exceed zero.
+        assert!(!matches_element(&filter, "line", &Bson::Int32(1), None).unwrap());
+    }
+
+    #[test]
+    fn an_element_filter_does_not_evaluate_an_expression_a_cheaper_clause_decides() {
+        // The same ordering the document filters have (ADR-206), counted on an
+        // entry's parsed filter: `kind` is stripped of its identifier, as the
+        // update parser leaves it.
+        let vars = ["line".to_string()];
+        let gt = doc! { "$gt": ["$$line.qty", 1] };
+        let element = Bson::Document(doc! { "kind": "b", "qty": 5 });
+        for entry in [
+            doc! { "$expr": gt.clone(), "kind": "a" },
+            doc! { "$and": [ { "$expr": gt.clone() }, { "kind": "a" } ] },
+            doc! { "$nor": [ { "$expr": gt.clone() }, { "kind": "b" } ] },
+        ] {
+            let filter = parse_with_vars(&entry, &vars).unwrap();
+            let before = expr_evaluations();
+            assert!(!matches_element(&filter, "line", &element, None).unwrap(), "{entry}");
+            assert_eq!(expr_evaluations() - before, 0, "{entry} evaluated its expression");
+        }
+        // Where nothing cheaper decides, it is evaluated, once.
+        let filter = parse_with_vars(&doc! { "$expr": gt, "kind": "b" }, &vars).unwrap();
+        let before = expr_evaluations();
+        assert!(matches_element(&filter, "line", &element, None).unwrap());
+        assert_eq!(expr_evaluations() - before, 1);
     }
 
     #[test]

@@ -22335,8 +22335,9 @@ in the other.
     answers `500 partially_applied` with this as the cause (ADR-086, ADR-192);
   - `aggregate::apply`'s `$match`, after any stage and in a `$lookup`
     pipeline;
-  - `arrayFilters` element selection in the update language. An entry cannot
-    carry `$expr` at its top level, but it can under an `$elemMatch` on a
+  - `arrayFilters` element selection in the update language. An entry could
+    not carry `$expr` at its top level (ADR-209 lets it, and the same failure
+    applies), but it can under an `$elemMatch` on a
     field of the element (`{"l.subs": {"$elemMatch": {"$expr": …}}}`), and
     that one fails the update, naming the document the element is in:
     `$expr cannot be evaluated for an array element of the document with _id
@@ -22434,3 +22435,159 @@ error returned at once rather than kept until no clause decides, in `$and` and
 in `$or` each, and both with the order written (the plan test fails); the
 `$lookup` early return removed; `Modify::apply` passing the error's full text
 again.
+
+---
+
+## ADR-209 — An `arrayFilters` entry takes `$expr`, reading the element as `$$<identifier>`
+
+**Status:** accepted, for the next `0.MINOR`. Widens
+[ADR-104](#adr-104--array-elements-are-addressed-by-filtered-identifiers-not-by-query-position),
+whose entries took field conditions and `$and`/`$or`/`$nor` and nothing else,
+because `$expr` reached the filter language afterwards
+([ADR-106](#adr-106--expr-joins-the-filter-language-by-delegating-to-the-expression-evaluator))
+and the entry's parser was left alone rather than widened as a side effect.
+Builds on [ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope) and
+[ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request).
+A new decision and not an amendment of either: what the expression may read is
+a rule of its own.
+
+**The gap.** Over `{_id: 1, lines: [{sku: "gasket", qty: 2, min: 5}, {sku:
+"bolt", qty: 10, min: 5}]}`, flagging each line whose quantity is below its own
+minimum had no spelling. An entry compares a field with a constant
+(`{"short.qty": {"$lt": 5}}`), so comparing two fields *of one element* meant
+reading the document out, computing the indices in the caller, and writing back
+by explicit position, which loses what the update route is for: the selection
+and the write in one transaction (ADR-083). It was a `400` that said so.
+
+**Decision.**
+
+- **An entry may carry `$expr` at its top level or inside `$and`, `$or` and
+  `$nor`**, beside field conditions or alone. The expression reads the element
+  as **`$$<identifier>`**, with a path into it as `$$line.qty`:
+  `{"$expr": {"$lt": ["$$short.qty", "$$short.min"]}}`.
+- **The element is a variable, bound in the expression's scope (ADR-105), not
+  the root.** `parse_array_filters` parses the entry's expressions with the
+  identifier as a declared name, and `filter::matches_element` evaluates them in
+  a scope with the identifier bound to the element. Any element: a scalar is
+  `$$n` like a document is `$$line`, and `{"$expr": {"$gt": ["$$n", 5]}}` selects
+  from an array of numbers where it used to select nothing.
+- **The document is not readable.** A field (`"$qty"`), `$$ROOT` and `$$CURRENT`
+  in an entry's `$expr` are a `400` at parse, naming the name to use. ADR-105
+  says `$$ROOT` and `$$CURRENT` are the root document and are never rebound, so
+  the element cannot be the root; and if the root were the document, `"$qty"`
+  would mean the document's field here and the element's field under
+  `$elemMatch`, where `{$elemMatch: {$expr: …}}` reads the element as the
+  document (ADR-106). Either reading hands a caller who expected the other a
+  null, a clause that is false for every element, with a `200`. Refused instead:
+  the element has one spelling, and a later release can give the document a
+  reading (`"$qty"` and `$$ROOT` as the document being updated, as it was
+  before this update's writes) without changing a request that works, which a
+  reading chosen now could not promise. The check is `Expr::reads_document`,
+  over every node of the parsed tree, so a read under `$let`, `$map` or
+  `$reduce` is found too.
+- **One identifier per entry, as for field conditions.** The identifier is the
+  one the entry's field conditions use, or, when it has none, the one its
+  expressions name. `Expr::free_variables` finds the names an expression reads
+  that nothing inside it binds, **in one parse**: in that mode the parser
+  records a lowercase `$$name` nothing binds instead of refusing it, under its
+  own scoping, so a `$filter`'s `as`, a `$let` variable and a `$reduce`'s
+  `$$value` are never taken for the identifier, a name bound around one use and
+  free at another is free, and a string `$literal` holds is not read at all. (A
+  first build parsed once per candidate name, which is cubic: a `$let` with four
+  thousand variables took forty seconds on a request thread, and the request
+  timeout cannot interrupt a synchronous parse.) An entry that names two (`{"short.qty": 1, "$expr": … "$$other"
+  …}`) is refused naming both, as two in field conditions are. An `$expr` that
+  reads no name at all, a constant or a read of the document, is refused: it
+  says nothing about the element. Every other rule of ADR-104 holds: every
+  identifier a path uses needs exactly one entry and every entry must be used.
+- **Evaluation is ADR-206's, per element.** `element_matches` returns a `Result`
+  through the same `all_of` and `any_of` as every filter, so an expression that
+  cannot be evaluated against an element fails the update, naming the document
+  the element is in, and only where that element's answer depends on it: the
+  clauses of an entry without `$expr` are evaluated first (set once, at parse,
+  by `filter::conjunction` and `cheap_first`), and an element a field
+  condition excludes, or a true `$or` branch includes, never has its expression
+  evaluated, written first or last. Selection runs for every operation against
+  the document as it was before the update (ADR-205), so which elements an
+  expression sees does not depend on the order of operators.
+- **Under an `$elemMatch` inside an entry, `$$<identifier>` is not bound.** That
+  body is a filter over the elements of another array, parsed with nothing
+  bound, so `$$short` there is the unknown-variable refusal ADR-105 already
+  has, at parse. An `$expr` there keeps its reading (the inner element is the
+  document, ADR-106) and its ADR-206 behaviour.
+- **The regex budget is unchanged.** All the entries of one update count as a
+  single filter against it ([Query language](query-language.md), regex limits). The expression language has no operator
+  that compiles a pattern, so an `$expr` adds nothing to it; an entry holding one
+  beside a `$regex` still counts that `$regex`. An operator that compiles one
+  would have to charge the same budget, and the test below is where that would
+  show.
+- **A superset of the reference behaviour,** which refuses `$expr` in an entry:
+  an entry it accepts means the same thing here, and this one it refuses is
+  accepted. Recorded in the register beside `$expr` under `$elemMatch`.
+- **Loosening only.** A request that worked is unchanged: no entry containing
+  `$expr` was accepted before, and the message of the refusal of any other
+  `$`-operator now lists `$expr` among what an entry takes.
+
+**Why.** ADR-121 and ADR-124: a request the server cannot honour is refused,
+and one it can is answered. This one it can, with machinery that exists: the
+expression evaluator knows variables (ADR-105) and the matcher already walks an
+entry's elements. The reading was the open question, and "the element is the
+document" was the one on offer (a rewrite of `$$short` to `$$CURRENT`), which is
+a second, silent, meaning for `"$qty"`. A named variable is the reading ADR-105
+was built for.
+
+**Rejected.**
+
+- *Rewrite `$$<identifier>` to `$$ROOT` and evaluate against the element.* It is
+  what an `$elemMatch` body does, and the shortest change. It rebinds
+  `$$ROOT`, which ADR-105 says is never rebound, it leaves `"$qty"` reading the
+  element, and it makes the entry's `$expr` unable to ever read the document
+  without a second, different spelling for the element.
+- *Root is the document and `$$<identifier>` the element, both readable.* The
+  most useful reading: it lets an element be compared with a value of the
+  document. Not chosen now, for the reasons above, and not foreclosed: it is a
+  loosening of the refusal.
+- *Accept an `$expr` that names no identifier, taking the entry's from nowhere.*
+  It has no identifier to attach to, and a constant condition on every element
+  is nearly always a misspelt `$$name`.
+- *Refuse a scalar element.* The variable reads it as well as it reads a
+  document; the old "scalar matches nothing" was a property of evaluating
+  against a document root, which this does not do.
+
+**Cost.** One more parameter on `matches_element` (the identifier), and a
+`parse_with_vars` beside `parse` in the filter parser, whose logical operators
+carry the declared names. Parsing an entry's `$expr` costs two parses of the
+expression, one to find its names and one into the filter, at request parse and
+never per element, and each is the cost of parsing it as a filter's `$expr`.
+Evaluating one costs a scope with one binding per element, a stack slot
+(ADR-105). Nothing is evaluated for a document with no positional path.
+
+### Test
+
+`kimmy-query` unit tests: the worked example applies, selecting the gasket line
+and not the bolt line, at the top level, inside `$and`, `$or` and `$nor`, and
+beside a field condition; a scalar element is read as `$$n`; a `$filter`'s own
+`as` is not taken for the identifier; an `$expr` naming a second identifier is
+refused naming both, in every position of the entry; a constant, a field,
+`$$ROOT` and `$$CURRENT`, a document read under a `$let`, an unknown operator,
+a `$$name` under an `$elemMatch`, and an unused entry are each refused; an
+expression that cannot be evaluated fails the update naming the document, and
+does not where a field condition excludes the element or an `$or` branch holds
+for every element, in either written order; three entries over the regex budget
+are refused with an `$expr` among them and two are not. `Expr::free_variables`
+and `Expr::reads_document` are tested over each construct that binds a name or
+holds an expression. `kimmy-api` drives the example over `update` and
+`find_and_modify`, the two parse refusals and an evaluation failure, each
+asserting what was written. Each guard was broken and its test failed: the
+`$expr` arm of the entry's parser refusing again; the identifier not bound in
+evaluation; the free-variable search taking an expression's own names, or
+missing one (and a count of parses, one, over expressions holding two thousand
+bound names and two thousand free ones, where the first build parsed once per
+name); a differential over generated entries, in which an entry written with
+field conditions and the same entry with some conditions written as `$expr` over
+`$$<identifier>` select the same elements, and an `$expr` over `$$e.f` answers
+what a document-level `$expr` over `$f` answers on the element; the check for a document read removed; the one-identifier check
+removed; an `$expr` with no name accepted; the evaluation error swallowed;
+the clauses without `$expr` not put first.
+
+---

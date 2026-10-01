@@ -589,6 +589,19 @@ The rules, which are MongoDB's:
   would. A bare `{"line": {"$gte": 80}}` tests the element itself, which is
   how an array of scalars is addressed. `$and`, `$or` and `$nor` may group
   conditions on the identifier.
+- **`$expr` compares fields of the same element** (a KimmyDB extension: MongoDB
+  refuses `$expr` in an `arrayFilters` entry, [Deviations](deviations.md)). It reads the element as
+  `$$<identifier>`: `{"$expr": {"$lt": ["$$line.qty", "$$line.min"]}}` selects
+  the lines whose quantity is below their own minimum. It may stand alone, beside
+  field conditions, or inside `$and`, `$or` and `$nor`, and the identifier is the
+  one the entry's other conditions use, or the one the expression names. An
+  element may be a scalar (`$$n` is the number). The expression cannot read the
+  document: a field (`"$qty"`), `$$ROOT` and `$$CURRENT` are a `400` there, as is
+  an `$expr` that names no identifier or a second one. An element it cannot be
+  evaluated against fails the update, naming the document
+  ([ADR-206](decisions.md#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request),
+  [ADR-209](decisions.md#adr-209--an-arrayfilters-entry-takes-expr-reading-the-element-as-identifier)); one a cheaper condition of the entry has decided is
+  never evaluated.
 - **Every identifier used needs exactly one filter, and every filter must be
   used.** An identifier without a filter, a filter no path uses, or two filters
   for one identifier is a `400`. A filter nothing refers to is almost always a

@@ -11,6 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::aggregate::group_key;
+use crate::expr::Expr;
 use crate::filter::{self, Filter};
 use crate::path;
 use crate::shape::{self, SortKey};
@@ -323,7 +324,33 @@ fn parse_array_filters(docs: &[Document]) -> Result<Vec<ArrayFilter>> {
     let mut out: Vec<ArrayFilter> = Vec::new();
     for doc in docs {
         let mut identifier = None;
-        let stripped = strip_identifier(doc, &mut identifier)?;
+        let mut expressions = Vec::new();
+        let stripped = strip_identifier(doc, &mut identifier, &mut expressions)?;
+        // A `$expr` names its identifier as `$$name`, so it can be the only
+        // thing in an entry that does: the names it reads settle the identifier
+        // when the fields did not, and must be the one they named when they did.
+        for expression in &expressions {
+            let read = Expr::free_variables(expression)?;
+            if read.is_empty() {
+                return Err(Error::InvalidUpdate(format!(
+                    "an $expr in an arrayFilters entry must read the element as $$<identifier>, \
+                     as in {{\"$expr\": {{\"$gt\": [\"$$line.qty\", 5]}}}}; a field of the \
+                     document ($field, $$ROOT, $$CURRENT) is not readable there; got {expression}"
+                )));
+            }
+            for name in read {
+                match &identifier {
+                    Some(seen) if *seen != name => {
+                        return Err(Error::InvalidUpdate(format!(
+                            "an arrayFilters entry names one identifier, but this one names both \
+                             {seen:?} and {name:?}"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => identifier = Some(name),
+                }
+            }
+        }
         let Some(identifier) = identifier else {
             return Err(Error::InvalidUpdate(format!(
                 "an arrayFilters entry must name an identifier in every field, as in \
@@ -336,7 +363,7 @@ fn parse_array_filters(docs: &[Document]) -> Result<Vec<ArrayFilter>> {
                 "arrayFilters has more than one filter for identifier {identifier:?}"
             )));
         }
-        let filter = filter::parse(&stripped)?;
+        let filter = filter::parse_with_vars(&stripped, std::slice::from_ref(&identifier))?;
         out.push(ArrayFilter { identifier, filter });
     }
     Ok(out)
@@ -346,15 +373,26 @@ fn parse_array_filters(docs: &[Document]) -> Result<Vec<ArrayFilter>> {
 /// field, recording the identifier and refusing a second one. `{"line.qty":
 /// 1}` becomes `{"qty": 1}`; a bare `{"line": 1}` becomes `{"": 1}`, the empty
 /// path that [`filter::matches_element`] reads as the element itself.
-/// `$and`/`$or`/`$nor` are rewritten through; no other `$`-operator has a
-/// meaning at the top of an array filter.
-fn strip_identifier(doc: &Document, identifier: &mut Option<String>) -> Result<Document> {
+/// `$and`/`$or`/`$nor` are rewritten through; `$expr` is kept as written and
+/// its expression recorded in `expressions`, for the names it reads (ADR-209);
+/// no other `$`-operator has a meaning at the top of an array filter.
+fn strip_identifier(
+    doc: &Document,
+    identifier: &mut Option<String>,
+    expressions: &mut Vec<Bson>,
+) -> Result<Document> {
     let mut out = Document::new();
     for (key, value) in doc {
         if let Some(op) = key.strip_prefix('$') {
+            if op == "expr" {
+                expressions.push(value.clone());
+                out.insert(key.clone(), value.clone());
+                continue;
+            }
             if !matches!(op, "and" | "or" | "nor") {
                 return Err(Error::InvalidUpdate(format!(
-                    "an arrayFilters entry takes field conditions and $and/$or/$nor, not ${op}"
+                    "an arrayFilters entry takes field conditions, $expr and $and/$or/$nor, \
+                     not ${op}"
                 )));
             }
             let Bson::Array(branches) = value else {
@@ -365,7 +403,7 @@ fn strip_identifier(doc: &Document, identifier: &mut Option<String>) -> Result<D
                 let Bson::Document(branch) = branch else {
                     return Err(Error::InvalidUpdate(format!("${op} requires documents")));
                 };
-                rewritten.push(Bson::Document(strip_identifier(branch, identifier)?));
+                rewritten.push(Bson::Document(strip_identifier(branch, identifier, expressions)?));
             }
             out.insert(key.clone(), Bson::Array(rewritten));
             continue;
@@ -872,20 +910,17 @@ fn expand_into(
         };
         let selector = match identifier {
             "" => None,
-            named => Some(
-                &filters
-                    .iter()
-                    .find(|f| f.identifier == named)
-                    .ok_or_else(|| {
-                        Error::InvalidUpdate(format!("no array filter for identifier {named:?}"))
-                    })?
-                    .filter,
-            ),
+            named => {
+                let found = filters.iter().find(|f| f.identifier == named).ok_or_else(|| {
+                    Error::InvalidUpdate(format!("no array filter for identifier {named:?}"))
+                })?;
+                Some((found.identifier.as_str(), &found.filter))
+            }
         };
         for (index, item) in items.iter().enumerate() {
             let selected = match selector {
                 None => true,
-                Some(f) => filter::matches_element(f, item, id)?,
+                Some((name, f)) => filter::matches_element(f, name, item, id)?,
             };
             if selected {
                 prefix.push(index.to_string());
@@ -1965,25 +2000,278 @@ mod tests {
         );
     }
 
-    /// `$expr` reached the filter language (ADR-106) after array filters were
-    /// written, so it is worth saying which of the two won: an arrayFilters
-    /// entry still takes field conditions and `$and`/`$or`/`$nor` and nothing
-    /// else, at the top or inside a branch. MongoDB allows `$expr` here; that
-    /// is recorded in `docs/deviations.md` rather than quietly half-supported.
+    /// An arrayFilters entry takes `$expr` (ADR-209): the element is `$$line`,
+    /// the identifier the entry's other conditions use, and a line below its own
+    /// minimum is flagged where the others are not.
     #[test]
-    fn an_array_filter_does_not_take_expr() {
-        let update = doc! { "$set": { "items.$[line].qty": 0 } };
-        let err = parse_with_filters(&update, &[doc! { "$expr": { "$gt": ["$line.qty", 5] } }])
-            .expect_err("$expr is not an array-filter condition");
-        assert!(err.to_string().contains("$expr"), "the error should name it: {err}");
-        assert!(
-            parse_with_filters(
-                &update,
-                &[doc! { "$or": [ { "$expr": { "$gt": ["$line.qty", 5] } } ] }]
-            )
-            .is_err(),
-            "a branch is not a way around the restriction"
+    fn an_array_filter_takes_expr_over_two_fields_of_the_element() {
+        let order = doc! { "_id": 1, "lines": [
+            { "sku": "gasket", "qty": 2, "min": 5 },
+            { "sku": "bolt", "qty": 10, "min": 5 },
+        ] };
+        let short = doc! { "$expr": { "$lt": ["$$short.qty", "$$short.min"] } };
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "lines.$[short].flag": "below-min" } },
+                vec![short.clone()],
+                order.clone(),
+            ),
+            doc! { "_id": 1, "lines": [
+                { "sku": "gasket", "qty": 2, "min": 5, "flag": "below-min" },
+                { "sku": "bolt", "qty": 10, "min": 5 },
+            ] }
         );
+        // Inside each of the three groupings, beside a field condition.
+        for entry in [
+            doc! { "$and": [ short.clone(), { "short.sku": "gasket" } ] },
+            doc! { "$or": [ short.clone(), { "short.sku": "none" } ] },
+            doc! { "$nor": [ { "$expr": { "$gte": ["$$short.qty", "$$short.min"] } } ] },
+            doc! { "short.sku": "gasket", "$expr": { "$lt": ["$$short.qty", "$$short.min"] } },
+        ] {
+            let got = applied_with(
+                doc! { "$set": { "lines.$[short].flag": 1 } },
+                vec![entry.clone()],
+                order.clone(),
+            );
+            assert_eq!(
+                got.get_array("lines").unwrap()[0].as_document().unwrap().get("flag"),
+                Some(&Bson::Int32(1)),
+                "{entry}"
+            );
+            assert!(
+                !got.get_array("lines").unwrap()[1].as_document().unwrap().contains_key("flag"),
+                "{entry}"
+            );
+        }
+    }
+
+    /// A scalar element is `$$n` like any other, and an array of scalars needs
+    /// no field to read.
+    #[test]
+    fn an_expr_in_an_array_filter_reads_a_scalar_element() {
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "xs.$[n]": 0 } },
+                vec![doc! { "$expr": { "$gt": [{ "$mod": ["$$n", 2] }, 0] } }],
+                doc! { "xs": [1, 2, 3, 4] },
+            ),
+            doc! { "xs": [0, 2, 0, 4] }
+        );
+    }
+
+    /// Names the expression binds itself are not identifiers: `$$t` is the
+    /// `$filter`'s own, `$$line` the entry's.
+    #[test]
+    fn the_names_an_expr_binds_itself_are_not_the_identifier() {
+        let tagged = doc! { "$expr": { "$gt": [ { "$size": { "$filter": {
+        "input": "$$line.tags", "as": "t", "cond": { "$eq": ["$$t", "x"] } } } }, 0 ] } };
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "lines.$[line].hit": true } },
+                vec![tagged],
+                doc! { "lines": [ { "tags": ["x", "y"] }, { "tags": ["y"] } ] },
+            ),
+            doc! { "lines": [ { "tags": ["x", "y"], "hit": true }, { "tags": ["y"] } ] }
+        );
+    }
+
+    /// One identifier per entry, as for field conditions: an `$expr` naming a
+    /// second one, or a different one from the fields', is refused with both
+    /// names, wherever each is written.
+    #[test]
+    fn an_expr_naming_a_second_identifier_is_refused() {
+        let update = doc! { "$set": { "lines.$[short].flag": 1 } };
+        for entry in [
+            doc! { "short.qty": 1, "$expr": { "$gt": ["$$other.qty", 0] } },
+            doc! { "$expr": { "$gt": ["$$short.qty", "$$other.qty"] } },
+            doc! { "$and": [ { "short.qty": 1 }, { "$or": [ { "$expr": { "$gt": ["$$other.qty", 0] } } ] } ] },
+            doc! { "$and": [ { "$expr": { "$gt": ["$$short.qty", 0] } }, { "$expr": { "$gt": ["$$other.qty", 0] } } ] },
+        ] {
+            let err =
+                parse_with_filters(&update, std::slice::from_ref(&entry)).unwrap_err().to_string();
+            assert!(
+                err.contains("names both") && err.contains("short") && err.contains("other"),
+                "{entry}: {err}"
+            );
+        }
+    }
+
+    /// Everything an `$expr` can get wrong about the element's name is a `400`
+    /// at parse, before a document is read.
+    #[test]
+    fn an_expr_that_does_not_read_the_element_as_a_name_is_refused() {
+        let update = doc! { "$set": { "lines.$[short].flag": 1 } };
+        let refused = |entry: Document, needle: &str| {
+            let err =
+                parse_with_filters(&update, std::slice::from_ref(&entry)).unwrap_err().to_string();
+            assert!(err.contains(needle), "{entry}: {err}");
+        };
+        // Nothing read: a constant is not a condition on the element.
+        refused(doc! { "$expr": true }, "must read the element");
+        refused(doc! { "short.qty": 1, "$expr": { "$gt": [1, 0] } }, "must read the element");
+        // The document: the element has one spelling, `$$short`.
+        refused(doc! { "short.qty": 1, "$expr": { "$gt": ["$qty", 0] } }, "is not readable there");
+        refused(doc! { "$expr": { "$gt": ["$$short.qty", "$min"] } }, "which it cannot read");
+        refused(doc! { "$expr": { "$gt": ["$$short.qty", "$$ROOT.min"] } }, "which it cannot read");
+        refused(doc! { "$expr": { "$eq": ["$$CURRENT", "$$short"] } }, "which it cannot read");
+        // Even where the document read is under a binder of the expression's own.
+        refused(
+            doc! { "$expr": { "$let": { "vars": { "m": "$min" }, "in": { "$gt": ["$$short.qty", "$$m"] } } } },
+            "which it cannot read",
+        );
+        // An expression that is not one.
+        refused(doc! { "$expr": { "$nope": ["$$short.qty"] } }, "$nope");
+        // An unbound uppercase name is a system variable this build does not
+        // have, never a second identifier, while the entry's names are collected.
+        refused(
+            doc! { "$expr": { "$gt": ["$$short.qty", "$$NOW"] } },
+            "a system variable this build does not have",
+        );
+        // Under an `$elemMatch` the entry's name is not bound: that body is a
+        // filter over the elements of another array.
+        refused(
+            doc! { "short.subs": { "$elemMatch": { "$expr": { "$gt": ["$$short.qty", 0] } } } },
+            "unknown variable $$short",
+        );
+        // The same entry's refusal, other `$` operators: still refused.
+        refused(doc! { "$where": "1" }, "$where");
+    }
+
+    /// An entry's `$expr` is read once for its names, whatever their number: one
+    /// that binds thousands of its own is accepted, and one that names thousands
+    /// of identifiers is refused naming two, both at once.
+    #[test]
+    fn an_expr_with_thousands_of_names_is_read_once() {
+        let k = 2000;
+        let mut vars = Document::new();
+        for i in 0..k {
+            vars.insert(format!("v{i}"), i);
+        }
+        let mut names: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$v{i}"))).collect();
+        names.push(Bson::String("$$line.qty".into()));
+        let bound = doc! { "$expr": { "$gt": [
+        { "$let": { "vars": vars, "in": { "$add": names } } }, 0 ] } };
+        let update = doc! { "$set": { "lines.$[line].flag": 1 } };
+        parse_with_filters(&update, &[bound]).unwrap();
+
+        let many: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$w{i}"))).collect();
+        let err = parse_with_filters(&update, &[doc! { "$expr": { "$add": many } }])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names both"), "{err}");
+    }
+
+    /// An entry whose only name is one no path uses is the unused-filter
+    /// refusal, and a path whose identifier no entry names is the missing one.
+    #[test]
+    fn an_expr_entry_is_held_to_the_identifiers_the_paths_use() {
+        let entry = doc! { "$expr": { "$gt": ["$$typo.qty", 0] } };
+        let err = parse_with_filters(&doc! { "$set": { "lines.$[short].flag": 1 } }, &[entry])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "invalid update: the update path \"lines.$[short].flag\" uses identifier \"short\", \
+             but arrayFilters has no filter for it"
+        );
+        // And the entry for a name no path uses is the unused-filter refusal.
+        let err = parse_with_filters(
+            &doc! { "$set": { "lines.$[short].flag": 1 } },
+            &[
+                doc! { "$expr": { "$gt": ["$$short.qty", 0] } },
+                doc! { "$expr": { "$gt": ["$$typo.qty", 0] } },
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "invalid update: arrayFilters names identifier \"typo\", which no update path uses"
+        );
+    }
+
+    /// An `$expr` that cannot be evaluated against an element fails the update
+    /// where it decides, naming the document (ADR-206 holds per element); where
+    /// a cheaper condition of the entry has decided, or a branch of an `$or` is
+    /// true, it is never evaluated, whichever order the entry is written in.
+    #[test]
+    fn an_expr_that_cannot_be_evaluated_fails_the_update_only_where_it_decides() {
+        let update = doc! { "$set": { "lines.$[line].seen": true } };
+        let bad = doc! { "$gt": [{ "$add": ["$$line.qty", 1] }, 0] };
+        let lines = |a: Bson, b: Bson| doc! { "_id": 9, "lines": [ { "kind": "a", "qty": a }, { "kind": "b", "qty": b } ] };
+
+        // The text qty is on a line the field condition excludes: nothing fails.
+        for entry in [
+            doc! { "line.kind": "a", "$expr": bad.clone() },
+            doc! { "$and": [ { "$expr": bad.clone() }, { "line.kind": "a" } ] },
+        ] {
+            let got = applied_with(
+                update.clone(),
+                vec![entry.clone()],
+                lines(Bson::Int32(1), Bson::String("x".into())),
+            );
+            let seen = |i: usize| {
+                got.get_array("lines").unwrap()[i].as_document().unwrap().get("seen").cloned()
+            };
+            assert_eq!((seen(0), seen(1)), (Some(Bson::Boolean(true)), None), "{entry}");
+        }
+        // A branch of an `$or` that is true on every line decides before the
+        // expression, written first or last.
+        for entry in [
+            doc! { "$or": [ { "$expr": bad.clone() }, { "line.kind": { "$exists": true } } ] },
+            doc! { "$or": [ { "line.kind": { "$exists": true } }, { "$expr": bad.clone() } ] },
+        ] {
+            let got = applied_with(
+                update.clone(),
+                vec![entry.clone()],
+                lines(Bson::String("x".into()), Bson::String("y".into())),
+            );
+            let seen = |i: usize| {
+                got.get_array("lines").unwrap()[i].as_document().unwrap().get("seen").cloned()
+            };
+            assert_eq!(
+                (seen(0), seen(1)),
+                (Some(Bson::Boolean(true)), Some(Bson::Boolean(true))),
+                "{entry}"
+            );
+        }
+        // The text qty is on a line nothing else decides: the update fails.
+        for entry in [
+            doc! { "line.kind": "b", "$expr": bad.clone() },
+            doc! { "$expr": bad.clone() },
+            doc! { "$and": [ { "$expr": bad.clone() }, { "line.kind": "b" } ] },
+        ] {
+            let err = apply_err_with(
+                update.clone(),
+                vec![entry.clone()],
+                lines(Bson::Int32(1), Bson::String("x".into())),
+            );
+            assert_eq!(
+                err,
+                "invalid query: $expr cannot be evaluated for an array element of the document \
+                 with _id 9: $add needs numbers, found a string",
+                "{entry}"
+            );
+        }
+    }
+
+    /// The `$regex` conditions of every entry are held under one budget, an
+    /// `$expr` entry's included: the expression language compiles no pattern,
+    /// so an `$expr` adds nothing to it, and an entry holding one beside a
+    /// `$regex` still counts that one.
+    #[test]
+    fn an_expr_entry_still_counts_its_regex_conditions_against_the_shared_budget() {
+        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!(r"\w{{15}}{id}") } };
+        let with_expr = |id: &str| {
+            doc! { "$and": [
+                { "$expr": { "$gt": [format!("$${id}.n"), 0] } },
+                entry(id),
+            ] }
+        };
+        let three = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1, "c.$[z].s": 1 } };
+        parse_with_filters(&three, &[with_expr("x"), entry("y"), with_expr("z")]).unwrap_err();
+        let two = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1 } };
+        parse_with_filters(&two, &[with_expr("x"), with_expr("y")]).unwrap();
     }
 
     // -----------------------------------------------------------------------

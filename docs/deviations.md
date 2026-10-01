@@ -408,13 +408,14 @@ callers, in a `0.MINOR`.
 
 ---
 
-## 🟡 `$expr` is accepted under `$elemMatch`, and not at the top level of an `arrayFilters` entry
+## 🟡 `$expr` is accepted under `$elemMatch` and in an `arrayFilters` entry, where MongoDB refuses both
 
 **Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106)**,
-and recorded with the evaluation-error entry above until that closed. Two
-places where the filter's `$expr` differs from MongoDB's, both by design and
-both small. An evaluation error under `$elemMatch` fails the request like any
-other (ADR-206).
+and recorded with the evaluation-error entry above until that closed; the
+second place was added 2026-10-01 ([ADR-209](decisions.md#adr-209--an-arrayfilters-entry-takes-expr-reading-the-element-as-identifier)).
+Two places where the filter's `$expr` is accepted and MongoDB's is not, both
+by design and both small. An evaluation error in either fails the request like
+any other (ADR-206).
 
 **`$expr` is accepted inside a document-form `$elemMatch`.** MongoDB refuses
 `{lines: {$elemMatch: {$expr: …}}}` outright. Here the element is a document
@@ -424,22 +425,30 @@ compares two fields of one element, which MongoDB needs `$map` and
 `$anyElementTrue` for and this database does not have. A strict superset: a
 filter MongoDB accepts means the same thing here.
 
-**`$expr` is *not* accepted in an `arrayFilters` entry, where MongoDB takes
-it.** An entry takes field conditions on its identifier and `$and`/`$or`/`$nor`
-to group them, and refuses every other `$`-operator — the rule predates `$expr`
-joining the filter language (ADR-106 landed after ADR-104) and was left alone
-rather than widened as a side effect of the two meeting. `{"line.qty": {"$gt":
-5}}` covers what an array filter is usually for; comparing two fields *of the
-same element* is what it cannot express. The check reads only the entry's
-top-level keys, so a `$expr` under an `$elemMatch` on a field of the element
-— `{"l.subs": {"$elemMatch": {"$expr": …}}}` — is accepted, compares fields
-of an element of `subs`, and fails the update when it cannot be evaluated.
+**`$expr` is accepted in an `arrayFilters` entry.** MongoDB refuses it there
+too. An entry takes `$expr` at its top level or under `$and`/`$or`/`$nor`, and
+the expression reads the element as `$$<identifier>`: `{"$expr": {"$lt":
+["$$line.qty", "$$line.min"]}}` flags the lines below their own minimum, which
+a field condition cannot say, since it compares a field with a constant. The
+identifier is the one the entry's field conditions use, or the one the
+expression names when it has none; naming two is a `400`, as two in field
+conditions are. A strict superset again: an entry MongoDB accepts means the
+same thing here. Where an `$elemMatch` body reads the element *as the
+document* (`"$qty"` is the element's field), an entry's expression has the
+element under a name, and **a field (`"$qty"`), `$$ROOT` and `$$CURRENT` in it
+are a `400`**: answering `"$qty"` with the document's field here and the
+element's field under `$elemMatch` would be a null in one place nobody asked
+for. An `$expr` that reads no `$$<identifier>` at all is a `400` too, since it
+says nothing about the element. The document is not readable from an entry,
+which a later release can change without breaking a request that works. A
+scalar element is `$$n` like any other. Inside the entry, an `$elemMatch` on a
+field of the element is a filter over the elements of another array: its
+`$expr` reads *those* elements' fields as above, and `$$<identifier>` is not
+bound there and is refused as an unknown variable.
 
-**To close:** the first is a feature, and would only be withdrawn if the
-operator set gained the pipeline-side spelling. The second is
-`update::strip_identifier` letting `$expr` through to the filter parser:
-`filter::matches_element` already answers one, against the element, and fails
-on one it cannot evaluate.
+**To close:** both are features, and would be withdrawn only if the operator
+set gained the pipeline-side spelling, which a request MongoDB refuses would
+have to be rewritten into.
 
 ---
 
