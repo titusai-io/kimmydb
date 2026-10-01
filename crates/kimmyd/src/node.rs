@@ -1538,7 +1538,15 @@ fn record_outcome(
                 error = %cause,
                 "exiting without closing the storage engine; the next start repairs the database"
             );
-            Err(StorageNotClosed(cause).into())
+            // The run's own error stays underneath, so what `main` prints
+            // still names why the start or the run failed (a port in use, a
+            // refused issuer), not only that the store was left open.
+            match outcome {
+                Err(e) if e.downcast_ref::<WritesStillOpen>().is_none() => {
+                    Err(e.context(StorageNotClosed(cause)))
+                }
+                _ => Err(StorageNotClosed(cause).into()),
+            }
         }
         (Ok(()), Ok(())) => {
             lifecycle::record_exit(data_dir, lifecycle::Exit::Shutdown);
@@ -3511,6 +3519,10 @@ mod tests {
         let still_held = Engine::open(&path).unwrap();
         let outcome = conclude_now(failed_start(dir.path(), true));
         assert!(not_closed(&outcome), "{outcome:?}");
+        // What `main` prints keeps the start's own error under it.
+        let printed = format!("{:#}", outcome.as_ref().unwrap_err());
+        assert!(printed.starts_with("exiting without closing the storage engine"), "{printed}");
+        assert!(printed.contains("a failure after the open, on purpose"), "{printed}");
         let last = marker(dir.path());
         assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
         assert!(last.cause.unwrap().contains("still open when the process stopped"));
