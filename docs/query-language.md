@@ -42,6 +42,18 @@ graph LR
 { "seq": { "$mod": [4, 0] } }           // every fourth
 ```
 
+**`$in`, `$nin`, `$all` and `$ne` compare values, so a regular expression
+among their operands is refused.** A regex literal, `{"$regex": ...}` with or
+without `$options`, or the Extended JSON `{"$regularExpression": ...}` in the
+list, or as the operand of `$ne`, is a **`400`** before any document is read.
+They used to be compared as values, so `{"s": {"$in": [{"$regex": "abc"}]}}`
+matched no string, and `$nin` and `$ne` matched every one, with a `200`. To
+match any of several patterns, write an `$or` of `$regex` clauses, or one
+pattern: `{"s": {"$regex": "^(abc|def)"}}`; to exclude what a pattern matches,
+`{"s": {"$not": {"$regex": "abc"}}}`. Any other document, one with
+`$`-prefixed keys included, is still compared as a value, and `$eq` compares a
+regex as a value too. See [Deviations](deviations.md).
+
 ### Logical
 
 | Operator | Meaning |
@@ -72,6 +84,15 @@ Top-level fields are implicitly `$and`-ed.
 | `$all` | Array contains every listed value |
 | `$size` | Array has exactly this length |
 | `$elemMatch` | **One** element satisfies all the conditions |
+
+**`$all` compares values, so an `$elemMatch` among them is refused.**
+`{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` is a **`400`**: it used to
+compare each element with the document `{"$elemMatch": {"qty": 5}}` and match
+nothing, with a `200`. To require an element matching each of several
+conditions, write an `$and` of `$elemMatch` clauses:
+`{"$and": [{"items": {"$elemMatch": {"qty": 5}}}, {"items": {"$elemMatch": {"sku": "a"}}}]}`.
+A document with any other key beside `$elemMatch` is still a value. See
+[Deviations](deviations.md).
 
 ### `$expr` — comparing fields of the same document
 
@@ -795,7 +816,8 @@ reach projections.
 ## Regex compatibility
 
 Patterns are compiled with the Rust [`regex`](https://docs.rs/regex) crate,
-**not** PCRE.
+**not** PCRE. A pattern is compiled once, when the filter is parsed, and the
+compiled form is what every document is matched against.
 
 | | |
 |---|---|
@@ -820,6 +842,31 @@ is case-sensitive. Earlier releases dropped an unknown flag and the pattern
 compiled without it, so `"I"` returned a case-sensitive result and `"iz"`
 swallowed the `z`. This is the same rule as for an unknown
 [`$type` alias](#type).
+
+**What a filter's patterns may hold.** A compiled pattern is kept in the parsed
+filter until the request ends, so its size is held, and it is bounded. Past
+any of these limits the request is a **`400`** naming the limit, before any
+document is read:
+
+| Limit | Value |
+|---|---|
+| One pattern, compiled | 1 MiB |
+| `$regex` conditions in one filter | 32 |
+| All the patterns of one filter, compiled | 2 MiB |
+| One pattern's lazy DFA cache, per search direction, while matching | 256 KiB (a cap, not a refusal) |
+
+Every `$match` of a pipeline, its `$lookup` sub-pipelines included, counts as
+one filter, and all the entries of an update's or a `find_and_modify`'s
+`arrayFilters` count as another, apart from its query filter, which has its
+own. A pattern that has matched keeps its search caches until the request ends:
+the most measured for thirty-two patterns is 17.7 MiB after matching, about
+0.53 MiB per pattern; that is a measurement of the shapes that fill the caches
+most, not a guaranteed bound. Most
+patterns compile to a few kilobytes. What reaches the limits is a Unicode class
+repeated many times: `\w` alone compiles to some 55 KiB, so `\w{20}` is about
+1 MiB and `\w{100}` is refused, where `[A-Za-z0-9_]{100}` compiles to a few
+kilobytes. Many alternatives fit better as one pattern, `"^(abc|def|ghi)"`,
+than as an `$or` of one `$regex` each.
 
 ---
 

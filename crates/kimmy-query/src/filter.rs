@@ -11,6 +11,9 @@ use kimmy_core::matching::{self, any_element};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
+use regex_automata::meta;
+use regex_automata::util::syntax;
+
 use crate::expr::{self, Expr};
 use crate::path;
 
@@ -53,10 +56,8 @@ pub enum Condition {
     Nin(Vec<Bson>),
     Exists(bool),
     Type(Vec<String>),
-    Regex {
-        pattern: String,
-        options: String,
-    },
+    /// `$regex`, compiled when the filter was parsed.
+    Regex(RegexPattern),
     /// Every listed value must be present in the field's array.
     All(Vec<Bson>),
     /// At least one array element must match the inner filter.
@@ -76,7 +77,12 @@ pub enum Condition {
 // ---------------------------------------------------------------------------
 
 /// Parse a filter document into a [`Filter`].
+///
+/// Every `$regex` the filter holds is charged to one budget
+/// ([`REGEX_CONDITIONS_LIMIT`], [`REGEX_TOTAL_LIMIT_BYTES`]), or to the
+/// budget of the enclosing pipeline when one is being parsed.
 pub fn parse(doc: &Document) -> Result<Filter> {
+    let _budget = RegexBudget::open();
     let mut clauses = Vec::new();
 
     for (key, value) in doc {
@@ -243,14 +249,14 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
 
     Ok(match op {
         "eq" => Condition::Eq(arg.clone()),
-        "ne" => Condition::Ne(arg.clone()),
+        "ne" => Condition::Ne(not_regex(arg)?.clone()),
         "gt" => Condition::Gt(arg.clone()),
         "gte" => Condition::Gte(arg.clone()),
         "lt" => Condition::Lt(arg.clone()),
         "lte" => Condition::Lte(arg.clone()),
-        "in" => Condition::In(array_arg(arg)?),
-        "nin" => Condition::Nin(array_arg(arg)?),
-        "all" => Condition::All(array_arg(arg)?),
+        "in" => Condition::In(without_regex(op, array_arg(arg)?)?),
+        "nin" => Condition::Nin(without_regex(op, array_arg(arg)?)?),
+        "all" => Condition::All(without_elem_match(without_regex(op, array_arg(arg)?)?)?),
         "exists" => Condition::Exists(truthy(arg)),
         "size" => match arg {
             Bson::Int32(n) => Condition::Size(i64::from(*n)),
@@ -305,6 +311,85 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
             return Err(Error::UnsupportedOperator { operator: format!("${other}"), reason: None });
         }
     })
+}
+
+/// Whether `value` is a regular expression in one of the shapes a filter
+/// can carry: a regex literal, a document whose keys are `$regex` and
+/// optionally `$options`, or a document whose only key is
+/// `$regularExpression`, which is how one arrives over HTTP.
+fn is_regex_shaped(value: &Bson) -> bool {
+    match value {
+        Bson::RegularExpression(_) => true,
+        Bson::Document(d) => {
+            (d.contains_key("$regex") && d.keys().all(|k| k == "$regex" || k == "$options"))
+                || (d.len() == 1 && d.contains_key("$regularExpression"))
+        }
+        _ => false,
+    }
+}
+
+/// Refuse a regular expression among the values of `$in`, `$nin` or `$all`.
+///
+/// These operators compare values, so a regex among them was compared as a
+/// value: `{s: {$in: [/abc/]}}` matched only a stored regex `/abc/` and never
+/// the string `"xabcx"`, and `$nin` matched every string. Over HTTP a regex
+/// cannot even be written as one, so `{$regex: "abc"}` or the Extended JSON
+/// `{$regularExpression: ...}` arrived as a document and was compared as
+/// that. Each answered a result that looks right and is not.
+///
+/// Only those shapes are refused ([`is_regex_shaped`]). A stored document
+/// may hold a key beginning with `$`, and `$in` still compares against any
+/// other document, a `{$regex: ..., other: ...}` among them.
+fn without_regex(op: &str, values: Vec<Bson>) -> Result<Vec<Bson>> {
+    match values.iter().find(|v| is_regex_shaped(v)) {
+        Some(regex) => Err(Error::InvalidQuery(format!(
+            "${op} cannot hold a regular expression, and {regex} is one: ${op} compares \
+             values, so it would match a stored value of that shape and never a string the \
+             pattern matches; to match any of several patterns, write an $or of $regex \
+             clauses, as in {{\"$or\": [{{\"name\": {{\"$regex\": \"^a\"}}}}, {{\"name\": \
+             {{\"$regex\": \"^b\"}}}}]}}, or one pattern, as in {{\"$regex\": \"^(a|b)\"}}"
+        ))),
+        None => Ok(values),
+    }
+}
+
+/// Refuse a regular expression as the operand of `$ne`.
+///
+/// `$ne` compares values, so `{s: {$ne: /abc/}}` held for every string, the
+/// ones the pattern matches included, and over HTTP `{$ne: {$regex: "abc"}}`
+/// did the same through a document. `$eq` keeps comparing a regex as a value,
+/// as a regex written directly as a field's value does (`docs/deviations.md`).
+fn not_regex(operand: &Bson) -> Result<&Bson> {
+    if is_regex_shaped(operand) {
+        return Err(Error::InvalidQuery(format!(
+            "$ne cannot take a regular expression, and {operand} is one: $ne compares values, \
+             so it would hold for every string, the ones the pattern matches included; to \
+             exclude the strings a pattern matches, write {{\"$not\": {{\"$regex\": \
+             \"abc\"}}}}"
+        )));
+    }
+    Ok(operand)
+}
+
+/// Refuse an `$elemMatch` among the values of `$all`.
+///
+/// `$all` compares values, so `{items: {$all: [{$elemMatch: {qty: 5}}]}}`
+/// compared every element with the document `{$elemMatch: {qty: 5}}` and
+/// matched nothing, even when an element has `qty: 5`. Only a document whose
+/// only key is `$elemMatch` is refused; any other document is still a value.
+fn without_elem_match(values: Vec<Bson>) -> Result<Vec<Bson>> {
+    let is_elem_match =
+        |v: &Bson| matches!(v, Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch"));
+    match values.iter().find(|v| is_elem_match(v)) {
+        Some(elem_match) => Err(Error::InvalidQuery(format!(
+            "$all cannot hold an $elemMatch, and {elem_match} is one: $all compares values, so \
+             it would match only a stored document of that shape; to require an element \
+             matching each condition, write an $and of $elemMatch clauses, as in \
+             {{\"$and\": [{{\"items\": {{\"$elemMatch\": {{\"qty\": 5}}}}}}, {{\"items\": \
+             {{\"$elemMatch\": {{\"sku\": \"a\"}}}}}}]}}"
+        ))),
+        None => Ok(values),
+    }
 }
 
 /// Refuse a `Decimal128` anywhere in a comparison operand.
@@ -447,24 +532,199 @@ fn parse_type_arg(arg: &Bson) -> Result<Vec<String>> {
 }
 
 /// A `$regex` condition, once its flags are known and its pattern compiles.
-///
-/// Both are decided here, when the filter is parsed, so a pattern the matcher
-/// cannot use is a `400` naming what is wrong with it. It used to match
-/// nothing, which reads as an empty result: a backreference or a lookaround,
-/// which the engine does not support, and a plain typo look the same as "no
-/// document matches".
 fn regex_condition(pattern: &str, options: &str) -> Result<Condition> {
-    check_regex_options(options)?;
-    if let Err(e) = build_regex(pattern, options) {
-        // The crate's message is a multi-line rendering of the pattern with a
-        // caret under the fault. The reason is its last line.
-        let reason = e.to_string();
-        let reason = reason.lines().last().unwrap_or_default().trim_start_matches("error: ");
-        return Err(Error::InvalidQuery(format!(
-            "$regex pattern {pattern:?} cannot be used: {reason}"
-        )));
+    Ok(Condition::Regex(RegexPattern::new(pattern, options)?))
+}
+
+/// The most memory one `$regex` pattern may compile to: 1 MiB, as the engine
+/// counts the automaton it builds (`regex`'s own default is 10 MiB).
+///
+/// A compiled pattern is kept in the parsed filter for the life of the
+/// request, so its size is held, not passed through. Most patterns compile to
+/// a few kilobytes; what reaches the limit is a Unicode class repeated many
+/// times — `\w` alone is some 55 KiB, so `\w{20}` is about 1 MiB and
+/// `\w{209}` would be 11 MiB.
+pub const REGEX_PATTERN_LIMIT_BYTES: usize = 1 << 20;
+
+/// The most a compiled pattern's lazy DFA may grow to while it matches:
+/// 256 KiB (`regex`'s default is 2 MiB).
+///
+/// The cache stays with the pattern once grown, so a filter can hold one per
+/// `$regex` until the request ends: a hundred patterns of the shape
+/// `[ab]*a[ab]{14}[^ab]` over strings of `a` and `b` held 92 MiB after matching
+/// at 1 MiB each. Past the capacity the engine clears the cache or falls back
+/// to a slower search, and the answer is the same. Measured on 10,000 short
+/// strings, only a pattern near [`REGEX_PATTERN_LIMIT_BYTES`] slows down
+/// (`\w{20}` from 0.3 ms to 6 ms); an ordinary one is as fast as at 2 MiB.
+pub const REGEX_CACHE_LIMIT_BYTES: usize = 256 << 10;
+
+/// The most `$regex` conditions one filter may hold.
+///
+/// Every `$match` of a pipeline, its `$lookup` sub-pipelines included, counts
+/// as one filter, and so do all the entries of an update's `arrayFilters`; an
+/// update's or a `find_and_modify`'s query filter is a budget of its own,
+/// apart from its `arrayFilters`.
+///
+/// Each pattern that has matched keeps its search caches until the request
+/// ends: up to two lazy DFA caches of [`REGEX_CACHE_LIMIT_BYTES`], one for
+/// each direction it searches in, and the smaller caches of the slower
+/// engines. So this is what limits a request's memory after matching, not
+/// only after parse. **Measured, not bounded:** the most measured for
+/// thirty-two patterns is 17.7 MiB after matching, about 0.53 MiB of caches
+/// per pattern, from reverse-anchored alternations such as
+/// `(a|b)*a(a|b){13}(a|b)*$` over long strings of `a` and `b`
+/// (`tests/regex_memory.rs`). A filter of more than a couple of dozen
+/// patterns is not a workload this serves; alternatives fit in one pattern,
+/// `"^(abc|def)"`.
+pub const REGEX_CONDITIONS_LIMIT: usize = 32;
+
+/// The most memory the compiled patterns of one filter may hold together,
+/// counted over the same scope as [`REGEX_CONDITIONS_LIMIT`]: 2 MiB.
+pub const REGEX_TOTAL_LIMIT_BYTES: usize = 2 << 20;
+
+/// What the `$regex` conditions parsed so far under one budget have cost.
+#[derive(Clone, Copy, Default)]
+struct RegexSpend {
+    conditions: usize,
+    bytes: usize,
+}
+
+thread_local! {
+    /// The budget being charged, while one is open on this thread.
+    ///
+    /// Parsing is synchronous and never yields, so a thread-local scope is
+    /// exactly one parse; it lets a pipeline or an update charge every filter
+    /// it parses to one budget without threading it through each parser.
+    static REGEX_SPEND: std::cell::Cell<Option<RegexSpend>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One budget for the `$regex` conditions parsed until it is dropped.
+///
+/// Opening one while another is open joins it, so a filter parsed inside a
+/// pipeline charges the pipeline's budget. Only the outermost closes it.
+pub(crate) struct RegexBudget {
+    outermost: bool,
+}
+
+impl RegexBudget {
+    pub(crate) fn open() -> Self {
+        REGEX_SPEND.with(|spend| {
+            let outermost = spend.get().is_none();
+            if outermost {
+                spend.set(Some(RegexSpend::default()));
+            }
+            Self { outermost }
+        })
     }
-    Ok(Condition::Regex { pattern: pattern.to_string(), options: options.to_string() })
+}
+
+impl Drop for RegexBudget {
+    fn drop(&mut self) {
+        if self.outermost {
+            REGEX_SPEND.with(|spend| spend.set(None));
+        }
+    }
+}
+
+/// A `$regex` pattern under its flags, compiled once, when the filter is
+/// parsed, and kept in the condition.
+///
+/// Matching used to compile the pattern again for every document it was
+/// tested against — after parsing had already compiled it once to check it
+/// and thrown the result away. Compiling is the expensive half of a regex
+/// match, so a scan paid for it once per document. Now nothing compiles after
+/// parse: the matcher only runs the compiled program, which the engine shares
+/// between clones, so cloning a filter copies no program either.
+///
+/// Keeping it means holding it, so what one pattern and one filter may hold
+/// is bounded: [`REGEX_PATTERN_LIMIT_BYTES`], [`REGEX_CACHE_LIMIT_BYTES`],
+/// [`REGEX_CONDITIONS_LIMIT`] and [`REGEX_TOTAL_LIMIT_BYTES`].
+///
+/// The fields are private, so the only way to build one is [`Self::new`],
+/// which refuses what the matcher cannot use. A condition carrying a flag
+/// nothing implements, or a pattern that does not compile, cannot exist.
+///
+/// Two patterns are equal when their source and flags are: the compiled form
+/// is a function of those two.
+#[derive(Clone)]
+pub struct RegexPattern {
+    pattern: String,
+    options: String,
+    compiled: meta::Regex,
+}
+
+impl RegexPattern {
+    /// Compile `pattern` under `options`.
+    ///
+    /// Both are decided here, when the filter is parsed, so a pattern the
+    /// matcher cannot use is a `400` naming what is wrong with it. It used to
+    /// match nothing, which reads as an empty result: a backreference or a
+    /// lookaround, which the engine does not support, and a plain typo look
+    /// the same as "no document matches". While a filter is being parsed the
+    /// pattern is charged to its budget, and refused past it.
+    pub fn new(pattern: &str, options: &str) -> Result<Self> {
+        let spent = REGEX_SPEND.with(std::cell::Cell::get);
+        // Counted before compiling, so a filter of many patterns stops at the
+        // limit rather than compiling them all first.
+        if spent.is_some_and(|s| s.conditions >= REGEX_CONDITIONS_LIMIT) {
+            return Err(Error::InvalidQuery(format!(
+                "a filter may hold at most {REGEX_CONDITIONS_LIMIT} $regex conditions, the stages \
+                 of a pipeline counting as one filter and the arrayFilters of an update as \
+                 another, apart from its query filter; this one holds more: write alternatives \
+                 as one pattern, as in \"^(abc|def)\""
+            )));
+        }
+        let compiled = build_regex(pattern, options)?;
+        if let Some(spent) = spent {
+            let bytes = spent.bytes + compiled.memory_usage();
+            if bytes > REGEX_TOTAL_LIMIT_BYTES {
+                return Err(Error::InvalidQuery(format!(
+                    "the $regex patterns of this filter compile to more than {} MiB together, \
+                     the limit for one filter, the stages of a pipeline counting as one filter \
+                     and the arrayFilters of an update as another, apart from its query \
+                     filter; {pattern:?} is the one past it: a Unicode class \
+                     repeated many times, such as \\w{{20}}, is the usual cause, and an ASCII \
+                     class such as [A-Za-z0-9_] compiles far smaller",
+                    REGEX_TOTAL_LIMIT_BYTES >> 20
+                )));
+            }
+            REGEX_SPEND.with(|s| {
+                s.set(Some(RegexSpend { conditions: spent.conditions + 1, bytes }));
+            });
+        }
+        Ok(Self { pattern: pattern.to_string(), options: options.to_string(), compiled })
+    }
+
+    /// The pattern as the filter wrote it.
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// The flags it was compiled under.
+    pub fn options(&self) -> &str {
+        &self.options
+    }
+
+    /// Whether the pattern matches somewhere in `s`.
+    pub fn is_match(&self, s: &str) -> bool {
+        self.compiled.is_match(s)
+    }
+}
+
+impl PartialEq for RegexPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.options == other.options
+    }
+}
+
+impl std::fmt::Debug for RegexPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegexPattern")
+            .field("pattern", &self.pattern)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 /// Refuse a `$regex` flag this database does not implement. The four it does
@@ -473,11 +733,13 @@ fn regex_condition(pattern: &str, options: &str) -> Result<Condition> {
 /// empty result with nothing said.
 fn check_regex_options(options: &str) -> Result<()> {
     match options.chars().find(|flag| !matches!(flag, 'i' | 'm' | 's' | 'x')) {
-        Some(flag) => Err(Error::InvalidQuery(format!(
-            "unknown $regex flag {flag:?}; the flags are i, m, s and x"
-        ))),
+        Some(flag) => Err(unknown_regex_flag(flag)),
         None => Ok(()),
     }
+}
+
+fn unknown_regex_flag(flag: char) -> Error {
+    Error::InvalidQuery(format!("unknown $regex flag {flag:?}; the flags are i, m, s and x"))
 }
 
 fn type_name_for_code(code: i64) -> Result<String> {
@@ -704,13 +966,10 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
             any_element(values, |v| names.iter().any(|n| n == type_name_of(v)))
         }
 
-        Condition::Regex { pattern, options } => match compile_regex(pattern, options) {
-            Some(re) => any_element(values, |v| match v {
-                Bson::String(s) => re.is_match(s),
-                _ => false,
-            }),
-            None => false,
-        },
+        Condition::Regex(re) => any_element(values, |v| match v {
+            Bson::String(s) => re.is_match(s),
+            _ => false,
+        }),
 
         // Array-shaped operators inspect the array itself rather than its
         // elements, so they must not go through `any_element`.
@@ -836,37 +1095,75 @@ fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> Result<bool> {
     }
 }
 
-/// The pattern under its flags, which [`check_regex_options`] has vetted.
-fn build_regex(pattern: &str, options: &str) -> std::result::Result<regex::Regex, regex::Error> {
-    let mut builder = regex::RegexBuilder::new(pattern);
+/// The pattern under its flags, compiled within [`REGEX_PATTERN_LIMIT_BYTES`]
+/// and [`REGEX_CACHE_LIMIT_BYTES`].
+///
+/// The flags are checked here, before anything is compiled, and this is the
+/// check a `$regex` meets; a lone `$options` meets [`check_regex_options`].
+/// The engine is `regex`'s own, configured as `regex::RegexBuilder` configures
+/// it but for the two limits, and used directly because it reports how much
+/// memory a compiled pattern holds, which the filter's budget counts.
+///
+/// Called only from [`RegexPattern::new`]: once per `$regex` in a filter, when
+/// it is parsed, and never while matching.
+fn build_regex(pattern: &str, options: &str) -> Result<meta::Regex> {
+    #[cfg(test)]
+    REGEX_COMPILATIONS.with(|n| n.set(n.get() + 1));
+    let mut syntax = syntax::Config::new();
     for flag in options.chars() {
-        match flag {
-            'i' => {
-                builder.case_insensitive(true);
-            }
-            'm' => {
-                builder.multi_line(true);
-            }
-            's' => {
-                builder.dot_matches_new_line(true);
-            }
-            'x' => {
-                builder.ignore_whitespace(true);
-            }
-            // Refused when the filter is parsed (`check_regex_options`), so
-            // none reaches here from the parser. A condition built any other
-            // way gets an error, which `compile_regex` turns into a no-match.
-            _ => return Err(regex::Error::Syntax(format!("unknown flag {flag:?}"))),
-        }
+        syntax = match flag {
+            'i' => syntax.case_insensitive(true),
+            'm' => syntax.multi_line(true),
+            's' => syntax.dot_matches_new_line(true),
+            'x' => syntax.ignore_whitespace(true),
+            other => return Err(unknown_regex_flag(other)),
+        };
     }
-    builder.build()
+    meta::Builder::new()
+        .syntax(syntax)
+        .configure(
+            meta::Config::new()
+                .nfa_size_limit(Some(REGEX_PATTERN_LIMIT_BYTES))
+                .hybrid_cache_capacity(REGEX_CACHE_LIMIT_BYTES),
+        )
+        .build(pattern)
+        .map_err(|e| {
+            let reason = match (e.syntax_error(), e.size_limit()) {
+                // The engine's message is a multi-line rendering of the
+                // pattern with a caret under the fault. The reason is its
+                // last line.
+                (Some(syntax), _) => {
+                    let message = syntax.to_string();
+                    message
+                        .lines()
+                        .last()
+                        .unwrap_or_default()
+                        .trim_start_matches("error: ")
+                        .to_string()
+                }
+                (None, Some(limit)) => format!(
+                    "it compiles to more than {} MiB, the limit for one pattern; a Unicode class \
+                     repeated many times, such as \\w{{100}}, is the usual cause, and an ASCII \
+                     class such as [A-Za-z0-9_] or a smaller count compiles far smaller",
+                    limit >> 20
+                ),
+                (None, None) => e.to_string(),
+            };
+            Error::InvalidQuery(format!("$regex pattern {pattern:?} cannot be used: {reason}"))
+        })
 }
 
-/// The compiled pattern of a parsed condition. `None` is unreachable through
-/// [`parse`], which refuses a pattern that does not compile, and is kept as a
-/// no-match rather than a panic for a condition built any other way.
-fn compile_regex(pattern: &str, options: &str) -> Option<regex::Regex> {
-    build_regex(pattern, options).ok()
+#[cfg(test)]
+thread_local! {
+    /// How many regexes this thread has compiled, for the tests that hold
+    /// matching to compiling none.
+    static REGEX_COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Regexes this thread has compiled so far.
+#[cfg(test)]
+pub(crate) fn regex_compilations() -> usize {
+    REGEX_COMPILATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1296,14 +1593,292 @@ mod tests {
     }
 
     #[test]
-    fn a_condition_built_outside_the_parser_with_an_unchecked_flag_matches_nothing() {
-        // The parser refuses a flag it does not implement, but `Condition` is a
-        // public type: one built by hand with such a flag must not panic.
-        let filter = Filter::Field {
-            path: "s".into(),
-            conditions: vec![Condition::Regex { pattern: "a".into(), options: "z".into() }],
-        };
-        assert!(!matches(&filter, &doc! { "s": "a" }).unwrap());
+    fn a_regex_among_the_values_of_in_nin_or_all_is_refused() {
+        let shapes: Vec<Bson> = vec![
+            literal("abc", ""),
+            literal("^a", "i"),
+            Bson::Document(doc! { "$regex": "abc" }),
+            Bson::Document(doc! { "$regex": "abc", "$options": "i" }),
+            Bson::Document(doc! { "$options": "i", "$regex": literal("abc", "") }),
+            Bson::Document(doc! { "$regularExpression": { "pattern": "abc", "options": "" } }),
+        ];
+        for op in ["$in", "$nin", "$all"] {
+            for shape in &shapes {
+                // Alone, beside an ordinary value, under `$not` and inside an
+                // `$elemMatch`: every place the operator can be written.
+                for q in [
+                    doc! { "s": { op: [shape.clone()] } },
+                    doc! { "s": { op: ["plain", shape.clone()] } },
+                    doc! { "s": { "$not": { op: [shape.clone()] } } },
+                    doc! { "s": { "$elemMatch": { op: [shape.clone()] } } },
+                ] {
+                    let message = refused(q.clone());
+                    assert!(
+                        message.starts_with(&format!("{op} cannot hold a regular expression"))
+                            && message.contains("write an $or of $regex clauses"),
+                        "{q}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_regex_as_the_operand_of_ne_is_refused() {
+        for shape in [
+            literal("abc", ""),
+            literal("^a", "i"),
+            Bson::Document(doc! { "$regex": "abc" }),
+            Bson::Document(doc! { "$regex": "abc", "$options": "i" }),
+            Bson::Document(doc! { "$regularExpression": { "pattern": "abc", "options": "" } }),
+        ] {
+            for q in [
+                doc! { "s": { "$ne": shape.clone() } },
+                doc! { "s": { "$not": { "$ne": shape.clone() } } },
+                doc! { "s": { "$elemMatch": { "$ne": shape.clone() } } },
+            ] {
+                let message = refused(q.clone());
+                assert!(
+                    message.starts_with("$ne cannot take a regular expression")
+                        && message.contains("$not"),
+                    "{q}: {message}"
+                );
+            }
+        }
+        // Any other document is still a value to `$ne`, and `$eq` still
+        // compares a regex as a value.
+        let d = doc! { "s": { "$regex": "x", "other": 1 }, "r": literal("abc", "") };
+        assert!(!hits(doc! { "s": { "$ne": { "$regex": "x", "other": 1 } } }, d.clone()));
+        assert!(hits(doc! { "s": { "$ne": { "a": 1 } } }, d.clone()));
+        assert!(hits(doc! { "r": { "$eq": literal("abc", "") } }, d));
+    }
+
+    #[test]
+    fn an_elem_match_among_the_values_of_all_is_refused() {
+        for q in [
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } } ] } },
+            doc! { "items": { "$all": [ { "$elemMatch": { "$eq": "q" } } ] } },
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 } }, { "$elemMatch": { "sku": "a" } } ] } },
+            doc! { "items": { "$all": [ "plain", { "$elemMatch": { "qty": 5 } } ] } },
+            doc! { "items": { "$not": { "$all": [ { "$elemMatch": { "qty": 5 } } ] } } },
+        ] {
+            let message = refused(q.clone());
+            assert!(
+                message.starts_with("$all cannot hold an $elemMatch")
+                    && message.contains("write an $and of $elemMatch clauses"),
+                "{q}: {message}"
+            );
+        }
+        // What the message points to answers it; a document with another key
+        // beside `$elemMatch` is still a value.
+        let d = doc! { "items": [ { "qty": 5, "sku": "b" }, { "qty": 1, "sku": "a" } ] };
+        assert!(hits(
+            doc! { "$and": [
+                { "items": { "$elemMatch": { "qty": 5 } } },
+                { "items": { "$elemMatch": { "sku": "a" } } },
+            ] },
+            d.clone()
+        ));
+        let odd = doc! { "items": [ { "$elemMatch": { "qty": 5 }, "x": 1 } ] };
+        assert!(hits(
+            doc! { "items": { "$all": [ { "$elemMatch": { "qty": 5 }, "x": 1 } ] } },
+            odd
+        ));
+    }
+
+    #[test]
+    fn in_still_compares_documents_that_are_not_regex_shaped() {
+        // A stored document may hold a key beginning with `$`; only the exact
+        // regex shapes are refused.
+        let d =
+            doc! { "s": { "$regex": "x", "other": 1 }, "t": { "$options": "i" }, "u": { "a": 1 } };
+        for q in [
+            doc! { "s": { "$in": [ { "$regex": "x", "other": 1 } ] } },
+            doc! { "t": { "$in": [ { "$options": "i" } ] } },
+            doc! { "u": { "$in": [ { "a": 1 }, "abc" ] } },
+            doc! { "u": { "$all": [ { "a": 1 } ] } },
+        ] {
+            assert!(hits(q.clone(), d.clone()), "{q} must match {d}");
+        }
+        assert!(!hits(doc! { "u": { "$nin": [ { "a": 1 } ] } }, d.clone()));
+        // A regex is still an ordinary value to `$eq`, as it is written directly
+        // as a field's value.
+        assert!(hits(
+            doc! { "r": { "$eq": literal("abc", "") } },
+            doc! { "r": literal("abc", "") }
+        ));
+    }
+
+    #[test]
+    fn the_pattern_itself_refuses_an_unknown_flag_naming_it() {
+        // `RegexPattern::new` is the check a `$regex` meets, whether the flag
+        // came from `$options` or a literal; a lone `$options` has its own.
+        for flag in ['z', 'I', 'g', 'u'] {
+            match RegexPattern::new("a", &format!("i{flag}")) {
+                Err(Error::InvalidQuery(message)) => assert_eq!(
+                    message,
+                    format!("unknown $regex flag {flag:?}; the flags are i, m, s and x")
+                ),
+                other => panic!("flag {flag:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// `n` distinct `$regex` clauses on `s` under one `$or`.
+    fn or_of(n: usize, pattern: impl Fn(usize) -> String) -> Document {
+        let clauses: Vec<Bson> =
+            (0..n).map(|i| Bson::Document(doc! { "s": { "$regex": pattern(i) } })).collect();
+        doc! { "$or": clauses }
+    }
+
+    #[test]
+    fn a_pattern_compiling_past_the_one_pattern_limit_is_refused_naming_it() {
+        // `\w` is a Unicode class of some 55 KiB compiled; twenty of them fit
+        // in 1 MiB and a hundred do not. `regex`'s own limit, 10 MiB, let
+        // `\w{209}` through at 11 MiB held for the life of the request.
+        for pattern in [r"\w{100}", r"\w{209}", r"(?i)\p{L}{30}"] {
+            let message = refused(doc! { "s": { "$regex": pattern } });
+            assert!(
+                message.contains(&format!("$regex pattern {pattern:?} cannot be used"))
+                    && message.contains("more than 1 MiB, the limit for one pattern"),
+                "{message}"
+            );
+        }
+        for pattern in [r"\w{20}", "[a-z]{50}", r"^\w+@\w+\.com$"] {
+            parse(&doc! { "s": { "$regex": pattern, "$options": "i" } }).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_filter_holds_at_most_thirty_two_regex_conditions() {
+        parse(&or_of(REGEX_CONDITIONS_LIMIT, |i| format!("^a{i}"))).unwrap();
+        let message = refused(or_of(REGEX_CONDITIONS_LIMIT + 1, |i| format!("^a{i}")));
+        assert!(message.contains("at most 32 $regex conditions"), "{message}");
+        // Wherever they are written: under `$not` and inside `$elemMatch` too.
+        let mut q = or_of(REGEX_CONDITIONS_LIMIT, |i| format!("^a{i}"));
+        q.insert("t", doc! { "$not": literal("x", "") });
+        refused(q);
+        let mut q = or_of(REGEX_CONDITIONS_LIMIT, |i| format!("^a{i}"));
+        q.insert("u", doc! { "$elemMatch": { "v": { "$regex": "y" } } });
+        refused(q);
+        // The budget is the filter's, not the thread's: the next one starts
+        // from nothing, and a pattern built outside a parse is not counted.
+        parse(&or_of(REGEX_CONDITIONS_LIMIT, |i| format!("^a{i}"))).unwrap();
+        for i in 0..=REGEX_CONDITIONS_LIMIT {
+            RegexPattern::new(&format!("^a{i}"), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn one_filter_holds_at_most_two_mib_of_compiled_patterns() {
+        // Each `\w{20}` compiles to just over 1 MiB: one fits, two do not.
+        // Each `\w{12}` is about 0.64 MiB: three fit, four do not.
+        let pattern = |i: usize| format!(r"\w{{20}}{i}");
+        parse(&or_of(1, pattern)).unwrap();
+        let message = refused(or_of(2, pattern));
+        assert!(
+            message.contains("compile to more than 2 MiB together, the limit for one filter")
+                && message.contains(r#""\\w{20}1" is the one past it"#),
+            "{message}"
+        );
+        let pattern = |i: usize| format!(r"\w{{12}}{i}");
+        parse(&or_of(3, pattern)).unwrap();
+        refused(or_of(4, pattern));
+        // The reviewer's shape: forty patterns of 11 MiB each, 446 MiB held,
+        // from a 1.4 KB filter. Refused at the first.
+        refused(or_of(40, |_| r"\w{209}".to_string()));
+    }
+
+    #[test]
+    fn a_regex_condition_cannot_be_built_with_an_unchecked_flag_or_pattern() {
+        // `Condition` is a public type, and a regex condition built by hand
+        // used to carry an unchecked flag to the matcher, which had to read it
+        // as a no-match. Its pattern is now built only through the same check
+        // the parser makes.
+        for (pattern, options) in [("a", "z"), ("a", "I"), ("(unclosed", ""), ("(?=a)", "")] {
+            assert!(
+                matches!(RegexPattern::new(pattern, options), Err(Error::InvalidQuery(_))),
+                "{pattern:?} under {options:?} must be refused"
+            );
+        }
+        let re = RegexPattern::new("^a", "i").unwrap();
+        let filter = Filter::Field { path: "s".into(), conditions: vec![Condition::Regex(re)] };
+        assert!(matches(&filter, &doc! { "s": "Abc" }).unwrap());
+    }
+
+    #[test]
+    fn regex_conditions_compare_by_pattern_and_flags() {
+        let re = |p: &str, o: &str| RegexPattern::new(p, o).unwrap();
+        assert_eq!(re("^a", "i"), re("^a", "i"));
+        assert_ne!(re("^a", "i"), re("^a", ""));
+        assert_ne!(re("^a", "i"), re("^b", "i"));
+        // One filter parsed twice is equal to itself, compiled programs and all.
+        let q = doc! { "s": { "$regex": literal("^a", "i") } };
+        assert_eq!(parse(&q).unwrap(), parse(&q).unwrap());
+        assert_ne!(
+            parse(&q).unwrap(),
+            parse(&doc! { "s": { "$regex": literal("^a", "") } }).unwrap()
+        );
+        // A clone shares the compiled program and still matches.
+        let cloned = re("^a", "i").clone();
+        assert!(cloned.is_match("AB") && cloned.pattern() == "^a" && cloned.options() == "i");
+        // The debug form names the pattern and flags, not the program.
+        assert_eq!(
+            format!("{:?}", re("^a", "i")),
+            r#"RegexPattern { pattern: "^a", options: "i" }"#
+        );
+    }
+
+    #[test]
+    fn a_regex_is_compiled_once_at_parse_and_never_while_matching() {
+        // Every shape a `$regex` reaches the matcher in: on a field, on a
+        // nested path through an array, beside `$options`, as a literal, under
+        // `$not`, inside an `$elemMatch` over documents and over scalars, and
+        // in an `$or` branch.
+        let queries = [
+            doc! { "s": { "$regex": "^a.*z$" } },
+            doc! { "s": { "$regex": "^A", "$options": "i" } },
+            doc! { "s": { "$regex": literal("b+", "") } },
+            doc! { "tags": { "$regex": "^t[0-3]$" } },
+            doc! { "items.name": { "$regex": "x$" } },
+            doc! { "s": { "$not": literal("^a", "") } },
+            doc! { "s": { "$not": { "$regex": "^a", "$options": "i" } } },
+            doc! { "items": { "$elemMatch": { "name": { "$regex": "^n" } } } },
+            doc! { "tags": { "$elemMatch": { "$regex": "1$" } } },
+            doc! { "$or": [ { "s": { "$regex": "q" } }, { "n": 3 } ] },
+        ];
+        let docs: Vec<Document> = (0..200)
+            .map(|i| {
+                doc! {
+                    "_id": i,
+                    "s": if i % 2 == 0 { format!("a{i}z") } else { format!("b{i}") },
+                    "n": i % 5,
+                    "tags": ["x", format!("t{}", i % 7)],
+                    "items": [ { "name": format!("n{i}x") }, { "name": "other" } ],
+                }
+            })
+            .collect();
+        for q in queries {
+            let before = regex_compilations();
+            let filter = parse(&q).unwrap();
+            assert_eq!(regex_compilations() - before, 1, "{q} compiles its pattern once at parse");
+
+            let before = regex_compilations();
+            let mut hits = 0;
+            for d in &docs {
+                hits += usize::from(matches(&filter, d).unwrap());
+            }
+            // Cloning a filter compiles nothing either.
+            let copy = filter.clone();
+            hits += usize::from(matches(&copy, &docs[0]).unwrap());
+            assert_eq!(
+                regex_compilations() - before,
+                0,
+                "{q} compiled a regex while matching {} documents",
+                docs.len()
+            );
+            assert!(hits > 0, "premise: {q} matched something");
+        }
     }
 
     #[test]

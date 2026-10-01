@@ -178,7 +178,13 @@ pub fn parse(pipeline: &[Document]) -> Result<Vec<Stage>> {
 /// [`Placement::SubPipeline`], which is where the `$match` variable refusal
 /// applies. This entry point exists for a caller that has names bound by
 /// some other means and wants the top-level rules.
+///
+/// Every `$regex` in the pipeline, its `$lookup` sub-pipelines included, is
+/// charged to one budget, the one a single filter has
+/// ([`crate::filter::REGEX_TOTAL_LIMIT_BYTES`]): the compiled patterns of every
+/// stage are held together while the pipeline runs.
 pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Stage>> {
+    let _budget = crate::filter::RegexBudget::open();
     parse_pipeline(pipeline, vars, Placement::TopLevel)
 }
 
@@ -1162,6 +1168,49 @@ mod tests {
             doc! { "_id": 2, "city": "London", "qty": 15, "tags": ["b"] },
             doc! { "_id": 3, "city": "Paris", "qty": 10, "tags": [] },
         ])
+    }
+
+    #[test]
+    fn a_match_stage_compiles_its_regex_once_whatever_the_input() {
+        // A leading `$match` and one after another stage both run the filter
+        // parsed with the pipeline, so its `$regex` is compiled there and
+        // never per document.
+        let many: Vec<Document> = (0..300)
+            .map(|i| doc! { "_id": (i as i64), "city": (["London", "Paris", "Lisbon"][i % 3]), "qty": (i as i64) })
+            .collect();
+        let before = crate::filter::regex_compilations();
+        let stages = parse(&[
+            doc! {"$match": {"city": {"$regex": "^L", "$options": "i"}}},
+            doc! {"$addFields": {"twice": {"$multiply": ["$qty", 2]}}},
+            doc! {"$match": {"city": {"$not": {"$regex": "bon$"}}}},
+        ])
+        .unwrap();
+        assert_eq!(crate::filter::regex_compilations() - before, 2, "one per $regex, at parse");
+        let before = crate::filter::regex_compilations();
+        let mut current = many;
+        for stage in &stages {
+            current = apply(stage, current, &Limits::default()).unwrap();
+        }
+        assert_eq!(current.len(), 100, "the London documents");
+        assert_eq!(crate::filter::regex_compilations() - before, 0, "none while matching");
+    }
+
+    #[test]
+    fn a_pipeline_holds_its_regex_patterns_under_one_budget() {
+        // One `\w{15}`, about 0.8 MiB, fits one filter's 2 MiB, and so do
+        // two stages of one; three stages do not, because every stage's
+        // patterns are held together.
+        let one = |n: usize| doc! {"$match": {"s": {"$regex": format!(r"\w{{15}}{n}")}}};
+        parse(&[one(0), one(1)]).unwrap();
+        let err = parse(&[one(0), doc! {"$limit": 5}, one(1), one(2)]).unwrap_err().to_string();
+        assert!(err.contains("more than 2 MiB together"), "{err}");
+        // A `$lookup` sub-pipeline is charged to the same budget.
+        let lookup = doc! {"$lookup": {"from": "items", "pipeline": [one(2)], "as": "items"}};
+        parse(&[one(0), lookup.clone()]).unwrap();
+        let err = parse(&[one(0), one(1), lookup]).unwrap_err().to_string();
+        assert!(err.contains("more than 2 MiB together"), "{err}");
+        // And each pipeline has its own.
+        parse(&[one(0), one(1)]).unwrap();
     }
 
     #[test]

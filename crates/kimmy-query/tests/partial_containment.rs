@@ -214,7 +214,10 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
     // hold the values the whole record is about.
     assert_eq!(docs.len(), 432, "the document corpus");
     assert_eq!(partials.len(), 442, "the partial filters that parse");
-    assert_eq!(queries.len(), 1_412, "the queries that parse");
+    // 20 fewer since a regex among the values of `$in`, `$nin` or `$all`, or
+    // as the operand of `$ne`, is refused: two regex operands, five such
+    // queries each, on two paths.
+    assert_eq!(queries.len(), 1_392, "the queries that parse");
     assert_eq!(
         docs.iter().filter(|d| kimmy_core::holds_decimal128(&Bson::Document((*d).clone()))).count(),
         27,

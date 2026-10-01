@@ -112,6 +112,64 @@ match; that has not changed.
 
 ---
 
+## 🟡 A regular expression inside `$in`, `$nin` or `$all`, or under `$ne`, is refused, where MongoDB matches it as a pattern
+
+**Raised 2026-10-01, by the review of the change that keeps a `$regex`
+compiled.** The three operators compare values, and a regex among them was
+compared as one: `{"s": {"$in": [/abc/]}}` matched only a stored regex
+`/abc/` and never the string `"xabcx"`, and `$nin` matched every string.
+Over HTTP it was worse, because the JSON decoder has no
+`$regularExpression` form: `{"$in": [{"$regex": "abc"}]}` and the Extended
+JSON spelling both arrived as ordinary documents, matched nothing under `$in`
+and everything under `$nin`, and answered `200`. MongoDB matches each such
+element as a pattern.
+
+**The rule.** A regex literal, a document whose keys are `$regex` and
+optionally `$options`, or a document whose only key is `$regularExpression`,
+among the values of `$in`, `$nin` or `$all`, wherever the operator is written
+(under `$not` and inside `$elemMatch` too), is a `400` naming the operator and
+the value, and saying that alternatives belong in an `$or` of `$regex` clauses
+or in one pattern. The same shapes as the operand of `$ne` are refused too,
+pointing to `{"$not": {"$regex": ...}}`: `$ne` compared them as values, so
+`{"s": {"$ne": {"$regex": "abc"}}}` held for every string, the ones the pattern
+matches included (raised by the same review, a day later). `$eq` still compares
+a regex as a value, as a regex written directly as a field's value does.
+
+**What that costs.** A stored document may hold `$`-prefixed keys, so a
+document shaped exactly `{"$regex": ...}` cannot be found through `$in`; `$eq`
+still finds it, and `$in` still compares a document of any other shape, a
+`{"$regex": ..., "kind": ...}` among them. A filter written for MongoDB that
+uses a pattern inside `$in` must be rewritten as an `$or`.
+
+**Closing it** means matching a regex element as a pattern, as MongoDB does,
+and giving the JSON decoder a `$regularExpression` form so a regex can be sent
+as a value at all. Not planned until someone needs patterns in a list; the
+`$or` says the same thing.
+
+---
+
+## 🟡 An `$elemMatch` inside `$all` is refused, where MongoDB matches each one against an element
+
+**Raised 2026-10-01, by the same review.** `$all` compares values, so
+`{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` compared each element with
+the document `{"$elemMatch": {"qty": 5}}` and matched nothing, even over an
+element holding `qty: 5`, and even `{"$elemMatch": {"$eq": "q"}}` over an array
+holding `"q"`; it answered `200`. MongoDB reads each `$elemMatch` in the list as
+a condition some element must satisfy.
+
+**The rule.** A document whose only key is `$elemMatch`, among the values of
+`$all`, wherever the operator is written, is a `400` naming the value and
+pointing to an `$and` of `$elemMatch` clauses, which says the same thing.
+
+**What that costs.** A stored document shaped exactly `{"$elemMatch": ...}`
+cannot be found through `$all`; one with any other key beside it still can. A
+filter written for MongoDB that uses this form must be rewritten as the `$and`.
+
+**Closing it** means evaluating each such element as an `$elemMatch`, as MongoDB
+does. Not planned: the `$and` is the same query.
+
+---
+
 ## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` is outside it
 
 **Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The

@@ -103,6 +103,55 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   smaller `indexEntriesRead`. Answers do not
   change; only how much of the index a query reads
   ([Indexes](docs/indexes.md#the-planner)).
+- **A `$regex` is compiled once per query, not once per document.** Parsing a
+  filter compiled each pattern to check it and threw the result away, and
+  matching compiled it again for every document it tested, so a scan paid for
+  a compilation per document. The compiled pattern is now kept in the parsed
+  filter and every match runs it, on `find`, `count`, `update`, `delete`,
+  `find_and_modify`, `$match`, a vector search's `filter`, `arrayFilters` and
+  the MCP tools. Matching 10,000 in-memory documents against a
+  case-insensitive anchored pattern took about 223 ms in a release build and
+  now takes about 0.65 ms; a scan still reads every document, which now
+  dominates. Answers do not change
+  ([Query language](docs/query-language.md#regex-compatibility)).
+- **Breaking: a `$regex` pattern, and the patterns of one filter together,
+  have a size limit.** The compiled patterns are now held for the whole
+  request, so what they hold is bounded, and a filter past a limit is a `400`
+  naming it before any document is read. One pattern may compile to 1 MiB
+  (the engine's own default was 10 MiB): `{"$regex": "\\w{209}"}` used to be
+  accepted and is now refused, because a Unicode class such as `\w` compiles
+  to some 55 KiB and repeating it is what reaches the limit; an ASCII class
+  such as `[A-Za-z0-9_]` compiles far smaller. One filter may hold 32 `$regex`
+  conditions compiling to 2 MiB together; the stages of a pipeline (its
+  `$lookup` sub-pipelines included) count as one filter, and the
+  `arrayFilters` of an update or `find_and_modify` as another, apart from its
+  query filter. A pattern's lazy DFA cache is capped at 256 KiB per search
+  direction. Before this, with the patterns held, a 1.4 KB `$or` of forty
+  `\w{209}` clauses held 446 MiB. Measured within the limits, the largest
+  filters hold 2 MiB after parsing and up to 17.7 MiB after matching, when
+  every pattern fills its caches; that is a measurement, not a bound. Check
+  stored filters with many or long Unicode patterns before upgrading; write
+  alternatives as one pattern, as in `"^(abc|def)"`
+  ([Query language](docs/query-language.md#regex-compatibility)).
+- **Breaking: a regular expression inside `$in`, `$nin` or `$all`, or as the
+  operand of `$ne`, is a `400`.** These compare values, so a regex among their
+  operands was compared as a value: `{"s": {"$in": [{"$regex": "abc"}]}}`
+  matched no string, and `$nin` and `$ne` matched every one, with a `200`, and
+  over HTTP a regex could only arrive as such a document. A regex literal,
+  `{"$regex": ...}` (with or without `$options`) or `{"$regularExpression":
+  ...}` there is now refused, naming the operator; write an `$or` of `$regex`
+  clauses, or one pattern such as `"^(abc|def)"`, and `{"$not": {"$regex":
+  ...}}` in place of `$ne`. Any other document is still compared as a value,
+  and `$eq` still compares a regex as one
+  ([Query language](docs/query-language.md#comparison),
+  [Deviations](docs/deviations.md)).
+- **Breaking: an `$elemMatch` inside `$all` is a `400`.** `$all` compares
+  values, so `{"items": {"$all": [{"$elemMatch": {"qty": 5}}]}}` compared each
+  element with that document and matched nothing, with a `200`. A document
+  whose only key is `$elemMatch` in the list is now refused; write an `$and`
+  of `$elemMatch` clauses
+  ([Query language](docs/query-language.md#array),
+  [Deviations](docs/deviations.md)).
 
 ### Fixed
 
