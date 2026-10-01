@@ -6828,6 +6828,7 @@ async fn an_ordinary_tick_against_a_caught_up_peer_always_opens() {
 
     const TICKS: usize = 40;
     let mut seen = Vec::with_capacity(TICKS);
+    let mut skipped_early = false;
     // 40 ticks at 200 ms nominal is 8 s; a shared, loaded CI runner earns
     // a wide margin over that rather than a tight one; see the other
     // reset-chain test's own note on a fixed deadline failing there.
@@ -6838,6 +6839,19 @@ async fn an_ordinary_tick_against_a_caught_up_peer_always_opens() {
             panic!("the loop stalled; {} ticks so far", seen.len());
         };
         assert!(!report.reset, "premise: no backlog exists to reset over: {report:?}");
+        // The first tick can come before the seeds are resolved (they resolve beside
+        // the loop), and is then followed at once by the early tick the answer earns.
+        // An early tick opens none, by design (ADR-195), and is not an ordinary
+        // one, which is what this counts. That one, and only that one: an early
+        // tick later, or a second, is a loop that was given one it had no call for.
+        if report.early_retry {
+            assert!(
+                seen.len() <= 1 && !skipped_early,
+                "only the early tick the first answer earns is skipped: {report:?} after {seen:?}"
+            );
+            skipped_early = true;
+            continue;
+        }
         seen.push(report.opened);
     }
     looping.abort();

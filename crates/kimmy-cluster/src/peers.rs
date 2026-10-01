@@ -214,10 +214,12 @@ pub struct RoundReport {
     /// the addresses that answered as this node itself were taken out: 0 is a
     /// tick that found none.
     pub peers_known: usize,
-    /// How many times this run has resolved its seeds so far, a counter: the
-    /// ticker's own, and one more for each early retry of a tick that found
-    /// nothing discovered (ADR-202's addendum), so a resolver that failed at the
-    /// start is asked again within a retry and not a discovery interval later.
+    /// How many resolutions of the seeds have completed so far this run, a
+    /// counter: the ticker's own, and one more for each early retry of a tick that
+    /// found nothing discovered (ADR-202's addendum), so a resolver that failed at
+    /// the start is asked again within a retry and not a discovery interval later.
+    /// A resolution runs beside the loop, one at a time, so a resolver that hangs
+    /// adds nothing here and holds nothing up.
     pub discoveries: u64,
     /// Whether this tick called `stalls.tick_opened()` (ADR-195): about
     /// once `sync_interval_secs` has passed since the last one did,
@@ -462,6 +464,13 @@ fn slower(
 /// What the loop reports after every sync tick. See [`RoundReport`].
 pub type RoundHook = Arc<dyn Fn(RoundReport) + Send + Sync>;
 
+/// A stand-in for resolving the seeds: see [`ReplicationConfig::resolver`].
+pub type Resolver = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = BTreeSet<SocketAddr>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct ReplicationConfig {
     pub seeds: Vec<SeedSource>,
     pub secret: String,
@@ -532,6 +541,10 @@ pub struct ReplicationConfig {
     /// new id, a service or load-balancer address whose backends changed), so
     /// the answer is not kept for the life of the process.
     pub self_recheck: Duration,
+    /// What resolves the seeds, in place of resolving [`Self::seeds`] themselves:
+    /// for a test that needs a resolver that hangs, fails or counts its calls.
+    /// `None` is every real node.
+    pub resolver: Option<Resolver>,
 }
 
 /// Each peer's last advertised vector, kept for the replication lag gauge,
@@ -622,6 +635,7 @@ impl ReplicationConfig {
             catch_up: None,
             expected_members: None,
             self_recheck: SELF_RECHECK,
+            resolver: None,
         }
     }
 }
@@ -747,13 +761,81 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut peerless_ticks: u32 = 0;
     let mut tick_is_early_retry = false;
     let mut discoveries: u64 = 0;
+    // The seeds are resolved beside the loop, never inside it: a resolver that
+    // hangs (DNS that does not answer) holds a blocking-pool thread (`dns:`,
+    // `k8s:`) or a task (`dns-srv:`) for its own timeout, and awaited in the
+    // loop's own arm it held every sync tick with it. One at a
+    // time, so a hung one is not stacked on by the next; the peers last resolved
+    // are kept until a resolution completes. A resolution is a task the loop owns:
+    // it is waited for in its own arm, and aborted when the loop ends, which lets
+    // go of what it holds with it.
+    struct Resolving(tokio::time::Instant, tokio::task::JoinHandle<BTreeSet<SocketAddr>>);
+    impl Drop for Resolving {
+        fn drop(&mut self) {
+            self.1.abort();
+        }
+    }
+    let mut resolving: Option<Resolving> = None;
 
     loop {
         tokio::select! {
             _ = discovery.tick() => {
-                discovered = resolve(&config.seeds, config.local).await;
+                match resolving.as_ref().map(|r| r.0) {
+                    // In flight: waited for, never stacked on, and said when it has
+                    // been going on for a discovery interval or longer (not at the
+                    // early retries' own ticks, which come while it is new).
+                    Some(since) => {
+                        if let Some(resolving_secs) =
+                            slow_resolution(since, config.discovery_interval)
+                        {
+                            warn!(
+                                resolving_secs,
+                                "resolving the seeds is taking longer than a discovery \
+                                 interval; the peers last resolved are kept and no second \
+                                 resolution is started"
+                            );
+                        }
+                    }
+                    None => {
+                        let resolver = config.resolver.clone();
+                        let seeds = config.seeds.clone();
+                        let local = config.local;
+                        // UNSUPERVISED: one resolution at a time, whose end is the
+                        // loop's next message; a resolver that panics ends its task
+                        // without an answer, which the loop sees as an error and
+                        // clears (it costs one resolution, not discovery), and the
+                        // guard aborts the task if the loop itself ends first.
+                        let task = tokio::spawn(async move {
+                            match resolver {
+                                Some(resolver) => resolver().await,
+                                None => resolve(&seeds, local).await,
+                            }
+                        });
+                        resolving = Some(Resolving(tokio::time::Instant::now(), task));
+                    }
+                }
+            }
+            joined = async { (&mut resolving.as_mut().unwrap().1).await }, if resolving.is_some() => {
+                resolving = None;
+                let found = match joined {
+                    Ok(found) => found,
+                    Err(e) => {
+                        warn!(error = %e, "resolving the seeds ended without an answer");
+                        continue;
+                    }
+                };
+                let fresh = found != discovered;
+                discovered = found;
                 discoveries += 1;
                 debug!(count = discovered.len(), "resolved peers");
+                // The last tick found nobody, and this answer names someone it had
+                // not: it gets its early tick now rather than at the next one of the
+                // ticker's own. An answer that changes nothing (a lone member whose
+                // seed resolves to its own address, again and again) earns none.
+                if fresh && peerless_ticks > 0 && !discovered.is_empty() {
+                    sync.reset_immediately();
+                    tick_is_early_retry = true;
+                }
 
                 // Offer every resolved address to membership. Announcing to one
                 // we already know is harmless — foca ignores it — and doing it
@@ -1552,6 +1634,14 @@ impl Contact {
     }
 }
 
+/// How long a resolution has been running, in seconds, once that is longer than
+/// a discovery interval (`None` while it is not: the loop says nothing of a
+/// resolution that has had less time than the next one would have had).
+fn slow_resolution(since: tokio::time::Instant, discovery_interval: Duration) -> Option<u64> {
+    let age = since.elapsed();
+    (age >= discovery_interval).then_some(age.as_secs())
+}
+
 /// A ticker for one of the loop's two arms, which does not catch up on
 /// ticks it missed (ADR-154).
 ///
@@ -1884,6 +1974,393 @@ mod tests {
         assert!(!reports[0].early_retry && reports[1..].iter().all(|r| r.early_retry));
         assert!(reports.iter().all(|r| r.peers_known == 0 && r.failed == 0));
         assert_eq!(reports.iter().filter(|r| r.opened).count(), 1, "only the first opens");
+    }
+
+    /// A loop whose seeds are resolved by `resolver`, and whose reports are
+    /// read on virtual time: a sync interval of a minute and a discovery
+    /// interval of ten seconds, so that over a hundred seconds the resolver is
+    /// asked for many times if nothing stops it.
+    fn loop_resolved_by(
+        engine: &Arc<Engine>,
+        resolver: Resolver,
+    ) -> (tokio::sync::mpsc::UnboundedReceiver<RoundReport>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_secs(10);
+        config.resolver = Some(resolver);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        (rx, tokio::spawn(replicate(Arc::clone(engine), config)))
+    }
+
+    /// **A resolver that never answers holds up neither the sync ticks nor the
+    /// loop.** The seeds were resolved inside the loop's own discovery arm, so DNS
+    /// that did not answer held every tick behind it for its own timeout, and
+    /// A3's early retries could run into it four times more. The resolution runs
+    /// beside the loop now, one at a time: over 100 s of virtual time with a
+    /// resolver that hangs, the loop makes the first tick, the four early
+    /// retries and the ticker's own tick at a minute, the resolver is asked for
+    /// once and not again while it is hanging, and no resolution completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_never_answers_holds_up_neither_the_ticks_nor_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        assert_eq!(
+            reports.len(),
+            6,
+            "the first tick, four early retries and the tick at a minute: {reports:?}"
+        );
+        assert!(reports.iter().all(|r| r.discoveries == 0), "nothing was resolved: {reports:?}");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a resolution that is still running is not started again, ten discovery ticks on"
+        );
+    }
+
+    /// A slow resolver is waited for beside the loop, and what it finds is used
+    /// when it answers: the ticks go on while it works (the first tick and the
+    /// early retries find nothing), and the tick after it answers contacts the
+    /// peer it found.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_resolver_is_waited_for_beside_the_loop_and_its_answer_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    BTreeSet::from([dead])
+                })
+            }),
+        );
+        let mut reports = Vec::new();
+        // The tick at a minute is the first after the answer at 20 s; twelve reports
+        // are far more than it needs, so a loop that never uses the answer ends the
+        // test here and not never.
+        while reports.len() < 12 && reports.last().is_none_or(|r: &RoundReport| r.peers_known == 0)
+        {
+            reports.push(
+                tokio::time::timeout(Duration::from_secs(300), rx.recv()).await.unwrap().unwrap(),
+            );
+        }
+        looping.abort();
+        let last = reports.last().unwrap();
+        assert_eq!(last.peers_known, 1, "the resolved address is a peer: {last:?}");
+        assert_eq!(last.failed, 1, "and the round against it ran: {last:?}");
+        assert!(last.discoveries >= 1);
+        assert!(
+            reports[..reports.len() - 1].iter().all(|r| r.peers_known == 0),
+            "before the answer there was nobody: {reports:?}"
+        );
+        assert!(reports.len() >= 5, "the ticks went on while it worked: {reports:?}");
+    }
+
+    /// **An answer that comes after the early retries are spent gets its own early
+    /// tick**, as it did when the resolution ran inside the loop: the last tick
+    /// found nobody, and waiting out a sync interval (a minute here) for the
+    /// ticker's next one would be a worse start than before the resolution moved.
+    /// The resolver answers at 5 s, after the first tick and its four retries have
+    /// all found nobody; the first tick that finds the peer is the early one the
+    /// answer earned (`early_retry`), and not the ticker's own at a minute.
+    ///
+    /// **Read from the report, not from the clock**: a tick reports when it ends,
+    /// and the early tick's contact with the peer (an address nothing listens on)
+    /// can take a connect timeout of virtual time, which the paused clock may
+    /// advance by while the refusal is still being read.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_after_the_early_retries_gets_an_early_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    BTreeSet::from([dead])
+                })
+            }),
+        );
+        let mut reports = Vec::new();
+        loop {
+            let r =
+                tokio::time::timeout(Duration::from_secs(300), rx.recv()).await.unwrap().unwrap();
+            let found = r.peers_known > 0;
+            reports.push(r);
+            if found || reports.len() > 20 {
+                break;
+            }
+        }
+        looping.abort();
+        let last = reports.last().unwrap();
+        assert_eq!(last.peers_known, 1, "the answer was used: {reports:?}");
+        assert!(
+            last.early_retry,
+            "the first tick with a peer is the early one the answer earned, not the ticker's \
+             own a sync interval later: {reports:?}"
+        );
+        assert_eq!(reports.len(), 6, "the first tick, four retries, then the early tick");
+    }
+
+    /// **The peers last resolved are used while the next resolution is still
+    /// running**, and the next one is started. The first resolution answers; every
+    /// one after it hangs. Over 200 s the resolver is asked again (a resolution that
+    /// has answered leaves nothing in flight), and every tick after the one that
+    /// found the peer still knows it.
+    #[tokio::test(start_paused = true)]
+    async fn the_peers_last_resolved_are_kept_while_the_next_resolution_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 { BTreeSet::from([dead]) } else { std::future::pending().await }
+                })
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        let first = reports.iter().position(|r| r.peers_known > 0).expect("a tick found the peer");
+        assert!(reports.len() - first >= 3, "{reports:?}");
+        assert!(
+            reports[first..].iter().all(|r| r.peers_known == 1),
+            "kept while the second resolution hangs: {reports:?}"
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "a second one was started");
+    }
+
+    /// **A resolver that panics costs one resolution, not discovery.** The task that
+    /// ran it ends without an answer, which clears the resolution in flight; the
+    /// next discovery tick asks again, and the peer it finds is used.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_panics_once_does_not_end_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        panic!("a resolver that panics once");
+                    }
+                    BTreeSet::from([dead])
+                })
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2, "it was asked again");
+        assert!(reports.iter().any(|r| r.peers_known > 0), "discovery went on: {reports:?}");
+    }
+
+    /// **An answer that changes nothing earns no early tick.** A lone member whose
+    /// seed resolves to its own address (set aside once it answers as this node)
+    /// is peerless however often it resolves, and every answer is the same one: an
+    /// early tick for each would run the loop at the discovery interval and keep the
+    /// ticker's own tick, when that is the longer, from ever firing. On the real
+    /// clock, as the handshake that sets the address aside is real I/O: a sync
+    /// interval of 2 s and a discovery interval of half of one, over 9 s. The loop
+    /// makes the first tick, the early tick the first answer earned, and three
+    /// early retries (the delays that fit inside the interval) among the ticker's
+    /// own ticks; one early tick per answer made fourteen of seventeen reports.
+    #[tokio::test]
+    async fn an_answer_that_changes_nothing_earns_no_early_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = listener.local_addr().unwrap();
+        tokio::spawn(crate::transport::serve(Arc::clone(&engine), listener, "a-secret".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![])],
+            "a-secret".into(),
+            "127.0.0.1:1".parse().unwrap(),
+        );
+        config.sync_interval = Duration::from_secs(2);
+        config.discovery_interval = Duration::from_millis(500);
+        config.resolver = Some(Arc::new(move || Box::pin(async move { BTreeSet::from([own]) })));
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        let early = reports.iter().filter(|r| r.early_retry).count();
+        assert!(
+            early <= 5,
+            "{early} early ticks in 9 s for answers that named nobody new: {reports:?}"
+        );
+        // At least one of the ticker's own: the loop went on. How many is the
+        // host's to decide (a stalled runner makes fewer); the early bound above
+        // is what an early tick per answer fails.
+        assert!(
+            reports.len() > early,
+            "the ticker's own ticks went on: {} of {}: {reports:?}",
+            reports.len() - early,
+            reports.len()
+        );
+    }
+
+    /// **A loop that has peers gets no early tick from a later answer**, even a
+    /// new one: an early tick is for a tick that found nobody. The resolver
+    /// answers one address, then two; after the first tick that has a peer (which
+    /// may itself be the early one the first answer earned) no report is early.
+    #[tokio::test(start_paused = true)]
+    async fn a_loop_with_peers_gets_no_early_tick_from_a_later_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let one = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let two = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let (mut rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 { BTreeSet::from([one]) } else { BTreeSet::from([one, two]) }
+                })
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        let first = reports.iter().position(|r| r.peers_known > 0).expect("a tick found a peer");
+        assert!(
+            reports[first + 1..].iter().all(|r| !r.early_retry),
+            "a loop with peers was given an early tick: {reports:?}"
+        );
+        assert!(reports.len() - first >= 3, "ticks went on: {reports:?}");
+    }
+
+    /// A resolution that has answered is followed by another: the resolver is
+    /// asked once per discovery interval (ten seconds here) for as long as it
+    /// answers, and not once.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_that_answered_is_followed_by_the_next_discovery_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let (_rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move { BTreeSet::from([dead]) })
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(55)).await;
+        looping.abort();
+        let asked = asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(asked >= 5, "asked {asked} times in 55 s at a ten-second interval");
+    }
+
+    /// **A resolution is called slow only once it has run for a discovery
+    /// interval or longer.** The early retries of a peerless member ask the
+    /// resolver again at the start, so a discovery tick comes while the first
+    /// resolution is milliseconds old; that is not "taking longer than a discovery
+    /// interval", and saying so at `WARN` was noise at every start.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_is_slow_only_once_it_is_a_discovery_interval_old() {
+        let interval = Duration::from_secs(10);
+        let since = tokio::time::Instant::now();
+        assert_eq!(slow_resolution(since, interval), None, "just started");
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        assert_eq!(slow_resolution(since, interval), None, "a millisecond short of it");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(slow_resolution(since, interval), Some(10), "a discovery interval old");
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert_eq!(slow_resolution(since, interval), Some(35));
+    }
+
+    /// **A resolution in flight ends with the loop.** The task that runs it is
+    /// aborted when the loop is dropped, so a resolver that never answers does not
+    /// outlive the loop that asked it (and what it holds, a connection or a
+    /// buffer, goes with it). The resolver here holds a guard, and the guard
+    /// is released once the loop is aborted.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_in_flight_ends_with_the_loop() {
+        struct Held(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&held);
+        let (_rx, looping) = loop_resolved_by(
+            &engine,
+            Arc::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let guard = Held(Arc::clone(&flag));
+                Box::pin(async move {
+                    let _guard = guard;
+                    std::future::pending::<BTreeSet<SocketAddr>>().await
+                })
+            }),
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(held.load(std::sync::atomic::Ordering::SeqCst), "the resolution is running");
+        looping.abort();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !held.load(std::sync::atomic::Ordering::SeqCst),
+            "the resolution outlived the loop that asked for it"
+        );
     }
 
     /// An address that answered as this node itself is not a peer, and not one

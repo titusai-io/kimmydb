@@ -181,6 +181,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   its 22 s stop budget from the failure before it gives up and exits 75, or about
   10 s when a write is still open at the writes cap, which runs inside it.
 
+- **A seed resolver that hangs no longer holds the sync loop.** The seeds were
+  resolved inside the loop's discovery arm, so DNS that did not answer held every
+  sync tick behind it for its own timeout, once per `cluster.discovery_interval_secs`,
+  and the early retries of a member that found no peers could run into it four times
+  more. The resolution now runs beside the loop, one at a time: the peers last
+  resolved are kept until it completes, an answer that comes after the early retries
+  gets an early tick of its own and not one a sync interval later, a resolver that
+  panics costs one resolution and not discovery, and a resolution still running when
+  the next discovery tick comes is said at `WARN` only once it has run for a
+  discovery interval or longer, and not stacked on. A hung `dns:` lookup still
+  holds a stop for the full stop budget, as before.
+
 - **A stored member that returns behind every peer's horizon is marked within a
   fraction of a second, not after a whole sync interval.** It starts unmarked,
   by design, and is marked `snapshot` when its own first pull gets

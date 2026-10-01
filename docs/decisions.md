@@ -21919,6 +21919,45 @@ peerless ticks, and none from the ticker's own peerless ticks after them, so a
 failing resolver is not asked in a loop and a resolver that failed at the start
 is not waited on for `discovery_interval_secs` (30 s by default).
 
+**The seeds are resolved beside the loop, one resolution at a time.** The
+resolution was awaited inside the loop's own discovery arm, so a resolver that
+hung (DNS that does not answer) held every sync tick behind it for its own
+timeout, once per discovery interval, and the four early retries could run into
+it. It now runs in a task the loop owns and waits for in an arm of its own; the
+loop keeps the peers last resolved until the result arrives and starts no second
+resolution while one is in flight. It says so at `WARN` only once the resolution
+has been running for a discovery interval or longer, so the early retries, which
+ask the resolver again at the start, do not log it. A resolver that panics ends its
+task without an answer: the loop clears the resolution, says so, and asks again at
+the next discovery tick, so it costs one resolution and not discovery. The task is
+aborted if the loop ends first. `RoundReport::discoveries` counts the resolutions
+that completed.
+
+An answer that arrives after the early retries are spent gets an early tick of its
+own, as it did when the resolution ran inside the loop: the last tick found nobody,
+so the loop opens the next one at once (an early retry, which opens no tick, as
+below) and not a whole sync interval later. Only an answer that names someone the
+last one did not earns it, and only while the last tick found nobody: a lone member
+whose seed resolves to its own address is peerless however often it resolves, and an
+early tick for each answer would run its loop at the discovery interval.
+
+What a hung lookup holds is not what it held before, and not nothing. A `dns:` or
+`k8s:` lookup is `getaddrinfo` on the blocking pool, so it costs a thread for its
+timeout; a `dns-srv:` lookup costs a task. Neither holds the loop. A hung `dns:`
+lookup still holds a *stop* for the full stop budget, because the runtime waits for
+its blocking pool, exactly as before; resolving addresses with the resolver the
+SRV lookup already uses would end that, and is not part of this change.
+
+Tests on virtual time: over 100 s with a resolver that never answers, the first
+tick, the four retries and the tick at a minute, one call to the resolver and no
+completed resolution; a resolver that answers at 5 s is used by a tick within
+seconds, not at a minute; one that panics once is asked again and its next answer
+used; the peers last resolved are kept while a later resolution hangs, and one that
+has answered is followed by the next discovery tick's. The mutations that await it
+inline, start one per discovery tick, drop its answer, schedule no tick for a late
+answer, never clear a resolution that ended in a panic, clear the peers when a
+resolution starts, or never clear the one in flight each fail one.
+
 An early retry is not an opening tick (`tick_opened`) and not a reset: ADR-195's
 and ADR-148's counters are wall-clock arguments about contacts, and a tick that
 reaches nobody must not move them. It is reported as `RoundReport::early_retry`,

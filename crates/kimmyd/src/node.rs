@@ -2515,6 +2515,7 @@ async fn spawn_cluster(
                 catch_up: state.catch_up().cloned(),
                 expected_members: config.cluster.expected_members,
                 self_recheck: kimmy_cluster::SELF_RECHECK,
+                resolver: None,
                 sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
                 discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
                 fanout: config.cluster.fanout,
