@@ -93,6 +93,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   them
   ([ADR-206](docs/decisions.md),
   [Query language](docs/query-language.md#expr--comparing-fields-of-the-same-document)).
+- **Several bounds on one indexed field read the range of the tightest, in any
+  order.** The planner kept the first lower and the first upper bound it met,
+  so `{"$and": [{"a": {"$gt": 0}}, {"a": {"$gt": 5}}]}` read the index from 0
+  and the same clauses swapped read it from 5. Parsing stores a clause holding
+  `$expr` after the others, so a filter could read a wider range than it
+  needed with nothing in the request saying so. The planner now keeps the
+  highest lower bound and the lowest upper one, which `explain` shows as a
+  smaller `indexEntriesRead`. Answers do not
+  change; only how much of the index a query reads
+  ([Indexes](docs/indexes.md#the-planner)).
 
 ### Fixed
 

@@ -15,10 +15,11 @@
 //! decision below resolves that way — unusable operators are ignored rather
 //! than guessed at, and anything uncertain widens the range.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bson::Bson;
-use kimmy_core::{IndexMeta, PartialOp, keyenc};
+use kimmy_core::{IndexMeta, PartialOp, canonical_cmp, keyenc};
 
 use crate::filter::{Condition, Filter};
 
@@ -75,10 +76,52 @@ const ABOVE_ANY_CONTINUATION: u8 = 0xFF;
 #[derive(Default, Clone, Debug)]
 struct Bounds {
     eq: Option<Bson>,
+    /// The tightest lower bound of every `$gt` and `$gte` on the field.
     lower: Option<Bson>,
+    /// The tightest upper bound of every `$lt` and `$lte` on the field.
     upper: Option<Bson>,
     /// The values of a `$in`, when one is present.
     in_values: Option<Vec<Bson>>,
+}
+
+/// Keep whichever of the held bound and `value` admits less.
+///
+/// `tighter` is the direction that narrows: `Greater` for a lower bound,
+/// `Less` for an upper one. Whether the operator excludes its value does not
+/// matter here: the key range is inclusive either way, and the recheck removes
+/// a document sitting exactly on an exclusive end, so `$gt: 5` and `$gte: 5`
+/// read the same keys and the one already held is kept.
+///
+/// # Why this is sound across types
+///
+/// Every matching document satisfies **every** conjunct, so the range each
+/// bound yields on its own already holds all of them, and keeping one of the
+/// given bounds can never produce a range narrower than that. Which one is
+/// kept decides only how wide the range is, never which documents are in it,
+/// so bounds of different types need no special case. The comparison is
+/// `canonical_cmp`, which `keyenc` encodes byte for byte, so "admits less"
+/// here is "admits fewer keys" in the scan: `{$gt: 5}` with `{$gt: "a"}`
+/// keeps `"a"`, since strings sort above numbers.
+///
+/// A further shortcut, concluding that a lower and an upper bound of
+/// different types admit nothing, is not taken. It is sound only when the
+/// types are compared by the filter's **type groups** (`same_type_group` in
+/// `kimmy-core`, where `MinKey`, `MaxKey`, regular expressions and the code
+/// types are one group) and only on an index that has never seen an array,
+/// whose plan must still re-check that flag in the scan's snapshot. Keyed on
+/// the key order's type **ranks** it is wrong even there:
+/// `{$gt: MinKey, $lte: MaxKey}` matches a `MaxKey`. On a multikey index it is
+/// wrong either way, since an array can satisfy two groups with two
+/// elements. `kimmy-storage/tests/bound_intersection.rs` compares every pair
+/// against a scan and fails on the rank-keyed version.
+fn tighten(held: &mut Option<Bson>, value: &Bson, tighter: Ordering) {
+    let replace = match held {
+        None => true,
+        Some(bound) => canonical_cmp(value, bound) == tighter,
+    };
+    if replace {
+        *held = Some(value.clone());
+    }
 }
 
 /// Pick an index for this filter, or `None` to scan.
@@ -283,11 +326,16 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
                     Condition::Eq(v) => {
                         slot.eq.get_or_insert(v.clone());
                     }
+                    // Every bound on the path narrows, whichever clause it
+                    // came from and in whatever order: the range is their
+                    // intersection, the tightest lower and the tightest upper.
+                    // Keeping the first one seen instead made the range read
+                    // depend on clause order, which parsing rearranges.
                     Condition::Gt(v) | Condition::Gte(v) => {
-                        slot.lower.get_or_insert(v.clone());
+                        tighten(&mut slot.lower, v, Ordering::Greater);
                     }
                     Condition::Lt(v) | Condition::Lte(v) => {
-                        slot.upper.get_or_insert(v.clone());
+                        tighten(&mut slot.upper, v, Ordering::Less);
                     }
                     // `$in` is a disjunction of equalities on one field, so —
                     // unlike `$or` — every match still satisfies "the field is
@@ -986,6 +1034,214 @@ mod tests {
         let idx = [index(0, vec![IndexField::ascending("a")])];
         let p = plan(doc! { "a": { "$eq": 5, "$in": [1, 2, 5] } }, &idx).unwrap();
         assert_eq!(p.ranges.len(), 1, "the equality prefix answers this alone");
+    }
+
+    // ---- Several bounds on one path: the intersection, whatever the order ----
+
+    /// `{$and: [{a: first}, {a: second}]}` and the same two clauses swapped.
+    fn both_orders(first: Bson, second: Bson) -> [bson::Document; 2] {
+        [
+            doc! { "$and": [ { "a": first.clone() }, { "a": second.clone() } ] },
+            doc! { "$and": [ { "a": second }, { "a": first } ] },
+        ]
+    }
+
+    /// Assert that both orders of two clauses plan exactly as `alone` does.
+    fn plans_as(first: Bson, second: Bson, alone: bson::Document, indexes: &[IndexMeta]) {
+        let expected = plan(alone.clone(), indexes).expect("the single clause plans");
+        for query in both_orders(first, second) {
+            assert_eq!(
+                plan(query.clone(), indexes),
+                Some(expected.clone()),
+                "{query} should read the range {alone} reads"
+            );
+        }
+    }
+
+    fn ascending_and_descending(multikey_flag: bool) -> Vec<[IndexMeta; 1]> {
+        [IndexField::ascending("a"), IndexField::descending("a")]
+            .into_iter()
+            .map(|f| [IndexMeta { multikey: multikey_flag, ..index(0, vec![f]) }])
+            .collect()
+    }
+
+    #[test]
+    fn two_lower_bounds_keep_the_higher() {
+        for multikey_flag in [false, true] {
+            for idx in ascending_and_descending(multikey_flag) {
+                plans_as(
+                    doc! { "$gt": 5 }.into(),
+                    doc! { "$gt": 0 }.into(),
+                    doc! { "a": { "$gt": 5 } },
+                    &idx,
+                );
+                plans_as(
+                    doc! { "$gte": 5 }.into(),
+                    doc! { "$gt": 4.5 }.into(),
+                    doc! { "a": { "$gte": 5 } },
+                    &idx,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_upper_bounds_keep_the_lower() {
+        for multikey_flag in [false, true] {
+            for idx in ascending_and_descending(multikey_flag) {
+                plans_as(
+                    doc! { "$lt": 5 }.into(),
+                    doc! { "$lt": 9 }.into(),
+                    doc! { "a": { "$lt": 5 } },
+                    &idx,
+                );
+                plans_as(
+                    doc! { "$lte": 5 }.into(),
+                    doc! { "$lt": 5.5 }.into(),
+                    doc! { "a": { "$lte": 5 } },
+                    &idx,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_ends_intersect_across_clauses() {
+        // `{$gt: 0, $lt: 9}` and `{$gt: 3, $lt: 20}` on an index that has
+        // never seen an array: `[3, 9]`. On a multikey one the upper end is
+        // not used at all, and the lower is still the higher of the two.
+        for idx in ascending_and_descending(false) {
+            for query in
+                both_orders(doc! { "$gt": 0, "$lt": 9 }.into(), doc! { "$gt": 3, "$lt": 20 }.into())
+            {
+                let expected = plan(doc! { "a": { "$gt": 3, "$lt": 9 } }, &idx).unwrap();
+                assert!(expected.both_bounds);
+                assert_eq!(plan(query, &idx), Some(expected));
+            }
+        }
+        for idx in ascending_and_descending(true) {
+            plans_as(
+                doc! { "$gt": 0, "$lt": 9 }.into(),
+                doc! { "$gt": 3, "$lt": 20 }.into(),
+                doc! { "a": { "$gt": 3 } },
+                &idx,
+            );
+        }
+    }
+
+    #[test]
+    fn an_exclusive_and_an_inclusive_bound_on_one_value_read_the_same_range() {
+        // The key range is inclusive either way, so neither is tighter.
+        for multikey_flag in [false, true] {
+            for idx in ascending_and_descending(multikey_flag) {
+                plans_as(
+                    doc! { "$gt": 5 }.into(),
+                    doc! { "$gte": 5 }.into(),
+                    doc! { "a": { "$gte": 5 } },
+                    &idx,
+                );
+                plans_as(
+                    doc! { "$lt": 5.0 }.into(),
+                    doc! { "$lte": 5_i64 }.into(),
+                    doc! { "a": { "$lte": 5 } },
+                    &idx,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounds_of_different_types_keep_the_later_in_key_order() {
+        // A number sorts below a string, so `"a"` is the higher lower bound
+        // and `5` the lower upper bound. Either range still holds every
+        // document both clauses match: a scalar cannot satisfy two type
+        // groups at once, and an array that does it with two elements is on
+        // a multikey index, which uses one end only.
+        for multikey_flag in [false, true] {
+            for idx in ascending_and_descending(multikey_flag) {
+                plans_as(
+                    doc! { "$gt": 5 }.into(),
+                    doc! { "$gt": "a" }.into(),
+                    doc! { "a": { "$gt": "a" } },
+                    &idx,
+                );
+                plans_as(
+                    doc! { "$lt": 5 }.into(),
+                    doc! { "$lt": "a" }.into(),
+                    doc! { "a": { "$lt": 5 } },
+                    &idx,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_equality_beats_any_range_on_its_path() {
+        for idx in ascending_and_descending(false) {
+            plans_as(5.into(), doc! { "$gt": 0 }.into(), doc! { "a": 5 }, &idx);
+            plans_as(5.into(), doc! { "$gt": 9 }.into(), doc! { "a": 5 }, &idx);
+        }
+    }
+
+    #[test]
+    fn an_in_beats_any_range_on_its_path() {
+        for idx in ascending_and_descending(false) {
+            plans_as(
+                doc! { "$in": [1, 5] }.into(),
+                doc! { "$gt": 3 }.into(),
+                doc! { "a": { "$in": [1, 5] } },
+                &idx,
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_intersection_plans_a_range_that_holds_no_key() {
+        // `$gt: 10` and `$lt: 5`: nothing can match. On an index that has
+        // never seen an array the range runs from 10 down to 5, which holds
+        // no key — and the plan still says it intersected, so the scan
+        // re-checks the multikey flag in its own snapshot.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        for query in both_orders(doc! { "$gt": 10 }.into(), doc! { "$lt": 5 }.into()) {
+            let p = plan(query, &idx).unwrap();
+            assert!(p.both_bounds);
+            let (lower, upper) = bounds(&p);
+            assert!(lower > upper, "an empty intersection must be an empty range");
+            for v in [0, 5, 7, 10, 11] {
+                let key = keyenc::encode(&Bson::Int32(v)).unwrap();
+                assert!(!(&key >= lower && &key <= upper), "{v} lies in an empty range");
+            }
+        }
+        // A multikey index cannot conclude that: `{a: [11, 0]}` matches both.
+        let idx = [multikey(0, vec![IndexField::ascending("a")])];
+        plans_as(
+            doc! { "$gt": 10 }.into(),
+            doc! { "$lt": 5 }.into(),
+            doc! { "a": { "$gt": 10 } },
+            &idx,
+        );
+    }
+
+    #[test]
+    fn a_range_after_an_equality_prefix_is_intersected_too() {
+        let idx = [index(0, vec![IndexField::ascending("b"), IndexField::ascending("a")])];
+        let expected = plan(doc! { "b": 1, "a": { "$gt": 5, "$lt": 9 } }, &idx).unwrap();
+        for query in [
+            doc! { "b": 1, "$and": [ { "a": { "$gt": 0, "$lt": 9 } }, { "a": { "$gt": 5 } } ] },
+            doc! { "$and": [ { "a": { "$gt": 5 } }, { "b": 1 }, { "a": { "$lt": 9, "$gt": 0 } } ] },
+        ] {
+            assert_eq!(plan(query, &idx), Some(expected.clone()));
+        }
+    }
+
+    #[test]
+    fn a_clause_holding_an_expr_does_not_widen_the_range() {
+        // The shape a review found reading 6 entries at one commit and 8 at
+        // the next: parsing moves the clause holding `$expr` after the other,
+        // so with the first bound winning, `$gt: 0` decided the range.
+        let idx = [multikey(0, vec![IndexField::ascending("a")])];
+        let narrow = doc! { "$gt": 5, "$elemMatch": { "$expr": { "$gte": ["$x", 0] } } };
+        plans_as(narrow.into(), doc! { "$gt": 0 }.into(), doc! { "a": { "$gt": 5 } }, &idx);
     }
 }
 
