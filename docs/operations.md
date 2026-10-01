@@ -2264,6 +2264,31 @@ restore writes a fresh `kimmy.format` for the build that ran it.
 The start after a refusal still reports the run before it. See
 [What a shutdown logs](#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one).
 
+### What corruption a start detects
+
+Know what the engine does and does not find before relying on it:
+
+- **A torn write** after a crash or power loss is repaired at the next open,
+  from the commit slot that survived.
+- **A header, commit slot or root that cannot be right** refuses the start (see
+  [A damaged store](#a-damaged-store)).
+- **A record that no longer decodes** fails the read that reaches it with a
+  storage error (`StorageError::Corrupt`) and does not stop the node. What stops
+  the node is an I/O error from the storage backend, which is a different thing
+  ([ADR-188](decisions.md)).
+- **A flipped bit in a page that still decodes** is **not detected** on a store
+  that was closed cleanly: redb's page checksums are verified only in its repair
+  after an unclean shutdown, in the rebuild of its allocator when no saved state
+  exists, and in its own integrity check, which the engine does not run. An
+  ordinary read verifies nothing, and the damaged page is served as data.
+- **A file changed on purpose** is **not detected**. The checksums are not
+  cryptographic, and the engine holds no key.
+
+The last two are for the filesystem and the backups to answer: use a filesystem
+that checksums data, take backups and restore one now and then, and on a cluster
+remember that a peer holds the same documents. The reasoning is in
+[Storage: what the storage detects](storage.md#what-the-storage-detects).
+
 ### A damaged store
 
 A start refuses a store whose redb header or primary commit slot is damaged,
