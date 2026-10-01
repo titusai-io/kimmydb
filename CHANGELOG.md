@@ -96,6 +96,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A stored member that returns behind every peer's horizon is marked within a
+  fraction of a second, not after a whole sync interval.** It starts unmarked,
+  by design, and is marked `snapshot` when its own first pull gets
+  `BeyondHorizon`. That pull is its first sync tick, which fires before
+  discovery or SWIM has named a peer, so it chose none and the next tick was
+  `cluster.sync_interval_secs` (5 s) away: in two of eight returns on a deployed
+  cluster, and five of eight in a local lab, the member served its old state for
+  4.9 to 5.2 s first. A tick that finds no peers is now tried again after
+  250 ms, 500 ms, 1 s and 2 s (and asks the seeds to be resolved again each
+  time, when nothing is discovered), and then the member is on its interval; a
+  peer first known after the last retry is pulled within one interval, as before. A tick
+  with no peers contacts nobody, so this puts no load on a peer; a member whose
+  peers are known and down, or that is really alone, behaves as before
+  (ADR-202's addendum).
+
 - **A start whose store holds no unique violation since its last retention pass
   no longer commits before the node answers.** The completing pass for the
   unique-violations table (ADR-200) found `through`, the point the table is

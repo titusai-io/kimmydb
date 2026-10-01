@@ -2235,6 +2235,9 @@ mod tests {
             entries_skipped_purge_pending: 77,
             repair_rounds: 76,
             reset: true,
+            early_retry: false,
+            peers_known: 0,
+            discoveries: 0,
             opened: true,
             pulls: pulls_observed([3, 40, 700], 1_024, Some(1_500), 115, [101, 102, 103, 104]),
         });
@@ -2257,6 +2260,9 @@ mod tests {
             entries_skipped_purge_pending: 1,
             repair_rounds: 1,
             reset: false,
+            early_retry: false,
+            peers_known: 0,
+            discoveries: 0,
             opened: true,
             // A wait of 45 s: past the old 10 s top, so the golden reads the
             // buckets a long wait for the writer lands in (ADR-175).
@@ -4003,6 +4009,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            early_retry: false,
+            peers_known: 0,
+            discoveries: 0,
             opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         });
@@ -4025,6 +4034,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            early_retry: false,
+            peers_known: 0,
+            discoveries: 0,
             opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         });
@@ -4235,6 +4247,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             entries_skipped_purge_pending: 0,
             repair_rounds: 0,
             reset: false,
+            early_retry: false,
+            peers_known: 0,
+            discoveries: 0,
             opened: true,
             pulls: kimmy_cluster::PullReport::default(),
         };
