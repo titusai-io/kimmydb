@@ -148,30 +148,45 @@ impl StorageHealth {
         self.synced.load(Ordering::SeqCst)
     }
 
-    /// Arm the test switch to fail `call` once: a backend call's name, or
-    /// `call@write` to fail it only inside the commit of a client write.
-    /// Returns whether `call` names one of the backend's calls.
-    pub(crate) fn arm(&self, call: &str) -> bool {
+    /// What `call` names: the index into [`CALLS`], whether it is
+    /// `call@write`, and in test builds `call@after-sync`. `None` when it names
+    /// no backend call.
+    fn parse_switch(call: &str) -> Option<(usize, bool, bool)> {
         #[cfg(test)]
         let (call, after_sync) = match call.strip_suffix("@after-sync") {
             Some(call) => (call, true),
             None => (call, false),
         };
+        #[cfg(not(test))]
+        let after_sync = false;
         let (call, for_write) = match call.split_once('@') {
             Some((call, "write")) => (call, true),
-            Some(_) => return false,
+            Some(_) => return None,
             None => (call, false),
         };
-        match CALLS.iter().position(|c| *c == call) {
-            Some(i) => {
-                #[cfg(test)]
-                self.armed_after_sync.store(after_sync, Ordering::SeqCst);
-                self.armed_for_write.store(for_write, Ordering::SeqCst);
-                self.armed.store(i as u8 + 1, Ordering::SeqCst);
-                true
-            }
-            None => false,
-        }
+        CALLS.iter().position(|c| *c == call).map(|i| (i, for_write, after_sync))
+    }
+
+    /// Whether `call` names one of the backend's calls, as the test switch
+    /// reads it, without arming anything.
+    pub(crate) fn names_a_switch(call: &str) -> bool {
+        Self::parse_switch(call).is_some()
+    }
+
+    /// Arm the test switch to fail `call` once: a backend call's name, or
+    /// `call@write` to fail it only inside the commit of a client write.
+    /// Returns whether `call` names one of the backend's calls.
+    pub(crate) fn arm(&self, call: &str) -> bool {
+        let Some((i, for_write, after_sync)) = Self::parse_switch(call) else {
+            return false;
+        };
+        #[cfg(test)]
+        self.armed_after_sync.store(after_sync, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let _ = after_sync;
+        self.armed_for_write.store(for_write, Ordering::SeqCst);
+        self.armed.store(i as u8 + 1, Ordering::SeqCst);
+        true
     }
 
     /// Set the delay every backend page read takes, for a test of a real node

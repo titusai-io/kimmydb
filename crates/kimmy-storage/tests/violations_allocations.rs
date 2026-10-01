@@ -126,12 +126,14 @@ fn cold_first_call(documents: usize, violations: usize, from_oplog: bool) -> usi
     let path = dir.path().join("kimmy.redb");
     build(&path, documents, violations);
 
-    // Completing the table takes an open, the backfill, and a close: through is
-    // then at the tail, and the next open finds the table ready.
+    // Completing the table takes an open, the backfill, a retention pass and a
+    // close: a backfill that finds nothing commits nothing, and the pass is what
+    // moves through to the tail, so the next open finds the table ready.
     {
         let engine = Engine::open_with_cache(&path, Some(CACHE)).unwrap();
         let budget = ExamineBudget { time: std::time::Duration::from_secs(600), rows: 1_000 };
         while !engine.violations_backfill_step(budget).unwrap().done {}
+        engine.collect_garbage(kimmy_storage::RetentionPolicy::new(86_400, 172_800)).unwrap();
         engine.close().unwrap();
     }
     let engine = Engine::open_with_cache(&path, Some(CACHE)).unwrap();

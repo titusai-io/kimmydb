@@ -742,3 +742,170 @@ fn backfill_under_writers(retention_between_steps: bool) {
     assert_in_step(&engine, "after the backfill under writers");
     same_answer(&engine, &coll, "after the backfill under writers");
 }
+
+/// Writer holds taken since the engine opened, in all, and by the backfill's
+/// holder: counted from the hold meter, which no host stall moves.
+fn holds(engine: &Engine) -> (u64, u64) {
+    let count = engine.writer_hold().count;
+    (count.iter().sum(), count[crate::engine::WriterHolder::Violations.slot()])
+}
+
+/// **A start whose tail holds no violation makes no commit** (ADR-200). Every
+/// restart of a store with writes since the last retention pass finds `through`
+/// behind the tail and scans the stretch between; the scan used to commit
+/// `through` even when it found nothing, so that most starts opened with a
+/// fsync before the node answered. Now the scan completes the table in memory
+/// and the retention pass is what moves `through`.
+#[test]
+fn a_start_whose_tail_holds_no_violation_makes_no_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let (engine, coll, _keep) = {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("db", "c").unwrap();
+            engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+            let coll = engine.get_collection("db", "c").unwrap();
+            (engine, coll, ())
+        };
+        for i in 0..5 {
+            engine
+                .insert(&coll, doc! { "_id": format!("p{i}"), "email": format!("p{i}@x") })
+                .unwrap();
+        }
+        engine.close().unwrap();
+    }
+    let engine = Engine::open(&path).unwrap();
+    assert!(!engine.violations_table_ready(), "writes since `through` leave the open behind");
+    let through = in_table(&engine).1;
+    let before = holds(&engine);
+
+    let step = engine
+        .violations_backfill_step(ExamineBudget { time: Duration::from_secs(60), rows: 1_000 })
+        .unwrap();
+    assert!(step.done && step.found == 0 && step.scanned > 0, "{step:?}");
+    assert!(engine.violations_table_ready(), "ready in memory");
+    assert_eq!(holds(&engine), before, "the scan took the writer: a commit at the start");
+    assert_eq!(in_table(&engine).1, through, "through stays where the last commit left it");
+    assert_in_step(&engine, "after the skipped commit");
+    engine.close().unwrap();
+
+    // The next start scans the same tail again, still with no commit.
+    let engine = Engine::open(&path).unwrap();
+    assert!(!engine.violations_table_ready(), "through was not advanced, so the open is behind");
+    let before = holds(&engine);
+    assert!(engine.violations_backfill_step(ExamineBudget::serve()).unwrap().done);
+    assert_eq!(holds(&engine), before, "the second start commits nothing either");
+
+    // The retention pass, once the table is ready, is what moves `through`.
+    engine.advance_violations_through().unwrap();
+    assert_eq!(in_table(&engine).1, tail(&engine));
+    engine.close().unwrap();
+    let engine = Engine::open(&path).unwrap();
+    assert!(engine.violations_table_ready(), "ready at the open, nothing to scan");
+}
+
+/// The other half of the skip: a tail that holds a violation is recorded with
+/// its commit, `through` is persisted, and the next start finds the table ready
+/// and complete.
+#[test]
+fn a_tail_with_a_violation_is_still_recorded_and_persisted_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let coll = {
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("db", "c").unwrap();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "p", "email": "p@x" }).unwrap();
+        violate(&engine, &coll, "a", 1);
+        // What a build that does not know the table leaves behind.
+        wipe_table(&engine);
+        engine.close().unwrap();
+        coll
+    };
+    let engine = Engine::open(&path).unwrap();
+    assert!(!engine.violations_table_ready());
+    let before = holds(&engine);
+    let step = engine
+        .violations_backfill_step(ExamineBudget { time: Duration::from_secs(60), rows: 1_000 })
+        .unwrap();
+    assert!(step.done && step.found == 1, "{step:?}");
+    let after = holds(&engine);
+    assert_eq!(after.0, before.0 + 1, "one commit for the step");
+    assert_eq!(after.1, before.1 + 1, "held as the violations holder");
+    assert_eq!(in_table(&engine).0.len(), 1, "the violation is recorded");
+    assert_eq!(in_table(&engine).1, tail(&engine), "through is persisted at the tail");
+    same_answer(&engine, &coll, "after the recording step");
+    engine.close().unwrap();
+
+    let engine = Engine::open(&path).unwrap();
+    assert!(engine.violations_table_ready(), "the recorded table is ready at the next open");
+    assert_in_step(&engine, "after the restart");
+    assert_eq!(engine.live_unique_violations(&coll, None, WalkScope::Request).unwrap().len(), 1);
+}
+
+/// **A retention pass moves `through` to the tail, whether or not it removed
+/// anything, and a pass with nothing written since commits nothing.** A start
+/// whose backfill found no violation leaves `through` behind and counts on the
+/// pass to move it, so the next start's rescan is a pass's writes. Counted from
+/// the engine's commit counter.
+#[test]
+fn a_retention_pass_advances_through_after_writes_and_commits_nothing_when_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    let policy = RetentionPolicy::new(86_400, 172_800);
+    let (engine, coll, _keep) = {
+        let engine = Engine::open(&path).unwrap();
+        engine.create_collection("db", "c").unwrap();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        (engine, coll, ())
+    };
+    for i in 0..3 {
+        engine.insert(&coll, doc! { "_id": format!("p{i}"), "email": format!("p{i}@x") }).unwrap();
+    }
+    assert_ne!(in_table(&engine).1, tail(&engine), "writes since `through`");
+
+    let before = engine.commits();
+    assert_eq!(engine.collect_garbage(policy).unwrap().oplog_removed, 0, "nothing to collect");
+    assert_eq!(engine.commits(), before + 1, "a pass after writes commits `through` once");
+    assert_eq!(in_table(&engine).1, tail(&engine), "through is at the tail");
+    assert_in_step(&engine, "after the advance");
+
+    let idle = engine.commits();
+    engine.collect_garbage(policy).unwrap();
+    engine.collect_garbage(policy).unwrap();
+    assert_eq!(engine.commits(), idle, "a pass with nothing written since commits nothing");
+
+    engine.insert(&coll, doc! { "_id": "q", "email": "q@x" }).unwrap();
+    let after_write = engine.commits();
+    engine.collect_garbage(policy).unwrap();
+    assert_eq!(engine.commits(), after_write + 1, "and one more after the next write");
+    engine.close().unwrap();
+    let engine = Engine::open(&path).unwrap();
+    assert!(engine.violations_table_ready(), "ready at the open, with nothing to scan");
+}
+
+/// A write that lands between the pass's read, which finds `through` behind the
+/// tail, and its write, which advances it, is covered: the advance takes the tail
+/// the writer sees, and a violation the write made is in the table already,
+/// because it went in with its own entry. The structural check holds after it: no
+/// row missing at or below `through`, and the ready table is the oplog's.
+#[test]
+fn a_violation_written_between_the_passes_check_and_its_advance_is_covered() {
+    let (engine, coll, _dir) = store();
+    engine.insert(&coll, doc! { "_id": "p", "email": "p@x" }).unwrap();
+    assert!(engine.violations_table_ready());
+    let seen_before = tail(&engine);
+    crate::violations_table::test_hooks::between_advance_check_and_write({
+        let coll = coll.clone();
+        move |engine| violate(engine, &coll, "gap", 1)
+    });
+    engine.collect_garbage(RetentionPolicy::new(86_400, 172_800)).unwrap();
+    assert_ne!(tail(&engine), seen_before, "the write landed in the gap");
+    assert_eq!(in_table(&engine).1, tail(&engine), "through is at the tail the writer saw");
+    assert_eq!(in_table(&engine).0.len(), 1, "the violation is recorded");
+    assert_in_step(&engine, "after the interleaved advance");
+    same_answer(&engine, &coll, "after the interleaved advance");
+}

@@ -463,6 +463,36 @@ fn start_plan(clustered: bool, seeds_name_another: bool, store_existed: bool) ->
     }
 }
 
+/// `KIMMY_TEST_FAIL_STORAGE`, armed on the first request the router answers
+/// 200, not at the swap: the tasks spawned before it have been committing since
+/// they started (the embedding worker's position, the first backfill), so a
+/// switch armed at the swap took whichever of them committed first, and the
+/// node exited before it answered. The name is checked now, so a bad one is
+/// said at the start, and nothing is armed.
+fn arm_storage_switch_when_serving(
+    front: &crate::front::Front,
+    engine: &Arc<Engine>,
+    call: String,
+) -> bool {
+    if !Engine::names_a_test_storage_failure(&call) {
+        warn!(
+            KIMMY_TEST_FAIL_STORAGE = %call,
+            "the storage test switch names no backend call, so nothing will happen; the names \
+             are read, write, sync_data, set_len and len"
+        );
+        return false;
+    }
+    // A weak reference: a front that never answers 200 must not hold the
+    // engine open past the node's close.
+    let engine = Arc::downgrade(engine);
+    front.on_first_ok(move || {
+        if let Some(engine) = engine.upgrade() {
+            engine.arm_test_storage_failure(&call);
+        }
+    });
+    true
+}
+
 async fn start_and_serve(config: Config) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -1263,9 +1293,10 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         }
     }
 
-    // From here the node is serving, which is the earliest the test switch may
-    // act: armed later than startup so it can never turn a start into a crash
-    // loop, and can never be mistaken for a startup failure.
+    // Armed here, just before the router is installed, and the kill waits a
+    // further `TEST_KILL_GRACE` after that: it lands after the node serves, so it
+    // can never turn a start into a crash loop, and can never be mistaken for a
+    // startup failure.
     kimmy_task::arm_test_kills();
     if let [rows, ms] = &serve_walk
         && (rows.is_some() || ms.is_some())
@@ -1308,14 +1339,8 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         Some(TestStop::SlowApply(delay)) => engine.slow_peer_applies(delay),
         _ => {}
     }
-    if let Some(call) = &fail_storage
-        && !engine.arm_test_storage_failure(call)
-    {
-        warn!(
-            KIMMY_TEST_FAIL_STORAGE = %call,
-            "the storage test switch names no backend call, so nothing will happen; the names \
-             are read, write, sync_data, set_len and len"
-        );
+    if let Some(call) = fail_storage {
+        arm_storage_switch_when_serving(&front, &engine, call);
     }
     // An accept error that is the HTTP listener's own, counted beside the
     // cluster listener's on `kimmy_accept_errors_total{listener}`.
@@ -4361,5 +4386,50 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// **`KIMMY_TEST_FAIL_STORAGE` arms on the first request the front answers
+    /// 200**, not when the router is installed. A commit before it, which is
+    /// what the tasks spawned ahead of the swap make in the first milliseconds,
+    /// and one after a request the router refused, do not take the fault; the
+    /// first commit after a served 200 does.
+    #[tokio::test]
+    async fn the_storage_switch_arms_on_the_first_served_200_and_not_before() {
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let front = crate::front::Front::new();
+        assert!(arm_storage_switch_when_serving(&front, &engine, "sync_data".into()));
+        let app = axum::Router::new().route("/ok", axum::routing::get(|| async { "up" }));
+        front.install(app);
+        let get = |path: &str| {
+            axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap()
+        };
+
+        // The first milliseconds: tasks commit, and nothing has been served.
+        engine.create_collection("shop", "before").expect("no fault before a served 200");
+        // A request the router refuses is not a served 200.
+        let refused = front.clone().oneshot(get("/missing")).await.unwrap();
+        assert_eq!(refused.status(), axum::http::StatusCode::NOT_FOUND);
+        engine.create_collection("shop", "after_a_404").expect("no fault after a 404");
+
+        let served = front.clone().oneshot(get("/ok")).await.unwrap();
+        assert_eq!(served.status(), axum::http::StatusCode::OK);
+        assert!(
+            engine.create_collection("shop", "after_a_200").is_err(),
+            "the first commit after a served 200 takes the fault"
+        );
+    }
+
+    /// A switch that names no backend call arms nothing, and says so at once.
+    #[tokio::test]
+    async fn a_storage_switch_that_names_no_call_arms_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let front = crate::front::Front::new();
+        assert!(!arm_storage_switch_when_serving(&front, &engine, "fsync".into()));
+        assert!(!arm_storage_switch_when_serving(&front, &engine, "sync_data@nowhere".into()));
+        assert!(arm_storage_switch_when_serving(&front, &engine, "sync_data@write".into()));
     }
 }

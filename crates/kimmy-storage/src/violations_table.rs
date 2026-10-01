@@ -115,7 +115,11 @@ impl ViolationsState {
 /// The violations table as a scrape reads it (ADR-200).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViolationsSnapshot {
-    /// The route answers from the table (`through` is at the oplog's tail).
+    /// The route answers from the table: it is complete through the oplog's
+    /// tail, as the open found it or as a backfill scan that reached the end of
+    /// its range found it. `through`, the marker on disk, may be behind the tail
+    /// meanwhile (a scan that finds nothing makes no commit), and a retention pass
+    /// moves it.
     pub ready: bool,
     /// Oplog rows the background pass has read.
     pub backfilled_rows: u64,
@@ -175,8 +179,11 @@ impl Engine {
     /// every entry appended after the scan's snapshot went through
     /// `append_oplog_at` in this process, which maintains the table, so nothing
     /// above the snapshot is missing, and under steady writes a step that
-    /// stopped at its snapshot's tail could never finish (ADR-200). `Background`
-    /// scope: a stop ends it.
+    /// stopped at its snapshot's tail could never finish (ADR-200). **A scan
+    /// that used up its range and found no violation takes no writer at all**: the
+    /// table is ready in memory and `through` is left for the retention pass
+    /// to advance (the same argument holds, since what was appended since the
+    /// snapshot maintains the table). `Background` scope: a stop ends it.
     pub fn violations_backfill_step(&self, budget: ExamineBudget) -> Result<BackfillStep> {
         if self.violations().ready() {
             return Ok(BackfillStep { done: true, scanned: 0, found: 0 });
@@ -185,7 +192,18 @@ impl Engine {
         #[cfg(test)]
         test_hooks::run(self);
         self.violations().backfilled_rows.fetch_add(scan.scanned, Relaxed);
-        let (kept, done) = self.record_violations_backfill(&scan)?;
+        // A scan that reached the end of its range and found nothing records
+        // nothing: the table is ready in memory and no commit is made, so that
+        // the start of a store whose tail holds no violation costs a read and
+        // no fsync (ADR-200). `through` stays where it is and the next start
+        // scans the same tail again; the retention pass advances it, once the
+        // table is ready. A scan that found rows, or that stopped at its budget
+        // and must keep its place, commits as before.
+        let (kept, done) = if scan.exhausted && scan.found.is_empty() {
+            (0, true)
+        } else {
+            self.record_violations_backfill(&scan)?
+        };
         if done {
             self.violations().set_ready();
         }
@@ -274,12 +292,32 @@ impl Engine {
     /// Advance `through` to the oplog's tail, in a retention pass, when the
     /// table is ready: everything up to the tail is in the table, since a
     /// build that maintains it wrote every violation since it became ready.
-    /// Not at a clean close: the rescan after a crash is bounded by the
-    /// retention interval, and a close gains no write (ADR-200).
+    /// Every pass does it, whether or not it removed entries, and commits only
+    /// when `through` is behind the tail: a start whose backfill found nothing
+    /// leaves `through` where it was and relies on this to move it, so the next
+    /// start's rescan is bounded by one pass's writes and not by the oplog's
+    /// retention. Not at a clean close: a close gains no write (ADR-200).
     pub(crate) fn advance_violations_through(&self) -> Result<()> {
         if !self.violations().ready() {
             return Ok(());
         }
+        // A read first, so that a pass on a node with nothing written since the
+        // last one commits nothing. Another write may land between this read and
+        // the writer, and the write below looks again.
+        {
+            let txn = self.db().begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let table = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            match oplog.last()? {
+                None => return Ok(()),
+                Some((tail, _)) if through_of(&table)?.as_deref() == Some(tail.value()) => {
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        }
+        #[cfg(test)]
+        test_hooks::before_advance_write(self);
         let txn = self.begin_write(WriterHolder::Retention)?;
         {
             let oplog = txn.open_table(tables::OPLOG)?;
@@ -310,6 +348,21 @@ pub(crate) mod test_hooks {
     thread_local! {
         static BETWEEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static EVERY: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_ADVANCE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, between the read that finds `through` behind the tail
+    /// and the write that advances it, in the next retention pass on this
+    /// thread: a write that lands in that gap.
+    pub(crate) fn between_advance_check_and_write(hook: impl Fn(&Engine) + 'static) {
+        BEFORE_ADVANCE.with(|h| *h.borrow_mut() = Some(Rc::new(hook)));
+    }
+
+    pub(super) fn before_advance_write(engine: &Engine) {
+        let once = BEFORE_ADVANCE.with(|h| h.borrow_mut().take());
+        if let Some(hook) = once {
+            hook(engine);
+        }
     }
 
     /// Run `hook` once, between the next step's read and its write.
