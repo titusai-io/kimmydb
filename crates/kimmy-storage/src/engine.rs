@@ -40,6 +40,17 @@ pub(crate) enum PairedShadows {
     Included,
 }
 
+/// The repairs redb made when an engine opened its store, after an unclean
+/// stop, by outcome: at most one in all, since a process opens its store once
+/// (ADR-204). `kimmy_store_repairs_total{rolled_back}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairsAtOpen {
+    /// Repairs that kept every commit.
+    pub kept: u64,
+    /// Repairs that rolled back the latest commit, which failed verification.
+    pub rolled_back: u64,
+}
+
 pub struct Engine {
     db: Database,
     /// Whether the storage has hit an I/O error, shared with the backend that
@@ -50,6 +61,9 @@ pub struct Engine {
     /// was opened, before this run wrote anything (ADR-202): the position a
     /// replay of this node's own origin asks a peer from.
     own_position_at_open: Hlc,
+    /// The repair redb made when this engine opened the store, if it made one
+    /// (ADR-204).
+    repairs_at_open: RepairsAtOpen,
     /// Guards the HLC. Every write takes this briefly to mint a stamp, so it
     /// must never be held across a redb commit.
     clock: Mutex<HlcClock>,
@@ -1121,11 +1135,20 @@ impl Engine {
         // 0.4 s per GiB of file, measured (ADR-188), so on a large store it is
         // the part of the start worth a line.
         let repairing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // And whether the repair rolled back the latest commit: redb calls
+        // back at 0.3 when the primary commit slot failed verification and the
+        // secondary was promoted, discarding that commit (redb 4.3,
+        // `db.rs:1471-1480`). Without this a rollback at the open was silent.
+        let rolled_back = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let opened = std::time::Instant::now();
         {
             let repairing = std::sync::Arc::clone(&repairing);
+            let rolled_back = std::sync::Arc::clone(&rolled_back);
             let path = path.display().to_string();
             builder.set_repair_callback(move |session| {
+                if existing && (session.progress() - 0.3).abs() < 1e-9 {
+                    rolled_back.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 if existing && !repairing.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     crate::open_progress::set_open_phase(
                         crate::open_progress::OpenPhase::Repairing,
@@ -1169,11 +1192,33 @@ impl Engine {
                 path.display()
             )));
         }
-        if repairing.load(std::sync::atomic::Ordering::Relaxed) {
-            warn!(
-                elapsed_ms = opened.elapsed().as_millis() as u64,
-                "database repaired after an unclean stop"
-            );
+        let repairs_at_open = match (
+            repairing.load(std::sync::atomic::Ordering::Relaxed),
+            rolled_back.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            (false, _) => RepairsAtOpen::default(),
+            (true, false) => {
+                warn!(
+                    elapsed_ms = opened.elapsed().as_millis() as u64,
+                    rolled_back = false,
+                    "database repaired after an unclean stop"
+                );
+                RepairsAtOpen { kept: 1, rolled_back: 0 }
+            }
+            (true, true) => {
+                warn!(
+                    elapsed_ms = opened.elapsed().as_millis() as u64,
+                    rolled_back = true,
+                    "database repaired after an unclean stop, rolling back its latest commit, \
+                     which failed verification: the commit the stop interrupted, or damage to \
+                     it. A commit a client was told had succeeded is not lost this way unless \
+                     the disk lost it; if the previous run ended cleanly, the store is damaged \
+                     (see operations.md, \"Checking a store\")"
+                );
+                RepairsAtOpen { kept: 0, rolled_back: 1 }
+            }
+        };
+        if repairs_at_open != RepairsAtOpen::default() {
             crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Opening);
         }
 
@@ -1302,6 +1347,7 @@ impl Engine {
             health,
             node_id,
             own_position_at_open,
+            repairs_at_open,
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
             vector_generations: Mutex::new(Default::default()),
@@ -3228,6 +3274,12 @@ impl Engine {
     /// (ADR-202).
     pub fn own_position_at_open(&self) -> Hlc {
         self.own_position_at_open
+    }
+
+    /// The repair redb made when this engine opened the store: one, by whether
+    /// it kept every commit or rolled back the latest, or none (ADR-204).
+    pub fn repairs_at_open(&self) -> RepairsAtOpen {
+        self.repairs_at_open
     }
 
     /// Whether the oplog holds the entry with this stamp, whatever it says.
@@ -7711,5 +7763,121 @@ mod clearing {
             assert_no_growth(before, file(&path), "the final page's release");
             break;
         }
+    }
+}
+
+/// What an open says when redb repairs the store: a `WARN` line naming whether
+/// the repair rolled back the latest commit, and `Engine::repairs_at_open`, which
+/// `/metrics` reads (ADR-204).
+#[cfg(test)]
+mod repairs_at_open {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use super::{Engine, RepairsAtOpen};
+
+    const LATEST: &str = "latest-marker-9876543210-zyxwvutsrqponmlkjihgfedcba-end";
+
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Open the store at `path`, and return what the open logged with the
+    /// engine's repairs and whether document `b` survived.
+    fn open_logged(path: &Path) -> (String, RepairsAtOpen, bool) {
+        let out = Captured(Arc::new(Mutex::new(Vec::new())));
+        let writer = out.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        let engine = tracing::subscriber::with_default(subscriber, || Engine::open(path).unwrap());
+        let c = engine.get_collection("shop", "orders").unwrap();
+        let b = engine.get(&c, &kimmy_core::DocId::String("b".into())).unwrap().is_some();
+        let logs = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        (logs, engine.repairs_at_open(), b)
+    }
+
+    fn fill(engine: &Engine) {
+        let c = engine.create_collection("shop", "orders").unwrap();
+        let docs = (0..300).map(|i| bson::doc! { "_id": format!("d{i}"), "n": i }).collect();
+        engine.insert_many(&c, docs).unwrap();
+        engine.insert(&c, bson::doc! { "_id": "b", "v": LATEST }).unwrap();
+    }
+
+    /// A copy of a store taken while an engine had it open.
+    fn an_unclean_store() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.redb");
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&live).unwrap();
+        fill(&engine);
+        std::fs::copy(&live, &path).unwrap();
+        std::fs::copy(crate::format::sidecar_path(&live), crate::format::sidecar_path(&path))
+            .unwrap();
+        drop(engine);
+        (dir, path)
+    }
+
+    #[test]
+    fn a_clean_store_and_a_new_one_open_with_no_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(engine.repairs_at_open(), RepairsAtOpen::default(), "a new store");
+        fill(&engine);
+        drop(engine);
+        let (logs, repairs, _) = open_logged(&path);
+        assert_eq!(repairs, RepairsAtOpen::default());
+        assert!(!logs.contains("repaired"), "{logs}");
+    }
+
+    #[test]
+    fn a_repair_that_keeps_every_commit_says_so() {
+        let (_dir, path) = an_unclean_store();
+        let (logs, repairs, b) = open_logged(&path);
+        assert_eq!(repairs, RepairsAtOpen { kept: 1, rolled_back: 0 });
+        let line = logs
+            .lines()
+            .find(|l| l.contains("database repaired after an unclean stop"))
+            .unwrap_or_else(|| panic!("no repair line: {logs}"));
+        assert!(line.contains("WARN") && line.contains("rolled_back=false"), "{line}");
+        assert!(b, "the latest commit was kept");
+    }
+
+    /// The latest commit damaged, on a store that was not closed: redb's open
+    /// rolls it back, which used to be silent.
+    #[test]
+    fn a_repair_that_rolls_back_the_latest_commit_says_so() {
+        let (_dir, path) = an_unclean_store();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at: Vec<usize> = bytes
+            .windows(LATEST.len())
+            .enumerate()
+            .filter(|(_, w)| *w == LATEST.as_bytes())
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!at.is_empty());
+        for i in at {
+            bytes[i + 16] ^= 1;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let (logs, repairs, b) = open_logged(&path);
+        assert_eq!(repairs, RepairsAtOpen { kept: 0, rolled_back: 1 });
+        let line = logs
+            .lines()
+            .find(|l| l.contains("database repaired after an unclean stop"))
+            .unwrap_or_else(|| panic!("no repair line: {logs}"));
+        assert!(line.contains("WARN") && line.contains("rolled_back=true"), "{line}");
+        assert!(line.contains("rolling back its latest commit"), "{line}");
+        assert!(!b, "the rolled-back commit's document is gone");
     }
 }

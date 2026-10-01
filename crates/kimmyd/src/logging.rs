@@ -359,6 +359,21 @@ impl TelemetryGuard {
             "Entries in the oplog now, read from the count the table keeps.",
             oplog_entries
         );
+        // Whether this process's open repaired the store, and how (ADR-204).
+        observe!(
+            u64_observable_counter,
+            "kimmy.store.repairs.kept",
+            "{repair}",
+            "Repairs redb made when this process opened the store, after an unclean stop, that kept every commit. At most one per process.",
+            |s| s.store_repairs.kept
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.store.repairs.rolled_back",
+            "{repair}",
+            "Repairs redb made when this process opened the store, after an unclean stop, that discarded the latest commit, which failed verification. After a clean shutdown, a damaged store.",
+            |s| s.store_repairs.rolled_back
+        );
         observe!(
             u64_observable_gauge,
             "kimmy.oplog.verified.entries",
@@ -1625,7 +1640,13 @@ impl Drop for TelemetryGuard {
 /// and `restore` pass `None`: neither serves, both exit in under a second, and
 /// starting an exporter for them would mean a config check opens a connection
 /// to production's collector.
-pub fn init(cfg: &LogConfig, telemetry: Option<&TelemetryConfig>) -> Result<TelemetryGuard> {
+/// Install the log. `to_stderr` writes it to stderr rather than stdout, for a
+/// command whose stdout is its answer (`check-store`).
+pub fn init(
+    cfg: &LogConfig,
+    telemetry: Option<&TelemetryConfig>,
+    to_stderr: bool,
+) -> Result<TelemetryGuard> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.level))
         .with_context(|| format!("invalid log filter {:?}", cfg.level))?;
@@ -1636,9 +1657,19 @@ pub fn init(cfg: &LogConfig, telemetry: Option<&TelemetryConfig>) -> Result<Tele
     // below has to be built against *one* subscriber type. Building it inside
     // each arm instead would mean writing the exporter setup twice, and the
     // half that would drift is the audit filter.
-    let fmt = match cfg.format {
-        LogFormat::Pretty => tracing_subscriber::fmt::layer().with_target(true).boxed(),
-        LogFormat::Json => tracing_subscriber::fmt::layer().json().with_target(true).boxed(),
+    let fmt = match (cfg.format, to_stderr) {
+        (LogFormat::Pretty, false) => tracing_subscriber::fmt::layer().with_target(true).boxed(),
+        (LogFormat::Json, false) => {
+            tracing_subscriber::fmt::layer().json().with_target(true).boxed()
+        }
+        (LogFormat::Pretty, true) => {
+            tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(true).boxed()
+        }
+        (LogFormat::Json, true) => tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .boxed(),
     };
 
     let Some(telemetry) = telemetry.filter(|t| t.is_configured()) else {
@@ -2160,8 +2191,10 @@ mod tests {
         // derivation that this round has removed three times. Two instruments
         // reading one field is the actual defect, and it needs no list.
         //
-        // Only calls whose last argument is a bare field are judged; several
-        // legitimately compute, and a closure is a departure rather than a typo.
+        // Only calls whose last argument is a bare field, or a closure that
+        // reads one field path (`|s| s.store_repairs.kept`), are judged;
+        // several legitimately compute, and those are departures rather than
+        // typos.
         let source = include_str!("logging.rs");
         let mut by_field: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for (at, _) in source.match_indices("observe!(") {
@@ -2172,8 +2205,11 @@ mod tests {
             let Some(name_end) = after.find('"') else { continue };
             let name = after[..name_end].to_string();
             let last = call.rsplit(',').next().unwrap_or_default().trim().trim_end_matches(',');
+            let last = last.strip_prefix("|s| s.").unwrap_or(last);
             let bare = !last.is_empty()
-                && last.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                && last
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.');
             if bare {
                 by_field.entry(last.to_string()).or_default().push(name);
             }

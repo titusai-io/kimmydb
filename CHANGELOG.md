@@ -12,6 +12,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`kimmyd check-store` verifies a stopped member's store against redb's page
+  checksums, writing nothing.** A serving node never verifies them: redb checks
+  them only in its repair after an unclean stop and in its own integrity check,
+  which needs the database to itself, so on a store closed cleanly a flipped bit
+  in a page that still decodes was served as data and nothing ever looked. The
+  command runs redb's integrity check over the store in the configured data
+  directory, through a view that keeps every write redb makes in memory, under
+  the store's lock, and prints one JSON line (`verdict`, `detail`,
+  `unclean_close`, `rolled_back`, `elapsed_ms`, `bytes_read`) with its log on
+  stderr. It exits 0 when the store verifies, 65 when it is damaged, and 1 when
+  it could not be checked (a node holds the store, there is no store, a newer
+  build wrote it, a read failed, or it was stopped). It needs no serving
+  configuration, reads the whole store, and does not read `hnsw/`. See
+  operations.md, "Checking a store", and ADR-204. Not a rollback boundary:
+  nothing stored changes.
+
+- **A start that repairs the store says whether the repair rolled back the
+  latest commit.** redb's repair after an unclean stop discards the latest
+  commit when it fails verification, and did so silently. The `WARN` line
+  `database repaired after an unclean stop` now carries `rolled_back`, and a
+  new counter, `kimmy_store_repairs_total{rolled_back}`, reads 0 or 1 for the
+  process. A rollback is the commit the stop interrupted, or damage to it;
+  after a clean shutdown it means the store is damaged.
+
 ### Changed
 
 - **Breaking: an update that writes one path twice is a `400`, and writes
@@ -94,6 +120,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   for a node without it. A test that sets it must now make a request that
   answers 200 (a poll of `/readyz` does), and a name that is not a backend call
   is still said at the start.
+- **A start that failed after it opened the store, with a thread still holding
+  it, no longer records that it closed the store.** With no engine handed back,
+  the stop called the store closed, and its exit marker said `error`; a thread
+  holding the engine past the runtime's shutdown left the store open, and the
+  next start repaired it under a marker that said otherwise. The stop now reads
+  the store's header in that case, and a store still open is recorded as
+  `storage_not_closed`, with exit 75, as for a stop that could not close it.
+
 - **A clustered start that can never write its replay floor is refused before
   the store is opened, and leaves no temporary file.** The floor
   (`kimmy.replay-floor`) is written right after the open, from the position

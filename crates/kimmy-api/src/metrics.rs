@@ -82,6 +82,9 @@ pub struct StorageReadings {
     /// ADR-173's addendum of 2026-09-26).
     pub oplog_entries: u64,
     pub oplog_verified: kimmy_storage::VerifiedWalk,
+    /// The repair redb made when the store was opened, by whether it rolled
+    /// back the latest commit (`Engine::repairs_at_open`, ADR-204).
+    pub store_repairs: kimmy_storage::RepairsAtOpen,
     /// The storage engine's page cache: its fill (read cache and write
     /// buffer together), evictions, and page reads hit and missed, since the
     /// database was opened (`Engine::cache_reading`).
@@ -263,6 +266,8 @@ pub struct MetricsSnapshot {
     /// As [`StorageReadings::oplog_entries`] and [`StorageReadings::oplog_verified`].
     pub oplog_entries: u64,
     pub oplog_verified: kimmy_storage::VerifiedWalk,
+    /// As [`StorageReadings::store_repairs`].
+    pub store_repairs: kimmy_storage::RepairsAtOpen,
     /// The storage engine's page cache, as [`StorageReadings::storage_cache`].
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
@@ -1129,6 +1134,7 @@ impl Metrics {
             storage_bytes: readings.storage_bytes,
             oplog_entries: readings.oplog_entries,
             oplog_verified: readings.oplog_verified,
+            store_repairs: readings.store_repairs,
             storage_cache: readings.storage_cache,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
             process_resident_bytes: readings.process_resident_bytes,
@@ -1396,6 +1402,10 @@ impl Metrics {
              # TYPE kimmy_storage_bytes gauge\n\
              kimmy_storage_bytes {storage}\n\
              {storage_cache}\
+             # HELP kimmy_store_repairs_total Repairs redb made when this process opened the store, after an unclean stop: rolled_back=\"false\" kept every commit; rolled_back=\"true\" discarded the latest commit, which failed verification - the commit the stop interrupted, or damage to it. At most one per process. A rollback after a clean shutdown means a damaged store.\n\
+             # TYPE kimmy_store_repairs_total counter\n\
+             kimmy_store_repairs_total{{rolled_back=\"false\"}} {repairs_kept}\n\
+             kimmy_store_repairs_total{{rolled_back=\"true\"}} {repairs_rolled_back}\n\
              # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.\n\
              # TYPE kimmy_oplog_entries gauge\n\
              kimmy_oplog_entries {oplog_entries}\n\
@@ -1620,6 +1630,8 @@ impl Metrics {
             writer_hold_max = readings.writer_hold_max_us as f64 / 1e6,
             storage = readings.storage_bytes,
             oplog_entries = readings.oplog_entries,
+            repairs_kept = readings.store_repairs.kept,
+            repairs_rolled_back = readings.store_repairs.rolled_back,
             oplog_verified_entries = readings.oplog_verified.rows,
             oplog_verified_bytes = readings.oplog_verified.logical_bytes,
             oplog_verified_secs = readings.oplog_verified.elapsed_ms as f64 / 1e3,
@@ -2342,6 +2354,7 @@ mod tests {
                 logical_bytes: 1_303,
                 elapsed_ms: 1_304,
             },
+            store_repairs: kimmy_storage::RepairsAtOpen { kept: 1_401, rolled_back: 1_402 },
             storage_cache: kimmy_storage::CacheReading {
                 used_bytes: 9_101,
                 evictions: 9_102,
@@ -2783,6 +2796,10 @@ kimmy_write_lock_held_cpu_unmeasured_total 99
 # HELP kimmy_storage_bytes Size of the database file on disk.
 # TYPE kimmy_storage_bytes gauge
 kimmy_storage_bytes 47
+# HELP kimmy_store_repairs_total Repairs redb made when this process opened the store, after an unclean stop: rolled_back=\"false\" kept every commit; rolled_back=\"true\" discarded the latest commit, which failed verification - the commit the stop interrupted, or damage to it. At most one per process. A rollback after a clean shutdown means a damaged store.
+# TYPE kimmy_store_repairs_total counter
+kimmy_store_repairs_total{rolled_back=\"false\"} 1401
+kimmy_store_repairs_total{rolled_back=\"true\"} 1402
 # HELP kimmy_oplog_entries Entries in the oplog now, read from the count the table keeps. What an open that walks the oplog reads, with their bytes.
 # TYPE kimmy_oplog_entries gauge
 kimmy_oplog_entries 1301
@@ -3301,6 +3318,14 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.oplog_verified.elapsed_ms as f64 / 1e3
         ));
         expect(&format!("kimmy_storage_bytes {}\n", s.storage_bytes));
+        expect(&format!(
+            "kimmy_store_repairs_total{{rolled_back=\"false\"}} {}\n",
+            s.store_repairs.kept
+        ));
+        expect(&format!(
+            "kimmy_store_repairs_total{{rolled_back=\"true\"}} {}\n",
+            s.store_repairs.rolled_back
+        ));
         if cfg!(feature = "storage-cache-metrics") {
             expect(&format!("kimmy_storage_cache_bytes {}\n", s.storage_cache.used_bytes));
             expect(&format!("kimmy_storage_cache_evictions_total {}\n", s.storage_cache.evictions));
@@ -3780,6 +3805,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // vector: entries, logical bytes and seconds (ADR-173's
                 // addendum of 2026-09-26).
                 + 4
+                // The repair at the open, kept and rolled back (ADR-204).
+                + 2
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT

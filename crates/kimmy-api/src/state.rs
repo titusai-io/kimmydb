@@ -216,6 +216,9 @@ impl AppState {
             // A count from the table's root and one `get`.
             oplog_entries: self.engine.oplog_entries()?,
             oplog_verified: self.engine.version_vector_verified()?.unwrap_or_default(),
+            // Fixed at the open: whether redb repaired the store, and how
+            // (ADR-204).
+            store_repairs: self.engine.repairs_at_open(),
             // redb's own counters for the cache `storage.cache_bytes` bounds:
             // what it holds now, and how it has been doing since open. Only
             // in a build that has them; the render then omits the series.

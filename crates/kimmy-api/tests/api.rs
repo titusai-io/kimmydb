@@ -8660,6 +8660,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         Vec::new()
     })
     .chain([
+        "kimmy_store_repairs_total",
+        "kimmy_store_repairs_total",
         "kimmy_oplog_entries",
         "kimmy_oplog_verified_entries",
         "kimmy_oplog_verified_logical_bytes",

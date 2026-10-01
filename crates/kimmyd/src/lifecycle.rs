@@ -264,6 +264,32 @@ impl std::fmt::Display for InUse {
 
 impl std::error::Error for InUse {}
 
+/// How the previous run left the store, for `kimmyd check-store`, read
+/// without moving, removing or writing anything (ADR-204).
+///
+/// The store was closed cleanly only when the marker says so: a shutdown, a
+/// restore, or a run that ended on an error after it had served, which closes
+/// the store before its marker is written. A start that failed before it
+/// served is not clean, whatever it carried, and neither is a task's death,
+/// a storage failure, a close that failed, an unreadable marker, a marker set
+/// aside by a start that was itself ended, or no marker at all: the store may
+/// not have been closed, so a rollback at the check's open is the torn write
+/// redb's repair exists for.
+pub fn previous_run_for_check(data_dir: &Path) -> kimmy_storage::check::PreviousRun {
+    use kimmy_storage::check::PreviousRun;
+    let Ok(body) = std::fs::read_to_string(data_dir.join(LAST_EXIT_FILE)) else {
+        return PreviousRun::NotClean;
+    };
+    let Ok(last) = toml::from_str::<LastExit>(&body) else { return PreviousRun::NotClean };
+    // A failed start may not have closed a store it opened: its engine may
+    // still have been held by a thread when the process stopped. Not clean
+    // is always safe here, since a store it did close needs no repair and
+    // checks clean all the same.
+    let clean =
+        !last.failed_start && matches!(last.exit, Exit::Shutdown | Exit::Restore | Exit::Error);
+    if clean { PreviousRun::EndedCleanly } else { PreviousRun::NotClean }
+}
+
 /// Hold the data directory for as long as the returned handle lives, before
 /// anything in it is read or set aside. A second start on a live directory
 /// stops here. Before this, it set the live node's marker aside, failed at
@@ -798,6 +824,68 @@ mod tests {
         let db = dir.path().join("kimmy.redb");
         std::fs::write(&db, b"not a real database").unwrap();
         (dir, db)
+    }
+
+    /// `check-store` reads the marker without moving it, and calls the store
+    /// closed cleanly only when the marker says the run that wrote it closed
+    /// the store (ADR-204).
+    #[test]
+    fn check_store_reads_a_clean_close_only_from_a_marker_that_says_so() {
+        use kimmy_storage::check::PreviousRun::{EndedCleanly, NotClean};
+        let earlier = |exit: &str| Earlier {
+            exit: exit.to_string(),
+            version: None,
+            at_ms: None,
+            cause: None,
+            last_write_secs_ago: None,
+        };
+        let failed_start = |previous: Option<Earlier>| {
+            let mut last = LastExit::now(Exit::Error);
+            last.failed_start = true;
+            last.previous = previous;
+            last
+        };
+        let cases = [
+            (Some(LastExit::now(Exit::Shutdown)), EndedCleanly),
+            (Some(LastExit::now(Exit::Restore)), EndedCleanly),
+            (Some(LastExit::now(Exit::Error)), EndedCleanly),
+            (Some(LastExit::now(Exit::TaskDied)), NotClean),
+            (Some(LastExit::now(Exit::StorageFailed)), NotClean),
+            (Some(LastExit::now(Exit::StorageNotClosed)), NotClean),
+            (Some(failed_start(Some(earlier("shutdown")))), NotClean),
+            (Some(failed_start(Some(earlier("restore")))), NotClean),
+            (Some(failed_start(Some(earlier("error")))), NotClean),
+            (Some(failed_start(Some(earlier("unclean")))), NotClean),
+            (Some(failed_start(None)), NotClean),
+            (None, NotClean),
+        ];
+        for (marker, want) in cases {
+            let (dir, _db) = dir_with_database();
+            if let Some(last) = &marker {
+                assert!(write_marker(dir.path(), last.clone(), last.exit));
+            }
+            let before = std::fs::read(dir.path().join(LAST_EXIT_FILE)).ok();
+            assert_eq!(previous_run_for_check(dir.path()), want, "{marker:?}");
+            assert_eq!(
+                std::fs::read(dir.path().join(LAST_EXIT_FILE)).ok(),
+                before,
+                "the marker is left where it was"
+            );
+            assert!(!dir.path().join(PREVIOUS_FILE).exists());
+        }
+        // A marker set aside by a start that was killed, with none beside it,
+        // is an unclean end, whatever it says.
+        let (dir, _db) = dir_with_database();
+        std::fs::write(
+            dir.path().join(PREVIOUS_FILE),
+            toml::to_string(&LastExit::now(Exit::Shutdown)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(previous_run_for_check(dir.path()), NotClean);
+        // And one that does not parse.
+        let (dir, _db) = dir_with_database();
+        std::fs::write(dir.path().join(LAST_EXIT_FILE), "exit = \"shutdown\"\n").unwrap();
+        assert_eq!(previous_run_for_check(dir.path()), NotClean);
     }
 
     #[test]

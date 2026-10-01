@@ -88,9 +88,12 @@ pub enum StorageError {
 
     /// The store was refused before anything opened it for writing, and
     /// nothing in it was changed (ADR-190): a newer build wrote it, its
-    /// sidecar is unreadable, or it could not be read.
-    #[error("{0}")]
-    RefusedStore(String),
+    /// sidecar is unreadable, or it could not be read. `kind` says which of
+    /// those it was, so `kimmyd check-store` can tell damage from a store
+    /// that is only newer than this build (ADR-204); a serving start refuses
+    /// every kind alike.
+    #[error("{why}")]
+    RefusedStore { kind: RefusedKind, why: String },
 
     /// Another process has the store open, so this one does not open it and
     /// writes nothing. Its own variant because a second start on a live data
@@ -123,6 +126,23 @@ pub enum StorageError {
     /// and replicating; `cause` is why the request stopped there.
     #[error("the request was partly applied ({applied}) and then failed: {cause}")]
     PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+}
+
+/// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).
+///
+/// Only [`RefusedKind::Damaged`] says the store itself is damaged. A store a
+/// newer build wrote is healthy, and telling an operator to wipe it would lose
+/// it; a refusal for any other reason (an unreadable sidecar, a store that
+/// changed while it was checked, a read that failed) says nothing either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusedKind {
+    /// The header, a commit slot or a root cannot be right, or redb refused
+    /// the store as corrupted or panicked reading it.
+    Damaged,
+    /// A newer build wrote it: a newer schema, redb or file format.
+    Newer,
+    /// Neither: the store may be healthy, and this refusal cannot say.
+    Other,
 }
 
 /// Why a continuing request was stopped; see [`StorageError::Stopping`].

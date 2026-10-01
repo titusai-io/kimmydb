@@ -56,6 +56,18 @@ pub enum Command {
         #[arg(long)]
         until: Option<u64>,
     },
+    /// Verify a stopped node's store against redb's page checksums, then exit.
+    ///
+    /// Reads the store in the configured data directory, writing nothing to
+    /// it or beside it, and prints one JSON line on stdout: `verdict`,
+    /// `detail`, `unclean_close`, `rolled_back`, `elapsed_ms` and
+    /// `bytes_read`. Logs go to stderr. Exits 0 when the store verifies, 65
+    /// when it is damaged, and 1 when it could not be checked: a node holds
+    /// it, there is no store, a newer build wrote it, its `kimmy.format` is
+    /// unreadable, it changed during the check, it is in an older redb file
+    /// format a start would upgrade, a read failed, or the check was stopped
+    /// (ADR-204). Reads the whole store; see operations.md for the cost.
+    CheckStore,
 }
 
 /// Flags that override config-file values. Every one is optional so that
@@ -272,8 +284,9 @@ impl Cli {
         // serves, never authenticates anybody, and never joins a cluster, so
         // holding it to the serving configuration would mean an operator
         // recovering from an incident has to supply a root password to a
-        // command that will not use one. Found by running it.
-        if !matches!(self.command, Some(Command::Restore { .. })) {
+        // command that will not use one. Found by running it. `check-store`
+        // reads a stopped node's store and exits, for the same reason.
+        if !matches!(self.command, Some(Command::Restore { .. } | Command::CheckStore)) {
             cfg.validate()?;
         }
         Ok(cfg)

@@ -1,8 +1,9 @@
 avoid-breaking-exported-api = false
 
 # A store is opened for writing only after the check before it (ADR-190):
-# through `Engine::open_cleared`, which takes the check's token, or by a
-# restore, which creates a new file. Tests build stores directly.
+# through `Engine::open_cleared`, which takes the check's token, by a restore,
+# which creates a new file, or by `check::check_store`, on a copy-on-write view
+# that never writes to the file (ADR-204). Tests build stores directly.
 disallowed-methods = [
     { path = "redb::Database::create", reason = "open a store through Engine::open, after the ADR-190 check" },
     { path = "redb::Database::open", reason = "open a store through Engine::open, after the ADR-190 check" },

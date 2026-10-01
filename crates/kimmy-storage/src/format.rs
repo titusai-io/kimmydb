@@ -44,7 +44,7 @@ use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::error::{Result, StorageError};
+use crate::error::{RefusedKind, Result, StorageError};
 use crate::tables;
 
 /// The redb major.minor this build is compiled against. `Cargo.toml` pins redb
@@ -158,10 +158,18 @@ pub fn check_before_open(database: &Path) -> Result<Cleared> {
 /// Read the store at `database` without writing to it, and refuse it if a newer
 /// build wrote it (see the module docs).
 pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<Cleared> {
-    let sidecar_file = sidecar_path(database);
     // A temporary sidecar left by a crash mid-write is never read: the rename
     // either happened or it did not.
-    remove_stale_temporaries(&sidecar_file);
+    remove_stale_temporaries(&sidecar_path(database));
+    check_reading_only(database, build)
+}
+
+/// The same check, removing nothing: what `kimmyd check-store` runs, since a
+/// check of a stopped member's store writes nothing in its data directory
+/// (ADR-204). A temporary sidecar is never read, so leaving one changes no
+/// verdict.
+pub(crate) fn check_reading_only(database: &Path, build: &BuildVersions) -> Result<Cleared> {
+    let sidecar_file = sidecar_path(database);
     let len = match std::fs::metadata(database) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -180,7 +188,11 @@ pub fn check_before_open_with(database: &Path, build: &BuildVersions) -> Result<
         });
     }
     if (len as usize) < HEADER_LEN {
-        return Err(refused(database, format!("the file is {len} bytes, shorter than a header")));
+        return Err(refused(
+            database,
+            RefusedKind::Damaged,
+            format!("the file is {len} bytes, shorter than a header"),
+        ));
     }
     let header = read_header(&mut std::fs::File::open(database)?)?;
     check_header(database, &header, build)?;
@@ -234,13 +246,18 @@ fn read_header(file: &mut std::fs::File) -> Result<Vec<u8>> {
 
 fn check_header(database: &Path, header: &[u8], build: &BuildVersions) -> Result<()> {
     if header[..MAGIC.len()] != MAGIC {
-        return Err(refused(database, "the file does not begin with redb's magic".into()));
+        return Err(refused(
+            database,
+            RefusedKind::Damaged,
+            "the file does not begin with redb's magic".into(),
+        ));
     }
     for offset in SLOT_OFFSETS {
         let format = header[offset];
         if format > build.file_format {
             return Err(refused(
                 database,
+                RefusedKind::Newer,
                 format!(
                     "redb file format {format} is newer than this build writes ({}); a build \
                      with a newer redb wrote it",
@@ -334,6 +351,7 @@ fn check_roots(database: &Path, header: &[u8], len: u64) -> Result<()> {
     };
     Err(refused(
         database,
+        RefusedKind::Damaged,
         format!(
             "its {which} a root page past the file's end (read as order {order}, bytes \
              {}..{}, file {len} bytes), so it is damaged. {DAMAGED_WAY_OUT}",
@@ -343,12 +361,14 @@ fn check_roots(database: &Path, header: &[u8], len: u64) -> Result<()> {
 }
 
 fn parse_sidecar(path: &Path, bytes: &[u8]) -> Result<Sidecar> {
-    let unreadable = |why: String| {
-        StorageError::RefusedStore(format!(
-            "{} is unreadable ({why}). It records which builds may open this store: restore it \
-             from the source directory or the backup, or see operations.md; do not delete it",
+    let unreadable = |why: String| StorageError::RefusedStore {
+        kind: RefusedKind::Other,
+        why: format!(
+            "{} is unreadable ({why}). It records which builds may open this store: restore \
+                 it from the source directory or the backup, or see operations.md; do not delete \
+                 it",
             path.display()
-        ))
+        ),
     };
     let text = std::str::from_utf8(bytes).map_err(|e| unreadable(e.to_string()))?;
     let sidecar: Sidecar = toml::from_str(text).map_err(|e| unreadable(e.to_string()))?;
@@ -387,9 +407,11 @@ fn check_sidecar(database: &Path, sidecar: &Sidecar, build: &BuildVersions) -> R
         None
     };
     match newer {
-        Some(what) => {
-            Err(refused(database, format!("it was written by {} with {what}", sidecar.written_by)))
-        }
+        Some(what) => Err(refused(
+            database,
+            RefusedKind::Newer,
+            format!("it was written by {} with {what}", sidecar.written_by),
+        )),
         None => Ok(()),
     }
 }
@@ -416,7 +438,7 @@ fn read_only_fallback_unless_it_panics(database: &Path, build: &BuildVersions) -
     redb_time::add(started.elapsed());
     match read {
         Ok(read) => read,
-        Err(panic) => Err(refused(database, redb_panicked(&*panic))),
+        Err(panic) => Err(refused(database, RefusedKind::Damaged, redb_panicked(&*panic))),
     }
 }
 
@@ -475,6 +497,7 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
             {
                 return Err(refused(
                     database,
+                    RefusedKind::Newer,
                     format!("storage schema {schema} (this build: {})", build.schema),
                 ));
             }
@@ -483,6 +506,7 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
             {
                 return Err(refused(
                     database,
+                    RefusedKind::Newer,
                     format!(
                         "redb {version} last wrote it (this build: {}.{})",
                         build.redb.0, build.redb.1
@@ -493,12 +517,15 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
         }
         Err(redb::DatabaseError::RepairAborted) => Ok(Prior::DirtyNoSidecar),
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(in_use(database)),
-        Err(e) => Err(refused(
-            database,
-            header_refusal(&e).unwrap_or_else(|| {
-                format!("it could not be read before opening it for writing: {e}")
-            }),
-        )),
+        Err(e) => {
+            let (kind, why) = header_refusal(&e).unwrap_or_else(|| {
+                (
+                    RefusedKind::Other,
+                    format!("it could not be read before opening it for writing: {e}"),
+                )
+            });
+            Err(refused(database, kind, why))
+        }
     }
 }
 
@@ -517,15 +544,19 @@ fn read_only_fallback(database: &Path, build: &BuildVersions) -> Result<Prior> {
 /// the first tree read, before `begin_writable` writes. A `Corrupted` from a
 /// tree walk during a repair can follow a write, which is why
 /// [`Cleared::after_failed_open`] also looks at the file.
-fn header_refusal(error: &redb::DatabaseError) -> Option<String> {
+fn header_refusal(error: &redb::DatabaseError) -> Option<(RefusedKind, String)> {
     match error {
-        redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => {
-            Some(format!("redb refused it as damaged ({why}). {DAMAGED_WAY_OUT}"))
-        }
-        redb::DatabaseError::UpgradeRequired(format) => Some(format!(
-            "it is in redb file format {format}, which redb would upgrade by writing to it. \
-             Start the build that wrote it, or restore a backup (see operations.md, \"Rolling \
-             back, and kimmy.format\")"
+        redb::DatabaseError::Storage(redb::StorageError::Corrupted(why)) => Some((
+            RefusedKind::Damaged,
+            format!("redb refused it as damaged ({why}). {DAMAGED_WAY_OUT}"),
+        )),
+        redb::DatabaseError::UpgradeRequired(format) => Some((
+            RefusedKind::Other,
+            format!(
+                "it is in redb file format {format}, which redb would upgrade by writing to it. \
+                 Start the build that wrote it, or restore a backup (see operations.md, \"Rolling \
+                 back, and kimmy.format\")"
+            ),
         )),
         _ => None,
     }
@@ -540,11 +571,14 @@ pub(crate) fn in_use(database: &Path) -> StorageError {
     ))
 }
 
-fn refused(database: &Path, why: String) -> StorageError {
-    StorageError::RefusedStore(format!(
-        "{} is not opened by this build, and nothing in it was changed: {why}",
-        database.display()
-    ))
+fn refused(database: &Path, kind: RefusedKind, why: String) -> StorageError {
+    StorageError::RefusedStore {
+        kind,
+        why: format!(
+            "{} is not opened by this build, and nothing in it was changed: {why}",
+            database.display()
+        ),
+    }
 }
 
 impl Cleared {
@@ -562,8 +596,8 @@ impl Cleared {
         error: redb::DatabaseError,
         sidecar_written: bool,
     ) -> StorageError {
-        let Some(why) = header_refusal(&error) else { return error.into() };
-        self.refuse_unwritten(database, why, sidecar_written).unwrap_or_else(|| error.into())
+        let Some((kind, why)) = header_refusal(&error) else { return error.into() };
+        self.refuse_unwritten(database, kind, why, sidecar_written).unwrap_or_else(|| error.into())
     }
 
     /// What a read-write open that panicked in redb returns, by the same rule
@@ -581,7 +615,7 @@ impl Cleared {
         sidecar_written: bool,
     ) -> StorageError {
         let why = redb_panicked(panic);
-        self.refuse_unwritten(database, why.clone(), sidecar_written)
+        self.refuse_unwritten(database, RefusedKind::Damaged, why.clone(), sidecar_written)
             .unwrap_or_else(|| StorageError::Database(format!("{}: {why}", database.display())))
     }
 
@@ -597,23 +631,27 @@ impl Cleared {
     fn refuse_unwritten(
         &self,
         database: &Path,
+        kind: RefusedKind,
         why: String,
         sidecar_written: bool,
     ) -> Option<StorageError> {
         if !sidecar_written {
-            return self.store_unchanged(database).then(|| refused(database, why));
+            return self.store_unchanged(database).then(|| refused(database, kind, why));
         }
         #[cfg(test)]
         crate::store_lock::test_hooks::before_put_back(database);
         // Unlocked, the file cannot be looked at for what redb wrote, so this
         // refusal claims nothing about it, unlike [`refused`].
         let Some(relocked) = crate::store_lock::StoreLock::relock(database) else {
-            return Some(StorageError::RefusedStore(format!(
-                "{} is not opened by this build: {why}. It could not be locked again to check \
-                 it, so {} keeps this build's",
-                database.display(),
-                sidecar_path(database).display()
-            )));
+            return Some(StorageError::RefusedStore {
+                kind,
+                why: format!(
+                    "{} is not opened by this build: {why}. It could not be locked again to check \
+                     it, so {} keeps this build's",
+                    database.display(),
+                    sidecar_path(database).display()
+                ),
+            });
         };
         if !self.store_unchanged(database) {
             return None;
@@ -626,17 +664,26 @@ impl Cleared {
             };
             if let Err(e) = put_back {
                 drop(relocked);
-                return Some(StorageError::RefusedStore(format!(
-                    "{} is not opened by this build: {why}. Nothing in it was written, but the \
-                     sidecar written before redb's open could not be put back ({e}); restore \
-                     {} from the backup",
-                    database.display(),
-                    path.display()
-                )));
+                return Some(StorageError::RefusedStore {
+                    kind,
+                    why: format!(
+                        "{} is not opened by this build: {why}. Nothing in it was written, but \
+                         the sidecar written before redb's open could not be put back ({e}); \
+                         restore {} from the backup",
+                        database.display(),
+                        path.display()
+                    ),
+                });
             }
         }
         drop(relocked);
-        Some(refused(database, why))
+        Some(refused(database, kind, why))
+    }
+
+    /// Whether the check found no store, or an empty file: the read-write open
+    /// would lay a new one out.
+    pub(crate) fn fresh(&self) -> bool {
+        matches!(self.prior, Prior::Fresh)
     }
 
     /// Whether the database's header and length are still what the check read.
@@ -658,7 +705,11 @@ impl Cleared {
         } else if len == 0 {
             None
         } else {
-            return Err(refused(database, "it was created while it was being checked".into()));
+            return Err(refused(
+                database,
+                RefusedKind::Other,
+                "it was created while it was being checked".into(),
+            ));
         };
         let sidecar = match std::fs::read(sidecar_path(database)) {
             Ok(bytes) => Some(bytes),
@@ -667,7 +718,11 @@ impl Cleared {
         };
         let sidecar_matters = !matches!(self.prior, Prior::Fresh);
         if header != self.header || (sidecar_matters && sidecar != self.sidecar) {
-            return Err(refused(database, "it changed while it was being checked".into()));
+            return Err(refused(
+                database,
+                RefusedKind::Other,
+                "it changed while it was being checked".into(),
+            ));
         }
         // The same header, against the file's length now.
         if let Some(header) = &header {
@@ -877,7 +932,7 @@ mod tests {
     fn assert_refused_untouched(path: &Path, build: &BuildVersions, what: &str) {
         let before = snapshot(path);
         match Engine::open_as(path, None, build) {
-            Err(StorageError::RefusedStore(why)) => {
+            Err(StorageError::RefusedStore { why, .. }) => {
                 assert!(
                     why.contains("nothing in it was changed") || why.contains("unreadable"),
                     "{what}: {why}"
@@ -975,7 +1030,7 @@ mod tests {
             Err(redb::DatabaseError::RepairAborted)
         ));
         match Engine::open(&copy) {
-            Err(StorageError::RefusedStore(why)) => assert!(why.contains(&newer), "{why}"),
+            Err(StorageError::RefusedStore { why, .. }) => assert!(why.contains(&newer), "{why}"),
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a store a newer redb wrote"),
         }
@@ -1037,7 +1092,7 @@ mod tests {
             }
             let before = snapshot(&path);
             match Engine::open_cleared(&path, None, cleared) {
-                Err(StorageError::RefusedStore(why)) => {
+                Err(StorageError::RefusedStore { why, .. }) => {
                     assert!(why.contains("changed while it was being checked"), "{what}: {why}")
                 }
                 Err(other) => panic!("{what}: refused with the wrong error: {other}"),
@@ -1212,7 +1267,7 @@ mod tests {
         let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
         assert!(matches!(
             Engine::open_as(&path, None, &older()),
-            Err(StorageError::RefusedStore(_)) | Err(StorageError::UnsupportedFormat { .. })
+            Err(StorageError::RefusedStore { .. }) | Err(StorageError::UnsupportedFormat { .. })
         ));
         assert!(
             matches!(Engine::open(&path), Err(StorageError::StoreInUse(_))),
@@ -1475,7 +1530,7 @@ mod tests {
                         .is_some();
                     format!("opened found={found}")
                 }
-                Err(StorageError::RefusedStore(why)) => format!("refused {why}"),
+                Err(StorageError::RefusedStore { why, .. }) => format!("refused {why}"),
                 Err(StorageError::StoreInUse(why)) => format!("in_use {why}"),
                 Err(other) => format!("error {other}"),
             };
@@ -1754,7 +1809,7 @@ mod tests {
         crate::store_lock::test_hooks::BEFORE_PUT_BACK.with(|p| p.borrow_mut().take());
         assert!(holder.borrow().is_some(), "the probe ran");
         match result {
-            Err(StorageError::RefusedStore(why)) => assert!(
+            Err(StorageError::RefusedStore { why, .. }) => assert!(
                 why.contains("damaged")
                     && why.contains("could not be locked again to check it")
                     && !why.contains("nothing in it was changed"),
@@ -1769,7 +1824,7 @@ mod tests {
 
         // Nothing holding it: put back, and the lock let go after.
         with_sidecar(&path, |s| s.redb_version = "4.1".into());
-        assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore(_))));
+        assert!(matches!(Engine::open(&path), Err(StorageError::RefusedStore { .. })));
         assert_eq!(read_sidecar(&path).unwrap().redb_version, "4.1", "put back");
         std::fs::File::open(&path).unwrap().try_lock().expect("the put-back let the lock go");
     }
@@ -1783,7 +1838,7 @@ mod tests {
         damage_page_order_validly(&path, 1);
         for attempt in ["first", "second"] {
             match Engine::open(&path) {
-                Err(StorageError::RefusedStore(why)) => {
+                Err(StorageError::RefusedStore { why, .. }) => {
                     assert!(why.contains(REDB_PANICKED), "{attempt}: {why}")
                 }
                 Err(other) => panic!("{attempt}: refused with the wrong error: {other}"),
@@ -1846,7 +1901,9 @@ mod tests {
         std::fs::write(&path, &bytes[..8192]).unwrap();
         let before = fingerprints(&path);
         match Engine::open_cleared(&path, None, cleared) {
-            Err(StorageError::RefusedStore(why)) => assert!(why.contains(ROOT_PAST_END), "{why}"),
+            Err(StorageError::RefusedStore { why, .. }) => {
+                assert!(why.contains(ROOT_PAST_END), "{why}")
+            }
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened a store cut short"),
         }
@@ -1984,7 +2041,7 @@ mod tests {
         let result = Engine::open(&path);
         crate::hold_meter::test_hooks::ARM_AT_OPEN.with(|a| a.set(None));
         match result {
-            Err(StorageError::RefusedStore(why)) => {
+            Err(StorageError::RefusedStore { why, .. }) => {
                 panic!("refused, as if nothing was written: {why}")
             }
             Err(_) => {}
@@ -2017,7 +2074,7 @@ mod tests {
                 let sidecar = std::fs::read(sidecar_path(&path)).unwrap();
                 if changed {
                     assert!(
-                        !matches!(returned, StorageError::RefusedStore(_)),
+                        !matches!(returned, StorageError::RefusedStore { .. }),
                         "{what}, changed: {returned}"
                     );
                     assert_ne!(
@@ -2026,7 +2083,7 @@ mod tests {
                     );
                 } else {
                     assert!(
-                        matches!(&returned, StorageError::RefusedStore(why) if why.contains("nothing in it was changed")),
+                        matches!(&returned, StorageError::RefusedStore { why, .. } if why.contains("nothing in it was changed")),
                         "{what}: {returned}"
                     );
                     assert_eq!(sidecar, older, "{what}: the older sidecar is put back");
@@ -2044,7 +2101,7 @@ mod tests {
             redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::other("eio"))),
             true,
         );
-        assert!(!matches!(returned, StorageError::RefusedStore(_)), "{returned}");
+        assert!(!matches!(returned, StorageError::RefusedStore { .. }), "{returned}");
         assert_eq!(read_sidecar(&path), Some(written));
     }
 

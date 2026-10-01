@@ -556,6 +556,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         storage_bytes: 7,
         oplog_entries: 26,
         oplog_verified: kimmy_storage::VerifiedWalk { rows: 27, logical_bytes: 28, elapsed_ms: 29 },
+        store_repairs: kimmy_storage::RepairsAtOpen { kept: 30, rolled_back: 31 },
         storage_cache: kimmy_storage::CacheReading {
             used_bytes: 22,
             evictions: 23,

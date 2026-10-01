@@ -202,8 +202,10 @@ redb keeps a checksum over every page, a 128-bit hash arranged as a tree from
 the commit slot's root down. It is **not cryptographic**, and redb verifies it
 in three places only: in the repair after an unclean shutdown, which chooses
 the commit slot that survived; in the rebuild of its allocator state when no
-saved state exists; and in its own integrity check, which kimmydb does not
-call. **An ordinary page read verifies nothing.** redb's design document
+saved state exists; and in its own integrity check, which a serving node never
+runs and `kimmyd check-store` runs on a stopped one
+([Checking a store](operations.md#checking-a-store), ADR-204). **An ordinary
+page read verifies nothing.** redb's design document
 describes the checksums as non-cryptographic and meant to detect a partially
 committed transaction after a crash, and says that for a commit strategy that
 relies on them alone there is, at least in theory, a way to attack it. So, on a
@@ -214,10 +216,14 @@ store that was closed cleanly:
 | A torn write after a crash or power loss | Yes: redb's repair at the next open, from the commit slot that survived |
 | A record whose bytes no longer decode (truncated, out of bounds) | Yes, when it is read: the decoders return `StorageError::Corrupt` |
 | A damaged header, or a commit slot or root that cannot be right (a checksum that fails on a clean store, a page order redb never writes, a root past the end of the file) | Yes, at the open: the start is refused as damaged ([A damaged store](operations.md#a-damaged-store)) |
-| A flipped bit in a page that still decodes, on a store closed cleanly (bit rot) | **No.** The page is served as data. Nothing in the engine runs the check that would find it |
-| A file changed on purpose | **No.** A hash that is not cryptographic can be made to match, and the engine holds no key |
+| A flipped bit in a page that still decodes, on a store closed cleanly (bit rot) | **Not by a serving node**: the page is served as data. **Yes, by `kimmyd check-store`** on the stopped member, which verifies every page reachable from the commit slot (exit 65) |
+| Damage in the latest commit of a store that was not closed cleanly | Rolled back at the next open as a torn write, by the node and by the check alike. The check reports the rollback, and calls it damage only when the previous run ended cleanly |
+| Damage to `hnsw/`, the vector indexes' snapshots | **No.** They carry no checksum and the check does not read them. They are derived: delete them and they are rebuilt ([Rebuild vector indexes](operations.md#rebuild-vector-indexes-after-upgrading-past-2026-08-15)) |
+| A file changed on purpose | **No**, by neither. A hash that is not cryptographic can be made to match, and nothing holds a key |
 
-What a deployment can do about the last two is outside the engine: a filesystem
+The check is a full read of the store, run on a stopped member and writing
+nothing; operations.md says when and how. What a deployment can do about the
+rest is outside the engine: a filesystem
 that checksums its own data, backups taken and tried
 ([Backup and restore](operations.md#backup-and-restore)), and, on a cluster, a
 peer that holds the same documents. A start that skips the open-time walk

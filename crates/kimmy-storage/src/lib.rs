@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod backup;
+pub mod check;
 pub mod codec;
 pub mod divergence;
 pub mod docs;
@@ -58,11 +59,11 @@ pub use divergence::{
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{
-    CacheReading, DurabilityClass, Engine, NotClosed, WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN,
-    WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot, blocking,
-    metered_writer_wait, with_write_wait_budget,
+    CacheReading, DurabilityClass, Engine, NotClosed, RepairsAtOpen, WRITER_HOLD_BUCKETS_US,
+    WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot,
+    blocking, metered_writer_wait, with_write_wait_budget,
 };
-pub use error::{Applied, Result, StopReason, StorageError};
+pub use error::{Applied, RefusedKind, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use hold_meter::{
