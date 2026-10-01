@@ -89,7 +89,10 @@ pub fn parse(doc: &Document) -> Result<Filter> {
         if let Some(op) = key.strip_prefix('$') {
             clauses.push(parse_logical(op, value)?);
         } else {
-            clauses.push(Filter::Field { path: key.clone(), conditions: parse_conditions(value)? });
+            clauses.push(Filter::Field {
+                path: key.clone(),
+                conditions: parse_conditions(key, value)?,
+            });
         }
     }
 
@@ -165,7 +168,10 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
 /// `{a: {$gt: 1}}` is a comparison; `{a: {b: 1}}` is equality against a nested
 /// document. Mongo's rule is that the *first* key decides, and mixing is an
 /// error rather than a silent reinterpretation.
-fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
+///
+/// `path` is the field the conditions apply to, empty for an array element,
+/// and only names it in a refusal.
+fn parse_conditions(path: &str, value: &Bson) -> Result<Vec<Condition>> {
     let equality = |value: &Bson| -> Result<Vec<Condition>> {
         comparable("equality", value)?;
         Ok(vec![Condition::Eq(value.clone())])
@@ -199,7 +205,7 @@ fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
 
     let conditions = doc
         .iter()
-        .map(|(key, arg)| parse_condition(&key[1..], arg, &sibling_options))
+        .map(|(key, arg)| parse_condition(path, &key[1..], arg, &sibling_options))
         .collect::<Result<Vec<_>>>()?;
     Ok(cheap_first(conditions, condition_has_expr))
 }
@@ -226,13 +232,13 @@ fn parse_elem_match(doc: &Document) -> Result<Filter> {
         // element itself; see `matches_scalar_against`.
         return Ok(Filter::Field {
             path: String::new(),
-            conditions: parse_conditions(&Bson::Document(doc.clone()))?,
+            conditions: parse_conditions("", &Bson::Document(doc.clone()))?,
         });
     }
     parse(doc)
 }
 
-fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condition> {
+fn parse_condition(path: &str, op: &str, arg: &Bson, sibling_options: &str) -> Result<Condition> {
     let array_arg = |arg: &Bson| -> Result<Vec<Bson>> {
         match arg {
             Bson::Array(items) => Ok(items.clone()),
@@ -256,7 +262,10 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
         "lte" => Condition::Lte(arg.clone()),
         "in" => Condition::In(without_regex(op, array_arg(arg)?)?),
         "nin" => Condition::Nin(without_regex(op, array_arg(arg)?)?),
-        "all" => Condition::All(without_elem_match(without_regex(op, array_arg(arg)?)?)?),
+        "all" => Condition::All(non_empty_all(
+            path,
+            without_elem_match(without_regex(op, array_arg(arg)?)?)?,
+        )?),
         "exists" => Condition::Exists(truthy(arg)),
         "size" => match arg {
             Bson::Int32(n) => Condition::Size(i64::from(*n)),
@@ -294,7 +303,7 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
             Bson::Document(d) => {
                 // `{$not: {$gt: 1, $lt: 5}}` negates the whole conjunction, so
                 // the operators are combined before the negation is applied.
-                let combined = parse_conditions(&Bson::Document(d.clone()))?
+                let combined = parse_conditions(path, &Bson::Document(d.clone()))?
                     .into_iter()
                     .reduce(|a, b| Condition::Both(Box::new(a), Box::new(b)))
                     .ok_or_else(|| {
@@ -390,6 +399,26 @@ fn without_elem_match(values: Vec<Bson>) -> Result<Vec<Bson>> {
         ))),
         None => Ok(values),
     }
+}
+
+/// Refuse an empty `$all`.
+///
+/// "Every one of no values" holds for any array, so `{tags: {$all: []}}`
+/// matched every document whose field holds an array, and under `$not` every
+/// document whose field does not. A list that arrives empty is far more
+/// likely a client's bug than a question, and on a `multi` update or delete
+/// it reached every such document with a `200`.
+fn non_empty_all(path: &str, values: Vec<Bson>) -> Result<Vec<Bson>> {
+    if values.is_empty() {
+        let field =
+            if path.is_empty() { "an array element".to_string() } else { format!("{path:?}") };
+        return Err(Error::InvalidQuery(format!(
+            "$all on {field} has an empty list, which would match every document whose field \
+             holds an array, so a list emptied by mistake would reach all of them; send at least \
+             one value, or leave the condition out"
+        )));
+    }
+    Ok(values)
 }
 
 /// Refuse a `Decimal128` anywhere in a comparison operand.
@@ -1412,6 +1441,28 @@ mod tests {
         assert!(message.contains("nosuch"), "{message}");
         // The numeric spelling was already refused, and stays refused.
         assert!(refused(doc! { "a": { "$type": 999 } }).contains("999"));
+    }
+
+    #[test]
+    fn an_empty_all_is_refused_naming_the_field() {
+        for (q, field) in [
+            (doc! { "tags": { "$all": [] } }, r#""tags""#),
+            (doc! { "a.b": { "$all": [] } }, r#""a.b""#),
+            (doc! { "tags": { "$not": { "$all": [] } } }, r#""tags""#),
+            (doc! { "$or": [ { "x": 1 }, { "tags": { "$all": [] } } ] }, r#""tags""#),
+            (doc! { "items": { "$elemMatch": { "tags": { "$all": [] } } } }, r#""tags""#),
+            (doc! { "grid": { "$elemMatch": { "$all": [] } } }, "an array element"),
+        ] {
+            let message = refused(q.clone());
+            assert!(
+                message.starts_with(&format!("$all on {field} has an empty list"))
+                    && message.contains("send at least one value"),
+                "{q}: {message}"
+            );
+        }
+        // One value or more is unchanged.
+        assert!(hits(doc! { "tags": { "$all": ["a"] } }, doc! { "tags": ["a", "b"] }));
+        assert!(!hits(doc! { "tags": { "$all": ["a", "c"] } }, doc! { "tags": ["a", "b"] }));
     }
 
     #[test]

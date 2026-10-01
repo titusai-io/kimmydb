@@ -10895,6 +10895,56 @@ async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
 }
 
 #[tokio::test]
+async fn an_empty_all_is_refused_on_every_route_and_writes_nothing() {
+    // `{tags: {$all: []}}` held for every document whose `tags` is an array,
+    // so a list a client emptied by mistake reached all of them, on a `multi`
+    // delete or update too, with a 200.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "posts" })).await;
+    let batch: Vec<Value> =
+        (0..5i64).map(|i| json!({ "_id": i, "tags": ["a", format!("t{i}")] })).collect();
+    server.post("/v1/db/shop/coll/posts/bulk", Some(&token), json!(batch)).await;
+    let empty = json!({ "tags": { "$all": [] } });
+    let refused = |res: &Res, route: &str| {
+        assert_eq!(res.status, 400, "{route}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains(r#"$all on "tags" has an empty list"#), "{route}: {message}");
+    };
+    let coll = "/v1/db/shop/coll/posts";
+    let res = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": empty })).await;
+    refused(&res, "find");
+    let res = server.post(&format!("{coll}/count"), Some(&token), json!({ "filter": empty })).await;
+    refused(&res, "count");
+    let res = server
+        .post(
+            &format!("{coll}/update"),
+            Some(&token),
+            json!({ "filter": empty, "update": { "$set": { "hit": true } }, "multi": true }),
+        )
+        .await;
+    refused(&res, "update");
+    let res = server
+        .post(&format!("{coll}/delete"), Some(&token), json!({ "filter": empty, "multi": true }))
+        .await;
+    refused(&res, "delete");
+
+    // Nothing was written or removed, and one value still selects.
+    let all = server.post(&format!("{coll}/find"), Some(&token), json!({ "filter": {} })).await;
+    let docs = all.body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 5, "{:?}", all.body);
+    assert!(docs.iter().all(|d| d.get("hit").is_none()), "{:?}", all.body);
+    let one = server
+        .post(
+            &format!("{coll}/count"),
+            Some(&token),
+            json!({ "filter": { "tags": { "$all": ["t3"] } } }),
+        )
+        .await;
+    assert_eq!(one.body["count"], 1, "{:?}", one.body);
+}
+
+#[tokio::test]
 async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
     // The value round-trips: `$numberDecimal` in, `$numberDecimal` out, the
     // digits untouched, and `$type` can still find it.
