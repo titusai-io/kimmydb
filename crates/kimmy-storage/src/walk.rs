@@ -109,6 +109,9 @@ impl WalkStop<'_> {
     #[cfg(any(test, feature = "test-hooks"))]
     fn count_row(&self) {
         use std::sync::atomic::{AtomicU64, Ordering};
+        // `fetch_update` is `try_update` from Rust 1.99, which the 1.90
+        // minimum does not have; the old name stays until the minimum moves.
+        #[allow(deprecated)]
         let reaches = |left: &AtomicU64| {
             left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1)
         };
