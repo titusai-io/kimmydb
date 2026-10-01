@@ -126,7 +126,17 @@ pub async fn run(config: Config) -> RunEnd {
         }
     };
     let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let started = start_and_serve(config, Arc::clone(&opened)).await;
+    // What a start that fails after the open needs to close the store as a stop
+    // does: the engine, and the stop's announcement to the tasks it spawned.
+    let engine_slot: Arc<std::sync::OnceLock<Arc<Engine>>> = Arc::default();
+    let stop_slot: Arc<std::sync::OnceLock<Stop>> = Arc::default();
+    let started = start_and_serve(
+        config,
+        Arc::clone(&opened),
+        Arc::clone(&engine_slot),
+        Arc::clone(&stop_slot),
+    )
+    .await;
     end.opened = opened.load(std::sync::atomic::Ordering::SeqCst);
     match started {
         Ok(served) => {
@@ -141,7 +151,41 @@ pub async fn run(config: Config) -> RunEnd {
             end.outcome = served.outcome.and(closed);
             end.engine = served.engine;
         }
-        Err(e) => end.outcome = Err(e),
+        Err(e) => {
+            end.outcome = Err(e);
+            // A start that failed after it opened the store closes it as a stop
+            // does: the tasks it spawned are told to stop, the engine is closed to
+            // writes and kept for `conclude`, which closes it on this thread once
+            // the runtime is down. Left to the runtime's shutdown, a task that
+            // held the last reference ran on into the dying runtime, panicked on a
+            // timer, and dropped the engine while unwinding, where redb skips its
+            // close and the next start repairs a store nothing was wrong with.
+            if let Some(engine) = engine_slot.get().cloned() {
+                let writes_by = tokio::time::Instant::now() + WRITES_CLOSE_CAP;
+                if let Some(stop) = stop_slot.get() {
+                    stop.begin();
+                    end.stop_by = stop.by.get().copied();
+                }
+                let closed = close_for_exit(&engine, WRITES_CLOSE_CAP);
+                end.writes_open = closed.is_err();
+                // The supervised tasks are waited for before the runtime is shut
+                // down, within the window the close to writes has, as the stop
+                // path does: a task inside a storage step runs on after an abort
+                // until its next yield, and a timer it polls once the runtime has
+                // begun to shut down panics. Only the engine's last holder
+                // matters to the store, since `conclude` closes it, but a panic
+                // is logged at ERROR and is not what a failed start should say.
+                if let Some(stop) = stop_slot.get()
+                    && !stop.shutdown.wait_stopped(writes_by).await
+                {
+                    warn!(
+                        "background tasks were still stopping at the end of the failed start's \
+                         window; left to the runtime"
+                    );
+                }
+                end.engine = Some(engine);
+            }
+        }
     }
     end
 }
@@ -150,9 +194,10 @@ pub async fn run(config: Config) -> RunEnd {
 pub struct RunEnd {
     /// `Ok` for a stop at the signal; otherwise what the run ended on.
     outcome: Result<()>,
-    /// The engine, closed to writes, when the run got as far as serving.
-    /// `None` for a start that failed, whose engine, if it opened one, was
-    /// dropped on the way out, as before.
+    /// The engine, closed to writes: when the run got as far as serving, and
+    /// when a start failed after it opened the store, which `run` then closes
+    /// to writes as a stop does and `conclude` closes on its own thread.
+    /// `None` only for a start that failed before the open.
     engine: Option<Arc<Engine>>,
     /// The data directory's hold, released after the last marker.
     held: Option<std::fs::File>,
@@ -164,10 +209,9 @@ pub struct RunEnd {
     /// run otherwise ended on: the engine is not closed.
     writes_open: bool,
     test_stop: Option<TestStop>,
-    /// The start opened the store. With no engine handed back, it failed
-    /// after the open, and dropped the engine on its way out; a thread may
-    /// still hold it, so `conclude` reads the header before calling the
-    /// store closed.
+    /// The start opened the store. With no engine handed back (the store opened
+    /// and the start failed before an engine was kept, which nothing is known
+    /// to do), `conclude` reads the header before calling the store closed.
     opened: bool,
 }
 
@@ -212,9 +256,10 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
              waiting to be made durable failed",
             WRITES_CLOSE_CAP.as_secs()
         )),
-        // A start that failed after it opened the store dropped its engine
-        // as it returned, and redb closed it then, unless a thread still held
-        // it past the runtime's shutdown. The header says which.
+        // The store was opened and no engine was kept (nothing is known to
+        // leave one out: `run` keeps the engine of a start that failed after
+        // the open, and closes it below as a stop does). A thread may still
+        // hold it past the runtime's shutdown; the header says which.
         None if opened => {
             match kimmy_storage::format::closed_cleanly(&data_dir.join(DATABASE_FILE)) {
                 Ok(false) => Err("the start failed after it opened the store, and the store was \
@@ -368,6 +413,15 @@ enum TestStop {
     /// bounded runtime shutdown lets the process end. The panic comes only
     /// after that thread is running with the engine.
     PanicInRun,
+    /// `fail_start` or `fail_start:<ms>`: the start fails once its tasks are
+    /// spawned, as a cluster port in use does. A thread holds the engine for
+    /// `<ms>` (400 by default) and then panics, as a task does that runs on into
+    /// a runtime that is shutting down, and a supervised task is inside a
+    /// storage step that ends after the failure, then polls a timer. The store
+    /// must be closed all the same, and no timer polled after the runtime has
+    /// begun to shut down. Unlike the others this acts **before** the node
+    /// serves, since it is a failed start.
+    FailStart(Duration),
     /// `slow_close:<ms>`: the close waits this long before dropping the
     /// engine, so a test can see what waits for it.
     SlowClose(Duration),
@@ -384,6 +438,10 @@ impl TestStop {
             None if value == "panic_in_write" => Some(Self::PanicInWrite),
             None if value == "serve_error" => Some(Self::ServeError),
             None if value == "panic_in_run" => Some(Self::PanicInRun),
+            None if value == "fail_start" => Some(Self::FailStart(Duration::from_millis(400))),
+            Some(("fail_start", ms)) => {
+                ms.parse().ok().map(|ms| Self::FailStart(Duration::from_millis(ms)))
+            }
             Some(("slow_close", ms)) => {
                 ms.parse().ok().map(|ms| Self::SlowClose(Duration::from_millis(ms)))
             }
@@ -516,6 +574,8 @@ fn arm_storage_switch_when_serving(
 async fn start_and_serve(
     config: Config,
     opened: Arc<std::sync::atomic::AtomicBool>,
+    engine_kept: Arc<std::sync::OnceLock<Arc<Engine>>>,
+    stop_kept: Arc<std::sync::OnceLock<Stop>>,
 ) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -685,7 +745,12 @@ async fn start_and_serve(
     let engine = match Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize)) {
         Ok(engine) => {
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
-            Arc::new(engine)
+            let engine = Arc::new(engine);
+            // Kept for `run` from the moment the store is open, so that whatever
+            // fails after it closes the store as a stop does: opened implies
+            // kept, with no gap between.
+            let _ = engine_kept.set(Arc::clone(&engine));
+            engine
         }
         // A stop asked for during a migration ends the open at a safe point,
         // between two of its one-commit steps. That is the stop being honoured,
@@ -753,6 +818,8 @@ async fn start_and_serve(
     let shutdown = kimmy_task::Shutdown::new();
     let stop = Stop { shutdown: shutdown.clone(), engine: Arc::clone(&engine), by: Arc::default() };
     let _ = engine_slot.set(Arc::clone(&engine));
+    // For `run`, which tells the tasks to stop if this start fails below.
+    let _ = stop_kept.set(stop.clone());
     // The stop is announced at the signal, before anything drains, so that a
     // supervised task ending during the drain is a stop rather than a death.
     // A signal that came during the open announces here, at once.
@@ -807,9 +874,9 @@ async fn start_and_serve(
         warn!(
             KIMMY_TEST_STOP = %value,
             recognised = parsed.is_some(),
-            "a test switch is set that acts on this node's stop, or with slow_apply slows \
-             every apply of a peer's batch for the whole run, on purpose; unset \
-             KIMMY_TEST_STOP outside a test"
+            "a test switch is set that acts on this node's stop, fails its start after the \
+             open (fail_start), or with slow_apply slows every apply of a peer's batch \
+             for the whole run, on purpose; unset KIMMY_TEST_STOP outside a test"
         );
         parsed
     });
@@ -1361,6 +1428,33 @@ async fn start_and_serve(
             let engine = Arc::clone(&engine);
             // UNSUPERVISED: a test switch whose panic is the point of it.
             tokio::spawn(async move { kimmy_storage::blocking(|| engine.panic_inside_a_write()) });
+        }
+        // The start fails here, after the store is open and its tasks are
+        // running, with a thread that holds the engine and panics after the
+        // runtime has begun to shut down (the last owner of the engine dropping
+        // it while unwinding, where redb skips its close), and a supervised task
+        // inside a storage step that ends after the failure and then polls a
+        // timer (a task running on into a runtime that is going away panics).
+        Some(TestStop::FailStart(hold)) => {
+            let engine = Arc::clone(&engine);
+            // UNSUPERVISED: a test switch whose panic is the point of it.
+            tokio::spawn(async move {
+                kimmy_storage::blocking(move || {
+                    let _held = engine;
+                    std::thread::sleep(hold);
+                    panic!("a task panicked holding the engine (KIMMY_TEST_STOP=fail_start)");
+                })
+            });
+            // Under the retention collector's name, which is the task this
+            // stands in for (a name outside `kimmy_task::TASKS` is refused by the
+            // guard that keeps its metric labels honest).
+            kimmy_task::supervise("retention_collector", shutdown.clone(), async {
+                kimmy_storage::blocking(|| std::thread::sleep(Duration::from_millis(300)));
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            return Err(anyhow::anyhow!(
+                "the start failed on purpose (KIMMY_TEST_STOP=fail_start)"
+            ));
         }
         Some(TestStop::SlowApply(delay)) => engine.slow_peer_applies(delay),
         _ => {}
@@ -3713,6 +3807,15 @@ mod tests {
         assert_eq!(TestStop::parse("panic_in_write"), Some(TestStop::PanicInWrite));
         assert_eq!(TestStop::parse("serve_error"), Some(TestStop::ServeError));
         assert_eq!(TestStop::parse("panic_in_run"), Some(TestStop::PanicInRun));
+        assert_eq!(
+            TestStop::parse("fail_start"),
+            Some(TestStop::FailStart(Duration::from_millis(400)))
+        );
+        assert_eq!(
+            TestStop::parse("fail_start:4000"),
+            Some(TestStop::FailStart(Duration::from_secs(4)))
+        );
+        assert_eq!(TestStop::parse("fail_start:soon"), None);
         assert_eq!(
             TestStop::parse("slow_close:1500"),
             Some(TestStop::SlowClose(Duration::from_millis(1500)))

@@ -44,7 +44,7 @@
 //! and a spurious process exit.
 
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -182,7 +182,30 @@ pub fn exit_because(task: &'static str, cause: Death, detail: &str) -> ! {
 /// A clone shares the same state, so the shutdown path holds one and every
 /// supervised task holds another.
 #[derive(Clone, Debug)]
-pub struct Shutdown(watch::Sender<bool>);
+pub struct Shutdown {
+    announced: watch::Sender<bool>,
+    /// The supervisors started under this shutdown that have not yet ended, so
+    /// a caller can wait for them ([`Shutdown::wait_stopped`]).
+    live: Arc<Live>,
+}
+
+/// The supervisors under one [`Shutdown`] that are still running.
+#[derive(Debug, Default)]
+struct Live {
+    count: std::sync::atomic::AtomicUsize,
+    ended: tokio::sync::Notify,
+}
+
+/// Held by a supervisor from before it is spawned until it ends, however it
+/// ends: returned, panicked, or dropped without ever having run.
+struct Supervising(Arc<Live>);
+
+impl Drop for Supervising {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.ended.notify_waiters();
+    }
+}
 
 impl Default for Shutdown {
     fn default() -> Self {
@@ -192,7 +215,34 @@ impl Default for Shutdown {
 
 impl Shutdown {
     pub fn new() -> Self {
-        Shutdown(watch::Sender::new(false))
+        Shutdown { announced: watch::Sender::new(false), live: Arc::default() }
+    }
+
+    /// Count a supervisor that is about to be spawned.
+    fn supervising(&self) -> Supervising {
+        self.live.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Supervising(Arc::clone(&self.live))
+    }
+
+    /// Wait until every supervisor started under this shutdown has ended, or
+    /// `deadline` passes; whether they all have. For a start that failed after
+    /// it spawned its tasks: the stop path waits for its supervisors before the
+    /// runtime shuts down, and so must that one, or a task inside a storage step
+    /// runs on into a runtime that is going away and panics on its timer.
+    pub async fn wait_stopped(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            // Registered before the count is read, so an end between the two is
+            // not missed.
+            let ended = self.live.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if self.live.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, ended).await.is_err() {
+                return self.live.count.load(std::sync::atomic::Ordering::SeqCst) == 0;
+            }
+        }
     }
 
     /// Announce that shutdown has begun.
@@ -210,17 +260,17 @@ impl Shutdown {
         // every "is this shutdown?" check answer no during shutdown -- turning
         // each abort into a death. Found by a test whose retry loop kept asking
         // to be retried after shutdown had begun.
-        self.0.send_replace(true);
+        self.announced.send_replace(true);
     }
 
     /// Whether [`begin`](Self::begin) has been called.
     pub fn has_begun(&self) -> bool {
-        *self.0.borrow()
+        *self.announced.borrow()
     }
 
     /// Resolves once shutdown has begun, immediately if it already has.
     async fn reached(&self) {
-        let mut rx = self.0.subscribe();
+        let mut rx = self.announced.subscribe();
         // `borrow_and_update` first, so a shutdown that began before this call
         // is not waited on for ever.
         if *rx.borrow_and_update() {
@@ -653,8 +703,13 @@ fn classify<T>(
 /// The work runs in a task of its own so that a panic arrives here as a
 /// `JoinError` carrying its message, which is how the panic text reaches the
 /// structured log rather than only stderr.
-async fn supervised<T, F, J>(name: &'static str, shutdown: Shutdown, work: F, judge: J)
-where
+async fn supervised<T, F, J>(
+    name: &'static str,
+    shutdown: Shutdown,
+    work: F,
+    judge: J,
+    _supervising: Supervising,
+) where
     T: Send + 'static,
     F: Future<Output = T> + Send + 'static,
     J: FnOnce(T) -> Return,
@@ -691,10 +746,15 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     mark_started(name);
+    let supervising = shutdown.supervising();
     // UNSUPERVISED: the supervisor task. Its body is `supervised`, which is the supervision.
-    tokio::spawn(supervised(name, shutdown, work, |()| {
-        Return::Fatal(Death::Returned, "the task returned".into())
-    }))
+    tokio::spawn(supervised(
+        name,
+        shutdown,
+        work,
+        |()| Return::Fatal(Death::Returned, "the task returned".into()),
+        supervising,
+    ))
 }
 
 /// The retry policy for a supervised task whose errors are transient, used from
@@ -891,11 +951,18 @@ where
     F: Future<Output = Ended> + Send + 'static,
 {
     mark_started(name);
+    let supervising = shutdown.supervising();
     // UNSUPERVISED: the supervisor task, as in `supervise`.
-    tokio::spawn(supervised(name, shutdown, work, |ended| match ended {
-        Ended::Expected(why) => Return::Finished(why),
-        Ended::Unexpected(why) => Return::Fatal(Death::Returned, why.into()),
-    }))
+    tokio::spawn(supervised(
+        name,
+        shutdown,
+        work,
+        |ended| match ended {
+            Ended::Expected(why) => Return::Finished(why),
+            Ended::Unexpected(why) => Return::Fatal(Death::Returned, why.into()),
+        },
+        supervising,
+    ))
 }
 
 /// Supervise work that ends on purpose: completion is expected, a panic is a
@@ -910,6 +977,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     mark_started(name);
+    let supervising = shutdown.supervising();
     // UNSUPERVISED: the supervisor task, as in `supervise`.
-    tokio::spawn(supervised(name, shutdown, work, |()| Return::Expected))
+    tokio::spawn(supervised(name, shutdown, work, |()| Return::Expected, supervising))
 }

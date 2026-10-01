@@ -162,6 +162,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A start that fails after it opens the store no longer leaves it needing
+  repair.** The cluster listener's port in use, or any other failure past the
+  open, left redb's recovery-required flag set: a background task that held the
+  last reference to the engine ran on into the runtime's shutdown, panicked on a
+  timer (`A Tokio 1.x context was found, but it is being shutdown`), and dropped
+  the engine while unwinding, where redb skips its close. The next start then
+  repaired a store nothing was wrong with, about 0.4 s per GiB on a warm disk
+  and minutes on a rotational one with a large store, and recorded the failed
+  start as `storage_not_closed`, exit 75. A start that fails after the open now
+  closes the store as a stop does: the tasks are told to stop, the store is
+  closed to writes, and it is closed on the main thread after the runtime is
+  down. It exits 1 with the marker `error` and the next start repairs nothing.
+  The supervised tasks are waited for before the runtime is shut down, as at a
+  stop, so none polls a timer in a dying runtime. Seen on Linux with a store
+  holding some tens of thousands of documents, whose unique-violations backfill
+  was mid-step when the start failed. A failed start whose store is held now takes
+  its 22 s stop budget from the failure before it gives up and exits 75, or about
+  10 s when a write is still open at the writes cap, which runs inside it.
+
 - **A stored member that returns behind every peer's horizon is marked within a
   fraction of a second, not after a whole sync interval.** It starts unmarked,
   by design, and is marked `snapshot` when its own first pull gets
@@ -207,9 +226,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   holding the engine past the runtime's shutdown left the store open, and the
   next start repaired it under a marker that said otherwise. The stop now reads
   the store's header in that case, and a store still open is recorded as
-  `storage_not_closed`, with exit 75, as for a stop that could not close it.
-  The error it prints keeps the start's own error under it (a cluster port in
-  use, say), so the cause of the failed start is still on stderr.
+  `storage_not_closed`, exit 75. The error it prints keeps the start's own error
+  under it (a cluster port in use, say), so the cause of the failed start is
+  still on stderr. A start that fails after the open now closes the store, so this
+  is reached only if a thread still holds it past the stop's budget (see the entry
+  on a start that fails after it opens the store).
 
 - **A clustered start that can never write its replay floor is refused before
   the store is opened, and leaves no temporary file.** The floor

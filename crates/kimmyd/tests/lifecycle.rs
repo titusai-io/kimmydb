@@ -879,6 +879,76 @@ async fn a_graceful_shutdown_is_not_a_task_death() {
     assert!(!marker.contains("task_died"), "{marker}");
 }
 
+/// **A start that fails after it opened the store closes it, as a stop does.**
+/// The cluster listener's port in use, or any failure past the open, left the
+/// store marked for recovery: a task that held the last reference to the engine
+/// ran on into the runtime's shutdown, panicked on a timer, and dropped the
+/// engine while unwinding, where redb skips its close. Every misconfigured start
+/// then cost the next one a repair. `KIMMY_TEST_STOP=fail_start:<ms>` fails the
+/// start once the tasks are running, with a thread that holds the engine for
+/// `<ms>` and then panics, which is the same last-owner drop on a panicking
+/// thread without depending on which task or which host's timing makes it, and
+/// with a supervised task inside a storage step that ends after the failure and
+/// then polls a timer.
+///
+/// The start exits 1 with the marker `error`, the file's header says it closed
+/// cleanly (the recovery-required flag is clear), no timer is polled after the
+/// runtime began to shut down, and the next start repairs nothing. Before, it
+/// exited 75 as `storage_not_closed` and the next start repaired.
+async fn a_failed_start_closes_the_store(hold_ms: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    // A clean store to start from.
+    let mut before = Run::spawn(dir.path(), "failed-start-before");
+    before.wait_ready(&client).await;
+    before.signal("TERM");
+    assert!(before.wait_exit().success());
+
+    let value = format!("fail_start:{hold_ms}");
+    let mut failing =
+        Run::spawn_with(dir.path(), "failed-start", &[("KIMMY_TEST_STOP", value.as_str())]);
+    let status = failing.wait_exit();
+    let log = failing.log();
+    assert_eq!(status.code(), Some(1), "a failed start exits 1: {status:?}\n{log}");
+    assert!(log.contains("the start failed on purpose"), "{log}");
+    assert!(
+        log.contains("a task panicked holding the engine"),
+        "premise: the thread that held the engine panicked: {log}"
+    );
+    // The supervised task that was inside a storage step when the start failed:
+    // waited for before the runtime shut down, so its timer was polled in a
+    // runtime that was still up.
+    assert!(!log.contains("is being shutdown"), "a task polled a timer in a dying runtime: {log}");
+    // Told to stop, so each ended inside the window: a stop that was never
+    // announced leaves them running until the window's end, and that is said.
+    assert!(!log.contains("were still stopping"), "the tasks were not told to stop: {log}");
+    let marker = marker(dir.path()).expect("a failed start leaves a marker");
+    assert!(marker.contains("exit = \"error\""), "a failed start, not an unclean close: {marker}");
+    assert!(!marker.contains("storage_not_closed"), "the store was closed: {marker}");
+
+    // Redb's header, read from the file: its god byte's recovery-required bit.
+    let header = std::fs::read(dir.path().join("data").join("kimmy.redb")).unwrap();
+    assert_eq!(header[9] & 0b10, 0, "the store was left needing repair: god byte {:#x}", header[9]);
+
+    let log = next_start_log(dir.path(), "failed-start-after", &client).await;
+    assert!(!log.contains("repairing the database"), "the next start repaired the store: {log}");
+}
+
+#[tokio::test]
+async fn a_start_that_fails_after_it_opens_the_store_closes_it() {
+    a_failed_start_closes_the_store(400).await;
+}
+
+/// The same with a holder that outlasts the runtime's shutdown floor (3 s): the
+/// failed start's deadline is the stop's budget from the failure, so the runtime
+/// shutdown waits for it. A failed start that took no deadline from the stop
+/// gave the floor, abandoned the thread, and exited 75.
+#[tokio::test]
+async fn a_failed_start_with_the_engine_held_past_the_runtime_floor_still_closes_the_store() {
+    a_failed_start_closes_the_store(4_000).await;
+}
+
 /// A storage engine that hits an I/O error stops the process, and the next
 /// start says so, repairs the database, and serves what was written before
 /// (ADR-188).
