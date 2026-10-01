@@ -928,6 +928,7 @@ impl From<CoreError> for ApiError {
             }
             CoreError::InvalidName { .. }
             | CoreError::InvalidQuery(_)
+            | CoreError::Limit(_)
             | CoreError::InvalidUpdate(_)
             | CoreError::InvalidDocumentId { .. }
             | CoreError::UnsupportedOperator { .. }
@@ -937,7 +938,9 @@ impl From<CoreError> for ApiError {
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }
-            CoreError::Bson(_) | CoreError::Serialization(_) => ApiError::internal(e.to_string()),
+            CoreError::Bson(_) | CoreError::Serialization(_) | CoreError::Internal(_) => {
+                ApiError::internal(e.to_string())
+            }
         }
     }
 }
@@ -1447,6 +1450,21 @@ mod tests {
     fn a_bad_query_is_the_callers_fault() {
         let e: ApiError = CoreError::InvalidQuery("nope".into()).into();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_request_over_a_limit_is_refused_like_a_bad_query() {
+        let e: ApiError = CoreError::Limit("$group produced 3 documents".into()).into();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.code, ErrorCode::BadRequest);
+        assert_eq!(e.message, "invalid query: $group produced 3 documents");
+    }
+
+    #[test]
+    fn a_broken_invariant_is_the_servers_fault() {
+        let e: ApiError = CoreError::Internal("variable $$x is not bound".into()).into();
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.code, ErrorCode::Internal);
     }
 
     #[test]

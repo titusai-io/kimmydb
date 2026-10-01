@@ -2039,6 +2039,133 @@ async fn an_expr_that_cannot_be_evaluated_fails_the_request_everywhere_a_filter_
     assert_eq!(res.body["documents"], json!([{"_id": 2}]));
 }
 
+/// An expression's `$and` is false when any argument is false, and its `$or`
+/// true when any is true, beside an argument that cannot be evaluated and in
+/// whatever order they are written; only when no argument decides does the
+/// request fail (ADR-211). In a filter's `$expr`, in `$project` and in
+/// `$group`.
+#[tokio::test]
+async fn an_expressions_and_or_fails_only_when_the_answer_depends_on_the_error() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for doc in [
+        json!({"_id": 1, "kind": "b", "qty": 5, "tags": ["x", "y", "z"]}),
+        json!({"_id": 3, "kind": "a", "qty": "twelve", "tags": "red"}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let bad = json!({"$gt": [{"$add": ["$qty", 1]}, 0]});
+    let is_a = json!({"$eq": ["$kind", "a"]});
+    let is_b = json!({"$eq": ["$kind", "b"]});
+    let refused = |res: &Res, what: &str| {
+        assert_eq!(res.status, 400, "{what}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().is_some_and(|m| m.contains("$add needs numbers")),
+            "{what}: {:?}",
+            res.body
+        );
+    };
+    let find = |filter: serde_json::Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/orders/find",
+                    Some(token),
+                    json!({"filter": filter, "projection": {"_id": 1}, "sort": {"_id": 1}}),
+                )
+                .await
+        }
+    };
+
+    // A filter's `$expr`, in both orders: document 3 is decided by `kind`,
+    // and document 1 answers true.
+    for args in [json!([is_b, bad]), json!([bad, is_b])] {
+        let res = find(json!({"$expr": {"$and": args}})).await;
+        assert_eq!(res.status, 200, "$and {args}: {:?}", res.body);
+        assert_eq!(res.body["documents"], json!([{"_id": 1}]), "$and {args}");
+    }
+    for args in [json!([bad, is_a]), json!([is_a, bad])] {
+        let res = find(json!({"$expr": {"$or": args}})).await;
+        assert_eq!(res.status, 200, "$or {args}: {:?}", res.body);
+        assert_eq!(res.body["documents"], json!([{"_id": 1}, {"_id": 3}]), "$or {args}");
+    }
+    // The type guard: `tags` is a string on document 3.
+    let guard = json!({"$and": [{"$isArray": "$tags"}, {"$gt": [{"$size": "$tags"}, 2]}]});
+    let res = find(json!({"$expr": guard})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1}]));
+    // Control: nothing decides document 3, so the request fails.
+    refused(&find(json!({"$expr": {"$and": [bad, is_a]}})).await, "find, no decider");
+
+    // A `multi` write selects by the same answer, document 3 included.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"$expr": {"$or": [bad, is_a]}}, "update": {"$set": {"seen": true}},
+                   "multi": true}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 2, "{:?}", res.body);
+    let res = find(json!({"seen": true})).await;
+    assert_eq!(res.body["documents"], json!([{"_id": 1}, {"_id": 3}]));
+
+    let aggregate = |pipeline: serde_json::Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/orders/aggregate",
+                    Some(token),
+                    json!({"pipeline": pipeline}),
+                )
+                .await
+        }
+    };
+    // `$project`.
+    let res = aggregate(json!([
+        {"$match": {"_id": 3}},
+        {"$project": {"x": {"$and": [false, bad]}, "y": {"$or": [bad, true]}}},
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 3, "x": false, "y": true}]));
+    refused(
+        &aggregate(json!([{"$project": {"x": {"$and": [bad, true]}}}])).await,
+        "$project, no decider",
+    );
+
+    // `$group`: an accumulator's `$cond` over a deciding `$and`.
+    let count_b = |first: serde_json::Value| {
+        json!([{"$group": {"_id": null, "n": {"$sum": {"$cond": [
+            {"$and": [first, bad]}, 1, 0
+        ]}}}}])
+    };
+    let res = aggregate(count_b(is_b.clone())).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Document 1 counts; document 3 is not "b", whatever its `$add` says.
+    assert_eq!(res.body["documents"][0]["n"], 1, "{:?}", res.body);
+    // Control: on document 3 `kind` is "a", so the `$add` is reached.
+    refused(&aggregate(count_b(is_a.clone())).await, "$group, no decider");
+
+    // `$group`'s `$last` reads only the last document's value: document 3's
+    // `$add` fails only when document 3 comes last.
+    let last = |order: i32| {
+        json!([{"$sort": {"_id": order}},
+               {"$group": {"_id": null, "v": {"$last": {"$add": ["$qty", 1]}}}}])
+    };
+    let res = aggregate(last(-1)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": null, "v": 6}]));
+    refused(&aggregate(last(1)).await, "$last, the last value fails");
+}
+
 /// Whether a request fails depends on whether its answer depends on a
 /// document whose `$expr` cannot be evaluated, and not on the plan: a clause
 /// without `$expr` that excludes the document decides it on a collection

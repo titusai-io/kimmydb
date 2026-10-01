@@ -321,9 +321,11 @@ impl Op {
     /// `$cond` and `$ifNull` are the exceptions and must not be: evaluating
     /// every branch would make `{$cond: [{$gt: ["$n", 0]}, {$divide: [1,
     /// "$n"]}, 0]}` fail on exactly the inputs the guard exists to protect.
-    /// `$literal` does not evaluate its argument at all.
+    /// `$and` and `$or` stop at the argument that decides them, and an
+    /// argument that cannot be evaluated fails them only when none does
+    /// (ADR-211). `$literal` does not evaluate its argument at all.
     fn is_lazy(self) -> bool {
-        matches!(self, Op::Cond | Op::IfNull | Op::Literal)
+        matches!(self, Op::Cond | Op::IfNull | Op::And | Op::Or | Op::Literal)
     }
 }
 
@@ -1253,8 +1255,9 @@ fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bs
     }
     let Some(value) = scope.get(name) else {
         // Parsing declares every name before reading its body, so this is a
-        // caller evaluating with fewer bindings than it parsed with.
-        return Err(Error::InvalidQuery(format!("variable $${name} is not bound")));
+        // caller evaluating with fewer bindings than it parsed with: a bug,
+        // which an `$or` with a true argument must not hide (ADR-211).
+        return Err(Error::Internal(format!("variable $${name} is not bound")));
     };
     Ok(match path {
         None => value.clone(),
@@ -1294,8 +1297,90 @@ fn eval_lazy(op: Op, args: &[Expr], scope: &Scope<'_>) -> Result<Bson> {
             }
             _ => unreachable!("arity checked at parse"),
         },
+        // The filter level's `$and` and `$or` run through the same two
+        // functions, so the two levels cannot come to read an error
+        // differently (ADR-206, ADR-211). The answer is a boolean, never the
+        // argument that decided it.
+        Op::And => all_of(args, |arg| truth_of(arg, scope)).map(Bson::Boolean),
+        Op::Or => any_of(args, |arg| truth_of(arg, scope)).map(Bson::Boolean),
         _ => unreachable!("only lazy operators reach here"),
     }
+}
+
+/// One argument of an `$and` or `$or`, read for its truth.
+fn truth_of(arg: &Expr, scope: &Scope<'_>) -> Result<bool> {
+    #[cfg(test)]
+    LOGIC_ARGUMENTS.with(|n| n.set(n.get() + 1));
+    arg.eval_in(scope).map(|v| truthy(&v))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `$and`/`$or` arguments this thread has evaluated, for the
+    /// tests that hold the two to stopping at the argument that decides.
+    static LOGIC_ARGUMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `$and`/`$or` arguments this thread has evaluated so far.
+#[cfg(test)]
+pub(crate) fn logic_arguments() -> usize {
+    LOGIC_ARGUMENTS.with(std::cell::Cell::get)
+}
+
+/// Three-valued conjunction: whether every item is true, where an item may
+/// also be not known (an `Err`). Shared by the expression language's `$and`
+/// and the filter level's (ADR-206, ADR-211), so both read one truth table.
+///
+/// - **Any `false` decides** the answer, `false`, whatever came before or
+///   after it; the scan stops there.
+/// - Otherwise, **if any item is not known, so is the answer**, and the error
+///   returned is that of the earliest-written item that has one. Items are
+///   evaluated in the order given, and an error is held, not returned, until
+///   the scan ends: the expression level passes its arguments as written, and
+///   the filter level's cheap-first order moves forward only clauses that
+///   cannot fail, keeping the rest as written. So the first error met is the
+///   earliest written. A caller that reorders items that can fail must keep
+///   the error of the lowest written position instead.
+/// - Otherwise the answer is `true`.
+///
+/// An error that is not [deferrable](Error::is_deferrable) — a broken
+/// invariant, or one day a budget for the whole request — is returned at
+/// once and nothing after it is evaluated.
+pub(crate) fn all_of<T>(
+    items: impl IntoIterator<Item = T>,
+    f: impl FnMut(T) -> Result<bool>,
+) -> Result<bool> {
+    decide(items, f, false)
+}
+
+/// Three-valued disjunction: [`all_of`] with `true` and `false` swapped. Any
+/// `true` decides; otherwise the earliest-written error; otherwise `false`.
+pub(crate) fn any_of<T>(
+    items: impl IntoIterator<Item = T>,
+    f: impl FnMut(T) -> Result<bool>,
+) -> Result<bool> {
+    decide(items, f, true)
+}
+
+/// The scan behind [`all_of`] and [`any_of`]: the first item whose truth is
+/// `decider` decides; an error waits for one.
+fn decide<T>(
+    items: impl IntoIterator<Item = T>,
+    mut f: impl FnMut(T) -> Result<bool>,
+    decider: bool,
+) -> Result<bool> {
+    let mut undecided = None;
+    for item in items {
+        match f(item) {
+            Ok(v) if v == decider => return Ok(decider),
+            Ok(_) => {}
+            Err(e) if !e.is_deferrable() => return Err(e),
+            Err(e) => {
+                undecided.get_or_insert(e);
+            }
+        }
+    }
+    undecided.map_or(Ok(!decider), Err)
 }
 
 /// The array an iteration operator walks, or `None` when the input is null
@@ -1408,8 +1493,6 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
             Ordering::Greater => 1,
         })),
 
-        Op::And => Ok(Bson::Boolean(args.iter().all(truthy))),
-        Op::Or => Ok(Bson::Boolean(args.iter().any(truthy))),
         Op::Not => Ok(Bson::Boolean(!truthy(&args[0]))),
 
         Op::Year | Op::Month | Op::DayOfMonth | Op::Hour | Op::Minute | Op::Second => {
@@ -1436,7 +1519,9 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::ObjectToArray => object_to_array(&args[0]),
         Op::ArrayToObject => array_to_object(&args[0]),
 
-        Op::Cond | Op::IfNull | Op::Literal => unreachable!("handled lazily"),
+        Op::Cond | Op::IfNull | Op::And | Op::Or | Op::Literal => {
+            unreachable!("handled lazily")
+        }
     }
 }
 
@@ -4054,6 +4139,572 @@ mod tests {
         let expr = doc! {"$multiply": [{"$toInt": "$qty"}, 2]};
         assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int64(42));
         assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int64(42));
+    }
+}
+
+/// An expression's `$and` and `$or` fail only when the answer depends on an
+/// argument that cannot be evaluated (ADR-211).
+#[cfg(test)]
+mod and_or {
+    use super::*;
+    use bson::{bson, doc};
+    use proptest::prelude::*;
+
+    /// The document every row is evaluated against: `qty` is the wrong type,
+    /// `n` is zero.
+    fn row() -> Document {
+        doc! {"_id": 3, "qty": "twelve", "kind": "a", "n": 0, "tags": "red"}
+    }
+
+    fn ev(expr: Bson) -> Result<Bson> {
+        Expr::parse(&expr)?.eval(&row())
+    }
+
+    /// Four arguments that cannot be evaluated, each failing differently.
+    fn bads() -> Vec<Bson> {
+        vec![
+            bson!({"$add": ["$qty", 1]}),
+            bson!({"$divide": [1, "$n"]}),
+            bson!({"$range": [0, 200_000]}),
+            bson!({"$switch": {"branches": [{"case": false, "then": 1}]}}),
+        ]
+    }
+
+    /// What `bad` fails with on its own.
+    fn message(bad: &Bson) -> String {
+        ev(bad.clone()).expect_err("the argument should fail").to_string()
+    }
+
+    fn falsy() -> Vec<Bson> {
+        vec![bson!(false), bson!(0), bson!(0.0), Bson::Null, bson!("$missing")]
+    }
+
+    fn truthy_values() -> Vec<Bson> {
+        vec![bson!(true), bson!(1), bson!(""), bson!([]), bson!("text"), bson!({"a": 1})]
+    }
+
+    /// Both orders of a two-argument call.
+    fn both_orders(op: &str, a: &Bson, b: &Bson) -> [Result<Bson>; 2] {
+        [ev(bson!({op: [a.clone(), b.clone()]})), ev(bson!({op: [b.clone(), a.clone()]}))]
+    }
+
+    #[test]
+    fn a_false_argument_decides_an_and_beside_one_that_cannot_be_evaluated() {
+        for bad in bads() {
+            for decider in falsy() {
+                for got in both_orders("$and", &bad, &decider) {
+                    assert_eq!(got.unwrap(), Bson::Boolean(false), "{bad} beside {decider}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_true_argument_decides_an_or_beside_one_that_cannot_be_evaluated() {
+        for bad in bads() {
+            for decider in truthy_values() {
+                for got in both_orders("$or", &bad, &decider) {
+                    assert_eq!(got.unwrap(), Bson::Boolean(true), "{bad} beside {decider}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_and_with_no_false_argument_fails_with_the_error() {
+        for bad in bads() {
+            for other in truthy_values() {
+                for got in both_orders("$and", &bad, &other) {
+                    assert_eq!(got.unwrap_err().to_string(), message(&bad), "{bad} beside {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_or_with_no_true_argument_fails_with_the_error() {
+        for bad in bads() {
+            for other in falsy() {
+                for got in both_orders("$or", &bad, &other) {
+                    assert_eq!(got.unwrap_err().to_string(), message(&bad), "{bad} beside {other}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_error_the_answers_are_unchanged() {
+        assert_eq!(ev(bson!({"$and": [true, 1, "x"]})).unwrap(), Bson::Boolean(true));
+        assert_eq!(ev(bson!({"$and": [true, 0]})).unwrap(), Bson::Boolean(false));
+        assert_eq!(ev(bson!({"$or": [false, null, 0]})).unwrap(), Bson::Boolean(false));
+        assert_eq!(ev(bson!({"$or": [false, []]})).unwrap(), Bson::Boolean(true));
+        assert_eq!(ev(bson!({"$and": "$kind"})).unwrap(), Bson::Boolean(true));
+        assert!(Expr::parse(&bson!({"$and": []})).is_err(), "an empty $and is refused at parse");
+        assert!(Expr::parse(&bson!({"$or": []})).is_err(), "an empty $or is refused at parse");
+    }
+
+    #[test]
+    fn the_answer_is_a_boolean_not_the_argument_that_decided() {
+        assert_eq!(ev(bson!({"$and": [0, {"$add": ["$qty", 1]}]})).unwrap(), Bson::Boolean(false));
+        assert_eq!(
+            ev(bson!({"$and": [{"$add": ["$qty", 1]}, null]})).unwrap(),
+            Bson::Boolean(false)
+        );
+        assert_eq!(ev(bson!({"$or": ["x", {"$add": ["$qty", 1]}]})).unwrap(), Bson::Boolean(true));
+        assert_eq!(ev(bson!({"$or": [{"$add": ["$qty", 1]}, 7]})).unwrap(), Bson::Boolean(true));
+    }
+
+    #[test]
+    fn the_error_reported_is_the_earliest_written() {
+        let [b1, b2, ..] = &bads()[..] else { unreachable!() };
+        assert_ne!(message(b1), message(b2));
+        let and = |args: Vec<Bson>| ev(bson!({"$and": args})).unwrap_err().to_string();
+        let or = |args: Vec<Bson>| ev(bson!({"$or": args})).unwrap_err().to_string();
+        assert_eq!(and(vec![b1.clone(), b2.clone(), bson!(true)]), message(b1));
+        assert_eq!(and(vec![b1.clone(), bson!(true), b2.clone()]), message(b1));
+        assert_eq!(and(vec![bson!(true), b2.clone(), b1.clone()]), message(b2));
+        assert_eq!(or(vec![b2.clone(), bson!(false), b1.clone()]), message(b2));
+        assert_eq!(or(vec![bson!(false), b1.clone(), b2.clone()]), message(b1));
+    }
+
+    #[test]
+    fn nesting_composes_as_three_valued_logic() {
+        let bad = bson!({"$add": ["$qty", 1]});
+        let and_bad_true = bson!({"$and": [bad.clone(), true]});
+        let and_bad_false = bson!({"$and": [bad.clone(), false]});
+        assert_eq!(
+            ev(bson!({"$or": [and_bad_false.clone(), false]})).unwrap(),
+            Bson::Boolean(false)
+        );
+        assert_eq!(ev(bson!({"$or": [and_bad_true.clone(), true]})).unwrap(), Bson::Boolean(true));
+        assert!(ev(bson!({"$or": [and_bad_true.clone(), false]})).is_err());
+        assert!(ev(bson!({"$not": [and_bad_true]})).is_err(), "$not of not known is not known");
+        assert_eq!(ev(bson!({"$not": [and_bad_false]})).unwrap(), Bson::Boolean(true));
+        assert_eq!(
+            ev(bson!({"$cond": [{"$or": [bad.clone(), true]}, 1, 2]})).unwrap(),
+            Bson::Int32(1)
+        );
+        // `$cond` itself is unchanged: a condition that cannot be evaluated
+        // fails it even when both branches agree.
+        assert!(ev(bson!({"$cond": [bad, 1, 1]})).is_err());
+    }
+
+    /// The guard `aggregation.md` recommends, written with `$and`.
+    #[test]
+    fn a_type_guard_written_with_and_protects_what_follows_it() {
+        let guard = bson!({"$and": [{"$isArray": "$tags"}, {"$gt": [{"$size": "$tags"}, 2]}]});
+        assert_eq!(ev(guard.clone()).unwrap(), Bson::Boolean(false));
+        let d = doc! {"tags": ["a", "b", "c"]};
+        assert_eq!(Expr::parse(&guard).unwrap().eval(&d).unwrap(), Bson::Boolean(true));
+    }
+
+    /// How many `$and`/`$or` arguments `expr` evaluates.
+    fn arguments_evaluated(expr: Bson) -> (Result<Bson>, usize) {
+        let parsed = Expr::parse(&expr).unwrap();
+        let before = logic_arguments();
+        let got = parsed.eval(&row());
+        (got, logic_arguments() - before)
+    }
+
+    #[test]
+    fn evaluation_stops_at_the_argument_that_decides() {
+        let bad = bson!({"$add": ["$qty", 1]});
+        assert_eq!(arguments_evaluated(bson!({"$and": [true, false, bad.clone(), true]})).1, 2);
+        assert_eq!(arguments_evaluated(bson!({"$and": [false, bad.clone()]})).1, 1);
+        assert_eq!(arguments_evaluated(bson!({"$or": [false, true, bad.clone(), false]})).1, 2);
+        assert_eq!(arguments_evaluated(bson!({"$or": [1, bad.clone()]})).1, 1);
+        // Nothing decides: every argument is read.
+        assert_eq!(arguments_evaluated(bson!({"$and": [true, true, true]})).1, 3);
+    }
+
+    #[test]
+    fn evaluation_goes_on_past_an_error_until_an_argument_decides() {
+        let bad = bson!({"$add": ["$qty", 1]});
+        let (got, n) = arguments_evaluated(bson!({"$and": [bad.clone(), true, false, true]}));
+        assert_eq!((got.unwrap(), n), (Bson::Boolean(false), 3));
+        let (got, n) = arguments_evaluated(bson!({"$or": [bad.clone(), false, true, false]}));
+        assert_eq!((got.unwrap(), n), (Bson::Boolean(true), 3));
+        let (got, n) = arguments_evaluated(bson!({"$and": [bad, true, true]}));
+        assert!(got.is_err());
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn a_filter_limit_still_stops_early_over_a_deciding_and() {
+        let expr = bson!({"$filter": {
+            "input": [1, 2, 3, 4],
+            "as": "i",
+            "cond": {"$and": [{"$gt": ["$$i", 0]}, true]},
+            "limit": 2,
+        }});
+        let (got, n) = arguments_evaluated(expr);
+        assert_eq!(got.unwrap(), bson!([1, 2]));
+        assert_eq!(n, 4, "two elements, two arguments each");
+    }
+
+    /// A variable nothing bound is a bug in the caller, not a value with no
+    /// answer: it fails the `$or` even when another argument is true.
+    #[test]
+    fn an_unbound_variable_is_never_set_aside() {
+        let vars = ["x".to_string()];
+        for (op, decider) in [("$or", bson!(true)), ("$and", bson!(false))] {
+            for args in [vec![bson!("$$x"), decider.clone()], vec![decider.clone(), bson!("$$x")]] {
+                let written = args.clone();
+                let parsed = Expr::parse_with_vars(&bson!({op: args}), &vars).unwrap();
+                let got = parsed.eval(&row());
+                if written[0] == decider {
+                    // The decider is reached first, so the variable is never read.
+                    assert_eq!(got.unwrap(), Bson::Boolean(truthy(&decider)), "{op} {written:?}");
+                } else {
+                    let e = got.expect_err("an unbound variable must fail");
+                    assert!(matches!(e, Error::Internal(_)), "{op} {written:?}: {e}");
+                    assert!(!e.is_deferrable());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_scan_returns_an_error_that_cannot_wait_at_once() {
+        let mut seen = 0;
+        let items: Vec<Result<bool>> = vec![
+            Err(Error::InvalidQuery("value".into())),
+            Err(Error::Internal("invariant".into())),
+            Ok(false),
+        ];
+        let got = all_of(items, |r| {
+            seen += 1;
+            r
+        });
+        assert!(matches!(got, Err(Error::Internal(_))), "{got:?}");
+        assert_eq!(seen, 2, "nothing after it is evaluated");
+    }
+
+    /// One argument of a generated `$and`/`$or`.
+    #[derive(Clone, Debug)]
+    enum Arg {
+        True(usize),
+        False(usize),
+        /// Fails with a message of its own.
+        Error(usize),
+    }
+
+    impl Arg {
+        fn expr(&self) -> Bson {
+            match *self {
+                Arg::True(i) => truthy_values()[i % truthy_values().len()].clone(),
+                Arg::False(i) => falsy()[i % falsy().len()].clone(),
+                // Each `k` names a different count in the refusal.
+                Arg::Error(k) => bson!({"$range": [0, 100_001 + k as i64]}),
+            }
+        }
+    }
+
+    fn arg() -> impl Strategy<Value = Arg> {
+        prop_oneof![
+            (0..6usize).prop_map(Arg::True),
+            (0..5usize).prop_map(Arg::False),
+            (0..4usize).prop_map(Arg::Error),
+        ]
+    }
+
+    /// The reference: three-valued logic, order-free, with the
+    /// earliest-written error, and how many arguments a scan in written order
+    /// evaluates before one decides.
+    fn model(is_and: bool, args: &[Arg]) -> (std::result::Result<bool, usize>, usize) {
+        let decides =
+            |a: &Arg| matches!((is_and, a), (true, Arg::False(_)) | (false, Arg::True(_)));
+        let evaluated = args.iter().position(decides).map_or(args.len(), |i| i + 1);
+        if args.iter().any(decides) {
+            return (Ok(!is_and), evaluated);
+        }
+        match args.iter().find_map(|a| if let Arg::Error(k) = a { Some(*k) } else { None }) {
+            Some(k) => (Err(k), evaluated),
+            None => (Ok(is_and), evaluated),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn and_and_or_match_three_valued_logic(
+            is_and in any::<bool>(),
+            args in prop::collection::vec(arg(), 1..7),
+        ) {
+            let op = if is_and { "$and" } else { "$or" };
+            let exprs: Vec<Bson> = args.iter().map(Arg::expr).collect();
+            let (got, n) = arguments_evaluated(bson!({op: exprs}));
+            let (want, want_n) = model(is_and, &args);
+            match want {
+                Ok(b) => prop_assert_eq!(got.unwrap(), Bson::Boolean(b)),
+                Err(k) => prop_assert_eq!(
+                    got.unwrap_err().to_string(),
+                    message(&Arg::Error(k).expr())
+                ),
+            }
+            prop_assert_eq!(n, want_n);
+        }
+    }
+}
+
+/// Random nested `$and`/`$or`/`$not`/`$cond` trees over literal values,
+/// distinct value errors and an unbound variable, against a naive
+/// three-valued reference that also counts the `$and`/`$or` arguments
+/// evaluated (ADR-211).
+#[cfg(test)]
+mod and_or_nested {
+    use super::*;
+    use bson::bson;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Node {
+        /// Index into `values()`.
+        Lit(usize),
+        /// A deferrable value error with a message of its own.
+        Bad(usize),
+        /// `$$x`, parsed as bound, evaluated unbound: `Error::Internal`.
+        Unbound,
+        And(Vec<Node>),
+        Or(Vec<Node>),
+        Not(Box<Node>),
+        Cond(Box<Node>, Box<Node>, Box<Node>),
+    }
+
+    fn values() -> Vec<Bson> {
+        vec![
+            bson!(true),
+            bson!(false),
+            bson!(1),
+            bson!(0),
+            Bson::Null,
+            bson!(""),
+            bson!([]),
+            bson!(0.0),
+            bson!("x"),
+            bson!("$missing"),
+        ]
+    }
+
+    fn to_bson(n: &Node) -> Bson {
+        match n {
+            Node::Lit(i) => values()[*i].clone(),
+            Node::Bad(k) => bson!({"$range": [0, 100_001 + *k as i64]}),
+            Node::Unbound => bson!("$$x"),
+            Node::And(a) => bson!({"$and": a.iter().map(to_bson).collect::<Vec<_>>()}),
+            Node::Or(a) => bson!({"$or": a.iter().map(to_bson).collect::<Vec<_>>()}),
+            Node::Not(x) => bson!({"$not": [to_bson(x)]}),
+            Node::Cond(c, t, e) => bson!({"$cond": [to_bson(c), to_bson(t), to_bson(e)]}),
+        }
+    }
+
+    /// What the reference returns: a value, a deferrable error `k`, or the
+    /// internal error.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Out {
+        Val(Bson),
+        Bad(usize),
+        Internal,
+    }
+
+    fn lit_value(i: usize) -> Bson {
+        // A missing field reads as null.
+        match values()[i].clone() {
+            Bson::String(s) if s == "$missing" => Bson::Null,
+            v => v,
+        }
+    }
+
+    /// Naive three-valued reference. Returns (result, $and/$or arguments evaluated).
+    fn reference(n: &Node) -> (Out, usize) {
+        match n {
+            Node::Lit(i) => (Out::Val(lit_value(*i)), 0),
+            Node::Bad(k) => (Out::Bad(*k), 0),
+            Node::Unbound => (Out::Internal, 0),
+            Node::Not(x) => match reference(x) {
+                (Out::Val(v), c) => (Out::Val(Bson::Boolean(!truthy(&v))), c),
+                other => other,
+            },
+            Node::Cond(c, t, e) => {
+                let (cv, cc) = reference(c);
+                match cv {
+                    Out::Val(v) => {
+                        let (bv, bc) = if truthy(&v) { reference(t) } else { reference(e) };
+                        (bv, cc + bc)
+                    }
+                    other => (other, cc),
+                }
+            }
+            Node::And(args) | Node::Or(args) => {
+                let decider = matches!(n, Node::Or(_));
+                let mut count = 0;
+                let mut first_bad: Option<usize> = None;
+                for a in args {
+                    let (r, c) = reference(a);
+                    count += 1 + c;
+                    match r {
+                        Out::Val(v) if truthy(&v) == decider => {
+                            return (Out::Val(Bson::Boolean(decider)), count);
+                        }
+                        Out::Val(_) => {}
+                        Out::Internal => return (Out::Internal, count),
+                        Out::Bad(k) => {
+                            first_bad.get_or_insert(k);
+                        }
+                    }
+                }
+                match first_bad {
+                    Some(k) => (Out::Bad(k), count),
+                    None => (Out::Val(Bson::Boolean(!decider)), count),
+                }
+            }
+        }
+    }
+
+    fn node() -> impl Strategy<Value = Node> {
+        let leaf = prop_oneof![
+            6 => (0..10usize).prop_map(Node::Lit),
+            3 => (0..5usize).prop_map(Node::Bad),
+            1 => Just(Node::Unbound),
+        ];
+        leaf.prop_recursive(5, 48, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 1..5).prop_map(Node::And),
+                prop::collection::vec(inner.clone(), 1..5).prop_map(Node::Or),
+                inner.clone().prop_map(|x| Node::Not(Box::new(x))),
+                (inner.clone(), inner.clone(), inner).prop_map(|(c, t, e)| Node::Cond(
+                    Box::new(c),
+                    Box::new(t),
+                    Box::new(e)
+                )),
+            ]
+        })
+    }
+
+    fn row() -> Document {
+        bson::doc! {"_id": 1}
+    }
+
+    fn actual(n: &Node) -> (Result<Bson>, usize) {
+        let parsed = Expr::parse_with_vars(&to_bson(n), &["x".to_string()]).unwrap();
+        let before = logic_arguments();
+        let got = parsed.eval(&row());
+        (got, logic_arguments() - before)
+    }
+
+    fn bad_message(k: usize) -> String {
+        Expr::parse(&to_bson(&Node::Bad(k))).unwrap().eval(&row()).unwrap_err().to_string()
+    }
+
+    /// `tree` with every unbound variable replaced by `true`.
+    fn without_unbound(n: Node) -> Node {
+        match n {
+            Node::Unbound => Node::Lit(0),
+            Node::Lit(_) | Node::Bad(_) => n,
+            Node::And(a) => Node::And(a.into_iter().map(without_unbound).collect()),
+            Node::Or(a) => Node::Or(a.into_iter().map(without_unbound).collect()),
+            Node::Not(x) => Node::Not(Box::new(without_unbound(*x))),
+            Node::Cond(c, t, e) => Node::Cond(
+                Box::new(without_unbound(*c)),
+                Box::new(without_unbound(*t)),
+                Box::new(without_unbound(*e)),
+            ),
+        }
+    }
+
+    /// Enough to reach depth five often, and quick enough to run with the
+    /// rest of the suite.
+    const CASES: u32 = 4000;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: CASES, .. ProptestConfig::default() })]
+
+        #[test]
+        fn nested_trees_match_the_naive_three_valued_reference(tree in node()) {
+            let (want, want_n) = reference(&tree);
+            let (got, n) = actual(&tree);
+            match (&want, &got) {
+                (Out::Val(v), Ok(g)) => prop_assert_eq!(g, v, "{}", to_bson(&tree)),
+                (Out::Bad(k), Err(e)) => {
+                    prop_assert!(e.is_deferrable(), "{}", to_bson(&tree));
+                    prop_assert_eq!(e.to_string(), bad_message(*k), "{}", to_bson(&tree));
+                }
+                (Out::Internal, Err(Error::Internal(m))) => {
+                    prop_assert_eq!(m.as_str(), "variable $$x is not bound")
+                }
+                _ => prop_assert!(false, "{}: want {:?}, got {:?}", to_bson(&tree), want, got),
+            }
+            prop_assert_eq!(n, want_n, "argument count for {}", to_bson(&tree));
+        }
+
+        /// Any reordering of the arguments of every `$and`/`$or` leaves a
+        /// value answer unchanged (no Internal leaf, which is order-dependent
+        /// by design).
+        #[test]
+        fn a_value_answer_does_not_depend_on_argument_order(
+            tree in node().prop_map(without_unbound),
+            seed in any::<u64>(),
+        ) {
+            fn rand(seed: &mut u64) -> usize {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (*seed >> 33) as usize
+            }
+            fn shuffle(n: &Node, seed: &mut u64) -> Node {
+                match n {
+                    Node::And(a) | Node::Or(a) => {
+                        let mut v: Vec<Node> = a.iter().map(|x| shuffle(x, seed)).collect();
+                        for i in (1..v.len()).rev() {
+                            let j = rand(seed) % (i + 1);
+                            v.swap(i, j);
+                        }
+                        if matches!(n, Node::And(_)) { Node::And(v) } else { Node::Or(v) }
+                    }
+                    Node::Not(x) => Node::Not(Box::new(shuffle(x, seed))),
+                    Node::Cond(c, t, e) => Node::Cond(
+                        Box::new(shuffle(c, seed)),
+                        Box::new(shuffle(t, seed)),
+                        Box::new(shuffle(e, seed)),
+                    ),
+                    other => other.clone(),
+                }
+            }
+            let mut s = seed;
+            let shuffled = shuffle(&tree, &mut s);
+            let (a, _) = actual(&tree);
+            let (b, _) = actual(&shuffled);
+            prop_assert_eq!(a.is_ok(), b.is_ok(), "{} vs {}", to_bson(&tree), to_bson(&shuffled));
+            if let (Ok(x), Ok(y)) = (a, b) {
+                prop_assert_eq!(x, y);
+            }
+        }
+    }
+
+    /// Nesting across `$not` and `$cond`, written out.
+    #[test]
+    fn hand_rows() {
+        let ev = |b: Bson| Expr::parse(&b).unwrap().eval(&bson::doc! {"qty": "t"});
+        let bad = bson!({"$add": ["$qty", 1]});
+        // `$or` inside `$not` inside `$and`.
+        assert_eq!(
+            ev(bson!({"$and": [{"$not": [{"$or": [bad.clone(), true]}]}, bad.clone()]})).unwrap(),
+            Bson::Boolean(false)
+        );
+        assert!(ev(bson!({"$and": [{"$not": [{"$or": [bad.clone(), false]}]}, false]})).is_ok());
+        assert!(ev(bson!({"$and": [{"$not": [{"$or": [bad.clone(), false]}]}, true]})).is_err());
+        // An error deferred across a `$cond` boundary: the condition's `$and`
+        // defers an error that a later false decides, and the branch taken
+        // decides an outer `$or`.
+        assert_eq!(
+            ev(bson!({"$or": [bad.clone(), {"$cond": [{"$and": [bad.clone(), false]}, 0, 1]}]}))
+                .unwrap(),
+            Bson::Boolean(true)
+        );
+        // `$cond` itself is still strict on its condition.
+        assert!(ev(bson!({"$or": [false, {"$cond": [bad.clone(), 1, 1]}]})).is_err());
+        // But an `$or` beside it with a true argument hides it.
+        assert_eq!(
+            ev(bson!({"$or": [{"$cond": [bad, 1, 1]}, true]})).unwrap(),
+            Bson::Boolean(true)
+        );
     }
 }
 

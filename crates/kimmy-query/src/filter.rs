@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use regex_automata::meta;
 use regex_automata::util::syntax;
 
-use crate::expr::{self, Expr};
+use crate::expr::{self, Expr, all_of, any_of};
 use crate::path;
 
 /// A parsed filter.
@@ -877,6 +877,11 @@ pub fn matches(filter: &Filter, doc: &Document) -> Result<bool> {
 /// The refusal for a `$expr` that could not be evaluated, against the
 /// document with `_id` when it has one, or against something `within` it.
 fn unevaluable(e: Error, id: Option<&Bson>, within: &str) -> Error {
+    // A broken invariant is not the document's fault and keeps its own kind,
+    // and so its own status (ADR-211).
+    if !e.is_deferrable() {
+        return e;
+    }
     let reason = match e {
         Error::InvalidQuery(reason) => reason,
         other => other.to_string(),
@@ -911,40 +916,11 @@ fn condition_has_expr(condition: &Condition) -> bool {
     }
 }
 
-/// Whether every item satisfies `f`, in the order the parser left them in
-/// (cheap first). The first `false` decides, whatever came before it; an
-/// error is kept, and returned only if no item said `false`.
-fn all_of<T>(items: &[T], mut f: impl FnMut(&T) -> Result<bool>) -> Result<bool> {
-    let mut undecided = None;
-    for item in items {
-        match f(item) {
-            Ok(true) => {}
-            Ok(false) => return Ok(false),
-            Err(e) => {
-                undecided.get_or_insert(e);
-            }
-        }
-    }
-    undecided.map_or(Ok(true), Err)
-}
-
-/// Whether any item satisfies `f`, in the order the parser left them in
-/// (cheap first). The first `true` decides, whatever came before it; an
-/// error is kept, and returned only if no item said `true`.
-fn any_of<T>(items: &[T], mut f: impl FnMut(&T) -> Result<bool>) -> Result<bool> {
-    let mut undecided = None;
-    for item in items {
-        match f(item) {
-            Ok(false) => {}
-            Ok(true) => return Ok(true),
-            Err(e) => {
-                undecided.get_or_insert(e);
-            }
-        }
-    }
-    undecided.map_or(Ok(false), Err)
-}
-
+// `all_of` and `any_of` are the expression language's own `$and` and `$or`
+// (`expr::all_of`), so a filter clause and an argument inside one `$expr` read
+// an error by the same truth table (ADR-206, ADR-211). Each list reaches them
+// in the order the parser left it in: cheap first, the clauses that can fail
+// still in the order written.
 fn evaluate(filter: &Filter, doc: &Document) -> Result<bool> {
     match filter {
         Filter::AlwaysTrue => Ok(true),
@@ -2329,6 +2305,52 @@ mod tests {
     }
 
     #[test]
+    fn filter_clauses_and_one_expression_answer_alike() {
+        // The same question asked with filter clauses and inside one `$expr`
+        // gets the same answer, or the same error, in every order: the two
+        // levels share one three-valued `$and`/`$or` (ADR-211).
+        let d = doc! { "_id": 3, "qty": "twelve", "kind": "a", "n": 0 };
+        // Each part as a filter clause and as an expression argument. A
+        // true or false part is written both without `$expr`, which the
+        // parser moves first, and with it, which stays in the order written.
+        let parts = [
+            (doc! { "kind": "a" }, bson::bson!({ "$eq": ["$kind", "a"] })),
+            (doc! { "kind": "b" }, bson::bson!({ "$eq": ["$kind", "b"] })),
+            (doc! { "$expr": { "$eq": ["$kind", "a"] } }, bson::bson!({ "$eq": ["$kind", "a"] })),
+            (doc! { "$expr": { "$eq": ["$kind", "b"] } }, bson::bson!({ "$eq": ["$kind", "b"] })),
+            (doc! { "$expr": { "$add": ["$qty", 1] } }, bson::bson!({ "$add": ["$qty", 1] })),
+            (doc! { "$expr": { "$divide": [1, "$n"] } }, bson::bson!({ "$divide": [1, "$n"] })),
+        ];
+        // Every sequence of one to three parts, repeats included.
+        let mut sequences: Vec<Vec<usize>> = Vec::new();
+        let mut frontier: Vec<Vec<usize>> = vec![vec![]];
+        for _ in 0..3 {
+            frontier = frontier
+                .iter()
+                .flat_map(|s| (0..parts.len()).map(move |i| [s.as_slice(), &[i]].concat()))
+                .collect();
+            sequences.extend(frontier.iter().cloned());
+        }
+        assert_eq!(sequences.len(), 6 + 36 + 216);
+        let outcome = |q: Document| match matches(&parse(&q).unwrap(), &d) {
+            Ok(b) => Ok(b),
+            Err(e) => Err(e.to_string()),
+        };
+        let mut errors = 0;
+        for seq in &sequences {
+            for op in ["$and", "$or"] {
+                let clauses: Vec<Document> = seq.iter().map(|&i| parts[i].0.clone()).collect();
+                let args: Vec<Bson> = seq.iter().map(|&i| parts[i].1.clone()).collect();
+                let by_clauses = outcome(doc! { op: clauses });
+                let by_expr = outcome(doc! { "$expr": { op: args } });
+                assert_eq!(by_clauses, by_expr, "{op} over {seq:?}");
+                errors += usize::from(by_expr.is_err());
+            }
+        }
+        assert!(errors > 0 && errors < 2 * sequences.len(), "{errors} of {}", sequences.len());
+    }
+
+    #[test]
     fn clauses_without_an_expression_are_evaluated_first() {
         // Not only the answer but the work: where a clause without `$expr`
         // decides, the expression is never evaluated, wherever it is written.
@@ -2356,6 +2378,28 @@ mod tests {
         let before = expr_evaluations();
         assert!(matches(&filter, &d).unwrap());
         assert_eq!(expr_evaluations() - before, 1);
+    }
+
+    #[test]
+    fn a_broken_invariant_is_neither_set_aside_nor_reworded() {
+        // A `$$x` nothing bound at evaluation is a bug in the caller: a true
+        // `$or` branch beside it does not hide it, and it keeps its own kind
+        // rather than becoming the document's `400` (ADR-211).
+        let unbound = || {
+            Filter::Expr(Box::new(
+                Expr::parse_with_vars(&Bson::String("$$x".into()), &["x".to_string()]).unwrap(),
+            ))
+        };
+        let d = doc! { "_id": 1 };
+        for filter in [
+            Filter::Or(vec![unbound(), Filter::AlwaysTrue]),
+            Filter::And(vec![unbound(), parse(&doc! { "_id": 2 }).unwrap()]),
+            unbound(),
+        ] {
+            let e = matches(&filter, &d).unwrap_err();
+            assert!(matches!(e, Error::Internal(_)), "{filter:?}: {e}");
+            assert_eq!(e.to_string(), "internal error: variable $$x is not bound");
+        }
     }
 
     #[test]

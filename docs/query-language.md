@@ -165,7 +165,8 @@ and null propagates, so `{$add: ["$missing", 1]}` is null and the clause is
 false, not an error.
 
 **A request fails exactly when its answer depends on a document whose `$expr`
-cannot be evaluated**, at the level of filter clauses. For one document: an `$and` (the implicit one between
+cannot be evaluated**, at the level of filter clauses and inside one `$expr`
+alike. For one document: an `$and` (the implicit one between
 top-level fields included) is false if any clause is false, an `$or` is true
 if any branch is true, `$nor` is the inverse, and `$elemMatch` is true if any
 element matches, whatever an expression that could not be evaluated would
@@ -178,12 +179,16 @@ Within each of these, the clauses without `$expr` are evaluated first and
 evaluation stops at the first that decides, so an expression is not even
 evaluated where a cheaper clause has answered.
 
-Inside one `$expr` the rule is the expression language's, which is not lazy:
-the expression's own `$and` and `$or` evaluate every argument (`$cond`
-evaluates only the branch it takes). So `{"$expr": {"$or": [{"$eq": ["$kind",
-"c"]}, <bad>]}}` fails on a document whose `kind` is `"c"`, where the filter
-`{"$or": [{"kind": "c"}, {"$expr": <bad>}]}` does not. Write the alternatives
-as filter clauses when one of them may not be evaluable.
+The expression's own `$and` and `$or` follow the same rule, by the same code
+([ADR-211](decisions.md)): an `$and` is false if any argument is false, an
+`$or` true if any is true, in whatever order they are written, and only when
+no argument decides does one that cannot be evaluated fail the document, with
+the error of the earliest-written argument that has one. So
+`{"$expr": {"$or": [{"$eq": ["$kind", "c"]}, <bad>]}}` and the filter
+`{"$or": [{"kind": "c"}, {"$expr": <bad>}]}` are the same question with the
+same answer: true on a document whose `kind` is `"c"`, a failure on one whose
+`kind` is anything else. `$cond` evaluates only the branch it takes, and a
+condition it cannot evaluate fails it, even when both branches are equal.
 
 Which documents the answer depends on is the request's own business:
 
