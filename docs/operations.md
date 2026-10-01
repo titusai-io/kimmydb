@@ -454,6 +454,14 @@ means the store is damaged ([Checking a store](#checking-a-store)).
 All four resolve. Every form is re-resolved each `discovery_interval_secs`, so
 a peer that appears later is found without a restart.
 
+**A `dns:` or `k8s:` lookup can hold a stop.** These resolve with the system
+resolver (`getaddrinfo`), which cannot be cancelled. A `kimmyd` stopped while one
+is in flight waits for it, up to the 22 s stop budget, then exits 0 with the store
+closed. The lookup lasts at most `timeout` × `attempts` × the nameservers in the
+node's `resolv.conf`, so with a resolver that may not answer, set for example
+`options timeout:2 attempts:2`, or expect stops of up to 22 s. A stop between
+lookups does not wait, and `dns-srv:` seeds never hold a stop.
+
 **`dns-srv:` is the one form where peers need not agree on a port**, because
 each record carries its own:
 

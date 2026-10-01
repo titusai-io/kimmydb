@@ -190,8 +190,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   gets an early tick of its own and not one a sync interval later, a resolver that
   panics costs one resolution and not discovery, and a resolution still running when
   the next discovery tick comes is said at `WARN` only once it has run for a
-  discovery interval or longer, and not stacked on. A hung `dns:` lookup still
-  holds a stop for the full stop budget, as before.
+  discovery interval or longer, and not stacked on. A stop still waits for a
+  `dns:` or `k8s:` lookup that is in flight when it begins, for what is left of
+  that lookup (at most `timeout` × `attempts` × the nameservers in resolv.conf)
+  and never past the 22 s stop budget, then exits 0, as before; between lookups,
+  or with a `dns-srv:` seed, it does not wait.
 
 - **A stored member that returns behind every peer's horizon is marked within a
   fraction of a second, not after a whole sync interval.** It starts unmarked,
