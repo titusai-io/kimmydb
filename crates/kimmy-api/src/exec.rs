@@ -1051,6 +1051,9 @@ pub fn replace(
     let doc = json_to_document(document)?;
     let expected = parse_if_stamp(params.if_stamp.as_deref())?;
     let outcome = state.engine.replace_if(&meta, &doc_id, doc, params.upsert, expected)?;
+    // `modified` is 0 for a body identical to the stored one, which writes
+    // nothing and reports no `stamp` (ADR-208).
+    //
     // Counts, not booleans, even though a replace touches at most one document.
     //
     // `WriteOutcome` is three bools and this route used to serialize them
@@ -1460,9 +1463,15 @@ pub fn find_and_modify(
         None => Value::Null,
     };
 
+    // `modified` as `/update` counts it (ADR-208): 1 when an existing
+    // document was changed or removed, 0 when the update left it byte for
+    // byte as it was, which writes nothing and so reports no `stamp`, and 0
+    // for a document the upsert created, which `upserted` says, as on `PUT`.
     let mut body = json!({
         "document": document,
         "matched": u64::from(outcome.matched),
+        "modified": u64::from(outcome.modified),
+        "upserted": outcome.upserted.is_some(),
     });
     if let Some(id) = outcome.upserted {
         body["upsertedId"] = crate::json::bson_to_json(&id.to_bson());

@@ -2646,39 +2646,304 @@ async fn a_replaced_document_reads_back_with_its_id_first() {
     assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":3,"alpha":4}"#);
 }
 
-/// `modified` counts documents **written**, not documents changed, so it equals
-/// `matched` even when the operators moved nothing. This is the deliberate
-/// deviation in `docs/deviations.md`, and `docs/openapi.yaml` stated the
-/// opposite until 2026-08-26 — nothing caught it because nothing ever asserted
-/// on the value for an update that changes nothing.
+/// `modified` counts documents **changed** (ADR-208). A document the update
+/// leaves byte for byte as it was is not written: it counts in `matched` and
+/// not in `modified`, spends no commit, reports no stamp, and keeps the stamp
+/// it had. Until ADR-208 every match was written back and `modified` always
+/// equalled `matched`.
 #[tokio::test]
-async fn a_no_op_update_still_counts_as_modified() {
+async fn a_no_op_update_is_not_written() {
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"g":"x"})).await;
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"g":"x"})).await;
+    async fn stamps(server: &Server, token: &str) -> Value {
+        let body = json!({ "filter": {}, "stamps": true });
+        server.post("/v1/db/shop/coll/c/find", Some(token), body).await.body["stamps"].clone()
+    }
+    let before = stamps(&server, &token).await;
+    assert_eq!(before.as_array().map(Vec::len), Some(2), "{before}");
 
     // Every document is already in the state the update asks for.
-    let res = server
-        .post(
-            "/v1/db/shop/coll/c/update",
-            Some(&token),
-            json!({ "filter": {}, "update": {"$set": {"g": "x"}}, "multi": true }),
-        )
-        .await;
-    assert_eq!(res.body["matched"], 2);
-    assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
+    for update in [json!({"$set": {"g": "x"}}), json!({"$unset": {"never_here": ""}})] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/c/update",
+                Some(&token),
+                json!({ "filter": {}, "update": update, "multi": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        assert_eq!(res.body, json!({ "matched": 2, "modified": 0, "commits": 0 }), "{update}");
+    }
 
-    // The same holds for `$unset` of a field that was never present.
+    // The single-document form, conditional on the current stamp: matched,
+    // not modified, no stamp, and the caller's stamp still names the
+    // document for the next conditional write.
+    let one = before[0].clone();
     let res = server
         .post(
             "/v1/db/shop/coll/c/update",
             Some(&token),
-            json!({ "filter": {}, "update": {"$unset": {"never_here": ""}}, "multi": true }),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"g": "x"}}, "if_stamp": one }),
         )
         .await;
-    assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
+    assert_eq!(res.body, json!({ "matched": 1, "modified": 0, "commits": 0 }), "{:?}", res.body);
+
+    // `find_and_modify` returns the document either way, and reports no
+    // stamp when it wrote nothing.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": 2}, "update": {"$set": {"g": "x"}}, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body,
+        json!({ "document": {"_id": 2, "g": "x"}, "matched": 1, "modified": 0, "upserted": false })
+    );
+
+    assert_eq!(stamps(&server, &token).await, before, "nothing was written, so no version moved");
+
+    // And the stamp the no-op left valid is the one a real change needs.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"g": "y"}}, "if_stamp": one }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!((res.body["matched"].clone(), res.body["modified"].clone()), (json!(1), json!(1)));
+    assert!(res.body["stamp"].is_string(), "{:?}", res.body);
+}
+
+/// A replace by id whose body is the stored document is not written either
+/// (ADR-208), and one that only reorders fields is.
+#[tokio::test]
+async fn a_replace_with_the_stored_body_is_not_written() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"k","a":1,"b":2})).await;
+    let stamp = inserted.body["stamp"].as_str().unwrap().to_string();
+
+    let res = server.put("/v1/db/shop/coll/c/docs/k", Some(&token), json!({"a":1,"b":2})).await;
+    assert_eq!(res.body, json!({ "matched": 1, "modified": 0, "upserted": false }));
+    let res = server
+        .put(
+            &format!("/v1/db/shop/coll/c/docs/k?if_stamp={stamp}"),
+            Some(&token),
+            json!({"a":1,"b":2}),
+        )
+        .await;
+    assert_eq!(res.body, json!({ "matched": 1, "modified": 0, "upserted": false }));
+
+    let res = server.put("/v1/db/shop/coll/c/docs/k", Some(&token), json!({"b":2,"a":1})).await;
+    assert_eq!((res.body["modified"].clone(), res.body["stamp"].is_string()), (json!(1), true));
+
+    // `_id` is stored as the path names it, a 64-bit integer, so the first
+    // `PUT` over a document inserted with a 32-bit `_id` changes its type and
+    // counts; the second does not.
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":5,"a":1})).await;
+    let res = server.put("/v1/db/shop/coll/c/docs/5", Some(&token), json!({"a":1})).await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let res = server.put("/v1/db/shop/coll/c/docs/5", Some(&token), json!({"a":1})).await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+}
+
+/// A replacement through `/update` or `find_and_modify` keeps `_id` first,
+/// where an insert and a `PUT` store it, so sending a document's own fields
+/// back, without `_id`, is no change the first time (ADR-208).
+#[tokio::test]
+async fn a_replacement_of_the_stored_fields_is_not_written() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"k","a":1,"b":2})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": "k"}, "update": {"a": 1, "b": 2} }),
+        )
+        .await;
+    assert_eq!(res.body, json!({ "matched": 1, "modified": 0, "commits": 0 }), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": "k"}, "update": {"a": 1, "b": 2}, "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(
+        (&res.body["matched"], &res.body["modified"]),
+        (&json!(1), &json!(0)),
+        "{:?}",
+        res.body
+    );
+    let stored = server.get("/v1/db/shop/coll/c/docs/k", Some(&token)).await.body;
+    assert_eq!(stored.to_string(), r#"{"_id":"k","a":1,"b":2}"#);
+
+    // A real replacement still writes, and still stores `_id` first.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": "k"}, "update": {"b": 3, "_id": "k"} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let stored = server.get("/v1/db/shop/coll/c/docs/k", Some(&token)).await.body;
+    assert_eq!(stored.to_string(), r#"{"_id":"k","b":3}"#);
+}
+
+/// `modified` counts changes to documents that were there. A document an
+/// upsert creates is `upserted`, and `modified: 0`, on every route.
+#[tokio::test]
+async fn an_upsert_that_creates_reports_upserted_and_not_modified() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": "n"}, "update": {"$set": {"v": 1}}, "upsert": true,
+                    "returnDocument": "after" }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        (&res.body["matched"], &res.body["modified"], &res.body["upserted"]),
+        (&json!(0), &json!(0), &json!(true)),
+        "{:?}",
+        res.body
+    );
+    assert_eq!(res.body["upsertedId"], "n");
+    assert!(res.body["stamp"].is_string(), "a creation is a write: {:?}", res.body);
+
+    // Matched now, and changed: modified, not upserted.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": "n"}, "update": {"$set": {"v": 2}}, "upsert": true }),
+        )
+        .await;
+    assert_eq!(
+        (&res.body["matched"], &res.body["modified"], &res.body["upserted"]),
+        (&json!(1), &json!(1), &json!(false)),
+        "{:?}",
+        res.body
+    );
+
+    let res =
+        server.put("/v1/db/shop/coll/c/docs/p?upsert=true", Some(&token), json!({"v": 1})).await;
+    assert_eq!(res.body["upserted"], true, "{:?}", res.body);
+    assert_eq!((&res.body["matched"], &res.body["modified"]), (&json!(0), &json!(0)));
+}
+
+/// What counts as a change is the stored bytes, so a value of another type is
+/// one, and a chunk holding both kinds counts only the changed (ADR-208).
+#[tokio::test]
+async fn modified_counts_the_documents_an_update_changed() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, a) in [(1, json!(1.0)), (2, json!(1)), (3, json!(2))] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "a": a})).await;
+    }
+    // A 32-bit `1` over a double `1.0` is a change; over a 32-bit `1` it is
+    // not; over `2` it is.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$set": {"a": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.body, json!({ "matched": 3, "modified": 2, "commits": 1 }), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$set": {"a": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.body, json!({ "matched": 3, "modified": 0, "commits": 0 }), "{:?}", res.body);
+
+    // The single-document form reports the stamp only when it wrote.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 3}, "update": {"$set": {"a": 7}} }),
+        )
+        .await;
+    assert_eq!((res.body["matched"].clone(), res.body["modified"].clone()), (json!(1), json!(1)));
+    assert!(res.body["stamp"].is_string(), "{:?}", res.body);
+}
+
+/// A watcher hears about changes, not about writes that changed nothing
+/// (ADR-208): an `update`, a `PUT` and a `find_and_modify` that leave the
+/// document as it was produce no event, and the next event is the next
+/// real change.
+#[tokio::test]
+async fn a_change_stream_sees_no_event_for_an_unchanged_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    let mut socket =
+        open_watch(&server.base, "/v1/db/shop/coll/orders/watch?full_document=true", &token).await;
+    async fn next(socket: &mut tokio::net::TcpStream) -> Value {
+        let frame =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_text_frame(socket))
+                .await
+                .expect("an event should arrive");
+        serde_json::from_str(&frame).expect("a JSON event")
+    }
+
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":"o","s":"paid"})).await;
+    assert_eq!(next(&mut socket).await["operationType"], "insert");
+
+    let path = "/v1/db/shop/coll/orders";
+    let res = server
+        .post(
+            &format!("{path}/update"),
+            Some(&token),
+            json!({ "filter": {"_id": "o"}, "update": {"$set": {"s": "paid"}} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = server.put(&format!("{path}/docs/o"), Some(&token), json!({"s": "paid"})).await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = server
+        .post(
+            &format!("{path}/find_and_modify"),
+            Some(&token),
+            json!({ "filter": {"_id": "o"}, "update": {"$set": {"s": "paid"}} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+
+    let res = server
+        .post(
+            &format!("{path}/update"),
+            Some(&token),
+            json!({ "filter": {"_id": "o"}, "update": {"$set": {"s": "shipped"}} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let event = next(&mut socket).await;
+    assert_eq!(event["fullDocument"], json!({"_id": "o", "s": "shipped"}), "{event}");
+    assert_eq!(event["documentKey"]["_id"], "o", "{event}");
 }
 
 /// `$[<identifier>]` with `arrayFilters` and `$[]` address array elements
@@ -2734,8 +2999,8 @@ async fn positional_updates_address_array_elements() {
     assert_eq!(doc["items"][0]["qty"], 2, "{doc}");
     assert_eq!(doc["items"][1]["qty"], 6, "{doc}");
 
-    // No element selected: the document is written back unchanged, and
-    // `modified` counts the write, as the register says it does.
+    // No element selected: the document is unchanged, so it is not written
+    // and does not count in `modified` (ADR-208).
     let res = server
         .post(
             "/v1/db/shop/coll/c/update",
@@ -2749,7 +3014,7 @@ async fn positional_updates_address_array_elements() {
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     assert_eq!(res.body["matched"], 1);
-    assert_eq!(res.body["modified"], 1, "modified counts writes, not changes");
+    assert_eq!(res.body["modified"], 0, "nothing changed, so nothing was written");
     let after = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
     assert_eq!(after, doc, "nothing selected, nothing changed");
 

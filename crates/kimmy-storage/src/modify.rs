@@ -149,6 +149,12 @@ pub struct ModifyOutcome {
     /// The document as it is now, absent when it was removed.
     pub after: Option<Document>,
     pub matched: bool,
+    /// Whether an existing document was written: changed or removed.
+    ///
+    /// `false` when the match's new image is byte for byte the stored one
+    /// (ADR-208): nothing was written, minted, logged or published. `false`
+    /// for an upsert that created the document too, which is `upserted`.
+    pub modified: bool,
     pub upserted: Option<DocId>,
     /// The stamp the write produced, when it wrote anything.
     pub stamp: Option<Stamp>,
@@ -163,13 +169,13 @@ pub struct ModifyManyOutcome {
     pub matched: u64,
     /// Documents written — replaced, or tombstoned when the spec removed them.
     ///
-    /// Equal to `matched` today: every match is written, whether or not the
-    /// operators changed anything (the `modified` deviation is documented).
-    /// Reported separately so a guard that declines a match has somewhere to
-    /// show up.
+    /// A match whose new image is byte for byte the stored one is not
+    /// written, and is counted in `matched` and not here (ADR-208).
     pub modified: u64,
-    /// Write transactions the request cost — one per chunk (ADR-086). Zero
-    /// when nothing matched.
+    /// Write transactions the request cost — one per chunk that wrote
+    /// something (ADR-086). Zero when nothing matched, and a chunk whose
+    /// matches were all unchanged commits nothing and is not counted
+    /// (ADR-208).
     pub commits: u64,
     /// The stamp of the last document written, when one was.
     ///
@@ -252,13 +258,19 @@ impl Engine {
                 }
                 Ok((examined, Some((matched, entries, last_key)))) => {
                     outcome.examined += examined;
-                    outcome.commits += 1;
                     outcome.matched += matched as u64;
-                    outcome.modified += entries.len() as u64;
-                    outcome.stamp = entries.last().map(|e| e.stamp);
-                    // Published per chunk, after its commit: a subscriber
-                    // sees a chunk whole before the next one begins.
-                    self.publish(entries);
+                    // A chunk whose matches were all unchanged wrote nothing
+                    // and committed nothing (ADR-208): it is not a commit,
+                    // and it leaves the last written stamp as it was.
+                    if let Some(last) = entries.last() {
+                        outcome.commits += 1;
+                        outcome.modified += entries.len() as u64;
+                        outcome.stamp = Some(last.stamp);
+                        // Published per chunk, after its commit: a
+                        // subscriber sees a chunk whole before the next one
+                        // begins.
+                        self.publish(entries);
+                    }
 
                     after = Some(last_key);
                     if matched < budget {
@@ -297,7 +309,9 @@ impl Engine {
     /// strictly after `after`, change them, and commit. `None` when nothing
     /// (more) matched, which commits nothing. Otherwise how many matched, the
     /// entries to publish, and the key the next chunk resumes after; with,
-    /// either way, how many documents the scan examined.
+    /// either way, how many documents the scan examined. No entries means
+    /// every match was unchanged: the chunk is aborted, not committed, and
+    /// the next one still resumes after its last match (ADR-208).
     ///
     /// `continuing` is whether the request has already committed a chunk,
     /// which decides how it waits for the writer (ADR-192). A failure comes
@@ -322,7 +336,7 @@ impl Engine {
             if continuing { self.begin_write_continuing(holder) } else { self.begin_write(holder) }
                 .map_err(none)?;
         let (matches, examined) =
-            match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after) {
+            match self.collect_matches(&txn, coll, candidates, spec, Some(budget), after, true) {
                 Ok(found) => found,
                 Err(e) => {
                     txn.abort().map_err(none)?;
@@ -330,13 +344,13 @@ impl Engine {
                 }
             };
 
-        let Some((_, last)) = matches.last() else {
+        let Some(last) = matches.last() else {
             // Nothing (more) matched: a no-op must not commit, mint or
             // publish.
             txn.abort().map_err(none)?;
             return Ok((examined, None));
         };
-        let last_key = match extract_id(last).and_then(|id| crate::docs::doc_key(&id)) {
+        let last_key = match extract_id(&last.doc).and_then(|id| crate::docs::doc_key(&id)) {
             Ok(key) => key,
             Err(e) => {
                 txn.abort().map_err(none)?;
@@ -345,14 +359,21 @@ impl Engine {
         };
 
         let mut entries = Vec::with_capacity(matches.len());
-        for (stamp, before) in &matches {
-            match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
-                Ok((_, entry)) => entries.push(entry),
+        for found in &matches {
+            match self.modify_in_txn(&txn, coll, found, spec) {
+                Ok((_, entry)) => entries.extend(entry),
                 Err(e) => {
                     txn.abort().map_err(none)?;
                     return Err(none(e));
                 }
             }
+        }
+
+        if entries.is_empty() {
+            // Matched, and nothing changed: the same rule as nothing
+            // matched, since the transaction holds no write (ADR-208).
+            txn.abort().map_err(none)?;
+            return Ok((examined, Some((matches.len(), entries, last_key))));
         }
 
         match txn.commit() {
@@ -379,7 +400,7 @@ impl Engine {
             }
         };
 
-        let Some((stamp, before)) = chosen else {
+        let Some(chosen) = chosen else {
             // Nothing matched. A caller that expected a version finds it
             // gone; otherwise an upsert inserts, and anything else is a
             // no-op that must not mint an oplog entry or publish an event.
@@ -415,12 +436,15 @@ impl Engine {
                 before: None,
                 after: Some(inserted),
                 matched: false,
+                // Created, not modified: `modified` counts changes to
+                // documents that were there (ADR-208).
+                modified: false,
                 upserted: Some(id),
                 stamp: Some(stamp),
             });
         };
 
-        let (next, entry) = match self.modify_in_txn(&txn, coll, stamp, &before, spec) {
+        let (next, entry) = match self.modify_in_txn(&txn, coll, &chosen, spec) {
             Ok(done) => done,
             Err(e) => {
                 txn.abort()?;
@@ -428,16 +452,28 @@ impl Engine {
             }
         };
 
-        txn.commit()?;
-        let stamp = entry.stamp;
-        self.publish(vec![entry]);
+        // Unchanged: nothing was written, so nothing is committed, minted or
+        // published, and the document keeps the stamp it had (ADR-208).
+        let stamp = match entry {
+            Some(entry) => {
+                txn.commit()?;
+                let stamp = entry.stamp;
+                self.publish(vec![entry]);
+                Some(stamp)
+            }
+            None => {
+                txn.abort()?;
+                None
+            }
+        };
 
         Ok(ModifyOutcome {
-            before: Some(before),
+            before: Some(chosen.doc),
             after: next,
             matched: true,
+            modified: stamp.is_some(),
             upserted: None,
-            stamp: Some(stamp),
+            stamp,
         })
     }
 
@@ -446,26 +482,28 @@ impl Engine {
     /// The one body behind both `find_and_modify` and `modify_where`, the
     /// way `insert` and `insert_many` share `insert_in_txn`: a rule added
     /// here — a guard, a stamp check — holds for every filtered write at
-    /// once. Returns the image written (`None` for a removal) and the oplog
-    /// entry to publish once the transaction commits.
+    /// once. Returns the new image (`None` for a removal) and the oplog
+    /// entry to publish once the transaction commits — `None` when the new
+    /// image is byte for byte the stored one, which is not written at all
+    /// (ADR-208). The stamp check comes first, so a stale caller is refused
+    /// even when its update would have changed nothing.
     fn modify_in_txn(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
-        current: Stamp,
-        before: &Document,
+        found: &Match,
         spec: &dyn ModifySpec,
-    ) -> Result<(Option<Document>, OplogEntry)> {
+    ) -> Result<(Option<Document>, Option<OplogEntry>)> {
         if let Some(expected) = spec.expected_stamp()
-            && expected != current
+            && expected != found.stamp
         {
-            return Err(StorageError::Stale { current: Some(current) });
+            return Err(StorageError::Stale { current: Some(found.stamp) });
         }
-        let id = extract_id(before)?;
+        let id = extract_id(&found.doc)?;
         let next = spec
-            .apply(before)
+            .apply(&found.doc)
             .map_err(|e| StorageError::Core(kimmy_core::Error::InvalidQuery(e)))?;
-        let entry = self.write_chosen(txn, coll, &id, before, next.clone())?;
+        let entry = self.write_chosen(txn, coll, &id, found, next.as_ref())?;
         Ok((next, entry))
     }
 
@@ -476,23 +514,39 @@ impl Engine {
         coll: &CollectionMeta,
         candidates: &Candidates,
         spec: &dyn ModifySpec,
-    ) -> Result<Option<(Stamp, Document)>> {
-        // Every match, because the sort has to see them all to pick one.
-        let (mut matches, _) = self.collect_matches(txn, coll, candidates, spec, None, None)?;
+    ) -> Result<Option<Match>> {
+        // Every match, because the sort has to see them all to pick one —
+        // without their stored bodies, which only the chosen one needs: up
+        // to `MAX_CANDIDATES` of them would otherwise be held twice over
+        // under the writer.
+        let (mut matches, _) =
+            self.collect_matches(txn, coll, candidates, spec, None, None, false)?;
 
         if matches.is_empty() {
             return Ok(None);
         }
-        for (_, doc) in &matches {
-            if let Some(why) = spec.unsortable(doc) {
+        for found in &matches {
+            if let Some(why) = spec.unsortable(&found.doc) {
                 return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(why)));
             }
         }
         // `sort_by` rather than picking a minimum: the comparator is the
         // caller's whole sort specification, and a stable sort keeps the
         // scan's order for documents the sort does not separate.
-        matches.sort_by(|a, b| spec.compare(&a.1, &b.1));
-        Ok(Some(matches.swap_remove(0)))
+        matches.sort_by(|a, b| spec.compare(&a.doc, &b.doc));
+        let mut chosen = matches.swap_remove(0);
+        drop(matches);
+
+        // The chosen one's stored body, for the comparison that decides
+        // whether it is written (ADR-208): one more lookup, of a record this
+        // transaction has just read, so the page is in hand.
+        let key = crate::docs::doc_key(&extract_id(&chosen.doc)?)?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let raw = docs.get((coll.id.0, key.as_slice()))?.ok_or_else(|| {
+            StorageError::Corrupt("a document matched in this transaction is not stored".into())
+        })?;
+        chosen.body = codec::decode_doc_record(raw.value())?.body;
+        Ok(Some(chosen))
     }
 
     /// Every live document among the candidates that the spec matches, in
@@ -505,7 +559,11 @@ impl Engine {
     /// cannot hold the writer for an unbounded time. `after` resumes strictly
     /// past an encoded document key, which is how one chunk follows another
     /// without revisiting anything — every candidate path delivers keys in
-    /// order, so it is a bound, not a filter.
+    /// order, so it is a bound, not a filter. `keep_bodies` keeps each
+    /// match's stored body for the unchanged comparison (ADR-208); without
+    /// it the body is left empty, for the caller to read for the one match
+    /// it writes.
+    #[allow(clippy::too_many_arguments)]
     fn collect_matches(
         &self,
         txn: &redb::WriteTransaction,
@@ -514,18 +572,20 @@ impl Engine {
         spec: &dyn ModifySpec,
         limit: Option<usize>,
         after: Option<&[u8]>,
-    ) -> Result<(Vec<(Stamp, Document)>, u64)> {
-        let mut matches: Vec<(Stamp, Document)> = Vec::new();
+        keep_bodies: bool,
+    ) -> Result<(Vec<Match>, u64)> {
+        let mut matches: Vec<Match> = Vec::new();
         let mut examined = 0u64;
 
         // `Ok(false)` asks the scan to stop: the limit is reached.
         let mut consider =
-            |stamp: Stamp, doc: Document, matches: &mut Vec<(Stamp, Document)>| -> Result<bool> {
+            |record: DocRecord, doc: Document, matches: &mut Vec<Match>| -> Result<bool> {
                 examined += 1;
                 if !spec.matches(&doc).map_err(StorageError::Core)? {
                     return Ok(true);
                 }
-                matches.push((stamp, doc));
+                let body = if keep_bodies { record.body } else { Vec::new() };
+                matches.push(Match { stamp: record.stamp, doc, body });
                 if limit.is_none() && matches.len() > MAX_CANDIDATES {
                     // Refused, not truncated: choosing from a prefix would return
                     // a document that is not the one the sort asked for, and no
@@ -543,7 +603,7 @@ impl Engine {
         // Direct lookups share one body: a `$in` union of index ranges and a
         // list of primary keys can both offer one document twice. Keys are
         // sorted first so the walk is in key order, which `after` relies on.
-        let mut lookup = |keys: Vec<Vec<u8>>, matches: &mut Vec<(Stamp, Document)>| -> Result<()> {
+        let mut lookup = |keys: Vec<Vec<u8>>, matches: &mut Vec<Match>| -> Result<()> {
             let mut keys = keys;
             keys.sort();
             keys.dedup();
@@ -559,7 +619,7 @@ impl Engine {
                     continue;
                 }
                 let doc = bson::deserialize_from_slice(&record.body)?;
-                if !consider(record.stamp, doc, matches)? {
+                if !consider(record, doc, matches)? {
                     break;
                 }
             }
@@ -587,13 +647,13 @@ impl Engine {
                     }
                     lookup(keys, &mut matches)?;
                 } else {
-                    scan_until(&docs, coll, after, &mut |stamp, doc| {
-                        consider(stamp, doc, &mut matches)
+                    scan_until(&docs, coll, after, &mut |record, doc| {
+                        consider(record, doc, &mut matches)
                     })?;
                 }
             }
-            Candidates::Scan => scan_until(&docs, coll, after, &mut |stamp, doc| {
-                consider(stamp, doc, &mut matches)
+            Candidates::Scan => scan_until(&docs, coll, after, &mut |record, doc| {
+                consider(record, doc, &mut matches)
             })?,
         }
 
@@ -614,26 +674,42 @@ impl Engine {
         Ok(fresh.index_by_id(index_id).is_none_or(|i| i.multikey))
     }
 
-    /// Write the chosen document's new state and return its oplog entry.
+    /// Write the chosen document's new state and return its oplog entry, or
+    /// `None` when the new state is the stored one.
+    ///
+    /// "The stored one" is byte for byte: the new image's encoding against
+    /// the stored body, which is the encoding the next read and every peer
+    /// would see (ADR-208). So a value of another type (`1` over `1.0`) or
+    /// the same fields in another order is a change, as is `-0.0` over
+    /// `0.0`, which compare equal as numbers. Nothing is minted, written,
+    /// indexed or logged for an unchanged document; the comparison is of two
+    /// buffers already in hand, the stored body kept from the match and the
+    /// encoding the write needs anyway.
     fn write_chosen(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         id: &DocId,
-        before: &Document,
-        next: Option<Document>,
-    ) -> Result<OplogEntry> {
+        found: &Match,
+        next: Option<&Document>,
+    ) -> Result<Option<OplogEntry>> {
         let key = crate::docs::doc_key(id)?;
+        let body = match next {
+            Some(doc) => Some(bson::serialize_to_vec(doc)?),
+            None => None,
+        };
+        if body.as_deref() == Some(found.body.as_slice()) {
+            return Ok(None);
+        }
+        // Minted only once there is something to write, under the writer
+        // (ADR-148): an unchanged document must not advance the clock.
         let stamp = self.next_stamp();
 
-        let (record, body, kind) = match &next {
-            Some(doc) => {
-                let body = bson::serialize_to_vec(doc)?;
-                (DocRecord::live(stamp, body.clone()), Some(body), OpKind::Replace)
-            }
+        let (record, kind) = match &body {
+            Some(body) => (DocRecord::live(stamp, body.clone()), OpKind::Replace),
             // A tombstone, exactly as an ordinary delete leaves — so a removal
             // through this route replicates and streams like any other delete.
-            None => (DocRecord::tombstone(stamp), None, OpKind::Delete),
+            None => (DocRecord::tombstone(stamp), OpKind::Delete),
         };
 
         {
@@ -647,13 +723,27 @@ impl Engine {
             )?;
         }
 
-        let newly_multikey = index::maintain(self, txn, coll, Some(before), next.as_ref(), &key)?;
+        let newly_multikey = index::maintain(self, txn, coll, Some(&found.doc), next, &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };
         append_oplog(txn, &entry)?;
-        Ok(entry)
+        Ok(Some(entry))
     }
+}
+
+/// A live document the spec matched, as the write transaction read it.
+///
+/// The stored body is kept beside the decoded document: it is what an update
+/// is compared against to decide whether anything changed (ADR-208), and the
+/// decode already copied it out of the page, so keeping it costs memory and
+/// no work. `find_and_modify`, which holds every match to sort them, keeps
+/// none and reads the chosen one's again.
+#[derive(Debug)]
+struct Match {
+    stamp: Stamp,
+    doc: Document,
+    body: Vec<u8>,
 }
 
 /// Every live document in the collection strictly after `after`, inside the
@@ -662,7 +752,7 @@ fn scan_until(
     docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
     coll: &CollectionMeta,
     after: Option<&[u8]>,
-    f: &mut impl FnMut(Stamp, Document) -> Result<bool>,
+    f: &mut impl FnMut(DocRecord, Document) -> Result<bool>,
 ) -> Result<()> {
     for entry in docs.range(doc_range_after(coll.id, after))? {
         let (_, value) = entry?;
@@ -670,7 +760,8 @@ fn scan_until(
         if record.deleted {
             continue;
         }
-        if !f(record.stamp, bson::deserialize_from_slice(&record.body)?)? {
+        let doc = bson::deserialize_from_slice(&record.body)?;
+        if !f(record, doc)? {
             break;
         }
     }
@@ -825,6 +916,8 @@ mod tests {
         let mut rx = engine.subscribe();
         let out = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap();
         assert!(!out.matched, "an upsert did not match; it created");
+        assert!(!out.modified, "created, not modified (ADR-208)");
+        assert!(out.stamp.is_some(), "a creation is a write, with its stamp");
         assert_eq!(out.upserted, Some(DocId::Int64(99)));
         assert_eq!(out.after.unwrap().get_str("status").unwrap(), "pending");
 
@@ -1660,5 +1753,387 @@ mod tests {
             "{cause:?}"
         );
         assert_eq!(claimed(&engine, &coll), vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unchanged documents are not written (ADR-208)
+    // -----------------------------------------------------------------------
+
+    /// A spec running real update operators, as the API's does.
+    struct Operators {
+        update: kimmy_query::update::Update,
+        now: i64,
+        expected: Option<Stamp>,
+    }
+
+    impl Operators {
+        fn new(update: Document) -> Self {
+            Self { update: kimmy_query::update::parse(&update).unwrap(), now: 1, expected: None }
+        }
+    }
+
+    impl ModifySpec for Operators {
+        fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+            Ok(true)
+        }
+        fn compare(&self, _: &Document, _: &Document) -> Ordering {
+            Ordering::Equal
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            let mut next = doc.clone();
+            kimmy_query::update::apply(&self.update, &mut next, self.now)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(next))
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            None
+        }
+        fn expected_stamp(&self) -> Option<Stamp> {
+            self.expected
+        }
+    }
+
+    /// The stored record of one document, header and body, exactly as the
+    /// table holds it: a write of any kind changes it, if only the stamp.
+    fn raw_record(engine: &Engine, coll: &CollectionMeta, id: i64) -> Vec<u8> {
+        use redb::ReadableDatabase;
+        let txn = engine.db().begin_read().unwrap();
+        let docs = txn.open_table(tables::DOCS).unwrap();
+        let key = crate::docs::doc_key(&DocId::Int64(id)).unwrap();
+        docs.get((coll.id.0, key.as_slice())).unwrap().unwrap().value().to_vec()
+    }
+
+    /// Everything a write leaves behind, to compare before and after.
+    #[derive(Debug, PartialEq)]
+    struct Footprint {
+        commits: u64,
+        oplog: u64,
+        clock: kimmy_core::Hlc,
+        records: Vec<Vec<u8>>,
+    }
+
+    fn footprint(engine: &Engine, coll: &CollectionMeta, ids: &[i64]) -> Footprint {
+        Footprint {
+            commits: engine.commits(),
+            oplog: engine.oplog_entries().unwrap(),
+            clock: engine.clock_last(),
+            records: ids.iter().map(|id| raw_record(engine, coll, *id)).collect(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_update_writes_mints_logs_and_publishes_nothing() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid"}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "status": "paid"}).unwrap();
+        let before = footprint(&engine, &coll, &[1, 2]);
+
+        let mut rx = engine.subscribe();
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 2, matched: 2, modified: 0, commits: 0, stamp: None }
+        );
+        assert_eq!(footprint(&engine, &coll, &[1, 2]), before, "nothing reached the store");
+        assert!(drain(&mut rx).is_empty(), "nothing was published");
+
+        // `find_and_modify` the same: the document comes back, unwritten.
+        let out = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap();
+        assert!(out.matched && !out.modified, "{out:?}");
+        assert_eq!(out.stamp, None);
+        assert_eq!(out.before, out.after);
+        assert_eq!(out.after.unwrap().get_str("status").unwrap(), "paid");
+        assert_eq!(footprint(&engine, &coll, &[1, 2]), before);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_chunk_of_changed_and_unchanged_documents_writes_and_logs_only_the_changed() {
+        let (engine, coll, _dir) = engine();
+        for (id, status) in [(1_i64, "paid"), (2, "due"), (3, "paid"), (4, "due")] {
+            engine.insert(&coll, doc! {"_id": id, "status": status}).unwrap();
+        }
+        let unchanged = footprint(&engine, &coll, &[1, 3]).records;
+        let (commits, oplog) = (engine.commits(), engine.oplog_entries().unwrap());
+
+        let mut rx = engine.subscribe();
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!((out.matched, out.modified, out.commits), (4, 2, 1));
+        assert_eq!(engine.commits() - commits, 1);
+        assert_eq!(engine.oplog_entries().unwrap() - oplog, 2, "one entry per changed document");
+        assert_eq!(footprint(&engine, &coll, &[1, 3]).records, unchanged);
+
+        let published: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let ids: Vec<_> = published.iter().map(|e| e.doc_id.clone().unwrap()).collect();
+        assert_eq!(ids, vec![DocId::Int64(2), DocId::Int64(4)]);
+        assert_eq!(out.stamp, Some(published[1].stamp), "the last written document's stamp");
+        assert_eq!(engine.document_stamp(&coll, &DocId::Int64(4)).unwrap(), out.stamp);
+    }
+
+    #[test]
+    fn a_chunk_with_nothing_changed_commits_nothing_and_the_next_chunk_goes_on() {
+        // Chunks of two over six documents: the first two chunks change
+        // nothing and are aborted, the third writes. Every document is
+        // visited once, and only the writing chunk is a commit.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        for id in 0..6_i64 {
+            let status = if id < 4 { "paid" } else { "due" };
+            engine.insert(&coll, doc! {"_id": id, "status": status}).unwrap();
+        }
+        let first_four = footprint(&engine, &coll, &[0, 1, 2, 3]).records;
+        let commits = engine.commits();
+
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!((out.examined, out.matched, out.modified, out.commits), (6, 6, 2, 1));
+        assert_eq!(engine.commits() - commits, 1);
+        assert_eq!(footprint(&engine, &coll, &[0, 1, 2, 3]).records, first_four);
+        assert_eq!(out.stamp, engine.document_stamp(&coll, &DocId::Int64(5)).unwrap());
+    }
+
+    #[test]
+    fn an_unchanged_chunk_after_a_written_one_keeps_the_written_stamp() {
+        // Chunks of two over six documents: the first chunk changes both of
+        // its documents, the next two change nothing. The request's stamp is
+        // the last document written, not cleared by the chunks after it.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        for id in 0..6_i64 {
+            let status = if id < 2 { "due" } else { "paid" };
+            engine.insert(&coll, doc! {"_id": id, "status": status}).unwrap();
+        }
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!((out.matched, out.modified, out.commits), (6, 2, 1));
+        assert!(out.stamp.is_some());
+        assert_eq!(out.stamp, engine.document_stamp(&coll, &DocId::Int64(1)).unwrap());
+    }
+
+    #[test]
+    fn an_unchanged_chunk_does_not_make_the_request_part_done() {
+        // ADR-192 binds a request once it has committed. A chunk that changed
+        // nothing committed nothing, so the chunk after it begins as a first
+        // one does: past the drain deadline it still takes the writer and
+        // commits, where a request already part done would stop.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(2);
+        // Two unchanged, then one to change: the second chunk is short, so
+        // the request ends with it.
+        for id in 0..3_i64 {
+            let status = if id < 2 { "paid" } else { "due" };
+            engine.insert(&coll, doc! {"_id": id, "status": status}).unwrap();
+        }
+        engine.set_stopping();
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        let out = engine
+            .modify_where(&coll, &Candidates::Scan, &spec, None)
+            .expect("nothing was written before the second chunk, so it is a first commit");
+        assert_eq!((out.matched, out.modified, out.commits), (3, 1, 1));
+    }
+
+    #[test]
+    fn a_stale_stamp_is_refused_even_when_the_update_would_change_nothing() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid"}).unwrap();
+        let current = engine.document_stamp(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        let stale = Stamp::new(kimmy_core::Hlc::new(1, 0), current.node);
+
+        let mut spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        spec.expected = Some(stale);
+        let err = engine
+            .modify_where(&coll, &Candidates::Scan, &spec, Some(1))
+            .expect_err("a stale stamp is stale whatever the update");
+        assert_eq!(stale_of(err), Some(current));
+
+        // At the current stamp it is a no-op, and the stamp stays valid for
+        // the next conditional write.
+        spec.expected = Some(current);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, Some(1)).unwrap();
+        assert_eq!((out.matched, out.modified, out.stamp), (1, 0, None));
+        let mut next = Operators::new(doc! {"$set": {"status": "refunded"}});
+        next.expected = Some(current);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &next, Some(1)).unwrap();
+        assert_eq!((out.matched, out.modified), (1, 1));
+    }
+
+    /// Whether `update` over `stored` writes, decided by the stored bytes.
+    fn changes(stored: Document, update: Document) -> bool {
+        let (engine, coll, _dir) = engine();
+        let mut stored = stored;
+        stored.insert("_id", 1_i64);
+        engine.insert(&coll, stored).unwrap();
+        let before = footprint(&engine, &coll, &[1]);
+        let mut spec = Operators::new(update);
+        spec.now = 1_700_000_000_000;
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, Some(1)).unwrap();
+        assert_eq!(out.matched, 1);
+        let changed = out.modified == 1;
+        assert_eq!(changed, footprint(&engine, &coll, &[1]) != before, "the count is the store");
+        assert_eq!(changed, out.commits == 1);
+        changed
+    }
+
+    #[test]
+    fn unchanged_is_byte_for_byte_and_type_strict() {
+        // A number of another type is a change, though it compares equal.
+        assert!(changes(doc! {"a": 1.0}, doc! {"$set": {"a": 1_i32}}));
+        assert!(changes(doc! {"a": 1_i32}, doc! {"$set": {"a": 1_i64}}));
+        assert!(changes(doc! {"a": 1_i64}, doc! {"$set": {"a": 1.0}}));
+        assert!(!changes(doc! {"a": 1.0}, doc! {"$set": {"a": 1.0}}));
+        assert!(!changes(doc! {"a": 1_i32}, doc! {"$set": {"a": 1_i32}}));
+        // `-0.0` and `0.0` are equal numbers and different bytes.
+        assert!(changes(doc! {"a": 0.0}, doc! {"$set": {"a": -0.0}}));
+        // A NaN is the same NaN by its bytes, though it is unequal to itself.
+        assert!(!changes(doc! {"a": f64::NAN}, doc! {"$set": {"a": f64::NAN}}));
+        // `$set` of an existing field keeps its place, so the same value is
+        // no change, and a new value does not move it.
+        assert!(!changes(doc! {"a": 1_i32, "b": 2_i32}, doc! {"$set": {"a": 1_i32}}));
+        assert!(!changes(doc! {"n": {"x": 1_i32, "y": 2_i32}}, doc! {"$set": {"n.x": 1_i32}}));
+        assert!(changes(doc! {"a": "s", "b": 2_i32}, doc! {"$set": {"a": "t"}}));
+        // A nested document with its fields in another order is a change.
+        assert!(changes(
+            doc! {"n": {"x": 1_i32, "y": 2_i32}},
+            doc! {"$set": {"n": {"y": 2_i32, "x": 1_i32}}}
+        ));
+    }
+
+    #[test]
+    fn set_of_an_existing_field_keeps_its_position() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "a": 1_i32, "b": 2_i32}).unwrap();
+        let spec = Operators::new(doc! {"$set": {"a": 5_i32}});
+        engine.modify_where(&coll, &Candidates::Scan, &spec, Some(1)).unwrap();
+        let doc = engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        assert_eq!(doc.keys().collect::<Vec<_>>(), ["_id", "a", "b"]);
+    }
+
+    #[test]
+    fn each_operator_that_leaves_a_document_alone_writes_nothing() {
+        // No change, so no write.
+        assert!(!changes(doc! {"a": 1_i32}, doc! {"$unset": {"missing": ""}}));
+        assert!(!changes(doc! {"n": 5_i64}, doc! {"$inc": {"n": 0_i64}}));
+        assert!(!changes(doc! {"n": 2.5}, doc! {"$inc": {"n": 0.0}}));
+        assert!(!changes(doc! {"n": 5_i64}, doc! {"$mul": {"n": 1_i64}}));
+        assert!(!changes(doc! {"n": 5_i64}, doc! {"$min": {"n": 9_i64}}));
+        assert!(!changes(doc! {"n": 5_i64}, doc! {"$max": {"n": 1_i64}}));
+        assert!(!changes(doc! {"l": [1_i32, 2_i32]}, doc! {"$push": {"l": {"$each": []}}}));
+        assert!(!changes(doc! {"l": [1_i32, 2_i32]}, doc! {"$addToSet": {"l": 2_i32}}));
+        assert!(!changes(
+            doc! {"l": [1_i32, 2_i32]},
+            doc! {"$addToSet": {"l": {"$each": [1_i32, 2_i32]}}}
+        ));
+        assert!(!changes(doc! {"l": [1_i32, 2_i32]}, doc! {"$pull": {"l": 9_i32}}));
+        assert!(!changes(doc! {"l": [1_i32, 2_i32]}, doc! {"$pullAll": {"l": [9_i32]}}));
+        assert!(!changes(doc! {"a": 1_i32}, doc! {"$rename": {"missing": "b"}}));
+        assert!(!changes(doc! {"a": 1_i32}, doc! {"$setOnInsert": {"b": 1_i32}}));
+        assert!(!changes(doc! {"l": []}, doc! {"$pop": {"l": 1_i32}}));
+
+        // A change, even where it looks like none.
+        //
+        // Integer arithmetic answers a 64-bit integer, so `$inc` by zero on
+        // a 32-bit field widens it: a different type, so a write.
+        assert!(changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i32}}));
+        // `$currentDate` sets the time of the write over an earlier one.
+        assert!(changes(
+            doc! {"t": bson::DateTime::from_millis(0)},
+            doc! {"$currentDate": {"t": true}}
+        ));
+        // `$push` with an empty `$each` creates the array it names.
+        assert!(changes(doc! {"a": 1_i32}, doc! {"$push": {"l": {"$each": []}}}));
+        assert!(changes(doc! {"a": 1_i32}, doc! {"$unset": {"a": ""}}));
+        assert!(changes(doc! {"l": [1_i32]}, doc! {"$addToSet": {"l": 2_i32}}));
+        assert!(changes(doc! {"a": 1_i32}, doc! {"$rename": {"a": "b"}}));
+    }
+
+    #[test]
+    fn current_date_at_the_stored_instant_is_no_change() {
+        // The rule is the bytes, not the operator: `$currentDate` changes the
+        // document unless the stored time is already the time of this write.
+        assert!(!changes(
+            doc! {"t": bson::DateTime::from_millis(1_700_000_000_000)},
+            doc! {"$currentDate": {"t": true}}
+        ));
+    }
+
+    #[test]
+    fn a_replacement_with_its_fields_reordered_is_a_change() {
+        // Through the query language's own replacement, as `/update` and
+        // `find_and_modify` run it: `_id` stays first, so the stored fields
+        // again are no change, with or without `_id` in the replacement.
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "a": 1_i32, "b": 2_i32}).unwrap();
+        let before = footprint(&engine, &coll, &[1]);
+        for same in [doc! {"a": 1_i32, "b": 2_i32}, doc! {"a": 1_i32, "_id": 1_i64, "b": 2_i32}] {
+            let out = engine.find_and_modify(&coll, &Candidates::Scan, &Operators::new(same));
+            let out = out.unwrap();
+            assert!(out.matched && !out.modified && out.stamp.is_none(), "{out:?}");
+            let out = engine
+                .modify_where(
+                    &coll,
+                    &Candidates::Scan,
+                    &Operators::new(doc! {"a": 1_i32, "b": 2_i32}),
+                    None,
+                )
+                .unwrap();
+            assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0));
+        }
+        assert_eq!(footprint(&engine, &coll, &[1]), before);
+
+        let reordered = Operators::new(doc! {"b": 2_i32, "a": 1_i32});
+        let out = engine.find_and_modify(&coll, &Candidates::Scan, &reordered).unwrap();
+        assert!(out.matched && out.modified && out.stamp.is_some(), "{out:?}");
+        let doc = engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        assert_eq!(doc.keys().collect::<Vec<_>>(), ["_id", "b", "a"]);
+    }
+
+    #[test]
+    fn a_removal_is_always_a_change() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64}).unwrap();
+        let remove = TestSpec {
+            matches: |_: &Document| true,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| Ok(None),
+            upsert: None,
+        };
+        let out = engine.find_and_modify(&coll, &Candidates::Scan, &remove).unwrap();
+        assert!(out.matched && out.modified && out.stamp.is_some(), "{out:?}");
+        assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unchanged_document_keeps_its_index_entries_and_stays_findable() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index(
+                "app",
+                "jobs",
+                vec![kimmy_core::IndexField::ascending("status")],
+                true,
+                Some("status_1".into()),
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "jobs").unwrap();
+        engine.insert(&coll, doc! {"_id": 1_i64, "status": "paid"}).unwrap();
+
+        let index = coll.index("status_1").unwrap();
+        let probe = kimmy_core::keyenc::encode_compound_ordered(&[(
+            bson::Bson::String("paid".into()),
+            false,
+        )])
+        .unwrap();
+        let candidates = Candidates::Index {
+            index_id: index.id,
+            ranges: vec![(probe.clone(), probe)],
+            both_bounds: false,
+        };
+        let spec = Operators::new(doc! {"$set": {"status": "paid"}});
+        for _ in 0..2 {
+            let out = engine.modify_where(&coll, &candidates, &spec, None).unwrap();
+            assert_eq!((out.matched, out.modified), (1, 0));
+        }
     }
 }

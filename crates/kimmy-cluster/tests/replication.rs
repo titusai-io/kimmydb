@@ -157,6 +157,59 @@ async fn two_nodes_converge_over_the_network() {
     }
 }
 
+/// An update that changes nothing sends nothing (ADR-208): no oplog entry is
+/// written for it, so a peer's next pull receives nothing, and the document
+/// keeps the version both members already agree on.
+#[tokio::test]
+async fn a_peer_receives_nothing_for_an_update_that_changed_nothing() {
+    struct SetStatus(&'static str);
+    impl kimmy_storage::ModifySpec for SetStatus {
+        fn matches(&self, _: &bson::Document) -> kimmy_core::Result<bool> {
+            Ok(true)
+        }
+        fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+        fn apply(&self, doc: &bson::Document) -> Result<Option<bson::Document>, String> {
+            let mut next = doc.clone();
+            next.insert("status", self.0);
+            Ok(Some(next))
+        }
+        fn upsert(&self) -> Option<Result<bson::Document, String>> {
+            None
+        }
+    }
+
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let id = DocId::String("o".into());
+    a.engine.insert(&ca, doc! { "_id": "o", "status": "paid" }).unwrap();
+    sync(&a, &b).await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    let stamp = a.engine.document_stamp(&ca, &id).unwrap();
+    assert_eq!(b.engine.document_stamp(&cb, &id).unwrap(), stamp, "converged");
+    let vector = a.engine.version_vector().unwrap();
+
+    let all = kimmy_storage::Candidates::Scan;
+    let out = a.engine.modify_where(&ca, &all, &SetStatus("paid"), None).unwrap();
+    assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0));
+    let out = a.engine.replace(&ca, &id, doc! { "status": "paid" }, false).unwrap();
+    assert!(out.matched && !out.modified, "{out:?}");
+    assert_eq!(a.engine.version_vector().unwrap(), vector, "nothing advanced on the writer");
+
+    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!((pulled.applied, pulled.superseded), (0, 0), "nothing to send: {pulled:?}");
+    assert_eq!(b.engine.document_stamp(&cb, &id).unwrap(), stamp);
+
+    // A real change still travels, so the pull above was not simply idle.
+    let out = a.engine.modify_where(&ca, &all, &SetStatus("shipped"), None).unwrap();
+    assert_eq!((out.matched, out.modified), (1, 1));
+    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(pulled.applied, 1, "{pulled:?}");
+    assert_eq!(b.engine.get(&cb, &id).unwrap().unwrap().get_str("status").unwrap(), "shipped");
+}
+
 /// A replicated document costs about its own size on the wire, not twelve times it.
 ///
 /// Serde encodes a bare `Vec<u8>` as a BSON array of int32s — one element, with its own

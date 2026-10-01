@@ -619,8 +619,8 @@ The rules, which are MongoDB's:
   that document and the request fails. It does not create an array or treat a
   scalar as a one-element one.
 - **No element selected is not an error.** The operator has nothing to do; the
-  document is written back as it was, and `modified` counts it, as it counts
-  [every write](#modified-counts-writes-not-changes).
+  document is left as it was, so it is not written and does not count in
+  `modified` ([`modified` counts changes](#modified-counts-changes)).
 - **Every operator that takes a path accepts one**, except `$rename`, whose
   source and destination are fixed places. `$unset` of an element leaves
   `null` in its position rather than closing the gap, so the other elements
@@ -659,24 +659,43 @@ document:
 { "_id": 999, "item": "widget" }
 ```
 
-### `modified` counts writes, not changes
+### `modified` counts changes
 
-An update that sets a field to the value it already holds is still a write, and
-still counts:
+A document the update leaves exactly as it was is **not written**, and counts
+in `matched` but not in `modified`:
 
 ```javascript
 // Both documents already have g: "x"
-{ "matched": 2, "modified": 2 }
+{ "filter": {}, "update": { "$set": { "g": "x" } }, "multi": true }
+// -> { "matched": 2, "modified": 0, "commits": 0 }
 ```
 
-**This is where the register differs from MongoDB**, whose `nModified` excludes
-documents that were already in the requested state. The two disagree on exactly
-the question a caller tends to ask — "did anything actually change?" — so an
-update ported from MongoDB gets a number that looks right and is not.
+Nothing happens for it: no new version (`stamp`) is made, no oplog entry is
+written, no change event is published, nothing is sent to other nodes, and a
+`multi` chunk in which nothing changed spends no commit. A single-document
+update that changed nothing reports no `stamp`, and the document keeps the one
+it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 
-To ask that question here, compare `matched` with a `count` whose filter
-describes the state you want; that works in either database and does not depend
-on how a write is counted. Recorded in [Deviations](deviations.md).
+**"Exactly as it was" means the stored bytes**, not equal values:
+
+| Update | Stored | Counts in `modified` |
+|---|---|---|
+| `$set: {a: 1}` | `a: 1` | no |
+| `$set: {a: 1}` | `a: 1.0` (a double) | **yes**: another type |
+| `$set: {a: -0.0}` | `a: 0.0` | **yes**: another value, though equal as numbers |
+| `$set: {"n.x": 1}` | `n: {x: 1, y: 2}` | no: `$set` of an existing field keeps its place |
+| `$set: {n: {y: 2, x: 1}}` | `n: {x: 1, y: 2}` | **yes**: another field order |
+| `$unset`, `$rename` of a missing field; `$setOnInsert` on a match | | no |
+| `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
+| `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
+| `$inc: {n: 0}` | `n` a 32-bit integer | **yes**: [integer arithmetic](#integers-stay-integral) answers a 64-bit integer |
+| `$currentDate` | an earlier time | **yes** |
+
+A replacement (`PUT`, or a whole document as the `update` of `/update` or
+`find_and_modify`) follows the same rule: the stored body, field order
+included, is no change. A replacement keeps `_id` first, where every write
+stores it, whether or not it names `_id` and wherever it names it, so sending a
+document's own fields back is no change.
 
 ---
 
@@ -698,8 +717,16 @@ counters and claim-a-row patterns.
 
 ```javascript
 // -> matched 0 or 1; document is null when nothing matched
-{ "document": { "_id": 2, "status": "pending", ... }, "matched": 1 }
+{ "document": { "_id": 2, "status": "pending", ... }, "matched": 1, "modified": 1,
+  "upserted": false }
 ```
+
+`modified` is `1` when an existing document was changed or removed, and `0`
+when the update left it as it was, which writes nothing and so reports no
+`stamp`; the document is returned either way
+([`modified` counts changes](#modified-counts-changes)). A document an upsert
+creates is `upserted: true` with `modified: 0`, as on `PUT`: `modified` counts
+changes to documents that were there.
 
 **Why this exists rather than read-then-write.** Two clients running
 `find` then `update` both see the same pending job and both claim it. Here the

@@ -1567,6 +1567,34 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         )
         .await;
     assert_eq!(modified["document"]["status"], "packed");
+    assert_eq!(modified["modified"], 1, "{modified}");
+
+    // The same update again changes nothing, and `modified` says so on both
+    // routes (ADR-208). Pinned here because the specification once stated
+    // the opposite of what the server did, and nothing compared them.
+    let unchanged = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find_and_modify",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "a" }, "update": { "$set": { "status": "packed" } } })),
+            200,
+        )
+        .await;
+    assert_eq!((&unchanged["matched"], &unchanged["modified"]), (&json!(1), &json!(0)));
+    assert!(unchanged.get("stamp").is_none(), "{unchanged}");
+    let unchanged = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/update",
+            "/v1/db/shop/coll/orders/update",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "a" }, "update": { "$set": { "status": "packed" } } })),
+            200,
+        )
+        .await;
+    assert_eq!(unchanged, json!({ "matched": 1, "modified": 0, "commits": 0 }));
 
     // `arrayFilters` on both write routes, driven rather than only declared
     // (ADR-104): the update's `$[line]` needs the filter the request carries.

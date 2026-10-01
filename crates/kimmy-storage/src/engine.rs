@@ -3306,6 +3306,13 @@ impl Engine {
         Stamp::new(hlc, self.node_id)
     }
 
+    /// The last time the clock handed out, for a test that a path mints
+    /// nothing.
+    #[cfg(test)]
+    pub(crate) fn clock_last(&self) -> kimmy_core::Hlc {
+        self.clock.lock().last()
+    }
+
     /// Fold a stamp observed from a peer into the local clock.
     pub(crate) fn witness(&self, stamp: &Stamp) {
         self.clock.lock().witness(stamp.hlc);

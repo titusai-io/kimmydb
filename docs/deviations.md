@@ -269,9 +269,9 @@ a `400` rather than a write; the message names the replacement. Two smaller
 points, both on the strict side: a filter document that names no identifier —
 `{"$and": []}` — is refused rather than read as always-true, and only field
 conditions and `$and`/`$or`/`$nor` are accepted at the top of a filter
-document. A positional update that selects no element writes the document
-back unchanged, so it counts in `modified` exactly as the entry below says a
-no-op `$set` does.
+document. A positional update that selects no element leaves the document
+unchanged, so it is not written and does not count in `modified`
+([ADR-208](decisions.md)).
 
 **Closing it** means a second evaluation mode for `Filter::Field` that
 returns the matching element's index, plumbed from `ModifySpec::matches` into
@@ -601,62 +601,46 @@ recorded so they are visible.
 
 ---
 
-## 🟡 `modified` counts documents written, not documents changed
+## 🟢 `modified` counted documents written, not documents changed
 
-**Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
-`update` reports `modified` for every document the write path put back, whether
-or not the stored document ended up different. A `$set` to the value a field
-already holds counts:
+**Was** (raised 2026-08-21, found by sweeping the CLI against a running
+cluster). `update` wrote back every document the filter matched, whether or
+not the operators changed it, and counted it in `modified`, so `modified`
+always equalled `matched`. A `$set` to the value a field already held counted:
 
 ```
 $ kimmy update dev.mod '{"g":"x"}' '{"$set":{"g":"x"}}' --multi
 {"matched":2,"modified":2}
 ```
 
-Not a miscount. `docs.rs` returns `WriteOutcome { matched: existed, modified:
-existed, .. }`, so the field means *a document was there and we wrote over it* —
-which is exactly what it reports. It is consistent across every path that
-returns it: `$unset` of a field that was never present counts, and a `PUT`
-replacing a document with a byte-identical body counts.
+So did an `$unset` of a field that was never there, and a `PUT` of a
+byte-identical body. MongoDB's `nModified` excludes documents that were
+already in the requested state, so the two disagreed on exactly the question
+a caller tends to ask, "did this change anything?", and a client ported from
+MongoDB got a number that looked right and was not. Each such write also
+minted a stamp, wrote the record and its index entries, appended an oplog
+entry, replicated it to every peer, published a change event and spent a
+commit, and its new stamp could win a last-writer-wins conflict against a
+real change made concurrently on a peer. Deferred at first on the grounds
+that closing it meant a serialize-and-compare per document on the write path
+to sharpen a number nothing acted on; the write path already held both
+images, and the cost was not the number but the write.
 
-**MongoDB's `nModified` means the other thing.** It excludes documents whose
-values were already what the update asked for, so the two answers diverge on
-precisely the case a caller is most likely to be testing for — "did this change
-anything?" A client ported from MongoDB gets a number that looks right, is
-wrong, and never says so. That is what makes this worth an entry rather than a
-footnote: silent disagreement on a field both systems spell the same way.
-
-Nothing on the retry path depends on it. `modified` is reported, not consumed:
-no retry class reads it, and the value cannot make a write happen twice.
-
-**Closing it means comparing documents, not counting differently.** The write
-path would have to hold the pre-image and compare it with the result to know
-whether anything moved — a serialize-and-compare per document, on the write
-path, to make a reported number more precise. Deferred rather than done because
-the cost lands on every update in order to improve an answer that no part of the
-system acts on.
-
-**The workaround is to ask the question directly.** `matched` already says how
-many documents the filter found, and a `count` with a filter describing the
-desired state says how many are already that way — which is the honest way to
-learn whether an update would change anything, in either database.
-
-Also noted in [the HTTP API](http-api.md#count-update-delete-by-filter),
-[Query language](query-language.md) and [`openapi.yaml`](openapi.yaml), which
-are where someone writing an update will meet it — rather than in
-[Compatibility](compatibility.md), which is about this project's own `/v1`
-promise and not about MongoDB.
-
-**`openapi.yaml` was the one that got out of step**, and it stated the opposite
-until 2026-08-26: *"Matched but unchanged documents count in `matched` and not
-here."* Found by someone writing a fourth client (.NET) from the specification,
-which is the only document a client author is obliged to read — so the register
-was right about the behaviour everywhere except in the contract. Same shape as
-the `409` on a second collection create, below: a false sentence about an
-*outcome* survives because the specification's coverage assertion checks that
-every *operation* is exercised, not every documented outcome. The contract test
-now pins `modified == matched` for a no-op `$set`, so the sentence and the
-server cannot drift apart again in silence.
+**Now** (closed 2026-10-01, [ADR-208](decisions.md)). A document whose new
+image is byte for byte the stored one is not written: no stamp, no record,
+no index maintenance, no oplog entry, nothing replicated or published.
+`modified` counts the documents written, on `update`, `PUT`, and
+`find_and_modify`, which now reports it too, and the response carries no
+`stamp` for a write that wrote nothing. A `multi` chunk that changed nothing
+is not committed and not counted in `commits`. "The same" is the stored
+bytes: a `1` over a `1.0`, or the same fields in another order, is a change,
+which is also MongoDB's rule. Two places still differ from MongoDB, both
+because a value's stored type changes: `$inc` and `$mul` on a 32-bit integer
+answer a 64-bit one, so `$inc` by `0` on one counts, and a `PUT` stores the
+`_id` the path names, so the first replace of a document inserted with a
+32-bit integer `_id` stores a 64-bit one and counts. Both are tracked
+separately. Breaking for callers
+who relied on `modified == matched`, in a `0.MINOR`.
 
 ---
 

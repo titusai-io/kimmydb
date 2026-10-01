@@ -73,6 +73,38 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Breaking: `modified` counts the documents an update changed, and a
+  document it leaves as it was is not written.** An `update` (single or
+  `multi`), a `find_and_modify` or a `PUT .../docs/{id}` whose new document is
+  byte for byte the stored one used to write it back anyway and count it, so
+  `modified` always equalled `matched`: `{"$set": {"status": "paid"}}` over two
+  paid orders answered `{"matched": 2, "modified": 2}`. It now answers
+  `{"matched": 2, "modified": 0, "commits": 0}`, and nothing is written for
+  such a document: no new stamp (a single-document write reports none, and an
+  `if_stamp` that named the document still does), no record or index write,
+  **no oplog entry, so no change-stream event, no webhook delivery, nothing
+  replicated to other members and no re-embedding**, and a `multi` chunk in
+  which nothing changed spends no commit and does not count in `commits`. The
+  comparison is of the stored bytes: a value of another type (`1` over
+  `1.0`), `-0.0` over `0.0`, or the same fields in another order is a change.
+  `$inc` by `0` on a 32-bit integer still counts, because integer arithmetic
+  stores a 64-bit result, and so does the first `PUT` over a document
+  inserted with a small integer `_id`, which the path stores as a 64-bit
+  integer; both are tracked separately. A replacement through `update` or
+  `find_and_modify` now stores `_id` first, as an insert and a `PUT` do, where
+  it used to put it last when the replacement left it out; a document an
+  earlier such replacement stored with `_id` last counts as changed once, the
+  first time it is replaced again. `find_and_modify` gains `modified` (0 or 1)
+  and `upserted` beside `matched`, and reports no `stamp` when it changed
+  nothing; it returns the document either way. `modified` counts changes to
+  documents that were there, so a document an upsert creates is
+  `upserted: true` with `modified: 0` on every route. A `partially_applied`
+  answer's `applied.matched` also counts the documents of chunks in which
+  nothing changed. Check callers that relied on
+  `modified == matched`, or on every update producing an event or a new stamp
+  ([ADR-208](docs/decisions.md),
+  [Query language](docs/query-language.md#modified-counts-changes)).
+
 - **Breaking: an update that writes one path twice is a `400`, and writes
   nothing.** Two writes to the same path, or to a path and a path inside it,
   were applied in the order their keys arrived: `{"$set": {"a": 1}, "$inc":

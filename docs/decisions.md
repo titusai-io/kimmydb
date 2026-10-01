@@ -4152,6 +4152,11 @@ behaviour change for a configuration nobody should have had.
 
 ## ADR-086 — A `multi` write commits in bounded chunks
 
+> **Amended by [ADR-208](#adr-208--a-document-an-update-leaves-as-it-was-is-not-written-and-modified-counts-changes).**
+> A chunk whose matches the update leaves unchanged writes nothing, so it is
+> aborted rather than committed and does not count in `commits`; the next
+> chunk resumes after its last match.
+
 > **Amended by [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed).** "Why the failure answer is an error and not a
 > partial count" no longer holds. Once a chunk has committed, a later chunk
 > could give up waiting for the writer and answer `503 timeout`, "nothing was
@@ -8431,6 +8436,11 @@ resulting row"* — rather than surfacing `path::set`'s internal vocabulary.
 
 
 ## ADR-131 — `explain: true` on `update` and `delete` plans the write; it does not perform it
+
+> **Amended by [ADR-208](#adr-208--a-document-an-update-leaves-as-it-was-is-not-written-and-modified-counts-changes).**
+> The invariant cited below, `modified == matched` for a real write, no
+> longer holds: a document the update leaves unchanged counts in `matched`
+> and not in `modified`. The decision here is unaffected.
 
 **Decision.** `explain: true` on `POST .../update` and `POST .../delete` no
 longer executes the write it was asked to describe. Both routes now run the
@@ -22442,6 +22452,235 @@ error returned at once rather than kept until no clause decides, in `$and` and
 in `$or` each, and both with the order written (the plan test fails); the
 `$lookup` early return removed; `Modify::apply` passing the error's full text
 again.
+
+---
+
+## ADR-208 — A document an update leaves as it was is not written, and `modified` counts changes
+
+**Status:** accepted, for the next `0.MINOR`. Closes the register entry
+"`modified` counted documents written, not documents changed". Amends
+[ADR-086](#adr-086--a-multi-write-commits-in-bounded-chunks) (a chunk that
+changed nothing is not a commit) and the invariant
+[ADR-131](#adr-131--explain-true-on-update-and-delete-plans-the-write-it-does-not-perform-it)
+cites (`modified == matched` for a real write no longer holds).
+
+**The defect.** Every document a filtered write matched was written back,
+whether or not its operators changed it, and a replace by id wrote its body
+over an identical one. `modified` counted writes, so it always equalled
+`matched`, and `{"$set": {"status": "paid"}}` over two paid orders answered
+`{"matched": 2, "modified": 2}`. A caller asking "did this change anything?"
+was told yes, always. And each such write did everything a change does: it
+minted a stamp, wrote the record and its index entries, appended an oplog
+entry, shipped it to every peer, published a change event and a webhook
+delivery, handed the embedding worker an entry to consider, and spent a commit.
+Its new stamp could also win a last-writer-wins conflict against a real
+change a peer made concurrently, so a write that changed nothing could undo
+one that did.
+
+**Decision.**
+
+- **A document whose new image is byte for byte the stored one is not
+  written.** No stamp is minted, so the clock does not advance for it; no
+  record, no index maintenance, no oplog entry; so nothing is replicated,
+  published, delivered or embedded, and the document keeps the stamp it had.
+- **"The same" is the stored bytes.** The new image's BSON encoding, which the
+  write needs anyway, is compared with the stored body, which the match
+  already read. A value of another type is a change (`$set: {a: 1}` over a
+  double `1.0`), as is the same fields in another order, and `-0.0` over
+  `0.0`, which compare equal as numbers. A NaN over the same NaN is no change.
+  This is the comparison the stored document itself would make, and it is
+  stricter than `bson::Document` equality, which ignores field order (it is
+  an `IndexMap`'s), says `-0.0 == 0.0` and `NaN != NaN`. Do not replace it
+  with the document comparison: it would call a reordered replace unchanged
+  and never call a NaN unchanged.
+- **Where.** The filtered writes (`update`, single and `multi`, and
+  `find_and_modify`) share one body, `modify_in_txn` and `write_chosen`, and
+  the comparison is there; the match keeps the stored body it decoded, so
+  nothing is read twice, except by `find_and_modify`, which holds every match
+  to sort them and so keeps no bodies, and reads the chosen one's again: one
+  lookup of a page the transaction has just read, rather than up to 10,000
+  bodies held beside their documents under the writer. The by-id replace (`PUT .../docs/{id}`, and every
+  internal `Engine::replace` and `WriteScope::replace`) compares in
+  `replace_in_txn`. In both, the stamp is minted only after the comparison,
+  still under the writer (ADR-148). A removal is always a change. An upsert
+  that inserts is always a write; one that matches follows the rule.
+- **A replacement keeps `_id` first.** A whole document as the `update` of
+  `/update` or `find_and_modify` used to be stored with `_id` appended after
+  the replacement's fields when the replacement left it out, where an insert
+  and a `PUT` store it first. So sending a document's own fields back was a
+  different document byte for byte, and counted as a change every time. The
+  replacement is now built with the stored `_id` first, whether or not it
+  names `_id` and wherever it names it. A document an earlier replacement
+  stored with `_id` last counts as changed once, the first time it is
+  replaced again, and is then stored with `_id` first.
+  `delete` and `insert` are unaffected. There is no other update path: the
+  bulk route inserts, and there are no update pipelines.
+- **`if_stamp` is checked first.** A stale stamp is `409 stale` even when the
+  update would have changed nothing. A matched stamp with nothing to change
+  answers `matched: 1, modified: 0` and no `stamp`, and the caller's stamp
+  still names the document for its next conditional write.
+- **Chunks.** A `multi` chunk whose matches were all unchanged holds no write,
+  so it is aborted, as a chunk that matched nothing always was: no commit, and
+  not counted in `commits`. The next chunk still resumes strictly after its
+  last match, so nothing is visited twice. A chunk holding both kinds commits
+  once, with entries for the changed documents only. `stamp` is the last
+  written document's, and an empty chunk after it does not clear it. Since
+  nothing was written, an unchanged chunk does not make the request part done
+  (ADR-192): the next chunk waits for the writer as a first one does, and a
+  failure before any commit is the request's plain answer, with nothing
+  written. A `partially_applied` answer's `matched` also counts the
+  documents of unchanged chunks it got through; `in_doubt` is the number
+  written in the chunk whose commit's outcome is unknown.
+- **Responses.** `modified` counts the existing documents written, changed or
+  removed; `matched` is unchanged. A document an upsert creates is
+  `upserted`, not `modified`, on every route: `PUT` already answered
+  `{"matched": 0, "modified": 0, "upserted": true}`, and `find_and_modify`
+  now does the same. `stamp` is reported only for a write that wrote,
+  creation included. `PUT` answers `{"matched": 1, "modified": 0,
+  "upserted": false}` for its stored body. `find_and_modify` gains
+  `modified`, 0 or 1, because without it a caller could tell a no-op from a
+  change only by the absence of `stamp`, which a removal shares, and
+  `upserted`, which `PUT` has; it returns the document either way, and with
+  `returnDocument: "after"` that is the stored document.
+- **Replication, the version vector and the clock** see nothing: they are
+  derived from oplog entries and minted stamps, and there are none. No
+  metric counts updated documents. `kimmy_oplog_entries` and `commits` move only for
+  writes. The writer-hold histogram still records an unchanged chunk's hold,
+  as it records a chunk that matched nothing: the writer was held for the
+  match.
+- **Indexes.** An unchanged document's entries already describe it, so
+  nothing is maintained. TTL is untouched; `$currentDate` on a TTL field
+  writes whenever the time differs, which is every time but a repeat in the
+  same millisecond. One consequence to know: a document that stands in a
+  replicated unique violation (ADR-020), which a local write of it used to be
+  refused for, now answers `modified: 0` for an update or replace that
+  leaves it as it is, because no index maintenance runs to meet the other
+  holder. Nothing changed, so nothing new violates anything; the standing
+  violation is reported as before.
+- **Internal writers** — users and roles, a webhook's delivery progress, the
+  topology record — call `replace` with documents that are often what is
+  stored; they now write nothing then, and none reads the stamp of such a
+  write. The embedding worker's vector chunks (`WriteScope::put_vectors`,
+  through `replace`) are in practice unaffected: every chunk carries the
+  source document's version (`source_hlc`) and the fingerprint of the
+  configuration that made it (ADR-203), so a chunk for a newer version, or
+  under another configuration, always differs from the one stored. Only a
+  repeat of the same version under the same configuration with the same
+  provider output is byte-identical, and that one is now not written; the
+  shadow's generation is still bumped for it, which costs a rebuild of the
+  vector index and changes no answer.
+- **Last-writer-wins.** A write that changed nothing used to mint a new stamp
+  and so re-assert the document's value: if a peer had changed the document
+  concurrently, the no-op's later stamp could win and undo that change. It
+  no longer does. The trade-off is that a caller can no longer use an
+  identical write to make its value win over a concurrent change it has not
+  seen: to win, a write has to change something. `if_stamp` does not help
+  here, since it is checked against this member's own version and a no-op
+  under it still writes nothing.
+
+**Two places still count where nothing looks different**, both because the
+stored type changes. Integer arithmetic answers a 64-bit integer, so `$inc`
+by `0` or `$mul` by `1` on a 32-bit field widens it and is a change. A
+`PUT` stores the `_id` the path names, and an integer path is a 64-bit
+integer, so the first replace of a document inserted with a small integer
+`_id`, stored as 32-bit, changes its `_id`'s type and is a change; the
+second is not. Each is a change of stored bytes, which is the rule, and
+changing either is a decision of its own, tracked separately.
+
+**Why.** Reporting a change that did not happen is answering a question the
+caller did not ask, and the cost was never the number: it was a write, an
+oplog entry, a replication round, an event and a commit per document, for
+nothing, and a stamp that could beat a real change. The comparison costs no
+read and no encoding, since both buffers are in hand.
+
+**Caller-visible, and breaking.** `modified` was always `matched`, and a
+caller may have relied on that, or on every update producing a change event,
+a webhook delivery or a new stamp. Listed under **Changed**, marked
+**Breaking**, in the CHANGELOG. The clients' guidance not to branch on
+`modified` can go when they are next updated against a server carrying this.
+
+**Rejected.**
+
+- *Keep writing, and count `modified` precisely.* Fixes the number and keeps
+  the commit, the oplog growth, the replication traffic, the events and the
+  last-writer-wins hazard.
+- *Compare decoded documents.* Field-order-blind and NaN-unequal, as above;
+  and it would compare what the server means, not what it stores and sends.
+- *Compare values loosely, so `1` over `1.0` is no change.* The stored bytes
+  and every peer's copy would then disagree with the write the caller asked
+  for, and a type is part of the value in this store.
+- *Report the document's existing stamp on a no-op.* It names a version this
+  request did not produce; the caller who needs it already has it, or can
+  read it with `"stamps": true`.
+
+**Cost.** One comparison of two buffers per matched document, inside the
+writer, and the stored body kept beside each match of an `update` chunk,
+which the decode had already copied; `find_and_modify` keeps none, and
+reads one record again. Measured in a release build on one
+machine, a `multi` `$set` over 100,000 documents of about 250 bytes in
+chunks of 1,000, median of seven runs, two rounds each against the build
+before this change. Half the documents unchanged: the writer was held 840
+to 873 ms in total over 101 holds, against 1,191 to 1,297 ms before, since
+half the records, index entries and oplog entries are no longer written.
+All unchanged: 66 to 72 ms with no commit, against 1,239 to 1,303 ms and
+100 commits. All changed, each document differing only in its last field,
+so that every comparison reads the whole body: 1,131 to 1,438 ms against
+1,168 to 1,272 ms, within the spread of the fsyncs; the comparisons are a
+thousand reads of 250 bytes per chunk.
+
+### Test
+
+`kimmy-storage`: an unchanged `multi` update and `find_and_modify` leave the
+commit count, the oplog's length, the clock and every stored record (header
+and body) exactly as they were, and publish nothing; a chunk of changed and
+unchanged documents commits once, logs and publishes only the changed, and
+reports the last written stamp; chunks of only unchanged documents commit
+nothing and the scan goes on, and an empty chunk after a written one keeps
+its stamp; a stale stamp is refused even when nothing would change, and a
+no-op at the current stamp leaves it valid; byte rules (int over double,
+int32 over int64, `-0.0`, NaN, a nested reorder, `$set` keeping a field's
+place) and each operator that leaves a document alone (`$unset`, `$rename`
+of a missing field, `$inc` by zero on int64 and double, `$mul` by one,
+`$min`, `$max`, `$push` with an empty `$each`, `$addToSet` of present
+values, `$pull`, `$pullAll`, `$pop` of an empty array, `$setOnInsert` on a
+match) against the ones that change it (`$inc` by zero on an int32,
+`$currentDate`, `$push` with an empty `$each` creating its array); a
+replacement reordering fields is a change; a removal is always one; an
+unchanged document stays findable through a unique index; an unchanged
+chunk does not make a request part done, so the next chunk commits past the
+drain deadline as a first one does; an upsert that creates is not
+`modified`; a replacement through the query language, with and without
+`_id`, is no change. `kimmy-query`: a replacement stores `_id` first, named
+or not. A local no-op `replace`, `update` and `find_and_modify` on a
+document standing in a replicated unique violation write and refuse
+nothing. The replace path:
+an identical body, with and without upsert and at the current stamp, leaves
+record, commits, oplog and clock untouched; reorder and type are changes; a
+stale stamp still wins; a scope whose replaces change nothing does not
+commit. `kimmy-api`: `matched: 2, modified: 0, commits: 0` for `$set` and
+`$unset` no-ops, the single form at an `if_stamp`, `find_and_modify`
+reporting `modified: 0` and no stamp, stamps unmoved, and the old stamp
+still good for a real change; `PUT` of the stored body, and of a reorder;
+a replacement without `_id` on `/update` and `find_and_modify` is
+`modified: 0` the first time; an upsert that creates is `upserted: true`,
+`modified: 0` on `find_and_modify` and `PUT`;
+`1` over `1.0` counts in a mixed `multi`; a change stream receives no event
+for an unchanged `update`, `PUT` and `find_and_modify` and receives the next
+real change; the specification test drives both no-op answers.
+`kimmy-cluster`: after an unchanged `update` and `replace` on one member, the
+other's pull receives nothing and the version vector has not moved, and a
+real change then arrives. Each guard was broken and its test failed: the
+comparison always "changed" and always "unchanged", decoded-document and
+type-loose comparisons, the oplog entry appended for an unchanged document,
+`modified` counted from `matched` (in `update` and in `find_and_modify`), an
+unchanged chunk counted as a commit or committed, the stamp cleared by an
+empty chunk, the stamp minted before the comparison, the stale check skipped
+when nothing changes, and on the replace path the comparison always
+"changed", a decoded comparison, the unchanged check before the stamp check,
+and `modified` reported for an unchanged replace; index maintenance run for
+an unchanged document, in each path; an unchanged chunk counted as making
+the request part done; `_id` appended last by a replacement; and an upsert
+that creates reported as `modified`.
 
 ---
 

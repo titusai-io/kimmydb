@@ -29,6 +29,9 @@ use crate::walk::{WalkScope, open_walk_table};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WriteOutcome {
     pub matched: bool,
+    /// Whether an existing document was written over. `false` when the new
+    /// body is byte for byte the stored one, which is not written at all
+    /// (ADR-208), and for an upsert, which is `upserted` instead.
     pub modified: bool,
     pub upserted: bool,
     /// The stamp the write produced, when it wrote anything.
@@ -605,8 +608,9 @@ impl Engine {
                 self.publish(vec![entry]);
                 Ok(outcome)
             }
-            // Unmatched and not an upsert: nothing was written, so nothing
-            // is committed — a miss must not cost an fsync.
+            // Unmatched and not an upsert, or a body identical to the stored
+            // one (ADR-208): nothing was written, so nothing is committed —
+            // a miss or a no-op must not cost an fsync.
             Ok((outcome, None)) => {
                 txn.abort()?;
                 Ok(outcome)
@@ -629,7 +633,10 @@ impl Engine {
     ///
     /// Answers with the outcome and the entry to publish once the caller has
     /// committed. An unmatched replace without `upsert` writes nothing and
-    /// yields no entry; a version that does not match `expected` is
+    /// yields no entry, and neither does a replace whose body is byte for
+    /// byte the stored one, which mints no stamp either (ADR-208), the
+    /// version check having passed first; a version that does not match
+    /// `expected` is
     /// [`StorageError::Stale`], and the caller aborts. Nothing is aborted
     /// here: a scope holding many writes aborts once for the scope
     /// (ADR-149), not once per write.
@@ -648,18 +655,18 @@ impl Engine {
 
         let key = doc_key(id)?;
         let body = bson::serialize_to_vec(&doc)?;
-        let stamp = self.next_stamp();
 
-        let (existed, previous) = {
+        let (existed, previous, stamp) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The previous image is needed to remove the index entries it
             // contributed — they are derived from the old value, not the new.
-            let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
+            let (current, previous, unchanged) = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => {
                     let record = codec::decode_doc_record(raw.value())?;
-                    (record.is_live().then_some(record.stamp), record.document()?)
+                    let unchanged = record.is_live() && record.body == body;
+                    (record.is_live().then_some(record.stamp), record.document()?, unchanged)
                 }
-                None => (None, None),
+                None => (None, None, false),
             };
             let existed = previous.is_some();
 
@@ -671,7 +678,17 @@ impl Engine {
                     WriteOutcome { matched: false, modified: false, upserted: false, stamp: None };
                 return Ok((unmatched, None));
             }
+            if unchanged {
+                // Byte for byte what is stored: no stamp, no record, no
+                // index maintenance, no oplog entry (ADR-208).
+                let unchanged =
+                    WriteOutcome { matched: true, modified: false, upserted: false, stamp: None };
+                return Ok((unchanged, None));
+            }
 
+            // Minted only once there is something to write, and still under
+            // the writer (ADR-148).
+            let stamp = self.next_stamp();
             let record = DocRecord::live(stamp, body.clone());
             crate::live_count::put_record(
                 txn,
@@ -680,7 +697,7 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
-            (existed, previous)
+            (existed, previous, stamp)
         };
 
         // Same transaction as the document write, so the index cannot describe
@@ -2471,6 +2488,56 @@ mod tests {
         }
     }
 
+    /// ADR-208's consequence for a standing replicated unique violation
+    /// (ADR-020): a local write that leaves the local holder as it is runs
+    /// no index maintenance, so it is not refused for the violation it did
+    /// not cause, and answers `modified: 0` on both update paths. A write
+    /// that runs maintenance anyway — an unchanged document handed to the
+    /// index code — meets the other holder and is refused.
+    #[test]
+    fn a_no_op_on_a_document_in_a_replicated_violation_writes_and_refuses_nothing() {
+        struct SetEmail;
+        impl crate::ModifySpec for SetEmail {
+            fn matches(&self, d: &Document) -> kimmy_core::Result<bool> {
+                Ok(d.get_str("_id").is_ok_and(|i| i == "local"))
+            }
+            fn compare(&self, _: &Document, _: &Document) -> std::cmp::Ordering {
+                std::cmp::Ordering::Equal
+            }
+            fn apply(&self, d: &Document) -> std::result::Result<Option<Document>, String> {
+                let mut next = d.clone();
+                next.insert("email", "clash@x");
+                Ok(Some(next))
+            }
+            fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+                None
+            }
+        }
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+        let entry =
+            remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
+        assert!(engine.apply_remote(&coll, &entry).unwrap(), "the violation stands");
+        let local = DocId::String("local".into());
+        let record = raw_record(&engine, &coll, &local);
+        let (commits, oplog) = (engine.commits(), engine.oplog_entries().unwrap());
+
+        let out = engine.replace(&coll, &local, doc! { "email": "clash@x" }, false).unwrap();
+        assert_eq!(
+            out,
+            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+        );
+        let out = engine.modify_where(&coll, &crate::Candidates::Scan, &SetEmail, None).unwrap();
+        assert_eq!((out.matched, out.modified, out.commits), (1, 0, 0));
+        let out = engine.find_and_modify(&coll, &crate::Candidates::Scan, &SetEmail).unwrap();
+        assert!(out.matched && !out.modified, "{out:?}");
+
+        assert_eq!(raw_record(&engine, &coll, &local), record);
+        assert_eq!((engine.commits(), engine.oplog_entries().unwrap()), (commits, oplog));
+    }
+
     #[test]
     fn a_replicated_document_is_visible_to_an_index() {
         // Without index maintenance on the remote path, an index-backed query
@@ -2797,6 +2864,90 @@ mod tests {
         let err = engine.replace_if(&coll, &id, doc! {"n": 3}, true, Some(second)).unwrap_err();
         assert_eq!(stale_of(err), None);
         assert!(engine.get(&coll, &id).unwrap().is_none());
+    }
+
+    /// The stored record, header included: any write changes it.
+    fn raw_record(engine: &Engine, coll: &CollectionMeta, id: &DocId) -> Vec<u8> {
+        let txn = engine.db().begin_read().unwrap();
+        let docs = txn.open_table(tables::DOCS).unwrap();
+        let key = doc_key(id).unwrap();
+        docs.get((coll.id.0, key.as_slice())).unwrap().unwrap().value().to_vec()
+    }
+
+    #[test]
+    fn a_replace_with_the_stored_body_writes_mints_logs_and_publishes_nothing() {
+        // ADR-208: byte for byte the stored document is not a write.
+        let (engine, coll, _dir) = engine();
+        let id = DocId::Int64(1);
+        let (_, stamp) = engine.insert_stamped(&coll, doc! {"_id": 1_i64, "a": 1, "b": 2}).unwrap();
+        let record = raw_record(&engine, &coll, &id);
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+        let mut rx = engine.subscribe();
+
+        let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, false).unwrap();
+        assert_eq!(
+            out,
+            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+        );
+        // Upsert changes nothing about an existing document.
+        let out = engine.replace(&coll, &id, doc! {"a": 1, "b": 2}, true).unwrap();
+        assert_eq!(
+            out,
+            WriteOutcome { matched: true, modified: false, upserted: false, stamp: None }
+        );
+        // At the current stamp it is the same no-op, and the stamp stays
+        // valid for the next conditional write.
+        let out = engine.replace_if(&coll, &id, doc! {"a": 1, "b": 2}, false, Some(stamp)).unwrap();
+        assert_eq!((out.modified, out.stamp), (false, None));
+
+        assert_eq!(raw_record(&engine, &coll, &id), record, "the record is untouched");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert!(rx.try_recv().is_err(), "nothing published");
+
+        let out = engine.replace_if(&coll, &id, doc! {"a": 1, "b": 3}, false, Some(stamp)).unwrap();
+        assert!(out.modified && out.stamp.is_some(), "{out:?}");
+    }
+
+    #[test]
+    fn a_replace_that_changes_only_order_or_type_is_a_write() {
+        let (engine, coll, _dir) = engine();
+        let id = DocId::Int64(1);
+        engine.insert(&coll, doc! {"_id": 1_i64, "a": 1_i32, "b": 2_i32}).unwrap();
+
+        let out = engine.replace(&coll, &id, doc! {"b": 2_i32, "a": 1_i32}, false).unwrap();
+        assert!(out.modified && out.stamp.is_some(), "another order is a change");
+        let out = engine.replace(&coll, &id, doc! {"b": 2_i32, "a": 1_i64}, false).unwrap();
+        assert!(out.modified && out.stamp.is_some(), "another type is a change");
+        let out = engine.replace(&coll, &id, doc! {"b": 2_i32, "a": 1_i64}, false).unwrap();
+        assert!(!out.modified && out.stamp.is_none(), "and then the same is not");
+    }
+
+    #[test]
+    fn a_stale_replace_is_refused_even_when_its_body_is_the_stored_one() {
+        let (engine, coll, _dir) = engine();
+        let id = DocId::Int64(1);
+        let (_, first) = engine.insert_stamped(&coll, doc! {"_id": 1_i64, "n": 0}).unwrap();
+        let second = engine.replace(&coll, &id, doc! {"n": 1}, false).unwrap().stamp.unwrap();
+        let err = engine.replace_if(&coll, &id, doc! {"n": 1}, false, Some(first)).unwrap_err();
+        assert_eq!(stale_of(err), Some(second));
+    }
+
+    #[test]
+    fn a_scope_whose_replaces_change_nothing_does_not_commit() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64, "v": "same"}).unwrap();
+        let (commits, oplog) = (engine.commits(), engine.oplog_entries().unwrap());
+        let out = engine
+            .write_batch(WriterHolder::Bulk, |scope| {
+                scope.replace(&coll, &DocId::Int64(1), doc! {"v": "same"}, true)
+            })
+            .unwrap();
+        assert!(out.matched && !out.modified);
+        assert_eq!(engine.commits(), commits, "a scope that wrote nothing is aborted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog);
     }
 
     #[test]

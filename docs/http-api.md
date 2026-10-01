@@ -230,6 +230,15 @@ integer → integer, anything else → string.
 touches at most one document. Replacement is **not** a merge — unnamed fields
 are dropped — and `_id` always comes from the path, never the body.
 
+**A body identical to the stored document is not written**
+([ADR-208](decisions.md)): `{"matched": 1, "modified": 0, "upserted": false}`,
+no `stamp`, and the document keeps its version, so no oplog entry, no change
+event and nothing for other nodes. Identical means the stored bytes: the same
+fields in another order are a change. `_id` is stored as the path names it,
+and an integer in the path is a 64-bit integer, so the first `PUT` over a
+document inserted with a small integer `_id` (stored as 32-bit) changes that
+type and counts as modified.
+
 **Without `?upsert=true` a missing document is not an error.** The answer is
 `200 {"matched": 0}` and nothing is written. A test built on the assumption
 that this creates the document writes nothing and passes.
@@ -355,13 +364,16 @@ omitted `filter`, or `{}`, matches every document — combined with
 explicit `filter: null` is not the same as omitting it: it is refused `422`,
 not read as "no filter" ([The JSON boundary](#the-json-boundary)).
 
-> **`modified` counts documents written, not documents changed.** A `$set` to
-> the value a field already holds is still a write, so it still counts —
-> `{"matched": 2, "modified": 2}` for an update that moved nothing. MongoDB's
-> `nModified` excludes those, so the two disagree on exactly the question
-> "did anything change?". To ask that, compare `matched` against a `count`
-> with a filter describing the state you want. Recorded in
-> [Deviations](deviations.md).
+**`modified` counts documents changed** ([ADR-208](decisions.md)). A
+document the update leaves byte for byte as it was — a `$set` to the value a
+field already holds, an `$unset` of a field that is not there — counts in
+`matched` and not in `modified`, and is **not written**: no new version, no
+oplog entry, no change event, nothing replicated. `{"matched": 2,
+"modified": 0, "commits": 0}` is an update that found two documents already
+in the state it asked for. A single-document update that changed nothing
+reports no `stamp`, and the document keeps the one it had. A value of another
+type is a change (`1` over `1.0`), as is another field order; the full table
+is in [Query language](query-language.md#modified-counts-changes).
 
 **The operators run inside the write transaction.** An `update` matches and
 writes in one transaction, on the image that transaction holds, so two
@@ -370,7 +382,8 @@ concurrent `$inc`s on one document both land — the same guarantee
 `multi: true` request commits in **chunks** of `storage.multi_chunk_docs`
 documents (default 1,000): each chunk is one transaction and one fsync, the
 writer is released between chunks, and the response's `commits` field says
-how many chunks landed ([ADR-086](decisions.md)).
+how many chunks landed ([ADR-086](decisions.md)). A chunk in which nothing
+changed is not committed and not counted.
 
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
@@ -420,8 +433,11 @@ fields beside the usual three:
  "cause": {"code": "stopping", "message": "the node reached its shutdown deadline"}}
 ```
 
-- **`applied`** counts the committed chunks only. **`in_doubt`** is the size of
-  a chunk whose commit's outcome is unknown: it may be there. A database drop
+- **`applied`** counts what the request got through before it stopped: the
+  committed chunks, and chunks in which nothing changed, which commit nothing
+  (`matched` includes their documents, `modified` and `commits` do not).
+  **`in_doubt`** is the number of documents written in a chunk whose commit's
+  outcome is unknown: they may be there. A database drop
   answers `{"dropped": [names…], "in_doubt": name-or-null}`.
 - **`cause`** is the code and message the failure would have been answered
   with on its own — `bad_request` for an operator a later document cannot
