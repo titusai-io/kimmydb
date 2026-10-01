@@ -5605,6 +5605,12 @@ followed by a plain `eval` is an error rather than a null, which is the point.
 
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
 
+> **Amended by [ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request).**
+> The deferral below is withdrawn: `matches` returns a `Result`, and an
+> evaluation error fails the request instead of being "no match". The regex
+> arm it cited no longer resolves an unusable pattern as "no match" either; the
+> parser refuses one (ADR-196).
+
 **Decision.** `{$expr: <expression>}` is a filter clause. It parses through
 `Expr::parse`, evaluates through `Expr::eval` against the whole document, and
 matches when the result is truthy under the expression language's rule. It is
@@ -21998,3 +22004,197 @@ applying; the canonical form dropped; a rename's destination not claimed in a
 document; `$setOnInsert` claimed first; the lookup of a path inside one
 claimed, and of a claimed prefix, each dropped; a lookup per path already
 claimed; the apply-time claim not run; plain operations' paths not claimed.
+
+---
+
+## ADR-206 — A filter's `$expr` that cannot be evaluated fails the request
+
+**Status:** accepted, for the next `0.MINOR`. Amends
+[ADR-106](#adr-106--expr-joins-the-filter-language-by-delegating-to-the-expression-evaluator),
+which deferred it. Extends
+[ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+and [ADR-124](#adr-124--a-route-that-reads-no-query-string-refuses-every-query-string)
+from what a request says to what it finds.
+
+**The defect.** `filter::matches` answered a `bool`, and its `$expr` arm read
+an evaluation error as `false`. Over `{_id: 1, qty: 5}`, `{_id: 2, qty: 12}`
+and `{_id: 3, qty: "twelve"}`, the filter `{"$expr": {"$gt": [{"$add":
+["$qty", 1]}, 10]}}` answered `200` with document 2: document 3 has no truth
+value under the expression, since `$add` cannot take a string, and it was
+dropped exactly as a document that does not qualify is. A caller using the
+query to find bad data, or trusting that a query which succeeds saw clean
+data, was told nothing. A pipeline's `$addFields` with the same expression
+was already a `400`, so the same evaluation was loud in one place and silent
+in the other.
+
+**Decision.**
+
+- **`filter::matches` and `filter::matches_element` return `Result<bool>`,
+  and an evaluation error inside a `$expr` is an `Err`**: `InvalidQuery`,
+  so `400 bad_request`, with a message naming the document's `_id` when the
+  document has one, and the evaluator's reason, which names the operator and
+  the type it could not take:
+  `$expr cannot be evaluated for the document with _id 3: $add needs numbers,
+  found a string`. No bool-returning wrapper is kept, so no caller can read
+  the error as a non-match by accident.
+- **What counts as an error is the expression language's**, unchanged: a
+  missing field is null and null propagates, so `{$add: ["$missing", 1]}` is
+  null, the clause is false, and the document does not match. A parse-time
+  error was a `400` already.
+- **A request fails exactly when its answer depends on a document whose
+  `$expr` cannot be evaluated, at the level of filter clauses.** The matcher
+  is three-valued: true, false,
+  or not known. An `$and` (the implicit one between top-level fields
+  included) is false if any clause is false, an `$or` is true if any branch
+  is true, `$nor` is its inverse, `$elemMatch` is true if any element
+  matches, and a `$not` of a condition that is not known is not known; only
+  a document whose answer is not known fails, with the first error met.
+  Within each `$and`, `$or` and `$nor`, a field's conditions, an
+  `$elemMatch`'s body and a leading run of `$match` stages, the clauses
+  holding no `$expr` are evaluated first, and evaluation stops at the first
+  clause that decides, so an expression is not evaluated where a cheaper
+  clause has answered. That order is set once, when the filter is parsed
+  (`filter::conjunction`, `cheap_first`), not worked out per document: an
+  earlier build classified the clauses on every evaluation and cost 8 to 21
+  per cent on filters with no `$expr` at all.
+- **Inside one `$expr` the expression language's own rule holds.** Its `$and`
+  and `$or` evaluate every argument, and `$cond` evaluates only the branch it
+  takes, so `{"$expr": {"$or": [{"$eq": ["$kind", "c"]}, <bad>]}}` fails over
+  a document whose `kind` is `"c"`, where the filter-level `$or` does not.
+  Making the expression's `$and` and `$or` lazy is a change to the
+  expression language, recorded for a later release, not made here.
+- **So the outcome does not depend on the plan, or on the order clauses are
+  written in.** `{"$expr": …, "kind": "b"}` over a document whose `kind` is
+  `"a"` is false on a collection scan, because the `kind` clause decides
+  before the expression is reached, and the document is left out by an
+  index on `kind`: an index can only leave out a document that a clause
+  without `$expr` excludes, and that clause would have decided it. As first
+  built, clauses were evaluated in the order written, so the same filter was
+  a `400` on a scan and a `200` through the index.
+- **Which documents an answer depends on is the request's own.** `count`
+  and a `sort` read every document the filter admits, so one whose
+  expression cannot be evaluated, among those the other clauses admit, fails
+  them. `find_and_modify` reads every candidate even without a `sort`,
+  because it refuses a filter matching more than 10,000 documents rather than
+  pick from a prefix; stopping at the first match when there is no sort would
+  remove that refusal for the unsorted form, which is a change of its own, so
+  it is left and documented. A `find` with a `limit` and no `sort`, a page,
+  and a single-document `update` or `delete` stop once they hold what they
+  return, and a document past that point is not part of the answer and is not
+  evaluated. A `$lookup` with no input documents runs nothing of its pipeline,
+  its leading `$match` included. A `$limit` does not stop the source read: a
+  leading `$match` reads up to the pipeline's document ceiling before later
+  stages run, so `[{"$match": {"$expr": <bad>}}, {"$limit": 1}]` fails over a
+  collection holding such a document even when the first document matches.
+- **Every caller that serves a request fails it**:
+  - the read scan's re-check (`exec::Recheck`), behind `find`, `count`, a
+    leading `$match`, a vector search's `filter` and the `explain` of a
+    write — whichever access path offered the candidate (primary key, index,
+    collection scan);
+  - the write selection (`ModifySpec::matches`, now `kimmy_core::Result<bool>`)
+    behind `update`, `delete` and `find_and_modify`, which aborts the chunk's
+    transaction whole, as an operator that cannot be applied does: a
+    single-document write and `find_and_modify` write nothing, and a `multi`
+    write whose later chunk meets the error keeps the chunks it committed and
+    answers `500 partially_applied` with this as the cause (ADR-086, ADR-192);
+  - `aggregate::apply`'s `$match`, after any stage and in a `$lookup`
+    pipeline;
+  - `arrayFilters` element selection in the update language. An entry cannot
+    carry `$expr` at its top level, but it can under an `$elemMatch` on a
+    field of the element (`{"l.subs": {"$elemMatch": {"$expr": …}}}`), and
+    that one fails the update, naming the document the element is in:
+    `$expr cannot be evaluated for an array element of the document with _id
+    9: …`. Reported through the engine's selection, which wraps an apply
+    error as `InvalidQuery`, so `Modify::apply` passes an `InvalidQuery`'s
+    reason through rather than `invalid query: invalid query: …`;
+  - the MCP tools, which share `exec`.
+- **Nothing that runs without a request evaluates a `$expr`, so no caller has
+  to keep the old reading.** A partial index's filter, evaluated on every
+  write and by expiry for a TTL index, is the bounded language of
+  `kimmy_core::partial` ([Indexes](indexes.md)), which refuses any top-level operator,
+  `$expr` included, when the index is created, and a replicated index
+  definition goes through the same parse. Replication applies documents, not
+  filters. Change streams and webhooks take no query filter. A test pins the
+  partial-filter refusal of `$expr`.
+- **`$regex` needs no change.** An unusable pattern has been refused at parse
+  since ADR-196; the matcher's own no-match for one is unreachable through
+  the parser.
+
+**Why.** It is ADR-121's rule, that a request the server cannot honour is
+refused rather than answered, applied to a failure that only the data reveals.
+A document whose expression has no value is one the filter cannot place on
+either side, and answering as though it did made the `200` dishonest in the
+one case a caller most needs it honest. The cost ADR-106 cited, a `Result`
+through every caller, was a refactor and not a trade-off: every caller that
+serves a request already had an error path, and none of the background
+callers can meet a `$expr`.
+
+**Caller-visible, and breaking.** A filter that returned `200` now returns
+`400` (or `500 partially_applied` in a `multi` write past its first chunk)
+when its `$expr` reaches a document it cannot be evaluated against. Listed
+under **Changed**, marked **Breaking**, in the CHANGELOG.
+
+**Rejected.**
+
+- *Keep the skip and document it harder.* The register already did, and the
+  failure still looked like an empty result.
+- *Evaluate clauses in the order written and stop at the first error.* The
+  first build did; the outcome then depended on the order of the keys and on
+  the plan, which is the class of surprise this change exists to remove.
+- *Evaluate every clause regardless.* It reads expressions the answer does
+  not need. Deferring an error until no clause has decided gives the same
+  answers at no more cost than the order-written evaluation.
+- *Keep a bool `matches` beside a `try_matches` for callers that must not
+  fail.* No such caller exists, and a bool form left lying about is how the
+  silent reading would come back.
+- *Count and skip, as a background caller would.* There is none to need it.
+
+### Test
+
+`kimmy-query` unit tests: a type violation is an `Err` with the exact message,
+with and without an `_id`; a clean false, a missing field and a null are
+`Ok(false)`; the error surfaces at the top level, beside a matching clause,
+in an `$or` branch nothing else decides, under `$nor`, `$and` and `$cond`'s
+taken branch, inside `$elemMatch` and under `$not` of one; it does not surface
+beside a false clause or a true `$or` branch written before or after it,
+beside an expression that decides, under `$nor` with a true branch, in
+`$cond`'s untaken branch, in an `$elemMatch` another element satisfies (in
+either order) or whose cheap condition fails, or under a scalar `$elemMatch`;
+a counter of `$expr` evaluations shows no expression is evaluated where a
+clause without one decides — beside it in an `$and`, an `$or` and a `$nor`,
+after `$size` in a field's conditions, in an `$elemMatch` body and in a
+leading run of `$match` stages — and exactly one where nothing else does;
+an element filter fails on an
+expression it cannot evaluate, naming the document, and not on a scalar; a
+pipeline
+`$match` fails, also after a `$project`, and a clean false still drops the
+document. `kimmy-core`: a partial filter refuses `$expr`. `kimmy-api` tests
+drive the worked example through `find`, `find` with `explain`, `count`, a
+`find` by `_id`, a `find` through an index (and one whose index range
+excludes the document, which answers `200`), a `multi` `update` and
+`delete`, `find_and_modify`
+updating and removing, a leading `$match`, a `$match` after a stage and one in
+a `$lookup` pipeline, each with the exact message, and assert nothing was
+written; a `multi` update over chunks of one keeps its first chunk and answers
+`partially_applied` with the cause; a filter whose `kind` clause excludes the
+document answers `200`, written before or after the expression, on a scan
+and through the `kind_1` index (asserted from `explain`), and one whose
+`kind` clause admits it answers `400` on both, as does nothing when an `$or`
+branch without `$expr` matches; an `arrayFilters` `$elemMatch` that cannot be
+evaluated fails the update with the document's `_id` and writes nothing; a
+`$lookup` with nothing to join answers `200` over a foreign document that
+would fail its pipeline. `kimmy-mcp` tests drive `find`, `count` and a vector
+search's filter. Each guard was broken and its test failed: the
+`$expr` arm reading an error as `false` again; the read re-check, the write
+selection's `matches`, the engine's selection loop, the pipeline's `$match`,
+`$elemMatch` and the element filter each swallowing the error; the `_id`
+left out of the message;
+a partial filter taking `$expr`; the `arrayFilters` selection swallowing the
+error; the primary-key re-check swallowing it; clauses evaluated in the order
+written again, and the classifier reading a `$expr`, or an `$elemMatch`
+holding one, as cheap (only the counted-order tests fail, the answers being
+unchanged); an
+error returned at once rather than kept until no clause decides, in `$and` and
+in `$or` each, and both with the order written (the plan test fails); the
+`$lookup` early return removed; `Modify::apply` passing the error's full text
+again.

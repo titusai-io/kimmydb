@@ -425,7 +425,9 @@ fields beside the usual three:
   answers `{"dropped": [names…], "in_doubt": name-or-null}`.
 - **`cause`** is the code and message the failure would have been answered
   with on its own — `bad_request` for an operator a later document cannot
-  take, `internal` for a storage failure, `outcome_unknown` — or `stopping`,
+  take, or for a filter whose `$expr` cannot be evaluated against a later
+  document ([ADR-206](decisions.md)), `internal` for a storage failure,
+  `outcome_unknown` — or `stopping`,
   the node's shutdown deadline, or `storage_failed`, a storage failure that is
   stopping the node (ADR-188). A request that begins after the deadline still
   commits its first chunk, and then answers this with `stopping`.

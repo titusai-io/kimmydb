@@ -1078,7 +1078,7 @@ mod containment_is_sound {
         let index = kimmy_core::PartialFilter::parse(filter).unwrap();
         let query = crate::filter::parse(query).unwrap();
         index.covered_by(&containment_predicates(&query))
-            && crate::filter::matches(&query, doc)
+            && crate::filter::matches(&query, doc).unwrap()
             && !index.selects(doc)
     }
 

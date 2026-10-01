@@ -505,7 +505,9 @@ carries its own `vector` never builds a provider and never sees this at all.
 
 `filter` is an ordinary query-language document. It runs first, and its matching
 ids restrict the search — which is what lets semantic search compose with
-structured querying instead of being a separate world.
+structured querying instead of being a separate world. A `$expr` in it that
+cannot be evaluated against a document fails the search with a `400`, as it
+fails a `find` ([Query language](query-language.md)).
 
 It is planned the way a `find` is: a filter that pins `_id` is a primary-key
 read, a filter on an indexed field uses the index, anything else scans the

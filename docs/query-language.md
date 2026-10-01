@@ -112,11 +112,66 @@ so a filter that is only `$expr` is a collection scan. An equality or range
 beside it — `{account: "acme", $expr: …}` — still uses the index on `account`,
 and the expression is applied to each candidate. `explain` shows which.
 
-**An evaluation error is "no match".** A type violation inside the expression
-— `{$add: ["$name", 1]}` where `name` is a string — makes that document fail
-the filter rather than failing the request, because the failure depends on the
-data and shows up mid-scan. MongoDB fails the query; the difference is recorded in
-[Deviations](deviations.md).
+**An evaluation error fails the request.** A type violation inside the
+expression — `{$add: ["$qty", 1]}` where `qty` is a string — has no truth
+value, so the request is refused with a `400` naming the document, the
+operator and the type it could not take, and no documents are returned
+([ADR-206](decisions.md#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request)):
+
+```
+invalid query: $expr cannot be evaluated for the document with _id 3: $add needs numbers, found a string
+```
+
+Reading it as "no match", as releases before this one did, made a document
+holding bad data indistinguishable from one that does not qualify. The rule
+holds wherever a filter is taken: `find`, `count`, `update`, `delete`,
+`find_and_modify`, a pipeline `$match` (leading, later, or in a `$lookup`
+pipeline), a vector search's `filter`, and the MCP tools. A write it fails
+writes nothing, except that a `multi` write keeps the chunks it committed
+before reaching the document and answers `500 partially_applied` with this as
+the cause (see [HTTP API](http-api.md)).
+
+What counts as an error is the expression language's: a missing field is null
+and null propagates, so `{$add: ["$missing", 1]}` is null and the clause is
+false, not an error.
+
+**A request fails exactly when its answer depends on a document whose `$expr`
+cannot be evaluated**, at the level of filter clauses. For one document: an `$and` (the implicit one between
+top-level fields included) is false if any clause is false, an `$or` is true
+if any branch is true, `$nor` is the inverse, and `$elemMatch` is true if any
+element matches, whatever an expression that could not be evaluated would
+have said. Only when nothing else decides does the expression fail the
+document. So `{"$expr": …, "kind": "b"}` and `{"kind": "b", "$expr": …}` are
+the same request, and over a document whose `kind` is `"a"` neither fails,
+whether the collection is scanned or an index on `kind` leaves the document
+out: an index can only leave out what a clause without `$expr` excludes.
+Within each of these, the clauses without `$expr` are evaluated first and
+evaluation stops at the first that decides, so an expression is not even
+evaluated where a cheaper clause has answered.
+
+Inside one `$expr` the rule is the expression language's, which is not lazy:
+the expression's own `$and` and `$or` evaluate every argument (`$cond`
+evaluates only the branch it takes). So `{"$expr": {"$or": [{"$eq": ["$kind",
+"c"]}, <bad>]}}` fails on a document whose `kind` is `"c"`, where the filter
+`{"$or": [{"kind": "c"}, {"$expr": <bad>}]}` does not. Write the alternatives
+as filter clauses when one of them may not be evaluable.
+
+Which documents the answer depends on is the request's own business:
+
+- **`count`, a `sort`, and `find_and_modify`** read every document the filter
+  admits, so a document whose expression cannot be evaluated, among those
+  the other clauses admit, fails them. `find_and_modify` reads every
+  candidate even without a `sort`, as it does to refuse a filter matching
+  more than 10,000 documents, so it fails the same way.
+- **A `find` with a `limit` and no `sort`, a page, and a single-document
+  `update` or `delete`** stop once they have what they return, and a document
+  after that point is not part of the answer and is not evaluated.
+- **An aggregation** evaluates each `$match` over what reaches it; a
+  `$lookup` with no input documents runs nothing of its pipeline. A
+  `$limit` does not stop the read of the source: a leading `$match` is read
+  up to the pipeline's document ceiling before any later stage runs, so
+  `[{"$match": {"$expr": <bad>}}, {"$limit": 1}]` fails over a collection
+  holding such a document even when the first document matches.
 
 ### `$mod`
 

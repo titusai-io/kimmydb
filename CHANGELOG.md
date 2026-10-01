@@ -38,6 +38,36 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   fails; write the one value it meant instead
   ([ADR-205](docs/decisions.md), [Query language](docs/query-language.md#one-write-per-path)).
 
+- **Breaking: a filter's `$expr` that cannot be evaluated against a document
+  fails the request with a `400`, instead of dropping the document.** Over
+  `{_id: 3, qty: "twelve"}`, `{"$expr": {"$gt": [{"$add": ["$qty", 1]}, 10]}}`
+  used to answer `200` without document 3, which could not be told from a
+  correct result; it now answers `400 bad_request`: `$expr cannot be evaluated
+  for the document with _id 3: $add needs numbers, found a string`. On `find`,
+  `count`, `update`, `delete`, `find_and_modify`, a pipeline `$match`
+  (leading, later or in a `$lookup` pipeline), a vector search's `filter`, and
+  the MCP tools. A write it fails writes nothing; a `multi` write that meets
+  it after committing a chunk keeps that chunk and answers
+  `500 partially_applied` with it as the cause. A missing field is still null
+  and null still propagates, so `{$add: ["$missing", 1]}` is a non-match, not
+  an error. A request fails exactly when its answer depends on such a
+  document, at the level of filter clauses: a clause without `$expr` that
+  excludes it (or an `$or` branch that admits it) decides it, wherever the
+  clause is written and whether the collection is scanned or an index leaves
+  it out. Inside one `$expr` the expression's own `$and` and `$or` evaluate
+  every argument (`$cond` only the branch it takes), so write alternatives
+  that may not be evaluable as filter clauses. `count`, a `sort` and
+  `find_and_modify` read every document the other clauses admit; a `find`
+  with a `limit` and no `sort`, and a single-document write, stop once they
+  have what they return; in an aggregation, `$limit` does not stop the read
+  of a leading `$match`. An `arrayFilters` entry's `$expr` under an
+  `$elemMatch` fails the update the same way. Check stored filters before
+  upgrading: one whose `$expr` met documents of the wrong type now fails;
+  guard it with `$type`, `$convert` with `onError`, or a clause that excludes
+  them
+  ([ADR-206](docs/decisions.md),
+  [Query language](docs/query-language.md#expr--comparing-fields-of-the-same-document)).
+
 ### Fixed
 
 - **A clustered start that can never write its replay floor is refused before

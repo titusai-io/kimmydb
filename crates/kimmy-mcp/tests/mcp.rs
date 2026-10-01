@@ -1484,3 +1484,50 @@ async fn the_aggregate_tool_refuses_a_lookup_the_caller_cannot_read() {
         "a $lookup into an ungranted collection must be refused: {rendered}"
     );
 }
+
+/// A filter's `$expr` that cannot be evaluated against a document fails the
+/// tool call, as it fails an HTTP request, rather than dropping the document
+/// from the answer (ADR-206).
+#[tokio::test]
+async fn a_find_whose_expr_cannot_be_evaluated_is_refused() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    let bad = json!({"$expr": {"$gt": [{"$add": ["$status", 1]}, 0]}});
+    for tool in ["find", "count"] {
+        let refused = server
+            .call(&token, tool, json!({"database":"sales","collection":"orders","filter": bad}))
+            .await;
+        assert_eq!(refused["error"]["data"]["error"], "bad_request", "{tool}: {refused}");
+        assert_eq!(
+            refused["error"]["message"],
+            "invalid query: $expr cannot be evaluated for the document with _id \"a\": $add \
+             needs numbers, found a string",
+            "{tool}: {refused}"
+        );
+    }
+}
+
+/// A vector search's `filter` is evaluated by the same scan as `find`, so a
+/// `$expr` it cannot evaluate refuses the search rather than narrowing it
+/// silently (ADR-206).
+#[tokio::test]
+async fn a_vector_search_whose_filter_expr_cannot_be_evaluated_is_refused() {
+    let server = Server::start().await;
+    seed_vectors(&server);
+    let token = server.root();
+
+    let refused = server
+        .call(
+            &token,
+            "vector_search",
+            json!({"database":"kb","collection":"notes","vector":[1.0, 0.0, 0.0],
+                   "filter": {"$expr": {"$gt": [{"$add": ["$text", 1]}, 0]}}}),
+        )
+        .await;
+    assert_eq!(refused["error"]["data"]["error"], "bad_request", "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("$expr cannot be evaluated for the document with _id"), "{message}");
+    assert!(message.contains("$add needs numbers, found a string"), "{message}");
+}

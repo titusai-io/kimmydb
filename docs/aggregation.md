@@ -247,6 +247,9 @@ than failing on exactly the inputs it exists to protect.
 **Null propagates; a type violation refuses.** `{$add: ["$typo", 1]}` is null
 because a missing field is null. `{$add: ["text", 1]}` is a 400. Returning null
 for both would make a typo and a type error indistinguishable in the output.
+The same holds for a `$match` stage's `$expr`: a document it cannot be
+evaluated against fails the pipeline, it is not dropped
+([ADR-206](decisions.md)).
 
 **Integer arithmetic is exact.** `$add`, `$subtract` and `$multiply` compute in
 64-bit integers whenever every operand is integral, promoting to a double only

@@ -539,7 +539,10 @@ years, so there is one mechanism rather than two overlapping ones.
 | any conjunction of the above | |
 
 **Refused at index creation:** `$or`, `$ne`, `$in`, `$nin`, `$regex`, `$not`,
-`$elemMatch`, `$exists: false`, and more than one operator on a field.
+`$elemMatch`, `$expr`, `$exists: false`, and more than one operator on a field.
+Refusing `$expr` also means no write ever evaluates an expression to decide
+what an index holds, so a write is never refused for one that cannot be
+evaluated ([ADR-206](decisions.md)).
 
 This is not laziness — it is the safety property. A partial index may answer a
 query only if the query is **provably contained** by the filter, and general

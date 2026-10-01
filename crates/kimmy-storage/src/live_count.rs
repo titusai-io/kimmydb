@@ -433,8 +433,8 @@ mod tests {
     }
 
     impl ModifySpec for Modify {
-        fn matches(&self, doc: &Document) -> bool {
-            doc.get_str("_id").is_ok_and(|id| id == self.id)
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            Ok(doc.get_str("_id").is_ok_and(|id| id == self.id))
         }
         fn compare(&self, _: &Document, _: &Document) -> Ordering {
             Ordering::Equal

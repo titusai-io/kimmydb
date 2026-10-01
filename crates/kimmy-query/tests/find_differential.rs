@@ -127,13 +127,11 @@ fn write_the_table() {
         let parsed = filter::parse(f);
         for (j, d) in docs.iter().enumerate() {
             let answer = match &parsed {
-                Ok(parsed) => {
-                    if filter::matches(parsed, d) {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                }
+                Ok(parsed) => match filter::matches(parsed, d) {
+                    Ok(true) => "1",
+                    Ok(false) => "0",
+                    Err(_) => "unevaluable",
+                },
                 Err(_) => "refused",
             };
             writeln!(out, "{i}\t{j}\t{answer}\t{f:?}\t{d:?}").unwrap();
@@ -178,7 +176,7 @@ fn a_partial_filter_selects_exactly_what_find_returns() {
         for d in &docs {
             assert_eq!(
                 partial.selects(d),
-                filter::matches(&query, d),
+                filter::matches(&query, d).unwrap(),
                 "selects and find disagree on {f:?} for {d:?}"
             );
         }
