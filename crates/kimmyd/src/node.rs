@@ -768,6 +768,16 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         );
         parsed
     });
+    let page_read_delay = std::env::var("KIMMY_TEST_PAGE_READ_MS").ok().map(|value| {
+        let parsed = value.parse::<u64>().ok().map(Duration::from_millis);
+        warn!(
+            KIMMY_TEST_PAGE_READ_MS = %value,
+            recognised = parsed.is_some(),
+            "a test switch is set that slows every page the storage backend reads on purpose; \
+             unset KIMMY_TEST_PAGE_READ_MS outside a test"
+        );
+        parsed
+    });
     // The budget a window served to a peer gets (ADR-194), smaller so a test
     // of a real node can see a drain in a known number of partial windows.
     let serve_walk = ["KIMMY_TEST_SERVE_WALK_ROWS", "KIMMY_TEST_SERVE_WALK_MS"].map(|name| {
@@ -1267,6 +1277,9 @@ async fn start_and_serve(config: Config) -> Result<Served> {
     }
     if let Some(Some(delay)) = walk_row_delay {
         kimmy_storage::walk::set_test_walk_row_delay(delay);
+    }
+    if let Some(Some(delay)) = page_read_delay {
+        engine.set_test_page_read_delay(delay);
     }
     match test_stop {
         // A test's stand-in for a walk serving a peer, which holds the engine

@@ -16,7 +16,7 @@
 //! deadlock.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 
 /// The first I/O error the storage backend returned.
@@ -47,6 +47,9 @@ pub(crate) struct StorageHealth {
     /// a client write (`WriterHolder::Write`), so a test fails the write it
     /// is watching and not a background writer's commit that came first.
     armed_for_write: AtomicBool,
+    /// `KIMMY_TEST_PAGE_READ_MS`: how long every page the backend reads takes
+    /// beyond the read itself, in microseconds; 0 for none.
+    page_read_delay_us: AtomicU64,
     /// Whether a `sync_data` has been attempted since the current commit
     /// began. Commits are serialized by the writer, so this belongs to the one
     /// commit in progress: a commit that fails with it set may have reached
@@ -83,6 +86,7 @@ impl Default for StorageHealth {
             reacted: Once::new(),
             armed: AtomicU8::new(0),
             armed_for_write: AtomicBool::new(false),
+            page_read_delay_us: AtomicU64::new(0),
             synced: AtomicBool::new(false),
             #[cfg(test)]
             armed_after_sync: AtomicBool::new(false),
@@ -167,6 +171,23 @@ impl StorageHealth {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Set the delay every backend page read takes, for a test of a real node
+    /// that needs reads of pages the cache does not hold to cost what they do
+    /// on a cold disk.
+    pub(crate) fn set_page_read_delay(&self, delay: std::time::Duration) {
+        let us = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.page_read_delay_us.store(us, Ordering::Relaxed);
+    }
+
+    /// Sleep out the page read delay, when one is set. On every backend read,
+    /// so the unset case is one relaxed load.
+    pub(crate) fn delay_page_read(&self) {
+        let us = self.page_read_delay_us.load(Ordering::Relaxed);
+        if us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(us));
         }
     }
 

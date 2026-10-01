@@ -639,6 +639,8 @@ mod tests {
                 .map(drop)
         }
         let background: &[(&str, Walk)] = &[
+            // covers: engine::Engine::warm_purge_chunk
+            ("warm_purge_chunk", |e, c| e.warm_purge_chunk(c.id)),
             // covers: violations_table::Engine::violations_backfill_scan
             ("violations_backfill_step", |e, _| {
                 e.violations().clear_ready_for_test();
