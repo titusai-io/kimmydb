@@ -328,7 +328,7 @@ conformance test drives it.
 
 **Raised 2026-08-30, with the expression scope (ADR-105).** The array operators
 follow the expression layer's standing rule — *null propagates, a type violation
-refuses* — and in four places that is a strict superset of MongoDB, which
+refuses* — and in six places that is a strict superset of MongoDB, which
 errors instead:
 
 | Operator | Here | MongoDB |
@@ -337,6 +337,8 @@ errors instead:
 | `$in` with a null array | null | error |
 | `$range` with a null bound or step | null | error |
 | `$slice`, `$arrayElemAt`, `$indexOfArray` with a null count, index or bound | null | error |
+| `$setEquals`, `$setIsSubset` with a null or missing array | null | error |
+| `$anyElementTrue`, `$allElementsTrue` on null or a missing field | null | error |
 
 A pipeline MongoDB accepts means the same thing here; a pipeline that errors
 there may succeed here with a null in the row. Chosen because a sparse
@@ -371,6 +373,38 @@ someone needs it.
 **Closing the null leniency** would mean a per-operator strictness flag in the
 evaluator for the sake of matching an error, at the cost of the one rule the
 expression layer has been able to state in a sentence. Not planned.
+
+---
+
+## 🟡 Set operators answer in a fixed order and refuse a `Decimal128`
+
+**Raised 2026-10-01, with the set operators, `$objectToArray` and
+`$arrayToObject` (ADR-207).** Two choices a pipeline ported from MongoDB can
+meet. None changes the answer to a pipeline both accept, apart from the order
+of a set result, which MongoDB leaves unspecified.
+
+- **A set result is first-seen.** MongoDB does not promise an order for
+  `$setUnion`, `$setIntersection` or `$setDifference`. Here the members come
+  back in the order they first appear, arguments left to right, and the
+  element kept is that first appearance. A port that sorted the result keeps
+  working; one that relied on whatever order MongoDB happened to give may see
+  a different one.
+- **A `Decimal128` in a set input, or as an element of `$anyElementTrue` or
+  `$allElementsTrue`, is a `400`.** MongoDB compares it exactly. Here the
+  canonical order ranks one equal to every other number and truthiness has no
+  reading of one, so an answer would be wrong rather than merely different.
+
+`$arrayToObject` takes every string key but one holding a NUL, the empty,
+dotted and `$`-prefixed ones included, so it is not an entry here.
+
+**Two smaller ones, same entry.** `$setUnion` and `$setIntersection` need at
+least one argument, the same minimum `$concatArrays` has here, where MongoDB
+accepts an empty list. A non-array argument is refused even beside a null, so the
+outcome does not depend on which argument is written first; what MongoDB
+answers for that pair is not verified here, so no claim is made about it.
+
+**To close:** the order is a promise, not a debt, and stays. The `Decimal128`
+refusal goes when the canonical order can place one ([ADR-005](decisions.md)).
 
 ---
 
@@ -422,8 +456,8 @@ any other (ADR-206).
 and `$elemMatch`'s body is an ordinary filter over it, so the expression reads
 the element's fields — `{$elemMatch: {$expr: {$gt: ["$qty", "$min"]}}}`
 compares two fields of one element, which MongoDB needs `$map` and
-`$anyElementTrue` for and this database does not have. A strict superset: a
-filter MongoDB accepts means the same thing here.
+`$anyElementTrue` for (both exist here too, since ADR-207). A strict superset:
+a filter MongoDB accepts means the same thing here.
 
 **`$expr` is accepted in an `arrayFilters` entry.** MongoDB refuses it there
 too. An entry takes `$expr` at its top level or under `$and`/`$or`/`$nor`, and
@@ -2345,7 +2379,7 @@ here so that the absence of a decision is visible as a decision.
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
-| Set expression operators (`$setUnion` and family), `$zip` and `$objectToArray` | Deliberately outside M9 task 1's agreed operator list. The array operators, variable binding and type conversion it also excluded have all since shipped — the first two on an evaluation scope (ADR-105), the third as `$convert` and the `$toX` shorthands; the set family is a further pass over the same scope | not scheduled |
+| `$zip` and `$sortArray` | Refused at parse as unknown operators, so a ported pipeline using either fails loudly. Declined when the set operators, `$objectToArray` and `$arrayToObject` were built (2026-09-29, ADR-207): `$map` over a `$range` of indexes with `$arrayElemAt` reads arrays by position, and `$unwind`, `$sort` and `$group` with `$push` order an array's elements | not planned |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |

@@ -126,6 +126,17 @@ pub enum Op {
     IsArray,
     ReverseArray,
     Range,
+    // Sets
+    SetUnion,
+    SetIntersection,
+    SetDifference,
+    SetEquals,
+    SetIsSubset,
+    AnyElementTrue,
+    AllElementsTrue,
+    // Documents and arrays of pairs
+    ObjectToArray,
+    ArrayToObject,
     // Escape
     Literal,
 }
@@ -181,6 +192,15 @@ impl Op {
             "$isArray" => Op::IsArray,
             "$reverseArray" => Op::ReverseArray,
             "$range" => Op::Range,
+            "$setUnion" => Op::SetUnion,
+            "$setIntersection" => Op::SetIntersection,
+            "$setDifference" => Op::SetDifference,
+            "$setEquals" => Op::SetEquals,
+            "$setIsSubset" => Op::SetIsSubset,
+            "$anyElementTrue" => Op::AnyElementTrue,
+            "$allElementsTrue" => Op::AllElementsTrue,
+            "$objectToArray" => Op::ObjectToArray,
+            "$arrayToObject" => Op::ArrayToObject,
             "$literal" => Op::Literal,
             _ => return None,
         })
@@ -229,15 +249,30 @@ impl Op {
             Op::IsArray => "$isArray",
             Op::ReverseArray => "$reverseArray",
             Op::Range => "$range",
+            Op::SetUnion => "$setUnion",
+            Op::SetIntersection => "$setIntersection",
+            Op::SetDifference => "$setDifference",
+            Op::SetEquals => "$setEquals",
+            Op::SetIsSubset => "$setIsSubset",
+            Op::AnyElementTrue => "$anyElementTrue",
+            Op::AllElementsTrue => "$allElementsTrue",
+            Op::ObjectToArray => "$objectToArray",
+            Op::ArrayToObject => "$arrayToObject",
             Op::Literal => "$literal",
         }
     }
 
     fn arity(self) -> Arity {
         match self {
-            Op::Add | Op::Multiply | Op::Concat | Op::And | Op::Or | Op::ConcatArrays => {
-                Arity::AtLeast(1)
-            }
+            Op::Add
+            | Op::Multiply
+            | Op::Concat
+            | Op::And
+            | Op::Or
+            | Op::ConcatArrays
+            | Op::SetUnion
+            | Op::SetIntersection => Arity::AtLeast(1),
+            Op::SetEquals => Arity::AtLeast(2),
             Op::Subtract
             | Op::Divide
             | Op::Mod
@@ -251,7 +286,9 @@ impl Op {
             | Op::Lte
             | Op::Cmp
             | Op::ArrayElemAt
-            | Op::In => Arity::Exact(2),
+            | Op::In
+            | Op::SetDifference
+            | Op::SetIsSubset => Arity::Exact(2),
             Op::Substr => Arity::Exact(3),
             Op::Cond => Arity::Exact(3),
             Op::Slice | Op::Range => Arity::Between(2, 3),
@@ -271,6 +308,10 @@ impl Op {
             | Op::Last
             | Op::IsArray
             | Op::ReverseArray
+            | Op::AnyElementTrue
+            | Op::AllElementsTrue
+            | Op::ObjectToArray
+            | Op::ArrayToObject
             | Op::Literal => Arity::Exact(1),
         }
     }
@@ -1386,6 +1427,15 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::ReverseArray => reverse_array(&args[0]),
         Op::Range => range(args),
 
+        Op::SetUnion => set_union(args),
+        Op::SetIntersection => set_intersection(args),
+        Op::SetDifference => set_difference(args),
+        Op::SetEquals => set_equals(args),
+        Op::SetIsSubset => set_is_subset(args),
+        Op::AnyElementTrue | Op::AllElementsTrue => element_truth(op, &args[0]),
+        Op::ObjectToArray => object_to_array(&args[0]),
+        Op::ArrayToObject => array_to_object(&args[0]),
+
         Op::Cond | Op::IfNull | Op::Literal => unreachable!("handled lazily"),
     }
 }
@@ -1932,6 +1982,305 @@ fn range(args: &[Bson]) -> Result<Bson> {
         )));
     }
     Ok(Bson::Array((0..count as i64).map(|i| Bson::Int64(start + i * step)).collect()))
+}
+
+// ---------------------------------------------------------------------------
+// Sets
+// ---------------------------------------------------------------------------
+//
+// The set operators read each array as the set of its distinct members, and
+// two values are one member exactly when `$eq` says they are equal: when
+// `canonical_cmp` ranks them `Equal`. So `1`, `1.0` and `1_i64` are one
+// member, every `NaN` is one, `0.0` and `-0.0` are one, `null` and
+// `undefined` are one, and two documents are one only with their keys in the
+// same order. A `Decimal128` anywhere in an input is refused, because that
+// order ranks one equal to every other number (ADR-207).
+//
+// A result is in **first-seen order**: the members as they first appear,
+// reading the arguments left to right and each array from its start, and the
+// member kept is that first appearance, untouched — `$setUnion` of `[1]` and
+// `[1.0]` is `[1]`, still an `Int32`. Nothing here builds more than its inputs
+// already hold, so no cap of its own applies; `$range`'s exists because it
+// builds from two integers.
+
+/// A value ordered by [`canonical_cmp`], so an ordered set of them holds one
+/// entry per member. With every `Decimal128` refused before one is built, the
+/// order is total and its `Equal` is an equivalence.
+struct Member<'a>(&'a Bson);
+
+impl PartialEq for Member<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        canonical_cmp(self.0, other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for Member<'_> {}
+
+impl PartialOrd for Member<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Member<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        canonical_cmp(self.0, other.0)
+    }
+}
+
+type Members<'a> = std::collections::BTreeSet<Member<'a>>;
+
+/// The arrays a set operator compares, or `None` when one of them is null and
+/// so is the result.
+///
+/// Every argument's type is checked before a null is honoured, so a
+/// non-array is refused wherever it stands; a set has no first argument that
+/// could hide the others. A `Decimal128` anywhere in an array is refused once
+/// no argument is null — the point where it would be compared.
+fn set_inputs(op: Op, args: &[Bson]) -> Result<Option<Vec<&[Bson]>>> {
+    let mut arrays = Vec::with_capacity(args.len());
+    let mut null = false;
+    for arg in args {
+        match as_array(op, arg)? {
+            None => null = true,
+            Some(items) => arrays.push(items),
+        }
+    }
+    if null {
+        return Ok(None);
+    }
+    for (i, items) in arrays.iter().enumerate() {
+        if items.iter().any(kimmy_core::holds_decimal128) {
+            return Err(Error::InvalidQuery(format!(
+                "{} cannot compare a Decimal128 (argument {} holds one): the canonical order \
+                 ranks a Decimal128 equal to every other number, so set membership would be \
+                 wrong; store a double or a long",
+                op.name(),
+                i + 1
+            )));
+        }
+    }
+    Ok(Some(arrays))
+}
+
+fn members(items: &[Bson]) -> Members<'_> {
+    items.iter().map(Member).collect()
+}
+
+/// Every member of every array, first-seen.
+fn set_union(args: &[Bson]) -> Result<Bson> {
+    let Some(arrays) = set_inputs(Op::SetUnion, args)? else {
+        return Ok(Bson::Null);
+    };
+    let mut seen = Members::new();
+    let mut out = Vec::new();
+    for item in arrays.into_iter().flatten() {
+        if seen.insert(Member(item)) {
+            out.push(item.clone());
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+/// The members of the first array that every other array holds, first-seen
+/// in the first.
+fn set_intersection(args: &[Bson]) -> Result<Bson> {
+    let Some(arrays) = set_inputs(Op::SetIntersection, args)? else {
+        return Ok(Bson::Null);
+    };
+    let (first, rest) = arrays.split_first().expect("arity checked at parse");
+    let others: Vec<Members<'_>> = rest.iter().map(|items| members(items)).collect();
+    let mut seen = Members::new();
+    let mut out = Vec::new();
+    for item in *first {
+        if others.iter().all(|set| set.contains(&Member(item))) && seen.insert(Member(item)) {
+            out.push(item.clone());
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+/// The members of the first array the second does not hold, first-seen in
+/// the first.
+fn set_difference(args: &[Bson]) -> Result<Bson> {
+    let Some(arrays) = set_inputs(Op::SetDifference, args)? else {
+        return Ok(Bson::Null);
+    };
+    let excluded = members(arrays[1]);
+    let mut seen = Members::new();
+    let mut out = Vec::new();
+    for item in arrays[0] {
+        if !excluded.contains(&Member(item)) && seen.insert(Member(item)) {
+            out.push(item.clone());
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+/// Whether every array has the same members, duplicates and order aside.
+fn set_equals(args: &[Bson]) -> Result<Bson> {
+    let Some(arrays) = set_inputs(Op::SetEquals, args)? else {
+        return Ok(Bson::Null);
+    };
+    let first = members(arrays[0]);
+    Ok(Bson::Boolean(arrays[1..].iter().all(|items| members(items) == first)))
+}
+
+/// Whether every member of the first array is a member of the second.
+fn set_is_subset(args: &[Bson]) -> Result<Bson> {
+    let Some(arrays) = set_inputs(Op::SetIsSubset, args)? else {
+        return Ok(Bson::Null);
+    };
+    let superset = members(arrays[1]);
+    Ok(Bson::Boolean(arrays[0].iter().all(|item| superset.contains(&Member(item)))))
+}
+
+/// `$anyElementTrue` and `$allElementsTrue`: the array's elements read by
+/// [`truthy`], as `$and` and `$or` read their arguments. An empty array has
+/// no true element and no false one, so it is `false` and `true`.
+///
+/// A `Decimal128` element is refused rather than read: [`truthy`] has no
+/// reading of one, and `Decimal128("0")` would be taken as true. Every element
+/// is looked at before the answer is given, so whether the refusal happens
+/// does not depend on where in the array the element is.
+fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
+    let Some(items) = as_array(op, value)? else {
+        return Ok(Bson::Null);
+    };
+    if let Some(i) = items.iter().position(|item| matches!(item, Bson::Decimal128(_))) {
+        return Err(Error::InvalidQuery(format!(
+            "{} cannot read a Decimal128 as true or false (element {i}): this engine has no \
+             reading of one, so a zero would be taken as true; store a double or a long",
+            op.name()
+        )));
+    }
+    Ok(Bson::Boolean(match op {
+        Op::AnyElementTrue => items.iter().any(truthy),
+        Op::AllElementsTrue => items.iter().all(truthy),
+        _ => unreachable!("only $anyElementTrue and $allElementsTrue reach here"),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Documents and arrays of pairs
+// ---------------------------------------------------------------------------
+
+/// A document as `[{k, v}, ...]`, in the document's field order. Only the top
+/// level is turned over; a value that is itself a document stays one.
+fn object_to_array(value: &Bson) -> Result<Bson> {
+    match value {
+        Bson::Null | Bson::Undefined => Ok(Bson::Null),
+        Bson::Document(fields) => Ok(Bson::Array(
+            fields
+                .iter()
+                .map(|(k, v)| {
+                    let mut pair = Document::new();
+                    pair.insert("k", k.as_str());
+                    pair.insert("v", v.clone());
+                    Bson::Document(pair)
+                })
+                .collect(),
+        )),
+        other => Err(Error::InvalidQuery(format!(
+            "$objectToArray needs a document, found {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// The two spellings of one key-value pair `$arrayToObject` reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairForm {
+    /// `[key, value]`
+    Array,
+    /// `{k: key, v: value}`
+    Document,
+}
+
+impl PairForm {
+    fn describe(self) -> &'static str {
+        match self {
+            PairForm::Array => "a [key, value] array",
+            PairForm::Document => "a {k, v} document",
+        }
+    }
+}
+
+/// `[[key, value], ...]` or `[{k: key, v: value}, ...]` as a document.
+///
+/// The first element decides the form and every other element must use it. A
+/// key is any string without a NUL, which a BSON field name cannot hold: an
+/// empty, dotted or `$`-prefixed key is taken as written, as an object
+/// expression, `$literal` and a stored document already take one, so
+/// `$objectToArray` and back is the same document whatever its keys. A key
+/// that comes again keeps the place of its first appearance and takes the
+/// value of its last. Anything else is refused, naming the element by its
+/// index.
+fn array_to_object(value: &Bson) -> Result<Bson> {
+    let Some(items) = as_array(Op::ArrayToObject, value)? else {
+        return Ok(Bson::Null);
+    };
+    let mut out = Document::new();
+    let mut form = None;
+    for (i, item) in items.iter().enumerate() {
+        let (this, key, value) = match item {
+            Bson::Array(pair) => match pair.as_slice() {
+                [key, value] => (PairForm::Array, key, value),
+                _ => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$arrayToObject element {i} is an array of {} elements; a [key, value] \
+                         pair has exactly 2",
+                        pair.len()
+                    )));
+                }
+            },
+            Bson::Document(pair) => {
+                if let Some(extra) = pair.keys().find(|k| *k != "k" && *k != "v") {
+                    return Err(Error::InvalidQuery(format!(
+                        "$arrayToObject element {i} has a field {extra:?} besides `k` and `v`"
+                    )));
+                }
+                let (Some(key), Some(value)) = (pair.get("k"), pair.get("v")) else {
+                    return Err(Error::InvalidQuery(format!(
+                        "$arrayToObject element {i} needs both `k` and `v`"
+                    )));
+                };
+                (PairForm::Document, key, value)
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$arrayToObject element {i} is {}; each element is a [key, value] array or \
+                     a {{k, v}} document",
+                    type_name(other)
+                )));
+            }
+        };
+        match form {
+            None => form = Some(this),
+            Some(first) if first != this => {
+                return Err(Error::InvalidQuery(format!(
+                    "$arrayToObject cannot mix the two forms: element 0 is {}, element {i} is {}",
+                    first.describe(),
+                    this.describe()
+                )));
+            }
+            Some(_) => {}
+        }
+        let Bson::String(key) = key else {
+            return Err(Error::InvalidQuery(format!(
+                "$arrayToObject element {i} has a key that is {}; a key must be a string",
+                type_name(key)
+            )));
+        };
+        if key.contains('\0') {
+            return Err(Error::InvalidQuery(format!(
+                "$arrayToObject element {i} has the key {key:?}, which holds a NUL; a BSON field \
+                 name cannot"
+            )));
+        }
+        out.insert(key.as_str(), value.clone());
+    }
+    Ok(Bson::Document(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -3738,5 +4087,522 @@ mod decimal128 {
             );
         }
         assert!(Expr::parse(&Bson::Document(doc! { "$eq": ["$v", 1.5] })).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sets_and_pairs {
+    use super::*;
+    use bson::doc;
+
+    fn ev(expr: Document, d: &Document) -> Result<Bson> {
+        Expr::parse(&Bson::Document(expr))?.eval(d)
+    }
+
+    fn on(expr: Document, d: Document) -> Bson {
+        ev(expr, &d).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn ok(expr: Document) -> Bson {
+        on(expr, doc! {})
+    }
+
+    fn refused(expr: Document, d: Document) -> String {
+        match ev(expr.clone(), &d) {
+            Ok(v) => panic!("{expr:?} should be refused, gave {v:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The exact elements, their BSON types included: `1` and `1.0` print
+    /// differently in `Debug`, so a kept representative is checked too.
+    fn exactly(got: &Bson, want: &[Bson]) {
+        assert_eq!(format!("{got:?}"), format!("{:?}", Bson::Array(want.to_vec())));
+    }
+
+    #[test]
+    fn the_worked_example_unions_tags_and_wants_first_seen() {
+        let d = doc! { "tags": ["vip", "eu"], "wants": ["eu", "newsletter"] };
+        let got = on(doc! { "$setUnion": ["$tags", "$wants"] }, d);
+        exactly(&got, &["vip".into(), "eu".into(), "newsletter".into()]);
+        let d = doc! { "tags": ["trial"], "wants": ["trial"] };
+        exactly(&on(doc! { "$setUnion": ["$tags", "$wants"] }, d), &["trial".into()]);
+    }
+
+    #[test]
+    fn union_keeps_one_of_each_member_first_seen_and_untouched() {
+        // Duplicates inside one array and across arrays collapse; the member
+        // kept is the first appearance, still an Int32.
+        let got = on(
+            doc! { "$setUnion": ["$a", "$b", "$c"] },
+            doc! { "a": [3, 1, 3], "b": [1.0, 2_i64], "c": [2.0, 4] },
+        );
+        exactly(&got, &[Bson::Int32(3), Bson::Int32(1), Bson::Int64(2), Bson::Int32(4)]);
+        exactly(&ok(doc! { "$setUnion": [[], []] }), &[]);
+        // One argument is the distinct members of that array.
+        exactly(&on(doc! { "$setUnion": "$a" }, doc! { "a": [2, 2, 1] }), &[2.into(), 1.into()]);
+    }
+
+    #[test]
+    fn intersection_is_the_first_arrays_members_every_other_holds() {
+        let got = on(
+            doc! { "$setIntersection": ["$a", "$b"] },
+            doc! { "a": [3, 1, 2, 1, 2.0], "b": [2.0, 1_i64, 9] },
+        );
+        exactly(&got, &[Bson::Int32(1), Bson::Int32(2)]);
+        let got = on(
+            doc! { "$setIntersection": ["$a", "$b", "$c"] },
+            doc! { "a": [1, 2, 3], "b": [3, 2], "c": [3, 1] },
+        );
+        exactly(&got, &[Bson::Int32(3)]);
+        exactly(&ok(doc! { "$setIntersection": [[1, 2], []] }), &[]);
+        exactly(&ok(doc! { "$setIntersection": [[], [1]] }), &[]);
+    }
+
+    #[test]
+    fn difference_is_the_first_arrays_members_the_second_lacks() {
+        let got =
+            on(doc! { "$setDifference": ["$a", "$b"] }, doc! { "a": [1, 2, 3, 1], "b": [2.0] });
+        exactly(&got, &[Bson::Int32(1), Bson::Int32(3)]);
+        exactly(&ok(doc! { "$setDifference": [[2, 2, 1], []] }), &[2.into(), 1.into()]);
+        exactly(&ok(doc! { "$setDifference": [[], [1]] }), &[]);
+    }
+
+    #[test]
+    fn equals_and_subset_ignore_duplicates_order_and_numeric_width() {
+        let d = doc! { "a": [1, 2], "b": [2.0, 1_i64, 1], "c": [1, 2, 3], "e": [] };
+        assert_eq!(on(doc! { "$setEquals": ["$a", "$b"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setEquals": ["$a", "$b", "$a"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setEquals": ["$a", "$c"] }, d.clone()), false.into());
+        // As many members, but not the same ones.
+        assert_eq!(ok(doc! { "$setEquals": [[1, 2], [1, 3, 3]] }), false.into());
+        assert_eq!(on(doc! { "$setEquals": ["$c", "$a"] }, d.clone()), false.into());
+        assert_eq!(on(doc! { "$setEquals": ["$a", "$b", "$c"] }, d.clone()), false.into());
+        assert_eq!(on(doc! { "$setEquals": ["$e", "$e"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$b", "$a"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$a", "$c"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$c", "$a"] }, d.clone()), false.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$e", "$a"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$a", "$e"] }, d), false.into());
+    }
+
+    #[test]
+    fn the_set_operators_pass_null_and_missing_through_from_any_position() {
+        for op in ["$setUnion", "$setIntersection", "$setDifference", "$setEquals", "$setIsSubset"]
+        {
+            for args in [
+                vec![Bson::from("$missing"), Bson::from("$a")],
+                vec![Bson::from("$a"), Bson::from("$missing")],
+                vec![Bson::from("$a"), Bson::Null],
+                vec![Bson::Null, Bson::Null],
+            ] {
+                let mut expr = Document::new();
+                expr.insert(op, args.clone());
+                assert_eq!(on(expr, doc! { "a": [1] }), Bson::Null, "{op} {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_array_is_refused_wherever_it_stands_even_beside_a_null() {
+        for op in ["$setUnion", "$setIntersection", "$setDifference", "$setEquals", "$setIsSubset"]
+        {
+            for args in [
+                vec![Bson::from("$s"), Bson::Null],
+                vec![Bson::Null, Bson::from("$s")],
+                vec![Bson::from("$a"), Bson::from("$s")],
+            ] {
+                let mut expr = Document::new();
+                expr.insert(op, args.clone());
+                let msg = refused(expr, doc! { "a": [1], "s": "text" });
+                assert!(
+                    msg.contains(op) && msg.contains("needs an array, found a string"),
+                    "{op} {args:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arity_is_checked_at_parse() {
+        for (expr, want) in [
+            (doc! { "$setDifference": [[1], [2], [3]] }, "exactly 2"),
+            (doc! { "$setIsSubset": [[1]] }, "exactly 2"),
+            (doc! { "$setEquals": [[1]] }, "at least 2"),
+            (doc! { "$setUnion": [] }, "at least 1"),
+            (doc! { "$anyElementTrue": [true, false] }, "exactly 1"),
+            (doc! { "$arrayToObject": [["a", 1], ["b", 2]] }, "exactly 1"),
+        ] {
+            let msg = Expr::parse(&Bson::Document(expr.clone())).unwrap_err().to_string();
+            assert!(msg.contains(want), "{expr:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn nested_arrays_and_documents_are_members_compared_whole() {
+        let d = doc! {
+            "a": [[1, 2], { "x": 1 }, { "x": 1, "y": 2 }],
+            "b": [[1.0, 2], { "x": 1.0 }, { "y": 2, "x": 1 }, [2, 1]],
+        };
+        // `[1, 2]` and `[1.0, 2]` are one member, `{x: 1}` and `{x: 1.0}` are
+        // one, and two documents with their keys in a different order are two.
+        let got = on(doc! { "$setUnion": ["$a", "$b"] }, d.clone());
+        exactly(
+            &got,
+            &[
+                Bson::Array(vec![1.into(), 2.into()]),
+                Bson::Document(doc! { "x": 1 }),
+                Bson::Document(doc! { "x": 1, "y": 2 }),
+                Bson::Document(doc! { "y": 2, "x": 1 }),
+                Bson::Array(vec![2.into(), 1.into()]),
+            ],
+        );
+        let got = on(doc! { "$setIntersection": ["$a", "$b"] }, d);
+        exactly(&got, &[Bson::Array(vec![1.into(), 2.into()]), Bson::Document(doc! { "x": 1 })]);
+        // An array element is a member, not flattened into its contents.
+        exactly(&ok(doc! { "$setIntersection": [[[1]], [1]] }), &[]);
+        assert_eq!(ok(doc! { "$setIsSubset": [[[1]], [1]] }), false.into());
+    }
+
+    /// Every way two values can be one member or two, without a Decimal128.
+    fn corpus() -> Vec<Bson> {
+        vec![
+            Bson::Double(f64::NAN),
+            Bson::Double(f64::NAN),
+            Bson::Int32(1),
+            Bson::Double(1.0),
+            Bson::Int64(1),
+            Bson::Double(-0.0),
+            Bson::Double(0.0),
+            Bson::Null,
+            Bson::Undefined,
+            Bson::Document(doc! { "a": 1, "b": 2 }),
+            Bson::Document(doc! { "b": 2, "a": 1 }),
+            Bson::Document(doc! { "a": 1.0, "b": 2 }),
+            Bson::String("s".into()),
+            Bson::Symbol("s".into()),
+            Bson::Array(vec![Bson::Int32(1)]),
+            Bson::Array(vec![Bson::Double(1.0)]),
+            Bson::Boolean(true),
+        ]
+    }
+
+    #[test]
+    fn a_member_is_what_eq_calls_equal_and_agrees_with_add_to_set() {
+        let corpus = corpus();
+        let got = on(doc! { "$setUnion": ["$v"] }, doc! { "v": corpus.clone() });
+        let Bson::Array(got) = got else { panic!("{got:?}") };
+        // NaN, 1, 0, null, two documents, the string, [1] and true: nine.
+        assert_eq!(got.len(), 9, "{got:?}");
+        // Pairwise, no two members are `$eq`, and every corpus value is `$eq`
+        // to exactly one member, which is its first appearance.
+        for (i, x) in got.iter().enumerate() {
+            for y in &got[i + 1..] {
+                assert_ne!(canonical_cmp(x, y), Ordering::Equal, "{x:?} {y:?}");
+            }
+        }
+        for v in &corpus {
+            let same: Vec<_> =
+                got.iter().filter(|m| canonical_cmp(m, v) == Ordering::Equal).collect();
+            assert_eq!(same.len(), 1, "{v:?}");
+            let first = corpus.iter().find(|c| canonical_cmp(c, v) == Ordering::Equal).unwrap();
+            assert_eq!(format!("{:?}", same[0]), format!("{first:?}"));
+        }
+        // The members `$addToSet` keeps (ADR-186) are the same ones.
+        let keys = |values: &[Bson]| -> std::collections::BTreeSet<Vec<u8>> {
+            values.iter().map(crate::aggregate::group_key).collect()
+        };
+        assert_eq!(keys(&got), keys(&corpus));
+        assert_eq!(keys(&got).len(), got.len());
+        // And they do not depend on the order the values arrive in.
+        for shift in 1..corpus.len() {
+            let mut rotated = corpus.clone();
+            rotated.rotate_left(shift);
+            let again = on(doc! { "$setUnion": ["$v"] }, doc! { "v": rotated });
+            let Bson::Array(again) = again else { panic!() };
+            assert_eq!(keys(&again), keys(&got), "rotation {shift}");
+        }
+    }
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    #[test]
+    fn a_decimal128_anywhere_in_a_set_input_is_refused() {
+        // The canonical order ranks a Decimal128 equal to every number, so
+        // `[Decimal128("5")]` would be a subset of `[1]`.
+        for op in ["$setUnion", "$setIntersection", "$setDifference", "$setEquals", "$setIsSubset"]
+        {
+            for (d, at) in [
+                (doc! { "a": [1], "b": [dec("5")] }, "argument 2"),
+                (doc! { "a": [{ "n": dec("5") }], "b": [1] }, "argument 1"),
+                (doc! { "a": [1], "b": [[2, dec("5")]] }, "argument 2"),
+            ] {
+                let mut expr = Document::new();
+                expr.insert(op, vec![Bson::from("$a"), Bson::from("$b")]);
+                let msg = refused(expr, d.clone());
+                assert!(
+                    msg.contains(op) && msg.contains("Decimal128") && msg.contains(at),
+                    "{op} {d:?}: {msg}"
+                );
+            }
+            // Beside a null, nothing is compared and the result is null.
+            let mut expr = Document::new();
+            expr.insert(op, vec![Bson::from("$b"), Bson::Null]);
+            assert_eq!(on(expr, doc! { "b": [dec("5")] }), Bson::Null, "{op}");
+        }
+    }
+
+    #[test]
+    fn any_and_all_read_each_element_by_truthiness() {
+        let d = doc! {
+            "falsy": [0, false, null, 0.0, Bson::Undefined],
+            "truthy": [1, "", [], {}, -0.5],
+            "mixed": [0, 1],
+            "nested": [[false], [0]],
+            "empty": [],
+        };
+        let any = |f: &str| on(doc! { "$anyElementTrue": [format!("${f}")] }, d.clone());
+        let all = |f: &str| on(doc! { "$allElementsTrue": [format!("${f}")] }, d.clone());
+        assert_eq!(any("falsy"), false.into());
+        assert_eq!(all("falsy"), false.into());
+        assert_eq!(any("truthy"), true.into());
+        assert_eq!(all("truthy"), true.into());
+        assert_eq!(any("mixed"), true.into());
+        assert_eq!(all("mixed"), false.into());
+        // An array element is true, whatever it holds: nothing is descended.
+        assert_eq!(all("nested"), true.into());
+        // Nothing true and nothing false.
+        assert_eq!(any("empty"), false.into());
+        assert_eq!(all("empty"), true.into());
+        // The shorthand takes the field directly.
+        assert_eq!(on(doc! { "$anyElementTrue": "$mixed" }, d.clone()), true.into());
+        assert_eq!(ok(doc! { "$allElementsTrue": [[true, 1]] }), true.into());
+        for op in ["$anyElementTrue", "$allElementsTrue"] {
+            let mut expr = Document::new();
+            expr.insert(op, "$missing");
+            assert_eq!(on(expr, d.clone()), Bson::Null, "{op}");
+            let mut expr = Document::new();
+            expr.insert(op, vec![Bson::Null]);
+            assert_eq!(on(expr, d.clone()), Bson::Null, "{op}");
+            let mut expr = Document::new();
+            expr.insert(op, "$s");
+            let msg = refused(expr, doc! { "s": "yes" });
+            assert!(msg.contains(op) && msg.contains("found a string"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn any_and_all_refuse_a_decimal128_element_wherever_it_is() {
+        // `Decimal128("0")` would otherwise read as true. The refusal does not
+        // depend on whether the answer was already known before the element.
+        for items in
+            [vec![dec("0")], vec![Bson::Int32(1), dec("0")], vec![Bson::Int32(0), dec("1")]]
+        {
+            for op in ["$anyElementTrue", "$allElementsTrue"] {
+                let mut expr = Document::new();
+                expr.insert(op, "$v");
+                let msg = refused(expr, doc! { "v": items.clone() });
+                assert!(msg.contains(op) && msg.contains("Decimal128"), "{items:?}: {msg}");
+            }
+        }
+        // Nested inside an element, it is not read: the element is an array.
+        assert_eq!(
+            on(doc! { "$anyElementTrue": "$v" }, doc! { "v": [[dec("0")]] }),
+            Bson::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn object_to_array_follows_the_documents_field_order() {
+        let d = doc! { "o": { "b": 1, "a": { "x": 2 }, "c": [1, 2], "n": null } };
+        let got = on(doc! { "$objectToArray": "$o" }, d);
+        exactly(
+            &got,
+            &[
+                Bson::Document(doc! { "k": "b", "v": 1 }),
+                Bson::Document(doc! { "k": "a", "v": { "x": 2 } }),
+                Bson::Document(doc! { "k": "c", "v": [1, 2] }),
+                Bson::Document(doc! { "k": "n", "v": null }),
+            ],
+        );
+        exactly(&on(doc! { "$objectToArray": "$o" }, doc! { "o": {} }), &[]);
+        assert_eq!(on(doc! { "$objectToArray": "$missing" }, doc! {}), Bson::Null);
+        assert_eq!(ok(doc! { "$objectToArray": [null] }), Bson::Null);
+        for value in [Bson::from("text"), Bson::Array(vec![]), Bson::Int32(3)] {
+            let msg = refused(doc! { "$objectToArray": "$o" }, doc! { "o": value.clone() });
+            assert!(msg.contains("$objectToArray needs a document"), "{value:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn array_to_object_reads_both_forms() {
+        let pairs =
+            on(doc! { "$arrayToObject": "$p" }, doc! { "p": [["b", 1], ["a", { "x": 2 }]] });
+        assert_eq!(
+            format!("{pairs:?}"),
+            format!("{:?}", Bson::Document(doc! { "b": 1, "a": { "x": 2 } }))
+        );
+        let kv = on(
+            doc! { "$arrayToObject": "$p" },
+            doc! { "p": [{ "k": "b", "v": 1 }, { "v": [2], "k": "a" }] },
+        );
+        assert_eq!(format!("{kv:?}"), format!("{:?}", Bson::Document(doc! { "b": 1, "a": [2] })));
+        assert_eq!(on(doc! { "$arrayToObject": "$p" }, doc! { "p": [] }), Bson::Document(doc! {}));
+        assert_eq!(on(doc! { "$arrayToObject": "$missing" }, doc! {}), Bson::Null);
+        assert_eq!(ok(doc! { "$arrayToObject": [null] }), Bson::Null);
+        let msg = refused(doc! { "$arrayToObject": "$p" }, doc! { "p": { "a": 1 } });
+        assert!(msg.contains("$arrayToObject needs an array, found a document"), "{msg}");
+    }
+
+    #[test]
+    fn a_repeated_key_keeps_its_first_place_and_its_last_value() {
+        for p in [
+            Bson::Array(vec![
+                Bson::Array(vec!["a".into(), 1.into()]),
+                Bson::Array(vec!["b".into(), 2.into()]),
+                Bson::Array(vec!["a".into(), 3.into()]),
+            ]),
+            Bson::Array(vec![
+                Bson::Document(doc! { "k": "a", "v": 1 }),
+                Bson::Document(doc! { "k": "b", "v": 2 }),
+                Bson::Document(doc! { "k": "a", "v": 3 }),
+            ]),
+        ] {
+            let got = on(doc! { "$arrayToObject": "$p" }, doc! { "p": p });
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{:?}", Bson::Document(doc! { "a": 3, "b": 2 }))
+            );
+        }
+    }
+
+    #[test]
+    fn array_to_object_refuses_a_malformed_pair_naming_the_element() {
+        let cases: Vec<(Bson, &str)> = vec![
+            (
+                Bson::Array(vec![Bson::Array(vec!["a".into()])]),
+                "element 0 is an array of 1 elements",
+            ),
+            (
+                Bson::Array(vec![
+                    Bson::Array(vec!["a".into(), 1.into()]),
+                    Bson::Array(vec!["b".into(), 2.into(), 3.into()]),
+                ]),
+                "element 1 is an array of 3 elements",
+            ),
+            (
+                Bson::Array(vec![Bson::Document(doc! { "k": "a", "v": 1, "w": 2 })]),
+                "element 0 has a field \"w\" besides `k` and `v`",
+            ),
+            (
+                Bson::Array(vec![Bson::Document(doc! { "k": "a" })]),
+                "element 0 needs both `k` and `v`",
+            ),
+            (Bson::Array(vec![Bson::Document(doc! {})]), "element 0 needs both `k` and `v`"),
+            (
+                Bson::Array(vec![
+                    Bson::Array(vec!["a".into(), 1.into()]),
+                    Bson::Document(doc! { "k": "b", "v": 2 }),
+                ]),
+                "cannot mix the two forms: element 0 is a [key, value] array, element 1 is a {k, v} document",
+            ),
+            (
+                Bson::Array(vec![
+                    Bson::Document(doc! { "k": "b", "v": 2 }),
+                    Bson::Array(vec!["a".into(), 1.into()]),
+                ]),
+                "element 0 is a {k, v} document, element 1 is a [key, value] array",
+            ),
+            (
+                Bson::Array(vec![Bson::Array(vec![1.into(), 1.into()])]),
+                "has a key that is an integer",
+            ),
+            (
+                Bson::Array(vec![Bson::Document(doc! { "k": null, "v": 1 })]),
+                "has a key that is null",
+            ),
+            (Bson::Array(vec!["a".into()]), "element 0 is a string"),
+            (Bson::Array(vec![Bson::Null]), "element 0 is null"),
+        ];
+        for (p, want) in cases {
+            let msg = refused(doc! { "$arrayToObject": "$p" }, doc! { "p": p.clone() });
+            assert!(msg.contains(want), "{p:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn array_to_object_refuses_only_a_key_holding_a_nul() {
+        for key in ["a\0b", "\0"] {
+            for p in [
+                Bson::Array(vec![
+                    Bson::Array(vec!["ok".into(), 0.into()]),
+                    Bson::Array(vec![key.into(), 1.into()]),
+                ]),
+                Bson::Array(vec![
+                    Bson::Document(doc! { "k": "ok", "v": 0 }),
+                    Bson::Document(doc! { "k": key, "v": 1 }),
+                ]),
+            ] {
+                let msg = refused(doc! { "$arrayToObject": "$p" }, doc! { "p": p.clone() });
+                assert!(msg.contains("element 1") && msg.contains("NUL"), "{key:?}: {msg}");
+            }
+        }
+        // Every other string is a key, taken as written, in both forms.
+        for key in ["", "$x", "a.b", ".", "a$"] {
+            let mut want = Document::new();
+            want.insert(key, 1);
+            for p in [
+                Bson::Array(vec![Bson::Array(vec![key.into(), 1.into()])]),
+                Bson::Array(vec![Bson::Document(doc! { "k": key, "v": 1 })]),
+            ] {
+                let got = on(doc! { "$arrayToObject": "$p" }, doc! { "p": p });
+                assert_eq!(got, Bson::Document(want.clone()), "{key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_document_with_any_keys_round_trips_through_pairs() {
+        // Storage, an object expression and `$literal` all take these keys,
+        // so turning such a document into pairs and back must not refuse it.
+        let mut o = Document::new();
+        o.insert("a.b", 1);
+        o.insert("$x", "dollar");
+        o.insert("", doc! { "inner.dot": 2 });
+        o.insert("plain", [1, 2]);
+        let got =
+            on(doc! { "$arrayToObject": { "$objectToArray": "$o" } }, doc! { "o": o.clone() });
+        assert_eq!(format!("{got:?}"), format!("{:?}", Bson::Document(o)));
+    }
+
+    #[test]
+    fn object_to_array_and_back_is_the_same_document() {
+        let o = doc! { "z": 1_i64, "a": [1, { "b": 2.5 }], "m": { "n": null }, "s": "t" };
+        let got =
+            on(doc! { "$arrayToObject": { "$objectToArray": "$o" } }, doc! { "o": o.clone() });
+        assert_eq!(format!("{got:?}"), format!("{:?}", Bson::Document(o)));
+    }
+
+    #[test]
+    fn the_documented_rename_through_pairs_works() {
+        // The example in aggregation.md, "Documents as pairs".
+        let expr = doc! { "$arrayToObject": { "$map": {
+            "input": { "$objectToArray": "$attrs" },
+            "in": { "k": { "$toUpper": "$$this.k" }, "v": "$$this.v" },
+        } } };
+        let got = on(expr, doc! { "attrs": { "tier": "gold", "since": 2019 } });
+        assert_eq!(got, Bson::Document(doc! { "TIER": "gold", "SINCE": 2019 }));
+    }
+
+    #[test]
+    fn zip_and_sort_array_stay_unknown_operators() {
+        for name in ["$zip", "$sortArray"] {
+            let mut expr = Document::new();
+            expr.insert(name, doc! { "inputs": [[1]] });
+            let msg = Expr::parse(&Bson::Document(expr)).unwrap_err().to_string();
+            assert!(msg.contains(name) && msg.contains("not an expression operator"), "{msg}");
+        }
     }
 }

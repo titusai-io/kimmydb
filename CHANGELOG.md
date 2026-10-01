@@ -26,6 +26,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   here, so this is an extension and is recorded in the Deviations register. See
   Query language, "Positional updates", and ADR-209.
 
+- **The set operators, `$objectToArray` and `$arrayToObject` in the
+  expression language.** `$setUnion`, `$setIntersection`, `$setDifference`,
+  `$setEquals`, `$setIsSubset`, `$anyElementTrue` and `$allElementsTrue` read
+  each array as the set of its distinct members, where two values are one
+  member exactly when `$eq` calls them equal (`1` and `1.0` are one), and a set
+  result comes back first-seen: members in the order they first appear,
+  arguments left to right. `$objectToArray` turns a document into
+  `[{k, v}, ...]` in field order; `$arrayToObject` reads `[[k, v], ...]` or
+  `[{k, v}, ...]`, and a repeated key keeps its first place and its last
+  value. Null or missing in is null out; a non-array (or, for
+  `$objectToArray`, a non-document) is a `400`. A `Decimal128` in a set input,
+  or as an element of `$anyElementTrue` or `$allElementsTrue`, is a `400`
+  rather than compared, and `$arrayToObject` refuses a mixed form, a pair of
+  the wrong shape, a non-string key, and a key holding a NUL, each naming the
+  element; any other string is a key, empty, dotted and `$`-prefixed ones
+  included, so a document turned into pairs and back is the same document.
+  Every one of these names was an
+  unknown operator before, so nothing that used to be accepted is refused.
+  `$zip` and `$sortArray` stay unknown operators. See aggregation.md, "Sets"
+  and "Documents as pairs", and ADR-207.
+
 - **`kimmyd check-store` verifies a stopped member's store against redb's page
   checksums, writing nothing.** A serving node never verifies them: redb checks
   them only in its repair after an unclean stop and in its own integrity check,
