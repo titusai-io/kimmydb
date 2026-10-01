@@ -1893,6 +1893,323 @@ async fn expr_compares_fields_of_the_same_document_everywhere_a_filter_is_taken(
     assert_eq!(res.status, 400, "{:?}", res.body);
 }
 
+/// A `$expr` that cannot be evaluated against a document fails the request,
+/// with a `400` naming the document, the operator and the type it could not
+/// take, on every route that takes a filter; it used to drop the document and
+/// answer `200` with the rest, which could not be told from a correct result
+/// (ADR-206). A write it fails writes nothing.
+#[tokio::test]
+async fn an_expr_that_cannot_be_evaluated_fails_the_request_everywhere_a_filter_is_taken() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for doc in [
+        json!({"_id": 1, "kind": "a", "qty": 5}),
+        json!({"_id": 2, "kind": "a", "qty": 12}),
+        json!({"_id": 3, "kind": "a", "qty": "twelve"}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let bad = json!({"$expr": {"$gt": [{"$add": ["$qty", 1]}, 10]}});
+    let refused = |res: &Res, what: &str| {
+        assert_eq!(res.status, 400, "{what}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{what}: {:?}", res.body);
+        assert_eq!(
+            res.body["message"],
+            "invalid query: $expr cannot be evaluated for the document with _id 3: $add needs \
+             numbers, found a string",
+            "{what}"
+        );
+    };
+
+    let res =
+        server.post("/v1/db/shop/coll/orders/find", Some(&token), json!({"filter": bad})).await;
+    refused(&res, "find");
+    let res = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"filter": bad, "explain": true}))
+        .await;
+    refused(&res, "find with explain");
+    let res =
+        server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({"filter": bad})).await;
+    refused(&res, "count");
+    // Through the primary key.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"_id": 3, "$expr": bad["$expr"]}}),
+        )
+        .await;
+    refused(&res, "find by _id");
+
+    // Through an index: the candidates the index offers are evaluated, and
+    // one it does not offer is never read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "kind"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"kind": "a", "$expr": bad["$expr"]}, "explain": true}),
+        )
+        .await;
+    refused(&res, "find through an index");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"kind": "b", "$expr": bad["$expr"]}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": bad, "update": {"$set": {"flag": true}}, "multi": true}),
+        )
+        .await;
+    refused(&res, "update");
+    let res = server
+        .post("/v1/db/shop/coll/orders/delete", Some(&token), json!({"filter": bad, "multi": true}))
+        .await;
+    refused(&res, "delete");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&token),
+            json!({"filter": bad, "update": {"$set": {"flag": true}}}),
+        )
+        .await;
+    refused(&res, "find_and_modify");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&token),
+            json!({"filter": bad, "remove": true}),
+        )
+        .await;
+    refused(&res, "find_and_modify remove");
+    let res = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"sort": {"_id": 1}}))
+        .await;
+    assert_eq!(
+        res.body["documents"],
+        json!([
+            {"_id": 1, "kind": "a", "qty": 5},
+            {"_id": 2, "kind": "a", "qty": 12},
+            {"_id": 3, "kind": "a", "qty": "twelve"},
+        ]),
+        "a refused write wrote nothing"
+    );
+
+    // A leading `$match`, one after a stage, and one in a `$lookup` pipeline.
+    for pipeline in [
+        json!([{"$match": bad}]),
+        json!([{"$addFields": {"seen": true}}, {"$match": bad}]),
+        json!([
+            {"$match": {"_id": 1}},
+            {"$lookup": {"from": "orders", "pipeline": [{"$match": bad}], "as": "x"}},
+        ]),
+    ] {
+        let res = server
+            .post("/v1/db/shop/coll/orders/aggregate", Some(&token), json!({"pipeline": pipeline}))
+            .await;
+        refused(&res, &format!("aggregate {pipeline}"));
+    }
+
+    // A clean false is still a document that does not match.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"$expr": {"$eq": ["$qty", 12]}}, "projection": {"_id": 1}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 2}]));
+}
+
+/// Whether a request fails depends on whether its answer depends on a
+/// document whose `$expr` cannot be evaluated, and not on the plan: a clause
+/// without `$expr` that excludes the document decides it on a collection
+/// scan, wherever it is written, just as an index on that clause leaves the
+/// document out (ADR-206).
+#[tokio::test]
+async fn whether_an_unevaluable_expr_fails_a_request_does_not_depend_on_the_plan() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"inv"})).await;
+    for doc in
+        [json!({"_id": 1, "kind": "a", "qty": "x"}), json!({"_id": 2, "kind": "b", "qty": "y"})]
+    {
+        let res = server.post("/v1/db/shop/coll/inv/docs", Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let bad = json!({"$gt": [{"$add": ["$qty", 1]}, 0]});
+    // Bodies as text, so the key order on the wire is the order written.
+    let find = |filter: String, explain: bool| {
+        let body = format!(r#"{{"filter":{filter},"explain":{explain}}}"#);
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let excluded =
+        [format!(r#"{{"$expr":{bad},"kind":"c"}}"#), format!(r#"{{"kind":"c","$expr":{bad}}}"#)];
+    let reached =
+        [format!(r#"{{"$expr":{bad},"kind":"b"}}"#), format!(r#"{{"kind":"b","$expr":{bad}}}"#)];
+    for plan in ["collectionScan", "index"] {
+        if plan == "index" {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/inv/indexes",
+                    Some(&token),
+                    json!({"fields": [{"path": "kind"}]}),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+        }
+        for filter in &excluded {
+            let res = server
+                .post("/v1/db/shop/coll/inv/find", Some(&token), find(filter.clone(), true))
+                .await;
+            assert_eq!(res.status, 200, "{plan} {filter}: {:?}", res.body);
+            assert_eq!(res.body["documents"], json!([]), "{plan} {filter}");
+            assert_eq!(res.body["explain"]["strategy"], plan, "{plan} {filter}: {:?}", res.body);
+            if plan == "index" {
+                assert_eq!(res.body["explain"]["index"], "kind_1", "{:?}", res.body);
+            }
+        }
+        for filter in &reached {
+            let res = server
+                .post("/v1/db/shop/coll/inv/find", Some(&token), find(filter.clone(), false))
+                .await;
+            assert_eq!(res.status, 400, "{plan} {filter}: {:?}", res.body);
+            let message = res.body["message"].as_str().unwrap_or_default();
+            assert!(message.contains("for the document with _id 2"), "{plan}: {message}");
+        }
+        // An `$or` branch without `$expr` that matches decides the document.
+        let filter = format!(r#"{{"$or":[{{"$expr":{bad}}},{{"kind":{{"$in":["a","b"]}}}}]}}"#);
+        let res =
+            server.post("/v1/db/shop/coll/inv/count", Some(&token), find(filter, false)).await;
+        assert_eq!(res.status, 200, "{plan}: {:?}", res.body);
+        assert_eq!(res.body["count"], 2, "{plan}");
+    }
+}
+
+/// An `arrayFilters` entry can carry a `$expr` under an `$elemMatch` on a
+/// field of the element, and one that cannot be evaluated fails the update,
+/// naming the document, rather than leaving the element unselected (ADR-206).
+#[tokio::test]
+async fn an_array_filter_whose_expr_cannot_be_evaluated_fails_the_update() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let lines = json!([{"subs": [{"qty": 1}]}, {"subs": [{"qty": "x"}]}]);
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 9, "lines": lines})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 9},
+                "update": {"$set": {"lines.$[l].hit": true}},
+                "arrayFilters": [
+                    {"l.subs": {"$elemMatch": {"$expr": {"$gt": [{"$add": ["$qty", 1]}, 5]}}}}
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["message"],
+        "invalid query: $expr cannot be evaluated for an array element of the document with _id \
+         9: $add needs numbers, found a string"
+    );
+    let res = server.get("/v1/db/shop/coll/c/docs/9", Some(&token)).await;
+    assert_eq!(res.body["lines"], lines, "nothing was written");
+}
+
+/// A `$lookup` pipeline with no input documents joins nothing, so the
+/// foreign collection is not part of the answer and its `$match` is not run
+/// over it (ADR-206).
+#[tokio::test]
+async fn a_lookup_with_nothing_to_join_does_not_evaluate_its_pipeline() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 3, "qty": "x"})).await;
+    let bad = json!({"$expr": {"$gt": [{"$add": ["$qty", 1]}, 0]}});
+    let pipeline = |leading: Value| {
+        json!({"pipeline": [
+            {"$match": leading},
+            {"$lookup": {"from": "orders", "pipeline": [{"$match": bad}], "as": "x"}},
+        ]})
+    };
+    let res = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), pipeline(json!({"_id": 99})))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([]));
+    // With something to join, the pipeline runs and the document fails it.
+    let res = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), pipeline(json!({"_id": 3})))
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+/// A `multi` update whose filter cannot be evaluated against a document in a
+/// later chunk keeps the chunks before it, and says so, as any refusal there
+/// does (ADR-086, ADR-192, ADR-206).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_update_whose_expr_fails_in_a_later_chunk_keeps_the_earlier_ones() {
+    let server = three_chunk_server().await;
+    let orders = server.state.engine.get_collection("shop", "orders").unwrap();
+    server
+        .state
+        .engine
+        .replace(
+            &orders,
+            &kimmy_core::DocId::Int64(1),
+            bson::doc! { "_id": 1i64, "n": "one" },
+            false,
+        )
+        .unwrap();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            None,
+            json!({
+                "filter": {"$expr": {"$gte": [{"$add": ["$n", 1]}, 0]}},
+                "update": {"$set": {"seen": true}},
+                "multi": true,
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(
+        res.body["applied"],
+        json!({ "matched": 1, "modified": 1, "commits": 1, "in_doubt": 0 }),
+        "{:?}",
+        res.body
+    );
+    assert_eq!(res.body["cause"]["code"], "bad_request", "{:?}", res.body);
+    assert!(res.body.to_string().contains("$add needs numbers, found a string"), "{:?}", res.body);
+    let seen = |id: i64| {
+        let doc = server.state.engine.get(&orders, &kimmy_core::DocId::Int64(id)).unwrap();
+        doc.and_then(|d| d.get_bool("seen").ok())
+    };
+    assert_eq!((seen(0), seen(1), seen(2)), (Some(true), None, None));
+}
+
 #[tokio::test]
 async fn updates_apply_operators() {
     let server = Server::start().await;

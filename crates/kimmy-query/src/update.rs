@@ -833,7 +833,7 @@ fn expand_positional(path: &str, filters: &[ArrayFilter], doc: &Document) -> Res
     let (head, rest) = segments.split_first().expect("non-empty path");
     let mut prefix = vec![(*head).to_string()];
     let mut out = Vec::new();
-    expand_into(doc.get(*head), rest, filters, path, &mut prefix, &mut out)?;
+    expand_into(doc.get(*head), rest, filters, path, &mut prefix, &mut out, doc.get(ID_FIELD))?;
     Ok(out)
 }
 
@@ -844,6 +844,9 @@ fn expand_into(
     path: &str,
     prefix: &mut Vec<String>,
     out: &mut Vec<String>,
+    // The `_id` of the document being updated, for the message when an
+    // array filter's `$expr` cannot be evaluated.
+    id: Option<&Bson>,
 ) -> Result<()> {
     let Some((head, rest)) = segments.split_first() else {
         out.push(prefix.join("."));
@@ -876,9 +879,13 @@ fn expand_into(
             ),
         };
         for (index, item) in items.iter().enumerate() {
-            if selector.is_none_or(|f| filter::matches_element(f, item)) {
+            let selected = match selector {
+                None => true,
+                Some(f) => filter::matches_element(f, item, id)?,
+            };
+            if selected {
                 prefix.push(index.to_string());
-                expand_into(Some(item), rest, filters, path, prefix, out)?;
+                expand_into(Some(item), rest, filters, path, prefix, out, id)?;
                 prefix.pop();
             }
         }
@@ -894,7 +901,7 @@ fn expand_into(
         _ => None,
     };
     prefix.push((*head).to_string());
-    expand_into(next, rest, filters, path, prefix, out)?;
+    expand_into(next, rest, filters, path, prefix, out, id)?;
     prefix.pop();
     Ok(())
 }

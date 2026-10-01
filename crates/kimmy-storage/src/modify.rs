@@ -99,7 +99,13 @@ pub enum Candidates {
 /// What the caller decides, as pure functions over documents.
 pub trait ModifySpec {
     /// Whether this document is a candidate.
-    fn matches(&self, doc: &Document) -> bool;
+    ///
+    /// An `Err` is the caller's refusal of this document — a filter's `$expr`
+    /// that cannot be evaluated against it (ADR-206) — and fails the write as
+    /// an `apply` error does: the chunk it is in is aborted whole, and a
+    /// failure after an earlier chunk committed is
+    /// [`StorageError::PartiallyApplied`].
+    fn matches(&self, doc: &Document) -> kimmy_core::Result<bool>;
 
     /// Order for choosing among matches; the first after sorting wins.
     ///
@@ -516,7 +522,7 @@ impl Engine {
         let mut consider =
             |stamp: Stamp, doc: Document, matches: &mut Vec<(Stamp, Document)>| -> Result<bool> {
                 examined += 1;
-                if !spec.matches(&doc) {
+                if !spec.matches(&doc).map_err(StorageError::Core)? {
                     return Ok(true);
                 }
                 matches.push((stamp, doc));
@@ -690,8 +696,8 @@ mod tests {
         C: Fn(&Document, &Document) -> Ordering,
         A: Fn(&Document) -> std::result::Result<Option<Document>, String>,
     {
-        fn matches(&self, doc: &Document) -> bool {
-            (self.matches)(doc)
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            Ok((self.matches)(doc))
         }
         fn compare(&self, a: &Document, b: &Document) -> Ordering {
             (self.compare)(a, b)
@@ -1379,8 +1385,8 @@ mod tests {
     }
 
     impl ModifySpec for ConditionalClaim {
-        fn matches(&self, d: &Document) -> bool {
-            d.get_str("status").map(|s| s == "pending").unwrap_or(false)
+        fn matches(&self, d: &Document) -> kimmy_core::Result<bool> {
+            Ok(d.get_str("status").map(|s| s == "pending").unwrap_or(false))
         }
         fn compare(&self, a: &Document, b: &Document) -> Ordering {
             i64_of(a, "created").cmp(&i64_of(b, "created"))

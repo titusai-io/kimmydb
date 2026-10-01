@@ -235,7 +235,7 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
                 assert_eq!(chosen.index_name, "p");
                 used += 1;
                 for d in &docs {
-                    if filter::matches(q, d)
+                    if filter::matches(q, d).unwrap()
                         && !holds(partial, d)
                         && seen.insert((pdoc.to_string(), qdoc.to_string()))
                     {

@@ -423,6 +423,9 @@ mod tests {
             doc! {"a": {"$elemMatch": {"b": 1}}},
             doc! {"a": {"$exists": false}},
             doc! {"a": {"$gt": 1, "$lt": 5}},
+            // An expression is outside the language too, so a write never has
+            // to evaluate one to decide what an index holds (ADR-206).
+            doc! {"$expr": {"$gt": ["$a", 1]}},
         ] {
             assert!(parse(bad.clone()).is_err(), "should have been refused: {bad:?}");
         }

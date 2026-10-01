@@ -144,6 +144,8 @@ pub fn filter_parse(data: &[u8]) {
     let Some(doc) = json_document(data) else { return };
     let Ok(filter) = filter::parse(&doc) else { return };
     for fixture in FIXTURES.iter() {
+        // An `Err` is an answer, not a failure: a `$expr` that cannot be
+        // evaluated against a fixture fails the request (ADR-206).
         let _ = filter::matches(&filter, fixture);
     }
     // The planner reads the same AST, and a wrong range bound there is a

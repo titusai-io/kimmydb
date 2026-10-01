@@ -95,7 +95,7 @@ fn by_scan(engine: &Engine, coll: &CollectionMeta, query: &Document, docs: usize
     let mut out = Vec::new();
     for id in 0..docs as i64 {
         if let Some(doc) = engine.get(coll, &kimmy_core::DocId::Int64(id)).unwrap()
-            && kimmy_query::filter::matches(&filter, &doc)
+            && kimmy_query::filter::matches(&filter, &doc).unwrap()
         {
             out.push(id);
         }

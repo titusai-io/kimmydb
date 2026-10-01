@@ -224,7 +224,8 @@ pub fn leading_match(stages: &[Stage]) -> Option<(Filter, usize)> {
     match filters.len() {
         0 => None,
         1 => filters.pop().map(|f| (f, 1)),
-        n => Some((Filter::And(filters), n)),
+        // Cheap clauses first, as within one filter (ADR-206).
+        n => Some((filter::conjunction(filters), n)),
     }
 }
 
@@ -716,7 +717,17 @@ pub fn apply_with_vars(
     vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     let out = match stage {
-        Stage::Match(f) => input.into_iter().filter(|d| filter::matches(f, d)).collect(),
+        // A `$expr` that cannot be evaluated against a document fails the
+        // pipeline, as in a top-level filter (ADR-206).
+        Stage::Match(f) => {
+            let mut out = Vec::with_capacity(input.len());
+            for doc in input {
+                if filter::matches(f, &doc)? {
+                    out.push(doc);
+                }
+            }
+            out
+        }
         Stage::Project { projection, computed } => {
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
@@ -1480,6 +1491,47 @@ mod tests {
             run(vec![doc! {"$match": {"$expr": {"$in": ["b", "$items.sku"]}}}], orders()).unwrap();
         let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_leading_run_of_matches_puts_its_expressions_last() {
+        // The run is one `$and`, and orders its clauses as one filter does.
+        let stages = parse(&[
+            doc! {"$match": {"$expr": {"$gt": ["$qty", 1]}}},
+            doc! {"$match": {"kind": "c"}},
+        ])
+        .unwrap();
+        let (filter, consumed) = leading_match(&stages).unwrap();
+        assert_eq!(consumed, 2);
+        let before = filter::expr_evaluations();
+        assert!(!filter::matches(&filter, &doc! { "kind": "a", "qty": 5 }).unwrap());
+        assert_eq!(filter::expr_evaluations() - before, 0);
+    }
+
+    #[test]
+    fn a_match_whose_expr_cannot_be_evaluated_fails_the_pipeline() {
+        // As in a top-level filter (ADR-206): the document is not dropped.
+        let input = docs(vec![
+            doc! { "_id": 1, "qty": 5 },
+            doc! { "_id": 2, "qty": 12 },
+            doc! { "_id": 3, "qty": "twelve" },
+        ]);
+        let gt = doc! {"$match": {"$expr": {"$gt": [{"$add": ["$qty", 1]}, 10]}}};
+        let err = run(vec![gt.clone()], input.clone()).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "invalid query: $expr cannot be evaluated for the document with _id 3: $add needs \
+             numbers, found a string"
+        );
+        // After a stage that derives the documents, the same rule.
+        let err = run(vec![doc! {"$project": {"_id": 0, "qty": 1}}, gt], input.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$expr cannot be evaluated: $add"), "{err}");
+        // A clean false still drops the document.
+        let ok = doc! {"$match": {"$expr": {"$eq": ["$qty", 12]}}};
+        let out = run(vec![ok], input).unwrap();
+        assert_eq!(out, vec![doc! { "_id": 2, "qty": 12 }]);
     }
 
     #[test]

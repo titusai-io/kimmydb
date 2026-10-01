@@ -4015,7 +4015,7 @@ mod tests {
         let mut ids = Vec::new();
         engine
             .for_each_doc(coll, crate::WalkScope::Request, |id, doc| {
-                if kimmy_query::filter::matches(&filter, &doc)
+                if kimmy_query::filter::matches(&filter, &doc).unwrap()
                     && let DocId::Int64(n) = id
                 {
                     ids.push(n);
@@ -4046,7 +4046,7 @@ mod tests {
         for key in candidates {
             // The recheck. An index narrows; only the filter decides.
             if let Some(doc) = engine.get_by_encoded_key(coll, &key).unwrap()
-                && kimmy_query::filter::matches(&filter, &doc)
+                && kimmy_query::filter::matches(&filter, &doc).unwrap()
                 && let Ok(DocId::Int64(n)) = DocId::try_from_bson(doc.get("_id").unwrap())
             {
                 ids.push(n);

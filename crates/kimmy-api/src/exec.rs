@@ -795,16 +795,19 @@ impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
     /// refuse it — a `limit: 0` page came back holding one document instead
     /// of none, whenever the very first candidate the scan examined happened
     /// to match.
-    fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> bool {
+    ///
+    /// `Err` when the filter's `$expr` cannot be evaluated against the
+    /// candidate, which ends the scan and fails the read (ADR-206).
+    fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> kimmy_core::Result<bool> {
         if self.stop_after == Some(self.matched) {
-            return false;
+            return Ok(false);
         }
         self.examined += 1;
-        if filter::matches(self.filter, &doc) {
+        if filter::matches(self.filter, &doc)? {
             self.matched += 1;
             (self.visit)(stamp, doc);
         }
-        !self.stop_after.is_some_and(|n| self.matched >= n)
+        Ok(!self.stop_after.is_some_and(|n| self.matched >= n))
     }
 }
 
@@ -852,7 +855,7 @@ where
             let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, key)? else {
                 continue;
             };
-            if !recheck.take(stamp, doc) {
+            if !recheck.take(stamp, doc)? {
                 break;
             }
         }
@@ -912,7 +915,7 @@ where
                 &scan,
                 delivery,
                 kimmy_storage::WalkScope::Request,
-                |_, stamp, doc| Ok(recheck.take(stamp, doc)),
+                |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
             )
         })?;
         match outcome {
@@ -930,7 +933,7 @@ where
                 meta,
                 after,
                 kimmy_storage::WalkScope::Request,
-                |_, stamp, doc| Ok(recheck.take(stamp, doc)),
+                |_, stamp, doc| Ok(recheck.take(stamp, doc)?),
             )
         })?;
     }
@@ -1307,7 +1310,7 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         self.expected
     }
 
-    fn matches(&self, doc: &Document) -> bool {
+    fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
         filter::matches(self.filter, doc)
     }
 
@@ -1324,7 +1327,13 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
             return Ok(None);
         };
         let mut next = doc.clone();
-        update::apply(update, &mut next, self.now).map_err(|e| e.to_string())?;
+        // The engine reports this string as an `InvalidQuery`, so a refusal
+        // that already is one gives its reason alone, rather than
+        // `invalid query: invalid query: …`.
+        update::apply(update, &mut next, self.now).map_err(|e| match e {
+            kimmy_core::Error::InvalidQuery(reason) => reason,
+            other => other.to_string(),
+        })?;
         Ok(Some(next))
     }
 
@@ -2136,6 +2145,12 @@ fn lookup_pipeline(
 ) -> Result<Vec<bson::Document>, ApiError> {
     // The second authorization point, exactly as for the equality form.
     let foreign_meta = authorize(state, auth, Action::Read, db, from)?;
+    // Nothing to join, so nothing of the foreign collection is part of the
+    // answer: reading it would cost a walk, and its leading `$match` could
+    // fail the request over a document no output depends on (ADR-206).
+    if input.is_empty() {
+        return Ok(input);
+    }
 
     let mut foreign: Vec<bson::Document> = Vec::new();
     // The whole foreign collection, so a walk (ADR-153).

@@ -293,28 +293,47 @@ expression layer has been able to state in a sentence. Not planned.
 
 ---
 
-## 🟡 `$expr` treats an evaluation error as no match, and is accepted under `$elemMatch`
+## 🟢 `$expr` treated an evaluation error as no match
 
-**Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106).**
-Two places where the filter's `$expr` is looser than MongoDB's, both by
-design and both small.
-
-**A type violation inside the expression is a document that does not match,
-not a failed request.** `{$expr: {$gt: [{$add: ["$name", 1]}, 0]}}` over a
+**Was** (raised 2026-08-30, while adding `$expr` to the filter language,
+ADR-106). A type violation inside the expression was a document that did not
+match, not a failed request. `{$expr: {$gt: [{$add: ["$name", 1]}, 0]}}` over a
 collection where one document's `name` is a string: MongoDB fails the whole
-query on reaching that document; here the document is skipped and the rest of
-the result is returned. `filter::matches` answers a `bool` for every caller —
-the scan, `$elemMatch`, the executor's residual re-check after an index probe
-— and a failure that depends on the data shows up mid-scan, so it cannot be
-found at parse. Parse-
-time errors (an unknown operator, a wrong arity, a `$$name` nothing binds) are
-still a `400`, so the leniency is confined to failures that depend on the data.
-`$$ROOT` and `$$CURRENT` were parse-time errors here too until the expression
-scope landed (ADR-105); they now name the document under consideration, which
-inside a document-form `$elemMatch` is the element. A pipeline's
-`$addFields` with the same expression still refuses, as it did before; the
-difference is that a filter *selects* and a stage *derives*, and a
-derivation that cannot be computed has no honest value to write.
+query on reaching that document; here the document was skipped and the rest of
+the result returned, which could not be told from a correct result.
+`filter::matches` answered a `bool` for every caller — the scan, `$elemMatch`,
+the executor's residual re-check after an index probe — so a failure that
+depends on the data, found mid-scan, had nowhere to go. Parse-time errors (an
+unknown operator, a wrong arity, a `$$name` nothing binds) were already a
+`400`. A pipeline's `$addFields` with the same expression already refused.
+
+**Now** (closed 2026-10-01, [ADR-206](decisions.md)). `filter::matches`
+returns a `Result`, and an evaluation error fails the request with a `400`
+naming the document's `_id`, the operator and the type, on every route that
+takes a filter: `find`, `count`, `update`, `delete`, `find_and_modify`, a
+pipeline `$match` (leading, later, or in a `$lookup` pipeline), a vector
+search's `filter`, and the MCP tools. A `multi` write that meets one after a
+committed chunk answers `500 partially_applied` with it as the cause, as any
+later refusal does. Nothing evaluates a `$expr` in the background or on
+replication: a partial index's filter (and so a TTL index's) is the bounded
+language of `kimmy_core::partial`, which refuses `$expr` at index creation, and
+change streams and webhooks take no query filter. A request fails exactly
+when its answer depends on a document whose expression cannot be evaluated: a
+clause without `$expr` that decides the document (a false `$and` clause, a
+true `$or` branch) spares it wherever it is written, so the outcome does not
+depend on the plan. MongoDB evaluates in its own order and can fail a query
+whose answer the expression did not decide; here it does not. Breaking for
+callers, in a `0.MINOR`.
+
+---
+
+## 🟡 `$expr` is accepted under `$elemMatch`, and not at the top level of an `arrayFilters` entry
+
+**Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106)**,
+and recorded with the evaluation-error entry above until that closed. Two
+places where the filter's `$expr` differs from MongoDB's, both by design and
+both small. An evaluation error under `$elemMatch` fails the request like any
+other (ADR-206).
 
 **`$expr` is accepted inside a document-form `$elemMatch`.** MongoDB refuses
 `{lines: {$elemMatch: {$expr: …}}}` outright. Here the element is a document
@@ -330,14 +349,16 @@ to group them, and refuses every other `$`-operator — the rule predates `$expr
 joining the filter language (ADR-106 landed after ADR-104) and was left alone
 rather than widened as a side effect of the two meeting. `{"line.qty": {"$gt":
 5}}` covers what an array filter is usually for; comparing two fields *of the
-same element* is what it cannot express.
+same element* is what it cannot express. The check reads only the entry's
+top-level keys, so a `$expr` under an `$elemMatch` on a field of the element
+— `{"l.subs": {"$elemMatch": {"$expr": …}}}` — is accepted, compares fields
+of an element of `subs`, and fails the update when it cannot be evaluated.
 
-**To close:** thread a `Result` through `filter::matches` and its callers so
-an evaluation error can surface as a `400`, at which point the first item
-becomes a choice rather than a constraint. The second is a feature, and would
-only be withdrawn if the operator set gained the pipeline-side spelling. The
-third is `update::strip_identifier` letting `$expr` through to the filter
-parser: `filter::matches_element` already answers one, against the element.
+**To close:** the first is a feature, and would only be withdrawn if the
+operator set gained the pipeline-side spelling. The second is
+`update::strip_identifier` letting `$expr` through to the filter parser:
+`filter::matches_element` already answers one, against the element, and fails
+on one it cannot evaluate.
 
 ---
 

@@ -90,8 +90,28 @@ pub fn parse(doc: &Document) -> Result<Filter> {
     Ok(match clauses.len() {
         0 => Filter::AlwaysTrue,
         1 => clauses.pop().expect("length checked"),
-        _ => Filter::And(clauses),
+        _ => conjunction(clauses),
     })
+}
+
+/// `$and` of `clauses`, with the clauses that hold no `$expr` first.
+///
+/// Every list the matcher evaluates is put in that order when it is built —
+/// the clauses of an `$and`, `$or` or `$nor`, a field's conditions — so that
+/// evaluation, which stops at the first clause that decides, reaches an
+/// expression only when nothing cheaper has answered (ADR-206). The order is
+/// decided once here rather than for every document. The order is not what
+/// makes the answer independent of the written order: the matcher keeps an
+/// expression's error until no clause has decided, whatever came first.
+pub fn conjunction(clauses: Vec<Filter>) -> Filter {
+    Filter::And(cheap_first(clauses, filter_has_expr))
+}
+
+/// `items` with those `has_expr` marks moved to the end, keeping each
+/// group's order.
+fn cheap_first<T>(items: Vec<T>, has_expr: fn(&T) -> bool) -> Vec<T> {
+    let (cheap, expensive): (Vec<T>, Vec<T>) = items.into_iter().partition(|i| !has_expr(i));
+    cheap.into_iter().chain(expensive).collect()
 }
 
 fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
@@ -102,13 +122,14 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
         if items.is_empty() {
             return Err(Error::InvalidQuery(format!("${op} requires a non-empty array")));
         }
-        items
+        let parsed = items
             .iter()
             .map(|item| match item {
                 Bson::Document(d) => parse(d),
                 _ => Err(Error::InvalidQuery(format!("${op} entries must be documents"))),
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(cheap_first(parsed, filter_has_expr))
     };
 
     Ok(match op {
@@ -170,7 +191,11 @@ fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
         None => String::new(),
     };
 
-    doc.iter().map(|(key, arg)| parse_condition(&key[1..], arg, &sibling_options)).collect()
+    let conditions = doc
+        .iter()
+        .map(|(key, arg)| parse_condition(&key[1..], arg, &sibling_options))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(cheap_first(conditions, condition_has_expr))
 }
 
 /// Parse the body of an `$elemMatch`.
@@ -510,15 +535,110 @@ fn type_name_of(value: &Bson) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Test a document against a parsed filter.
-pub fn matches(filter: &Filter, doc: &Document) -> bool {
+///
+/// `Err` when a `$expr` the evaluation reached cannot be evaluated against
+/// this document — `{$add: ["$qty", 1]}` where `qty` is a string — and every
+/// caller fails its request with it (ADR-206). The error names the document's
+/// `_id` when it has one, and the evaluator's reason, which names the operator
+/// and the type it could not take.
+///
+/// **A document fails exactly when the answer for it depends on a `$expr`
+/// that cannot be evaluated** (ADR-206). An `$and` (an implicit one
+/// included) is false if any clause is false, whatever the others say; an
+/// `$or` is true if any branch is true; `$nor` is the inverse of `$or`, and
+/// `$elemMatch` is true if any element matches. Only when no clause decides
+/// does an expression that could not be evaluated fail the document. So the
+/// outcome is the same in any order the clauses are written, and the same
+/// whichever access path offered the document: an index can only leave out a
+/// document that a clause without `$expr` already excludes.
+///
+/// Within each of them the clauses that hold no `$expr` are evaluated first,
+/// and evaluation stops at the first clause that decides, so an expression is
+/// not evaluated where a cheaper clause has already answered.
+pub fn matches(filter: &Filter, doc: &Document) -> Result<bool> {
+    evaluate(filter, doc).map_err(|e| unevaluable(e, doc.get("_id"), ""))
+}
+
+/// The refusal for a `$expr` that could not be evaluated, against the
+/// document with `_id` when it has one, or against something `within` it.
+fn unevaluable(e: Error, id: Option<&Bson>, within: &str) -> Error {
+    let reason = match e {
+        Error::InvalidQuery(reason) => reason,
+        other => other.to_string(),
+    };
+    let at = match id {
+        Some(id) => format!(" for {within}the document with _id {id}"),
+        None if within.is_empty() => String::new(),
+        None => format!(" for {}", within.trim_end_matches(" of ")),
+    };
+    Error::InvalidQuery(format!("$expr cannot be evaluated{at}: {reason}"))
+}
+
+/// Whether a filter holds a `$expr` anywhere it is evaluated from.
+fn filter_has_expr(filter: &Filter) -> bool {
     match filter {
-        Filter::AlwaysTrue => true,
-        Filter::And(branches) => branches.iter().all(|f| matches(f, doc)),
-        Filter::Or(branches) => branches.iter().any(|f| matches(f, doc)),
-        Filter::Nor(branches) => !branches.iter().any(|f| matches(f, doc)),
+        Filter::AlwaysTrue => false,
+        Filter::And(branches) | Filter::Or(branches) | Filter::Nor(branches) => {
+            branches.iter().any(filter_has_expr)
+        }
+        Filter::Field { conditions, .. } => conditions.iter().any(condition_has_expr),
+        Filter::Expr(_) => true,
+    }
+}
+
+/// Whether a condition holds a `$expr`, which only an `$elemMatch` can.
+fn condition_has_expr(condition: &Condition) -> bool {
+    match condition {
+        Condition::ElemMatch(inner) => filter_has_expr(inner),
+        Condition::Not(inner) => condition_has_expr(inner),
+        Condition::Both(a, b) => condition_has_expr(a) || condition_has_expr(b),
+        _ => false,
+    }
+}
+
+/// Whether every item satisfies `f`, in the order the parser left them in
+/// (cheap first). The first `false` decides, whatever came before it; an
+/// error is kept, and returned only if no item said `false`.
+fn all_of<T>(items: &[T], mut f: impl FnMut(&T) -> Result<bool>) -> Result<bool> {
+    let mut undecided = None;
+    for item in items {
+        match f(item) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(e) => {
+                undecided.get_or_insert(e);
+            }
+        }
+    }
+    undecided.map_or(Ok(true), Err)
+}
+
+/// Whether any item satisfies `f`, in the order the parser left them in
+/// (cheap first). The first `true` decides, whatever came before it; an
+/// error is kept, and returned only if no item said `true`.
+fn any_of<T>(items: &[T], mut f: impl FnMut(&T) -> Result<bool>) -> Result<bool> {
+    let mut undecided = None;
+    for item in items {
+        match f(item) {
+            Ok(false) => {}
+            Ok(true) => return Ok(true),
+            Err(e) => {
+                undecided.get_or_insert(e);
+            }
+        }
+    }
+    undecided.map_or(Ok(false), Err)
+}
+
+fn evaluate(filter: &Filter, doc: &Document) -> Result<bool> {
+    match filter {
+        Filter::AlwaysTrue => Ok(true),
+        Filter::And(branches) => all_of(branches, |f| evaluate(f, doc)),
+        Filter::Or(branches) => any_of(branches, |f| evaluate(f, doc)),
+        Filter::Nor(branches) => Ok(!any_of(branches, |f| evaluate(f, doc))?),
         Filter::Field { path, conditions } => {
             let values = path::resolve(doc, path);
-            conditions.iter().all(|c| condition_matches(c, &values))
+            all_of(conditions, |c| condition_matches(c, &values))
         }
         Filter::Expr(e) => expr_matches(e, doc),
     }
@@ -531,29 +651,42 @@ pub fn matches(filter: &Filter, doc: &Document) -> bool {
 /// because the value came out of that language and `$cond` already reads it
 /// this way.
 ///
-/// **A type violation is "no match", not an error.** `{$expr: {$gt: [{$add:
-/// ["$name", 1]}, 0]}}` on a document whose `name` is a string is a
-/// document-dependent failure that only shows up mid-scan, and this function
-/// answers a `bool` for every caller — the scan, `$elemMatch`, the executor's
-/// residual check. Failing the whole request from here would have to thread a
-/// `Result` through all of them, for a failure that depends on the data and so
-/// cannot be found at parse. Recorded in `docs/deviations.md`, because
-/// MongoDB does fail the query.
-fn expr_matches(e: &Expr, doc: &Document) -> bool {
-    e.eval(doc).is_ok_and(|v| expr::truthy(&v))
+/// **An evaluation error is the caller's error, not "no match"** (ADR-206).
+/// `{$expr: {$gt: [{$add: ["$name", 1]}, 0]}}` on a document whose `name` is
+/// a string has no truth value, and reading it as false made a document with
+/// bad data look like one that did not satisfy the filter: the result could
+/// not be told from a correct one. It used to be read that way because this
+/// function answered a `bool` to every caller.
+fn expr_matches(e: &Expr, doc: &Document) -> Result<bool> {
+    #[cfg(test)]
+    EXPR_EVALUATIONS.with(|n| n.set(n.get() + 1));
+    e.eval(doc).map(|v| expr::truthy(&v))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `$expr` clauses this thread has evaluated, for the tests that
+    /// hold the matcher to evaluating cheap clauses first.
+    static EXPR_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `$expr` clauses this thread has evaluated so far.
+#[cfg(test)]
+pub(crate) fn expr_evaluations() -> usize {
+    EXPR_EVALUATIONS.with(std::cell::Cell::get)
 }
 
 /// Evaluate one condition against the values found at a path.
 ///
 /// `values` is empty when the path is absent, which several operators treat
-/// specially.
-fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
-    match condition {
+/// specially. Only `$elemMatch` can fail, through a `$expr` in its body.
+fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
+    Ok(match condition {
         // The operators a partial filter may also carry are evaluated in
         // `kimmy_core::matching`, once, for both (ADR-181).
         Condition::Exists(want) => matching::exists(values, *want),
         Condition::Eq(expected) => matching::equals(values, expected),
-        Condition::Ne(expected) => !condition_matches(&Condition::Eq(expected.clone()), values),
+        Condition::Ne(expected) => !matching::equals(values, expected),
 
         Condition::Gt(bound) => matching::compares(values, bound, &[Ordering::Greater]),
         Condition::Gte(bound) => {
@@ -564,10 +697,8 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
             matching::compares(values, bound, &[Ordering::Less, Ordering::Equal])
         }
 
-        Condition::In(options) => {
-            options.iter().any(|option| condition_matches(&Condition::Eq(option.clone()), values))
-        }
-        Condition::Nin(options) => !condition_matches(&Condition::In(options.clone()), values),
+        Condition::In(options) => options.iter().any(|option| matching::equals(values, option)),
+        Condition::Nin(options) => !options.iter().any(|option| matching::equals(values, option)),
 
         Condition::Type(names) => {
             any_element(values, |v| names.iter().any(|n| n == type_name_of(v)))
@@ -596,15 +727,15 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
             other => required.len() == 1 && canonical_cmp(other, &required[0]) == Ordering::Equal,
         }),
 
-        Condition::ElemMatch(inner) => values.iter().any(|v| match v {
-            Bson::Array(items) => items.iter().any(|item| match item {
-                Bson::Document(d) => matches(inner, d),
+        Condition::ElemMatch(inner) => any_of(values, |v| match v {
+            Bson::Array(items) => any_of(items, |item| match item {
+                Bson::Document(d) => evaluate(inner, d),
                 // A scalar element is tested by wrapping it so that
                 // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
                 scalar => matches_scalar_against(inner, scalar),
             }),
-            _ => false,
-        }),
+            _ => Ok(false),
+        })?,
 
         // Element-wise like the comparisons, and numeric only: a string never
         // has a remainder. The value is truncated to an integer first, so 8.5
@@ -624,11 +755,13 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
             n.checked_rem(*divisor).unwrap_or(0) == *remainder
         }),
 
-        Condition::Not(inner) => !condition_matches(inner, values),
+        Condition::Not(inner) => !condition_matches(inner, values)?,
 
         Condition::AlwaysTrue => true,
-        Condition::Both(a, b) => condition_matches(a, values) && condition_matches(b, values),
-    }
+        Condition::Both(a, b) => {
+            all_of(&[a.as_ref(), b.as_ref()], |c| condition_matches(c, values))?
+        }
+    })
 }
 
 /// Test one array element against a filter, for the update language's
@@ -640,21 +773,31 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
 /// path reads a field of a document element. A scalar element has no fields,
 /// so a dotted condition sees an absent path there, exactly as a document
 /// without the field would: `$exists: false` holds, `$gt` does not.
-pub fn matches_element(filter: &Filter, element: &Bson) -> bool {
+///
+/// `Err` as for [`matches`], when a `$expr` cannot be evaluated against a
+/// document element. An `arrayFilters` entry cannot carry `$expr` at its top
+/// level, but can under an `$elemMatch` on a field of the element, and that
+/// one is evaluated here. `id` is the `_id` of the document the element is
+/// in, for the message.
+pub fn matches_element(filter: &Filter, element: &Bson, id: Option<&Bson>) -> Result<bool> {
+    element_matches(filter, element).map_err(|e| unevaluable(e, id, "an array element of "))
+}
+
+fn element_matches(filter: &Filter, element: &Bson) -> Result<bool> {
     match filter {
-        Filter::AlwaysTrue => true,
-        Filter::And(branches) => branches.iter().all(|f| matches_element(f, element)),
-        Filter::Or(branches) => branches.iter().any(|f| matches_element(f, element)),
-        Filter::Nor(branches) => !branches.iter().any(|f| matches_element(f, element)),
+        Filter::AlwaysTrue => Ok(true),
+        Filter::And(branches) => all_of(branches, |f| element_matches(f, element)),
+        Filter::Or(branches) => any_of(branches, |f| element_matches(f, element)),
+        Filter::Nor(branches) => Ok(!any_of(branches, |f| element_matches(f, element))?),
         Filter::Field { path, conditions } => {
             if path.is_empty() {
-                return conditions.iter().all(|c| condition_matches(c, &[element]));
+                return all_of(conditions, |c| condition_matches(c, &[element]));
             }
             let values = match element {
                 Bson::Document(doc) => path::resolve(doc, path),
                 _ => Vec::new(),
             };
-            conditions.iter().all(|c| condition_matches(c, &values))
+            all_of(conditions, |c| condition_matches(c, &values))
         }
         // Unreachable through `arrayFilters` today: `update::strip_identifier`
         // refuses every `$`-operator but `$and`/`$or`/`$nor`, so no `$expr`
@@ -667,28 +810,29 @@ pub fn matches_element(filter: &Filter, element: &Bson) -> bool {
         // does not match, which is what `matches_scalar_against` answers too.
         Filter::Expr(e) => match element {
             Bson::Document(doc) => expr_matches(e, doc),
-            _ => false,
+            _ => Ok(false),
         },
     }
 }
 
 /// Evaluate a filter whose conditions target the element itself, used by
 /// `$elemMatch` over an array of scalars.
-fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> bool {
+fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> Result<bool> {
     match filter {
-        Filter::AlwaysTrue => true,
-        Filter::And(branches) => branches.iter().all(|f| matches_scalar_against(f, scalar)),
-        Filter::Or(branches) => branches.iter().any(|f| matches_scalar_against(f, scalar)),
-        Filter::Nor(branches) => !branches.iter().any(|f| matches_scalar_against(f, scalar)),
+        Filter::AlwaysTrue => Ok(true),
+        Filter::And(branches) => all_of(branches, |f| matches_scalar_against(f, scalar)),
+        Filter::Or(branches) => any_of(branches, |f| matches_scalar_against(f, scalar)),
+        Filter::Nor(branches) => Ok(!any_of(branches, |f| matches_scalar_against(f, scalar))?),
         Filter::Field { path, conditions } => {
             // A scalar element has no fields, so only an empty path applies.
             if !path.is_empty() {
-                return false;
+                return Ok(false);
             }
-            conditions.iter().all(|c| condition_matches(c, &[scalar]))
+            all_of(conditions, |c| condition_matches(c, &[scalar]))
         }
-        // An expression reads fields, and a scalar has none to read.
-        Filter::Expr(_) => false,
+        // An expression reads fields, and a scalar has none to read: nothing
+        // is evaluated, so there is nothing to fail.
+        Filter::Expr(_) => Ok(false),
     }
 }
 
@@ -733,7 +877,7 @@ mod tests {
 
     fn hits(query: Document, d: Document) -> bool {
         let filter = parse(&query).unwrap_or_else(|e| panic!("parse failed: {e}"));
-        matches(&filter, &d)
+        matches(&filter, &d).unwrap_or_else(|e| panic!("evaluation failed: {e}"))
     }
 
     // -----------------------------------------------------------------------
@@ -1016,7 +1160,10 @@ mod tests {
             seen.insert(name);
             let filter = parse(&doc! { "a": { "$type": name } })
                 .unwrap_or_else(|e| panic!("{name} must parse: {e}"));
-            assert!(matches(&filter, &doc! { "a": value.clone() }), "{name} must match itself");
+            assert!(
+                matches(&filter, &doc! { "a": value.clone() }).unwrap(),
+                "{name} must match itself"
+            );
         }
         // `dbPointer` cannot be built through the public API; it is in the
         // table all the same, and parses.
@@ -1070,7 +1217,7 @@ mod tests {
             Bson::Boolean(false),
         ] {
             let d = doc! { "a": value };
-            assert_eq!(matches(&by_alias, &d), matches(&listed, &d), "{d:?}");
+            assert_eq!(matches(&by_alias, &d).unwrap(), matches(&listed, &d).unwrap(), "{d:?}");
         }
     }
 
@@ -1156,7 +1303,7 @@ mod tests {
             path: "s".into(),
             conditions: vec![Condition::Regex { pattern: "a".into(), options: "z".into() }],
         };
-        assert!(!matches(&filter, &doc! { "s": "a" }));
+        assert!(!matches(&filter, &doc! { "s": "a" }).unwrap());
     }
 
     #[test]
@@ -1408,13 +1555,176 @@ mod tests {
         assert!(!hits(q, doc! { "qty": 9, "lines": [ { "qty": 1 } ] }));
     }
 
+    /// The evaluation error for `query` against `d`, as every caller gets it.
+    fn unevaluable(query: Document, d: Document) -> String {
+        let filter = parse(&query).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        match matches(&filter, &d) {
+            Ok(answer) => panic!("{query} on {d} answered {answer}, expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     #[test]
-    fn expr_treats_a_type_violation_as_no_match() {
-        // Adding to a string is an error in a pipeline; here it is a document
-        // that does not match, the same way an unusable regex matches nothing.
-        let q = doc! { "$expr": { "$gt": [ { "$add": ["$name", 1] }, 0 ] } };
-        assert!(!hits(q.clone(), doc! { "name": "text" }));
-        assert!(hits(q, doc! { "name": 1 }));
+    fn expr_fails_on_a_type_violation_rather_than_not_matching() {
+        // Adding to a string has no value, so the clause has no truth value:
+        // read as false, the document looked like one that did not qualify.
+        let q = doc! { "$expr": { "$gt": [ { "$add": ["$qty", 1] }, 10 ] } };
+        assert_eq!(
+            unevaluable(q.clone(), doc! { "_id": 3, "qty": "twelve" }),
+            "invalid query: $expr cannot be evaluated for the document with _id 3: $add needs \
+             numbers, found a string"
+        );
+        // Without an `_id` (a pipeline's derived document) it says no more.
+        assert_eq!(
+            unevaluable(q.clone(), doc! { "qty": "twelve" }),
+            "invalid query: $expr cannot be evaluated: $add needs numbers, found a string"
+        );
+        // A clean false is still a document that does not match, and null
+        // still propagates through arithmetic rather than failing.
+        let filter = parse(&q).unwrap();
+        assert!(!matches(&filter, &doc! { "_id": 1, "qty": 5 }).unwrap());
+        assert!(matches(&filter, &doc! { "_id": 2, "qty": 12 }).unwrap());
+        assert!(!matches(&filter, &doc! { "_id": 4 }).unwrap());
+        assert!(!matches(&filter, &doc! { "_id": 5, "qty": Bson::Null }).unwrap());
+    }
+
+    #[test]
+    fn expr_errors_wherever_the_evaluation_reaches_it() {
+        let bad = doc! { "$add": ["$qty", 1] };
+        let d = || doc! { "_id": 1, "status": "open", "qty": "x" };
+        for q in [
+            doc! { "$expr": { "$gt": [bad.clone(), 0] } },
+            doc! { "status": "open", "$expr": { "$gt": [bad.clone(), 0] } },
+            doc! { "$or": [ { "status": "closed" }, { "$expr": { "$gt": [bad.clone(), 0] } } ] },
+            doc! { "$nor": [ { "$expr": { "$gt": [bad.clone(), 0] } } ] },
+            doc! { "$and": [ { "$expr": { "$gt": [bad.clone(), 0] } } ] },
+            // `$cond` evaluates only the branch it takes; this one takes it.
+            doc! { "$expr": { "$cond": [true, bad.clone(), false] } },
+        ] {
+            let err = unevaluable(q.clone(), d());
+            assert!(err.contains("$add needs numbers, found a string"), "{q}: {err}");
+        }
+        // Inside `$elemMatch` the expression reads the element, and an element
+        // it cannot be evaluated against fails the request the same way.
+        let q = doc! { "lines": { "$elemMatch": { "$expr": { "$gt": [bad.clone(), 0] } } } };
+        let err = unevaluable(q, doc! { "_id": 2, "lines": [ { "qty": -5 }, { "qty": "x" } ] });
+        assert!(err.contains("_id 2") && err.contains("$add needs numbers"), "{err}");
+        let q =
+            doc! { "a": { "$not": { "$elemMatch": { "$expr": { "$gt": [bad.clone(), 0] } } } } };
+        assert!(unevaluable(q, doc! { "a": [ { "qty": "x" } ] }).contains("$add"));
+    }
+
+    #[test]
+    fn a_clause_that_decides_the_answer_spares_an_expression_that_cannot_be_evaluated() {
+        // A document fails only when its answer depends on the expression: a
+        // false clause of an `$and`, or a true branch of an `$or`, decides it
+        // whatever the expression would have said, and wherever it is written.
+        let bad = doc! { "$gt": [ { "$add": ["$qty", 1] }, 0 ] };
+        let d = doc! { "_id": 1, "status": "open", "qty": "x" };
+        let answer = |q: Document| matches(&parse(&q).unwrap(), &d).unwrap();
+        for (q, expected) in [
+            (doc! { "status": "closed", "$expr": bad.clone() }, false),
+            (doc! { "$expr": bad.clone(), "status": "closed" }, false),
+            (doc! { "$and": [ { "$expr": bad.clone() }, { "status": "closed" } ] }, false),
+            (doc! { "$or": [ { "status": "open" }, { "$expr": bad.clone() } ] }, true),
+            (doc! { "$or": [ { "$expr": bad.clone() }, { "status": "open" } ] }, true),
+            (doc! { "$nor": [ { "$expr": bad.clone() }, { "status": "open" } ] }, false),
+            // Between two expressions, the one that can be evaluated decides.
+            (doc! { "$and": [ { "$expr": bad.clone() }, { "$expr": false } ] }, false),
+            (doc! { "$or": [ { "$expr": bad.clone() }, { "$expr": true } ] }, true),
+            // `$cond` evaluates only the branch it takes.
+            (doc! { "$expr": { "$cond": [false, { "$add": ["$qty", 1] }, false] } }, false),
+        ] {
+            assert_eq!(answer(q.clone()), expected, "{q}");
+        }
+        // An element that matches decides an `$elemMatch`, whichever element
+        // could not be evaluated, and in either order.
+        let q = doc! { "lines": { "$elemMatch": { "$expr": bad.clone() } } };
+        let filter = parse(&q).unwrap();
+        for lines in [
+            bson::bson!([{ "qty": "x" }, { "qty": 5 }]),
+            bson::bson!([{ "qty": 5 }, { "qty": "x" }]),
+        ] {
+            assert!(matches(&filter, &doc! { "lines": lines.clone() }).unwrap(), "{lines}");
+        }
+        // Inside `$elemMatch` too, a cheap condition decides first.
+        let q = doc! { "lines": { "$elemMatch": { "$expr": bad.clone(), "sku": "z" } } };
+        let d = doc! { "lines": [ { "sku": "a", "qty": "x" } ] };
+        assert!(!matches(&parse(&q).unwrap(), &d).unwrap());
+        // An element a scalar `$elemMatch` reads has no fields: nothing is
+        // evaluated, so nothing fails.
+        let q = doc! { "lines": { "$elemMatch": { "$expr": bad } } };
+        assert!(!matches(&parse(&q).unwrap(), &doc! { "lines": [1, 2] }).unwrap());
+    }
+
+    #[test]
+    fn an_expression_that_decides_nothing_alone_still_fails_the_document() {
+        let bad = doc! { "$gt": [ { "$add": ["$qty", 1] }, 0 ] };
+        let d = || doc! { "_id": 1, "status": "open", "qty": "x" };
+        for q in [
+            doc! { "$and": [ { "$expr": bad.clone() }, { "$expr": true } ] },
+            doc! { "$or": [ { "$expr": bad.clone() }, { "$expr": false } ] },
+            doc! { "$expr": bad.clone(), "status": "open" },
+            doc! { "$nor": [ { "status": "closed" }, { "$expr": bad.clone() } ] },
+        ] {
+            assert!(unevaluable(q.clone(), d()).contains("$add needs numbers"), "{q}");
+        }
+    }
+
+    #[test]
+    fn clauses_without_an_expression_are_evaluated_first() {
+        // Not only the answer but the work: where a clause without `$expr`
+        // decides, the expression is never evaluated, wherever it is written.
+        // Counted on parsed filters, so the parser's ordering is what is held.
+        let gt = doc! { "$gt": ["$qty", 1] };
+        let d = doc! { "_id": 1, "kind": "a", "qty": 5, "lines": [ { "sku": "a", "qty": 5 } ] };
+        for (q, expected) in [
+            (doc! { "$expr": gt.clone(), "kind": "c" }, false),
+            (doc! { "$and": [ { "$expr": gt.clone() }, { "kind": "c" } ] }, false),
+            (doc! { "$or": [ { "$expr": gt.clone() }, { "kind": "a" } ] }, true),
+            (doc! { "$nor": [ { "$expr": gt.clone() }, { "kind": "a" } ] }, false),
+            // A field's conditions: the `$elemMatch` holding the expression
+            // goes after `$size`, which decides.
+            (doc! { "lines": { "$elemMatch": { "$expr": gt.clone() }, "$size": 0 } }, false),
+            // An `$elemMatch` body.
+            (doc! { "lines": { "$elemMatch": { "$expr": gt.clone(), "sku": "z" } } }, false),
+        ] {
+            let filter = parse(&q).unwrap();
+            let before = expr_evaluations();
+            assert_eq!(matches(&filter, &d).unwrap(), expected, "{q}");
+            assert_eq!(expr_evaluations() - before, 0, "{q} evaluated its expression");
+        }
+        // Where nothing cheaper decides, the expression is evaluated, once.
+        let filter = parse(&doc! { "$expr": gt, "kind": "a" }).unwrap();
+        let before = expr_evaluations();
+        assert!(matches(&filter, &d).unwrap());
+        assert_eq!(expr_evaluations() - before, 1);
+    }
+
+    #[test]
+    fn an_element_filter_fails_on_an_expression_it_cannot_evaluate() {
+        // An `arrayFilters` entry reaches one under an `$elemMatch` on a field
+        // of the element; answered as an error, not "not selected", naming the
+        // document the element is in.
+        let filter = Filter::Expr(Box::new(
+            Expr::parse(&Bson::Document(doc! { "$gt": [ { "$add": ["$qty", 1] }, 0 ] })).unwrap(),
+        ));
+        let id = Bson::Int32(7);
+        let err =
+            matches_element(&filter, &Bson::Document(doc! { "qty": "x" }), Some(&id)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid query: $expr cannot be evaluated for an array element of the document with \
+             _id 7: $add needs numbers, found a string"
+        );
+        let err = matches_element(&filter, &Bson::Document(doc! { "qty": "x" }), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid query: $expr cannot be evaluated for an array element: $add needs numbers, \
+             found a string"
+        );
+        assert!(matches_element(&filter, &Bson::Document(doc! { "qty": 1 }), None).unwrap());
+        assert!(!matches_element(&filter, &Bson::Int32(1), None).unwrap());
     }
 
     #[test]
@@ -1485,9 +1795,9 @@ mod decimal128 {
         // compares nothing and still finds a stored Decimal128.
         let stored = doc! { "v": dec() };
         let by_type = parse(&doc! { "v": { "$type": "decimal" } }).unwrap();
-        assert!(matches(&by_type, &stored));
+        assert!(matches(&by_type, &stored).unwrap());
         let exists = parse(&doc! { "v": { "$exists": true } }).unwrap();
-        assert!(matches(&exists, &stored));
+        assert!(matches(&exists, &stored).unwrap());
         assert!(parse(&doc! { "v": { "$eq": 1.5 } }).is_ok(), "a double compares as ever");
     }
 }

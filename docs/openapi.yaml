@@ -122,6 +122,15 @@ info:
     nothing after it names no parameter and is not refused. `/mcp` is a
     separate transport, outside this rule and outside this document.
 
+    A filter's `$expr` that cannot be evaluated against a document the
+    request examines — `{"$add": ["$qty", 1]}` where `qty` is a string —
+    fails the request `400 bad_request`, naming the document's `_id`, the
+    operator and the type (ADR-206), on every operation that takes a
+    filter: `find`, `count`, `update`, `delete`, `find_and_modify`, a
+    pipeline `$match` and a vector search's `filter`. A `multi` write that
+    meets one after committing a chunk answers `500 partially_applied` with
+    it as the cause.
+
     ## Paging
 
     **A `find` with no `limit` returns at most 100 documents, not all of them.**
@@ -1726,6 +1735,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/find_and_modify:
     parameters:
@@ -1893,6 +1903,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/docs/{id}:
     parameters:
@@ -2900,6 +2911,17 @@ components:
         parameter and says the route takes none (ADR-124). A query string is
         refused `400` where a body of the wrong shape is `422`: it is part of
         the request line, not an entity the server failed to process.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PartiallyApplied:
+      description: |
+        `partially_applied`, `retry: verify` (ADR-192): a `multi: true`
+        request failed after its first chunk committed. What landed stands
+        and replicates; `applied` says how much, and `cause` why the rest did
+        not: the code and message the failure would have had on its own, such
+        as `bad_request` for an operator a later document cannot take or a
+        filter whose `$expr` cannot be evaluated against one (ADR-206).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

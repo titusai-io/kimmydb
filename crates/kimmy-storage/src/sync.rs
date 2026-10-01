@@ -4768,7 +4768,7 @@ mod tests {
         for (lower, upper) in &plan.ranges {
             for key in a.index_candidates(&coll, plan.index_id, lower, upper).unwrap() {
                 if let Some(d) = a.get_by_encoded_key(&coll, &key).unwrap()
-                    && kimmy_query::filter::matches(&filter, &d)
+                    && kimmy_query::filter::matches(&filter, &d).unwrap()
                 {
                     found.push(d.get_str("_id").unwrap().to_string());
                 }
