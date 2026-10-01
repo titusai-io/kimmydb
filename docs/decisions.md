@@ -22245,6 +22245,13 @@ claimed; the apply-time claim not run; plain operations' paths not claimed.
 
 ## ADR-206 — A filter's `$expr` that cannot be evaluated fails the request
 
+> **Amended by [ADR-211](#adr-211--an-expressions-and-and-or-fail-only-when-the-answer-depends-on-an-argument-that-cannot-be-evaluated).**
+> Inside one `$expr` the expression's own `$and` and `$or` are now
+> three-valued too, by the same scan as the filter level's, so the bullet
+> "Inside one `$expr` the expression language's own rule holds" below no
+> longer describes them: `{"$expr": {"$or": [{"$eq": ["$kind", "c"]}, <bad>]}}`
+> is true over a document whose `kind` is `"c"`.
+
 **Status:** accepted, for the next `0.MINOR`. Amends
 [ADR-106](#adr-106--expr-joins-the-filter-language-by-delegating-to-the-expression-evaluator),
 which deferred it. Extends
@@ -22725,3 +22732,250 @@ unknown.
 `$project`, a document turned into pairs and back with an override through
 `$addFields`, seven refusals as `400`s with their messages, and a stored
 `Decimal128` refused by `$setIsSubset`.
+
+---
+
+## ADR-211 — An expression's `$and` and `$or` fail only when the answer depends on an argument that cannot be evaluated
+
+**Status:** accepted, for the next `0.MINOR`. Amends the bullet of
+[ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request)
+that begins "Inside one `$expr` the expression language's own rule holds",
+which recorded this change as left for a later release.
+
+**The defect.** The expression language's `$and` and `$or` evaluated every
+argument, in the order written, before reading any of them, so the first
+argument that could not be evaluated failed the call even when another argument
+had already decided it. The type guard `aggregation.md` recommends for `$cond`,
+written with `$and`:
+
+```json
+{"$and": [{"$isArray": "$tags"}, {"$gt": [{"$size": "$tags"}, 2]}]}
+```
+
+failed over `{_id: 7, tags: "red"}` with `$size needs an array, found a
+string`, though its first argument is `false` and so is the answer, whatever
+`$size` would have said. The guard failed on exactly the documents it exists to
+protect. Written with `$cond`, or as two filter clauses (ADR-206's
+three-valued matcher), the same question answered `false`: three spellings of
+one question, and one of them failed. The defect reached every caller of the
+evaluator: a filter's `$expr`, `$project`, `$addFields`, `$replaceRoot`,
+`$group` keys and accumulators, `$filter`'s `cond`, `$map` and `$reduce`
+bodies, a `$lookup`'s `let` values and its pipeline, a vector search's
+`filter`, an `arrayFilters` entry's `$expr`
+([ADR-209](#adr-209--an-arrayfilters-entry-takes-expr-reading-the-element-as-identifier)),
+and the MCP tools.
+
+**Decision.**
+
+- **Three-valued and order-free.** Each argument is true, false, or not known
+  (it cannot be evaluated). Truthiness is unchanged: `false`, `null`, `0` and a
+  missing field are false; everything else, `""` and `[]` included, is true.
+
+  | `$and`, in any order | Result |
+  |---|---|
+  | any argument false | `false` |
+  | none false, at least one not known | the error of the earliest-written argument that has one |
+  | all true | `true` |
+
+  | `$or`, in any order | Result |
+  |---|---|
+  | any argument true | `true` |
+  | none true, at least one not known | the error of the earliest-written argument that has one |
+  | all false | `false` |
+
+  The result is always a boolean, never the argument that decided it. `$not`
+  of not known is not known, so `{$not: [{$and: [<bad>, true]}]}` fails and
+  `{$not: [{$and: [<bad>, false]}]}` is `true`. **When no argument fails, every
+  answer is what it was**, so no request that answered before changes its
+  answer.
+- **The error reported is specified by written position, not by evaluation
+  order.** An error result means no argument decided, which means every
+  argument was evaluated, so "the earliest-written argument that failed" is
+  well defined whatever order they ran in. Today the arguments run in the
+  order written and the first error met is kept, which is the same thing; a
+  later change that reorders them for speed (cheap first, as ADR-206 does for
+  filter clauses) must keep the error of the lowest written position, not the
+  first one met.
+- **Evaluation stops at the first argument that decides.** An error does not
+  stop the scan: it is held, and returned only if nothing decides. Expressions
+  are pure, so which arguments run changes the work, never the answer.
+- **One implementation for both levels.** `expr::all_of` and `expr::any_of`
+  are the scan; the expression's `$and` and `$or` and the filter level's
+  `$and`, `$or`, `$nor`, a field's conditions and `$elemMatch` all call them.
+  The two levels cannot drift apart: the same question asked with filter
+  clauses or inside one `$expr` gets the same answer, or the same error, in
+  every order. `filter::all_of` and `filter::any_of`, which ADR-206 wrote, are
+  gone.
+- **Which errors wait.** Errors are of two kinds, and only the first may be
+  held while another argument may still decide:
+  - **value errors**: this value has no answer under this operator — a type an
+    operator cannot take, `$divide` or `$mod` by zero, a `$switch` with no
+    match and no `default`, a `$filter` limit that is not a positive number,
+    and `$range` past its 100,000 elements (refused before anything is
+    allocated, so it means "no value", and every other argument keeps its own
+    cap). Every evaluation-time error is an `InvalidQuery` of this kind.
+  - **request errors**, which stop the evaluation at once: anything about the
+    whole request rather than one value, and a broken invariant. The one
+    request-wide budget today is the pipeline's document ceiling
+    (`aggregate::check_limit`), now `Error::Limit`: answered as before, the
+    same `400` and the same words, and classified as a request refusal for
+    replication like `InvalidQuery`, but never deferred. It is not raised
+    inside an `$and`, an `$or` or an accumulator today; the kind makes sure it
+    is not held back if it ever is. A deadline, a cancellation or a memory
+    budget, should one be added, is the same kind of error. Holding one
+    would let an argument that happens to decide hide it on some documents
+    and show it on others.
+
+  The split is `kimmy_core::Error::is_deferrable`, an exhaustive match with no
+  wildcard, so the first request-wide error added later will not compile until
+  it is classified, and it belongs on the `false` side; it must not be spelled
+  as an `InvalidQuery`. **"Variable not bound" is now `Error::Internal`**, the
+  one non-deferrable error evaluation can raise: parsing declares every name
+  before its body, so it means a caller evaluated with fewer bindings than it
+  parsed with, a bug. Where it reaches the HTTP layer as itself it answers
+  `500 internal`, not `400`, and it passes through the filter's `$expr cannot
+  be evaluated` wrapping unchanged. On the update path it does not: the
+  engine's selection (`Modify::apply`) carries an apply error as text, and the
+  storage layer reports that text as an `InvalidQuery`, so there it would
+  answer `400`. That path is left as it is, because the error is unreachable
+  from any request, as it was when it was a `400`.
+- **Unchanged, and correct by the rule.** `$cond`, `$ifNull`, `$switch` and
+  `$convert` already evaluate only what they need. **`{$cond: [<bad>, 1, 1]}`
+  stays an error**: deciding it would mean evaluating both branches and
+  comparing them, which gives up the laziness its guard use rests on, and a
+  conditional with an unknown condition is unknown in three-valued logic
+  anyway. `$not`, `$filter`, `$map`, `$reduce` and every strict operator
+  (arithmetic, string, comparison, array) need every argument.
+- **`$group`'s `$last` holds an error the same way.** It evaluated every
+  document's value with `?` and kept the last, so a value that could not be
+  evaluated on any document but the last failed the request, though only the
+  last value is the answer. Each group now holds its latest result, value or
+  error, and fails at the end only if that is an error; a later document's
+  value replaces an earlier error, and a non-deferrable error still stops at
+  once. Without a `$sort` before the `$group`, whether `$last` fails follows
+  the order the documents arrive in, as its value already does. `$first`
+  already read only the first document. `$sum`, `$avg`,
+  `$min`, `$max`, `$push` and `$addToSet` need every value, so stay strict.
+- **Known, and not changed here: `$let` binds its variables eagerly.**
+  `{$let: {vars: {r: {$divide: [1, "$n"]}}, in: {$cond: [{$eq: ["$n", 0]}, 0,
+  "$$r"]}}}` fails with `$divide by zero` when `n` is 0, though the body never
+  reads `r`. Making bindings call-by-need is a change to `Scope` and its own
+  question, recorded for a later release.
+
+**Cost.** With nothing failing, the work is never more than before, and less
+whenever an argument decides before the last: the old path evaluated every
+argument. After an error, the scan goes on to the argument that decides, or to
+the end; that is more than the old path, which stopped at the first error and
+failed the request, and never more than the old path's cost when nothing fails.
+Each held error has its message formatted and then dropped when an argument
+decides, once per document in a scan, which is small beside decoding the
+document. Writing the cheap guard first gives the same answer with less work.
+
+**Why.** It is ADR-206's rule one level down: a request fails exactly when its
+answer depends on something that cannot be evaluated, and the outcome does not
+depend on the order the caller wrote things in. Left-to-right short-circuit
+would have fixed the guard and kept the order dependence: `{$and: [<bad>,
+false]}` would fail where `{$and: [false, <bad>]}` answers, and the filter
+`{$and: [{$expr: <bad>}, {kind: "b"}]}` would answer where `{$expr: {$and:
+[<bad>, {$eq: ["$kind", "b"]}]}}` fails, the same question with two answers.
+
+**Caller-visible.**
+
+- **A pipeline stage that computes** (`$project`, `$addFields`,
+  `$replaceRoot`, `$group`, `$filter`'s `cond`, `$map`, `$reduce`, a
+  `$lookup`'s `let` values) and failed with a `400` now answers when an
+  argument decides. It relaxes an error into an
+  answer, and no request that answered changes its answer: CHANGELOG
+  **Changed**, not breaking. A caller that relied on the `400` to find bad data
+  inside a decided branch gets the correct answer and should ask for bad data
+  directly (`$type`, `$convert` with `onError`).
+- **An `arrayFilters` entry's `$expr`** is new in the same release
+  (ADR-209), and follows this rule from the start.
+- **A filter's `$expr`**, a pipeline `$match`'s included, has not shipped as
+  a `400`: ADR-206 is in the same release, and before it such an expression
+  read as no match. Across the
+  release, `{$expr: {$or: [<bad>, {$eq: ["$kind", "a"]}]}}` over a document
+  whose `kind` is `"a"` used to leave the document out and now includes it,
+  so a `multi` `update` or `delete` now touches a document it skipped; so does
+  `{$not: [{$and: [<bad>, false]}]}`. The new answer is the correct one. It is
+  folded into ADR-206's **Breaking** CHANGELOG entry, which describes the
+  combined change.
+- **During a roll** from 0.43, a filter `$expr` with a deciding argument
+  answers `200` without the document on a 0.43 member and `200` with it on a
+  new one; a pipeline stage answers `400` on a 0.43 member and `200` on a new
+  one. Nothing evaluated in the background or on replication runs an
+  expression (ADR-206), so no member computes different stored state. Rolling
+  back restores the old answers.
+
+**Rejected.**
+
+- *Left-to-right short-circuit* (stop at the first false, fail at the first
+  error). Order-dependent, as above, which is the class of surprise ADR-206
+  removed.
+- *Keep the expression strict and document harder.* The documentation already
+  advised writing alternatives as filter clauses, which does not help
+  `$project`, `$addFields`, `$group` or `$filter`'s `cond`, where there are no
+  filter clauses to move to.
+- *Evaluate every argument, then apply the three-valued rule.* Same answers,
+  more work.
+- *Defer every error, "variable not bound" included.* A binding bug would show
+  on some documents and hide on others, depending on data.
+- *Decide `{$cond: [<bad>, x, x]}`.* As above.
+- *Reorder arguments cheap first now.* Only a speed-up; the answers are
+  already order-free. The rule for the reported error is written so that it
+  survives one.
+
+### Test
+
+`kimmy-query` `expr::and_or`: both truth tables, each row in both argument
+orders, with four kinds of failing argument (a type error, `$divide` by zero,
+`$range` past its cap, `$switch` with no match) against the deciders `false`,
+`0`, `0.0`, `null` and a missing field for `$and` and `true`, `1`, `""`, `[]`,
+a string and a document for `$or`; the answer is exactly a boolean; the error
+reported is the earliest written, with two distinct messages in several
+orders; nesting under `$or`, `$not` and `$cond`, and `$cond: [<bad>, 1, 1]`
+still failing; the guard example; a per-argument counter
+(`expr::logic_arguments`, test-only) shows evaluation stops at the deciding
+argument, goes on past an error, and that `$filter`'s `limit` still stops
+early; an unbound variable fails an `$or` beside `true` with `Internal`, and the
+shared scan returns such an error at once; a property test over random
+argument lists of true, false and distinct errors compares answer, reported
+error and evaluation count with a three-valued reference model. `filter`: 516
+combinations of `$and`/`$or` over parts that are true or false (each with and
+without `$expr`) and two distinct failures give the same result as filter
+clauses and as one `$expr`; an unbound variable fails a filter beside a true
+`$or` branch with `Internal`, unwrapped.
+`aggregate`: `$project`, `$addFields`, a `$group` accumulator, `$filter`'s
+`cond` and `$match` answer where an argument decides and fail where none does;
+`$last` answers over a group whose earlier value fails, in either group, and
+fails when the last value does, and `$first` is unchanged.
+`kimmy-api`: over HTTP, a `find` with a deciding `$and` and `$or` in both
+orders, the guard, a `multi` `update` that now selects the document, a
+`$project` and a `$group`, each with a `400` control where nothing decides, and
+a `$last` after a `$sort` either way; a
+broken invariant maps to `500 internal`. `kimmy-core`: only `InvalidQuery`
+is deferrable.
+
+Each guard was broken and its tests failed: an error returned as soon as it is
+met; every argument evaluated strictly, as before; every argument evaluated and
+then read three-valued (only the counted tests fail, the answers being
+unchanged); an error winning over a false `$and` argument, and over a true
+`$or` argument; the last error reported instead of the first; the scan going on
+after the deciding argument (counted tests only); `$or` reading an error as
+false and `$and` as true; falsiness tested as `== false`; `$and` answering the
+deciding value instead of a boolean; "variable not bound" made a value error;
+a non-deferrable error deferred; the filter level's `$or` given its own strict
+scan; the filter wrapping rewording an `Internal` error; `$last` evaluating
+every document strictly again, and an earlier `$last` error surviving a later
+document's value; `$last` holding back a non-deferrable error; the pipeline
+ceiling spelled `InvalidQuery` again, `Limit` made deferrable, taken out of
+the request refusals, or mapped to anything but the `400` it was.
+
+A second property test builds random `$and`/`$or`/`$not`/`$cond` trees to
+depth five over literals, distinct value errors and an unbound variable, and
+compares each answer, error and count of `$and`/`$or` arguments evaluated with
+a naive three-valued reference; another shuffles the arguments of every
+`$and`/`$or` and expects the same value answer. A `$group` whose `$last` reads
+an unbound variable on one document and a good value on the next fails with
+`Internal`, and the pipeline ceiling is an `Error::Limit` with the same text
+as before.

@@ -53,6 +53,15 @@ pub enum Error {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    /// A request went past a limit set for the whole request, such as the
+    /// number of documents a pipeline stage may hold. Answered exactly as an
+    /// [`Error::InvalidQuery`] is, the same `400` and the same words, and
+    /// kept apart from it only so that nothing evaluating one value at a
+    /// time can set it aside: a budget for the request is never deferred
+    /// (ADR-211, [`Error::is_deferrable`]).
+    #[error("invalid query: {0}")]
+    Limit(String),
+
     #[error("invalid update: {0}")]
     InvalidUpdate(String),
 
@@ -85,6 +94,15 @@ pub enum Error {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// An invariant of this build does not hold: a bug, never something the
+    /// request or the data could cause. Kept apart from
+    /// [`Error::InvalidQuery`] so that nothing which sets an evaluation error
+    /// aside while another argument may still decide (an expression's `$and`
+    /// and `$or`, ADR-211) can set this one aside too, and show it for some
+    /// documents and hide it for others. See [`Error::is_deferrable`].
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl Error {
@@ -115,6 +133,7 @@ impl Error {
             // What was asked is not something this build can honour, and
             // retrying cannot change that.
             Error::InvalidQuery(_)
+            | Error::Limit(_)
             | Error::UnsupportedOperator { .. }
             | Error::Unsupported(_)
             | Error::IndexExists { .. } => true,
@@ -145,6 +164,56 @@ impl Error {
             // A value that will not decode or encode. Indistinguishable here
             // from corruption, which must never be skipped quietly.
             Error::Bson(_) | Error::Serialization(_) => false,
+
+            // A bug in this build. Failing the round is the safe answer.
+            Error::Internal(_) => false,
+        }
+    }
+
+    /// Whether an expression's `$and` or `$or` may hold this error while its
+    /// other arguments are evaluated, and drop it when one of them decides
+    /// (ADR-211).
+    ///
+    /// Only an error that says *this value has no answer* may wait: a type
+    /// the operator cannot take, a division by zero, a `$switch` with no
+    /// match, a `$range` past its size. Its argument is then "not known",
+    /// and a `false` beside it in an `$and` (a `true` in an `$or`) is the
+    /// answer whatever it would have been. Every evaluation-time error is an
+    /// [`Error::InvalidQuery`] of that kind.
+    ///
+    /// Anything that is about the *request* rather than one value — a
+    /// deadline, a cancellation, a memory budget for the whole request — and
+    /// a broken invariant ([`Error::Internal`]) must stop the evaluation at
+    /// once: deferring it would let an argument that happens to decide hide
+    /// it on some documents and not on others. **Exhaustive on purpose, with
+    /// no wildcard**, like [`Error::is_a_request_refusal`]: the first such
+    /// error added later will not compile until it is classified here, and
+    /// it belongs on the `false` side. It must not be spelled as an
+    /// `InvalidQuery`.
+    pub fn is_deferrable(&self) -> bool {
+        match self {
+            Error::InvalidQuery(_) => true,
+
+            Error::Internal(_)
+            | Error::Limit(_)
+            | Error::DatabaseNotFound(_)
+            | Error::CollectionNotFound { .. }
+            | Error::CollectionExists { .. }
+            | Error::IndexExists { .. }
+            | Error::DocumentNotFound(_)
+            | Error::DuplicateKey(_)
+            | Error::UniqueViolation { .. }
+            | Error::Unsupported(_)
+            | Error::InvalidDocumentId { .. }
+            | Error::InvalidName { .. }
+            | Error::InvalidUpdate(_)
+            | Error::UnsupportedOperator { .. }
+            | Error::ResumeTokenExpired
+            | Error::MalformedResumeToken
+            | Error::MalformedCursor
+            | Error::MalformedStamp
+            | Error::Bson(_)
+            | Error::Serialization(_) => false,
         }
     }
 
@@ -188,6 +257,19 @@ impl From<serde_json::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_value_error_may_wait_for_another_argument_to_decide() {
+        assert!(Error::InvalidQuery("$divide by zero".into()).is_deferrable());
+        assert!(!Error::Internal("variable $$x is not bound".into()).is_deferrable());
+        assert!(!Error::Internal("x".into()).is_a_request_refusal());
+        // A budget for the whole request is never deferred, though it reads
+        // and is refused like a bad query.
+        let limit = Error::Limit("$group produced 3 documents".into());
+        assert!(!limit.is_deferrable());
+        assert!(limit.is_a_request_refusal());
+        assert_eq!(limit.to_string(), "invalid query: $group produced 3 documents");
+    }
 
     #[test]
     fn valid_names_are_accepted() {

@@ -829,9 +829,13 @@ fn set_computed(
 }
 
 /// Refuse rather than truncate.
+///
+/// An [`Error::Limit`], not an `InvalidQuery`: the ceiling is a budget for
+/// the whole request, which an `$and`, `$or` or `$last` must never hold back
+/// while another value decides (ADR-211).
 pub fn check_limit(stage: &str, produced: usize, limits: &Limits) -> Result<()> {
     if produced > limits.max_documents {
-        return Err(Error::InvalidQuery(format!(
+        return Err(Error::Limit(format!(
             "{stage} produced {produced} documents, over the pipeline limit of {}. Narrow the \
              pipeline with an earlier $match",
             limits.max_documents
@@ -985,7 +989,12 @@ enum AccState {
     Sum(Total),
     Avg(f64, usize),
     MinMax(Option<Bson>),
-    FirstLast(Option<Bson>),
+    First(Option<Bson>),
+    /// The latest document's value, or why it has none. Only the last
+    /// document's value is the answer, so an earlier one that cannot be
+    /// evaluated is replaced by the next, and fails the request only if no
+    /// later document comes (ADR-211).
+    Last(Option<Result<Bson>>),
     Push(Vec<Bson>),
     /// The members in first-seen order, and the [`group_key`] of each, which
     /// is what makes two values one member (ADR-186).
@@ -1026,17 +1035,17 @@ fn group(
         }
     }
 
-    Ok(order
+    order
         .into_iter()
         .map(|bucket| {
             let mut out = Document::new();
             out.insert("_id", bucket.key);
             for (state, (name, _)) in bucket.values.into_iter().zip(fields) {
-                out.insert(name.clone(), finish(state));
+                out.insert(name.clone(), finish(state)?);
             }
-            out
+            Ok(out)
         })
-        .collect())
+        .collect()
 }
 
 fn init((_, acc): &(String, Accumulator)) -> AccState {
@@ -1044,7 +1053,8 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
         Accumulator::Sum(_) => AccState::Sum(Total::default()),
         Accumulator::Avg(_) => AccState::Avg(0.0, 0),
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
-        Accumulator::First(_) | Accumulator::Last(_) => AccState::FirstLast(None),
+        Accumulator::First(_) => AccState::First(None),
+        Accumulator::Last(_) => AccState::Last(None),
         Accumulator::Push(_) => AccState::Push(Vec::new()),
         Accumulator::AddToSet(_) => AccState::AddToSet(Vec::new(), Default::default()),
     }
@@ -1077,14 +1087,16 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
                 *current = Some(v);
             }
         }
-        (AccState::FirstLast(current), Accumulator::First(e)) => {
+        (AccState::First(current), Accumulator::First(e)) => {
             if current.is_none() {
                 *current = Some(e.eval_in(scope)?);
             }
         }
-        (AccState::FirstLast(current), Accumulator::Last(e)) => {
-            *current = Some(e.eval_in(scope)?);
-        }
+        (AccState::Last(current), Accumulator::Last(e)) => match e.eval_in(scope) {
+            // A broken invariant is not a value a later document replaces.
+            Err(err) if !err.is_deferrable() => return Err(err),
+            value => *current = Some(value),
+        },
         (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval_in(scope)?),
         (AccState::AddToSet(items, keys), Accumulator::AddToSet(e)) => {
             let v = e.eval_in(scope)?;
@@ -1100,17 +1112,18 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Res
     Ok(())
 }
 
-fn finish(state: AccState) -> Bson {
-    match state {
+fn finish(state: AccState) -> Result<Bson> {
+    Ok(match state {
         // An integer sum stays an integer, exactly rather than approximately:
         // `Total` accumulates in i64 and only widens when an operand is a
         // double or the addition overflows. Same reasoning as ADR-002.
         AccState::Sum(total) => total.to_bson(),
         AccState::Avg(_, 0) => Bson::Null,
         AccState::Avg(total, n) => Bson::Double(total / n as f64),
-        AccState::MinMax(v) | AccState::FirstLast(v) => v.unwrap_or(Bson::Null),
+        AccState::MinMax(v) | AccState::First(v) => v.unwrap_or(Bson::Null),
+        AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
-    }
+    })
 }
 
 fn numeric(value: &Bson) -> Option<f64> {
@@ -1874,6 +1887,23 @@ mod tests {
     }
 
     #[test]
+    fn the_pipeline_ceiling_is_a_request_limit_that_is_never_deferred() {
+        // Worded and answered as before, but its own kind, so an `$and`,
+        // `$or` or `$last` cannot hold it back (ADR-211).
+        let input: Vec<Document> = (0..3).map(|i| doc! { "k": i }).collect();
+        let limits = Limits { max_documents: 2 };
+        let stages = parse(&[doc! {"$group": {"_id": "$k"}}]).unwrap();
+        let err = apply(&stages[0], input, &limits).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)), "{err:?}");
+        assert!(!err.is_deferrable());
+        assert_eq!(
+            err.to_string(),
+            "invalid query: $group produced 3 documents, over the pipeline limit of 2. Narrow \
+             the pipeline with an earlier $match"
+        );
+    }
+
+    #[test]
     fn unwind_is_capped_while_it_expands_not_after() {
         // A few documents holding huge arrays exceed the cap long before the
         // outer loop ends; checking only at the end would allocate all of it.
@@ -2167,6 +2197,130 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![doc! { "qty": "ten", "n": 0 }]);
+    }
+
+    // -- $and and $or in a stage (ADR-211) ----------------------------------
+
+    /// `qty` cannot be added to; `kind` decides.
+    fn bad_row() -> Vec<Document> {
+        docs(vec![doc! { "_id": 3, "qty": "twelve", "kind": "a" }])
+    }
+
+    #[test]
+    fn a_stage_answers_where_an_argument_decides_an_and_or_an_or() {
+        let bad = doc! { "$add": ["$qty", 1] };
+        let out = run(
+            vec![doc! {"$project": {
+                "x": {"$and": [false, bad.clone()]},
+                "y": {"$and": [bad.clone(), {"$eq": ["$kind", "b"]}]},
+                "z": {"$or": [bad.clone(), {"$eq": ["$kind", "a"]}]},
+            }}],
+            bad_row(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! { "_id": 3, "x": false, "y": false, "z": true }]);
+
+        let out =
+            run(vec![doc! {"$addFields": {"x": {"$or": [true, bad.clone()]}}}], bad_row()).unwrap();
+        assert_eq!(out[0].get("x"), Some(&Bson::Boolean(true)));
+
+        // An accumulator whose `$cond` reads a deciding `$and`.
+        let out = run(
+            vec![doc! {"$group": {"_id": null, "n": {"$sum": {"$cond": [
+                {"$and": [{"$eq": ["$kind", "b"]}, {"$gt": [bad.clone(), 0]}]}, 1, 0
+            ]}}}}],
+            bad_row(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! { "_id": Bson::Null, "n": 0_i64 }]);
+
+        // `$filter`'s `cond`, per element.
+        let out = run(
+            vec![doc! {"$project": {"kept": {"$filter": {
+                "input": [1, 2, 6],
+                "as": "i",
+                "cond": {"$and": [{"$gt": ["$$i", 5]}, {"$add": ["$qty", "$$i"]}]},
+            }}}}],
+            bad_row(),
+        )
+        .unwrap_err();
+        // 6 passes the guard, so its `$add` is reached and fails the stage.
+        assert!(out.to_string().contains("$add needs numbers"), "{out}");
+        let out = run(
+            vec![doc! {"$project": {"kept": {"$filter": {
+                "input": [1, 2],
+                "as": "i",
+                "cond": {"$and": [{"$gt": ["$$i", 5]}, {"$add": ["$qty", "$$i"]}]},
+            }}}}],
+            bad_row(),
+        )
+        .unwrap();
+        assert_eq!(out[0].get("kept"), Some(&Bson::Array(vec![])));
+    }
+
+    #[test]
+    fn a_stage_still_fails_where_no_argument_decides() {
+        let bad = doc! { "$add": ["$qty", 1] };
+        for stage in [
+            doc! {"$project": {"x": {"$and": [bad.clone(), {"$eq": ["$kind", "a"]}]}}},
+            doc! {"$addFields": {"x": {"$or": [bad.clone(), false]}}},
+            doc! {"$group": {"_id": null, "n": {"$sum": {"$cond": [
+                {"$and": [{"$eq": ["$kind", "a"]}, {"$gt": [bad.clone(), 0]}]}, 1, 0
+            ]}}}},
+            doc! {"$match": {"$expr": {"$and": [bad.clone(), true]}}},
+        ] {
+            let e = run(vec![stage.clone()], bad_row()).unwrap_err();
+            assert!(e.to_string().contains("$add needs numbers"), "{stage}: {e}");
+        }
+        // A `$match` whose `$and` is decided keeps or drops the document.
+        let kept =
+            run(vec![doc! {"$match": {"$expr": {"$or": [bad.clone(), true]}}}], bad_row()).unwrap();
+        assert_eq!(kept.len(), 1);
+        let dropped =
+            run(vec![doc! {"$match": {"$expr": {"$and": [bad, false]}}}], bad_row()).unwrap();
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn last_fails_only_when_the_last_value_cannot_be_evaluated() {
+        // Only the last document's value is the answer, so an earlier one
+        // that cannot be evaluated is not part of it (ADR-211).
+        let stage = || doc! {"$group": {"_id": "$k", "v": {"$last": {"$add": ["$qty", 1]}}}};
+        let bad = |k: &str| doc! { "k": k, "qty": "twelve" };
+        let good = |k: &str, q: i32| doc! { "k": k, "qty": q };
+        let out = run(vec![stage()], vec![bad("a"), good("a", 5), good("b", 1)]).unwrap();
+        assert_eq!(out, vec![doc! { "_id": "a", "v": 6_i64 }, doc! { "_id": "b", "v": 2_i64 }]);
+        // Another group's bad value does not touch this one's.
+        let out = run(vec![stage()], vec![good("a", 5), bad("b"), good("b", 1)]).unwrap();
+        assert_eq!(out[1], doc! { "_id": "b", "v": 2_i64 });
+        // The last value fails, so the request does, whatever came before.
+        for input in
+            [vec![good("a", 5), bad("a")], vec![bad("a"), good("a", 5), bad("a")], vec![bad("a")]]
+        {
+            let e = run(vec![stage()], input).unwrap_err();
+            assert!(e.to_string().contains("$add needs numbers"), "{e}");
+        }
+        // `$first` reads only the first document, as before.
+        let first = doc! {"$group": {"_id": null, "v": {"$first": {"$add": ["$qty", 1]}}}};
+        let out = run(vec![first], vec![good("a", 5), bad("a")]).unwrap();
+        assert_eq!(out[0].get("v"), Some(&Bson::Int64(6)));
+    }
+
+    #[test]
+    fn last_does_not_hold_back_an_error_that_cannot_wait() {
+        // An unbound variable is a bug, not a value a later document
+        // replaces: the group fails on the document that raised it, even
+        // though the last document's value is good.
+        let stages = parse_with_vars(
+            &[doc! {"$group": {"_id": null, "v": {"$last": {"$cond": [
+                {"$eq": ["$k", "a"]}, "$$x", 1
+            ]}}}}],
+            &["x".to_string()],
+        )
+        .unwrap();
+        let input = docs(vec![doc! { "k": "a" }, doc! { "k": "b" }]);
+        let err = apply(&stages[0], input, &Limits::default()).unwrap_err();
+        assert!(matches!(err, Error::Internal(_)), "{err:?}");
     }
 
     // -- the leading $match -----------------------------------------------

@@ -110,22 +110,57 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `500 partially_applied` with it as the cause. A missing field is still null
   and null still propagates, so `{$add: ["$missing", 1]}` is a non-match, not
   an error. A request fails exactly when its answer depends on such a
-  document, at the level of filter clauses: a clause without `$expr` that
-  excludes it (or an `$or` branch that admits it) decides it, wherever the
-  clause is written and whether the collection is scanned or an index leaves
-  it out. Inside one `$expr` the expression's own `$and` and `$or` evaluate
-  every argument (`$cond` only the branch it takes), so write alternatives
-  that may not be evaluable as filter clauses. `count`, a `sort` and
+  document: a clause without `$expr` that excludes it (or an `$or` branch that
+  admits it) decides it, wherever the clause is written and whether the
+  collection is scanned or an index leaves it out, and inside one `$expr` the
+  expression's own `$and` and `$or` follow the same rule, in any order: an
+  `$and` with a false argument is false and an `$or` with a true one is true,
+  whatever an argument that cannot be evaluated would have said (`$cond`
+  evaluates only the branch it takes). That last part also changes an answer
+  with no error in it: 0.43.0 read the whole `$expr` as no match as soon as
+  any argument failed, so `{"$expr": {"$or": [<bad>, {"$eq": ["$kind",
+  "a"]}]}}` left out a document whose `kind` is `"a"`, and now includes it;
+  so does `{"$not": [{"$and": [<bad>, false]}]}`. A `multi` `update` or
+  `delete` with such a filter now touches documents it used to skip
+  ([ADR-211](docs/decisions.md)). `count`, a `sort` and
   `find_and_modify` read every document the other clauses admit; a `find`
   with a `limit` and no `sort`, and a single-document write, stop once they
   have what they return; in an aggregation, `$limit` does not stop the read
   of a leading `$match`. An `arrayFilters` entry's `$expr` under an
   `$elemMatch` fails the update the same way. Check stored filters before
-  upgrading: one whose `$expr` met documents of the wrong type now fails;
-  guard it with `$type`, `$convert` with `onError`, or a clause that excludes
-  them
+  upgrading: one whose `$expr` met documents of the wrong type now fails
+  unless another clause or argument decides them, and one whose `$or` (or
+  `$not` of an `$and`) holds an argument that fails on some documents now
+  selects documents it did not; guard it with `$type`, `$convert` with
+  `onError`, or a clause or argument that decides them
   ([ADR-206](docs/decisions.md),
   [Query language](docs/query-language.md#expr--comparing-fields-of-the-same-document)).
+- **An expression's `$and` is false when any argument is false, and its `$or`
+  true when any is true, even beside an argument that cannot be evaluated, in
+  whatever order they are written.** Both used to evaluate every argument
+  first, so in a pipeline stage `{"$and": [{"$isArray": "$tags"}, {"$gt":
+  [{"$size": "$tags"}, 2]}]}` failed with a `400` on a document whose `tags`
+  is a string, though its first argument already decided it. They now stop
+  at the first argument that decides, and fail only when none does, with the
+  error of the earliest-written argument that failed; the result is always a
+  boolean. On `$project`, `$addFields`, `$replaceRoot`, `$group`, `$filter`'s
+  `cond`, `$map`, `$reduce` and a `$lookup`'s `let` values, and in the MCP
+  `aggregate` tool; an `arrayFilters` entry's `$expr`, new in this release,
+  follows the same rule. No request that answered changes its answer; a request that failed only inside a
+  decided argument now answers. To find documents with bad data, ask for them
+  (`$type`, `$convert` with `onError`) rather than relying on the `400`. A
+  filter's `$expr`, a pipeline `$match`'s included, is covered by the
+  Breaking entry above
+  ([ADR-211](docs/decisions.md),
+  [Aggregation](docs/aggregation.md#behaviours-worth-knowing)).
+- **A `$group`'s `$last` fails only when the last document's value cannot be
+  evaluated.** It evaluated its expression for every document of a group and
+  kept the last, so `{"$last": {"$add": ["$qty", 1]}}` failed with a `400`
+  when any document but the last held a string `qty`, though only the last
+  value is the answer. An earlier document's failure is now replaced by the
+  next document's value. No request that answered changes its answer
+  ([ADR-211](docs/decisions.md),
+  [Aggregation](docs/aggregation.md#accumulators)).
 - **Several bounds on one indexed field read the range of the tightest, in any
   order.** The planner kept the first lower and the first upper bound it met,
   so `{"$and": [{"a": {"$gt": 0}}, {"a": {"$gt": 5}}]}` read the index from 0

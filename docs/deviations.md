@@ -408,6 +408,30 @@ refusal goes when the canonical order can place one ([ADR-005](decisions.md)).
 
 ---
 
+## 🟡 An expression's `$and`/`$or` that one argument decides answers beside an argument that cannot be evaluated, in any order
+
+**Raised 2026-10-01, with ADR-211.** MongoDB documents its expression `$and`
+and `$or` as short-circuiting: they stop at the first false (true) argument in
+the order written, so `{$and: [false, <bad>]}` answers and `{$and: [<bad>,
+false]}` fails. Here both answer `false`: an argument that cannot be evaluated
+fails an `$and` only when no argument is false, and an `$or` only when none is
+true, whatever the order, with the error of the earliest-written failing
+argument. The reading of MongoDB is from its documentation and was not checked
+against a live server; its optimiser may also evaluate an argument early (by
+folding constants), so its own error behaviour does not necessarily follow the
+written order either.
+
+**Why.** The filter level already answers this way (ADR-206), so the same
+question asked with filter clauses or inside one `$expr` gets the same answer,
+and the outcome never depends on the order arguments are written in. It only
+relaxes an error into an answer: a pipeline written for MongoDB that answers
+there answers the same here.
+
+**Closing it** would mean making the outcome depend on argument order again.
+Not planned.
+
+---
+
 ## 🟢 `$expr` treated an evaluation error as no match
 
 **Was** (raised 2026-08-30, while adding `$expr` to the filter language,

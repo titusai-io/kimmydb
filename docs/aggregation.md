@@ -157,6 +157,11 @@ wrong quietly:
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
 | `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them, and `undefined` is that same member | — nothing is unusable |
 
+`$first` evaluates its expression for the first document of a group only, and
+`$last` fails only when the last document's value cannot be evaluated: an
+earlier document's value is not part of the answer, so its failure is not
+either ([ADR-211](decisions.md)).
+
 Two consequences worth spelling out. **`$sum` and `$avg` disagree about a
 group with nothing to work on**: `0` against `null`, because a total of
 nothing is zero and a mean of nothing is not a number — so a `$sum` reading
@@ -245,6 +250,20 @@ not define — `{"input": "$items", "condition": …}` inside `$filter` is a
 **`$cond` and `$ifNull` do not evaluate the branch they do not take.** A guard
 like `{$cond: [{$gt: ["$n", 0]}, {$divide: [100, "$n"]}, null]}` works, rather
 than failing on exactly the inputs it exists to protect.
+
+**`$and` and `$or` fail only when the answer depends on the failure**
+([ADR-211](decisions.md)). An `$and` is `false` if any argument is false, and
+an `$or` `true` if any is true, beside an argument that cannot be evaluated and
+in whatever order they are written. So the guard works with `$and` too:
+`{$and: [{$isArray: "$tags"}, {$gt: [{$size: "$tags"}, 2]}]}` is `false` over
+a document whose `tags` is a string. Only when no argument decides does the
+failure stand, with the error of the earliest-written argument that failed.
+The result is always a boolean. Evaluation stops at the argument that decides,
+so writing the cheap guard first gives the same answer with less work. This
+holds wherever an expression is evaluated: a `$match`'s `$expr`, `$project`,
+`$addFields`, `$group`, `$filter`'s `cond`, a `$lookup`'s `let` and the rest. An error that is not
+about a value, a bug in the server, is never held back this way. `$let` still
+evaluates every variable before its body, whether the body reads it or not.
 
 **Null propagates; a type violation refuses.** `{$add: ["$typo", 1]}` is null
 because a missing field is null. `{$add: ["text", 1]}` is a 400. Returning null
