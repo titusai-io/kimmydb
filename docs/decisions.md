@@ -21889,6 +21889,52 @@ The consumers: a top-ranked member without the index, with a stale listing, catc
 
 The marker file round-trips and an unreadable one is still a marker; the operator's deletion clears it live; a wiped member clears by dominance only when it covers a counting peer, holds through a snapshot still under way, and does not count a catching-up peer or one that lost its own data; a peer that sends no block counts; an all-fresh cluster clears by the mutual clear; a member seen and not reached, an origin of an older cluster, a peer that is not `seeded_empty`, a restored member, and a shortfall against `expected_members` each hold it back; the gate opens after the wait and closes again on reaching a peer that is ahead, and wakes what waits on it; a peer reached earlier in the window, populated or ahead, holds the mutual and the dominance clear when only another peer is reached now; a snapshot under way holds the mutual clear; a contact with this member itself is no contact; the seen set is capped and a capped marker refuses the mutual clear; the file is rewritten only when the set grows; a standalone node discards a stale marker. Through the router: every data route, a login, a write, `/mcp` and a WebSocket upgrade are refused with `catching_up` and the header for each reason; the four exempt routes are answered; `/readyz` is 503 gated and 200 with `catching_up: "unknown"` past the wait; the gauge is one-hot and follows the marker; the topology marks the member and a peer. No owner work of any class runs while it is set, for each reason, past the wait, over a member set that ranks it first, and it comes back on the operator's clear. The facts source carries the bit and the reason. Through the real replication loop: a wiped member clears only once it holds what its peer holds, and a tick that reaches nobody clears nothing while the operator's deletion is read. Real processes: a fresh member with seeds is marked before its store exists, serves as `unknown` when nobody is reachable, is cleared by the operator live, and is not marked on its next start; a standalone start discards a stale file; a marker that cannot be written fails the start before the open with the exit of a bind that fails; an all-fresh three-node cluster clears in every member and then expires a document; two fresh members expecting three hold, warn and expire nothing until the operator clears them; the third arriving clears the three; and without `expected_members` two clear against each other. Each guard was broken and its test failed (recorded in the pull request).
 
+**Addendum, 2026-10-01: a tick that finds no peers is retried early.** A stored
+member that returns behind every peer's horizon starts unmarked, by design (a
+healthy restart must not refuse reads), and is marked `snapshot` only when its
+own pull gets `BeyondHorizon`. That pull is its first sync tick. The tick fires at
+once, but discovery has resolved nothing yet and SWIM has named no one, so it
+chooses no peers, and the next tick was a whole `sync_interval` away: in a local
+lab 5 of 8 returns served the old state for 4.9 s before they were marked (3 of 8
+pulled at once and were marked at 0.05 s), and two of eight returns on a deployed
+cluster served it for 5.2 s, 48 reads of 3,000 documents of 43,000, against 0.1
+to 0.2 s for the rest.
+
+A tick that finds no peers is now tried again after 250 ms, then 500 ms, 1 s and
+2 s, in the ticker's own interval's place (`early_retry_delay`). **The bound:**
+four retries, 3.75 s in all, and the delay never later than the interval itself
+(a short test interval gets none); a tick that finds any peer ends the run, and a
+later run starts again from 250 ms. **A tick with no peers contacts nobody**, so
+the retries cost a few local reads and put no load on a peer, down or not: a member
+whose peers are known and down (every seed down) is unaffected, its rounds fail
+and back off as before, and a member that is really alone makes the first tick
+and four retries and is then on the ordinary cadence, and is marked or served
+exactly as documented. The window becomes, normally, a fraction of a second: a peer known within the
+retries' 3.75 s is pulled at the next retry, and **a peer first known after the
+last retry is pulled within one interval, as before.** The retries re-read what
+discovery has resolved and do not resolve by themselves, so a peerless tick that
+finds nothing discovered also asks the seeds to be resolved again at once, once
+per retry (`discovery.reset_immediately()`): at most four resolutions per run of
+peerless ticks, and none from the ticker's own peerless ticks after them, so a
+failing resolver is not asked in a loop and a resolver that failed at the start
+is not waited on for `discovery_interval_secs` (30 s by default).
+
+An early retry is not an opening tick (`tick_opened`) and not a reset: ADR-195's
+and ADR-148's counters are wall-clock arguments about contacts, and a tick that
+reaches nobody must not move them. It is reported as `RoundReport::early_retry`,
+beside `peers_known`. The catching-up judgement runs on it as on any tick and is
+wall-clock, so an extra tick moves no wait. SWIM's own down-marking (about six
+seconds after a full cut) and ADR-191's back-off apply to peers that are known,
+which a tick with none never reaches. Tests: the delays, the cap, and the
+interval bound; a loop on virtual time whose members start empty gets an early tick
+that is not opening, finds a peer inserted afterwards on the very next one, is
+back on its interval after it, and starts over from 250 ms when the peer goes; and
+a member that never finds one makes exactly five ticks in thirty seconds of an
+interval of a minute; an address that answers as this node is left out of the
+report's `peers_known`; and the re-resolution is counted in the reports
+(`discoveries`): four or five by the fourth retry, and no more through 200 s of
+the ticker's own peerless ticks. Each was broken to watch it fail.
+
 ---
 
 ## ADR-203 — A vector record carries the configuration that made it

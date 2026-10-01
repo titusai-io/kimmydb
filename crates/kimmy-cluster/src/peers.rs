@@ -204,6 +204,21 @@ pub struct RoundReport {
     /// draining it at once instead of after a full `sync_interval_secs`.
     /// True for every tick in a reset chain, not only the first.
     pub reset: bool,
+    /// Whether this tick was an early retry of one that found no peers, rather
+    /// than the ticker's own interval (ADR-202's addendum): a member that
+    /// starts before discovery or SWIM has named anyone would otherwise serve
+    /// out a full `sync_interval_secs` before its first pull. Exclusive with
+    /// [`Self::reset`], and never a tick that opened (`tick_opened`).
+    pub early_retry: bool,
+    /// Peers this tick had to choose from, after discovery or membership and
+    /// the addresses that answered as this node itself were taken out: 0 is a
+    /// tick that found none.
+    pub peers_known: usize,
+    /// How many times this run has resolved its seeds so far, a counter: the
+    /// ticker's own, and one more for each early retry of a tick that found
+    /// nothing discovered (ADR-202's addendum), so a resolver that failed at the
+    /// start is asked again within a retry and not a discovery interval later.
+    pub discoveries: u64,
     /// Whether this tick called `stalls.tick_opened()` (ADR-195): about
     /// once `sync_interval_secs` has passed since the last one did,
     /// whether the ticks in between were ordinary or a chain of resets.
@@ -611,6 +626,31 @@ impl ReplicationConfig {
     }
 }
 
+/// The first delay of an early retry of a tick that found no peers, doubling
+/// at each try.
+const EARLY_RETRY_BASE: Duration = Duration::from_millis(250);
+
+/// How many early retries a run of peerless ticks gets: 250 ms, 500 ms, 1 s and
+/// 2 s, 3.75 s in all, after which the ticker's own interval is the cadence.
+const EARLY_RETRIES: u32 = 4;
+
+/// When to retry a tick early, given how many ticks in a row found no peers
+/// (ADR-202's addendum): `None` for none, for more than [`EARLY_RETRIES`], and
+/// for a delay that would not be earlier than the interval itself.
+///
+/// A member that starts before discovery or SWIM has named a peer is not
+/// marked, and serves what it holds, until its first pull; waiting the whole
+/// interval for it is the window this closes. A tick with no peers makes no
+/// call, so the retries cost a few local reads and nothing of any peer's, and
+/// a member that is really alone is on the ordinary cadence after the fourth.
+fn early_retry_delay(peerless_ticks: u32, interval: Duration) -> Option<Duration> {
+    if peerless_ticks == 0 || peerless_ticks > EARLY_RETRIES {
+        return None;
+    }
+    let delay = EARLY_RETRY_BASE * 2u32.pow(peerless_ticks - 1);
+    (delay < interval).then_some(delay)
+}
+
 /// Run anti-entropy against known peers, forever.
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovered: BTreeSet<SocketAddr> = BTreeSet::new();
@@ -702,11 +742,17 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // and neither should be able to reach its threshold in far less
     // wall-clock time than that, whichever direction the timing tips.
     let mut last_opened: Option<Instant> = None;
+    // Ticks in a row that found no peers, and whether the tick about to run was
+    // scheduled early because the last one did (see `early_retry_delay`).
+    let mut peerless_ticks: u32 = 0;
+    let mut tick_is_early_retry = false;
+    let mut discoveries: u64 = 0;
 
     loop {
         tokio::select! {
             _ = discovery.tick() => {
                 discovered = resolve(&config.seeds, config.local).await;
+                discoveries += 1;
                 debug!(count = discovered.len(), "resolved peers");
 
                 // Offer every resolved address to membership. Announcing to one
@@ -725,6 +771,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // firing from the ticker's own interval. Consumed here, once,
                 // however this tick itself ends.
                 let this_tick_is_a_reset = std::mem::take(&mut tick_is_a_reset);
+                let this_tick_is_an_early_retry = std::mem::take(&mut tick_is_early_retry);
                 if this_tick_is_a_reset {
                     debug!(
                         "reset tick starting, continuing a draining contact rather than \
@@ -842,7 +889,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // often as over it, and gating every tick on that comparison
                 // would silently drop close to half of ordinary opens to
                 // timer jitter, with no drain and no reset in sight.
-                if !this_tick_is_a_reset
+                if !(this_tick_is_a_reset || this_tick_is_an_early_retry)
                     || last_opened
                         .is_none_or(|last| tick_started.saturating_duration_since(last) >= config.sync_interval)
                 {
@@ -1253,7 +1300,40 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     carry_forward = resume_next_tick;
                     tick_is_a_reset = true;
                 }
+                // A tick that found no peers is tried again early, with a backoff
+                // and a cap (`early_retry_delay`), where it would otherwise wait
+                // out the interval; one that found any ends the run. No peers
+                // means no contact, so no reset was scheduled above either.
+                if peers.is_empty() {
+                    peerless_ticks = peerless_ticks.saturating_add(1);
+                    if let Some(delay) = early_retry_delay(peerless_ticks, config.sync_interval) {
+                        sync.reset_after(delay);
+                        tick_is_early_retry = true;
+                        // Nothing discovered either, as when the resolver failed
+                        // at the start: ask it again now, so the retry has
+                        // something to find, rather than a discovery interval
+                        // later. One per retry, so at most four per run of
+                        // peerless ticks, and never a loop against a failing
+                        // resolver: the ticker's own interval is the cadence after.
+                        let asks_again = discovered.is_empty();
+                        if asks_again {
+                            discovery.reset_immediately();
+                        }
+                        debug!(
+                            delay_ms = delay.as_millis() as u64,
+                            peerless_ticks,
+                            asks_again,
+                            "no peers found; retrying the sync tick early rather than waiting \
+                             out the interval"
+                        );
+                    }
+                } else {
+                    peerless_ticks = 0;
+                }
                 report.reset = this_tick_is_a_reset;
+                report.early_retry = this_tick_is_an_early_retry;
+                report.peers_known = peers.len();
+                report.discoveries = discoveries;
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms);
                 }
@@ -1677,6 +1757,228 @@ mod tests {
     }
 
     use super::*;
+
+    /// ADR-202's addendum: the delay doubles from 250 ms, there are four, and a
+    /// delay that would not be earlier than the interval is not one.
+    #[test]
+    fn the_early_retry_doubles_is_capped_and_is_never_later_than_the_interval() {
+        let five = Duration::from_secs(5);
+        let delays: Vec<_> = (0..=6).map(|n| early_retry_delay(n, five)).collect();
+        assert_eq!(
+            delays,
+            [
+                None,
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(500)),
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(2)),
+                None,
+                None,
+            ],
+            "none for a tick that found peers, four retries, then the interval's own"
+        );
+        assert_eq!(early_retry_delay(1, Duration::from_millis(100)), None, "a short interval");
+        assert_eq!(early_retry_delay(1, Duration::from_millis(250)), None, "not earlier");
+        let one = Duration::from_secs(1);
+        assert_eq!(early_retry_delay(2, one), Some(Duration::from_millis(500)));
+        assert_eq!(early_retry_delay(3, one), None, "a delay of the interval is not early");
+    }
+
+    /// Reports of a loop whose seeds name no one and whose members start empty,
+    /// on virtual time: a sync interval of a minute, so a tick that comes any
+    /// sooner is an early retry, and nothing here depends on how long the host
+    /// takes.
+    fn peerless_loop(
+        engine: &Arc<Engine>,
+    ) -> (tokio::sync::mpsc::UnboundedReceiver<RoundReport>, Members, tokio::task::JoinHandle<()>)
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let members = Members::default();
+        let local = "127.0.0.1:1".parse().unwrap();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(vec![])], "a-secret".into(), local);
+        config.sync_interval = Duration::from_secs(60);
+        // Far longer than any run of these tests, so the seeds are resolved by
+        // the first discovery tick and by an early retry asking again, and
+        // never by the ticker.
+        config.discovery_interval = Duration::from_secs(600);
+        config.members = Some(members.clone());
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        (rx, members, tokio::spawn(replicate(Arc::clone(engine), config)))
+    }
+
+    /// **A tick that finds no peers is tried again early**, and a peer found
+    /// ends the run. A member that starts before discovery or SWIM has named
+    /// anyone served its old state for a whole interval before its first pull,
+    /// and so before a returning member could learn it was behind every peer's
+    /// horizon. The retries are reports of their own (`early_retry`), never
+    /// open a tick (`opened`), and a peerless run that comes again starts over
+    /// from the first delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_that_finds_no_peers_is_retried_early_and_a_peer_found_ends_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (mut rx, members, looping) = peerless_loop(&engine);
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.peers_known, 0);
+        assert!(first.opened && !first.early_retry, "the first tick is the ticker's: {first:?}");
+
+        let at = tokio::time::Instant::now();
+        let second = rx.recv().await.unwrap();
+        assert!(second.early_retry && !second.opened && !second.reset, "{second:?}");
+        assert_eq!(second.peers_known, 0);
+        assert!(at.elapsed() < Duration::from_secs(1), "the retry did not wait out the interval");
+
+        // A member SWIM now lists, at an address nobody answers: the next tick
+        // finds a peer, and ends the run.
+        let dead =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        members.insert_for_test(dead, kimmy_core::NodeId::generate());
+        let third = rx.recv().await.unwrap();
+        assert!(third.early_retry, "still the second retry: {third:?}");
+        assert!(!third.opened, "a retry that finds a peer is still not an opening tick: {third:?}");
+        assert_eq!(third.peers_known, 1);
+        assert_eq!(third.failed, 1, "the round against it ran");
+        let at = tokio::time::Instant::now();
+        let fourth = rx.recv().await.unwrap();
+        assert!(!fourth.early_retry && fourth.peers_known == 1, "{fourth:?}");
+        assert!(
+            at.elapsed() >= Duration::from_secs(50),
+            "back on the interval: {:?}",
+            at.elapsed()
+        );
+
+        // The peer goes: a new run of peerless ticks starts from the first delay.
+        members.remove_for_test(&dead);
+        let fifth = rx.recv().await.unwrap();
+        assert_eq!(fifth.peers_known, 0);
+        assert!(!fifth.early_retry, "the ticker's own tick: {fifth:?}");
+        let at = tokio::time::Instant::now();
+        let sixth = rx.recv().await.unwrap();
+        assert!(sixth.early_retry && sixth.peers_known == 0, "{sixth:?}");
+        assert!(
+            at.elapsed() < Duration::from_millis(300),
+            "from the first delay: {:?}",
+            at.elapsed()
+        );
+        looping.abort();
+    }
+
+    /// The bound: a member with no peers at all makes the first tick and four
+    /// early ones, and then ticks only on its interval. A minute's interval and
+    /// thirty seconds of virtual time: five reports, no more.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_that_never_finds_a_peer_retries_four_times_and_then_waits_its_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (mut rx, _members, looping) = peerless_loop(&engine);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        looping.abort();
+        assert_eq!(reports.len(), 5, "the tick and four retries: {reports:?}");
+        assert!(!reports[0].early_retry && reports[1..].iter().all(|r| r.early_retry));
+        assert!(reports.iter().all(|r| r.peers_known == 0 && r.failed == 0));
+        assert_eq!(reports.iter().filter(|r| r.opened).count(), 1, "only the first opens");
+    }
+
+    /// An address that answered as this node itself is not a peer, and not one
+    /// the tick counts: `peers_known` is read after those are taken out, so a
+    /// member whose only listed address is its own is peerless, and retried
+    /// early, as one with no address at all. On the real clock, since the
+    /// handshake it depends on is real I/O under timeouts that virtual time
+    /// would run out; the assertions are on the reports.
+    #[tokio::test]
+    async fn an_address_that_answers_as_this_node_is_not_a_peer_in_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = listener.local_addr().unwrap();
+        tokio::spawn(crate::transport::serve(Arc::clone(&engine), listener, "a-secret".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let members = Members::default();
+        // Listed by an address other than the one the loop binds: the handshake
+        // names this node, and the address is set aside.
+        members.insert_for_test(own, engine.node_id());
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![])],
+            "a-secret".into(),
+            "127.0.0.1:1".parse().unwrap(),
+        );
+        config.sync_interval = Duration::from_secs(2);
+        config.discovery_interval = Duration::from_secs(600);
+        config.members = Some(members);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&engine), config));
+        async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RoundReport>) -> RoundReport {
+            tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the loop ticks")
+                .expect("it is running")
+        }
+
+        let first = next(&mut rx).await;
+        assert_eq!(first.peers_known, 1, "dialled once, to learn it is this node: {first:?}");
+        assert_eq!(first.failed, 0, "and never a failed round: {first:?}");
+        let second = next(&mut rx).await;
+        assert_eq!(second.peers_known, 0, "set aside, so no peer: {second:?}");
+        assert!(!second.early_retry, "the ticker's own tick: {second:?}");
+        let third = next(&mut rx).await;
+        assert!(third.early_retry && third.peers_known == 0, "peerless, so retried: {third:?}");
+        looping.abort();
+    }
+
+    /// **A peerless tick with nothing discovered asks the resolver again**, once
+    /// for each early retry and no more. A resolver that failed at the start would
+    /// otherwise be asked again a discovery interval later (30 s by default),
+    /// which the retries cannot wait for. The discovery interval here is ten
+    /// minutes, so the count of resolutions in the reports is the first
+    /// discovery tick's and the retries', and over 200 s of virtual time, past
+    /// the retries and through three of the ticker's own peerless ticks, it does
+    /// not grow: a failing resolver is not asked in a loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_peerless_tick_with_nothing_discovered_resolves_again_once_per_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (mut rx, _members, looping) = peerless_loop(&engine);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let mut reports = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            reports.push(report);
+        }
+        assert_eq!(reports.len(), 5, "the tick and four retries: {reports:?}");
+        // The first discovery tick (before or after the first sync tick, whichever
+        // the loop's select takes first) and one per retry, minus the one the first
+        // tick may have shared with it.
+        let after_retries = reports[4].discoveries;
+        assert!(
+            (4..=5).contains(&after_retries),
+            "the seeds were resolved {after_retries} times by the fourth retry"
+        );
+        assert!(
+            reports[2..].iter().all(|r| r.discoveries >= 2),
+            "from the second retry on, each follows a resolution it asked for: {reports:?}"
+        );
+
+        // Past the retries, three more peerless ticks of the ticker's own.
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let mut later = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            later.push(report);
+        }
+        looping.abort();
+        assert!(later.len() >= 3, "the ticker's own ticks went on: {later:?}");
+        assert!(
+            later.iter().all(|r| !r.early_retry && r.discoveries == after_retries),
+            "a failing resolver is not asked in a loop: {later:?}"
+        );
+    }
 
     #[test]
     fn a_contact_ends_on_what_stopped_it() {
