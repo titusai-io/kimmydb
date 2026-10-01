@@ -3071,93 +3071,45 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
     );
 }
 
-/// Counts ADR-154's overrun warning, so a test can assert that a tick did
-/// not take longer than the interval it owns.
-///
-/// A hand-written `Subscriber` rather than a subscriber crate: the whole
-/// question is whether one particular line was emitted, which is a field
-/// visit, and it is not worth a test-only logging dependency. Installed with
-/// `set_default`, which scopes it to the thread that installs it — the same
-/// thread the current-thread runtime drives the loop's task on — so a test
-/// reads back exactly the lines it caused and parallel tests do not see each
-/// other's.
-#[derive(Clone, Default)]
-struct Overruns(Arc<AtomicUsize>);
-
-impl tracing::Subscriber for Overruns {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
-        tracing::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut overran = OverrunLine(false);
-        event.record(&mut overran);
-        if overran.0 {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn enter(&self, _: &tracing::Id) {}
-
-    fn exit(&self, _: &tracing::Id) {}
-}
-
-/// Whether an event is the tick-overran warning, by its message.
-struct OverrunLine(bool);
-
-impl tracing::field::Visit for OverrunLine {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" && format!("{value:?}").contains("a sync tick took longer") {
-            self.0 = true;
-        }
-    }
-}
-
 /// A tick that spends its whole budget draining must not overrun the interval
 /// it owns *as a matter of course*, because ADR-154's overrun warning means
 /// "this member's sync tick was stuck" and is written to be one line per
 /// stall. The budget is therefore spent against a margin: another pull is
-/// started only when the pull before it would have fitted in what is left.
+/// started only when the pull before it would have fitted in what is left
+/// (`Contact::fits_before`, ADR-157).
 ///
-/// The claim is exactly as strong as the margin is, and no stronger. The
-/// margin is an estimate — the slowest pull the contact has made — so a pull
-/// slower than every pull before it, by more than the slack left over, can
-/// still cross the line, and a few in a run of a dozen ticks do. What must
-/// never happen is the systematic case: deciding on "is there any time left
-/// at all" makes *every* tick the budget cuts short end past its own period,
-/// so the warning fires on each and an operator watching a backlog drain sees
-/// nothing else.
+/// **Read from what the loop reports, not from the clock.** The test used to
+/// count ticks that overran the interval against ticks the budget cut short,
+/// at an interval priced from one pull. A host stall (a loaded runner, a
+/// paused process) inflated the price so no tick was cut short, or made the
+/// ticks overrun for its own reasons, and the test failed identically with and
+/// without the margin. It now reads each tick's report: how many pulls the tick
+/// made (`pulls.serve.count`, one observation per pull) and how its contacts
+/// ended (`pulls.contacts`).
 ///
-/// Three assertions, in the order they are made, and it takes all three to
-/// pin the budget half of ADR-157:
+/// The peer is reached through a relay that holds every chunk back by a fixed
+/// delay, so a pull costs at least a floor the relay guarantees, and the
+/// interval is 3.6 times the cheapest of five priced pulls. With a margin, a
+/// fourth pull would need the third to end with more than the slowest pull's
+/// cost still left, and four pulls of at least 0.9 times the price do not fit
+/// in 3.6 prices, so **no tick makes more than three pulls, whatever the host
+/// does**: a stall only adds elapsed time. Without the margin
+/// (`Instant::now() < deadline`) a fourth pull starts whenever the third ended
+/// with any time left, which three pulls of about a price each leave. Three
+/// assertions:
 ///
-/// 1. **The budget cut a drain short more than once** — a precondition, not
-///    a claim: without several such ticks the run says nothing either way.
-/// 2. **Fewer of those ticks overran than there were of them.** This is the
-///    claim. Reverting `Contact::fits_before` to `Instant::now() < deadline`
-///    makes the two numbers equal, and this is what fails.
-/// 3. **The tick drained several batches per contact.** Reverting the drain
-///    arm in `peers.rs` makes contacts equal batches, and this is what fails.
-///
-/// **The interval is measured, not chosen**, because what this test needs is
-/// one a few pulls wide — wide enough that a tick can make more than one
-/// pull, narrow enough that the backlog takes many ticks — and a pull's cost
-/// belongs to the machine rather than to the test. A fixed two seconds drained
-/// this fixture in two ticks on an idle machine, only one of which the budget
-/// cut short, so assertion 1 failed there while a loaded machine passed: the
-/// test read as green in the suite and broken to anyone running it alone, and
-/// it failed identically against the fix and against the revert, which is the
-/// one thing a regression test may not do.
+/// 1. **The budget cut a drain short**, at least once: a precondition, which
+///    19 batches behind a tick of three pulls and no more makes certain of unless
+///    the host made the five priced pulls all slow.
+/// 2. **No tick made more than three pulls.** This is the claim. Reverting
+///    `fits_before` to `Instant::now() < deadline` lets a tick whose pulls ran
+///    at the price make a fourth, and this is what fails (any one such tick is
+///    enough, so a host that stalls most of the ticks leaves it standing).
+/// 3. **Some tick drained more than one batch.** Reverting the drain arm in
+///    `peers.rs` makes every contact one pull, and this is what fails.
 #[tokio::test]
 async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() {
+    use kimmy_cluster::ContactEnd;
     use kimmy_cluster::protocol::MAX_BATCH;
 
     let a = node().await;
@@ -3167,55 +3119,64 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     let entries = MAX_BATCH * BATCHES;
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     seed(&a, &ca, entries);
+    // A fixed 25 ms behind every chunk the peer sends: what a pull costs is then
+    // mostly the relay's delay, which is the same for every pull.
+    let relay = slow_relay(a.addr, Duration::from_millis(25)).await;
 
-    let overruns = Overruns::default();
-    let counted = Arc::clone(&overruns.0);
-    let _recording = tracing::subscriber::set_default(overruns);
+    // Five rounds before the loop starts, to price a pull on this machine, by
+    // the cheapest: a stall inflates one sample and not the minimum. They leave
+    // the backlog five batches shorter.
+    let mut price = Duration::MAX;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        sync_once(&b.engine, relay, SECRET, None).await.expect("a round to price a pull by");
+        price = price.min(started.elapsed());
+    }
+    let interval = price.mul_f64(3.6);
 
-    // One round before the loop starts, to price a pull on this machine. It
-    // leaves the backlog a batch shorter, which is all it costs.
-    let priced = std::time::Instant::now();
-    sync_once(&b.engine, a.addr, SECRET, None).await.expect("a first round to price a pull by");
-    let interval = priced.elapsed() * 3;
-
-    let (looping, mut rx) = drain_loop(&b, a.addr, interval);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    let (mut contacts, mut cut_short) = (0usize, 0usize);
+    let (looping, mut rx) = drain_loop(&b, relay, interval);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let (mut budget_ends, mut most_pulls, mut ticks) = (0u64, 0u64, 0usize);
+    let mut contacts = 0usize;
+    let mut pulls_in_all = 0u64;
     while b.engine.count_by_id(ca.id).unwrap() != Some(entries as u64) {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
             .unwrap_or_else(|_| panic!("the backlog never drained"))
             .expect("the loop must keep reporting");
         assert_eq!(report.failed, 0, "a backlog is not a failure: {report:?}");
+        ticks += 1;
+        budget_ends += report.pulls.contacts[ContactEnd::Budget.slot()];
+        let pulls = report.pulls.serve.count;
+        most_pulls = most_pulls.max(pulls);
+        pulls_in_all += pulls;
         contacts += report.divergence_checks + report.divergence_skips;
-        cut_short += report.divergence_skips;
     }
     looping.abort();
 
-    let overran = counted.load(Ordering::Relaxed);
     assert!(
-        cut_short >= 2,
-        "the budget must have cut a drain short more than once, or this run says nothing: \
-         {cut_short} such ticks at an interval of {interval:?}"
+        budget_ends >= 1,
+        "the budget must have cut a drain short, or this run says nothing: {budget_ends} \
+         contacts ended on it in {ticks} ticks, at an interval of {interval:?} for a price of \
+         {price:?}"
     );
     assert!(
-        overran < cut_short,
-        "a tick must not overrun the interval it owns because it drained: {overran} overruns \
-         across {cut_short} ticks the budget cut short, which is every one of them"
+        most_pulls <= 3,
+        "a tick must not start a pull the budget's margin says will not fit: one made \
+         {most_pulls} pulls, at an interval of {interval:?} for a price of {price:?}"
     );
     assert!(
-        contacts < BATCHES,
-        "the ticks must have drained several batches each: {contacts} contacts for {BATCHES} \
-         batches"
+        most_pulls >= 2 && contacts > 0 && pulls_in_all > contacts as u64,
+        "the ticks must have drained several batches per contact: {pulls_in_all} pulls in \
+         {contacts} contacts, at most {most_pulls} in a tick"
     );
 }
 
 /// Captures the tick-overrun warning's fields, not just whether it fired
-/// (contrast [`Overruns`] above): where the tick's time went, summed across
+/// (contrast the drain-budget test above): where the tick's time went, summed across
 /// its pulls, and the peer its pulls summed to the most wall time against.
-/// The same hand-written-`Subscriber` shape as `Overruns`, for the same
-/// reason — one line is the whole question, and it is not worth a test-only
-/// logging dependency.
+/// A hand-written `Subscriber` rather than a subscriber crate: one line is the
+/// whole question, and it is not worth a test-only logging dependency.
 #[derive(Clone, Default)]
 struct OverrunCapture(Arc<std::sync::Mutex<Option<OverrunFields>>>);
 
@@ -3263,7 +3224,7 @@ struct OverrunVisitor {
 impl tracing::field::Visit for OverrunVisitor {
     /// Every field of a `warn!` call reaches a `Subscriber` through this one
     /// method unless a `record_i64`/`record_u64`/etc. override intercepts it
-    /// first, and none does here (as `Overruns` above relies on for
+    /// first, and none does here (as a one-line message check relies on for
     /// `message`) — so `elapsed_secs`, `serve_ms` and the rest, though they
     /// are `u64` values at the call site, arrive as their plain `{:?}`
     /// rendering, and a `String` field arrives quoted.
