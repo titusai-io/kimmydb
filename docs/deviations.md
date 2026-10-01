@@ -50,32 +50,64 @@ reports separately as `undecidable` ([ADR-185](decisions.md)).
 
 ---
 
-## 🟡 A `$lookup` join key that crosses an array reads the first element, where MongoDB joins on every one
+## 🟢 A `$lookup` join key read one value, where MongoDB joins on every element
 
-**Raised 2026-09-04, by the 2026-09 test round, which asked which value
-joins and found no doc that answered.** `localField` and `foreignField` are
-field paths and the join needs one key per document, so a path whose
+**Was** (raised 2026-09-04, by the 2026-09 test round, which asked which value
+joins and found no doc that answered). `localField` and `foreignField` are
+field paths and the join needed one key per document, so a path whose
 non-terminal segment is an array — `items.sku` over `items: [{sku: "ef-9"},
-{sku: "gh-3"}]` — resolves to every element's value and then keeps the
+{sku: "gh-3"}]` — resolved to every element's value and then kept the
 **first**. MongoDB fans the key out and attaches the union of every element's
-matches. So a stage that reads as "attach the product of every line" attaches
-the first line's product, and says nothing about the rest. A field that
-merely *holds* an array is not this case: `localField: "tags"` joins on the
-whole array as one value, which agrees with MongoDB and is what makes
-`["a","b"]` find a foreign document whose key is that same array.
+matches. So a stage that read as "attach the product of every line" attached
+the first line's product, and said nothing about the rest: a `200` that looked
+complete and was not. A field that *holds* an array joined on the whole array
+and nothing else, so an order's `productIds: [10, 20]` against products' `_id`
+attached no product. The register held the first-element reading as a default
+to keep, on the argument that fanning out silently multiplies a join by an
+array's length and the ceiling and cost both change with it.
 
-Not fanning out is the right default here and stays: it is the same rule
-`$sort` and `$unwind` follow for a path that names a field rather than
-computes one, and a join that silently multiplied its input by an array's
-length would be a `$unwind` nobody wrote. What was wrong was that nothing
-said which of the two it does — ADR-116's sentence about "the single value at
-the path" explains why the stage does not fan out, not which value it reads
-when there are several. `docs/aggregation.md` now says, and points at
-`$unwind` as the way to write the fanning join explicitly.
+**Now** (closed 2026-10-01, [ADR-210](decisions.md#adr-210--a-lookup-key-joins-on-every-value-its-path-yields-and-on-every-element-of-an-array)).
+Both sides read a field as a filter reads it: every value the path yields and,
+for one that is an array, each of its elements, one level down. The local side
+attaches the union of the matches of every such value, the foreign side is a
+candidate under every one of its own, and a foreign document met through more
+than one is attached once, in the foreign collection's scan order. A field that
+holds an array joins on the list itself and on each element, so `productIds`
+finds the products. A path with nothing at it joins nothing, as before. The
+foreign collection is still scanned once, and the ceiling counts the foreign
+documents held and the documents attached in all, so a pipeline that fit under it
+before can now be over it and is refused, which was the honest answer: the old
+stage returned less than it claimed. There is no opt-in key, because a key
+MongoDB does not have would leave the partial result as the default and a ported
+pipeline still wrong. **Breaking** for a caller that read the first element or
+relied on a list joining as a list alone; `$unwind` first is still the way to
+one row per element. This now agrees with MongoDB on a crossed path and on an
+array-valued field.
 
-**To close** — if it is ever worth closing — the fanning form would have to
-be opted into rather than made the default, because the ceiling and the cost
-both change with it. Nobody has asked.
+---
+
+## 🟡 A `$lookup` whose `localField` is missing joins nothing, where MongoDB joins it as `null`
+
+**Raised 2026-10-01, reviewing the array fan-out of ADR-210; the behaviour is
+older.** An input document that lacks `localField` gets an empty `as` and
+joins nothing, and a foreign document that lacks `foreignField` is never a
+candidate. MongoDB joins a missing `localField` as `null`, so such a document
+matches a foreign document whose `foreignField` is `null` or absent. An explicit
+`null` on both sides joins here as it does there; what differs is absence, on
+either side.
+
+**Why.** A join matches two stored values to each other, and an absent field
+holds none. The filter rule that `null` matches a missing field is about selecting
+documents by a condition, not about pairing two documents by a key, and carrying
+it into the join would pair every input document that lacks the field with every
+foreign document that lacks its own: a join that attaches the whole of one
+collection to the other for the want of a field. `docs/aggregation.md` says so
+beside the rule.
+
+**To close**, if a ported pipeline needs it: treat a path with no value as a
+`null` key on both sides, which attaches the documents that lack the field to
+each other, and say so in the aggregation page. Nobody has asked, and the
+alternative is the pairing described above.
 
 ---
 

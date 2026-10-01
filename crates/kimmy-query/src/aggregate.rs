@@ -844,6 +844,22 @@ pub fn check_limit(stage: &str, produced: usize, limits: &Limits) -> Result<()> 
     Ok(())
 }
 
+/// Refuse a `$lookup` that would attach more than the ceiling's worth of
+/// documents in all (ADR-210): the sum of the lengths of the arrays it adds.
+/// Checked before any is copied, because each attachment is a copy of the
+/// foreign document, and a key an array fans out can attach one document to
+/// every element of every input document.
+pub fn check_attached(stage: &str, attached: usize, limits: &Limits) -> Result<()> {
+    if attached > limits.max_documents {
+        return Err(Error::InvalidQuery(format!(
+            "{stage} would attach {attached} documents in all, over the pipeline limit of {}. \
+             Narrow the pipeline with an earlier $match, or $unwind the array first",
+            limits.max_documents
+        )));
+    }
+    Ok(())
+}
+
 /// Where writing to `field` in `doc` would fail, if it would: `(array_path,
 /// remainder)`, `array_path` the dotted prefix naming the array itself,
 /// `remainder` what was left of `field` to read from each of its elements.
@@ -1135,21 +1151,46 @@ fn numeric(value: &Bson) -> Option<f64> {
     }
 }
 
-/// The distinct local-field values a `$lookup` needs from its input.
+/// The values a document joins under at `field`, as a filter reads the path
+/// (ADR-210): every value the path resolves to, and, for one that is an array,
+/// each of its elements as well, one level down. `items.sku` over `items:
+/// [{sku: "a"}, {sku: "b"}]` is `"a"` and `"b"`; `tags` over `tags: ["a", "b"]`
+/// is `["a", "b"]`, `"a"` and `"b"`; `a.b` over `a: [{b: [1, 2]}, {b: [3]}]` is
+/// `[1, 2]`, `1`, `2`, `[3]` and `3`. Nothing at the path is no value, so a
+/// document without the field joins nothing. In a filter, `{field: v}` matches a
+/// document when `v` is one of these (`kimmy_core::matching::any_element`), and
+/// a join matches two documents when their values share one, so a join and a
+/// filter agree about what a field's value is.
+///
+/// Not deduplicated: the executor keys them, and equal keys are one there.
+pub fn join_values<'a>(doc: &'a Document, field: &str) -> Vec<&'a Bson> {
+    let mut out = Vec::new();
+    for value in path::resolve(doc, field) {
+        out.push(value);
+        if let Bson::Array(items) = value {
+            out.extend(items.iter());
+        }
+    }
+    out
+}
+
+/// The distinct values a `$lookup` needs from its input: every value of
+/// [`join_values`] of every input document, once each.
 ///
 /// Exposed so the executor can fetch the foreign side in **one** pass instead
 /// of once per document: a join done per input document is O(n·m), and on a
 /// collection of any size that is the difference between a query and an outage.
+/// The executor reads the foreign side through the same function, so the two
+/// agree about what a key is, and a document that has no value at the path
+/// wants nothing.
 pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut keys = Vec::new();
     for doc in input {
-        // `localField` is a field path, not an expression: it names the key
-        // to join on, and the executor reads the same path the same way
-        // when it matches the foreign side, so the two must agree.
-        let value = value_at(doc, local_field).cloned().unwrap_or(Bson::Null);
-        if seen.insert(group_key(&value)) {
-            keys.push(value);
+        for value in join_values(doc, local_field) {
+            if seen.insert(group_key(value)) {
+                keys.push(value.clone());
+            }
         }
     }
     keys
@@ -1613,39 +1654,55 @@ mod tests {
     }
 
     #[test]
-    fn unwind_and_lookup_keys_read_a_field_path_and_do_not_fan_out() {
-        // Before ADR-130's fix this test also ran `$unwind: "$a.b"` over this
-        // fixture and asserted `out.len() == 2`. That assertion is gone, not
-        // weakened: a fanning reader over `a: [{b: [1, 2]}, {b: [3]}]` would
-        // compute `$a.b` as `[[1, 2], [3]]` (ADR-116's own array rule) — also
-        // length 2 — so the old assertion held identically whichever reader
-        // `$unwind` used and pinned the defect's row count, not the reader
-        // choice. `lookup_keys` below is what actually pins it: a fanning
-        // reader would make this a single `[[1, 2], [3]]` key, not two flat
-        // integers, and `$lookup`'s key extraction is untouched by ADR-130
-        // (it only reads; there is no write to refuse).
-        //
-        // `$unwind` needs no test of its own for a **non-numeric** crossed
-        // segment: ADR-130's uniform refusal fires on the document's
-        // structure alone, before `value_at` is consulted, and it fires on
-        // exactly the documents where a fanning and a non-fanning reader
-        // would disagree there — a non-terminal array segment followed by a
-        // non-numeric one is both where they would differ and `path::set`'s
-        // one failure mode. See `unwind_refuses_a_path_that_crosses_an_array`,
-        // whose `items.sku` case refuses regardless of which reader you
-        // imagine deciding it.
-        //
-        // A **numeric** segment is the one place this does not hold — the
-        // one place ADR-116 itself already names an expression path and a
-        // filter path disagreeing, and `value_at`/`path::resolve` sides with
-        // the filter's reading (a numeric segment is read both as an index
-        // and a field name), not the expression layer's (field name only).
-        // `path::set` succeeds there by index, so `$unwind` does not refuse,
-        // and its own output *does* still distinguish the two readers — see
-        // `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`.
+    fn lookup_keys_are_every_value_a_path_yields_and_each_element_of_an_array() {
+        // `$unwind` refuses a path that crosses an array (ADR-130, below): it
+        // has to write each value back to one place. A join only reads, so
+        // `lookup_keys` reads the path as a filter does (ADR-210): every value it
+        // resolves to, and the elements of any that is an array.
+        let arr = |items: &[i32]| Bson::Array(items.iter().map(|n| Bson::Int32(*n)).collect());
         let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": [3]}] }]);
-        let keys = lookup_keys(&input, "a.b");
-        assert_eq!(keys, vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])]);
+        assert_eq!(
+            lookup_keys(&input, "a.b"),
+            vec![arr(&[1, 2]), Bson::Int32(1), Bson::Int32(2), arr(&[3]), Bson::Int32(3),],
+            "each element's `b`, and the elements of a `b` that is an array"
+        );
+        // The shop example: every line's sku.
+        let input = docs(vec![doc! { "items": [{"sku": "ef-9"}, {"sku": "gh-3"}] }]);
+        assert_eq!(
+            lookup_keys(&input, "items.sku"),
+            vec![Bson::String("ef-9".into()), Bson::String("gh-3".into())]
+        );
+        // Arrays at two levels: `a.b.c` yields every `c`.
+        let input = docs(vec![doc! { "a": [{"b": [{"c": 1}, {"c": 2}]}, {"b": [{"c": 3}]}] }]);
+        assert_eq!(
+            lookup_keys(&input, "a.b.c"),
+            vec![Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]
+        );
+        // A field that holds an array is the whole array and each element.
+        let input = docs(vec![doc! { "tags": ["a", "b"] }]);
+        assert_eq!(
+            lookup_keys(&input, "tags"),
+            vec![
+                Bson::Array(vec![Bson::String("a".into()), Bson::String("b".into())]),
+                Bson::String("a".into()),
+                Bson::String("b".into()),
+            ]
+        );
+        // One level: an array in an array is an element, and is not opened.
+        let input = docs(vec![doc! { "m": [[1, 2], 3] }]);
+        assert_eq!(
+            lookup_keys(&input, "m"),
+            vec![Bson::Array(vec![arr(&[1, 2]), Bson::Int32(3)]), arr(&[1, 2]), Bson::Int32(3)]
+        );
+        // Equal values from different elements and documents are one key.
+        let input = docs(vec![
+            doc! { "items": [{"sku": "a"}, {"sku": "a"}, {"sku": "b"}] },
+            doc! { "items": [{"sku": "b"}, {"sku": "c"}] },
+        ]);
+        assert_eq!(lookup_keys(&input, "items.sku").len(), 3);
+        // Nothing at the path is nothing wanted, and an explicit null is a key.
+        assert!(lookup_keys(&docs(vec![doc! { "x": 1 }]), "items.sku").is_empty());
+        assert_eq!(lookup_keys(&docs(vec![doc! { "k": Bson::Null }]), "k"), vec![Bson::Null]);
     }
 
     #[test]
