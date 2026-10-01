@@ -52,17 +52,41 @@ fn fixture(dir: &tempfile::TempDir) -> (Engine, CollectionMeta) {
     (engine, meta)
 }
 
+/// This member. Chosen, not the engine's own id: `Owners` decides from the id
+/// it is given, and the engine's id is random per run, so a test that searched
+/// for a peer outranking it found none whenever it outranked every candidate,
+/// about one run in 255, and panicked. With a fixed id the ranking is the same
+/// every run, and `the_fixed_ids_rank_as_these_tests_need` holds it.
+const ME: u8 = 0xAA;
+
+fn me() -> NodeId {
+    node(ME)
+}
+
 /// A peer id that outranks `me` for this collection's expiry when both are
 /// candidates, so that a rule which only looks at ranking hands the collection
 /// to the peer.
 fn outranking(me: NodeId) -> u8 {
     let k = key("app", "sessions");
     (1..=254u8)
+        .filter(|n| node(*n) != me)
         .find(|n| {
             let both: BTreeSet<NodeId> = [me, node(*n)].into();
             owner(&k, &both) == Some(node(*n))
         })
         .expect("some id outranks any other")
+}
+
+/// The premise of every test here that hands the collection to a peer: with
+/// the fixed ids, a peer outranks this member, and this member outranks no
+/// one it should not. A change to the ranking or to `ME` that broke it fails
+/// here, by name, rather than in a test that reads as about expiry.
+#[test]
+fn the_fixed_ids_rank_as_these_tests_need() {
+    let peer = outranking(me());
+    assert_ne!(node(peer), me());
+    let both: BTreeSet<NodeId> = [me(), node(peer)].into();
+    assert_eq!(owner(&key("app", "sessions"), &both), Some(node(peer)));
 }
 
 fn holder_block(meta: &CollectionMeta) -> Facts {
@@ -90,7 +114,7 @@ fn remaining(engine: &Engine, meta: &CollectionMeta) -> u64 {
 fn a_top_ranked_member_without_the_index_hands_expiry_on() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let said = Facts { boot: vec![2; 16], ..Facts::default() }; // holds nothing
     let view = owners(me, peer, said, Duration::ZERO, holder_block(&meta));
@@ -105,7 +129,7 @@ fn a_top_ranked_member_without_the_index_hands_expiry_on() {
 fn a_top_ranked_member_that_holds_the_index_keeps_expiry() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let view = owners(me, peer, holder_block(&meta), Duration::ZERO, holder_block(&meta));
     let outcome = pass_with(&engine, &view, physical_now_ms());
@@ -120,7 +144,7 @@ fn a_top_ranked_member_that_holds_the_index_keeps_expiry() {
 fn a_stale_listing_does_not_keep_the_collection() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let view =
         owners(me, peer, holder_block(&meta), Duration::from_secs(3_600), holder_block(&meta));
@@ -133,7 +157,7 @@ fn a_stale_listing_does_not_keep_the_collection() {
 fn a_top_ranked_holder_that_is_catching_up_hands_expiry_on() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let said = Facts { catching_up: true, ..holder_block(&meta) };
     let view = owners(me, peer, said, Duration::ZERO, holder_block(&meta));
@@ -146,7 +170,7 @@ fn a_top_ranked_holder_that_is_catching_up_hands_expiry_on() {
 fn a_catching_up_member_expires_nothing_and_says_why() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let mine = Facts { catching_up: true, ..holder_block(&meta) };
     // The only other member does not hold the index.
@@ -166,7 +190,7 @@ fn a_catching_up_member_expires_nothing_and_says_why() {
 fn a_member_with_expiry_off_owes_the_collection_elsewhere_or_says_nobody_can() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let off = Facts { ttl_disabled: true, ..holder_block(&meta) };
     let collections = engine.all_collections().unwrap();
@@ -188,7 +212,7 @@ fn a_member_with_expiry_off_owes_the_collection_elsewhere_or_says_nobody_can() {
 fn a_view_is_never_empty_for_a_collection_this_member_can_expire() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let alone = Owners::over(me, None);
     assert_eq!(alone.ttl_view(&engine.all_collections().unwrap()).counts, [1, 0, 0, 0]);
     assert!(alone.owns_ttl(&meta));
@@ -202,7 +226,7 @@ fn a_view_is_never_empty_for_a_collection_this_member_can_expire() {
 fn an_older_peer_that_says_nothing_is_not_known_to_hold_the_index() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, meta) = fixture(&dir);
-    let me = engine.node_id();
+    let me = me();
     let peer = outranking(me);
     let members = Members::default();
     members.insert_for_test(addr(peer), node(peer));

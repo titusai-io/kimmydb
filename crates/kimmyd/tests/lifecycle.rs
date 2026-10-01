@@ -2286,18 +2286,8 @@ async fn until_ready_is(
     }
 }
 
-/// A member that creates its store in a cluster it has seeds for is marked
-/// before the store exists, is not ready (it says why), and refuses data routes.
-/// With no peer reachable it cannot learn, so past the wait it serves as
-/// `unknown`, with the marker still set; the operator deleting the file clears
-/// it live; and the next start, which finds a store, is not marked.
-#[tokio::test]
-async fn a_fresh_member_with_seeds_is_marked_and_the_marker_goes_by_the_wait_and_the_operator() {
-    let dir = tempfile::tempdir().unwrap();
-    let client = reqwest::Client::new();
-    let mut run = Run::spawn_clustered(dir.path(), "fresh", dead_port(), 3);
-
-    // Not ready at first: wait for the port, not for a 200.
+/// The member's HTTP port, once it is in the log: wait for the port, not for a 200.
+async fn until_bound(run: &Run) {
     let deadline = Instant::now() + PATIENCE;
     while run.http.get().is_none() {
         let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
@@ -2307,18 +2297,44 @@ async fn a_fresh_member_with_seeds_is_marked_and_the_marker_goes_by_the_wait_and
         assert!(Instant::now() < deadline, "no port; log: {}", run.log());
         tokio::time::sleep(POLL).await;
     }
-    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, body| {
+}
+
+/// A member that creates its store in a cluster it has seeds for is marked
+/// before the store exists, is not ready (it says why), and refuses data routes.
+/// With no peer reachable it cannot learn, so past the wait it serves as
+/// `unknown`, with the marker still set; the operator deleting the file clears
+/// it live; and the next start, which finds a store, is not marked.
+///
+/// The marked state lasts for the wait, and the wait runs on the member's own
+/// clock, so a member stalled for longer than it (a loaded runner) is `unknown`
+/// before the first poll. Each half is therefore asserted of a member whose wait
+/// does not decide it: the marked state of one whose wait is far longer than the
+/// test, and `unknown`, which holds from then on, of one whose wait is short.
+#[tokio::test]
+async fn a_fresh_member_with_seeds_is_marked_and_the_marker_goes_by_the_wait_and_the_operator() {
+    let client = reqwest::Client::new();
+
+    // Marked, not ready, and not a member that serves: the wait cannot run out.
+    let held = tempfile::tempdir().unwrap();
+    let mut marked = Run::spawn_clustered(held.path(), "marked", dead_port(), 3600);
+    until_bound(&marked).await;
+    until_ready_is(&marked, &client, "503 catching_up seeded_empty", |status, header, body| {
         status == 503 && header.as_deref() == Some("seeded_empty") && body["error"] == "catching_up"
     })
     .await;
-    let file = catching_up_marker(dir.path()).expect("the marker is written for a fresh member");
+    let file = catching_up_marker(held.path()).expect("the marker is written for a fresh member");
     assert!(file.contains("seeded_empty"), "{file}");
     assert_eq!(
-        catching_up_gauge(&run, &client).await,
+        catching_up_gauge(&marked, &client).await,
         ["kimmy_catching_up{reason=\"seeded_empty\"} 1"]
     );
+    marked.signal("TERM");
+    assert!(marked.wait_exit().success());
 
     // The wait runs out with no peer reached: ready, and honest about it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = Run::spawn_clustered(dir.path(), "fresh", dead_port(), 3);
+    until_bound(&run).await;
     until_ready_is(&run, &client, "200 unknown", |status, header, body| {
         status == 200 && header.as_deref() == Some("unknown") && body["catching_up"] == "unknown"
     })
