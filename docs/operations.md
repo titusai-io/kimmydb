@@ -620,7 +620,7 @@ took), and **closes the store**: it logs `engine closed` with `elapsed_ms`, chec
 the close, and only then writes the clean-exit marker and logs `shutdown
 complete`. Exported spans and metrics get 2 s more, after the marker.
 
-**A stop that cannot close the store says so, and exits 75.** Four things
+**A stop that cannot close the store says so, and exits 75.** Three things
 prevent the close, and each is logged at `ERROR` as `exiting without closing
 the storage engine; the next start repairs the database`, with the reason in
 `error`:
@@ -630,10 +630,20 @@ the storage engine; the next start repairs the database`, with the reason in
   `storage.durability = coalesced`, a last flush that failed (`a write was
   still in progress …`);
 - a close that redb did not record, such as after a task panicked inside a
-  write transaction (`… needing recovery …`);
-- a start that failed after it opened the store, such as one whose cluster
-  listener could not bind, with the store still open when the process stopped
-  (`the start failed after it opened the store …`).
+  write transaction (`… needing recovery …`).
+
+**A start that fails after it opened the store closes it as a stop does**, so a
+cluster listener that cannot bind, or any other failure past the open, exits 1
+with the marker `error`, and the next start repairs nothing. The tasks the start
+had spawned are told to stop and waited for, the store is closed to writes, and
+it is closed once the runtime is down. It exits 75 for the same three reasons,
+measured from the failure: a thread that still holds the store 22 s after it, or
+a write still open 10 s after, so a failed start whose store is held can take up
+to about 22 s to exit, and about 10 s when a write is still open at the cap: the
+writes cap runs inside the 22 s, not after it. Before this
+a start that failed after the open always left the store marked for recovery on
+a store with data to scan, and exited 75 as `storage_not_closed`
+([ADR-188](decisions.md)).
 
 The node writes the marker `storage_not_closed` with that reason as its
 `cause` and exits with status **75**. The next start logs `the previous
