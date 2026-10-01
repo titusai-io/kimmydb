@@ -105,6 +105,28 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   ([ADR-208](docs/decisions.md),
   [Query language](docs/query-language.md#modified-counts-changes)).
 
+- **Breaking: a `$lookup` joins on every element of an array its key crosses or
+  holds, and its attachments are held to the ceiling.** `localField: "items.sku"`
+  over `items: [{sku: "ef-9"}, {sku: "gh-3"}]` attached the product of the first
+  line only and answered `200` with nothing said of the second; it now attaches
+  both, the union of what each element's key matched. A field that holds an array
+  is read as a filter reads it, on both sides: `localField: "productIds"` over
+  `productIds: [10, 20]` attached no product, since no `_id` was the list, and now
+  attaches the products with `_id` 10 and 20; `tags: ["a", "b"]` finds a foreign
+  `tags` of `"a"`, of `["a", "c"]` and of `["a", "b"]`. One level of an array is
+  opened, not more. A foreign document met through more than one key is attached
+  once, in the foreign collection's scan order, and a path with nothing at it joins
+  nothing, as before. The foreign collection is still scanned once, but the
+  documents a fan-out needs are held in memory up to the pipeline's 100,000
+  document ceiling, and the documents a `$lookup` attaches *in all* are now counted
+  against it too, before any is copied: a join of order lines to products
+  attaches a product per line, and one that attached more than 100,000 in total
+  (it used to be answered, at whatever memory it took) is refused, naming `$lookup`
+  and the count. Callers that relied on the first element, or on a list joining
+  only as a list, should `$unwind` the array first or match the one element they
+  meant, and narrow a join that over-attaches with an earlier `$match`. See
+  Aggregation, "$lookup", and ADR-210.
+
 - **Breaking: an update that writes one path twice is a `400`, and writes
   nothing.** Two writes to the same path, or to a path and a path inside it,
   were applied in the order their keys arrived: `{"$set": {"a": 1}, "$inc":

@@ -583,23 +583,46 @@ around the single authorization point ([ADR-024](decisions.md)).
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
 
-**`localField` and `foreignField` name one value each, and a path that
-crosses an array reads only the first element's.** They are field paths, not
-expressions, and the join needs one key per document on each side, so
-`localField: "items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` joins on
-`"a"` and never on `"b"` — a stage that looked like it attached every line's
-product attaches the first line's. The same rule reads the foreign side, so
-the two always agree about what a key is. A field that simply *holds* an
-array is a different case and is not affected: `localField: "tags"` over
-`tags: ["a", "b"]` joins on the whole array `["a", "b"]`, matching a foreign
-document whose `foreignField` is that same array and not one whose field is
-`"a"`.
+**A document joins under every value its path yields, and under every element
+of an array it holds** ([ADR-210](decisions.md#adr-210--a-lookup-key-joins-on-every-value-its-path-yields-and-on-every-element-of-an-array)).
+`localField: "items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` joins on `"a"`
+and on `"b"`, and `as` holds the union of what each matched; `localField:
+"productIds"` over `productIds: [10, 20]` joins on `10` and on `20` (and on the
+list itself, for a foreign key that is that list). The foreign side is read the
+same way, so a foreign document whose `foreignField` crosses an array, or holds
+one, is a candidate under each element, and the two always agree about what a
+key is. A field is read as a filter reads it: `{tags: "a"}` matches a document
+whose `tags` is `"a"`, is `["a", "b"]`, or is any array holding `"a"`, and a join
+on `tags` matches under the same three. Two documents join when a value of one
+equals a value of the other, where a value is what the path resolves to and,
+if that is an array, each of its elements, **one level down**: an array inside an
+array is an element and is not opened. The fields are field paths, not
+expressions (`items.sku` is every element's `sku`, and a numeric segment is both
+an index and a field name). Four rules decide the rest:
 
-Join on a scalar key. Where the key really is one per array element,
-`$unwind` the array first and join each row, which is a stage more and says
-what it means; the register records the difference from MongoDB, which fans
-a crossed `localField` out and joins on every element
-([Deviations](deviations.md)).
+- **A foreign document is attached once.** Met through two elements of one
+  input document, or through two of its own, it appears once in `as`, in the
+  order the foreign collection is scanned, not the order the elements name
+  them in. The reference behaviour does not promise an order here.
+- **Nothing at the path joins nothing.** An input document without the field
+  attaches nothing, and a foreign document without it is never a candidate; an
+  explicit `null` joins an explicit `null`. A stored `Decimal128` cannot be a
+  key and joins nothing, and inside an array the rest of the array still joins:
+  `[Decimal128, 5]` joins on `5`.
+- **The ceiling counts what is held and what is attached.** The foreign
+  collection is still scanned once, and the documents any key of the input needs
+  are held in memory, each once, up to the pipeline's ceiling of 100,000. The
+  documents a stage attaches in all, summed over the input, are counted against
+  the same ceiling before any is copied: a join that fans out can attach one
+  foreign document to every element of every input document. A pipeline that fit
+  before can be refused now, naming `$lookup` and the count, where it used to
+  answer with fewer documents attached than it meant.
+- **A join on one key per document is held to the attached ceiling too.** Input
+  documents that each match many foreign documents were never bounded in total.
+
+To get one row per element instead, `$unwind` the array first and join each row,
+which is a stage more and says what it means: the stage then joins each
+element's key alone and `as` holds that element's matches.
 
 **A key is a value, so a missing key is not `null` here.** An input document
 that lacks `localField` gets an empty `as` and joins nothing, and a foreign

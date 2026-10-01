@@ -6387,6 +6387,11 @@ lock, and is the next step if it is ever needed.
 
 ## ADR-116 — An expression field path through an array fans out, as MongoDB's does
 
+> **Amended by [ADR-210](#adr-210--a-lookup-key-joins-on-every-value-its-path-yields-and-on-every-element-of-an-array).**
+> `$lookup`'s `localField` and `foreignField` no longer read the single value at
+> the path: they join on every value it yields. `$unwind`'s path and `$sort`'s
+> keys still do.
+
 **Decision.** The expression layer has its own path resolver. A field path
 read as an expression — `"$items.sku"`, `$$ROOT.items.sku`, `$$var.items.sku`
 — walks its segments left to right; where a segment lands on an array before
@@ -23218,3 +23223,168 @@ a naive three-valued reference; another shuffles the arguments of every
 an unbound variable on one document and a good value on the next fails with
 `Internal`, and the pipeline ceiling is an `Error::Limit` with the same text
 as before.
+
+---
+
+## ADR-210 — A `$lookup` key joins on every value its path yields, and on every element of an array
+
+**Status:** accepted, for the next `0.MINOR`. Amends
+[ADR-116](#adr-116--an-expression-field-path-through-an-array-fans-out-as-mongodbs-does),
+whose sentence that `$lookup`'s `localField` and `foreignField` "keep reading
+the single value at the path" no longer holds. Extends
+[ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+from what a request says to what it answers: an answer that looks complete and
+is not is the failure it exists to close.
+
+**The defect.** Over `orders` `{_id: 1, items: [{sku: "ef-9"}, {sku:
+"gh-3"}]}` and `products` `{_id: "ef-9"}`, `{_id: "gh-3"}`, the stage `{$lookup:
+{from: "products", localField: "items.sku", foreignField: "_id", as:
+"products"}}` answered `200` with one product attached. `lookup_keys` and the
+executor both read `path::resolve(...).next()`, the first value, so the second
+line's product was dropped and nothing said so. A report totalling the attached
+products under-counted every multi-line order and never failed. The same reading
+made a field that holds a list join as the list and nothing else: an order's
+`productIds: [10, 20]` against products' `_id` attached no product, since no
+product's `_id` is the list, and `tags: ["a", "b"]` against a foreign `tags: "a"`
+or `["a", "c"]` found neither. The register had kept the first-element reading as
+a default (a join that multiplies its input by an array's length is a `$unwind`
+nobody wrote, and the ceiling and cost both change with it). Its own example
+refutes it: nobody who writes `localField: "items.sku"` means "the first item",
+and nobody who writes `localField: "productIds"` means "the list as one value".
+
+**Decision.**
+
+- **A document joins under the values its path yields, read as a filter reads
+  a field.** `aggregate::join_values` is every value `path::resolve` returns and,
+  for each that is an array, each of its elements as well, one level down. It is
+  the filter's own reading (`kimmy_core::matching::any_element`: `{field: v}`
+  matches when `v` is the field's value or an element of it), so a join and a
+  filter agree about what a field's value is. Examples: `items.sku` over `items:
+  [{sku: "a"}, {sku: "b"}]` is `"a"` and `"b"`; `tags` over `tags: ["a", "b"]`
+  is `["a", "b"]`, `"a"` and `"b"`; `productIds: [10, 20]` is the list, `10` and
+  `20`; `a.b` over `a: [{b: [1, 2]}, {b: [3]}]` is `[1, 2]`, `1`, `2`, `[3]` and
+  `3`. **One level:** an array inside an array is an element and is not opened,
+  as the filter does not open it. A path that crosses no array and holds no
+  array yields one value, as before.
+- **Both sides are read through that function.** The input side's wanted set is
+  `lookup_keys` (the distinct values of `join_values` over the input), and the
+  foreign scan files each document under every wanted key of `join_values` of its
+  `foreignField`, through `join_keys`, the distinct encoded keys: one function, so
+  the two sides cannot disagree about what a key is. Two documents join when
+  their values share a key: the local value equal to the foreign one, to an
+  element of it, or an element of the local one equal to either.
+- **Absent is nothing.** A path absent from a document yields no value. An input
+  document without the field attaches nothing and adds no key to the wanted set,
+  and a foreign document without the field is never a candidate: an explicit
+  `null` joins an explicit `null`, and an absent field joins nothing on either
+  side, as before. (An earlier build still wanted a `null` key for an input
+  document without the field, which attached nothing but held every foreign
+  document whose key was `null` and counted them against the ceiling.)
+- **A value that cannot be keyed yields no key.** A `Decimal128` cannot be
+  keyed (ADR-005) and joins nothing, as before. Inside an array the array as a
+  whole has no key and its other elements do: `[Decimal128, 5]` joins on its `5`.
+- **A foreign document is attached once.** The foreign documents that match are
+  held once, in scan order, in a vector, and the keys index into it. An input
+  document attaches the sorted, de-duplicated union of the indices of its keys'
+  buckets, so a document met through two of the input's values, or through two
+  of its own, is attached once, in scan order. The reference behaviour does not
+  promise an order for the union; scan order is chosen and documented.
+- **The foreign collection is still scanned once** for the whole stage, and
+  `as` is always an array.
+- **The ceiling counts both what is held and what is attached.**
+  - *Held:* `check_limit("$lookup", …)` is given the number of foreign documents
+    in that vector, each once however many keys it is filed under. For a join on
+    one value per document the count is what it was; for a fan-out it can be
+    larger, because the wanted set grows with the total array length of the
+    input.
+  - *Attached:* `check_attached` is given the sum of the lengths of the `as`
+    arrays across the input, and runs before any attachment is copied. Held once
+    is not attached once: each attachment is a copy of the foreign document, and a
+    join of order lines to products by `_id` attaches a product to every line of
+    every order. Measured on 600 inputs each naming the same 600 documents of a
+    kilobyte each: 360,000 attachments, 868 MB resident, with 600 held. The count
+    is checked against the same 100,000 ceiling, and a pipeline over it is a
+    `400` naming `$lookup` and the count. The one-key-per-document join was not
+    held to it and now is, so a join attaching more than the ceiling in all is
+    refused where it was answered.
+  - So a pipeline that fit before can be refused now, in either count. The old
+    query was returning less than it claimed, and the attached count bounds what
+    the answer holds. The index entries (one `usize` per document per key) are
+    not documents and are not counted.
+- **`$unwind` is unchanged.** Its refusal of a path that crosses an array
+  (ADR-130) is about writing each element back to one place, which a join does
+  not do. `$unwind` first, then the join, is the way to one row per element, and
+  is unchanged. `$sort` keeps its single value.
+
+**Why.** It is ADR-121's rule applied to an answer: a request the server cannot
+honour is refused, and one it can is answered in full. The server could, with
+what it had: both sides already resolved every value and discarded all but one,
+and the filter language already says what a field that holds an array is.
+Taking them all costs one set per key and a vector of the matches. The change
+makes a pipeline mean what it says.
+
+**Caller-visible, and breaking.** A stage that attached the first element's
+matches now attaches every element's; a join on a field that holds a list, which
+attached nothing unless a foreign key was that same list, now attaches a match
+for each element; and one that attaches more than the ceiling in all is refused.
+Under **Changed**, marked **Breaking**, in the CHANGELOG. The test-kit has no case
+that pins the first element.
+
+**Rejected.**
+
+- *An opt-in `fanOut` key on `$lookup`.* A key a ported pipeline will not carry:
+  the silent partial result stays the default and the pipeline stays wrong.
+- *Fan out the local side only.* The foreign side's documents whose key sits in
+  an array would then never match, and the two sides would disagree about what a
+  key is, which the shared reader exists to prevent.
+- *Join a field that holds an array on the whole array alone, as an earlier
+  version of this ADR did.* It was the narrower reading and the one the code had,
+  and it made `productIds` against `_id` join nothing. A filter on the same field
+  matches either, so a join should.
+- *Open arrays all the way down.* A filter opens one level, and a join that opened
+  more would join on what no filter on the field finds.
+- *Count only the foreign documents held.* They are what is in memory once, and
+  attachments are what is in memory per input document; counting the first alone
+  lets a join of a few documents to many inputs copy a collection's worth.
+- *Count the index entries as documents held.* They are not documents, and a
+  document under many keys is held once; counting each would refuse a join that
+  fits.
+- *Order the union by the keys' order in the input document.* It would need a
+  second pass or a map from foreign document to first key; scan order is free.
+
+**Cost.** One vector of the matched foreign documents and a `usize` per
+document per wanted key it yields, in place of a vector per key; the attach step
+sorts and de-duplicates the indices of one input document's keys, which is the
+length of its arrays; and the indices of every input document are held for the
+ceiling's count before any is copied, a `usize` per attachment. The ceiling can
+now be reached by a pipeline that fit before, which is the change. Nothing is read
+per input document from storage.
+
+### Test
+
+`kimmy-query`: `lookup_keys` over every value and each element, with the examples
+above, one level only, equal values one key, nothing at the path nothing wanted
+and an explicit `null` a key; `$unwind`'s tests of ADR-130 pass unchanged.
+`kimmy-api`: the example through the executor attaches both products, in scan
+order, a product named by two elements once, nothing for an unknown sku and for an
+input document without the field; the foreign side crossing an array attaches a
+document met through two elements once and through its second key; a field
+holding an array joins on the whole array and on each element, on both sides
+(`tags` against `"a"`, `["a", "c"]` and the same list; `productIds` against
+`_id`); the held ceiling (three refused under three with four products held, four
+accepted under four, one document under four keys held once under one); the
+attached ceiling (nine attachments of three held documents refused under eight,
+accepted under nine, naming the count); a missing local field holds nothing under
+a ceiling below the foreign `null`s; a `Decimal128` key joins nothing and
+`[Decimal128, 5]` joins on `5`; and a join against a naive reference over 120
+generated pairs of documents, with arrays, nested arrays, missing fields, `null`,
+numbers of several types, documents and `Decimal128`, agrees with the reference
+document for document. Over HTTP the example attaches Gasket and Bolt, and
+`$unwind`-first gives a row per line. Each guard was broken and its test failed:
+`lookup_keys` taking the first value again; the executor reading the first value
+on the local side, and on the foreign side; the elements of an array not offered
+on either side; the elements of an array opened more than one level; the buckets
+keyed by the first key only; the union not de-duplicated; the union not sorted;
+the held count counting index entries or not checked; the attached count not
+checked, or counting only the held documents; an input document without the
+field wanting a `null` key.

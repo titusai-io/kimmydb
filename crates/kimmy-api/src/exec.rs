@@ -2081,41 +2081,63 @@ fn lookup(
     let wanted: std::collections::HashSet<Vec<u8>> =
         aggregate::lookup_keys(&input, local_field).iter().filter_map(encode_key).collect();
 
-    let mut matches: std::collections::HashMap<Vec<u8>, Vec<bson::Bson>> =
+    // Each matching foreign document is held once, in scan order, and filed
+    // under every wanted key its `foreignField` yields (ADR-210).
+    let mut foreign_docs: Vec<bson::Document> = Vec::new();
+    let mut buckets: std::collections::HashMap<Vec<u8>, Vec<usize>> =
         std::collections::HashMap::new();
-    let mut held = 0usize;
     // The whole foreign collection, so a walk (ADR-153).
     kimmy_storage::blocking(|| {
         state.engine.for_each_doc(&foreign, kimmy_storage::WalkScope::Request, |_id, doc| {
             // `foreignField` and `localField` are field paths, not expressions:
-            // they name the key on each side, read the same way here and in
-            // `aggregate::lookup_keys`, and neither fans out across an array.
-            let Some(value) = kimmy_core::path::resolve(&doc, foreign_field).into_iter().next()
-            else {
+            // they name the keys on each side, read the same way here and in
+            // `aggregate::lookup_keys`: every value the path yields is a key,
+            // so a path that crosses an array joins under each element's.
+            let mut keys = join_keys(&doc, foreign_field);
+            keys.retain(|key| wanted.contains(key));
+            if keys.is_empty() {
                 return Ok(true);
-            };
-            let Some(key) = encode_key(value) else {
-                return Ok(true);
-            };
-            if wanted.contains(&key) {
-                matches.entry(key).or_default().push(bson::Bson::Document(doc));
-                held += 1;
             }
+            let at = foreign_docs.len();
+            for key in keys {
+                buckets.entry(key).or_default().push(at);
+            }
+            foreign_docs.push(doc);
             Ok(true)
         })
     })?;
     // The joined documents are held in memory alongside the input, so they are
-    // subject to the same ceiling.
-    aggregate::check_limit("$lookup", held, limits)?;
+    // subject to the same ceiling. A document filed under several keys is held
+    // once, and counted once; what is attached is counted below.
+    aggregate::check_limit("$lookup", foreign_docs.len(), limits)?;
+
+    // The union of the buckets of every key each input document yields, each
+    // foreign document once however many of its keys met, in scan order.
+    let attached: Vec<Vec<usize>> = input
+        .iter()
+        .map(|doc| {
+            let mut at: Vec<usize> = join_keys(doc, local_field)
+                .iter()
+                .filter_map(|key| buckets.get(key))
+                .flatten()
+                .copied()
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            at
+        })
+        .collect();
+    // Each attachment is a copy, so the ceiling counts them too, before any is
+    // made: a fan-out can attach one foreign document to every element of every
+    // input document, and held once is not attached once.
+    aggregate::check_attached("$lookup", attached.iter().map(Vec::len).sum(), limits)?;
 
     let mut out = Vec::with_capacity(input.len());
-    for mut doc in input {
-        let key =
-            kimmy_core::path::resolve(&doc, local_field).into_iter().next().and_then(encode_key);
-        let joined = key.and_then(|k| matches.get(&k).cloned()).unwrap_or_default();
+    for (mut doc, at) in input.into_iter().zip(attached) {
+        let joined = at.into_iter().map(|i| bson::Bson::Document(foreign_docs[i].clone()));
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
-        doc.insert(as_field.to_string(), bson::Bson::Array(joined));
+        doc.insert(as_field.to_string(), bson::Bson::Array(joined.collect()));
         out.push(doc);
     }
     Ok(out)
@@ -2201,6 +2223,20 @@ fn lookup_pipeline(
 
 fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
     kimmy_core::keyenc::encode(value).ok()
+}
+
+/// The distinct keys a document joins under at `field`: one for every value of
+/// [`aggregate::join_values`] (what the path yields, and the elements of any
+/// that is an array), the same function the input side's wanted set is built
+/// from. A value that cannot be keyed (a `Decimal128`, alone or inside an array)
+/// yields none, so `[Decimal128, 5]` joins on its `5` and not as a whole, and a
+/// document without the field yields no keys at all.
+fn join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> =
+        aggregate::join_values(doc, field).into_iter().filter_map(encode_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 #[cfg(test)]
@@ -2616,6 +2652,363 @@ mod tests {
         assert!(format!("{err:?}").contains("leading $match"), "{err:?}");
     }
 
+    /// `app.<coll>` holding `docs`, for the join tests.
+    fn seed_docs(state: &SharedState, coll: &str, docs: Vec<bson::Document>) {
+        state.engine.create_collection("app", coll).unwrap();
+        let meta = state.engine.get_collection("app", coll).unwrap();
+        for doc in docs {
+            state.engine.insert(&meta, doc).unwrap();
+        }
+    }
+
+    fn joined_ids(out: &Value, as_field: &str) -> Vec<Vec<Value>> {
+        out["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d[as_field].as_array().unwrap().iter().map(|p| p["_id"].clone()).collect())
+            .collect()
+    }
+
+    /// A join key that crosses an array joins on every element (ADR-210): the
+    /// local side attaches the union of each element's matches, a foreign
+    /// document met through two elements is attached once, in scan order, and
+    /// the foreign side is filed under every value its own path crosses.
+    #[test]
+    fn a_join_key_that_crosses_an_array_joins_on_every_element() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(
+            &state,
+            "products",
+            vec![
+                bson::doc! { "_id": "ef-9", "name": "Gasket" },
+                bson::doc! { "_id": "gh-3", "name": "Bolt" },
+                bson::doc! { "_id": "zz-0", "name": "Never" },
+            ],
+        );
+        seed_docs(
+            &state,
+            "orders",
+            vec![
+                bson::doc! { "_id": 1, "items": [{"sku": "ef-9"}, {"sku": "gh-3"}] },
+                // Two elements naming one product: attached once.
+                bson::doc! { "_id": 2, "items": [{"sku": "gh-3"}, {"sku": "gh-3"}, {"sku": "ef-9"}] },
+                bson::doc! { "_id": 3, "items": [{"sku": "nope"}] },
+                bson::doc! { "_id": 4 },
+            ],
+        );
+        let pipeline = |local: &str, from: &str, foreign: &str| {
+            json!([
+                { "$lookup": { "from": from, "localField": local, "foreignField": foreign, "as": "p" } },
+                { "$sort": { "_id": 1 } },
+            ])
+        };
+        let out = aggregate(
+            &state,
+            &superuser(),
+            "app",
+            "orders",
+            &pipeline("items.sku", "products", "_id"),
+        )
+        .unwrap();
+        // Scan order is the foreign collection's key order: ef-9 before gh-3,
+        // whichever order the elements name them in.
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![
+                vec![json!("ef-9"), json!("gh-3")],
+                vec![json!("ef-9"), json!("gh-3")],
+                vec![],
+                vec![],
+            ]
+        );
+
+        // The foreign side crosses an array too: a stock record lists the skus
+        // it covers, and is a candidate under each.
+        seed_docs(
+            &state,
+            "stock",
+            vec![
+                bson::doc! { "_id": "s1", "covers": [{"sku": "ef-9"}, {"sku": "gh-3"}] },
+                bson::doc! { "_id": "s2", "covers": [{"sku": "gh-3"}] },
+            ],
+        );
+        let out = aggregate(
+            &state,
+            &superuser(),
+            "app",
+            "orders",
+            &pipeline("items.sku", "stock", "covers.sku"),
+        )
+        .unwrap();
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![vec![json!("s1"), json!("s2")], vec![json!("s1"), json!("s2")], vec![], vec![],],
+            "s1 is met through two elements and attached once"
+        );
+
+        // A field that holds an array joins on the whole array and on each
+        // element, as a filter reads it, on both sides: a foreign document whose
+        // key is that same array, one whose key is an element, and one whose
+        // array holds an element are all found.
+        seed_docs(
+            &state,
+            "tagged",
+            vec![
+                bson::doc! { "_id": 1, "tags": ["a", "b"] },
+                bson::doc! { "_id": 2, "tags": "a" },
+                bson::doc! { "_id": 3, "tags": ["c"] },
+            ],
+        );
+        seed_docs(
+            &state,
+            "tag_sets",
+            vec![
+                bson::doc! { "_id": "x", "tags": ["a", "b"] },
+                bson::doc! { "_id": "y", "tags": "a" },
+                bson::doc! { "_id": "z", "tags": ["a", "c"] },
+                bson::doc! { "_id": "w", "tags": "q" },
+            ],
+        );
+        let out =
+            aggregate(&state, &superuser(), "app", "tagged", &pipeline("tags", "tag_sets", "tags"))
+                .unwrap();
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![
+                vec![json!("x"), json!("y"), json!("z")],
+                vec![json!("x"), json!("y"), json!("z")],
+                vec![json!("z")],
+            ]
+        );
+
+        // A list of ids joins on each id: an order's `productIds` to products.
+        seed_docs(
+            &state,
+            "baskets",
+            vec![
+                bson::doc! { "_id": 1, "productIds": [10, 20, 99] },
+                bson::doc! { "_id": 2, "productIds": [] },
+            ],
+        );
+        seed_docs(
+            &state,
+            "catalog",
+            vec![
+                bson::doc! { "_id": 10, "name": "a" },
+                bson::doc! { "_id": 20, "name": "b" },
+                bson::doc! { "_id": 30, "name": "c" },
+            ],
+        );
+        let out = aggregate(
+            &state,
+            &superuser(),
+            "app",
+            "baskets",
+            &pipeline("productIds", "catalog", "_id"),
+        )
+        .unwrap();
+        assert_eq!(joined_ids(&out, "p"), vec![vec![json!(10), json!(20)], vec![]]);
+    }
+
+    /// Both sides are read the same way, and the union is in the foreign
+    /// collection's scan order, not the order the keys are written or sorted
+    /// in. A foreign document is reachable through any of its keys, the second
+    /// as well as the first; a missing local field joins nothing and an
+    /// explicit `null` joins an explicit `null`.
+    #[test]
+    fn a_fanned_out_join_attaches_in_scan_order_and_reads_every_key_on_each_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        // `code` orders the other way round from `_id`: "z" is scanned first.
+        seed_docs(
+            &state,
+            "coded",
+            vec![
+                bson::doc! { "_id": 1, "code": "z" },
+                bson::doc! { "_id": 2, "code": "a" },
+                bson::doc! { "_id": 3, "code": bson::Bson::Null },
+                bson::doc! { "_id": 4, "other": 1 },
+                // A null among the elements of an array is a key, as it is to a filter.
+                bson::doc! { "_id": 5, "code": [bson::Bson::Null, "w"] },
+            ],
+        );
+        seed_docs(
+            &state,
+            "carts",
+            vec![
+                bson::doc! { "_id": 1, "items": [{"sku": "a"}, {"sku": "z"}] },
+                bson::doc! { "_id": 2, "items": [{"sku": "z"}, {"sku": "a"}] },
+                bson::doc! { "_id": 3, "items": [{"sku": bson::Bson::Null}] },
+                bson::doc! { "_id": 4 },
+                bson::doc! { "_id": 5, "items": [{"sku": [bson::Bson::Null, "zz"]}] },
+            ],
+        );
+        let join = json!([
+            { "$lookup": { "from": "coded", "localField": "items.sku", "foreignField": "code", "as": "p" } },
+            { "$sort": { "_id": 1 } },
+        ]);
+        let out = aggregate(&state, &superuser(), "app", "carts", &join).unwrap();
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![
+                vec![json!(1), json!(2)],
+                vec![json!(1), json!(2)],
+                vec![json!(3), json!(5)],
+                vec![],
+                vec![json!(3), json!(5)],
+            ],
+            "scan order, whichever way the keys are written; an explicit null joins a null, and a \
+             null among the elements of an array does on either side; a missing field joins \
+             nothing, and a foreign document without the field is no candidate"
+        );
+
+        // The foreign side crosses an array: a document is a candidate through
+        // its second element as well as its first.
+        seed_docs(
+            &state,
+            "covers",
+            vec![bson::doc! { "_id": "s1", "covers": [{"sku": "a"}, {"sku": "z"}] }],
+        );
+        seed_docs(&state, "late", vec![bson::doc! { "_id": 1, "items": [{"sku": "z"}] }]);
+        let join = json!([{ "$lookup": { "from": "covers", "localField": "items.sku",
+                                        "foreignField": "covers.sku", "as": "p" } }]);
+        let out = aggregate(&state, &superuser(), "app", "late", &join).unwrap();
+        assert_eq!(joined_ids(&out, "p"), vec![vec![json!("s1")]], "found through its second key");
+    }
+
+    #[test]
+    fn a_document_joins_under_each_distinct_key_once() {
+        let doc = bson::doc! { "items": [{"sku": "b"}, {"sku": "a"}, {"sku": "b"}], "d": bson::Decimal128::from_bytes([0; 16]) };
+        assert_eq!(
+            join_keys(&doc, "items.sku"),
+            vec![
+                encode_key(&bson::Bson::String("a".into())).unwrap(),
+                encode_key(&bson::Bson::String("b".into())).unwrap(),
+            ]
+        );
+        assert!(join_keys(&doc, "missing").is_empty());
+        assert!(join_keys(&doc, "d").is_empty(), "a value that cannot be keyed yields none");
+    }
+
+    /// The ceiling counts the foreign documents held, once each: a join that
+    /// fans out can hold more than one that read the first element, and is
+    /// refused over the ceiling like any other (ADR-210), while a document filed
+    /// under several keys is not counted per key.
+    #[test]
+    fn a_fanned_out_join_is_held_to_the_ceiling_by_the_documents_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(
+            &state,
+            "products",
+            (0..5).map(|i| bson::doc! { "_id": i, "name": format!("p{i}") }).collect(),
+        );
+        seed_docs(
+            &state,
+            "orders",
+            vec![
+                bson::doc! { "_id": 1, "items": [{"sku": 0}, {"sku": 1}, {"sku": 2}, {"sku": 3}] },
+            ],
+        );
+        let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
+                                        "foreignField": "_id", "as": "p" } }]);
+        let tight = aggregate::Limits { max_documents: 3 };
+        let err = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, tight)
+            .expect_err("four products held under a ceiling of three");
+        assert!(format!("{err:?}").contains("$lookup produced 4 documents"), "{err:?}");
+        let roomy = aggregate::Limits { max_documents: 4 };
+        let out =
+            aggregate_with_limits(&state, &superuser(), "app", "orders", &join, roomy).unwrap();
+        assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 4);
+
+        // One foreign document filed under all four keys is held once.
+        seed_docs(
+            &state,
+            "wide",
+            vec![
+                bson::doc! { "_id": "w", "covers": [{"sku": 0}, {"sku": 1}, {"sku": 2}, {"sku": 3}] },
+            ],
+        );
+        let wide = json!([{ "$lookup": { "from": "wide", "localField": "items.sku",
+                                        "foreignField": "covers.sku", "as": "p" } }]);
+        let one = aggregate::Limits { max_documents: 1 };
+        let out = aggregate_with_limits(&state, &superuser(), "app", "orders", &wide, one).unwrap();
+        assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 1);
+    }
+
+    /// The ceiling counts what a join attaches, in all, before any is copied
+    /// (ADR-210): held once is not attached once. Three orders each naming the
+    /// same three products hold three foreign documents and attach nine.
+    #[test]
+    fn a_join_is_held_to_the_ceiling_by_what_it_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(&state, "products", (0..3).map(|i| bson::doc! { "_id": i }).collect());
+        seed_docs(
+            &state,
+            "orders",
+            (0..3)
+                .map(|i| bson::doc! { "_id": i, "items": [{"sku": 0}, {"sku": 1}, {"sku": 2}] })
+                .collect(),
+        );
+        let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
+                                        "foreignField": "_id", "as": "p" } }]);
+        let nine = aggregate::Limits { max_documents: 9 };
+        let out =
+            aggregate_with_limits(&state, &superuser(), "app", "orders", &join, nine).unwrap();
+        assert_eq!(out["count"], 3);
+        let eight = aggregate::Limits { max_documents: 8 };
+        let err = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, eight)
+            .expect_err("nine attached under a ceiling of eight, three held");
+        assert!(format!("{err:?}").contains("$lookup would attach 9 documents in all"), "{err:?}");
+    }
+
+    /// A document with no value at the path wants nothing: it adds no key, so
+    /// foreign documents holding an explicit `null` are not held on its account,
+    /// and a join that attaches nothing is not refused for holding them.
+    #[test]
+    fn a_missing_local_field_wants_no_key_and_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_docs(&state, "orders", vec![bson::doc! { "_id": 1 }]);
+        seed_docs(
+            &state,
+            "nulls",
+            (0..3).map(|i| bson::doc! { "_id": i, "k": bson::Bson::Null }).collect(),
+        );
+        let join = json!([{ "$lookup": { "from": "nulls", "localField": "k", "foreignField": "k", "as": "p" } }]);
+        let two = aggregate::Limits { max_documents: 2 };
+        let out = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, two).unwrap();
+        assert_eq!(out["documents"][0]["p"], json!([]));
+    }
+
+    /// A value that cannot be keyed joins nothing, and inside an array the
+    /// elements that can be still do.
+    #[test]
+    fn a_decimal128_key_joins_nothing_and_its_array_joins_on_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let dec = || bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]));
+        seed_docs(
+            &state,
+            "orders",
+            vec![bson::doc! { "_id": 1, "k": dec() }, bson::doc! { "_id": 2, "k": [dec(), 5] }],
+        );
+        seed_docs(
+            &state,
+            "targets",
+            vec![bson::doc! { "_id": "five", "k": 5 }, bson::doc! { "_id": "dec", "k": dec() }],
+        );
+        let join = json!([
+            { "$lookup": { "from": "targets", "localField": "k", "foreignField": "k", "as": "p" } },
+            { "$sort": { "_id": 1 } },
+        ]);
+        let out = aggregate(&state, &superuser(), "app", "orders", &join).unwrap();
+        assert_eq!(joined_ids(&out, "p"), vec![vec![], vec![json!("five")]]);
+    }
+
     #[test]
     fn a_match_after_another_stage_is_not_pushed_down() {
         // `$project` then `$match` must mean what it says: the filter reads
@@ -2859,5 +3252,212 @@ mod decimal128_at_the_edge {
             crate::egress::EgressPolicy::public_only(crate::egress::WEBHOOKS),
         )
         .unwrap()
+    }
+}
+
+/// A join against a naive reference over generated documents (ADR-210): two
+/// documents join when a value of one, and the elements of it when it is an
+/// array, equals a value of the other read the same way; a missing field joins
+/// nothing and a `Decimal128` cannot be a key. Scan order is ascending `_id`.
+#[cfg(test)]
+mod join_differential {
+    use super::*;
+    use bson::{Bson, Document, doc};
+    use serde_json::json;
+    use std::cmp::Ordering;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn scalar(r: &mut Rng) -> Bson {
+        match r.below(16) {
+            0 => Bson::Int32(1),
+            1 => Bson::Double(1.0),
+            2 => Bson::Int64(2),
+            3 => Bson::Double(2.0),
+            4 => Bson::Double(0.0),
+            5 => Bson::Double(-0.0),
+            6 => Bson::Int32(0),
+            7 => Bson::Double(f64::NAN),
+            8 => Bson::String("a".into()),
+            9 => Bson::String("b".into()),
+            10 => Bson::Null,
+            11 => Bson::Decimal128(bson::Decimal128::from_bytes([0; 16])),
+            12 => Bson::Document(doc! {"x": 1, "y": 2}),
+            13 => Bson::Document(doc! {"y": 2, "x": 1}),
+            14 => Bson::Document(doc! {"x": 1.0, "y": 2i64}),
+            _ => Bson::Boolean(true),
+        }
+    }
+
+    /// A scalar, or an array of values two deep, with nulls over-represented
+    /// among the elements: the one level a join opens must be told from none and
+    /// from two.
+    fn value(r: &mut Rng, depth: u32) -> Bson {
+        if depth < 2 && r.below(3) == 0 {
+            let n = r.below(4);
+            Bson::Array(
+                (0..n)
+                    .map(|_| if r.below(3) == 0 { Bson::Null } else { value(r, depth + 1) })
+                    .collect(),
+            )
+        } else {
+            scalar(r)
+        }
+    }
+
+    /// Something at `top.k` or `k` in `d`: absent, a scalar, a document, an
+    /// array of documents some of which lack `k`, or arrays in arrays.
+    fn place(r: &mut Rng, d: &mut Document, top: &str) {
+        match r.below(6) {
+            0 => {}
+            1 => {
+                d.insert(top, doc! {"k": value(r, 0)});
+            }
+            2 | 3 => {
+                let elems: Vec<Bson> = (0..r.below(4))
+                    .map(|_| {
+                        if r.below(5) == 0 {
+                            Bson::Document(doc! {"z": 1})
+                        } else {
+                            Bson::Document(doc! {"k": value(r, 0)})
+                        }
+                    })
+                    .collect();
+                d.insert(top, elems);
+            }
+            4 => {
+                d.insert(top, value(r, 0));
+            }
+            _ => {
+                let inner = Bson::Array(vec![Bson::Document(doc! {"k": value(r, 0)})]);
+                d.insert(top, Bson::Array(vec![inner]));
+            }
+        }
+        if r.below(2) == 0 {
+            d.insert("k", value(r, 0));
+        }
+    }
+
+    fn has_decimal(v: &Bson) -> bool {
+        match v {
+            Bson::Decimal128(_) => true,
+            Bson::Array(a) => a.iter().any(has_decimal),
+            Bson::Document(d) => d.values().any(has_decimal),
+            _ => false,
+        }
+    }
+
+    fn equal(a: &Bson, b: &Bson) -> bool {
+        !has_decimal(a)
+            && !has_decimal(b)
+            && kimmy_core::cmp::canonical_cmp(a, b) == Ordering::Equal
+    }
+
+    /// The reference's values: each resolved value, then its elements.
+    fn expanded(values: Vec<&Bson>) -> Vec<Bson> {
+        let mut out = Vec::new();
+        for v in values {
+            out.push(v.clone());
+            if let Bson::Array(a) = v {
+                out.extend(a.iter().cloned());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_join_agrees_with_a_naive_reference_over_generated_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(
+            kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
+        );
+        let tokens =
+            kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret-for-hs256", 3600).unwrap();
+        let state = crate::state_with_egress(
+            engine,
+            tokens,
+            false,
+            crate::RateLimits::disabled(),
+            crate::egress::EgressPolicy::public_only(crate::egress::WEBHOOKS),
+        )
+        .unwrap();
+        let auth = Auth(kimmy_auth::Principal::superuser("test"));
+
+        let mut attached_in_all = 0;
+        for seed in 1..=120u64 {
+            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (local_name, foreign_name) = (format!("l{seed}"), format!("f{seed}"));
+            let local_path = if r.below(2) == 0 { "a.k" } else { "k" };
+            let foreign_path = if r.below(2) == 0 { "c.k" } else { "k" };
+            let locals: Vec<Document> = (0..1 + r.below(6))
+                .map(|i| {
+                    let mut d = doc! {"_id": i as i32};
+                    place(&mut r, &mut d, "a");
+                    d
+                })
+                .collect();
+            let foreigns: Vec<Document> = (0..1 + r.below(8))
+                .map(|i| {
+                    let mut d = doc! {"_id": i as i32};
+                    place(&mut r, &mut d, "c");
+                    d
+                })
+                .collect();
+            for (name, docs) in [(&local_name, &locals), (&foreign_name, &foreigns)] {
+                state.engine.create_collection("app", name).unwrap();
+                let meta = state.engine.get_collection("app", name).unwrap();
+                for d in docs {
+                    state.engine.insert(&meta, d.clone()).unwrap();
+                }
+            }
+            let pipeline = json!([
+                {"$lookup": {"from": foreign_name, "localField": local_path,
+                             "foreignField": foreign_path, "as": "p"}},
+                {"$sort": {"_id": 1}},
+                {"$project": {"_id": 1, "p": 1}},
+            ]);
+            let out = aggregate(&state, &auth, "app", &local_name, &pipeline)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
+            let got: Vec<Vec<i64>> = out["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    d["p"].as_array().unwrap().iter().map(|p| p["_id"].as_i64().unwrap()).collect()
+                })
+                .collect();
+            let want: Vec<Vec<i64>> = locals
+                .iter()
+                .map(|l| {
+                    let lv = expanded(kimmy_core::path::resolve(l, local_path));
+                    foreigns
+                        .iter()
+                        .filter(|f| {
+                            let fv = expanded(kimmy_core::path::resolve(f, foreign_path));
+                            lv.iter().any(|a| fv.iter().any(|b| equal(a, b)))
+                        })
+                        .map(|f| i64::from(f.get_i32("_id").unwrap()))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                got, want,
+                "seed {seed}\nlocal {local_path} {locals:?}\nforeign {foreign_path} {foreigns:?}"
+            );
+            attached_in_all += got.iter().map(Vec::len).sum::<usize>();
+        }
+        // Not vacuous: most generated pairs join something.
+        assert!(attached_in_all > 30, "{attached_in_all} attachments over 120 generated joins");
     }
 }

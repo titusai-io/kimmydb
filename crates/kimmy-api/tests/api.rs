@@ -8760,6 +8760,56 @@ async fn lookup_is_authorized_against_the_collection_it_joins() {
     );
 }
 
+/// A `$lookup` whose `localField` crosses an array attaches the product of
+/// every line, not the first line's (ADR-210); a field that holds an array
+/// still joins on the whole array, and `$unwind` first is still one row per line.
+#[tokio::test]
+async fn a_lookup_over_a_crossed_array_attaches_every_elements_match() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"products"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({"_id": 1, "items": [{"sku": "ef-9"}, {"sku": "gh-3"}]}),
+        )
+        .await;
+    for (id, name) in [("ef-9", "Gasket"), ("gh-3", "Bolt")] {
+        server
+            .post("/v1/db/shop/coll/products/docs", Some(&token), json!({"_id": id, "name": name}))
+            .await;
+    }
+    let lookup = json!({"$lookup": {"from": "products", "localField": "items.sku",
+                                    "foreignField": "_id", "as": "products"}});
+    let res = server
+        .post("/v1/db/shop/coll/orders/aggregate", Some(&token), json!({"pipeline": [lookup]}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"][0]["products"],
+        json!([{"_id": "ef-9", "name": "Gasket"}, {"_id": "gh-3", "name": "Bolt"}])
+    );
+    // The `$unwind`-first spelling still gives a row per line, each with its own.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$unwind": "$items"},
+                {"$lookup": {"from": "products", "localField": "items.sku",
+                             "foreignField": "_id", "as": "products"}},
+                {"$sort": {"items.sku": 1}},
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["products"][0]["name"], "Gasket");
+    assert_eq!(res.body["documents"][1]["products"][0]["name"], "Bolt");
+}
+
 #[tokio::test]
 async fn array_operators_and_variables_work_over_http() {
     let server = Server::start().await;
