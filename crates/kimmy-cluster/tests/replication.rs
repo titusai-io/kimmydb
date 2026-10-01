@@ -7425,9 +7425,23 @@ async fn a_peer_that_answers_a_horizon_for_the_whole_wait_is_given_up_on() {
 /// A floor an earlier start left, older than every peer's oplog, is clamped to
 /// what the peers keep, so a newer loss is still read back and marked. Without the
 /// clamp the same floor is answered `BeyondHorizon` and the loss is never seen.
+///
+/// **The clamp is `now - retention` on the real clock, so what it can read back
+/// is what was written within the retention of the last round.** The loss here is
+/// the writes made after the backup, and they are read back only while they are
+/// newer than the clamp. The test used to make them, then sync the peer, restore
+/// the backup, open the restored store and listen on it before the first round:
+/// on a loaded host the steps between the writes and the last round took longer
+/// than the retention of 3 s, the clamp passed the writes, and the replay read
+/// back 4 rows of 7. A host stall in the same steps did the same. Nothing the
+/// clamp does was wrong; the writes had aged out of what it is for. The restore,
+/// the open, the listener and the arming now come *before* the writes, so the
+/// time between them and the last round is the peer's sync and three rounds,
+/// and the retention is 5 s, which a host has to stall for in that stretch to
+/// age the writes out. A run that does so says how long it took.
 #[tokio::test]
 async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
-    let retention = Duration::from_secs(3);
+    let retention = Duration::from_secs(5);
     let writer = node().await;
     let peer = node().await;
     let meta = writer.engine.create_collection("shop", "orders").unwrap();
@@ -7447,12 +7461,10 @@ async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
         .unwrap();
     let mut backup = Vec::new();
     writer.engine.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
-    writer.engine.insert_many(&meta, (4..7i64).map(|i| doc! { "_id": i }).collect()).unwrap();
-    while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
-        sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
-    }
-    writer.serving.abort();
 
+    // The restored member, open and listening, before the loss is made: the
+    // loss is what the writer writes next, and what ages is its time to the
+    // last round.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kimmy.redb");
     kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
@@ -7468,6 +7480,14 @@ async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
     let catch_up = marker_in(&marker_dir);
     catch_up.arm_replay(position, Some(retention)).unwrap();
     assert!(catch_up.replay_floor() > old_floor, "the floor is clamped past the stale one");
+
+    // The loss: writes the backup does not hold, which the peer syncs.
+    let written = std::time::Instant::now();
+    writer.engine.insert_many(&meta, (4..7i64).map(|i| doc! { "_id": i }).collect()).unwrap();
+    while !peer.engine.version_vector().unwrap().covers(&writer.engine.version_vector().unwrap()) {
+        sync_once(&peer.engine, writer.addr, SECRET, None).await.unwrap();
+    }
+    writer.serving.abort();
     for _ in 0..3 {
         round_with(&restored, &peer, &catch_up).await;
     }
@@ -7475,7 +7495,9 @@ async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
     assert_eq!(
         restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
         7,
-        "the writes made after the backup are read back"
+        "the writes made after the backup are read back ({:?} between the writes and the last \
+         round, against a retention of {retention:?}, which is how long the clamp reads back)",
+        written.elapsed()
     );
     assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
 }
