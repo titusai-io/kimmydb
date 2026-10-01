@@ -170,6 +170,29 @@ does. Not planned: the `$and` is the same query.
 
 ---
 
+## 🟡 An empty `$all` is refused, where MongoDB matches no document
+
+**Raised 2026-10-01.** `{"tags": {"$all": []}}` matched every document whose
+`tags` holds an array, since every one of no values is in any array, and under
+`$not` every document whose `tags` does not; it answered `200`. A list that
+arrives empty is far more often a client's bug (a filter built from a
+selection nobody made) than a question, and on a `multi` update or delete it
+reached every such document. MongoDB matches no document.
+
+**The rule.** An empty `$all` list, wherever it is written (under `$not`, in
+an `$or` branch, inside `$elemMatch`), is a `400` naming the field (or "an
+array element") and asking for at least one value.
+
+**What that costs.** A caller relying on MongoDB's empty answer, for example to
+build a filter that matches nothing on purpose, gets a `400` instead and must
+leave the condition out or skip the request.
+
+**Closing it** means answering it as MongoDB does, matching nothing. Not
+planned: the refusal says more than an empty answer would, and an empty answer
+on a write would be just as silent about the bug.
+
+---
+
 ## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` is outside it
 
 **Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The

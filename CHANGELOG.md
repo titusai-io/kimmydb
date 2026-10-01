@@ -152,6 +152,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   of `$elemMatch` clauses
   ([Query language](docs/query-language.md#array),
   [Deviations](docs/deviations.md)).
+- **Breaking: an empty `$all` is a `400`.** `{"tags": {"$all": []}}` matched
+  every document whose `tags` holds an array (under `$not`, every one whose
+  `tags` does not), with a `200`, so a list a client emptied by mistake reached
+  all of them, on a `multi` `update` or `delete` too. It is now refused before
+  any document is read, naming the field; send at least one value, or leave
+  the condition out ([Query language](docs/query-language.md#array),
+  [Deviations](docs/deviations.md)).
 
 ### Fixed
 

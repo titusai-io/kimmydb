@@ -94,6 +94,14 @@ conditions, write an `$and` of `$elemMatch` clauses:
 A document with any other key beside `$elemMatch` is still a value. See
 [Deviations](deviations.md).
 
+**An empty `$all` is refused.** `{"tags": {"$all": []}}` is a **`400`** naming
+the field, before any document is read. "Every one of no values" holds for any
+array, so it used to match every document whose field holds an array (and under
+`$not`, every document whose field does not), with a `200`; a list a client
+emptied by mistake reached all of them, on a `multi` update or delete too. Send
+at least one value, or leave the condition out. See
+[Deviations](deviations.md).
+
 ### `$expr` — comparing fields of the same document
 
 Every operator above compares a field with a **constant**. `$expr` takes an
