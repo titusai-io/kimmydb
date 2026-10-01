@@ -22591,3 +22591,137 @@ removed; an `$expr` with no name accepted; the evaluation error swallowed;
 the clauses without `$expr` not put first.
 
 ---
+
+## ADR-207 — A set operator's member is what `$eq` calls equal, its result is first-seen, and what it cannot compare it refuses
+
+**Status:** accepted, for the next `0.MINOR`. Extends the expression scope of
+[ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope) and its rule that
+null propagates and a type violation refuses. Takes the identity of
+[ADR-186](#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)
+wherever the two can both answer.
+
+**The gap.** `$setUnion`, `$setIntersection`, `$setDifference`, `$setEquals`,
+`$setIsSubset`, `$anyElementTrue`, `$allElementsTrue`, `$objectToArray` and
+`$arrayToObject` were refused at parse as unknown operators. The array
+operators could express most of them by hand, but a pipeline written with them
+failed outright. `$zip` and `$sortArray` were refused the same way and are
+left so: `$map` over a `$range` of indexes reads arrays by position, and
+`$unwind`, `$sort` and `$group` order an array's elements.
+
+**Decision.**
+
+- **Two values are one member exactly when `canonical_cmp` ranks them
+  `Equal`**: the comparison `$eq`, `$ne`, `$in` and `$indexOfArray` use. So
+  `1`, `1.0` and `1_i64` are one member, every `NaN` is one, `0.0` and `-0.0`
+  are one, `null` and `undefined` are one, a string and a symbol with the same
+  text are one, and two documents are one only with their keys in the same
+  order. An array or document element is a member whole, compared whole, never
+  flattened. Membership is kept in an ordered set keyed by that comparison, so
+  each operator is `O(n log n)` in its inputs rather than pairwise.
+- **A `Decimal128` anywhere in a set input is refused**, `400`, naming the
+  operator and the argument: `$setIsSubset cannot compare a Decimal128
+  (argument 1 holds one)`. The canonical order ranks one equal to every other
+  number, which makes its equality non-transitive, so `[Decimal128("5")]`
+  would be a subset of `[1]` and a union's members would depend on input
+  order. With every `Decimal128` refused, the order is total and its `Equal`
+  is an equivalence, and on every value left it agrees with `group_key`, the
+  identity `$addToSet` and `$group` use: a set operator and `$addToSet` keep
+  the same members. Beside a null nothing is compared and the result is null.
+- **A result is first-seen**: members in the order they first appear,
+  arguments left to right and each array from its start, and the element kept
+  is that first appearance, untouched, its numeric type included.
+  `$setIntersection` and `$setDifference` follow the first array. No
+  duplicate is ever returned.
+- **Null propagates; a non-array refuses, wherever it stands.** A null or
+  missing argument makes the result null, the boolean `$setEquals` and
+  `$setIsSubset` included, as `$in` already answers null for a null array.
+  Every argument's type is checked before a null is honoured, so `[null, "x"]`
+  and `["x", null]` are both a `400`; a set has no first argument that could
+  hide the others. `$concatArrays`, which is ordered, still stops at its first
+  null.
+- **`$anyElementTrue` and `$allElementsTrue` read elements by `truthy`**, as
+  `$and` and `$or` read their arguments; an array element is true without
+  being looked inside, and an empty array is `false` and `true`. A
+  `Decimal128` element is refused, since `truthy` has no reading of one and
+  would take `Decimal128("0")` as true, and every element is checked before
+  the answer is given, so the refusal does not depend on its position.
+- **`$objectToArray`** gives `[{k, v}, ...]` in the document's field order,
+  top level only. **`$arrayToObject`** reads `[[k, v], ...]` and
+  `[{k, v}, ...]` (`k` and `v` in either order); the first element decides the
+  form. A mixed form, an array pair of other than two elements, a document
+  pair with another field or without both, an element that is neither, a
+  non-string key, and a key holding a NUL, which a BSON field name cannot, are
+  each a `400` naming the element's index. **Every other string is a key,
+  taken as written**: empty, dotted (`"a.b"`) and `$`-prefixed keys included.
+  **A repeated key keeps the place of its first appearance and the value of
+  its last.**
+- **No new size cap.** Each of these returns at most what its inputs already
+  hold; `$range`'s cap exists because it builds from two integers. The
+  pipeline's document ceiling is unchanged.
+
+**Why.** It is ADR-121's rule, that a request the server cannot honour is
+refused rather than answered, applied to values the data supplies. Equality
+had to be `$eq`'s: a set operator that disagreed with `$in` about whether `1`
+is in `[1.0]` would make two spellings of one question answer differently,
+which is the defect ADR-186 closed for `$addToSet`. First-seen order costs
+nothing over an unspecified one, makes the same input give the same output,
+and is the order `$addToSet` already keeps. Keys are taken as an object
+expression, `$literal` and storage take them: a stored document may hold an
+empty, dotted or `$`-prefixed key, and `{$arrayToObject: {$objectToArray:
+"$o"}}` must give it back rather than refuse it, since under
+[ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request)'s
+reading one such document would fail the whole aggregation. A repeated key's
+last value wins because that is what a caller building a document from pairs
+means by writing the key again; refusing it would make `$concatArrays` of an
+object's pairs with an override impossible.
+
+### Considered and rejected
+
+- **`group_key` as the identity, with a `Decimal128` identified by its
+  bytes**, as ADR-186 does for `$addToSet`. Accepts the value, but then
+  `$setIsSubset: [[Decimal128("5")], [5]]` is `false` while `$in` says `5` is
+  in `[Decimal128("5")]`, and the comparison would no longer be `$eq`'s.
+  `$addToSet` cannot refuse stored data without failing an aggregation over a
+  whole field; a set operator is an expression the caller chose to write over
+  values it named, where the refusal is local and says what to store instead.
+- **`canonical_cmp` with no refusal.** Order-dependent members, and subsets
+  that hold for every number.
+- **Pairwise comparison without an ordered set.** Same answers, but quadratic
+  in the input, and an array's length has no cap of its own.
+- **Sorted results.** Deterministic too, but throws away the caller's order
+  for no gain, and a caller who wants a sort can add one.
+- **Refusing a repeated key in `$arrayToObject`.** Safe, but blocks the
+  override idiom above, and the rule "last wins" is stated and tested.
+- **Refusing a key a field path cannot read back** (empty, dotted or
+  `$`-prefixed), the rule `$unwind`'s `includeArrayIndex` follows. As first
+  built it did, and a round trip of a stored document holding such a key was
+  a `400`. `includeArrayIndex` names a field the pipeline itself invents;
+  `$arrayToObject`'s keys are usually the data's own. That a `$`-prefixed key
+  returned over HTTP reads like an Extended JSON wrapper is true of one built
+  by `$literal` or stored by a caller too, and is not this operator's to
+  fix.
+
+### Tests
+
+`kimmy-query` (`expr::sets_and_pairs`): each operator on its worked case,
+empty arrays, duplicates, mixed numeric widths with the first appearance
+kept by type, nested arrays and documents as members (key order counts,
+nothing flattened), null and missing in every argument position, a non-array
+refused in every position including beside a null, arity at parse; a
+seventeen-value corpus whose union is nine members, pairwise unequal under
+`canonical_cmp`, each the first of its kind, equal by `group_key` to the
+members `$addToSet` keeps and unchanged under every rotation; a `Decimal128`
+refused in either argument, nested in a document or an array, and passed over
+beside a null; `$anyElementTrue`/`$allElementsTrue` on falsy, truthy, mixed,
+nested and empty arrays and a `Decimal128` element first, after a true
+element and after a false one; `$objectToArray` order, nesting, empty,
+null and non-documents; the rename example in aggregation.md;
+`$arrayToObject` in both forms, a repeated key in both forms, eleven
+malformed pairs each with its message, a NUL key refused in both forms naming
+the element, empty, dotted and `$`-prefixed keys accepted in both, and round
+trips, one of a document holding such keys; `$zip` and `$sortArray` still
+unknown.
+`kimmy-api`: the worked example and the rest of the family through
+`$project`, a document turned into pairs and back with an override through
+`$addFields`, seven refusals as `400`s with their messages, and a stored
+`Decimal128` refused by `$setIsSubset`.

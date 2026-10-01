@@ -205,6 +205,8 @@ field path.
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
 | Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` |
+| Sets | `$setUnion` `$setIntersection` `$setDifference` `$setEquals` `$setIsSubset` `$anyElementTrue` `$allElementsTrue` |
+| Documents | `$objectToArray` `$arrayToObject` |
 | Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
 | Variables | `$$ROOT` `$$CURRENT` `$let` |
 | Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
@@ -366,6 +368,108 @@ element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
 exhaustion written as an expression, and it is refused before anything is
 allocated. Its elements are 64-bit integers, as every integer result here is.
+
+### Sets
+
+```json
+{ "$project": { "all": { "$setUnion": [ "$tags", "$wants" ] } } }
+```
+
+Over `{tags: ["vip", "eu"], wants: ["eu", "newsletter"]}` that is
+`["vip", "eu", "newsletter"]`.
+
+| Operator | Arguments | Result |
+|---|---|---|
+| `$setUnion` | one or more arrays | every member of any of them |
+| `$setIntersection` | one or more arrays | the members of the first that every other holds |
+| `$setDifference` | two arrays | the members of the first the second does not hold |
+| `$setEquals` | two or more arrays | `true` when all have the same members |
+| `$setIsSubset` | two arrays | `true` when every member of the first is in the second |
+| `$anyElementTrue` | one array | `true` when any element is true |
+| `$allElementsTrue` | one array | `true` when no element is false |
+
+**A member is what `$eq` calls equal.** Each array is read as the set of its
+distinct members, and two values are one member exactly when `$eq` and `$in`
+would call them equal — the canonical order's equality. So `1`, `1.0` and
+`{"$numberLong": "1"}` are one member, every `NaN` is one, `0.0` and `-0.0` are
+one, and `null` and `undefined` are one. An array or a document element is a
+member as a whole and is compared whole, never flattened: `[1, 2]` and
+`[1.0, 2]` are one member, and two documents are one only with their keys in
+the same order, as `find` compares them. These are the members `$addToSet`
+keeps too ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)).
+
+**Results come back first-seen, without duplicates.** A set result lists the
+members in the order they first appear, reading the arguments left to right
+and each array from its start, and the element kept is that first appearance,
+untouched: `{$setUnion: [[3, 1, 3], [1.0, 2]]}` is `[3, 1, 2]`, its `1` still
+the integer. `$setIntersection` and `$setDifference` keep the first array's
+order. The order is fixed so the same input always gives the same output; a
+pipeline that needs another order sorts after.
+
+**Null in, null out; a non-array refuses wherever it stands.** A null or
+missing argument makes the result null, the boolean operators included. A
+non-array is a `400` even beside a null — a set has no first argument that
+could hide the others, so the refusal does not depend on where the bad value
+is written.
+
+**A `Decimal128` anywhere in a set input is refused.** The canonical order
+ranks a `Decimal128` equal to every other number, so `[Decimal128("5")]` would
+be a subset of `[1]`. Rather than answer that, the operator refuses, `400`,
+naming the argument: `$setIsSubset cannot compare a Decimal128 (argument 1
+holds one)`. Nested inside an element counts. Beside a null nothing is
+compared, and the result is null.
+
+**`$anyElementTrue` and `$allElementsTrue` read truthiness** as `$and` and
+`$or` do: `false`, `null`, `0` and missing are false, and everything else is
+true, the empty array included, and an array element is not looked inside.
+An empty array is `false` for `$anyElementTrue` and `true` for
+`$allElementsTrue`. A `Decimal128` element is refused, whatever else the
+array holds, because a zero one would be read as true. The argument is one
+array, so a literal is written inside the argument list:
+`{"$anyElementTrue": [[true, false]]}`, not `{"$anyElementTrue": [true,
+false]}`, which is two arguments and refused.
+
+**No cap of their own.** None of these builds more than its inputs already
+hold, so the only expression-level size limit, `$range`'s, does not apply;
+the pipeline's document ceiling still does.
+
+### Documents as pairs
+
+```json
+{ "$addFields": {
+    "pairs":   { "$objectToArray": "$attrs" },
+    "renamed": { "$arrayToObject": { "$map": { "input": { "$objectToArray": "$attrs" },
+                   "in": { "k": { "$toUpper": "$$this.k" }, "v": "$$this.v" } } } } } }
+```
+
+**`$objectToArray`** turns a document into `[{"k": name, "v": value}, ...]`,
+in the document's field order. Only the top level is turned over; a value that
+is a document stays one. An empty document is `[]`; null or missing is null;
+anything else is a `400`.
+
+**`$arrayToObject`** is the reverse, and reads two forms: `[["name", value],
+...]` and `[{"k": "name", "v": value}, ...]` (the `k` and `v` in either
+order). The first element decides the form and every element must use it.
+Each of these is a `400` naming the element by its index:
+
+- a form mixed with the other (`element 0 is a [key, value] array, element 1
+  is a {k, v} document`);
+- an array pair with other than two elements, or a document pair with a field
+  besides `k` and `v`, or without both;
+- an element that is neither, `null` included;
+- a key that is not a string;
+- a key holding a NUL, which a BSON field name cannot.
+
+**Any other string is a key, taken as written**: an empty key, a dotted one
+(`"a.b"`) and one starting with `$` are accepted, as an object expression,
+`$literal` and a stored document accept them, so `{"$arrayToObject":
+{"$objectToArray": "$o"}}` gives back `o` whatever its keys. A field path
+cannot read such a field (`"$a.b"` is a path, not a name), but
+`$objectToArray` can.
+
+**A repeated key keeps its first place and takes its last value**:
+`[["a", 1], ["b", 2], ["a", 3]]` is `{"a": 3, "b": 2}`. An empty array is
+`{}`; null or missing is null.
 
 ### Type conversion
 
@@ -628,12 +732,11 @@ documents holding large arrays can exceed the cap long before the stage ends.
 
 | | Why |
 |---|---|
-| Set operators (`$setUnion`, `$setIntersection`, `$setDifference`, `$setEquals`, `$allElementsTrue`, `$anyElementTrue`) | Not built. The array operators above cover membership and iteration; the set family is a further pass over the same scope |
-| `$zip`, `$objectToArray`, `$arrayToObject`, `$sortArray` | Not built |
+| `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
-| A `Decimal128` literal — bare, under `$literal`, or inside a document or array literal | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it |
+| A `Decimal128` literal — bare, under `$literal`, or inside a document or array literal | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators and `$anyElementTrue`/`$allElementsTrue`, which refuse one in their input rather than compare or read it ([ADR-207](decisions.md), [Sets](#sets)) |
 | `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "$toDecimal": not an expression operator` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |

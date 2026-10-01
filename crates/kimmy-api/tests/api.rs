@@ -7980,6 +7980,127 @@ async fn computed_expressions_derive_fields_over_http() {
 }
 
 #[tokio::test]
+async fn set_operators_and_pair_conversions_run_in_a_pipeline_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"customers"})).await;
+    for body in [
+        json!({"_id": 1, "tags": ["vip", "eu"], "wants": ["eu", "newsletter"],
+               "flags": [false, 0, 1], "attrs": {"tier": "gold", "since": 2019}}),
+        json!({"_id": 2, "tags": ["trial"], "wants": ["trial"],
+               "flags": [], "attrs": {}}),
+        json!({"_id": 3, "tags": ["eu"]}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/customers/docs", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        server.post(
+            "/v1/db/shop/coll/customers/aggregate",
+            Some(&token),
+            json!({ "pipeline": pipeline }),
+        )
+    };
+
+    // The worked example: the union, first-seen, with the missing `wants`
+    // of document 3 making its union null.
+    let res = aggregate(json!([
+        {"$project": {
+            "all": {"$setUnion": ["$tags", "$wants"]},
+            "both": {"$setIntersection": ["$tags", "$wants"]},
+            "only": {"$setDifference": ["$tags", "$wants"]},
+            "same": {"$setEquals": ["$tags", "$wants"]},
+            "within": {"$setIsSubset": ["$tags", ["eu", "vip", "trial"]]},
+            "any": {"$anyElementTrue": "$flags"},
+            "every": {"$allElementsTrue": "$flags"},
+        }},
+        {"$sort": {"_id": 1}}
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs[0]["all"], json!(["vip", "eu", "newsletter"]));
+    assert_eq!(docs[0]["both"], json!(["eu"]));
+    assert_eq!(docs[0]["only"], json!(["vip"]));
+    assert_eq!(docs[0]["same"], false);
+    assert_eq!(docs[0]["within"], true);
+    assert_eq!(docs[0]["any"], true);
+    assert_eq!(docs[0]["every"], false);
+    assert_eq!(docs[1]["all"], json!(["trial"]));
+    assert_eq!(docs[1]["same"], true);
+    assert_eq!(docs[1]["any"], false);
+    assert_eq!(docs[1]["every"], true);
+    for field in ["all", "both", "only", "same", "any", "every"] {
+        assert_eq!(docs[2][field], Value::Null, "{field}: {:?}", docs[2]);
+    }
+    assert_eq!(docs[2]["within"], true);
+
+    // A document turned into pairs and back, with one pair edited between.
+    let res = aggregate(json!([
+        {"$match": {"_id": 1}},
+        {"$addFields": {
+            "pairs": {"$objectToArray": "$attrs"},
+            "rebuilt": {"$arrayToObject": {"$concatArrays": [
+                {"$objectToArray": "$attrs"},
+                [{"k": "tier", "v": "platinum"}]
+            ]}},
+            "fromArrays": {"$arrayToObject": [[["b", 1], ["a", 2]]]},
+        }}
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = &res.body["documents"][0];
+    assert_eq!(doc["pairs"], json!([{"k": "tier", "v": "gold"}, {"k": "since", "v": 2019}]));
+    // The repeated key keeps its first place and takes its last value.
+    assert_eq!(doc["rebuilt"], json!({"tier": "platinum", "since": 2019}));
+    let keys: Vec<&String> = doc["rebuilt"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["tier", "since"]);
+    let keys: Vec<&String> = doc["fromArrays"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["b", "a"]);
+
+    // Refusals are 400s that name the problem.
+    for (pipeline, want) in [
+        (
+            json!([{"$project": {"o": {"$arrayToObject": [[["a", 1], {"k": "b", "v": 2}]]}}}]),
+            "cannot mix the two forms",
+        ),
+        (json!([{"$project": {"o": {"$arrayToObject": [[["a\0b", 1]]]}}}]), "holds a NUL"),
+        (json!([{"$project": {"o": {"$arrayToObject": [[[1, 1]]]}}}]), "a key must be a string"),
+        (json!([{"$project": {"o": {"$setUnion": ["$tags", "eu"]}}}]), "needs an array"),
+        (json!([{"$project": {"o": {"$objectToArray": "$tags"}}}]), "needs a document"),
+        (json!([{"$project": {"o": {"$zip": {"inputs": ["$tags"]}}}}]), "$zip"),
+        (
+            json!([{"$project": {"o": {"$sortArray": {"input": "$tags", "sortBy": 1}}}}]),
+            "$sortArray",
+        ),
+    ] {
+        let res = aggregate(pipeline.clone()).await;
+        assert_eq!(res.status, 400, "{pipeline}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains(want), "{pipeline}: {message}");
+    }
+
+    // A stored Decimal128 cannot be a set member: the canonical order ranks
+    // it equal to every number, so it is refused rather than compared.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/customers/docs",
+            Some(&token),
+            json!({"_id": 4, "tags": [{"$numberDecimal": "5"}], "wants": [1]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = aggregate(json!([
+        {"$match": {"_id": 4}},
+        {"$project": {"sub": {"$setIsSubset": ["$tags", "$wants"]}}}
+    ]))
+    .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("$setIsSubset cannot compare a Decimal128"), "{message}");
+}
+
+#[tokio::test]
 async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
     // The same pipeline MongoDB runs: a path that crosses an array is the
     // array of what it found, in `$addFields`, in `$expr` and as a `$group`
