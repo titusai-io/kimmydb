@@ -366,7 +366,10 @@ rather than an invented one. See [ADR-132](decisions.md).
 Rule-based, no cost model. The operator surface is small enough that
 predictability beats sophistication.
 
-1. Collect the predicates that must hold for **every** match.
+1. Collect the predicates that must hold for **every** match. Several bounds
+   on one field, from one clause or from several, are intersected: the highest
+   lower bound and the lowest upper bound are kept, whatever order the clauses
+   are written in, so `{$and: [{qty: {$gt: 0}}, {qty: {$gt: 5}}]}` reads from 5.
 2. For each index, count how many **leading** fields those predicates cover with
    equality, plus an optional range on the next field.
 3. Take the index covering the most fields. If that count is zero, scan.

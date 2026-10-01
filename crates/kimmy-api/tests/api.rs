@@ -6617,6 +6617,66 @@ async fn an_indexed_find_with_limit_one_reads_one_entry() {
 }
 
 #[tokio::test]
+async fn bounds_from_several_clauses_read_the_tightest_range_in_either_order() {
+    // Two clauses bounding one indexed path. The planner kept the first bound
+    // it met, and parsing stores a clause holding `$expr` after the others,
+    // so this filter read from 0 rather than from 5: same answer, wider
+    // range. It now keeps the tightest, whatever the order.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "pairs" })).await;
+    let batch: Vec<Value> = (0..10i64).map(|i| json!({ "_id": i, "a": [i, { "x": i }] })).collect();
+    server.post("/v1/db/shop/coll/pairs/bulk", Some(&token), json!(batch)).await;
+    let find = |filter: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/pairs/find",
+                    Some(token),
+                    json!({ "filter": filter, "explain": true }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body
+        }
+    };
+    let narrow = json!({ "$gt": 5, "$elemMatch": { "$expr": { "$gte": ["$x", 0] } } });
+    let filters = [
+        json!({ "$and": [{ "a": narrow }, { "a": { "$gt": 0 } }] }),
+        json!({ "$and": [{ "a": { "$gt": 0 } }, { "a": narrow }] }),
+    ];
+    let mut scanned = Vec::new();
+    for f in &filters {
+        scanned.push(find(f.clone()).await["documents"].clone());
+    }
+
+    server
+        .post(
+            "/v1/db/shop/coll/pairs/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "a" }] }),
+        )
+        .await;
+    let alone = find(json!({ "a": { "$gt": 5 } })).await;
+    assert_eq!(alone["explain"]["strategy"], "index", "{alone}");
+    // Numbers 5..=9, then the ten `{x: i}` elements and the ten whole arrays,
+    // which sort above every number.
+    assert_eq!(alone["explain"]["indexEntriesRead"], 25);
+    for (f, before) in filters.iter().zip(&scanned) {
+        let indexed = find(f.clone()).await;
+        assert_eq!(indexed["explain"]["strategy"], "index", "{indexed}");
+        assert_eq!(&indexed["documents"], before, "the index changed the answer to {f}");
+        assert_eq!(indexed["documents"].as_array().unwrap().len(), 4, "6, 7, 8 and 9");
+        assert_eq!(
+            indexed["explain"]["indexEntriesRead"], alone["explain"]["indexEntriesRead"],
+            "{f} should read the range of its tightest bound"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty() {
     // A client must end its walk on a short page or a missing token, not on a
     // token stopping being offered. A collection whose size is an exact
