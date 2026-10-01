@@ -21,6 +21,11 @@ txn.commit()?;          // both, or neither
 self.publish(vec![entry]);   // only after commit
 ```
 
+A write that would leave a document byte for byte as it was — an update
+whose operators change nothing, a replace with the stored body — is not a
+mutation, and appends nothing: no entry, no stamp, nothing to replicate or
+publish ([ADR-208](decisions.md)).
+
 There is no window in which a document is changed but unlogged, or logged but
 not applied. That is what makes the log trustworthy enough to build on.
 

@@ -720,8 +720,8 @@ impl ApiError {
         let (what, applied) = match applied {
             kimmy_storage::Applied::Modify { matched, modified, commits, in_doubt } => (
                 format!(
-                    "{matched} matching documents in {commits} commits were written, and \
-                     {in_doubt} more may have been"
+                    "{matched} matching documents were reached, {modified} of them changed \
+                     and written in {commits} commits, and {in_doubt} more may have been"
                 ),
                 json!({
                     "matched": matched,

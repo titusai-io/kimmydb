@@ -41,6 +41,13 @@ Each event is one JSON text frame:
 or `invalidate`. Requires the `watch` action on the collection — which is
 **not** implied by `read`. See [Security](security.md).
 
+**An event is a change.** An update, replace or `find_and_modify` that leaves
+a document byte for byte as it was writes nothing and produces no event — the
+same request reports `modified: 0` — and a `multi` update produces one event
+per document it changed, not per document it matched
+([ADR-208](decisions.md)). A value of another type (`1` over `1.0`) or a new
+field order is a change, and has its event.
+
 A `uniqueViolation` event reports that merging a replicated write broke a unique
 constraint. It carries no `documentKey` — nothing was lost, and no single
 document is *the* problem — but names the index and every colliding id:

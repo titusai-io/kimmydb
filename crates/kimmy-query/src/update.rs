@@ -763,17 +763,21 @@ enum Target {
 fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) -> Result<()> {
     let operations = match update {
         Update::Replace(replacement) => {
-            // `_id` belongs to the document's identity, not its contents.
-            let id = doc.get(ID_FIELD).cloned();
-            *doc = replacement.clone();
-            match id {
-                Some(id) => {
-                    doc.insert(ID_FIELD, id);
-                }
-                None => {
-                    doc.remove(ID_FIELD);
+            // `_id` belongs to the document's identity, not its contents, and
+            // it is stored first, where every write path puts it: a
+            // replacement that left it last would be a different document,
+            // byte for byte, from the same fields stored by a `PUT`, and
+            // would count as a change every time it was sent (ADR-208).
+            let mut next = Document::new();
+            if let Some(id) = doc.get(ID_FIELD) {
+                next.insert(ID_FIELD, id.clone());
+            }
+            for (key, value) in replacement {
+                if key != ID_FIELD {
+                    next.insert(key.clone(), value.clone());
                 }
             }
+            *doc = next;
             return Ok(());
         }
         Update::Operators(ops) => ops,
@@ -1563,10 +1567,15 @@ mod tests {
 
     #[test]
     fn a_document_without_operators_is_a_replacement() {
-        assert_eq!(
-            applied(doc! { "x": 1 }, doc! { "_id": 7, "a": 1, "b": 2 }),
-            doc! { "x": 1, "_id": 7 }
-        );
+        let out = applied(doc! { "x": 1 }, doc! { "_id": 7, "a": 1, "b": 2 });
+        assert_eq!(out, doc! { "_id": 7, "x": 1 });
+        // `_id` first, where every write path stores it, whether or not the
+        // replacement names it, and wherever it names it (ADR-208).
+        let keys = |d: &Document| d.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&out), ["_id", "x"]);
+        let out = applied(doc! { "x": 1, "_id": 999, "y": 2 }, doc! { "_id": 7, "a": 1 });
+        assert_eq!(keys(&out), ["_id", "x", "y"]);
+        assert_eq!(out.get_i32("_id").unwrap(), 7);
     }
 
     #[test]

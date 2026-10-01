@@ -1701,32 +1701,32 @@ paths:
                   modified:
                     type: integer
                     description: |
-                      Documents **written**, not documents changed — so this
-                      equals `matched`. Every match is written back whether or
-                      not the operators moved anything: a `$set` to the value a
-                      field already holds still counts, as does an `$unset` of
-                      a field that was never there.
-
-                      **MongoDB's `nModified` means the other thing**, and
-                      excludes those, so a client ported from it gets a number
-                      that looks right and is not. To ask "did anything
-                      change?", compare `matched` against a `count` filtered on
-                      the state you want. See
-                      [Deviations](deviations.md).
+                      Documents **changed**, and so written (ADR-208). A
+                      matched document the update leaves byte for byte as it
+                      was — a `$set` to the value a field already holds, an
+                      `$unset` of a field that is not there — counts in
+                      `matched` and not here, and is not written at all: no
+                      new version, no oplog entry, no change event, nothing
+                      replicated. Compared by the stored bytes, so a value of
+                      another type (`1` over `1.0`) or another field order is
+                      a change.
                   commits:
                     type: integer
                     description: |
                       Write transactions the request cost — one per chunk of
-                      `storage.multi_chunk_docs` documents, zero when nothing
-                      matched (ADR-086) and zero under `explain: true`, which
-                      spends none (ADR-131).
+                      `storage.multi_chunk_docs` documents that changed
+                      something, zero when nothing matched or nothing changed
+                      (ADR-086, ADR-208), and zero under `explain: true`,
+                      which spends none (ADR-131).
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The version the write produced. Present only when the
                       request wrote exactly one document without `multi` — a
                       version names one document, and a multi write has no
-                      single one to name (ADR-084). Always absent under
+                      single one to name (ADR-084). Absent when the matched
+                      document was unchanged, which writes nothing and keeps
+                      its version (ADR-208), and always absent under
                       `explain: true`, which writes nothing (ADR-131).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -1801,7 +1801,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [document, matched]
+                required: [document, matched, modified, upserted]
                 properties:
                   document:
                     oneOf:
@@ -1809,12 +1809,28 @@ paths:
                       - type: "null"
                   matched:
                     type: integer
+                  modified:
+                    type: integer
+                    enum: [0, 1]
+                    description: |
+                      1 when an existing document was changed or removed; 0
+                      when nothing matched, when the update left the chosen
+                      document byte for byte as it was, which writes nothing
+                      and reports no `stamp`, and when an upsert created the
+                      document, which `upserted` reports instead (ADR-208).
+                      `document` is returned either way.
+                  upserted:
+                    type: boolean
+                    description: |
+                      Whether `upsert` created the document, as on `PUT`; its
+                      `_id` is `upsertedId`.
                   upsertedId: {}
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The version the write produced. Absent when nothing was
-                      written, and after a removal — nothing can be
+                      written — nothing matched, or the document was
+                      unchanged — and after a removal: nothing can be
                       conditional on a document that is gone.
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1987,6 +2003,12 @@ paths:
                   modified:
                     type: integer
                     enum: [0, 1]
+                    description: |
+                      1 when an existing document was replaced, 0 when the
+                      body is byte for byte the stored document (field order
+                      included), which writes nothing, reports no `stamp`
+                      and keeps the document's version (ADR-208). 0 for an
+                      upsert, which reports `upserted` instead.
                   upserted:
                     type: boolean
                     description: Genuinely a yes/no, so it stays one.
@@ -3024,8 +3046,10 @@ components:
           description: |
             `partially_applied` only (ADR-192): what the request committed
             before it failed. For a `multi: true` update or delete,
-            `matched`, `modified`, `commits` and `in_doubt` (documents in a
-            chunk whose commit's outcome is unknown). For a database drop,
+            `matched`, `modified`, `commits` and `in_doubt` (documents
+            written in a chunk whose commit's outcome is unknown). `matched`
+            also counts documents in chunks where nothing changed, which
+            commit nothing (ADR-208). For a database drop,
             `dropped` (the collections whose drop committed) and `in_doubt`.
         cause:
           type: object

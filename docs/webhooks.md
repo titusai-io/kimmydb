@@ -4,7 +4,8 @@
 
 Register a URL and the cluster pushes change events to it. The same events a
 [change stream](change-streams.md) carries, for consumers that cannot hold a
-WebSocket open.
+WebSocket open — so an update that leaves a document as it was delivers
+nothing ([ADR-208](decisions.md)).
 
 ```bash
 curl -X POST https://node:7878/v1/db/shop/coll/orders/webhooks \
