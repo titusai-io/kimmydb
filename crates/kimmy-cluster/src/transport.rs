@@ -3833,6 +3833,9 @@ mod tests {
         let dial = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
         let (_stream, peer) = accept_with_backoff(
             || {
+                // `fetch_update` is `try_update` from Rust 1.99, which the 1.90
+                // minimum does not have.
+                #[allow(deprecated)]
                 let fail = failing
                     .fetch_update(
                         std::sync::atomic::Ordering::Relaxed,
