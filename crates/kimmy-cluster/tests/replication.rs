@@ -3142,33 +3142,40 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
 /// started only when the pull before it would have fitted in what is left
 /// (`Contact::fits_before`, ADR-157).
 ///
-/// **Read from what the loop reports, not from the clock.** The test used to
-/// count ticks that overran the interval against ticks the budget cut short,
-/// at an interval priced from one pull. A host stall (a loaded runner, a
-/// paused process) inflated the price so no tick was cut short, or made the
-/// ticks overrun for its own reasons, and the test failed identically with and
-/// without the margin. It now reads each tick's report: how many pulls the tick
-/// made (`pulls.serve.count`, one observation per pull) and how its contacts
-/// ended (`pulls.contacts`).
+/// **Read from what the loop reports, and from a floor the test fixes, not
+/// from a price it measures.** The test used to count ticks that overran the
+/// interval against ticks the budget cut short, at an interval priced from one
+/// pull. A host stall (a loaded runner, a paused process) inflated the price so
+/// no tick was cut short, or made the ticks overrun for its own reasons, and
+/// the test failed identically with and without the margin. It then read each
+/// tick's report (how many pulls it made, `pulls.serve.count`, and how its
+/// contacts ended, `pulls.contacts`) but still priced a pull by the cheapest
+/// of five and set the interval at 3.6 times it, and so still assumed that no
+/// later pull cost less than 0.9 of that price. A host that was slow while the
+/// five were priced and faster after, or stalled through all of them, broke the
+/// assumption (one stalled run priced a pull at 1.1 s and made five pulls in a
+/// 4 s tick).
 ///
-/// The peer is reached through a relay that holds every chunk back by a fixed
-/// delay, so a pull costs at least a floor the relay guarantees, and the
-/// interval is 3.6 times the cheapest of five priced pulls. With a margin, a
-/// fourth pull would need the third to end with more than the slowest pull's
-/// cost still left, and four pulls of at least 0.9 times the price do not fit
-/// in 3.6 prices, so **no tick makes more than three pulls, whatever the host
-/// does**: a stall only adds elapsed time. Without the margin
-/// (`Instant::now() < deadline`) a fourth pull starts whenever the third ended
-/// with any time left, which three pulls of about a price each leave. Three
-/// assertions:
+/// Every pull is now held for a fixed floor: the relay takes each connection
+/// and passes nothing either way for `FLOOR`, and a pull is one connection, so
+/// **no pull takes less than `FLOOR`, whatever the host does**: a stall only adds
+/// to it. The interval is 3.9 floors. With a margin, a fourth pull would need
+/// the first three, which took at least three floors, to leave more than the
+/// slowest of them, at least one, so that four pulls fit in 3.9 floors, which
+/// they cannot: **no tick makes more than three pulls.** That is a fact about
+/// the margin and the floor and not about how fast the host is. Without the
+/// margin (`Instant::now() < deadline`) a fourth pull starts whenever the third
+/// ended with any time left, which three pulls of up to 1.3 floors each leave;
+/// on a host that is not that quick the mutation goes unseen by this test, and
+/// is never reported as a failure of the margin. Three assertions:
 ///
-/// 1. **The budget cut a drain short**, at least once: a precondition, which
-///    19 batches behind a tick of three pulls and no more makes certain of unless
-///    the host made the five priced pulls all slow.
+/// 1. **The budget cut a drain short**, at least once: a precondition. With
+///    24 batches behind a tick of three pulls and no more it holds unless the
+///    host made every pull of every tick fit alone in the interval, which a
+///    floor of 3.9 does not allow.
 /// 2. **No tick made more than three pulls.** This is the claim. Reverting
 ///    `fits_before` to `Instant::now() < deadline` lets a tick whose pulls ran
-///    at the price make a fourth, and this is what fails (any one such tick is
-///    enough, so a host that stalls most of the ticks leaves it standing).
+///    at near the floor make a fourth, and this is what fails.
 /// 3. **Some tick drained more than one batch.** Reverting the drain arm in
 ///    `peers.rs` makes every contact one pull, and this is what fails.
 #[tokio::test]
@@ -3183,20 +3190,11 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     let entries = MAX_BATCH * BATCHES;
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     seed(&a, &ca, entries);
-    // A fixed 25 ms behind every chunk the peer sends: what a pull costs is then
-    // mostly the relay's delay, which is the same for every pull.
-    let relay = slow_relay(a.addr, Duration::from_millis(25)).await;
-
-    // Five rounds before the loop starts, to price a pull on this machine, by
-    // the cheapest: a stall inflates one sample and not the minimum. They leave
-    // the backlog five batches shorter.
-    let mut price = Duration::MAX;
-    for _ in 0..5 {
-        let started = std::time::Instant::now();
-        sync_once(&b.engine, relay, SECRET, None).await.expect("a round to price a pull by");
-        price = price.min(started.elapsed());
-    }
-    let interval = price.mul_f64(3.6);
+    // Every pull is one connection, and the relay holds a connection for this
+    // long before it passes anything: no pull is cheaper than the floor.
+    const FLOOR: Duration = Duration::from_millis(500);
+    let relay = delayed_relay(a.addr, FLOOR).await;
+    let interval = FLOOR.mul_f64(3.9);
 
     let (looping, mut rx) = drain_loop(&b, relay, interval);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -3221,13 +3219,13 @@ async fn a_tick_that_spends_its_budget_draining_does_not_overrun_its_interval() 
     assert!(
         budget_ends >= 1,
         "the budget must have cut a drain short, or this run says nothing: {budget_ends} \
-         contacts ended on it in {ticks} ticks, at an interval of {interval:?} for a price of \
-         {price:?}"
+         contacts ended on it in {ticks} ticks, at an interval of {interval:?} for a floor of \
+         {FLOOR:?}"
     );
     assert!(
         most_pulls <= 3,
         "a tick must not start a pull the budget's margin says will not fit: one made \
-         {most_pulls} pulls, at an interval of {interval:?} for a price of {price:?}"
+         {most_pulls} pulls, at an interval of {interval:?} for a floor of {FLOOR:?}"
     );
     assert!(
         most_pulls >= 2 && contacts > 0 && pulls_in_all > contacts as u64,
@@ -5316,6 +5314,26 @@ async fn slow_relay(target: std::net::SocketAddr, delay: Duration) -> std::net::
                     }
                 };
                 let _ = tokio::join!(up, down);
+            });
+        }
+    });
+    addr
+}
+
+/// A plain TCP relay to `target` that holds every connection for `delay`
+/// before it dials the target or passes a byte either way, and then relays at
+/// the speed of the wire. A client that makes one connection per request, as a
+/// pull does, therefore spends at least `delay` on each, and nothing the host
+/// does can make it spend less.
+async fn delayed_relay(target: std::net::SocketAddr, delay: Duration) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let Ok(mut server) = TcpStream::connect(target).await else { return };
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
             });
         }
     });
