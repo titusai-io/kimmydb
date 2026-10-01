@@ -2529,7 +2529,7 @@ dependencies = [
  "bson",
  "kimmy-core",
  "proptest",
- "regex",
+ "regex-automata",
  "serde",
  "thiserror 2.0.20",
  "tracing",

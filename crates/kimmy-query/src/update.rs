@@ -315,7 +315,11 @@ fn check_identifier(identifier: &str) -> Result<()> {
 }
 
 /// Parse the request's `arrayFilters` documents.
+///
+/// Their `$regex` conditions share one budget, the one a single filter has:
+/// every entry is held for the whole update.
 fn parse_array_filters(docs: &[Document]) -> Result<Vec<ArrayFilter>> {
+    let _budget = filter::RegexBudget::open();
     let mut out: Vec<ArrayFilter> = Vec::new();
     for doc in docs {
         let mut identifier = None;
@@ -1163,6 +1167,20 @@ mod tests {
             Err(e) => return e.to_string(),
         };
         apply(&parsed, &mut doc, NOW).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn the_array_filters_of_one_update_hold_their_regex_patterns_under_one_budget() {
+        // Three entries of one `\w{15}` each: about 2.4 MiB held for the whole
+        // update, past the 2 MiB one filter may hold; two fit.
+        let entry = |id: &str| doc! { format!("{id}.s"): { "$regex": format!(r"\w{{15}}{id}") } };
+        let two = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1 } };
+        parse_with_filters(&two, &[entry("x"), entry("y")]).unwrap();
+        let three = doc! { "$set": { "a.$[x].s": 1, "b.$[y].s": 1, "c.$[z].s": 1 } };
+        let err = parse_with_filters(&three, &[entry("x"), entry("y"), entry("z")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 MiB together"), "{err}");
     }
 
     #[test]

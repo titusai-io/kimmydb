@@ -10774,6 +10774,127 @@ async fn type_number_finds_every_numeric_type_and_an_unknown_alias_or_flag_is_a_
 }
 
 #[tokio::test]
+async fn a_regex_in_in_nin_or_all_is_refused_and_a_dollar_keyed_document_is_not() {
+    // `$in` compares values, and over HTTP a regex arrives as a document:
+    // `{$in: [{$regex: "abc"}]}` matched nothing and `$nin` everything, with a
+    // 200. Refused now, while a stored document with `$`-prefixed keys stays
+    // reachable by `$eq` and by `$in` of any other shape.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "names" })).await;
+    let docs = "/v1/db/shop/coll/names/docs";
+    for doc in [
+        json!({ "_id": 1, "s": "xabcx" }),
+        json!({ "_id": 2, "s": { "$regex": "abc" } }),
+        json!({ "_id": 3, "s": { "$regex": "abc", "kind": "note" } }),
+    ] {
+        let stored = server.post(docs, Some(&token), doc).await;
+        assert_eq!(stored.status, 200, "a document may hold a $-prefixed key: {:?}", stored.body);
+    }
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/names/find", Some(&token), json!({ "filter": filter }))
+    };
+    let ids = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    for op in ["$in", "$nin", "$all"] {
+        for value in [
+            json!({ "$regex": "abc" }),
+            json!({ "$regex": "abc", "$options": "i" }),
+            json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
+        ] {
+            let res = find(json!({ "s": { op: ["plain", value.clone()] } })).await;
+            assert_eq!(res.status, 400, "{op} with {value}: {:?}", res.body);
+            let message = res.body["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("{op} cannot hold a regular expression"))
+                    && message.contains("$or of $regex clauses"),
+                "{message}"
+            );
+        }
+    }
+    // What the refusal points to answers the question.
+    let either =
+        find(json!({ "$or": [{ "s": { "$regex": "abc" } }, { "s": { "$regex": "^q" } }] }));
+    assert_eq!(ids(&either.await.body), [1]);
+    // The stored `{$regex: "abc"}` is a value like any other to `$eq`, and
+    // a document of another shape is still compared by `$in`.
+    let eq = find(json!({ "s": { "$eq": { "$regex": "abc" } } })).await;
+    assert_eq!(ids(&eq.body), [2], "{:?}", eq.body);
+    let other =
+        find(json!({ "s": { "$in": [{ "$regex": "abc", "kind": "note" }, "xabcx"] } })).await;
+    assert_eq!(ids(&other.body), [1, 3], "{:?}", other.body);
+}
+
+#[tokio::test]
+async fn a_regex_under_ne_and_an_elem_match_under_all_are_refused() {
+    // `$ne` compares values, so `{$ne: {$regex: "abc"}}` held for every
+    // string; `$all` compares values, so `[{$elemMatch: ...}]` matched
+    // nothing. Both answered 200.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "carts" })).await;
+    let docs = "/v1/db/shop/coll/carts/docs";
+    for doc in [
+        json!({ "_id": 1, "s": "xabcx", "items": [{ "qty": 5, "sku": "b" }, { "qty": 1, "sku": "a" }] }),
+        json!({ "_id": 2, "s": "q", "items": ["q"] }),
+    ] {
+        let stored = server.post(docs, Some(&token), doc).await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/carts/find", Some(&token), json!({ "filter": filter }))
+    };
+    let ids = |body: &Value| -> Vec<i64> {
+        let mut ids: Vec<i64> = body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    for value in [
+        json!({ "$regex": "abc" }),
+        json!({ "$regex": "abc", "$options": "i" }),
+        json!({ "$regularExpression": { "pattern": "abc", "options": "" } }),
+    ] {
+        let res = find(json!({ "s": { "$ne": value.clone() } })).await;
+        assert_eq!(res.status, 400, "$ne with {value}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("$ne cannot take a regular expression"), "{message}");
+    }
+    let not = find(json!({ "s": { "$not": { "$regex": "abc" } } })).await;
+    assert_eq!(ids(&not.body), [2], "{:?}", not.body);
+
+    for filter in [
+        json!({ "items": { "$all": [{ "$elemMatch": { "qty": 5 } }] } }),
+        json!({ "items": { "$all": [{ "$elemMatch": { "$eq": "q" } }] } }),
+    ] {
+        let res = find(filter.clone()).await;
+        assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("$all cannot hold an $elemMatch"), "{message}");
+    }
+    let both = find(json!({ "$and": [
+        { "items": { "$elemMatch": { "qty": 5 } } },
+        { "items": { "$elemMatch": { "sku": "a" } } },
+    ] }))
+    .await;
+    assert_eq!(ids(&both.body), [1], "{:?}", both.body);
+}
+
+#[tokio::test]
 async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
     // The value round-trips: `$numberDecimal` in, `$numberDecimal` out, the
     // digits untouched, and `$type` can still find it.
