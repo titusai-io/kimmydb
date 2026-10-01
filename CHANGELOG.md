@@ -127,6 +127,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   next start repaired it under a marker that said otherwise. The stop now reads
   the store's header in that case, and a store still open is recorded as
   `storage_not_closed`, with exit 75, as for a stop that could not close it.
+  The error it prints keeps the start's own error under it (a cluster port in
+  use, say), so the cause of the failed start is still on stderr.
 
 - **A clustered start that can never write its replay floor is refused before
   the store is opened, and leaves no temporary file.** The floor
