@@ -1914,54 +1914,90 @@ async fn updates_apply_operators() {
     assert_eq!(res.body["n"], 15);
 }
 
-/// Two operators on one path apply in the order their keys arrive, and the
-/// last one wins — the promise `docs/query-language.md` makes. The parser
-/// kept it from the start; the boundary broke it, because a `serde_json::Map`
-/// built without `preserve_order` is a `BTreeMap` and sorted every object's
-/// keys before the parser saw them, so both orders below ran `$inc` first
-/// and both left `1`. Driven over HTTP on purpose: a `doc!`-built test in the
-/// parser never crossed the boundary and never saw the defect (ADR-120).
+/// Two operators on one path are refused, in either order, and nothing is
+/// written (ADR-205). Applied in the order the keys arrived, `{"$set": {"a":
+/// 1}, "$inc": {"a": 5}}` on `a: 0` left 6 and the reverse left 1, so the
+/// result was decided by the key order of the body, which a client's JSON
+/// encoder may not keep. Driven over HTTP with bodies written as text, so the
+/// key order on the wire is the order that appears here (ADR-120): the
+/// refusal must not depend on which operator arrives first.
 #[tokio::test]
-async fn update_operators_apply_in_the_order_the_request_wrote_them() {
+async fn update_operators_that_write_one_path_are_refused_in_either_order() {
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"a":0})).await;
 
-    // The bodies are written as text, not with `json!`, so the key order on
-    // the wire is exactly the order that appears here.
-    async fn apply(server: &Server, token: &str, update: &str) -> Value {
-        server.post("/v1/db/shop/coll/c/docs", Some(token), json!({"_id":1,"a":0})).await;
-        let body = format!(r#"{{"filter":{{"_id":1}},"update":{update}}}"#);
-        let body: Value = serde_json::from_str(&body).unwrap();
-        let res = server.post("/v1/db/shop/coll/c/update", Some(token), body).await;
-        assert_eq!(res.status, 200, "{:?}", res.body);
-        let res = server.get("/v1/db/shop/coll/c/docs/1", Some(token)).await;
-        let value = res.body["a"].clone();
-        server.delete("/v1/db/shop/coll/c/docs/1", Some(token)).await;
-        value
+    for (update, first, second, updating, at) in [
+        (r#"{"$set":{"a":1},"$inc":{"a":5}}"#, "$set", "$inc", "a", "a"),
+        (r#"{"$inc":{"a":5},"$set":{"a":1}}"#, "$inc", "$set", "a", "a"),
+        (r#"{"$min":{"a":3},"$max":{"a":10}}"#, "$min", "$max", "a", "a"),
+        (r#"{"$set":{"a":1},"$inc":{"a.b":5}}"#, "$set", "$inc", "a.b", "a"),
+    ] {
+        for route in ["update", "find_and_modify"] {
+            let body = format!(r#"{{"filter":{{"_id":1}},"update":{update}}}"#);
+            let body: Value = serde_json::from_str(&body).unwrap();
+            let res = server.post(&format!("/v1/db/shop/coll/c/{route}"), Some(&token), body).await;
+            assert_eq!(res.status, 400, "{route} {update}: {:?}", res.body);
+            assert_eq!(res.body["error"], "bad_request", "{route} {update}");
+            let message = res.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!("{first} on \""))
+                    && message.contains(&format!("conflicts with {second} on \""))
+                    && message.contains(&format!(
+                        "updating the path \"{updating}\" would create a conflict at \"{at}\""
+                    )),
+                "{route} {update}: {message}"
+            );
+        }
     }
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["a"], 0, "nothing was written: {:?}", res.body);
 
-    assert_eq!(apply(&server, &token, r#"{"$set":{"a":1},"$inc":{"a":5}}"#).await, 6);
-    assert_eq!(apply(&server, &token, r#"{"$inc":{"a":5},"$set":{"a":1}}"#).await, 1);
-    assert_eq!(apply(&server, &token, r#"{"$set":{"a":7},"$mul":{"a":10}}"#).await, 70);
-    assert_eq!(apply(&server, &token, r#"{"$mul":{"a":10},"$set":{"a":7}}"#).await, 7);
-
-    // `$min` then `$max` on 5: 3, then 10. The reverse: 10, then 3.
-    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"a":5})).await;
+    // Writes to separate paths still apply together.
     let body: Value =
-        serde_json::from_str(r#"{"filter":{"_id":2},"update":{"$min":{"a":3},"$max":{"a":10}}}"#)
+        serde_json::from_str(r#"{"filter":{"_id":1},"update":{"$set":{"b":1},"$inc":{"a":5}}}"#)
             .unwrap();
-    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
-    let res = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await;
-    assert_eq!(res.body["a"], 10, "$min then $max on 5: {:?}", res.body);
+    let res = server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!((res.body["a"].clone(), res.body["b"].clone()), (json!(5), json!(1)));
+}
 
-    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":3,"a":5})).await;
-    let body: Value =
-        serde_json::from_str(r#"{"filter":{"_id":3},"update":{"$max":{"a":10},"$min":{"a":3}}}"#)
-            .unwrap();
-    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
-    let res = server.get("/v1/db/shop/coll/c/docs/3", Some(&token)).await;
-    assert_eq!(res.body["a"], 3, "$max then $min on 5: {:?}", res.body);
+/// Two positional paths that reach one element of a document are refused for
+/// that document, and the request with it; on a document where they reach
+/// separate elements, the same update applies (ADR-205).
+#[tokio::test]
+async fn positional_paths_that_reach_one_element_are_refused() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let lines = json!([{"sku":"a","qty":1},{"sku":"b","qty":5}]);
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"items":lines})).await;
+
+    let request = |sku: &str| {
+        json!({
+            "filter": {"_id": 1},
+            "update": {"$set": {"items.$[l].qty": 0}, "$inc": {"items.$[].qty": 1}},
+            "arrayFilters": [{"l.sku": sku}],
+        })
+    };
+    let res = server.post("/v1/db/shop/coll/c/update", Some(&token), request("b")).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    // The message as query-language.md shows it, prefix and all.
+    assert_eq!(
+        res.body["message"],
+        "invalid query: invalid update: $set on \"items.$[l].qty\" conflicts with $inc on \
+         \"items.$[].qty\" in this document: updating the path \"items.1.qty\" would create \
+         a conflict at \"items.1.qty\"; an update may write each path once"
+    );
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["items"], lines, "nothing was written");
+
+    let res = server.post("/v1/db/shop/coll/c/update", Some(&token), request("z")).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["items"], json!([{"sku":"a","qty":2},{"sku":"b","qty":6}]));
 }
 
 /// A sort document's key order is its precedence, and it too crossed the

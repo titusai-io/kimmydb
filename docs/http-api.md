@@ -984,7 +984,9 @@ document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
 `zeta` first, as BSON keeps it, and the same holds for the keys of a filter,
 sort or update document, where the order carries meaning — a sort document's
 first key is its primary key, and update operators apply in the order they
-arrive (ADR-120). An inclusion projection answers in the document's order,
+arrive, which is the order the fields they add are appended in (ADR-120). Two
+that write one path are refused, not ordered
+([ADR-205](decisions.md)). An inclusion projection answers in the document's order,
 not the projection's. **An update keeps the order it found and appends what
 it adds:** a `$set` of a field the document already has rewrites it in place,
 and a `$set` of a new one puts it last, so `[_id, zeta, alpha]` becomes

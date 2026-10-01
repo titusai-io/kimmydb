@@ -1028,12 +1028,12 @@ async fn a_write_tool_actually_writes() {
 }
 
 /// Tool arguments arrive as JSON like an HTTP body does and reach the same
-/// `exec` layer, so the MCP boundary keeps operator order exactly as the HTTP
-/// one does (ADR-120). Pinned here rather than assumed: the changelog says
-/// both boundaries were affected and both are fixed. The argument is parsed
-/// from text so the key order on the wire is the order written here.
+/// `exec` layer, so two operators on one path are refused through the update
+/// tool as over HTTP, in either key order, and nothing is written (ADR-205).
+/// The arguments are parsed from text so the key order on the wire is the
+/// order written here (ADR-120).
 #[tokio::test]
-async fn the_update_tool_applies_operators_in_the_order_written() {
+async fn the_update_tool_refuses_two_operators_on_one_path() {
     let server = Server::start().await;
     seed(&server);
     let token = server.root();
@@ -1046,12 +1046,24 @@ async fn the_update_tool_applies_operators_in_the_order_written() {
         )
         .await;
 
-    let args: Value = serde_json::from_str(
-        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
-            "update":{"$set":{"a":1},"$inc":{"a":5}}}"#,
-    )
-    .unwrap();
-    server.call_ok(&token, "update", args).await;
+    for (update, first, second) in [
+        (r#"{"$set":{"a":1},"$inc":{"a":5}}"#, "$set", "$inc"),
+        (r#"{"$inc":{"a":5},"$set":{"a":1}}"#, "$inc", "$set"),
+    ] {
+        let args: Value = serde_json::from_str(&format!(
+            r#"{{"database":"sales","collection":"orders","filter":{{"_id":"o"}},
+                "update":{update}}}"#
+        ))
+        .unwrap();
+        let refused = server.call(&token, "update", args).await;
+        assert_eq!(refused["error"]["data"]["error"], "bad_request", "must not run: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("{first} on \"a\" conflicts with {second} on \"a\""))
+                && message.contains("would create a conflict at \"a\""),
+            "{message}"
+        );
+    }
     let found = server
         .call_ok(
             &token,
@@ -1059,22 +1071,7 @@ async fn the_update_tool_applies_operators_in_the_order_written() {
             json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
         )
         .await;
-    assert_eq!(found["documents"][0]["a"], 6, "$set then $inc: {found}");
-
-    let args: Value = serde_json::from_str(
-        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
-            "update":{"$inc":{"a":5},"$set":{"a":1}}}"#,
-    )
-    .unwrap();
-    server.call_ok(&token, "update", args).await;
-    let found = server
-        .call_ok(
-            &token,
-            "find",
-            json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
-        )
-        .await;
-    assert_eq!(found["documents"][0]["a"], 1, "$inc then $set: {found}");
+    assert_eq!(found["documents"][0]["a"], 0, "nothing was written: {found}");
 }
 
 #[tokio::test]

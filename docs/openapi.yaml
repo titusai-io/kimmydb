@@ -1619,6 +1619,12 @@ paths:
         every element, and `items.$[line].qty` reaches the elements the
         `arrayFilters` entry for `line` selects (ADR-104).
 
+        An update writes each path once: two writes to one path, or to a
+        path and a path inside it, are refused `400` and nothing is written,
+        whichever operators carry them and in either order (ADR-205). Two
+        positional paths that reach one element are refused for the document
+        where they meet, as any document an operator cannot apply to is.
+
         **`explain: true` plans the update; it does not perform it**
         (ADR-131). It answers with the same plan a real update would use —
         `documentsExamined`, `documentsMatched`, and which index, if any —
@@ -1738,6 +1744,10 @@ paths:
         The candidate set is bounded. A filter matching more than 10,000
         documents is **refused** rather than answered from a prefix, which
         would return a document the sort did not pick.
+
+        The update follows the rules of `/update`, including that two writes
+        to one path, or to a path and a path inside it, are refused `400`
+        with nothing written (ADR-205).
       x-kimmy-action: write
       requestBody:
         required: true

@@ -8,7 +8,7 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::aggregate::group_key;
 use crate::filter::{self, Filter};
@@ -253,7 +253,7 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
         )));
     }
 
-    reject_set_on_insert_conflicts(&operations)?;
+    reject_conflicting_paths(&operations)?;
     Ok(Update::Operators(operations))
 }
 
@@ -382,48 +382,147 @@ fn strip_identifier(doc: &Document, identifier: &mut Option<String>) -> Result<D
     Ok(out)
 }
 
-/// Refuse a `$setOnInsert` that shares a path — or a prefix of one — with any
-/// other write in the update, as MongoDB does.
+/// Every path an operation writes: its own, and for a `$rename` its
+/// destination as well, since a rename clears one field and writes another.
+fn written_paths(op: &Operation) -> Vec<&str> {
+    match &op.kind {
+        OpKind::Rename(target) => vec![op.path.as_str(), target.as_str()],
+        _ => vec![op.path.as_str()],
+    }
+}
+
+/// Refuse an update in which two writes share a path, or one writes inside
+/// the other (ADR-205).
 ///
-/// The two would disagree about the inserted document depending on the order
-/// they ran in, and an update that means different things on insert and on
-/// match is exactly the kind of thing that should fail loudly at parse time.
-fn reject_set_on_insert_conflicts(operations: &[Operation]) -> Result<()> {
-    let written_paths = |op: &Operation| -> Vec<String> {
-        match &op.kind {
-            // A rename writes its destination as well as clearing its source.
-            OpKind::Rename(target) => vec![op.path.clone(), target.clone()],
-            _ => vec![op.path.clone()],
-        }
-    };
-    for (i, a) in operations.iter().enumerate() {
-        if !matches!(a.kind, OpKind::SetOnInsert(_)) {
-            continue;
-        }
-        for (j, b) in operations.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for path in written_paths(b) {
-                if paths_overlap(&a.path, &path) {
-                    return Err(Error::InvalidUpdate(format!(
-                        "$setOnInsert on {:?} conflicts with {} on {:?}",
-                        a.path,
-                        b.kind.name(),
-                        path
-                    )));
-                }
-            }
+/// Applied one after the other, the two would leave a result that depends on
+/// which ran first, and the order is the order of the keys in the request
+/// body, which a client's JSON encoder may not preserve. A request whose
+/// meaning depends on an accident of encoding is one the server cannot
+/// honour, so it is refused at parse time rather than answered. Every pair of
+/// operations is checked, including two paths under one operator, and the
+/// error names the two in the order they were written.
+///
+/// A positional segment is compared as written: `items.$[a].qty` and
+/// `items.$[b].qty` do not overlap here, because which elements each reaches
+/// depends on the document. [`apply_to`] checks the concrete paths they
+/// expand to, in each document. An index segment is compared by its value, so
+/// `a.1` and `a.01` are one path.
+fn reject_conflicting_paths(operations: &[Operation]) -> Result<()> {
+    let mut claims = Claims::new(operations, "");
+    for (i, op) in operations.iter().enumerate() {
+        for path in written_paths(op) {
+            claims.claim(i, path)?;
         }
     }
     Ok(())
 }
 
-/// Whether two dot paths name the same field or one lies inside the other.
-fn paths_overlap(a: &str, b: &str) -> bool {
-    a == b
-        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.'))
-        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
+/// The paths an update's operations write, each with the operation that
+/// writes it, for finding two that overlap in time proportional to the paths
+/// and their depth rather than to every pair of them.
+///
+/// Paths are claimed in operation order. Each is looked up as a path another
+/// operation wrote, as a path that lies inside one another operation wrote
+/// (through `inner`, every proper prefix of every path claimed), and through
+/// each of its own proper prefixes, as lying inside one. Two paths of the same
+/// operation are not compared: a positional operation's paths reach distinct
+/// elements, and a `$rename` whose source and destination overlap is not this
+/// rule's business.
+struct Claims<'a> {
+    operations: &'a [Operation],
+    /// How the refusal says where the conflict was found.
+    where_: &'static str,
+    /// Each canonical path claimed, and the operation that claimed it first.
+    exact: HashMap<String, usize>,
+    /// Each proper prefix of a canonical path claimed, with the first
+    /// operation and path that had it.
+    inner: HashMap<String, (usize, String)>,
+    /// Map lookups made, which a test holds to a bound.
+    probes: usize,
+}
+
+impl<'a> Claims<'a> {
+    fn new(operations: &'a [Operation], where_: &'static str) -> Self {
+        Claims { operations, where_, exact: HashMap::new(), inner: HashMap::new(), probes: 0 }
+    }
+
+    /// Refuse operation `i` writing `path` when another operation wrote it, a
+    /// path inside it, or a path it lies inside; otherwise record it.
+    fn claim(&mut self, i: usize, path: &str) -> Result<()> {
+        let path = canonical(path);
+        let prefixes: Vec<&str> = path.match_indices('.').map(|(at, _)| &path[..at]).collect();
+        self.probes += 2 + prefixes.len();
+        if let Some(&j) = self.exact.get(&path)
+            && j != i
+        {
+            return Err(self.conflict(j, i, &path, &path));
+        }
+        if let Some((j, longer)) = self.inner.get(&path)
+            && *j != i
+        {
+            return Err(self.conflict(*j, i, longer, &path));
+        }
+        for prefix in &prefixes {
+            if let Some(&j) = self.exact.get(*prefix)
+                && j != i
+            {
+                return Err(self.conflict(j, i, prefix, &path));
+            }
+        }
+        for prefix in prefixes {
+            self.inner.entry(prefix.to_string()).or_insert_with(|| (i, path.clone()));
+        }
+        self.exact.entry(path).or_insert(i);
+        Ok(())
+    }
+
+    /// The refusal for operation `earlier`'s write at `theirs` and operation
+    /// `later`'s at `mine`, which overlap.
+    fn conflict(&self, earlier: usize, later: usize, theirs: &str, mine: &str) -> Error {
+        conflict(&self.operations[earlier], &self.operations[later], theirs, mine, self.where_)
+    }
+}
+
+/// A path with every segment that addresses an array element by number in
+/// its decimal form: `a.01` and `a.+1` are `a.1`, because the path language
+/// reads all three as the element at index 1 (`usize::from_str`), and two
+/// writes to it are one path written twice. A positional segment is left as
+/// it is. Over a document whose `a` holds an object, `01` and `1` would be
+/// two keys; they are still read as one path here, so such a pair is refused
+/// rather than told apart. The first segment is left as written: it names a
+/// field of the document itself, which is never an array, so `01` and `1`
+/// there are always two fields.
+fn canonical(path: &str) -> String {
+    path::segments(path)
+        .iter()
+        .enumerate()
+        .map(|(at, segment)| match segment.parse::<usize>() {
+            Ok(index) if at > 0 => index.to_string(),
+            _ => (*segment).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The refusal for two writes that overlap at `first` and `second`, which
+/// name the field the conflict is at and the path inside it, in either order.
+fn conflict(
+    earlier: &Operation,
+    later: &Operation,
+    first: &str,
+    second: &str,
+    where_: &str,
+) -> Error {
+    let (at, updating) =
+        if first.len() <= second.len() { (first, second) } else { (second, first) };
+    Error::InvalidUpdate(format!(
+        "{} on {:?} conflicts with {} on {:?}{where_}: updating the path {updating:?} would \
+         create a conflict at {at:?}; an update may write each path once",
+        earlier.kind.name(),
+        earlier.path,
+        later.kind.name(),
+        later.path,
+    ))
 }
 
 /// Whether a target path is `_id` or anything beneath it.
@@ -638,34 +737,87 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
         Update::Operators(ops) => ops,
     };
 
-    // `$setOnInsert` first and only for an inserted document, then everything
-    // else — each through `apply_expanded`, so a positional path is expanded
-    // whichever of the two passes carries it.
-    let on_insert = |op: &&Operation| matches!(op.kind, OpKind::SetOnInsert(_));
-    if target == Target::Inserted {
-        for op in operations.iter().filter(on_insert) {
-            apply_expanded(op, doc, now_ms)?;
-        }
+    // Two phases. Every operation's positional paths are expanded against
+    // the document as it was before the update, and every concrete path is
+    // claimed, before anything is written: which elements an array filter
+    // selects cannot depend on what an operation written before it did, and
+    // an update refused for two writes that meet leaves the document as it
+    // found it (ADR-205).
+    let applies =
+        |op: &Operation| target == Target::Inserted || !matches!(op.kind, OpKind::SetOnInsert(_));
+    let concrete = concrete_paths(operations, doc, applies)?;
+    if operations.iter().any(|op| has_positional(&op.path)) {
+        claim_concrete(operations, &concrete)?;
     }
-    for op in operations.iter().filter(|op| !on_insert(op)) {
-        apply_expanded(op, doc, now_ms)?;
+
+    // Then `$setOnInsert`, only for an inserted document, and everything else.
+    let on_insert = |op: &Operation| matches!(op.kind, OpKind::SetOnInsert(_));
+    let passes: [&dyn Fn(&Operation) -> bool; 2] = [&on_insert, &|op| !on_insert(op)];
+    for pass in passes {
+        for (op, paths) in operations.iter().zip(&concrete) {
+            if applies(op) && pass(op) {
+                apply_at(op, paths, doc, now_ms)?;
+            }
+        }
     }
     Ok(())
 }
 
-/// One operation, applied through however many concrete paths its positional
-/// segments name.
+/// Each operation's concrete paths in `doc`, in operation order: its own path
+/// when it has no positional segment, the paths its positional segments
+/// select otherwise, and none for an operation that does not apply.
+fn concrete_paths(
+    operations: &[Operation],
+    doc: &Document,
+    applies: impl Fn(&Operation) -> bool,
+) -> Result<Vec<Vec<String>>> {
+    operations
+        .iter()
+        .map(|op| {
+            if !applies(op) {
+                Ok(Vec::new())
+            } else if has_positional(&op.path) {
+                expand_positional(&op.path, &op.array_filters, doc)
+            } else {
+                Ok(vec![op.path.clone()])
+            }
+        })
+        .collect()
+}
+
+/// Refuse the update when two operations' concrete paths overlap.
 ///
-/// The segments are resolved against the document as it is before the
-/// operation touches it, and each concrete index path is then applied in turn.
+/// The parser has refused every pair whose paths overlap as written. What it
+/// cannot see is two positional paths, or a positional and a plain one, that
+/// reach the same element: `items.$[a].qty` and `items.$[].qty` both reach
+/// every element `a` selects, and `items.1.qty` and `items.$[].qty` meet at
+/// the second. Run only when some operation has a positional path; returns
+/// the lookups made.
+fn claim_concrete(operations: &[Operation], concrete: &[Vec<String>]) -> Result<usize> {
+    let mut claims = Claims::new(operations, " in this document");
+    for (i, (op, paths)) in operations.iter().zip(concrete).enumerate() {
+        for path in paths {
+            claims.claim(i, path)?;
+        }
+        if let OpKind::Rename(target) = &op.kind
+            && !paths.is_empty()
+        {
+            claims.claim(i, target)?;
+        }
+    }
+    Ok(claims.probes)
+}
+
+/// One operation, applied through the concrete paths phase one found for it.
+///
 /// Positions stay valid across those applications because `$unset` leaves a
 /// null hole rather than shifting the elements after it.
-fn apply_expanded(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
+fn apply_at(op: &Operation, paths: &[String], doc: &mut Document, now_ms: i64) -> Result<()> {
     if !has_positional(&op.path) {
         return apply_one(op, doc, now_ms);
     }
-    for concrete in expand_positional(&op.path, &op.array_filters, doc)? {
-        let at = Operation { path: concrete, kind: op.kind.clone(), array_filters: Vec::new() };
+    for path in paths {
+        let at = Operation { path: path.clone(), kind: op.kind.clone(), array_filters: Vec::new() };
         apply_one(&at, doc, now_ms)?;
     }
     Ok(())
@@ -1617,15 +1769,10 @@ mod tests {
                 { "sku": "b", "tags": ["x", "z"] },
             ]
         };
-        let out = applied_with(
-            doc! {
-                "$pull": { "items.$[line].tags": "x" },
-                "$push": { "items.$[line].tags": "w" },
-                "$addToSet": { "items.$[line].tags": "z" },
-            },
-            vec![doc! { "line.sku": "b" }],
-            doc,
-        );
+        let filters = || vec![doc! { "line.sku": "b" }];
+        let out = applied_with(doc! { "$pull": { "items.$[line].tags": "x" } }, filters(), doc);
+        let out = applied_with(doc! { "$push": { "items.$[line].tags": "w" } }, filters(), out);
+        let out = applied_with(doc! { "$addToSet": { "items.$[line].tags": "z" } }, filters(), out);
         assert_eq!(
             out,
             doc! {
@@ -1635,6 +1782,17 @@ mod tests {
                 ]
             }
         );
+        // The three in one update write one path three times, and are refused.
+        let err = parse_with_filters(
+            &doc! {
+                "$pull": { "items.$[line].tags": "x" },
+                "$push": { "items.$[line].tags": "w" },
+            },
+            &filters(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("would create a conflict"), "{err}");
         // `$pop` and `$push` with `$each` go through the same path.
         let out = applied_with(
             doc! { "$pop": { "items.$[].tags": -1 } },
@@ -1877,6 +2035,411 @@ mod tests {
         // Sharing a prefix of the *name* is not sharing a path.
         assert!(parse(&doc! { "$setOnInsert": { "ab": 1 }, "$set": { "a": 2 } }).is_ok());
         assert!(parse(&doc! { "$setOnInsert": { "a.b": 1 }, "$set": { "a.c": 2 } }).is_ok());
+    }
+
+    /// The refusal for an update whose paths overlap, as the parser gives it.
+    fn conflict_err(update: Document) -> String {
+        match parse(&update) {
+            Ok(parsed) => panic!("{update} parsed as {parsed:?}, expected a conflict"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn two_operators_may_not_write_one_path_in_either_order() {
+        // Applied in the order written, each pair below left one result for
+        // one key order and another for the other: `$set` then `$inc` on
+        // `a: 0` left 6, the reverse left 1.
+        for (first, second) in [("$set", "$inc"), ("$set", "$mul"), ("$min", "$max")] {
+            for (a, b) in [(first, second), (second, first)] {
+                let update = doc! { a: { "a": 1 }, b: { "a": 5 } };
+                let err = conflict_err(update.clone());
+                assert_eq!(
+                    err,
+                    format!(
+                        "invalid update: {a} on \"a\" conflicts with {b} on \"a\": updating the \
+                         path \"a\" would create a conflict at \"a\"; an update may write each \
+                         path once"
+                    ),
+                    "{update}"
+                );
+            }
+        }
+        let err = conflict_err(doc! { "$push": { "tags": "x" }, "$pull": { "tags": "y" } });
+        assert!(err.contains("$push on \"tags\" conflicts with $pull on \"tags\""), "{err}");
+        let err = conflict_err(doc! { "$currentDate": { "t": true }, "$unset": { "t": "" } });
+        assert!(err.contains("$currentDate") && err.contains("$unset"), "{err}");
+    }
+
+    #[test]
+    fn a_path_inside_another_written_path_is_a_conflict() {
+        let err = conflict_err(doc! { "$set": { "a": 1 }, "$unset": { "a.b": "" } });
+        assert!(
+            err.contains("$set on \"a\" conflicts with $unset on \"a.b\"")
+                && err.contains("updating the path \"a.b\" would create a conflict at \"a\""),
+            "{err}"
+        );
+        let err = conflict_err(doc! { "$inc": { "a.b": 1 }, "$set": { "a": {} } });
+        assert!(
+            err.contains("updating the path \"a.b\" would create a conflict at \"a\""),
+            "{err}"
+        );
+        // Two paths under one operator are two writes too.
+        let err = conflict_err(doc! { "$set": { "a": { "b": 1 }, "a.b": 2 } });
+        assert!(err.contains("$set on \"a\" conflicts with $set on \"a.b\""), "{err}");
+    }
+
+    #[test]
+    fn a_rename_writes_both_its_source_and_its_destination() {
+        let err = conflict_err(doc! { "$rename": { "a": "b" }, "$set": { "b": 1 } });
+        assert!(err.contains("$rename on \"a\" conflicts with $set on \"b\""), "{err}");
+        let err = conflict_err(doc! { "$set": { "a.x": 1 }, "$rename": { "a": "b" } });
+        assert!(err.contains("$set on \"a.x\" conflicts with $rename on \"a\""), "{err}");
+        let err = conflict_err(doc! { "$rename": { "a": "c", "b": "c.d" } });
+        assert!(err.contains("$rename on \"a\" conflicts with $rename on \"b\""), "{err}");
+    }
+
+    #[test]
+    fn a_rename_whose_source_lies_under_its_destination_still_meets_an_earlier_write() {
+        // The `$set` claims `a.b` first; the rename's own source `a.c` must not
+        // take the place of that claim inside `a`, or its destination `a`
+        // would no longer meet `a.b`.
+        let err = conflict_err(doc! { "$set": { "a.b": 1 }, "$rename": { "a.c": "a" } });
+        assert!(err.contains("$set on \"a.b\" conflicts with $rename"), "{err}");
+        assert!(err.contains("would create a conflict at \"a\""), "{err}");
+    }
+
+    #[test]
+    fn a_rename_that_overlaps_only_its_own_path_is_not_a_conflict() {
+        for spec in [
+            doc! { "$rename": { "a": "a.b" } },
+            doc! { "$rename": { "a.b": "a" } },
+            doc! { "$rename": { "a": "a" } },
+        ] {
+            assert!(parse_with_filters(&spec, &[]).is_ok(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn a_numeric_top_level_field_is_compared_as_written() {
+        // The document itself is never an array, so `01` and `1` are two fields.
+        assert_eq!(
+            applied(doc! { "$set": { "01": 1, "1": 2 } }, doc! {}),
+            doc! { "01": 1, "1": 2 }
+        );
+        let err = conflict_err(doc! { "$set": { "a.01": 1, "a.1": 2 } });
+        assert!(err.contains("would create a conflict at \"a.1\""), "{err}");
+    }
+
+    #[test]
+    fn writes_to_separate_paths_still_apply_together() {
+        assert_eq!(
+            applied(doc! { "$set": { "a": 1 }, "$inc": { "b": 5 } }, doc! { "a": 0, "b": 1 }),
+            doc! { "a": 1, "b": 6i64 }
+        );
+        assert_eq!(
+            applied(
+                doc! { "$set": { "a.b": 1 }, "$unset": { "a.c": "" } },
+                doc! { "a": { "c": 2 } }
+            ),
+            doc! { "a": { "b": 1 } }
+        );
+        // A shared prefix of the name is not a shared path.
+        assert_eq!(
+            applied(doc! { "$set": { "ab": 1 }, "$inc": { "a": 1 } }, doc! {}),
+            doc! { "ab": 1, "a": 1i64 }
+        );
+        assert_eq!(
+            applied(doc! { "$rename": { "a": "b" }, "$set": { "c": 1 } }, doc! { "a": 7 }),
+            doc! { "b": 7, "c": 1 }
+        );
+    }
+
+    #[test]
+    fn positional_paths_conflict_at_parse_when_they_overlap_as_written() {
+        let filters = vec![doc! { "l.sku": "b" }];
+        for update in [
+            doc! { "$set": { "items.$[l].qty": 0 }, "$inc": { "items.$[l].qty": 1 } },
+            doc! { "$set": { "items.$[l]": {} }, "$inc": { "items.$[l].qty": 1 } },
+            doc! { "$set": { "items": [] }, "$inc": { "items.$[l].qty": 1 } },
+        ] {
+            let err = parse_with_filters(&update, &filters).unwrap_err().to_string();
+            assert!(err.contains("would create a conflict"), "{update}: {err}");
+        }
+        let err = parse(&doc! { "$set": { "items.$[]": 0 }, "$unset": { "items.$[].qty": "" } })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would create a conflict at \"items.$[]\""), "{err}");
+    }
+
+    #[test]
+    fn positional_paths_that_reach_one_element_conflict_in_that_document() {
+        // `l` selects the second line, which `$[]` reaches too.
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[l].qty": 0 }, "$inc": { "items.$[].qty": 1 } },
+            vec![doc! { "l.sku": "b" }],
+            order(),
+        );
+        assert_eq!(
+            err,
+            "invalid update: $set on \"items.$[l].qty\" conflicts with $inc on \
+             \"items.$[].qty\" in this document: updating the path \"items.1.qty\" would \
+             create a conflict at \"items.1.qty\"; an update may write each path once"
+        );
+        // Written the other way round, the refusal names them that way round.
+        let err = apply_err_with(
+            doc! { "$inc": { "items.$[].qty": 1 }, "$set": { "items.$[l].qty": 0 } },
+            vec![doc! { "l.sku": "b" }],
+            order(),
+        );
+        assert!(err.contains("$inc on \"items.$[].qty\" conflicts with $set"), "{err}");
+        // A plain index path meets a positional one at that element.
+        let err = apply_err_with(
+            doc! { "$set": { "items.2.qty": 0 }, "$inc": { "items.$[].qty": 1 } },
+            vec![],
+            order(),
+        );
+        assert!(err.contains("would create a conflict at \"items.2.qty\""), "{err}");
+        // A whole element against a field inside it.
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[l]": {} }, "$unset": { "items.$[].qty": "" } },
+            vec![doc! { "l.qty": { "$gt": 4 } }],
+            order(),
+        );
+        assert!(
+            err.contains(
+                "updating the path \"items.1.qty\" would create a conflict at \"items.1\""
+            ),
+            "{err}"
+        );
+        // Two filters that both select the third line.
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[a].shipped": true }, "$unset": { "items.$[b].shipped": "" } },
+            vec![doc! { "a.qty": { "$gt": 4 } }, doc! { "b.sku": "c" }],
+            order(),
+        );
+        assert!(err.contains("would create a conflict at \"items.2.shipped\""), "{err}");
+    }
+
+    #[test]
+    fn positional_paths_that_reach_separate_elements_apply_together() {
+        // The same update as above, on a document where `l` selects nothing.
+        let out = applied_with(
+            doc! { "$set": { "items.$[l].qty": 0 }, "$inc": { "items.$[].qty": 1 } },
+            vec![doc! { "l.sku": "z" }],
+            order(),
+        );
+        let qty: Vec<i64> = out
+            .get_array("items")
+            .unwrap()
+            .iter()
+            .map(|line| line.as_document().unwrap().get_i64("qty").unwrap())
+            .collect();
+        assert_eq!(qty, vec![2, 6, 10]);
+        // Two filters that select different lines, on one field.
+        let out = applied_with(
+            doc! { "$set": { "items.$[a].shipped": true }, "$unset": { "items.$[b].shipped": "" } },
+            vec![doc! { "a.sku": "a" }, doc! { "b.sku": "c" }],
+            order(),
+        );
+        let lines = out.get_array("items").unwrap();
+        assert!(lines[0].as_document().unwrap().get_bool("shipped").unwrap());
+        assert!(!lines[2].as_document().unwrap().contains_key("shipped"));
+        // A positional path and a plain one beside it.
+        let out = applied_with(
+            doc! { "$set": { "items.$[].shipped": true, "total": 15 } },
+            vec![],
+            order(),
+        );
+        assert_eq!(shipped(&out), vec![true, true, true]);
+        assert_eq!(out.get_i32("total").unwrap(), 15);
+    }
+
+    #[test]
+    fn set_on_insert_is_checked_on_insert_against_the_paths_it_reaches() {
+        // On a match `$setOnInsert` writes nothing, so nothing conflicts; on
+        // an insert it writes, and its element is checked like any other.
+        let update = parse_with_filters(
+            &doc! { "$setOnInsert": { "items.$[l].qty": 0 }, "$inc": { "items.$[].qty": 1 } },
+            &[doc! { "l.sku": "b" }],
+        )
+        .unwrap();
+        let mut matched = order();
+        apply(&update, &mut matched, NOW).unwrap();
+        let mut seeded = order();
+        let err = apply_on_insert(&update, &mut seeded, NOW).unwrap_err().to_string();
+        assert!(err.contains("$setOnInsert on \"items.$[l].qty\" conflicts with $inc"), "{err}");
+    }
+
+    #[test]
+    fn array_filters_select_against_the_document_before_the_update() {
+        // Applied operation by operation, `l` was evaluated after `$inc` had
+        // made the line's qty 3, selected it, and the pair conflicted; the
+        // other order evaluated `l` first, selected nothing, and applied.
+        let filters = || vec![doc! { "m.qty": 2 }, doc! { "l.qty": 3 }];
+        let start = || doc! { "items": [ { "qty": 2 } ] };
+        let one = applied_with(
+            doc! { "$inc": { "items.$[m].qty": 1 }, "$set": { "items.$[l].qty": 0 } },
+            filters(),
+            start(),
+        );
+        let other = applied_with(
+            doc! { "$set": { "items.$[l].qty": 0 }, "$inc": { "items.$[m].qty": 1 } },
+            filters(),
+            start(),
+        );
+        assert_eq!(one, doc! { "items": [ { "qty": 3i64 } ] });
+        assert_eq!(one, other);
+
+        // With no conflict at all: `m` reads the sku as it was, so the line
+        // whose sku the same update renames to "b" is not selected, in
+        // either order.
+        let filters = || vec![doc! { "m.sku": "b" }];
+        let start = || doc! { "items": [ { "sku": "a", "qty": 1 } ] };
+        let one = applied_with(
+            doc! { "$set": { "items.0.sku": "b" }, "$inc": { "items.$[m].qty": 1 } },
+            filters(),
+            start(),
+        );
+        let other = applied_with(
+            doc! { "$inc": { "items.$[m].qty": 1 }, "$set": { "items.0.sku": "b" } },
+            filters(),
+            start(),
+        );
+        assert_eq!(one, doc! { "items": [ { "sku": "b", "qty": 1 } ] });
+        assert_eq!(one, other);
+    }
+
+    #[test]
+    fn an_update_refused_in_a_document_leaves_it_as_it_was() {
+        // Through the public entry point: every path is claimed before any
+        // is written, so the `$set` and `$inc` written before the `$unset`
+        // that meets `$inc` are not applied either.
+        let update = parse_with_filters(
+            &doc! {
+                "$set": { "total": 15 },
+                "$inc": { "items.$[].qty": 1 },
+                "$unset": { "items.1.qty": "" },
+            },
+            &[],
+        )
+        .unwrap();
+        let mut doc = order();
+        let err = apply(&update, &mut doc, NOW).unwrap_err().to_string();
+        assert!(err.contains("would create a conflict at \"items.1.qty\""), "{err}");
+        assert_eq!(doc, order(), "nothing was written");
+        let mut doc = order();
+        apply_on_insert(&update, &mut doc, NOW).unwrap_err();
+        assert_eq!(doc, order(), "nothing was written on insert either");
+    }
+
+    #[test]
+    fn an_index_segment_is_one_path_however_it_is_spelled() {
+        // The path language reads `01` and `+1` as index 1, so each was a
+        // second write to `a.1`, and the result followed the key order.
+        for spelling in ["a.01", "a.+1", "a.001"] {
+            for update in [
+                doc! { "$set": { "a.1": 5 }, "$inc": { spelling: 1 } },
+                doc! { "$inc": { spelling: 1 }, "$set": { "a.1": 5 } },
+            ] {
+                let err = conflict_err(update.clone());
+                assert!(err.contains("would create a conflict at \"a.1\""), "{update}: {err}");
+            }
+        }
+        let err = conflict_err(doc! { "$set": { "a": [] }, "$inc": { "a.01.n": 1 } });
+        assert!(err.contains("updating the path \"a.1.n\" would create a conflict at \"a\""));
+        // Against a positional path, in the document.
+        let err = apply_err_with(
+            doc! { "$inc": { "items.$[].qty": 1 }, "$set": { "items.01.qty": 0 } },
+            vec![],
+            order(),
+        );
+        assert!(err.contains("in this document") && err.contains("at \"items.1.qty\""), "{err}");
+        // Spelled that way alone, it is not refused, and different indexes
+        // whose spellings share a prefix are different paths.
+        assert_eq!(
+            applied(doc! { "$set": { "a.01": 5 } }, doc! { "a": [10, 20] }),
+            doc! {
+                "a": [10, 5]
+            }
+        );
+        assert_eq!(
+            applied(doc! { "$set": { "a.1": 5 }, "$inc": { "a.10": 1 } }, doc! { "a": [10, 20] })
+                .get_array("a")
+                .unwrap()[1],
+            Bson::Int32(5)
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_an_element_conflicts_with_a_positional_path_reaching_it() {
+        let mut start = order();
+        start.insert("x", 7);
+        let err = apply_err_with(
+            doc! { "$rename": { "x": "items.1.qty" }, "$inc": { "items.$[].qty": 1 } },
+            vec![],
+            start.clone(),
+        );
+        assert!(
+            err.contains(
+                "$rename on \"x\" conflicts with $inc on \"items.$[].qty\" in this document"
+            ) && err.contains("at \"items.1.qty\""),
+            "{err}"
+        );
+        // Onto a field no positional path reaches, it applies.
+        let out = applied_with(
+            doc! { "$rename": { "x": "items.1.note" }, "$inc": { "items.$[].qty": 1 } },
+            vec![],
+            start,
+        );
+        assert_eq!(
+            out.get_array("items").unwrap()[1].as_document().unwrap().get_i32("note").unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn a_conflict_found_on_insert_names_the_pair_in_written_order() {
+        // `$setOnInsert` runs first on an insert, but the refusal names the
+        // two operations in the order the update wrote them.
+        let update = parse_with_filters(
+            &doc! { "$inc": { "items.$[].qty": 1 }, "$setOnInsert": { "items.$[l].qty": 0 } },
+            &[doc! { "l.sku": "b" }],
+        )
+        .unwrap();
+        let mut seeded = order();
+        let err = apply_on_insert(&update, &mut seeded, NOW).unwrap_err().to_string();
+        assert!(err.contains("$inc on \"items.$[].qty\" conflicts with $setOnInsert"), "{err}");
+    }
+
+    #[test]
+    fn claiming_concrete_paths_costs_a_bounded_number_of_lookups_per_path() {
+        // Three operations over every element of a 20,000-element array:
+        // 60,000 concrete paths. Compared pairwise, that is 1.8e9
+        // comparisons; claimed, each path costs its own lookup, one into the
+        // paths it may lie inside, and one per prefix (`items`, `items.N`).
+        let n = 20_000;
+        let items: Vec<Bson> = (0..n).map(|i| Bson::Document(doc! { "k": i })).collect();
+        let doc = doc! { "items": items };
+        let update = parse(
+            &doc! { "$set": { "items.$[].a": 1 }, "$inc": { "items.$[].b": 1 }, "$unset": { "items.$[].k": "" } },
+        )
+        .unwrap();
+        let Update::Operators(operations) = &update else { unreachable!() };
+        let concrete = concrete_paths(operations, &doc, |_| true).unwrap();
+        let paths: usize = concrete.iter().map(Vec::len).sum();
+        assert_eq!(paths, 3 * n as usize);
+        let probes = claim_concrete(operations, &concrete).unwrap();
+        assert_eq!(probes, 4 * paths);
+        // And a conflict at the last element is still found.
+        let update = parse_with_filters(
+            &doc! { "$set": { "items.$[].a": 1 }, "$inc": { "items.$[l].a": 1 } },
+            &[doc! { "l.k": n - 1 }],
+        )
+        .unwrap();
+        let mut target = doc.clone();
+        let err = apply(&update, &mut target, NOW).unwrap_err().to_string();
+        assert!(err.contains(&format!("at \"items.{}.a\"", n - 1)), "{err}");
     }
 
     #[test]
