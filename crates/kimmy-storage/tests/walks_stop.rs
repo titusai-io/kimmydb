@@ -46,6 +46,9 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
+    // The read ahead of a drop purge chunk, which serves no client: the stop is
+    // its error, so the chunk never reaches the writer during the drain.
+    "engine::Engine::warm_purge_chunk",
     // The pass that completes the violations table, which serves no client.
     "violations_table::Engine::violations_backfill_scan",
     // An index build's fill, and every read of an index's entries.

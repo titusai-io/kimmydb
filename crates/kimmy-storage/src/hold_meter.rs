@@ -795,7 +795,12 @@ impl redb::StorageBackend for MeteredBackend {
         let bytes = out.len();
         #[cfg(test)]
         test_hooks::backend_call(Io::Read);
-        self.checked("read", || io(Io::Read, bytes, || self.inner.read(offset, out)))
+        self.checked("read", || {
+            io(Io::Read, bytes, || {
+                self.health.delay_page_read();
+                self.inner.read(offset, out)
+            })
+        })
     }
 
     fn set_len(&self, len: u64) -> std::result::Result<(), std::io::Error> {

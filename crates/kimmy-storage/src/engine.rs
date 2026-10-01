@@ -4348,6 +4348,81 @@ impl Engine {
         Ok(removed)
     }
 
+    /// Make every page the backend reads take `delay` longer: `KIMMY_TEST_PAGE_READ_MS`.
+    /// So that a test of a real node can have reads the cache cannot answer
+    /// cost what they cost on a cold disk, which a host with a warm file cache
+    /// never shows.
+    pub fn set_test_page_read_delay(&self, delay: std::time::Duration) {
+        self.health.set_page_read_delay(delay);
+    }
+
+    /// Read the rows the next purge chunk will remove, in a read transaction
+    /// of its own, so that the pages the removal touches are in redb's cache
+    /// when the chunk takes the writer.
+    ///
+    /// **Why:** the removal reads its keys and the pages around them. On a
+    /// cold cache that is a disk read per page, inside the hold: a chunk of
+    /// 1,000 rows held the single writer for as long as those reads took, and
+    /// every write on the node queued behind it. Reading them here costs the
+    /// purger the same time and costs nobody else any.
+    ///
+    /// **Nothing is decided from it.** The chunk reads its keys again under
+    /// the writer, and asks there whether a collection stands under the id
+    /// again (the guard in [`Self::purge_chunk`]); this read only moves pages
+    /// into the cache, and an answer it got is never used. Another write may
+    /// run between this read and the chunk. It changes nothing under a dead id.
+    ///
+    /// **A cache that cannot hold the chunk** keeps some of its pages, or none:
+    /// the chunk then reads in its hold what the cache dropped, as it did before,
+    /// and this read has cost the purger a second pass over the rows and nothing
+    /// else. The daemon's cache is at least 8 MiB (`storage.cache_bytes` refuses
+    /// less), shared between what is read and what a transaction has written
+    /// and not yet flushed, and a chunk's pages are its thousand rows' size, a
+    /// few hundred kilobytes for small documents. So a chunk of documents large
+    /// enough that a thousand of them fill what the cache has to spare, an
+    /// engine opened with a smaller cache in a test, or other readers evicting
+    /// the pages in the milliseconds between this read and the chunk, meet it.
+    /// When the pages are already cached this is a walk of cached pages.
+    ///
+    /// **A stop ends it with the stop's error**, which `purge_chunk` returns
+    /// before it asks for the writer. Returning `Ok` at the stop instead would
+    /// leave the chunk to take the writer, which nothing refuses until the
+    /// writes close, after the HTTP drain: with a request in flight the drain
+    /// runs to its deadline, and the chunk would read its cold pages in the hold.
+    pub(crate) fn warm_purge_chunk(&self, id: CollectionId) -> Result<()> {
+        // Walk tables: a stop is the error a row yields, so it ends the read
+        // ahead and reaches the caller. Returning at the stop instead would
+        // leave the chunk to take the writer, and while the HTTP drain runs
+        // (a request in flight holds it to its deadline) nothing refuses the
+        // writer yet: the chunk read its cold pages in the hold, and the stop
+        // exited 75 with the store unclosed. A cold pass is up to a thousand
+        // page reads, which a stop must not wait out.
+        let txn = self.db.begin_read()?;
+        let docs = crate::walk::open_walk_table(
+            &txn,
+            tables::DOCS,
+            self.walk(crate::walk::WalkScope::Background),
+        )?;
+        let mut seen = 0usize;
+        for row in docs.range(doc_range(id))?.take(DROP_PURGE_CHUNK) {
+            // redb reads the leaf page when it yields an entry, so yielding
+            // the row is the read: nothing of it is used.
+            row?;
+            seen += 1;
+        }
+        if seen < DROP_PURGE_CHUNK {
+            let indexes = crate::walk::open_walk_table(
+                &txn,
+                tables::INDEX_ENTRIES,
+                self.walk(crate::walk::WalkScope::Background),
+            )?;
+            for entry in indexes.range(index_range(id))?.take(DROP_PURGE_CHUNK - seen) {
+                entry?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether anything is filed under a collection id at all.
     pub(crate) fn collection_range_is_empty(&self, id: CollectionId) -> Result<bool> {
         let txn = self.db.begin_read()?;
@@ -4376,6 +4451,8 @@ impl Engine {
         // serves (ADR-189); the holder names the work, not who asked.
         #[cfg(any(test, feature = "test-hooks"))]
         self.purges.gate.pass()?;
+        // Before the writer: see `warm_purge_chunk`.
+        self.warm_purge_chunk(id)?;
         // The wait for the writer, and only the wait, is what the drop
         // purger's age holds through (ADR-189).
         let counters = self.purge_counters();
@@ -5787,6 +5864,239 @@ mod tests {
             .insert_many(&shadow, (0..rows).map(|i| bson::doc! { "_id": i as i64 }).collect())
             .unwrap();
         (coll, shadow)
+    }
+
+    /// A collection of `chunks` full purge chunks, dropped, its rows left under
+    /// an id nothing resolves, and the engine reopened so redb's cache holds none
+    /// of it: what a purge meets on a member that has just started. Answers the
+    /// engine, the id and the data directory.
+    fn a_dropped_collection_on_a_cold_cache(
+        chunks: usize,
+        cache_bytes: Option<usize>,
+    ) -> (Engine, CollectionId, tempfile::TempDir) {
+        a_dropped_indexed_collection_on_a_cold_cache(chunks, 0, cache_bytes)
+    }
+
+    /// [`a_dropped_collection_on_a_cold_cache`] with `indexes` indexes on the
+    /// collection, so that after its documents the purge has index entries to
+    /// remove, a chunk of them at a time.
+    fn a_dropped_indexed_collection_on_a_cold_cache(
+        chunks: usize,
+        indexes: usize,
+        cache_bytes: Option<usize>,
+    ) -> (Engine, CollectionId, tempfile::TempDir) {
+        let (engine, dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for index in 0..indexes {
+            engine
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![kimmy_core::IndexField::ascending(format!("f{index}"))],
+                    false,
+                    None,
+                )
+                .unwrap();
+        }
+        let rows = DROP_PURGE_CHUNK * chunks;
+        for batch in (0..rows).step_by(500) {
+            engine
+                .insert_many(
+                    &coll,
+                    (batch..(batch + 500).min(rows))
+                        .map(|i| {
+                            let mut doc =
+                                bson::doc! { "_id": format!("r{i:07}"), "pad": "x".repeat(120) };
+                            for index in 0..indexes {
+                                doc.insert(format!("f{index}"), format!("v{index}-{i:07}"));
+                            }
+                            doc
+                        })
+                        .collect(),
+                )
+                .unwrap();
+        }
+        assert!(engine.drop_collection("shop", "orders").unwrap());
+        drop(engine);
+        let engine = Engine::open_with_cache(&dir.path().join("kimmy.redb"), cache_bytes).unwrap();
+        (engine, coll.id, dir)
+    }
+
+    /// The bytes the drop holder read inside its holds, and how many holds it
+    /// made, between two snapshots.
+    fn drop_holds_since(engine: &Engine, before: &(u64, u64)) -> (u64, u64) {
+        let slot = WriterHolder::Drop.slot();
+        let bytes = engine.writer_hold_decomposition().read_bytes[slot];
+        let holds = engine.writer_hold().count[slot];
+        (bytes - before.0, holds - before.1)
+    }
+
+    /// **A purge chunk reads its pages before it takes the writer.** On a cold
+    /// cache the removal's page reads used to run inside the hold: a chunk of
+    /// 1,000 rows held the single writer for as long as those reads took, which
+    /// on a rotational disk was up to seconds, and every write on the node
+    /// queued behind it. Measured from what the hold meter says the holds read,
+    /// not from how long they took, so a slow host cannot move it. Six chunks of
+    /// rows behind a cache of half a megabyte: the holds read about 1.3 MB
+    /// without the read ahead, and a few pages each with it.
+    ///
+    /// The setup is cold because of the half-megabyte cache and nothing else: a
+    /// debug build of redb reads every page at open, so with the daemon's 8 MiB
+    /// the same rows are cached and the holds read nothing with or without the
+    /// read ahead.
+    #[test]
+    fn a_purge_chunk_on_a_cold_cache_reads_its_pages_outside_the_writer() {
+        let (engine, id, _dir) = a_dropped_collection_on_a_cold_cache(6, Some(512 * 1024));
+        let slot = WriterHolder::Drop.slot();
+        let before =
+            (engine.writer_hold_decomposition().read_bytes[slot], engine.writer_hold().count[slot]);
+
+        let mut removed = 0;
+        loop {
+            let chunk = engine.purge_chunk(id).unwrap();
+            removed += chunk;
+            if chunk < DROP_PURGE_CHUNK {
+                break;
+            }
+        }
+
+        assert_eq!(removed, DROP_PURGE_CHUNK * 6);
+        assert_eq!(rows_under(&engine, id), (0, 0));
+        let (bytes, holds) = drop_holds_since(&engine, &before);
+        assert_eq!(holds, 7, "six full chunks and the one that found the range empty");
+        assert!(
+            bytes < 256 * 1024,
+            "the holds read {bytes} bytes of a cold collection: the chunks' pages are read \
+             inside the writer"
+        );
+    }
+
+    /// **The index entries are read ahead too.** After a collection's documents
+    /// the purge removes its index entries, a chunk of them at a time, and those
+    /// pages are cold as well. Two chunks of documents under three indexes behind
+    /// a half-megabyte cache: the holds read about 53 KB with the read ahead of
+    /// both, about 420 KB when only the documents are read ahead and 900 KB
+    /// with none.
+    #[test]
+    fn a_purge_chunk_reads_its_index_entries_outside_the_writer_too() {
+        let (engine, id, _dir) =
+            a_dropped_indexed_collection_on_a_cold_cache(2, 3, Some(512 * 1024));
+        let slot = WriterHolder::Drop.slot();
+        let before =
+            (engine.writer_hold_decomposition().read_bytes[slot], engine.writer_hold().count[slot]);
+
+        let mut removed = 0;
+        loop {
+            let chunk = engine.purge_chunk(id).unwrap();
+            removed += chunk;
+            if chunk < DROP_PURGE_CHUNK {
+                break;
+            }
+        }
+
+        assert_eq!(removed, DROP_PURGE_CHUNK * 2 * 4, "the documents and three indexes' entries");
+        assert_eq!(rows_under(&engine, id), (0, 0));
+        let (bytes, _) = drop_holds_since(&engine, &before);
+        assert!(
+            bytes < 200 * 1024,
+            "the holds read {bytes} bytes of a cold indexed collection: the index entries' pages \
+             are read inside the writer"
+        );
+    }
+
+    /// **A purge chunk meets the stop in its read ahead and never reaches the
+    /// writer.** The stop is the error a row of the read ahead yields, in the
+    /// loop of documents and in the loop of index entries alike, and
+    /// `purge_chunk` returns it before it asks for the writer: nothing refuses
+    /// the writer until the writes close, after the HTTP drain, so a chunk that
+    /// went on past the stop took it for its cold reads inside the drain. Five
+    /// documents under one index: the read ahead checks the stop 6 times in each
+    /// loop (a row each, and the end of the range), and the count is asserted,
+    /// because a loop that stopped checking would take its checks out of any
+    /// count the test made for itself. Stopped at each of the 12, the chunk
+    /// answers `Stopping`, removes nothing and takes no hold.
+    #[test]
+    fn a_purge_chunk_meets_the_stop_in_its_read_ahead_and_never_reaches_the_writer() {
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![kimmy_core::IndexField::ascending("f0")],
+                false,
+                None,
+            )
+            .unwrap();
+        for i in 0..5 {
+            engine.insert(&coll, bson::doc! { "_id": i, "f0": format!("v{i}") }).unwrap();
+        }
+        assert!(engine.drop_collection("shop", "orders").unwrap());
+        assert_eq!(rows_under(&engine, coll.id), (5, 5));
+
+        let (warmed, checks) =
+            crate::walk::every_row::rows_checked(&engine, || engine.warm_purge_chunk(coll.id));
+        warmed.unwrap();
+        assert_eq!(checks, 12, "six checks in the loop of documents and six in the index entries'");
+        for row in 1..=checks {
+            use std::sync::atomic::Ordering;
+            engine.lift_stops_for_test();
+            engine.stop_walks_after_rows(row);
+            // Counts every check, the ones after the stop too: a loop that
+            // read on past the stop would answer `Stopping` only at the next
+            // loop's first check, which the answer alone does not show.
+            engine.set_stopping_after_rows(u64::MAX);
+            let holds: u64 = engine.writer_hold().count.iter().sum();
+            let answer = engine.purge_chunk(coll.id);
+            let made = u64::MAX - engine.stopping_after_rows.swap(0, Ordering::SeqCst);
+            assert!(
+                matches!(answer, Err(crate::StorageError::Stopping(_))),
+                "stopped at check {row} of {checks}: {answer:?}"
+            );
+            assert_eq!(made, row, "stopped at check {row}: the read ahead read on past the stop");
+            assert_eq!(rows_under(&engine, coll.id), (5, 5), "stopped at check {row}: removed");
+            let after: u64 = engine.writer_hold().count.iter().sum();
+            assert_eq!(after, holds, "stopped at check {row}: the chunk took the writer");
+        }
+        engine.lift_stops_for_test();
+        assert_eq!(engine.purge_chunk(coll.id).unwrap(), 10, "unstopped, the chunk removes both");
+        assert_eq!(rows_under(&engine, coll.id), (0, 0));
+    }
+
+    /// **A cache that cannot hold a chunk costs nothing and breaks nothing.** The
+    /// read ahead keeps some of the chunk's pages, or none; the chunk reads what
+    /// the cache dropped inside its hold, as it did before. Everything goes, and
+    /// nothing is left under the id.
+    #[test]
+    fn a_purge_on_a_cache_too_small_for_a_chunk_still_removes_everything() {
+        let (engine, id, _dir) = a_dropped_collection_on_a_cold_cache(3, Some(32 * 1024));
+        let mut removed = 0;
+        loop {
+            let chunk = engine.purge_chunk(id).unwrap();
+            removed += chunk;
+            if chunk < DROP_PURGE_CHUNK {
+                break;
+            }
+        }
+        assert_eq!(removed, DROP_PURGE_CHUNK * 3);
+        assert_eq!(rows_under(&engine, id), (0, 0));
+    }
+
+    /// `KIMMY_TEST_PAGE_READ_MS` makes the pages the cache does not hold cost
+    /// what they cost on a cold disk. Only a lower bound is asserted, which no
+    /// load can break: a scan of 6,000 cold rows reads hundreds of pages, a
+    /// millisecond each.
+    #[test]
+    fn the_page_read_delay_slows_reads_the_cache_cannot_answer() {
+        let (engine, id, _dir) = a_dropped_collection_on_a_cold_cache(6, Some(512 * 1024));
+        engine.set_test_page_read_delay(std::time::Duration::from_millis(1));
+        let started = std::time::Instant::now();
+        assert_eq!(rows_under(&engine, id).0, DROP_PURGE_CHUNK * 6);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A drop answers at its burial and leaves what the collection held to the

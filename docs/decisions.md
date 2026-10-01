@@ -19956,6 +19956,70 @@ hang. Among them:
 - `rows_with_no_tombstone_are_queued_by_the_creation_that_meets_them`;
 - `a_retention_pass_leaves_a_drops_rows_to_the_purger_and_keeps_its_tombstones`.
 
+**Addendum, 2026-10-01: a chunk reads before it holds.** A chunk's hold was
+the removal of its rows, and the removal reads: its keys, and the pages
+around them. On a cold cache that is a disk read per page inside the hold, so
+the bound ADR-158 gave the hold, a thousand rows, was a bound on rows and not
+on time: in a three-member teardown of collections of 650,000, 137,000 and
+71,000 rows, the two members that had just restarted held the writer for up
+to 27 s a chunk (the hold meter put 90% of those holds in `read`), and the
+member with a warm cache purged the same collections five times faster with
+no hold over a second. Everything that writes queued behind a chunk: client
+writes, replicated applies, the sync tick (`wait_ms` was the whole of the
+overruns).
+
+A chunk now first reads the rows it is about to remove, in a read transaction
+of its own, and then takes the writer. **Nothing is decided from that read**:
+it moves pages into the cache and its answer is dropped, and the chunk reads
+its keys again under the writer and asks there, as before, whether a
+collection stands under the id (ADR-158's guard). So the id-dead guard and the
+re-read are exactly as they were, and a write that runs between the read and
+the chunk changes nothing under a dead id. The hold is then the deletes and the
+commit. The purge's total time is unchanged: the same pages are read, one chunk
+at a time, by the purger alone, which is what a purge on a cold cache is bound
+by; what changed is who waits. A cache that has dropped some of them leaves the
+chunk to read the rest in its hold, as it did, at the price of a second pass
+over the rows. The daemon's cache is at least 8 MiB and a chunk's pages are its
+thousand rows' size, and redb's cache is shared between what is read and what
+a transaction has written and not yet flushed, so documents of some kilobytes
+each, enough that a thousand of them fill what the cache has to spare, are the
+case.
+
+**The read ahead ends at the stop, and the stop is its error.** It reads
+through walk tables, as every walk does (`walk::open_walk_table`), so a stop
+reaches the caller as the error a row yields, and `purge_chunk` returns it
+before it asks for the writer. Run to its end the read ahead is up to a thousand
+page reads that nothing bounds, and it holds the engine open while it runs: with
+a 200 ms page read and the daemon's smallest cache, a stop in the middle of one
+waited out the budget, 22 s, and exited 75 without closing the store; with the
+check per row the same stop exits 0 in 0.31 s.
+
+**Returning `Ok` at the stop was not enough.** The chunk then goes to the
+writer, which nothing refuses until the writes close, and they close after the
+HTTP drain: with a request in flight at the signal the drain runs to its
+ten-second deadline, and the chunk took the writer inside it and read its cold
+pages in the hold, so `close_writes` hit its cap and the node exited 75 after
+20 s with the store unclosed. The same stop now exits 0 in the drain's ten
+seconds. `a_stop_during_a_purge_chunks_cold_read_ahead_ends_at_once` and
+`a_stop_with_a_request_in_the_drain_during_a_cold_read_ahead_exits_clean` pin
+it. `warm_purge_chunk` is a stop-aware walk, so the walk-stop guard
+(`walks_stop.rs`) requires it in the every-row test
+(`every_stop_aware_walk_answers_stopping_at_every_row_it_reads`), which stops it
+at each row and holds it to answering `Stopping`; and
+`a_purge_chunk_meets_the_stop_in_its_read_ahead_and_never_reaches_the_writer`
+stops a chunk at each of its checks and holds it to making no check past the
+stop and taking no hold.
+
+Measured on a three-member lab with a 5 ms cost on every page the cache did not
+hold (`KIMMY_TEST_PAGE_READ_MS`), the daemon's smallest cache, 8 MiB, and a
+collection of 100,000 rows dropped under two client writers: the `drop` hold
+went from a mean of 626 ms (99% read) to 8 ms (20% read), a client write during
+the purge from a median of 539 ms to 7.6 ms, and the writer wait summed over the
+member from 62.4 s to 0.2 s; the purge took 63.4 s before and 62.8 s after.
+`a_purge_chunk_on_a_cold_cache_reads_its_pages_outside_the_writer` and
+`a_purge_chunk_reads_its_index_entries_outside_the_writer_too` pin it from what
+the hold meter says the holds read, which no host stall moves.
+
 ---
 
 ## ADR-190 — A store is checked before it is opened for writing

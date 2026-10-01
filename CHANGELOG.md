@@ -36,6 +36,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   its name, is removed before the new one is created, so the write can no
   longer be redirected to, or truncate, the link's target.
 
+- **A collection drop no longer holds the single writer while it reads.** The
+  drop purger removes what a dropped collection held a thousand rows to a
+  commit, and each chunk read its rows' pages inside the hold. On a member
+  whose cache was cold (just restarted, or a collection larger than the
+  cache) that was a disk read per page under the writer: in a three-member
+  teardown of collections of 650,000, 137,000 and 71,000 rows, chunks held it
+  for up to 27 s, client writes and replicated applies queued behind them,
+  sync ticks overran by up to two minutes, and a change-stream tail saw
+  nothing from a peer for ten seconds. A chunk now reads its rows first, in a
+  read transaction, and holds the writer only for the deletes and the commit.
+  On a local three-member lab with a 5 ms page read, an 8 MiB cache and a
+  collection of 100,000 rows dropped under two client writers, the hold went
+  from a mean of 626 ms to 8 ms and a client write during it from a median of
+  539 ms to 7.6 ms, and the purge took 63.4 s before and 62.8 s after: its
+  total time is unchanged,
+  since the same pages are read, by the purger alone. A cache that has
+  dropped part of what was read ahead leaves the chunk to read the rest in its
+  hold, as before. A stop ends the read ahead at once, and does so while a
+  request in flight holds the stop in its drain, where the chunk would
+  otherwise have taken the writer and read its cold pages in the hold. The
+  new test switch `KIMMY_TEST_PAGE_READ_MS` ([docs/testing.md](docs/testing.md)) charges every
+  page read a cold disk's cost so a rehearsal can see it.
+
 ## 0.43.0 - 2026-09-30
 
 **Roll the members one at a time. This release is not a rollback boundary for

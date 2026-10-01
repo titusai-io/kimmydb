@@ -1408,6 +1408,139 @@ async fn an_expiry_pass_in_progress_at_the_stop_ends_at_once() {
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
 }
 
+/// A node, started cold, that has dropped a collection of 24,000 documents and is
+/// three seconds into its purge: in the first chunk's read ahead, which the
+/// drop holder's count of zero shows. Every page read costs 200 ms
+/// (`KIMMY_TEST_PAGE_READ_MS`) and the cache is the smallest the daemon takes,
+/// so that read ahead would run for most of a minute.
+async fn a_cold_node_three_seconds_into_a_purge(dir: &Path, client: &reqwest::Client) -> Run {
+    const BATCHES: usize = 24;
+    const PER_BATCH: usize = 1_000;
+    let storage = "cache_bytes = 8388608";
+    let login = |run: &Run| {
+        let url = format!("http://127.0.0.1:{}/v1/auth/login", run.http.get().unwrap());
+        let client = client.clone();
+        async move {
+            let body: serde_json::Value = client
+                .post(url)
+                .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["token"].as_str().expect("a token").to_string()
+        }
+    };
+
+    // The collection, written and left by a clean stop.
+    let mut loading = Run::spawn_with_storage(dir, "loading", storage);
+    loading.wait_ready(client).await;
+    let token = login(&loading).await;
+    let port = *loading.http.get().unwrap();
+    let post = |path: String, body: serde_json::Value| {
+        client.post(format!("http://127.0.0.1:{port}{path}")).bearer_auth(&token).json(&body).send()
+    };
+    let made = post("/v1/db/shop/collections".into(), serde_json::json!({ "name": "orders" }));
+    assert!(made.await.unwrap().status().is_success());
+    for batch in 0..BATCHES {
+        let docs: Vec<_> = (0..PER_BATCH)
+            .map(|i| {
+                serde_json::json!({ "_id": format!("d{:06}", batch * PER_BATCH + i), "pad": "x".repeat(1000) })
+            })
+            .collect();
+        let bulk = post("/v1/db/shop/coll/orders/bulk".into(), serde_json::json!(docs));
+        assert!(bulk.await.unwrap().status().is_success());
+    }
+    let (status, _) = stop(&mut loading);
+    assert!(status.success(), "{status:?}");
+
+    // Started again, so the cache holds none of it, and dropped.
+    let cold = Run::spawn_full(
+        dir,
+        "cold",
+        0,
+        &[("KIMMY_TEST_PAGE_READ_MS", "200")],
+        storage,
+        None,
+        false,
+        "",
+    );
+    cold.wait_ready(client).await;
+    let token = login(&cold).await;
+    let dropped = client
+        .delete(format!("http://127.0.0.1:{}/v1/db/shop/coll/orders", cold.http.get().unwrap()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(dropped.status().is_success(), "{}", dropped.text().await.unwrap());
+    // Long enough for the purger to be in its first chunk's read ahead.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The premise: the purge has begun and its first chunk has not finished, so
+    // the node is in the read ahead and no hold of the purger has been taken.
+    let metrics = client
+        .get(format!("http://127.0.0.1:{}/metrics", cold.http.get().unwrap()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let held = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("kimmy_write_lock_held_seconds_count{holder=\"drop\"} "))
+        .expect("the drop holder's count is exported");
+    assert_eq!(held, "0", "the first chunk's read ahead is over before the stop: {metrics}");
+    cold
+}
+
+/// A stop during the read ahead of a drop purge chunk ends at once. The
+/// purger reads the rows a chunk will remove before it takes the writer, and on
+/// a cold cache that is up to a thousand page reads: the read ahead ends at the
+/// stop, row by row, where waiting it out held the stop to the budget and the
+/// exit to 75. Every page read costs 200 ms here (`KIMMY_TEST_PAGE_READ_MS`),
+/// and the cache is the smallest the daemon takes, so the first chunk's read
+/// ahead would run for most of a minute.
+#[tokio::test]
+async fn a_stop_during_a_purge_chunks_cold_read_ahead_ends_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut cold = a_cold_node_three_seconds_into_a_purge(dir.path(), &client).await;
+
+    let (status, took) = stop(&mut cold);
+    let log = cold.log();
+    assert!(status.success(), "{status:?}: {log}");
+    assert!(took < Duration::from_secs(3), "the read ahead held the stop: {took:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
+/// The same stop with a request in flight at the signal. The HTTP drain then
+/// runs to its ten-second deadline before the writes close, and a read ahead
+/// that merely returned at the stop let the chunk take the writer during the
+/// drain and read its cold pages in the hold: `close_writes` hit its cap and the
+/// node exited 75 after 20 s. The read ahead ends in the stop's own error, so the
+/// chunk never reaches the writer.
+#[tokio::test]
+async fn a_stop_with_a_request_in_the_drain_during_a_cold_read_ahead_exits_clean() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut cold = a_cold_node_three_seconds_into_a_purge(dir.path(), &client).await;
+
+    let mut half = std::net::TcpStream::connect(("127.0.0.1", *cold.http.get().unwrap())).unwrap();
+    half.write_all(b"GET /healthz HTTP/1.1\r\nHost").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, took) = stop(&mut cold);
+    let log = cold.log();
+    drop(half);
+    assert!(status.success(), "{status:?}: {log}");
+    // The drain is ten seconds.
+    assert!(took < Duration::from_secs(14), "the purge held the stop: {took:?}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}
+
 /// A client that sent half its request's headers holds the stop no longer
 /// than the drain: its connection is closed at the drain's deadline. A 0.40.2
 /// candidate that waited for plain HTTP's connections to end held it to 20 s.
