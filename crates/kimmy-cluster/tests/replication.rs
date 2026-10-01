@@ -3037,6 +3037,17 @@ async fn a_tick_stops_pulling_when_its_budget_is_spent_and_counts_one_skip() {
 ///
 /// Reverting `outcome.truncated = window_truncated;` in `transport.rs`
 /// leaves the loop nothing to drain on, and the first contact is a skip.
+///
+/// **The tick's budget is out of the question.** A tick's budget is its interval
+/// (ADR-157), so at 2 s a host stall (a loaded runner, a paused process) of the
+/// first pull's apply spent it before the second pull, the contact ended
+/// truncated by the budget, and the report read one skip and no check: the
+/// failure this test is meant to catch, for a reason that is not the one under
+/// test. The interval is an hour here, which no stall spends, and the peer is
+/// already a member so the first tick contacts it. That a *budget* that is spent
+/// ends a contact as a skip is
+/// `a_tick_stops_pulling_when_its_budget_is_spent_and_counts_one_skip`'s claim, at
+/// an interval of a millisecond.
 #[tokio::test]
 async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
     use kimmy_cluster::protocol::MAX_BATCH;
@@ -3048,7 +3059,7 @@ async fn a_drain_that_ends_short_of_the_cap_is_checked_on_its_last_pull() {
     let entries = MAX_BATCH + 200;
     seed(&a, &ca, entries);
 
-    let (looping, mut rx) = drain_loop(&b, a.addr, Duration::from_secs(2));
+    let (looping, mut rx) = drain_loop_knowing(&b, &a, Duration::from_secs(3600));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let report = loop {
         let report = tokio::time::timeout_at(deadline, rx.recv())
