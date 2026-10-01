@@ -117,13 +117,8 @@ impl Engine {
         // and keeps any tombstone with rows still under it, below.
         self.ask_for_owed_check();
         let oplog_removed = self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?;
-        // The one place the violations table's `through` moves forward, when
-        // the table is ready, and only in a pass that removed entries: the
-        // rescan after a crash is bounded by what retention keeps, and a pass
-        // with nothing to collect commits nothing (ADR-200).
         if oplog_removed > 0 {
             self.trim_violation_rows()?;
-            self.advance_violations_through()?;
         }
         let outcome = GcOutcome {
             oplog_removed,
@@ -131,6 +126,14 @@ impl Engine {
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
         };
+        // The one place the violations table's `through` moves forward, when
+        // the table is ready, in every pass: a start that found no violation
+        // leaves it behind and counts on this, so the rescan at the next start
+        // is a pass's writes and not the oplog's retention. A pass with nothing
+        // written since the last commits nothing (ADR-200). Last, so that a
+        // failure of it, which like any storage error here stops the node
+        // (ADR-188), has not kept this pass from its collection.
+        self.advance_violations_through()?;
 
         // Always, not only when something was removed: a pass that collects
         // nothing still reads, and how long it took is the one thing an
@@ -942,8 +945,11 @@ mod tests {
         assert_eq!(commits, chunks + 1, "one commit per chunk of {OPLOG_COLLECT_CHUNK}");
     }
 
-    /// A pass that collects nothing opens no write transaction at all: the
-    /// scans run under readers, and the writer is taken only to remove.
+    /// A pass that collects nothing takes the writer for nothing but one short
+    /// commit that moves the violations table's `through` to the tail, and only
+    /// when something was written since the last: the scans run under readers,
+    /// and the writer is taken to remove, or to record that. A second pass over
+    /// the same store opens no write transaction at all.
     #[test]
     fn a_pass_with_nothing_to_collect_holds_the_writer_for_nothing() {
         let (engine, _dir) = engine();
@@ -957,7 +963,14 @@ mod tests {
         let outcome = engine.collect_garbage(policy()).unwrap();
 
         assert_eq!(outcome, GcOutcome::default());
-        assert_eq!(engine.commits(), before, "a no-op pass must not commit");
+        assert_eq!(engine.commits(), before + 1, "the one commit is `through`'s advance");
+        assert_eq!(engine.writer_wait().count, waits + 1, "and the one writer wait is its");
+
+        let after = engine.commits();
+        let waits = engine.writer_wait().count;
+        let outcome = engine.collect_garbage(policy()).unwrap();
+        assert_eq!(outcome, GcOutcome::default());
+        assert_eq!(engine.commits(), after, "a no-op pass must not commit");
         assert_eq!(engine.writer_wait().count, waits, "a no-op pass must not take the writer");
     }
 

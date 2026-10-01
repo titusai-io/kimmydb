@@ -364,7 +364,9 @@ pub enum Kill {
 /// a binary nobody ships. It is named in the `KIMMY_TEST_*` family, is never read
 /// from the configuration file, is announced at `WARN` on every start where it is
 /// set, and does nothing until [`arm_test_kills`] is called — which the daemon
-/// does only once it is serving, so it cannot interfere with startup.
+/// does just before it installs its router, and the kill then waits a further
+/// [`TEST_KILL_GRACE`], so it lands after the node serves and cannot interfere
+/// with startup.
 ///
 /// The environment is not remotely settable, so the exposure is a switch
 /// available to whoever can already set the process's environment.

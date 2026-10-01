@@ -1793,9 +1793,16 @@ impl Engine {
     /// `KIMMY_TEST_FAIL_STORAGE`: fail the next backend `call` (`read`,
     /// `write`, `sync_data`, `set_len` or `len`) once, with EIO. Returns
     /// whether `call` names one. For tests of a real node; the daemon arms it
-    /// only once it is serving.
+    /// on the first request its front answers 200.
     pub fn arm_test_storage_failure(&self, call: &str) -> bool {
         self.health.arm(call)
+    }
+
+    /// Whether `call` names a backend call for [`Self::arm_test_storage_failure`],
+    /// asked without arming it, so that a daemon can refuse a bad name at its
+    /// start and arm later.
+    pub fn names_a_test_storage_failure(call: &str) -> bool {
+        crate::health::StorageHealth::names_a_switch(call)
     }
 
     pub fn node_id(&self) -> NodeId {

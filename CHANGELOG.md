@@ -70,6 +70,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A start whose store holds no unique violation since its last retention pass
+  no longer commits before the node answers.** The completing pass for the
+  unique-violations table (ADR-200) found `through`, the point the table is
+  complete through, behind the oplog's tail after almost every restart, because
+  it advanced only in a retention pass that removed entries, and its first step
+  then committed even when the scan found nothing. That was an fsync on the
+  start path, where a real I/O error stops the node before it serves. A scan that
+  reaches the end of its range and finds no violation now makes no commit: the
+  table is ready in memory, and the next start reads the stretch above `through`
+  again, which is a read and no fsync. A scan that finds a violation commits as
+  before, and so does a step that stops at its budget. `through` is now moved by
+  every retention pass that finds it behind the tail, whether or not the pass
+  removed anything, and a pass with nothing written since commits nothing, so
+  that rescan is about one pass interval of writes (`storage.gc_interval_secs`,
+  600 s by default), plus what an unclean stop leaves.
+- **`KIMMY_TEST_FAIL_STORAGE` is armed on the first request the node answers
+  200, not before the node serves.** It was armed after the node's tasks were
+  spawned and before its router was installed, so the commit one of them made in
+  the first milliseconds took the fault, and `KIMMY_TEST_FAIL_STORAGE=sync_data`
+  could exit a node with status 70 before it had answered anything, against the
+  documented "once the node is serving". It is a test switch and changes nothing
+  for a node without it. A test that sets it must now make a request that
+  answers 200 (a poll of `/readyz` does), and a name that is not a backend call
+  is still said at the start.
 - **A clustered start that can never write its replay floor is refused before
   the store is opened, and leaves no temporary file.** The floor
   (`kimmy.replay-floor`) is written right after the open, from the position

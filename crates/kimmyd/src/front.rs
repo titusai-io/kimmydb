@@ -19,11 +19,19 @@
 //! The answer is built here and logs nothing: a probe every few seconds for a
 //! long open would be a line each. The swap is one `OnceLock`: once the router
 //! is installed, every request goes to it, at the cost of one atomic load.
+//!
+//! **The first 200 the router answers can run one action** ([`Front::on_first_ok`]):
+//! the point at which a node is serving, for the one thing that must wait for it,
+//! the storage test switch (`KIMMY_TEST_FAIL_STORAGE`). The router's tasks have
+//! been committing since they were spawned, before the swap, so arming at the
+//! swap was not arming at "serving": a background commit in the first
+//! milliseconds took the fault, and the node exited 70 before it answered.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -37,6 +45,34 @@ use tower::Service;
 #[derive(Clone, Default)]
 pub struct Front {
     app: Arc<OnceLock<axum::Router>>,
+    first_ok: Arc<FirstOk>,
+}
+
+/// An action that runs once, after the first 200 the router answers.
+#[derive(Default)]
+struct FirstOk {
+    /// Whether the action may still be running or waiting: one load per request
+    /// once it has finished.
+    pending: AtomicBool,
+    action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    once: OnceLock<()>,
+}
+
+impl FirstOk {
+    /// Run the action if it has not run, and **return only when it has**. A
+    /// request that finds the action already under way waits in the `OnceLock`'s
+    /// initialisation for it to finish, so no 200 is handed on before what the action does has
+    /// happened, however many answer together. `pending` is cleared only
+    /// afterwards, so that such a request still comes here.
+    fn fire(&self) {
+        self.once.get_or_init(|| {
+            let action = self.action.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(action) = action {
+                action();
+            }
+        });
+        self.pending.store(false, Ordering::Release);
+    }
 }
 
 impl Front {
@@ -59,6 +95,17 @@ impl Front {
         self.app.set(app).is_ok()
     }
 
+    /// Run `action` once, after the first request the router answers 200 and
+    /// before that answer is handed on, so that whatever the action does has
+    /// happened by the time any client has seen the node serve. Set before
+    /// [`Self::install`]: a request answered before it is set would not count.
+    /// A 503 of the opening node, a 4xx or a 5xx does not.
+    pub fn on_first_ok(&self, action: impl FnOnce() + Send + 'static) {
+        *self.first_ok.action.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Box::new(action));
+        self.first_ok.pending.store(true, Ordering::Release);
+    }
+
     /// Whether the router is installed.
     #[cfg(test)]
     pub fn is_installed(&self) -> bool {
@@ -79,7 +126,22 @@ impl Service<Request<Body>> for Front {
         match self.app.get() {
             Some(router) => {
                 let mut router = router.clone();
-                Box::pin(async move { router.call(request).await })
+                // Only while the action waits is there anything to carry into
+                // the future.
+                let first_ok = self
+                    .first_ok
+                    .pending
+                    .load(Ordering::Acquire)
+                    .then(|| Arc::clone(&self.first_ok));
+                Box::pin(async move {
+                    let response = router.call(request).await;
+                    if let (Some(first_ok), Ok(response)) = (&first_ok, &response)
+                        && response.status() == StatusCode::OK
+                    {
+                        first_ok.fire();
+                    }
+                    response
+                })
             }
             None => {
                 let response = while_opening(&request, kimmy_storage::open_snapshot());
@@ -197,6 +259,88 @@ mod tests {
         // A route the router lacks is the router's own answer, not the front's.
         let response = front.clone().oneshot(get("/nope")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_first_action_runs_once_after_the_first_200_the_router_answers() {
+        use std::sync::atomic::AtomicUsize;
+
+        let front = Front::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        front.on_first_ok(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        // The opening node's own 200 is not the router's.
+        let (status, _) = answer(&front, get("/healthz")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the opening node's /healthz is not serving");
+
+        let app = axum::Router::new()
+            .route("/ok", axum::routing::get(|| async { "up" }))
+            .route("/boom", axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        front.install(app);
+        for path in ["/nope", "/boom"] {
+            let (status, _) = answer(&front, get(path)).await;
+            assert_ne!(status, StatusCode::OK);
+            assert_eq!(ran.load(Ordering::SeqCst), 0, "{path} is not a served 200");
+        }
+        let response = front.clone().oneshot(get("/ok")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "ran before the answer was handed on");
+        for _ in 0..3 {
+            let (status, _) = answer(&front, get("/ok")).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "once, however many 200s follow");
+    }
+
+    /// Two first requests that answer 200 together, and a third that arrives
+    /// while the action is held: none is handed its answer before the action
+    /// has finished, though all but one only wait on the other's. The action
+    /// holds until released, so a request that did not wait for it would finish
+    /// while it is held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_first_200_is_handed_on_while_the_action_is_still_running() {
+        use std::sync::atomic::AtomicBool;
+
+        let front = Front::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        front.on_first_ok(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            done.store(true, Ordering::SeqCst);
+        });
+        front.install(axum::Router::new().route("/ok", axum::routing::get(|| async { "up" })));
+
+        let request = |front: &Front| {
+            let front = front.clone();
+            let finished = Arc::clone(&finished);
+            tokio::spawn(async move {
+                let response = front.oneshot(get("/ok")).await.unwrap();
+                (response.status(), finished.load(Ordering::SeqCst))
+            })
+        };
+        let mut requests: Vec<_> = (0..2).map(|_| request(&front)).collect();
+        started_rx.recv().expect("one of them runs the action");
+        // And one that arrives while the action is held: the flag is cleared
+        // only after the action, so this one waits as well.
+        requests.push(request(&front));
+        // Give the other every chance to be handed its answer.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            requests.iter().all(|r| !r.is_finished()),
+            "a request was answered while the action was still running"
+        );
+        release_tx.send(()).unwrap();
+        for request in requests {
+            let (status, after_the_action) = request.await.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert!(after_the_action, "answered before the action finished");
+        }
     }
 
     #[test]

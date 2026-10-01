@@ -21713,6 +21713,85 @@ insert, the rewind's removal and its lowering of `through`, the clearing of a
 `through` past the tail, the header check, retention's removal (row and trim
 together), `through` advanced while not ready, and `through` past the tail in
 a step's write.
+
+**Addendum, 2026-10-01: a scan that finds no violation makes no commit.** The
+decision above has every backfill step take the writer, and a step whose scan
+found nothing still committed, to move `through` to the tail. `through` advances
+only in a retention pass (`gc_interval_secs`, 600 s by default) and not at close,
+so **every start of a store with writes since its last pass found `through`
+behind the tail and began with a commit before the node answered**: a fsync on
+the start path, and a real I/O error there stops the node (ADR-188) before it
+serves. It also raced the storage test switch, which was armed before the node
+served and took that commit: `KIMMY_TEST_FAIL_STORAGE=sync_data` exited a node
+3 ms into its start in 0.43.0.
+
+A scan that reached the end of its range and found no violation now **takes no
+writer**: the table is marked ready in memory and `through` stays where the last
+commit left it. That is sound for the reason the commit's `through` was: every
+entry appended after the scan's snapshot went through `append_oplog_at`, which
+maintains the table in the entry's own transaction, so nothing above the snapshot
+is missing, and nothing below it was found. **A scan that found a violation, and
+a step that stopped at its budget, commit as before**: the first because the rows
+must be recorded, the second because the next step starts from `through`, and a
+step that did not save its place would scan the same stretch forever.
+
+**`through` is then moved by every retention pass, not only by one that removed
+entries** (this amends the bullet above, which said only the latter). The
+backfill used to move it at every start, so a start rescanned the previous run's
+writes at most; with the commit gone and `through` moving only when entries were
+removed, a store whose oplog was younger than `oplog_retention_secs` (24 h by
+default), or a quiet node, would rescan up to that much oplog at every start. A
+pass now commits `through` to the tail when the table is ready and `through` is
+behind it. It looks in a read transaction first, so a pass with nothing written
+since the last commits nothing: one short commit per pass on a node with writes,
+never at the start. The next start's rescan is then about one pass interval of
+writes (`gc_interval_secs`, 600 s by default), plus what an unclean stop leaves.
+
+**Why advancing to the tail is sound.** The table is ready, so it is complete
+through the oplog's tail as of the moment it became ready, and every entry
+appended since is maintained live, in its own transaction, by `append_oplog_at`
+(local appends and replicated ones alike; nothing else writes the oplog while
+the store is open). So at any instant the writer holds, the table is complete
+through the tail the writer reads. **The advance takes that tail**, read inside
+the write transaction, never the one the read transaction saw: a write that lands
+between the two is covered, because its violation is in the table already and
+its entry is at or below the tail that `through` takes, and a rewind in the gap
+cannot leave `through` above the tail. The read transaction only decides whether
+to take the writer at all.
+
+`kimmy_violations_backfill_rows_total` now counts those rescans too: it reads
+the stretch since the last advance on most starts, and is flat at 0 only where
+the table was ready at the open.
+
+**Tests.** `a_start_whose_tail_holds_no_violation_makes_no_commit` reopens a
+store with writes since `through` and asserts from the hold meter, which no
+host stall moves, that the step takes no writer at all (the count of holds over
+all holders is unchanged), that the table is ready in memory, that `through` is
+where it was, and that a second start commits nothing either.
+`a_tail_with_a_violation_is_still_recorded_and_persisted_across_a_restart`
+asserts one hold, as the violations holder, a recorded row, `through` at the
+tail, and a ready table at the next open.
+`a_retention_pass_advances_through_after_writes_and_commits_nothing_when_idle`
+counts commits: a pass after writes makes one and leaves `through` at the tail,
+two idle passes make none, the next write makes the next pass commit once, and
+the following open finds the table ready.
+`a_violation_written_between_the_passes_check_and_its_advance_is_covered` lands
+a violation between the pass's read and its write, and holds the table to the
+structural check afterwards. Each guard was broken and its test failed: the
+skip's predicate forced false (a commit at the start), the skip taken when
+violations were found (the row not recorded), the skip taken when the budget,
+not the end of the range, stopped the scan (the step claimed the table was ready
+over a stretch it had not read: five of the existing backfill tests failed), the
+pass's advance removed (the commit counts and the ready open), and its read-first
+check removed (an idle pass committed). The arming of the storage test switch is
+pinned the same way, in `front.rs` and `node.rs`: the switch armed at the swap
+again (a commit before any served 200 took the fault), the arming never firing,
+and the arming taken on any answer and not only a 200 each fail their test.
+
+Rejected for this: *advancing `through` at a clean close* (the stop-path write
+the decision above refused) and *delaying the first step until the node
+serves*, which leaves the commit on the start and depends on task order.
+
 ## ADR-201 — What a member says about itself on the sync contact decides who may own expiry, webhooks and embeddings
 
 > **Amended by [ADR-203](#adr-203--a-vector-record-carries-the-configuration-that-made-it).**
