@@ -527,6 +527,49 @@ pub(crate) fn validate_variable_name(name: &str) -> Result<()> {
     }
 }
 
+thread_local! {
+    /// The names a [`FreeVariables`] parse has met unbound, while one is running.
+    static FREE_VARIABLES: std::cell::RefCell<Option<std::collections::BTreeSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Expression parses begun on this thread, for the tests that hold a
+    /// search to one.
+    #[cfg(test)]
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A scope, for the life of the guard, in which the parser on this thread
+/// records an unbound lowercase `$$name` instead of refusing it. Parsing is
+/// synchronous, so the state is the thread's and the guard clears it.
+struct FreeVariables;
+
+impl FreeVariables {
+    fn begin() -> Self {
+        FREE_VARIABLES.with(|c| *c.borrow_mut() = Some(std::collections::BTreeSet::new()));
+        FreeVariables
+    }
+
+    /// Record `name` if a collecting parse is running; whether one is.
+    fn record(name: &str) -> bool {
+        FREE_VARIABLES.with(|c| match c.borrow_mut().as_mut() {
+            Some(names) => {
+                names.insert(name.to_string());
+                true
+            }
+            None => false,
+        })
+    }
+
+    fn take() -> Vec<String> {
+        FREE_VARIABLES.with(|c| c.borrow_mut().take().unwrap_or_default().into_iter().collect())
+    }
+}
+
+impl Drop for FreeVariables {
+    fn drop(&mut self) {
+        FREE_VARIABLES.with(|c| *c.borrow_mut() = None);
+    }
+}
+
 impl Expr {
     /// Parse an expression from BSON.
     ///
@@ -539,8 +582,62 @@ impl Expr {
     /// Parse with `vars` already bound by an enclosing construct — a `$lookup`
     /// `let`, whose names the sub-pipeline's expressions may use.
     pub fn parse_with_vars(value: &Bson, vars: &[String]) -> Result<Self> {
+        #[cfg(test)]
+        PARSES.with(|n| n.set(n.get() + 1));
         let mut declared = vars.to_vec();
         Self::parse_in(value, &mut declared)
+    }
+
+    /// The user variables `value` reads that nothing inside it binds, in name
+    /// order: what an enclosing construct has to bind for it to parse.
+    ///
+    /// Found by one parse, under the parser's own scoping: in this mode a
+    /// `$$name` nothing binds is recorded, where a plain parse refuses it, so a
+    /// name `$let`, `$map`, `$filter` or `$reduce` binds around a use of it is
+    /// not free there, and one bound around one use and not around another is.
+    /// A string a `$literal` holds is not read as a reference at all. An
+    /// expression that does not parse for another reason is that error.
+    pub fn free_variables(value: &Bson) -> Result<Vec<String>> {
+        let _collecting = FreeVariables::begin();
+        Self::parse_with_vars(value, &[])?;
+        Ok(FreeVariables::take())
+    }
+
+    /// Whether evaluating this reads the document it is evaluated against:
+    /// a field (`"$qty"`) or `$$ROOT` or `$$CURRENT` anywhere in the tree.
+    /// An expression for which this is false depends on its bound variables
+    /// and its literals alone.
+    pub fn reads_document(&self) -> bool {
+        let any = |exprs: &[Expr]| exprs.iter().any(Expr::reads_document);
+        match self {
+            Expr::Field(_) => true,
+            Expr::Var { name, .. } => SYSTEM_VARIABLES.contains(&name.as_str()),
+            Expr::Literal(_) => false,
+            Expr::Op(_, args) => any(args),
+            Expr::Switch { branches, default } => {
+                branches.iter().any(|(case, then)| case.reads_document() || then.reads_document())
+                    || default.as_ref().is_some_and(|d| d.reads_document())
+            }
+            Expr::DateToString { date, .. } => date.reads_document(),
+            Expr::Convert { input, on_error, on_null, .. } => {
+                input.reads_document()
+                    || on_error.as_ref().is_some_and(|e| e.reads_document())
+                    || on_null.as_ref().is_some_and(|e| e.reads_document())
+            }
+            Expr::Let { vars, body } => {
+                vars.iter().any(|(_, e)| e.reads_document()) || body.reads_document()
+            }
+            Expr::Filter { input, cond, limit, .. } => {
+                input.reads_document()
+                    || cond.reads_document()
+                    || limit.as_ref().is_some_and(|l| l.reads_document())
+            }
+            Expr::Map { input, body, .. } => input.reads_document() || body.reads_document(),
+            Expr::Reduce { input, initial, body } => {
+                input.reads_document() || initial.reads_document() || body.reads_document()
+            }
+            Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
+        }
     }
 
     /// `{name: <expr>, ...}` — the `vars` of `$let` and the `let` of `$lookup`.
@@ -592,6 +689,12 @@ impl Expr {
             return Err(Error::InvalidQuery(format!("$${name}. needs a field path after the dot")));
         }
         if !SYSTEM_VARIABLES.contains(&name) && !declared.iter().any(|d| d == name) {
+            // Collecting free variables: a lowercase name nothing binds is the
+            // answer, not an error. An uppercase one is a system variable this
+            // build does not have, and is refused below as ever.
+            if validate_variable_name(name).is_ok() && FreeVariables::record(name) {
+                return Ok(Expr::Var { name: name.to_string(), path: path.map(str::to_string) });
+            }
             // MongoDB's other system variables — `$$NOW`, `$$REMOVE`,
             // `$$DESCEND` and the rest — are uppercase by rule, so an
             // uppercase name that is not bound is a feature this does not
@@ -2234,6 +2337,115 @@ mod tests {
                 Bson::Array(vec![Bson::Int32(2), Bson::Int32(3)]),
             ])
         );
+    }
+
+    #[test]
+    fn free_variables_are_the_names_nothing_inside_binds() {
+        let free = |v: Bson| Expr::free_variables(&v).unwrap();
+        assert_eq!(free(doc! { "$gt": ["$$line.qty", "$$line.min"] }.into()), ["line"]);
+        assert_eq!(free(doc! { "$gt": ["$$b.x", "$$a.y"] }.into()), ["a", "b"]);
+        assert!(free(doc! { "$gt": ["$qty", 1] }.into()).is_empty());
+        assert!(free(Bson::Boolean(true)).is_empty());
+        // `$$ROOT` is a system name, not a user one.
+        assert!(free(doc! { "$eq": ["$$ROOT.a", 1] }.into()).is_empty());
+        // Bound inside: by `$let`, `$filter`, `$map` and `$reduce`.
+        assert_eq!(
+            free(doc! { "$let": { "vars": { "m": "$$line.min" }, "in": { "$gt": ["$$line.qty", "$$m"] } } }.into()),
+            ["line"]
+        );
+        assert_eq!(
+            free(doc! { "$size": { "$filter": { "input": "$$line.tags", "as": "t", "cond": { "$eq": ["$$t", "x"] } } } }.into()),
+            ["line"]
+        );
+        assert!(
+            free(
+                doc! { "$map": { "input": [1, 2], "as": "n", "in": { "$add": ["$$n", 1] } } }
+                    .into()
+            )
+            .is_empty()
+        );
+        assert!(
+            free(doc! { "$reduce": { "input": [1, 2], "initialValue": 0, "in": { "$add": ["$$value", "$$this"] } } }.into())
+                .is_empty()
+        );
+        // A name bound in one place and free in another is free.
+        assert_eq!(
+            free(
+                doc! { "$add": [
+                    { "$map": { "input": [1], "as": "n", "in": "$$n" } },
+                    "$$n",
+                ] }
+                .into()
+            ),
+            ["n"]
+        );
+        // A string a `$literal` holds is not a reference.
+        assert!(free(doc! { "$eq": ["$a", { "$literal": "$$nope" }] }.into()).is_empty());
+        // An expression that does not parse is that error.
+        assert!(Expr::free_variables(&doc! { "$nope": 1 }.into()).is_err());
+    }
+
+    /// Finding the free names is one parse, however many names the expression
+    /// holds, bound or not: an earlier build parsed once per candidate name, and
+    /// a `$let` with thousands of variables took minutes. Counted, not timed.
+    #[test]
+    fn free_variables_costs_one_parse_however_many_names_it_holds() {
+        for k in [10usize, 2000] {
+            let mut vars = Document::new();
+            for i in 0..k {
+                vars.insert(format!("v{i}"), i as i32);
+            }
+            let mut names: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$v{i}"))).collect();
+            names.push(Bson::String("$$line.x".into()));
+            let bound = Bson::Document(doc! { "$let": { "vars": vars, "in": { "$add": names } } });
+            let before = PARSES.with(std::cell::Cell::get);
+            assert_eq!(Expr::free_variables(&bound).unwrap(), ["line"], "{k} bound names");
+            assert_eq!(PARSES.with(std::cell::Cell::get) - before, 1, "{k} bound names");
+
+            // The same count of names, all of them free.
+            let free: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$w{i}"))).collect();
+            let before = PARSES.with(std::cell::Cell::get);
+            let found = Expr::free_variables(&Bson::Document(doc! { "$add": free })).unwrap();
+            assert_eq!(found.len(), k, "{k} free names");
+            assert_eq!(PARSES.with(std::cell::Cell::get) - before, 1, "{k} free names");
+        }
+        // The collecting mode ends with the call: a plain parse refuses again.
+        assert!(Expr::parse(&Bson::String("$$nope".into())).is_err());
+    }
+
+    #[test]
+    fn an_expression_reads_the_document_when_a_field_or_a_system_name_is_in_it() {
+        let reads =
+            |v: Bson| Expr::parse_with_vars(&v, &["line".to_string()]).unwrap().reads_document();
+        assert!(!reads(doc! { "$gt": ["$$line.qty", 5] }.into()));
+        assert!(!reads(Bson::Int32(1)));
+        assert!(reads(doc! { "$gt": ["$$line.qty", "$min"] }.into()));
+        assert!(reads(doc! { "$eq": ["$$line", "$$ROOT"] }.into()));
+        assert!(reads(doc! { "$eq": ["$$CURRENT.a", 1] }.into()));
+        // Under each construct that holds an expression.
+        for deep in [
+            doc! { "$cond": [true, "$a", 0] },
+            doc! { "$switch": { "branches": [ { "case": true, "then": "$a" } ], "default": 0 } },
+            doc! { "$switch": { "branches": [ { "case": true, "then": 1 } ], "default": "$a" } },
+            doc! { "$switch": { "branches": [ { "case": "$a", "then": 1 } ] } },
+            doc! { "$dateToString": { "date": "$d", "format": "%Y" } },
+            doc! { "$convert": { "input": "$a", "to": "int" } },
+            doc! { "$convert": { "input": 1, "to": "int", "onError": "$a" } },
+            doc! { "$convert": { "input": 1, "to": "int", "onNull": "$a" } },
+            doc! { "$let": { "vars": { "x": "$a" }, "in": "$$x" } },
+            doc! { "$let": { "vars": { "x": 1 }, "in": "$a" } },
+            doc! { "$filter": { "input": "$a", "as": "t", "cond": true } },
+            doc! { "$filter": { "input": [1], "as": "t", "cond": "$a" } },
+            doc! { "$filter": { "input": [1], "as": "t", "cond": true, "limit": "$a" } },
+            doc! { "$map": { "input": "$a", "as": "t", "in": 1 } },
+            doc! { "$map": { "input": [1], "as": "t", "in": "$a" } },
+            doc! { "$reduce": { "input": "$a", "initialValue": 0, "in": 1 } },
+            doc! { "$reduce": { "input": [1], "initialValue": "$a", "in": 1 } },
+            doc! { "$reduce": { "input": [1], "initialValue": 0, "in": "$a" } },
+            doc! { "x": "$a" },
+        ] {
+            assert!(reads(deep.clone().into()), "{deep}");
+        }
     }
 
     #[test]

@@ -14,6 +14,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **An `arrayFilters` entry takes `$expr`.** `{"$expr": {"$lt": ["$$line.qty",
+  "$$line.min"]}}` selects the elements whose quantity is below their own
+  minimum, where an entry could only compare a field with a constant. The
+  expression reads the element as `$$<identifier>`, at the entry's top level or
+  under `$and`, `$or` and `$nor`, on `update` and `find_and_modify`; a scalar
+  element is `$$n` like any other. A field, `$$ROOT` and `$$CURRENT` in it are
+  refused, as is an `$expr` that names no identifier or a second one, and an
+  element it cannot be evaluated against fails the update, naming the document,
+  as a filter's does. No request that works changes. MongoDB refuses `$expr`
+  here, so this is an extension and is recorded in the Deviations register. See
+  Query language, "Positional updates", and ADR-209.
+
 - **`kimmyd check-store` verifies a stopped member's store against redb's page
   checksums, writing nothing.** A serving node never verifies them: redb checks
   them only in its repair after an unclean stop and in its own integrity check,
