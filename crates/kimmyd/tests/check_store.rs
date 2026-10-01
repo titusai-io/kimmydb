@@ -448,7 +448,19 @@ fn a_stop_signal_during_a_check_exits_1_untouched() {
 
 /// A node killed with writes in flight leaves a store that was not closed:
 /// the check repairs it in memory only, and the next start repairs it for
-/// real and says so.
+/// real and says how.
+///
+/// Whether that repair rolls back depends on where the kill lands. A durable
+/// commit is one-phase: redb buffers its pages and the header that makes it
+/// the primary slot, writes the buffer out stripe by stripe, header first
+/// (offset 0 is stripe 0), and then syncs (redb 4.3, `page_manager.rs`
+/// `commit` and `cached_file.rs` `flush_write_buffer`). A kill between those
+/// writes leaves a primary slot naming pages that were never written, which
+/// the repair rolls back: the commit in flight, which no client was told had
+/// succeeded, since a write is answered only after the sync. So either
+/// outcome is right, and what is held is that every acknowledged write is
+/// there, nothing but the one write in flight is ever added to them, the
+/// check and the start agree, and neither is told the store is damaged.
 #[tokio::test]
 async fn a_node_killed_mid_write_is_checked_untouched_and_the_next_start_repairs() {
     let dir = Dir::new();
@@ -473,47 +485,60 @@ async fn a_node_killed_mid_write_is_checked_untouched_and_the_next_start_repairs
         .send()
         .await
         .unwrap();
+    const BATCH: usize = 50;
+    let batch = |i: usize| (0..BATCH).map(move |j| format!("w{i}-{j}"));
+    // One request at a time: the batches a 2xx answered, and the one the kill
+    // left unanswered.
     let writer = {
         let (client, base, token) = (client.clone(), base.clone(), token.clone());
         tokio::spawn(async move {
+            let mut acknowledged = Vec::new();
             for i in 0.. {
-                let docs: Vec<_> =
-                    (0..50).map(|j| serde_json::json!({"_id": format!("w{i}-{j}")})).collect();
+                let docs: Vec<_> = batch(i).map(|id| serde_json::json!({"_id": id})).collect();
                 let sent = client
                     .post(format!("{base}/v1/db/shop/coll/orders/bulk"))
                     .bearer_auth(&token)
                     .json(&docs)
                     .send()
                     .await;
-                if sent.is_err() {
-                    break;
+                match sent {
+                    Ok(res) if res.status().is_success() => acknowledged.push(i),
+                    _ => return (acknowledged, i),
                 }
             }
+            unreachable!()
         })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
     node.signal("KILL");
     node.wait_exit();
-    let _ = writer.await;
+    let (acknowledged, in_flight) = writer.await.unwrap();
+    assert!(!acknowledged.is_empty(), "the writer had written before the kill");
 
     let before = dir.listing();
     let checked = dir.check(&[]);
-    assert_eq!(checked.code, Some(0), "{} {}", checked.json, checked.stderr);
+    assert_eq!(checked.code, Some(0), "never damage: {} {}", checked.json, checked.stderr);
     assert_eq!(checked.json["unclean_close"], true, "{}", checked.json);
+    let rolled_back = checked.json["rolled_back"].as_bool().unwrap();
+    let verdict = if rolled_back { "rolled_back_after_unclean_stop" } else { "clean_after_repair" };
+    assert_eq!(checked.verdict(), verdict, "{}", checked.json);
     assert_eq!(dir.listing(), before, "the check repaired nothing on disk");
 
     let mut next = dir.spawn_node("next");
     next.wait_ready().await;
     let log = next.log();
     assert!(log.contains("repairing the database after an unclean stop"), "{log}");
-    // The repair is named with its outcome, in the log and on /metrics: a
-    // killed node's acknowledged commits are durable, so nothing is rolled
-    // back.
+    // The repair is named with its outcome, in the log and on /metrics, and it
+    // is the outcome the check found on the same file.
     let line = log
         .lines()
         .find(|l| l.contains("database repaired after an unclean stop"))
         .unwrap_or_else(|| panic!("no repaired line: {log}"));
-    assert!(line.contains("WARN") && line.contains("rolled_back=false"), "{line}");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains(&format!("rolled_back={rolled_back}")),
+        "the check said {rolled_back}: {line}"
+    );
     let metrics = client
         .get(format!("{base}/metrics"))
         .bearer_auth(&token)
@@ -523,10 +548,43 @@ async fn a_node_killed_mid_write_is_checked_untouched_and_the_next_start_repairs
         .text()
         .await
         .unwrap();
-    assert!(metrics.contains("kimmy_store_repairs_total{rolled_back=\"false\"} 1\n"), "{metrics}");
-    assert!(metrics.contains("kimmy_store_repairs_total{rolled_back=\"true\"} 0\n"), "{metrics}");
+    let (kept, rolled) = if rolled_back { (0, 1) } else { (1, 0) };
+    assert!(
+        metrics.contains(&format!("kimmy_store_repairs_total{{rolled_back=\"false\"}} {kept}\n")),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!("kimmy_store_repairs_total{{rolled_back=\"true\"}} {rolled}\n")),
+        "{metrics}"
+    );
     next.signal("TERM");
     assert!(next.wait_exit().success());
+
+    // Every acknowledged write survived the repair, and the only other
+    // documents are the whole of the batch in flight, if its commit landed.
+    {
+        let engine = kimmy_storage::Engine::open(&dir.store()).unwrap();
+        let orders = engine.get_collection("shop", "orders").unwrap();
+        let present =
+            |id: String| engine.get(&orders, &kimmy_core::DocId::String(id)).unwrap().is_some();
+        for &i in &acknowledged {
+            assert!(
+                batch(i).all(present),
+                "acknowledged batch {i} lost (rolled_back={rolled_back})"
+            );
+        }
+        let in_flight_present = batch(in_flight).filter(|id| present(id.clone())).count();
+        assert!(
+            in_flight_present == 0 || in_flight_present == BATCH,
+            "the batch in flight is all or nothing: {in_flight_present} of {BATCH}"
+        );
+        let count = engine.count(&orders, kimmy_storage::WalkScope::Background).unwrap();
+        assert_eq!(
+            count as usize,
+            acknowledged.len() * BATCH + in_flight_present,
+            "nothing but acknowledged writes and the one in flight"
+        );
+    }
 
     // A clean stop leaves nothing to repair, and the next start says none.
     let mut clean = dir.spawn_node("clean");
