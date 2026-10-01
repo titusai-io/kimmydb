@@ -196,6 +196,36 @@ Every decoder bounds-checks. A truncated or corrupt record returns
 server. This is tested exhaustively: `truncated_records_error_rather_than_panic`
 cuts a valid entry at every possible offset and asserts a clean error each time.
 
+### What the storage detects
+
+redb keeps a checksum over every page, a 128-bit hash arranged as a tree from
+the commit slot's root down. It is **not cryptographic**, and redb verifies it
+in three places only: in the repair after an unclean shutdown, which chooses
+the commit slot that survived; in the rebuild of its allocator state when no
+saved state exists; and in its own integrity check, which kimmydb does not
+call. **An ordinary page read verifies nothing.** redb's design document
+describes the checksums as non-cryptographic and meant to detect a partially
+committed transaction after a crash, and says that for a commit strategy that
+relies on them alone there is, at least in theory, a way to attack it. So, on a
+store that was closed cleanly:
+
+| Damage | Detected? |
+|---|---|
+| A torn write after a crash or power loss | Yes: redb's repair at the next open, from the commit slot that survived |
+| A record whose bytes no longer decode (truncated, out of bounds) | Yes, when it is read: the decoders return `StorageError::Corrupt` |
+| A damaged header, or a commit slot or root that cannot be right (a checksum that fails on a clean store, a page order redb never writes, a root past the end of the file) | Yes, at the open: the start is refused as damaged ([A damaged store](operations.md#a-damaged-store)) |
+| A flipped bit in a page that still decodes, on a store closed cleanly (bit rot) | **No.** The page is served as data. Nothing in the engine runs the check that would find it |
+| A file changed on purpose | **No.** A hash that is not cryptographic can be made to match, and the engine holds no key |
+
+What a deployment can do about the last two is outside the engine: a filesystem
+that checksums its own data, backups taken and tried
+([Backup and restore](operations.md#backup-and-restore)), and, on a cluster, a
+peer that holds the same documents. A start that skips the open-time walk
+because the version vector is verified ([ADR-173](decisions.md)'s addendum of
+2026-09-26, "What a skip gives up") changes none of this: the walk decoded every oplog
+key and vector row, so damage in those is now left to the decoders when they are
+read.
+
 ---
 
 ## Tombstones

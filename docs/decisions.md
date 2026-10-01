@@ -16868,8 +16868,13 @@ store keeps I.
 
 **What a skip gives up.** The walk decoded every oplog key and every vector
 row, so damage there failed the open. A skipping open reads neither, and such
-damage is found by the first read that reaches it. redb's page checksums still
-apply.
+damage is left to kimmydb's own decoders: a record that no longer decodes
+fails the first read that reaches it with `StorageError::Corrupt`, and damage
+that still decodes is served as data. redb's page checksums do not catch it on a
+cleanly closed store, because redb verifies them only in the repair after an
+unclean shutdown, in the rebuild of its allocator when no saved state exists, and
+in its own integrity check, which kimmydb does not call; an ordinary page read
+verifies nothing ([storage.md](storage.md#what-the-storage-detects)).
 
 **Guards and tests**, in `kimmy-storage`'s `verified.rs`:
 - **`every_writer_of_the_invariants_tables_is_an_audited_one`** fails on any
@@ -20189,7 +20194,13 @@ Which slot is checked follows redb's own choice of slot:
 
 What stays open is a store without the two-phase bit whose primary slot
 verifies and names such a page while the secondary is sound. Producing it
-takes damage that matches a 128-bit checksum.
+takes damage that matches the slot's checksum. For accidental damage that is
+a 128-bit match, which chance does not produce. For deliberate damage it is
+not a barrier: the checksum is a plain hash, not a cryptographic one, redb's
+design document describes it as meant to detect a partially committed
+transaction after a crash, and the `redb_damage` example makes exactly such a
+store by recomputing the slot's checksum
+([storage.md](storage.md#what-the-storage-detects)).
 
 **Reported upstream and declined, so this check is kimmydb's own permanent
 guard, not a stopgap.** A canary test watches redb's side:
