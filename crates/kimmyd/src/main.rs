@@ -37,7 +37,8 @@ fn main() -> Result<()> {
     // connection to production's collector.
     let command = cli.command.unwrap_or(Command::Run);
     let telemetry = matches!(command, Command::Run).then_some(&config.telemetry);
-    let telemetry_guard = logging::init(&config.log, telemetry)?;
+    let to_stderr = matches!(command, Command::CheckStore);
+    let telemetry_guard = logging::init(&config.log, telemetry, to_stderr)?;
 
     match command {
         Command::CheckConfig => {
@@ -185,6 +186,36 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::CheckStore => {
+            let target = config.storage.data_dir.join("kimmy.redb");
+            // The exit marker is read by the check itself, once it holds the
+            // store's lock.
+            let mut options = kimmy_storage::check::CheckOptions {
+                previous_run: lifecycle::previous_run_for_check,
+                ..Default::default()
+            };
+            if let Ok(value) = std::env::var("KIMMY_TEST_CHECK_READ_MS") {
+                let ms = value.parse::<u64>().ok();
+                tracing::warn!(
+                    KIMMY_TEST_CHECK_READ_MS = %value,
+                    recognised = ms.is_some(),
+                    "a test switch is set that slows every read of the store on purpose; unset \
+                     KIMMY_TEST_CHECK_READ_MS outside a test"
+                );
+                if let Some(ms) = ms {
+                    options.read_delay = std::time::Duration::from_millis(ms);
+                }
+            }
+            stop_on_signal();
+            let report = kimmy_storage::check::check_store(&target, &options);
+            {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{}", report.json_line())?;
+                out.flush()?;
+            }
+            std::process::exit(report.exit_code());
+        }
         Command::Run => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -223,4 +254,31 @@ fn main() -> Result<()> {
             concluded
         }
     }
+}
+
+/// A `SIGTERM` or `SIGINT` during `check-store` ends the check at its next
+/// read of the store, which then exits 1 having written nothing. Watched on a
+/// thread of its own, since the check itself is synchronous.
+fn stop_on_signal() {
+    // UNSUPERVISED: a one-shot watcher for a command that exits once the check
+    // returns; if it died, the check would run on and a signal's default kill it.
+    std::thread::spawn(|| {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        runtime.block_on(async {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut term), Ok(mut interrupt)) =
+                (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+            else {
+                return;
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            tracing::warn!("stop signal received; ending the check");
+            kimmy_storage::request_open_stop();
+        });
+    });
 }

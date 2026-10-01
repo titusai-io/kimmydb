@@ -555,7 +555,7 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::Transaction(_)
         | E::Io(_)
         | E::WriterBusy { .. }
-        | E::RefusedStore(_)
+        | E::RefusedStore { .. }
         | E::StoreInUse(_)
         | E::OutcomeUnknown(_)
         | E::Stopping(_) => true,

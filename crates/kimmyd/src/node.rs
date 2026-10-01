@@ -108,6 +108,7 @@ pub async fn run(config: Config) -> RunEnd {
         stop_by: None,
         writes_open: false,
         test_stop: None,
+        opened: false,
     };
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         end.outcome = Err(anyhow::Error::new(e)
@@ -124,7 +125,10 @@ pub async fn run(config: Config) -> RunEnd {
             return end;
         }
     };
-    match start_and_serve(config).await {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = start_and_serve(config, Arc::clone(&opened)).await;
+    end.opened = opened.load(std::sync::atomic::Ordering::SeqCst);
+    match started {
         Ok(served) => {
             end.stop_by = served.stop_by.get().copied();
             end.test_stop = served.test_stop;
@@ -160,6 +164,11 @@ pub struct RunEnd {
     /// run otherwise ended on: the engine is not closed.
     writes_open: bool,
     test_stop: Option<TestStop>,
+    /// The start opened the store. With no engine handed back, it failed
+    /// after the open, and dropped the engine on its way out; a thread may
+    /// still hold it, so `conclude` reads the header before calling the
+    /// store closed.
+    opened: bool,
 }
 
 /// From the signal, how long the stop has before the runtime is shut down
@@ -188,7 +197,7 @@ const WRITES_OPEN_SHUTDOWN: Duration = Duration::from_millis(100);
 /// repairs the store; the marker then says `storage_not_closed` and why, and
 /// the error returned is a [`StorageNotClosed`], which `main` exits 75 on.
 pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
-    let RunEnd { outcome, engine, held, data_dir, stop_by, writes_open, test_stop } = end;
+    let RunEnd { outcome, engine, held, data_dir, stop_by, writes_open, test_stop, opened } = end;
     let now = std::time::Instant::now();
     let deadline = if writes_open {
         now + WRITES_OPEN_SHUTDOWN
@@ -203,6 +212,17 @@ pub fn conclude(end: RunEnd, runtime: tokio::runtime::Runtime) -> Result<()> {
              waiting to be made durable failed",
             WRITES_CLOSE_CAP.as_secs()
         )),
+        // A start that failed after it opened the store dropped its engine
+        // as it returned, and redb closed it then, unless a thread still held
+        // it past the runtime's shutdown. The header says which.
+        None if opened => {
+            match kimmy_storage::format::closed_cleanly(&data_dir.join(DATABASE_FILE)) {
+                Ok(false) => Err("the start failed after it opened the store, and the store was \
+                                  still open when the process stopped"
+                    .to_string()),
+                Ok(true) | Err(_) => Ok(()),
+            }
+        }
         None => Ok(()),
         Some(engine) => close_engine(engine, deadline, stop_by, test_stop),
     };
@@ -493,7 +513,10 @@ fn arm_storage_switch_when_serving(
     true
 }
 
-async fn start_and_serve(config: Config) -> Result<Served> {
+async fn start_and_serve(
+    config: Config,
+    opened: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Served> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
     })?;
@@ -660,7 +683,10 @@ async fn start_and_serve(config: Config) -> Result<Served> {
         }
     }
     let engine = match Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize)) {
-        Ok(engine) => Arc::new(engine),
+        Ok(engine) => {
+            opened.store(true, std::sync::atomic::Ordering::SeqCst);
+            Arc::new(engine)
+        }
         // A stop asked for during a migration ends the open at a safe point,
         // between two of its one-commit steps. That is the stop being honoured,
         // not a failed start: it concludes as a clean shutdown with no engine,
@@ -3454,7 +3480,55 @@ mod tests {
             data_dir: dir.to_path_buf(),
             stop_by: Some(std::time::Instant::now()),
             test_stop: None,
+            opened: true,
         }
+    }
+
+    /// A start that failed with no engine handed back, `opened` saying
+    /// whether it had opened the store.
+    fn failed_start(dir: &std::path::Path, opened: bool) -> RunEnd {
+        RunEnd {
+            outcome: Err(anyhow::anyhow!("a failure after the open, on purpose")),
+            engine: None,
+            held: None,
+            data_dir: dir.to_path_buf(),
+            stop_by: Some(std::time::Instant::now()),
+            writes_open: false,
+            test_stop: None,
+            opened,
+        }
+    }
+
+    /// A start that failed after it opened the store, whose engine a thread
+    /// still holds when the run concludes, does not leave a marker that says
+    /// the store was closed: it says `storage_not_closed`, and `main` exits
+    /// 75. The same failure with the store closed, or before the open on a
+    /// store the run never opened, is the failed start it was.
+    #[test]
+    fn a_start_that_failed_after_the_open_with_the_store_still_held_is_not_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DATABASE_FILE);
+        let still_held = Engine::open(&path).unwrap();
+        let outcome = conclude_now(failed_start(dir.path(), true));
+        assert!(not_closed(&outcome), "{outcome:?}");
+        let last = marker(dir.path());
+        assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
+        assert!(last.cause.unwrap().contains("still open when the process stopped"));
+
+        // A start that never opened it records a failed start, held or not:
+        // the store's state is not this run's.
+        let dir = tempfile::tempdir().unwrap();
+        drop(still_held);
+        let still_held = Engine::open(&dir.path().join(DATABASE_FILE)).unwrap();
+        let outcome = conclude_now(failed_start(dir.path(), false));
+        assert!(!not_closed(&outcome), "{outcome:?}");
+        assert_eq!(marker(dir.path()).exit, lifecycle::Exit::Error);
+        drop(still_held);
+
+        // Opened and closed again: a failed start.
+        let outcome = conclude_now(failed_start(dir.path(), true));
+        assert!(!not_closed(&outcome), "{outcome:?}");
+        assert_eq!(marker(dir.path()).exit, lifecycle::Exit::Error);
     }
 
     fn conclude_now(end: RunEnd) -> Result<()> {

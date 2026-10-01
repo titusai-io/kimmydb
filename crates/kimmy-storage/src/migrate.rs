@@ -690,15 +690,18 @@ pub(crate) fn refuse_newer(
     if let Some(recorded) = stored_redb_version(db)?
         && crate::format::major_minor(&recorded).is_some_and(|v| v > build.redb)
     {
-        return Err(StorageError::RefusedStore(format!(
-            "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
-             kimmy.format and was not shut down cleanly, so redb repaired it before that could be \
-             read; nothing but redb's own repair and close was written. Start the build that \
-             wrote it, or restore a backup",
-            path.display(),
-            build.redb.0,
-            build.redb.1
-        )));
+        return Err(StorageError::RefusedStore {
+            kind: crate::error::RefusedKind::Newer,
+            why: format!(
+                "{} was last written by redb {recorded}, newer than this build's {}.{}. It had no \
+                 kimmy.format and was not shut down cleanly, so redb repaired it before that \
+                 could be read; nothing but redb's own repair and close was written. Start the \
+                 build that wrote it, or restore a backup",
+                path.display(),
+                build.redb.0,
+                build.redb.1
+            ),
+        });
     }
     Ok(())
 }
@@ -2228,7 +2231,7 @@ mod membership_migration {
             crate::format::BuildVersions { schema: 3, ..crate::format::BuildVersions::ours() };
         assert!(matches!(
             Engine::open_as(&path, None, &schema_3),
-            Err(StorageError::RefusedStore(_))
+            Err(StorageError::RefusedStore { .. })
         ));
         let after = (
             std::fs::read(&path).unwrap(),

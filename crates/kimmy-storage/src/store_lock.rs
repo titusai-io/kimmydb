@@ -76,7 +76,57 @@ pub(crate) struct StoreLock {
     /// description. Released on close, or when this is dropped.
     #[cfg(target_os = "linux")]
     flock: std::sync::Mutex<Option<std::fs::File>>,
+    answers: LockAnswers,
+}
+
+/// How a backend answers redb's lock requests when the whole storage is held
+/// already: the trait's second level (see the module docs). Separate from
+/// [`StoreLock`] because `kimmyd check-store`'s backend answers the same way
+/// for a lock held on another descriptor, which it must neither take again
+/// nor release (ADR-204).
+#[derive(Debug, Default)]
+pub(crate) struct LockAnswers {
     granted: Arc<AtomicBool>,
+}
+
+impl LockAnswers {
+    pub(crate) fn grant(&self) -> LockGrant {
+        LockGrant(Arc::clone(&self.granted))
+    }
+
+    /// redb asking for a lock. Its own ranges are unsupported until it asks for
+    /// the whole storage, which it is told it holds; after that, any request is
+    /// one this backend was not built for, and an error.
+    pub(crate) fn request(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+        shared: bool,
+    ) -> Result<bool, BackendError> {
+        #[cfg(test)]
+        test_hooks::record((start, end), shared);
+        if shared {
+            return Err(unexpected("a shared lock", start, end));
+        }
+        if is_whole_storage(start, end) {
+            self.granted.store(true, Ordering::SeqCst);
+            return Ok(true);
+        }
+        if self.granted.load(Ordering::SeqCst) {
+            return Err(unexpected("a range lock after the whole storage", start, end));
+        }
+        Err(BackendError::Unsupported)
+    }
+
+    /// redb releasing a lock. The whole-storage lock is held until the backend
+    /// closes, so releasing it early is a no-op; nothing else was granted.
+    pub(crate) fn unlock(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        if is_whole_storage(start, end) {
+            Ok(())
+        } else {
+            Err(unexpected("the release of a range it was never granted", start, end))
+        }
+    }
 }
 
 fn is_whole_storage(start: Bound<u64>, end: Bound<u64>) -> bool {
@@ -131,7 +181,7 @@ impl StoreLock {
         Ok(StoreLock {
             #[cfg(target_os = "linux")]
             flock: std::sync::Mutex::new(flock),
-            granted: Arc::new(AtomicBool::new(false)),
+            answers: LockAnswers::default(),
         })
     }
 
@@ -139,49 +189,40 @@ impl StoreLock {
     /// returned pair lives: `None` if anything else holds it, or it cannot be
     /// opened.
     pub(crate) fn relock(database: &std::path::Path) -> Option<Relocked> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(database).ok()?;
-        let clone = file.try_clone().ok()?;
-        let backend = redb::backends::FileBackend::new(file).ok()?;
-        let lock = StoreLock::take(&clone, &backend).ok()?;
-        Some(Relocked { backend, lock })
+        Self::hold(database).ok().map(|(relocked, _)| relocked)
+    }
+
+    /// Take the lock on an existing store, never creating it, for as long as
+    /// the returned pair lives, with a descriptor sharing the locked file
+    /// description to read through. `DatabaseAlreadyOpen` when anything else
+    /// holds it.
+    pub(crate) fn hold(
+        database: &std::path::Path,
+    ) -> Result<(Relocked, std::fs::File), redb::DatabaseError> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(database)?;
+        let clone = file.try_clone()?;
+        let backend = redb::backends::FileBackend::new(file)?;
+        let lock = StoreLock::take(&clone, &backend)?;
+        Ok((Relocked { backend, lock }, clone))
     }
 
     pub(crate) fn grant(&self) -> LockGrant {
-        LockGrant(Arc::clone(&self.granted))
+        self.answers.grant()
     }
 
-    /// redb asking for a lock. Its own ranges are unsupported until it asks for
-    /// the whole storage, which it is told it holds; after that, any request is
-    /// one this backend was not built for, and an error.
+    /// See [`LockAnswers::request`].
     pub(crate) fn request(
         &self,
         start: Bound<u64>,
         end: Bound<u64>,
         shared: bool,
     ) -> Result<bool, BackendError> {
-        #[cfg(test)]
-        test_hooks::record((start, end), shared);
-        if shared {
-            return Err(unexpected("a shared lock", start, end));
-        }
-        if is_whole_storage(start, end) {
-            self.granted.store(true, Ordering::SeqCst);
-            return Ok(true);
-        }
-        if self.granted.load(Ordering::SeqCst) {
-            return Err(unexpected("a range lock after the whole storage", start, end));
-        }
-        Err(BackendError::Unsupported)
+        self.answers.request(start, end, shared)
     }
 
-    /// redb releasing a lock. The whole-storage lock is held until the backend
-    /// closes, so releasing it early is a no-op; nothing else was granted.
+    /// See [`LockAnswers::unlock`].
     pub(crate) fn unlock(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
-        if is_whole_storage(start, end) {
-            Ok(())
-        } else {
-            Err(unexpected("the release of a range it was never granted", start, end))
-        }
+        self.answers.unlock(start, end)
     }
 
     /// The `flock`'s release; the range lock goes with the `FileBackend`'s

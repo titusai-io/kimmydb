@@ -152,7 +152,7 @@ pub fn open_stop_requested() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::Cell;
 
     use bson::doc;
@@ -163,7 +163,7 @@ mod tests {
         /// A stop asked for on this thread only. The real request is one flag for
         /// the process, and a test that raised it would stop every open running
         /// beside it in the same test binary.
-        pub(super) static THIS_THREAD_STOPS: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static THIS_THREAD_STOPS: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The verification walk checks for a stop every 8,192 rows, and a stop asked

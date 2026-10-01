@@ -435,7 +435,11 @@ as it goes.
 open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
 4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
 logs `repairing the database after an unclean stop` at `WARN`, then `database
-repaired after an unclean stop` with how long it took.
+repaired after an unclean stop` with how long it took and `rolled_back`: `true`
+when the latest commit failed verification and was discarded, which is the
+commit the stop interrupted or damage to it, and which after a clean shutdown
+means the store is damaged ([Checking a store](#checking-a-store)).
+`kimmy_store_repairs_total{rolled_back}` counts the same.
 
 ### Discovery formats
 
@@ -616,7 +620,7 @@ took), and **closes the store**: it logs `engine closed` with `elapsed_ms`, chec
 the close, and only then writes the clean-exit marker and logs `shutdown
 complete`. Exported spans and metrics get 2 s more, after the marker.
 
-**A stop that cannot close the store says so, and exits 75.** Three things
+**A stop that cannot close the store says so, and exits 75.** Four things
 prevent the close, and each is logged at `ERROR` as `exiting without closing
 the storage engine; the next start repairs the database`, with the reason in
 `error`:
@@ -626,7 +630,10 @@ the storage engine; the next start repairs the database`, with the reason in
   `storage.durability = coalesced`, a last flush that failed (`a write was
   still in progress …`);
 - a close that redb did not record, such as after a task panicked inside a
-  write transaction (`… needing recovery …`).
+  write transaction (`… needing recovery …`);
+- a start that failed after it opened the store, such as one whose cluster
+  listener could not bind, with the store still open when the process stopped
+  (`the start failed after it opened the store …`).
 
 The node writes the marker `storage_not_closed` with that reason as its
 `cause` and exits with status **75**. The next start logs `the previous
@@ -859,6 +866,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_embed_provider_errors_total{kind}` | Provider calls that failed before any response, by what failed: `connect` (DNS, TCP, TLS), `timeout`, `reset` (the far side closed an open connection), `other`. Where `kimmy_embed_failures_total` says a call failed, this says at which layer |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
+| `kimmy_store_repairs_total{rolled_back}` | Repairs redb made when this process opened the store, after an unclean stop: `rolled_back="false"` kept every commit, `rolled_back="true"` discarded the latest commit, which failed verification. At most one per process, so each reads 0 or 1; the start logs the same at `WARN` (`database repaired after an unclean stop`, with `rolled_back`). A rollback is the commit the stop interrupted, or damage to it; **after a clean shutdown it means the store is damaged**: stop the member and run [`kimmyd check-store`](#checking-a-store) ([ADR-204](decisions.md)) |
 | `kimmy_oplog_entries` | Entries in the oplog now, read from the count the table keeps, so a scrape costs nothing however many. What a start that walks the oplog reads; see [Capacity](#capacity) for when one does and what it costs |
 | `kimmy_oplog_verified_entries` | Oplog entries read by the walk that last verified the version vector, at a start or a rewind. It describes that walk, not the oplog now. **0 means no record: the next start walks** |
 | `kimmy_oplog_verified_logical_bytes` | Key and value bytes that walk read: **logical bytes, not bytes of the file**, which redb's pages and free space make larger. The figure to divide a cold start's time by. 0 with no record |
@@ -2276,18 +2284,91 @@ Know what the engine does and does not find before relying on it:
   storage error (`StorageError::Corrupt`) and does not stop the node. What stops
   the node is an I/O error from the storage backend, which is a different thing
   ([ADR-188](decisions.md)).
-- **A flipped bit in a page that still decodes** is **not detected** on a store
-  that was closed cleanly: redb's page checksums are verified only in its repair
-  after an unclean shutdown, in the rebuild of its allocator when no saved state
-  exists, and in its own integrity check, which the engine does not run. An
-  ordinary read verifies nothing, and the damaged page is served as data.
+- **A flipped bit in a page that still decodes** is **not detected by a
+  serving node** on a store that was closed cleanly: redb's page checksums are
+  verified only in its repair after an unclean shutdown, in the rebuild of its
+  allocator when no saved state exists, and in its own integrity check, which
+  a serving node cannot run. An ordinary read verifies nothing, and the
+  damaged page is served as data. **`kimmyd check-store` finds it**, on the
+  stopped member ([Checking a store](#checking-a-store)).
 - **A file changed on purpose** is **not detected**. The checksums are not
-  cryptographic, and the engine holds no key.
+  cryptographic, and nothing holds a key.
 
-The last two are for the filesystem and the backups to answer: use a filesystem
-that checksums data, take backups and restore one now and then, and on a cluster
-remember that a peer holds the same documents. The reasoning is in
+The last is for the filesystem and the backups to answer, and so is bit rot
+between checks: use a filesystem that checksums data, take backups and restore
+one now and then, and on a cluster remember that a peer holds the same
+documents. The reasoning is in
 [Storage: what the storage detects](storage.md#what-the-storage-detects).
+
+### Checking a store
+
+`kimmyd check-store` verifies a **stopped** member's store against redb's page
+checksums: every page reachable from the commit slot, and the allocator state
+against the tree ([ADR-204](decisions.md)). It writes nothing, to the store or
+beside it. Run it with the same configuration, or the same `--data-dir` or
+`KIMMY_DATA_DIR`, as the node; none of the serving settings (a root password, a
+JWT secret) is needed.
+
+```bash
+# Stop the node first: the check refuses a store a node holds.
+kimmyd --config /etc/kimmydb/kimmy.toml check-store
+```
+
+It prints one JSON line on stdout, and its log on stderr:
+
+```json
+{"verdict":"clean","detail":"every page verified","unclean_close":false,"rolled_back":false,"elapsed_ms":1096,"bytes_read":285540681}
+```
+
+| Exit | `verdict` | What to do |
+|---|---|---|
+| 0 | `clean` | Nothing. |
+| 0 | `clean_after_repair` | Nothing. The store was not closed cleanly (`unclean_close`), and the node's next start repairs it the same way, keeping every commit. |
+| 0 | `rolled_back_after_unclean_stop` | The store was not closed cleanly, and its latest commit failed verification (`rolled_back`): the torn write a kill or a power loss leaves, which the next start rolls back the same way. The check cannot tell that from damage confined to that one commit. |
+| 65 | `damaged` | Restore or re-seed it: see [A damaged store](#a-damaged-store). `detail` says what redb found, or which read reached past the end of a file cut short. |
+| 1 | `not_checked` | Nothing is known about the store. `detail` says why: a node holds it; there is no store, or an empty file; a newer build wrote it; its `kimmy.format` is unreadable; it changed while it was checked; it is in an older redb file format that a start would upgrade; a read of the file failed (or the file shrank under the check); or the check was stopped. |
+
+**What a repair means depends on how the previous run ended**, which the check
+reads from `kimmy.last-exit`, under the store's lock and without moving it.
+After a clean shutdown the store needs no repair at all, so one at the check's
+open is damage (65). After anything else, a start that failed and a missing
+marker included, a rollback is the expected torn write (0).
+
+**Things to know:**
+- **The check takes the store's lock**, so a node started during it is refused
+  (`is open in another process`) and leaves its exit marker as it was. The
+  lock needs the file writable by the user running the check, though nothing
+  is written; a read-only copy cannot be checked, so copy it somewhere
+  writable first.
+- **`SIGTERM` or `SIGINT` ends it** at its next read, exit 1, nothing written.
+  So does `kill -9`.
+- **It holds up to 64 MiB of redb's own writes in memory** (header pages, and
+  the repair of a store that was not closed cleanly), plus a page cache sized
+  to the store, up to 1 GiB.
+- **It does not read `hnsw/`.** The vector indexes' snapshots carry no
+  checksum; if you suspect them, delete them
+  ([Rebuild vector indexes](#rebuild-vector-indexes-after-upgrading-past-2026-08-15)).
+- **It finds damage only in what redb checksums.** A file changed on purpose,
+  with its checksums recomputed, passes.
+
+**Cost.** A full read of the store, once if it fits the 1 GiB cache. Measured
+with a release build on a local SSD (a laptop's internal NVMe drive), on a
+272 MiB store closed cleanly: 285,540,681 bytes read, the file once, in 1.0 to
+1.5 s with the file out of the operating system's page cache and 0.1 to 0.15 s
+with it in, at a peak of 381 MiB resident (the cache). A store killed
+mid-write, in a 272 MiB file, was read about once over the file's length, and
+checked in 0.55 s cold, its repair included; a killed store's file can be twice
+the size of a cleanly closed one holding the same data, since the space a
+close gives back is still allocated.
+A store larger than the cache is read about twice, since the allocator check
+re-reads every page the verification read, and one that was not closed cleanly
+up to four times. The reads follow the tree rather than the file's order, so a
+spinning disk is far slower than these numbers: time one check there before
+scheduling them.
+
+Run it when a member is stopped anyway (an upgrade, a host's maintenance), on
+a member you suspect after an unexpected storage error or a disk's warning, and
+on a copy of a backup's source before relying on it.
 
 ### A damaged store
 
@@ -2298,11 +2379,17 @@ it was. Before the redb 4.3 bump, such a store made the start run at full CPU
 and grow its memory until it was killed, or abort on Linux, instead of
 refusing.
 
+`kimmyd check-store` says the same of a store whose pages fail their
+checksums, which a start does not look at ([Checking a store](#checking-a-store)),
+with exit 65.
+
 A damaged store is not repaired in place. Either:
 - **restore it from a backup** with `kimmyd restore` (see
   [Backup and restore](#backup-and-restore)), or
 - **on a cluster member, wipe the data directory** and let the member catch up
-  from its peers, keeping clients off it until it has.
+  from its peers: it starts marked as catching up and refuses requests until it
+  holds what they hold ([A member that is catching up](#a-member-that-is-catching-up)).
+  `kimmyd restore` is only for a backup.
 
 Keep a copy of the damaged file if you want to know what happened to it. A
 store whose other commit slot alone is damaged opens normally, because redb
