@@ -378,44 +378,45 @@ planned until someone stores such a value and needs to join on it.
 
 ---
 
-## 🟡 Update operators are not checked for conflicting paths, except `$setOnInsert`
+## 🟢 Update operators were not checked for conflicting paths, except `$setOnInsert`
 
-**Raised 2026-08-30, while adding `$setOnInsert` and the `$push` modifiers.**
-MongoDB rejects any update in which two operators write the same path, or one
-writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails with *"Updating
-the path 'a' would create a conflict at 'a'"*. Here the operators apply in the
-order their keys arrive on the wire and the last one wins: `{"$set": {"a": 1},
-"$inc": {"a": 5}}` on `a: 0` leaves `6`, and `{"$inc": {"a": 5}, "$set": {"a":
-1}}` leaves `1`. That is what the parser has done since the update language
-existed and what its tests pin — but before the release that records ADR-120
-it was not what a client saw. Every request body was decoded into a JSON map
-that sorted its keys, so the operators ran in alphabetical order whatever the
-body said — `$inc` before `$set` — and the two updates above both left `1`.
-The boundary now keeps the order it is given (ADR-120). "The order written"
-means the order the bytes arrive in: a client whose JSON encoder does not
-preserve insertion order — a language whose maps are unordered, or a library
-that sorts keys on output — gets whichever order its encoder produced, so a
-caller who depends on the last operator winning should serialise the update
-deliberately rather than trust a map.
+**Was** (raised 2026-08-30, while adding `$setOnInsert` and the `$push`
+modifiers). MongoDB rejects any update in which two operators write the same
+path, or one writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails
+with *"Updating the path 'a' would create a conflict at 'a'"*. Here the
+operators applied in the order their keys arrived on the wire and the last one
+won: `{"$set": {"a": 1}, "$inc": {"a": 5}}` on `a: 0` left `6`, and `{"$inc":
+{"a": 5}, "$set": {"a": 1}}` left `1`. Before the release that recorded
+ADR-120 every request body was decoded into a JSON map that sorted its keys, so
+the operators ran in alphabetical order whatever the body said and both left
+`1`; after it, the order was the order the bytes arrived in, which a client
+whose JSON encoder does not keep insertion order does not control. Only pairs
+involving `$setOnInsert` were refused, because widening the check to every
+pair turned an update that worked into a `400`, a break a patch release does
+not carry.
 
-**`$setOnInsert` is the exception, and it is checked.** An update that sets a
-path on insert and also `$set`s, `$inc`s, `$unset`s or `$rename`s onto it (or a
-prefix or extension of it) means one thing when it inserts and another when it
-matches, and which of the two ran would depend on operator order in a document
-whose key order is an accident of the client's JSON encoder. That case is
-refused at parse time with the same shape of message as MongoDB's. The check is
-confined to pairs involving `$setOnInsert` because extending it to every pair
-would turn an update that works today into a `400` on upgrade — a behaviour
-break, which a patch release does not carry.
+**Now** (closed 2026-10-01, [ADR-205](decisions.md)). Any two writes in one
+update whose paths are the same, or one inside the other, are a `400` at parse
+time, whichever operators they come from — two paths under one operator
+included — and nothing is written. The message keeps MongoDB's fragment
+(`updating the path "a.b" would create a conflict at "a"`) after naming both
+operators and their paths in the order written. A `$rename` writes both its
+source and its destination. Positional paths are compared as written at parse,
+as MongoDB does, and the concrete paths they reach are checked again in each
+document, where MongoDB reports *"Update created a conflict at 'items.1.qty'"*
+and this reports the same message as at parse, ending `in this document`;
+every positional path is expanded against the document before the update, so
+array filters select the same elements in any key order. An index segment is
+compared by its value (`a.01` is `a.1`).
+`$setOnInsert` is checked as before. Breaking for callers, in a `0.MINOR`.
 
-**Closing it** is a one-line widening of `reject_set_on_insert_conflicts` to
-all operator pairs, plus the tests that pin ordered application today, and it
-belongs in a `0.MINOR` bump that says so in the changelog. Until then an update
-that names one path twice is applied in order, not refused, and a client that
-relies on MongoDB refusing it will not be told.
+---
 
-Two smaller choices from the same change, recorded here so they are visible
-rather than because either is a debt:
+## 🟡 Two choices in the `$push` modifiers
+
+**Raised 2026-08-30, with the `$push` modifiers**, and recorded with the
+conflicting-paths entry above until that closed. Neither is a debt; they are
+recorded so they are visible.
 
 - **`$push`'s `$sort` on elements that are not documents.** With a
   `{field: direction}` sort, an element that is not a document sorts as though

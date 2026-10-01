@@ -12,6 +12,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **Breaking: an update that writes one path twice is a `400`, and writes
+  nothing.** Two writes to the same path, or to a path and a path inside it,
+  were applied in the order their keys arrived: `{"$set": {"a": 1}, "$inc":
+  {"a": 5}}` on `a: 0` left `6`, and the same operators written the other way
+  round left `1`, so the result was decided by the key order of the request
+  body, which a client's JSON encoder may not keep. Every such pair is now
+  refused at parse, whichever operators carry it (two paths under one operator
+  included, and a `$rename`'s source and destination both count), with a
+  message naming both and the field they meet at: `$set on "a" conflicts with
+  $inc on "a.b": updating the path "a.b" would create a conflict at "a"`.
+  Only pairs involving `$setOnInsert` were refused before. Positional paths
+  that differ only in their `$[…]` segments are checked against the elements
+  they reach in each document, and a document where two of them meet fails
+  the request the way a document an operator cannot apply to does, with
+  nothing of the update written to it. An index is compared by its value, so
+  `a.01` and `a.+1` are `a.1`. An array filter now selects against the
+  document as it was before the update: one that read a field another
+  operation in the same update writes used to see the new value or the old
+  one depending on key order, and now always sees the old. Applies to
+  `update`, `find_and_modify` and the MCP `update` tool. Check stored update
+  documents before upgrading: one that relied on the last write winning now
+  fails; write the one value it meant instead
+  ([ADR-205](docs/decisions.md), [Query language](docs/query-language.md#one-write-per-path)).
+
 ### Fixed
 
 - **A clustered start that can never write its replay floor is refused before

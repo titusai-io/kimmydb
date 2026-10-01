@@ -6824,6 +6824,12 @@ addendum for why the entry belongs in the build.
 
 ## ADR-120 — JSON object key order is preserved through the HTTP and MCP boundary
 
+> **Amended by [ADR-205](#adr-205--an-update-writes-each-path-once-and-two-writes-that-overlap-are-refused).**
+> The first consequence below no longer holds for two writes to one path:
+> `{"$set": {"a": 1}, "$inc": {"a": 5}}` is refused `400` in either order,
+> rather than applied in wire order. Operators still apply in the order
+> written, which still decides the order new fields are appended in.
+
 **Decision.** The workspace's `serde_json` is built with `preserve_order`, so
 `serde_json::Map` keeps insertion order — the order the keys arrived in the
 bytes — instead of sorting them. Every JSON object that crosses into the
@@ -21823,3 +21829,172 @@ The marker file round-trips and an unreadable one is still a marker; the operato
 ### Test
 
 A record carrying a fingerprint above `i64::MAX` encodes, decodes whole, and decodes with a copy of the 0.42.0 struct (from the stored document and from its bytes); a 0.42.0 record decodes with no fingerprint; a record with none encodes byte for byte as 0.42.0 encoded it. Staleness in every combination of version, fingerprint and `Unstamped`, and through the engine with a chunk set that mixes them. The finding itself: an owner re-embeds one batch of four documents out of ten under a new configuration and is stopped, its provider gone; the member that takes over, with no fingerprint, sends exactly the six old-configuration documents, under the new configuration, and none of the four. An owner that replays its interrupted reindex after a restart sends only the six. Every embed, on the stream and in a scan, stamps its records with the configuration it ran under, not the one this member last recorded. Records with no fingerprint are trusted by their version by an ownership rescan and a replayed entry, and a changed one is re-embedded; a member behind a configuration change forces them, and sends nothing for records already made under the current configuration. A `byo` collection's records are neither sent nor rewritten by any scan, and after a switch to a server-side provider a rescan re-embeds the stamped ones. A client's records carry the `byo` configuration's fingerprint, and none in a collection the server embeds. The fingerprint of two configurations is pinned. Ownership moves 250 ms into a reindex of 40 documents with a 100 ms provider and batches of four, and the new owner rescans while the old owner's scan runs: the two send at most 44 inputs between them and record nothing, and with records from before 0.43.0 the old owner alone sends all 40 and the new owner none. A document refused as input (`422`) between two documents of its split that land loses its old configuration's vectors, in a scan and on the stream's flush, where a batch whose documents are all refused removes nothing, and one batch of a flush lends nothing to the next. A provider that serves two batches of four and then answers `400` to everything, one that fails 6, 7, 8, 9 or 10 calls and then serves (landing on a split's boundary, inside it, and after it), and one that goes bad inside a split just after a real `422`, leave every document its vectors; an answer `store` refuses for the wrong count is no proof. Nothing is removed when the provider fails for every document (a missing key, a `400` for all 40, the reviewer's probe: 40 of 40 keep their vectors), for a lone document refused as input, for a document refused alone in a deferred re-check, for a `401` beside successes, or for a refused document whose vectors are under the current configuration. The owner check reading false for 150 ms of a backfill leaves the collection unsettled, and the owner's next evaluations finish the reindex: all 40 under B. Each guard was broken and its test failed: the fingerprint ignored by staleness; the stamp not written; the stamp written with the fingerprint this member last recorded; a record with no fingerprint read as stale everywhere; forcing reading a current fingerprint as stale; a record with no fingerprint not forced; a client's `byo` record left unstamped; the key written when there is no fingerprint; the ownership check before each batch; a forced scan stopping outright when it loses the collection; the fingerprint recorded by a scan that handed its collection over; a refused document's old vectors kept, across batches and in a split; a refused document's current vectors removed; any permanent failure read as a refusal of the input; the requirement that another document of the split landed dropped, in a scan and in a flush; a success in a split not counted; a success from another batch of the scan counted; the proof taken before `store` checks the answer; a success before the refused document enough; a success after it enough; a handed-over scan marking its collection settled.
+
+---
+
+## ADR-205 — An update writes each path once, and two writes that overlap are refused
+
+**Status:** accepted, for the next `0.MINOR`. Amends the first consequence of
+[ADR-120](#adr-120--json-object-key-order-is-preserved-through-the-http-and-mcp-boundary).
+Extends [ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+and [ADR-124](#adr-124--a-route-that-reads-no-query-string-refuses-every-query-string)
+into the update language.
+
+**The defect.** An update carries several operators, each naming paths, and
+they were applied one after the other in the order their keys arrived. Two
+writes to one path were not refused: `{"$set": {"a": 1}, "$inc": {"a": 5}}` on
+`a: 0` left `6`, and `{"$inc": {"a": 5}, "$set": {"a": 1}}` left `1`, each with
+a `200`. ADR-120 made that order the order of the bytes on the wire, but the
+bytes are written by the client's JSON encoder, and many do not keep insertion
+order (a language whose maps are unordered, a library that sorts keys on
+output). The same application code could leave `6` on one platform and `1` on
+another, and nothing told the caller its update meant two things. Only a pair
+involving `$setOnInsert` was refused, because an update that means one thing
+on insert and another on match was judged the dangerous case, and widening the
+check was held for a release that may break callers.
+
+**Decision.**
+
+- **Any two writes in one update whose paths are the same, or one inside the
+  other, are a `400` at parse time** (`InvalidUpdate`, `bad_request`), and
+  nothing is read or written. Every pair of operations is checked, two paths
+  under one operator included, and the message names the two in the order
+  written:
+  `$set on "a" conflicts with $inc on "a.b": updating the path "a.b" would
+  create a conflict at "a"; an update may write each path once`. "Inside"
+  is by segment: `a.b` is inside `a`, `ab` is not.
+- **An index segment is compared by its value.** The path language reads a
+  segment as an array index with `usize::from_str`, which takes `01` and `+1`
+  as `1`, so `a.01` and `a.+1` are `a.1`, and `{"$set": {"a.1": 5}, "$inc":
+  {"a.01": 1}}` is refused, at parse and in a document alike, with the
+  conflict named at the canonical path. A path spelled that way alone is not
+  refused. Over a field holding an object, `01` and `1` would be two keys;
+  such a pair is still refused, the conservative side. The first segment is
+  compared as written: it names a field of the document itself, which is never
+  an array, so `{"$set": {"01": 1, "1": 2}}` writes two fields.
+- **A `$rename` writes both its source and its destination**, against every
+  other write. A rename whose own source and destination overlap is not this
+  rule's business and is unchanged.
+- **Positional paths are compared as written at parse, and by what they reach
+  in each document.** At parse a `$[]` or `$[<identifier>]` segment is a
+  segment like any other, so `items.$[l]` and `items.$[l].qty` are refused,
+  and `items.$[a].qty` and `items.$[].qty` are not, since which elements each
+  reaches depends on the document. When the update is applied, it runs in
+  **two phases**: first every operation's positional paths are expanded
+  against the document as it was before the update, and, when some operation
+  has a positional path, every operation's concrete paths are claimed in
+  operation order; only then is anything written. A concrete path that
+  overlaps one an earlier operation claimed refuses the document, with the
+  same message ending `in this document`, naming the two operations in the
+  order written and the element (`items.1.qty`), and the document is left as
+  it was. The refusal is that of any document an operator cannot apply to (a
+  `$inc` on a string): the request fails, a single-document write writes
+  nothing, and a `multi` write whose later chunk meets it answers
+  `500 partially_applied` with what the earlier chunks committed (ADR-086,
+  ADR-192). Over HTTP it arrives inside the `invalid query:` prefix every
+  such refusal carries. Where the paths reach separate elements, the update
+  applies.
+- **An array filter selects against the document before the update.**
+  Expanded operation by operation, a filter saw what the operations before it
+  had written, so `{"$set": {"items.0.sku": "b"}, "$inc": {"items.$[m].qty":
+  1}}` with `m` selecting `sku` `"b"` incremented the line in one key order and
+  not in the other, though no path was written twice. Expanded against the
+  document as it was, the selection is the same in every order.
+- **`$setOnInsert` is checked as before, and now as one write among the
+  rest.** At parse it counts as a write whether or not the request inserts. In
+  a document it is applied only to an insert, so on a match it reaches nothing
+  and conflicts with nothing.
+- **Operators still apply in the order written.** With no two writes to one
+  path and every selection made before anything is written, the order decides
+  nothing about any value; it still decides the order in which new fields are
+  appended to the document, which is ADR-120's promise and is unchanged.
+- **The check costs a few lookups per path.** Paths are claimed into a map of
+  the paths written and a map of their proper prefixes, so each costs one
+  lookup for itself, one for a path inside it and one per prefix, rather than
+  one comparison with every path before it: a `$[]` over a 20,000-element
+  array under three operators is 240,000 lookups, not 1.8 billion
+  comparisons. The parse-time check uses the same structure.
+
+**Why.** It is ADR-121's rule, that a request the server cannot honour is
+refused rather than answered: a request whose result depends on an accident of
+its encoding is one whose meaning the server does not know, and the `200` it
+used to get could not be told from a correct one. The refusal costs a caller
+who meant the ordered reading one rewrite, which the message points at; the
+silent reading cost a caller who did not mean it a wrong value. The message
+keeps the fragment `would create a conflict at`, the shape of the refusal the
+`$setOnInsert` check already gave and that callers porting tests grep for,
+after the operator names that make it actionable.
+
+The apply-time check exists because the parse-time one alone left positional
+paths open: `{"$set": {"items.$[l].qty": 0}, "$inc": {"items.$[].qty": 1}}`
+writes `qty` twice in every element `l` selects, and the result again depends
+on the order. Refusing such a pair at parse, by reading every positional
+segment as overlapping every other, would refuse the update that sets one field
+in the elements one filter selects and increments it in the elements a
+disjoint filter selects, which writes each path once. Checking concrete paths
+refuses exactly the documents where two writes meet. The paths are claimed
+only when some operation has a positional segment, so an update without one
+pays nothing at apply.
+
+**Caller-visible, and breaking.** Updates that returned `200` now return
+`400`: two operators on one path, a path and a path inside it, two such paths
+under one operator, a write to a `$rename`'s source or destination. Positional
+paths that meet in a document now fail that request. An array filter that
+read a field another operation in the same update writes now reads its value
+before the update. Listed under **Changed**,
+marked **Breaking**, in the CHANGELOG, for the `update` and `find_and_modify`
+routes and the MCP `update` tool, which share the parser.
+
+**Rejected.**
+
+- *Keep ordered application and document it more loudly.* The register already
+  documented it, and a client whose encoder reorders keys still got a silently
+  different result.
+- *Refuse only pairs from different operators.* `{"$set": {"a": {"b": 1},
+  "a.b": 2}}` is as order-dependent as two operators, and its order is just as
+  much the encoder's.
+- *Treat every positional segment as overlapping every other at parse.* Simpler,
+  and refuses updates that write each path once (above).
+- *Check concrete paths for every update, positional or not.* A non-positional
+  pair that overlaps is already refused at parse, so it would find nothing.
+
+### Test
+
+`kimmy-query` unit tests: `$set` and `$inc`, `$set` and `$mul`, and `$min` and
+`$max` on one path are refused in both orders with the full message;
+`$push`/`$pull` and `$currentDate`/`$unset` are refused; a path inside another
+is refused in either order and under one operator; a `$rename`'s destination
+and its source each conflict, as do two renames onto overlapping
+destinations; separate paths, a shared prefix of a name and a rename beside an
+unrelated `$set` still apply. Positional paths that overlap as written are
+refused at parse; a filtered and an all-elements path, an index path and an
+all-elements path, an element and a field inside it, and two filters selecting
+one element are refused in the document, in the order written; the same
+updates apply where they reach separate elements; `$setOnInsert` on a
+positional path conflicts on insert and not on a match. The existing
+`$setOnInsert` cases pass unchanged. `kimmy-api` tests drive the refusal over
+`update` and `find_and_modify` with bodies written as text in both orders,
+assert the document is unchanged and that separate paths still apply, and
+refuse two positional paths meeting in a document while the same update
+applies where they do not. A `kimmy-mcp` test drives the update tool in both
+orders. Each guard was broken and its test failed: the parse-time check
+confined to pairs involving `$setOnInsert` again (the unit, API and MCP tests);
+the pair loop skipping two paths under one operator; the prefix half of the
+overlap dropped; a rename's destination not counted; the apply-time check not
+run (the unit and API tests); the apply-time check recording nothing; the
+apply-time check recording only positional operations' paths.
+
+Added with the two phases and the canonical index: the two selections above
+give identical results in both key orders; a refused update leaves the
+document untouched through `update::apply` and `apply_on_insert`; `01`, `+1`
+and `001` conflict with `1` at parse and against `$[]`, alone they apply, and
+`a.1` and `a.10` do not conflict; a `$rename` onto an element a `$[]` path
+reaches conflicts, and onto a field it does not reach applies; a conflict on
+an upsert's insert names the pair in written order; over a 20,000-element
+array under three operators the claim makes exactly four lookups per path and
+still finds a conflict at the last element. Each was broken and its test
+failed: expanding against the partly updated document; claiming after
+applying; the canonical form dropped; a rename's destination not claimed in a
+document; `$setOnInsert` claimed first; the lookup of a path inside one
+claimed, and of a claimed prefix, each dropped; a lookup per path already
+claimed; the apply-time claim not run; plain operations' paths not claimed.

@@ -408,13 +408,69 @@ the filter's equalities, then `$setOnInsert`, then every other operator:
 // every later call increments n and leaves created_at alone
 ```
 
-A `$setOnInsert` path that another operator in the same update also writes —
-the same path, or one inside the other, counting a `$rename`'s destination — is
-**rejected at parse time**, as MongoDB rejects it: the two would disagree about
-the inserted document. Other operator pairs are not checked against each other
-and apply in the order written — the order the keys arrive in the request body,
-so an encoder that reorders map keys decides it (see
-[Deviations](deviations.md)).
+A `$setOnInsert` path that another operator in the same update also writes is
+refused, as every such pair is: see the next section.
+
+### One write per path
+
+An update writes each path once. Two writes to the same path, or to a path and
+a path inside it, are **refused with a `400` and nothing is written**, whichever
+operators they come from and in whichever order they were written
+([ADR-205](decisions.md#adr-205--an-update-writes-each-path-once-and-two-writes-that-overlap-are-refused)):
+
+```javascript
+{ "$set": { "a": 1 }, "$inc": { "a": 5 } }        // 400: both write "a"
+{ "$inc": { "a": 5 }, "$set": { "a": 1 } }        // 400: the same, written the other way
+{ "$set": { "a": {} }, "$unset": { "a.b": "" } }  // 400: "a.b" lies inside "a"
+{ "$set": { "a": { "b": 1 }, "a.b": 2 } }         // 400: two paths under one operator count too
+{ "$rename": { "x": "b" }, "$set": { "b": 1 } }   // 400: a rename writes its destination
+{ "$set": { "a": 1 }, "$inc": { "b": 5 } }        // fine: separate paths
+{ "$set": { "ab": 1 }, "$inc": { "a": 1 } }       // fine: a shared prefix of the name is not a shared path
+```
+
+Applied one after the other, two such writes would leave a result decided by
+which ran first, and the only thing that orders them is the order of the keys
+in the request body, which a client's JSON encoder may not keep. The message
+names both operators and their paths, in the order written, and the field the
+conflict is at:
+
+```
+invalid update: $set on "a" conflicts with $inc on "a.b": updating the path "a.b" would create a conflict at "a"; an update may write each path once
+```
+
+A `$rename` counts as writing both its source and its destination. A
+`$setOnInsert` counts as a write whether or not the request inserts. **An
+index is compared by its value**: the path language reads `a.01` and `a.+1` as
+`a.1`, so `{"$set": {"a.1": 5}, "$inc": {"a.01": 1}}` writes one path twice
+and is refused, with the conflict named at `"a.1"`. A path spelled that way
+alone is not refused. Over a field holding an object rather than an array,
+`01` and `1` are two keys, but such a pair is still refused rather than told
+apart.
+
+**Positional paths are checked twice.** As written, a path with a `$[]` or
+`$[<identifier>]` segment is compared segment by segment like any other, so
+`items.$[l]` and `items.$[l].qty` are refused at parse. Two that differ only in
+their positional segments — `items.$[a].qty` and `items.$[].qty`, or
+`items.$[a].qty` and `items.1.qty` — may or may not reach the same element,
+depending on the document, so they are checked again against the concrete
+paths they reach in each document the update is applied to. Every positional
+path is expanded against the document **as it was before the update**, and
+every concrete path checked, before anything is written: an array filter
+never sees what another operation in the same update wrote, so `{"$set":
+{"items.0.sku": "b"}, "$inc": {"items.$[m].qty": 1}}` with `m.sku` equal to
+`"b"` selects by the old sku, in either order. Where two concrete paths meet,
+the document is refused, the request fails as for any document an operator
+cannot be applied to, and nothing of the update is written to it. The
+refusal names the two operations in the order written and the element, and,
+like every refusal an operator meets in a document, arrives over HTTP inside
+an `invalid query:` prefix:
+
+```
+invalid query: invalid update: $set on "items.$[l].qty" conflicts with $inc on "items.$[].qty" in this document: updating the path "items.1.qty" would create a conflict at "items.1.qty"; an update may write each path once
+```
+
+Where they reach separate elements, the update applies. On a match,
+`$setOnInsert` writes nothing and so reaches nothing.
 
 ### Positional updates
 
