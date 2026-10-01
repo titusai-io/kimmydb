@@ -21943,10 +21943,16 @@ early tick for each answer would run its loop at the discovery interval.
 
 What a hung lookup holds is not what it held before, and not nothing. A `dns:` or
 `k8s:` lookup is `getaddrinfo` on the blocking pool, so it costs a thread for its
-timeout; a `dns-srv:` lookup costs a task. Neither holds the loop. A hung `dns:`
-lookup still holds a *stop* for the full stop budget, because the runtime waits for
-its blocking pool, exactly as before; resolving addresses with the resolver the
-SRV lookup already uses would end that, and is not part of this change.
+timeout; a `dns-srv:` lookup costs a task. Neither holds the loop. A `dns:` lookup
+in flight when a stop begins still holds the *stop* until `getaddrinfo` returns,
+because the runtime waits for its blocking pool, exactly as before, but never past
+the stop budget (22 s from the signal). How long that is depends on the resolver: one
+that drops queries makes a lookup last `timeout` × `attempts` per nameserver (150 s
+at `timeout:30 attempts:5`), so a stop during it takes the full budget; one that
+answers with an error ends it sooner (Docker's embedded DNS answers SERVFAIL after
+about 4 s, and a refused port fails at once); and a stop between lookups does not
+wait at all. Resolving addresses with the resolver the SRV lookup already uses would
+end the wait, and is not part of this change.
 
 Tests on virtual time: over 100 s with a resolver that never answers, the first
 tick, the four retries and the tick at a minute, one call to the resolver and no
