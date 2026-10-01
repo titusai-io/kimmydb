@@ -5442,6 +5442,57 @@ mod tests {
         (worker, fake, flag)
     }
 
+    /// A provider that makes the owner check read false from the `after`th call
+    /// on, so the change of ownership lands at a batch of the caller's choosing
+    /// and not at a time: the scan asks again before each batch, and the one
+    /// after this call's is the first to read it.
+    struct LosesOwnershipAt {
+        inner: Arc<FakeProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+        after: usize,
+        owns: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for LosesOwnershipAt {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call == self.after {
+                self.owns.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.embed(texts).await
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// A worker for the collection, batching four documents to a call, whose
+    /// owner check turns false during the `after`th provider call. Answers the
+    /// worker and the flag, which reads true until then.
+    fn a_worker_that_loses_the_collection_at(
+        engine: &Arc<Engine>,
+        coll: &CollectionMeta,
+        after: usize,
+    ) -> (EmbeddingWorker, Arc<std::sync::atomic::AtomicBool>) {
+        let mut worker = EmbeddingWorker::new(Arc::clone(engine));
+        worker.set_batching(BatchSettings { max_chunks: 4, ..Default::default() });
+        let owns = switchable_owner(&mut worker, true);
+        let provider = LosesOwnershipAt {
+            inner: FakeProvider::new(4),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            after,
+            owns: Arc::clone(&owns),
+        };
+        worker.set_provider(coll.id.0, Arc::new(provider));
+        (worker, owns)
+    }
+
     /// Forty documents embedded under configuration A, then reconfigured to B
     /// (a document prefix). The owner O starts B's backfill; 250 ms in, the
     /// collection's ownership moves to N, whose rescan of it (after the
@@ -6013,19 +6064,22 @@ mod tests {
         assert!(made_under(&engine, &ids[0]).is_some(), "kept");
     }
 
-    /// The reviewer's flicker: the owner check reads false for 150 ms of the
-    /// owner's backfill and then true again. The scan hands the collection
-    /// over at the next batch and leaves the rest; no other member holds it
-    /// long enough to rescan it. The owner's next evaluations read the
-    /// collection as gained, and the settled rescan finishes it. Before, the
-    /// collection stayed settled here and 28 of 40 documents kept A's
-    /// vectors for good.
+    /// The reviewer's flicker: the owner check reads false during the owner's
+    /// backfill and then true again. The check turns false during the second
+    /// provider call, so the scan hands the collection over before the third
+    /// batch however long the host takes, and leaves the rest; the check reads
+    /// true again once the backfill has returned, and no other member holds
+    /// the collection long enough to rescan it. The owner's next evaluations
+    /// read the collection as gained, and the settled rescan finishes it.
+    /// Before, the collection stayed settled here and 32 of 40 documents kept
+    /// A's vectors for good. The settle hold runs from the regain, not from an
+    /// earlier gain the handed-over scan left behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_owner_whose_check_flickers_during_a_reindex_finishes_it() {
         let (engine, coll, _worker, _dir) = setup().await;
         let bodies: Vec<String> = (0..40).map(|i| format!("doc{i}")).collect();
         let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
-        let (mut owner, _, owns) = a_slow_worker(&engine, &coll, true);
+        let (mut owner, owns) = a_worker_that_loses_the_collection_at(&engine, &coll, 2);
         let t0 = Instant::now();
         owner.rescan_gained(t0).await.unwrap();
         owner.rescan_gained(t0 + Duration::from_secs(31)).await.unwrap();
@@ -6034,22 +6088,30 @@ mod tests {
         })
         .await;
 
-        let backfill = tokio::spawn(async move {
-            let outcome = owner.process(&entry).await;
-            (owner, outcome)
-        });
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        owns.store(false, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            owner.ownership_settled.get("app/docs"),
+            Some(&true),
+            "settled before the backfill"
+        );
+        let outcome = owner.process(&entry).await;
         owns.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (mut owner, outcome) = backfill.await.unwrap();
         assert!(matches!(outcome.unwrap(), Outcome::Backfilled { .. }));
         let left = ids.iter().filter(|id| made_under(&engine, id) != Some(b.fingerprint())).count();
         assert!(left > 0, "the premise: the handed-over scan left some under A");
+        assert_eq!(
+            owner.ownership_settled.get("app/docs"),
+            Some(&false),
+            "the handed-over scan leaves the collection unsettled"
+        );
 
-        let t1 = Instant::now();
-        owner.rescan_gained(t1).await.unwrap();
-        owner.rescan_gained(t1 + Duration::from_secs(31)).await.unwrap();
+        // The first evaluation after the regain starts the settle hold, even
+        // though the gain at `t0` is long past: the hold runs from now, so this
+        // one rescans nothing, and the one 31 s after it finishes the job.
+        let regained = t0 + Duration::from_secs(40);
+        owner.rescan_gained(regained).await.unwrap();
+        let held = ids.iter().filter(|id| made_under(&engine, id) != Some(b.fingerprint())).count();
+        assert_eq!(held, left, "the settle hold runs from the regain, not from the earlier gain");
+        owner.rescan_gained(regained + Duration::from_secs(31)).await.unwrap();
         for id in &ids {
             assert_eq!(made_under(&engine, id), Some(b.fingerprint()), "{id} is under B");
         }
